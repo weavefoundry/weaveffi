@@ -15,14 +15,12 @@ use std::fmt::Write as _;
 use weaveffi_core::abi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, pascal_case, walk_modules, DocCommentStyle,
-};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, pascal_case, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    IteratorBinding, ListenerBinding, ParamBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::pkg;
 use weaveffi_core::utils::{
@@ -31,14 +29,15 @@ use weaveffi_core::utils::{
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`AndroidGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AndroidConfig {
     /// JVM package for the generated Kotlin wrapper (default
     /// `"com.weaveffi"`).
     pub package: Option<String>,
-    /// When `true`, strip the IR module name prefix from emitted
-    /// Kotlin function names.
+    /// When `true` (the default), strip the IR module name prefix from
+    /// emitted Kotlin function names. Set to `false` to keep the prefixed
+    /// spelling (`contactsCreateContact` rather than `createContact`).
     pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the JNI shim calls the same
@@ -47,6 +46,19 @@ pub struct AndroidConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for AndroidConfig {
+    /// The default configuration strips module prefixes; every other field
+    /// falls back to `None` and resolves through its accessor.
+    fn default() -> Self {
+        Self {
+            package: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl AndroidConfig {
@@ -91,14 +103,13 @@ impl LanguageBackend for AndroidGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
         let package = config.package();
         let strip = config.strip_module_prefix;
         let input_basename = config.input_basename();
-        let c_prefix = config.prefix();
         let dir = out_dir.join("android");
         let dbl = CommentStyle::DoubleSlash;
         let pkg_path = package.replace('.', "/");
@@ -120,7 +131,7 @@ impl LanguageBackend for AndroidGenerator {
             ),
             OutputFile::new(
                 src_dir.join("WeaveFFI.kt"),
-                render_kotlin(api, package, strip, input_basename),
+                render_kotlin(model, package, strip, input_basename),
             ),
             OutputFile::new(
                 jni_dir.join("CMakeLists.txt"),
@@ -132,7 +143,7 @@ impl LanguageBackend for AndroidGenerator {
             ),
             OutputFile::new(
                 jni_dir.join("weaveffi_jni.c"),
-                render_jni_c(api, package, strip, input_basename, c_prefix),
+                render_jni_c(model, package, strip, input_basename),
             ),
         ]
     }
@@ -268,6 +279,9 @@ fn kotlin_type(t: &TypeRef) -> String {
         // A cross-module typed handle (resolved to e.g. `kv.Store`) must name the
         // bare local Kotlin class `Store`, not the qualified IR name.
         TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
+        // An interface surfaces as its generated Kotlin wrapper class,
+        // exactly like a typed handle; the JNI layer carries the raw `Long`.
+        TypeRef::Interface(name) => local_type_name(name).to_string(),
         TypeRef::Struct(_) => "Long".to_string(),
         TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
@@ -279,10 +293,15 @@ fn kotlin_type(t: &TypeRef) -> String {
 
 fn kotlin_jni_type(t: &TypeRef) -> String {
     match t {
-        TypeRef::TypedHandle(_) => "Long".to_string(),
-        // The JNI layer carries a typed handle as a raw `Long` even when nullable;
-        // the public wrapper re-wraps it into the owning class.
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::TypedHandle(_)) => {
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => "Long".to_string(),
+        // The JNI layer carries a typed handle or interface as a raw `Long`
+        // even when nullable; the public wrapper re-wraps it into the class.
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+            ) =>
+        {
             "Long?".to_string()
         }
         other => kotlin_type(other),
@@ -299,7 +318,8 @@ fn kotlin_list_type(inner: &TypeRef) -> String {
         | TypeRef::U64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
-        | TypeRef::Struct(_) => "LongArray".to_string(),
+        | TypeRef::Struct(_)
+        | TypeRef::Interface(_) => "LongArray".to_string(),
         TypeRef::F32 => "FloatArray".to_string(),
         TypeRef::F64 => "DoubleArray".to_string(),
         TypeRef::Bool => "BooleanArray".to_string(),
@@ -321,7 +341,7 @@ fn kotlin_cb_type(t: &TypeRef) -> String {
         TypeRef::I16 | TypeRef::U16 => "Short".to_string(),
         TypeRef::I32 | TypeRef::Enum(_) => "Int".to_string(),
         TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "Long".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Long".to_string(),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => "Long".to_string(),
         TypeRef::F32 => "Float".to_string(),
         TypeRef::F64 => "Double".to_string(),
         TypeRef::Bool => "Boolean".to_string(),
@@ -369,7 +389,8 @@ fn jni_param_type(t: &TypeRef) -> String {
         | TypeRef::U64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
-        | TypeRef::Struct(_) => "jlong".to_string(),
+        | TypeRef::Struct(_)
+        | TypeRef::Interface(_) => "jlong".to_string(),
         TypeRef::F32 => "jfloat".to_string(),
         TypeRef::F64 => "jdouble".to_string(),
         TypeRef::Bool => "jboolean".to_string(),
@@ -395,7 +416,8 @@ fn jni_array_type(inner: &TypeRef) -> String {
         | TypeRef::U64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
-        | TypeRef::Struct(_) => "jlongArray".to_string(),
+        | TypeRef::Struct(_)
+        | TypeRef::Interface(_) => "jlongArray".to_string(),
         TypeRef::F32 => "jfloatArray".to_string(),
         TypeRef::F64 => "jdoubleArray".to_string(),
         TypeRef::Bool => "jbooleanArray".to_string(),
@@ -427,6 +449,7 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*",
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*",
         TypeRef::Struct(_)
+        | TypeRef::Interface(_)
         | TypeRef::Optional(_)
         | TypeRef::List(_)
         | TypeRef::Iterator(_)
@@ -447,7 +470,7 @@ fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
         Some(TypeRef::Bool) => "return JNI_FALSE;",
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => "return NULL;",
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => "return NULL;",
-        Some(TypeRef::Struct(_)) => "return 0;",
+        Some(TypeRef::Struct(_) | TypeRef::Interface(_)) => "return 0;",
         Some(
             TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _),
         ) => "return NULL;",
@@ -464,7 +487,7 @@ fn jni_cast_for(t: &TypeRef) -> &'static str {
         }
         TypeRef::F32 => "(jfloat)",
         TypeRef::F64 => "(jdouble)",
-        TypeRef::Struct(_) => "(jlong)(intptr_t)",
+        TypeRef::Struct(_) | TypeRef::Interface(_) => "(jlong)(intptr_t)",
         _ => "",
     }
 }
@@ -515,14 +538,67 @@ fn lower_camel(s: &str) -> String {
     }
 }
 
-/// True if `t` is a typed handle or struct, or an optional wrapping one:
-/// the return shapes that re-wrap a raw JNI `Long` into a Kotlin class.
+/// The Kotlin name of a free function or listener registration: the module
+/// prefix is applied (or stripped) first, then the result is lowerCamelCased,
+/// so `contacts` + `create_contact` is `createContact` when stripping (the
+/// default) and `contactsCreateContact` otherwise.
+fn kotlin_fn_name(module_path: &str, name: &str, strip_module_prefix: bool) -> String {
+    lower_camel(&wrapper_name(module_path, name, strip_module_prefix))
+}
+
+/// Clone `params` with camelCased names so KDoc `@param` tags match the
+/// emitted Kotlin parameter spelling.
+fn camel_params(params: &[ParamBinding]) -> Vec<ParamBinding> {
+    params
+        .iter()
+        .map(|p| ParamBinding {
+            name: lower_camel(&p.name),
+            ..p.clone()
+        })
+        .collect()
+}
+
+/// The Kotlin exception type for an error domain: the shared exception brand
+/// naming, so `KvError` becomes `KvException`.
+fn kotlin_exception_name(eb: &ErrorBinding) -> String {
+    errors::exception_type_name(&eb.name)
+}
+
+/// The Kotlin expression mapping an async error `(code, message)` pair to the
+/// exception the continuation resumes with: the typed domain exception for a
+/// throwing callable, the generic brand exception otherwise.
+fn kotlin_error_mapper(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
+    match error {
+        Some(eb) if f.throws => {
+            format!("{}.fromCode(code, message)", kotlin_exception_name(eb))
+        }
+        _ => format!("{}(code, message)", errors::EXCEPTION_BRAND),
+    }
+}
+
+/// True if `t` is a typed handle, struct, or interface, or an optional
+/// wrapping one: the return shapes that re-wrap a raw JNI `Long` into a
+/// Kotlin class.
 fn is_class_wrapped_return(t: &TypeRef) -> bool {
     match t {
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => true,
-        TypeRef::Optional(inner) => {
-            matches!(inner.as_ref(), TypeRef::TypedHandle(_) | TypeRef::Struct(_))
-        }
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => true,
+        TypeRef::Optional(inner) => matches!(
+            inner.as_ref(),
+            TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_)
+        ),
+        _ => false,
+    }
+}
+
+/// True if `t` unwraps to a raw handle (`.handle` / `?.handle`) on the way
+/// into JNI: typed handles, structs, and interfaces, plus optionals of them.
+fn is_class_wrapped_param(t: &TypeRef) -> bool {
+    match t {
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => true,
+        TypeRef::Optional(inner) => matches!(
+            inner.as_ref(),
+            TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_)
+        ),
         _ => false,
     }
 }
@@ -530,32 +606,26 @@ fn is_class_wrapped_return(t: &TypeRef) -> bool {
 /// Whether a function needs the private-`Jni` + public-wrapper split rather than
 /// a bare `external fun`. This is required when any param or the return crosses
 /// the JNI boundary as a *different* type than its public Kotlin type: enums
-/// (`.value`/`fromValue`), typed handles, and structs (`.handle` / re-wrap into
-/// the class).
+/// (`.value`/`fromValue`), typed handles, structs, and interfaces (`.handle` /
+/// re-wrap into the class).
 fn has_enum_involvement(f: &FnBinding) -> bool {
-    f.params.iter().any(|p| {
-        matches!(
-            &p.ty,
-            TypeRef::Enum(_) | TypeRef::TypedHandle(_) | TypeRef::Struct(_)
-        )
-    }) || matches!(&f.ret, Some(TypeRef::Enum(_)))
+    f.params
+        .iter()
+        .any(|p| matches!(&p.ty, TypeRef::Enum(_)) || is_class_wrapped_param(&p.ty))
+        || matches!(&f.ret, Some(TypeRef::Enum(_)))
         || f.ret.as_ref().is_some_and(is_class_wrapped_return)
 }
 
 fn render_kotlin(
-    api: &Api,
+    model: &BindingModel,
     package: &str,
     strip_module_prefix: bool,
     input_basename: &str,
 ) -> String {
-    // The Kotlin layer emits no C symbols (it relies on JNI naming + the
-    // wrapper conventions), so the model prefix is irrelevant here; build with
-    // the default so we can consume the shared binding shapes uniformly.
-    let model = BindingModel::build(api, "weaveffi");
     let has_async = model
         .modules
         .iter()
-        .any(|m| m.functions.iter().any(|f| f.is_async));
+        .any(|m| m.callables().any(|f| f.is_async));
     let mut kotlin = render_prelude(CommentStyle::DoubleSlash, input_basename);
     kotlin.push_str(&format!("package {package}\n\n"));
     if has_async {
@@ -570,12 +640,12 @@ fn render_kotlin(
                 unreachable!("validation guarantees the listener's callback exists");
             };
             let cb_params: Vec<String> = cb.params.iter().map(|p| kotlin_cb_type(&p.ty)).collect();
-            let register = wrapper_name(
+            let register = kotlin_fn_name(
                 &m.path,
                 &format!("register_{}", l.name),
                 strip_module_prefix,
             );
-            let unregister = wrapper_name(
+            let unregister = kotlin_fn_name(
                 &m.path,
                 &format!("unregister_{}", l.name),
                 strip_module_prefix,
@@ -592,141 +662,7 @@ fn render_kotlin(
             );
         }
         for f in &m.functions {
-            let func_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
-            emit_fn_doc(&mut kotlin, &f.doc, &f.params, "        ");
-            if let Some(msg) = &f.deprecated {
-                let _ = writeln!(
-                    kotlin,
-                    "        @Deprecated(\"{}\")",
-                    msg.replace('"', "\\\"")
-                );
-            }
-            if f.is_async {
-                render_kotlin_async_fun(&mut kotlin, f, &func_name);
-            } else if has_enum_involvement(f) {
-                let native_params: Vec<String> = f
-                    .params
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name, kotlin_jni_type(&p.ty)))
-                    .collect();
-                let native_ret = f
-                    .ret
-                    .as_ref()
-                    .map(kotlin_jni_type)
-                    .unwrap_or_else(|| "Unit".to_string());
-                let _ = writeln!(
-                    kotlin,
-                    "        @JvmStatic private external fun {}Jni({}): {}",
-                    func_name,
-                    native_params.join(", "),
-                    native_ret
-                );
-
-                let public_params: Vec<String> = f
-                    .params
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name, kotlin_public_type(&p.ty)))
-                    .collect();
-                let public_ret = f
-                    .ret
-                    .as_ref()
-                    .map(kotlin_public_type)
-                    .unwrap_or_else(|| "Unit".to_string());
-                let call_args: Vec<String> = f
-                    .params
-                    .iter()
-                    .map(|p| {
-                        if matches!(&p.ty, TypeRef::Enum(_)) {
-                            format!("{}.value", p.name)
-                        } else if matches!(&p.ty, TypeRef::TypedHandle(_) | TypeRef::Struct(_)) {
-                            format!("{}.handle", p.name)
-                        } else {
-                            p.name.clone()
-                        }
-                    })
-                    .collect();
-                let call = format!("{}Jni({})", func_name, call_args.join(", "));
-
-                if let Some(TypeRef::Enum(name)) = &f.ret {
-                    let _ = writeln!(
-                        kotlin,
-                        "        @JvmStatic fun {}({}): {} = {}.fromValue({})",
-                        func_name,
-                        public_params.join(", "),
-                        public_ret,
-                        local_type_name(name),
-                        call
-                    );
-                } else if let Some(TypeRef::TypedHandle(name) | TypeRef::Struct(name)) = &f.ret {
-                    // The JNI returns a raw `Long` handle; re-wrap it into the
-                    // owning class so the public surface is the object type.
-                    let _ = writeln!(
-                        kotlin,
-                        "        @JvmStatic fun {}({}): {} = {}({})",
-                        func_name,
-                        public_params.join(", "),
-                        public_ret,
-                        local_type_name(name),
-                        call
-                    );
-                } else if let Some(TypeRef::Optional(inner)) = &f.ret {
-                    if let TypeRef::TypedHandle(name) | TypeRef::Struct(name) = inner.as_ref() {
-                        let _ = writeln!(
-                            kotlin,
-                            "        @JvmStatic fun {}({}): {} = {}?.let {{ {}(it) }}",
-                            func_name,
-                            public_params.join(", "),
-                            public_ret,
-                            call,
-                            local_type_name(name)
-                        );
-                    } else {
-                        let _ = writeln!(
-                            kotlin,
-                            "        @JvmStatic fun {}({}): {} = {}",
-                            func_name,
-                            public_params.join(", "),
-                            public_ret,
-                            call
-                        );
-                    }
-                } else if f.ret.is_some() {
-                    let _ = writeln!(
-                        kotlin,
-                        "        @JvmStatic fun {}({}): {} = {}",
-                        func_name,
-                        public_params.join(", "),
-                        public_ret,
-                        call
-                    );
-                } else {
-                    let _ = writeln!(
-                        kotlin,
-                        "        @JvmStatic fun {}({}) {{ {} }}",
-                        func_name,
-                        public_params.join(", "),
-                        call
-                    );
-                }
-            } else {
-                let params_sig: Vec<String> = f
-                    .params
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name, kotlin_type(&p.ty)))
-                    .collect();
-                let ret = f
-                    .ret
-                    .as_ref()
-                    .map(kotlin_type)
-                    .unwrap_or_else(|| "Unit".to_string());
-                let _ = writeln!(
-                    kotlin,
-                    "        @JvmStatic external fun {}({}): {}",
-                    func_name,
-                    params_sig.join(", "),
-                    ret
-                );
-            }
+            render_kotlin_free_fn(&mut kotlin, m, f, strip_module_prefix);
         }
     }
     kotlin.push_str("    }\n}\n");
@@ -740,13 +676,19 @@ fn render_kotlin(
                 render_kotlin_builder(&mut kotlin, s);
             }
         }
+        for i in &m.interfaces {
+            render_kotlin_interface(&mut kotlin, i, m.error.as_ref());
+        }
     }
-    render_kotlin_error_types(&mut kotlin, api);
+    render_kotlin_error_types(&mut kotlin, model);
     if has_async {
-        kotlin.push_str("\ninternal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {\n");
+        kotlin.push_str("\ninternal class WeaveContinuation<T>(\n");
+        kotlin.push_str("    private val cont: kotlinx.coroutines.CancellableContinuation<T>,\n");
+        kotlin.push_str("    private val mapError: (Int, String) -> Throwable\n");
+        kotlin.push_str(") {\n");
         kotlin.push_str("    @Suppress(\"UNCHECKED_CAST\")\n");
         kotlin.push_str("    fun onSuccess(result: Any?) { cont.resume(result as T) }\n");
-        kotlin.push_str("    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }\n");
+        kotlin.push_str("    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }\n");
         kotlin.push_str("}\n");
     }
     kotlin.push('\n');
@@ -754,34 +696,209 @@ fn render_kotlin(
     kotlin
 }
 
-fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
-    // The private external launcher crosses into JNI C, which declares raw
-    // JNI types (`jlong` for handles/structs, `jint` for enums), so the
-    // external signature must use the lowered types and the public suspend
-    // wrapper must unwrap (`.handle` / `.value`) exactly like the sync path.
-    // Passing a wrapper object where the C side reads a `jlong` is undefined
-    // behaviour (the pointer-sized register holds a JVM reference).
-    let mut native_param_chain: Vec<String> = f
+/// Render one free function into the `WeaveFFI` companion: a bare `external
+/// fun` when every type crosses JNI unchanged, otherwise a private `{name}Jni`
+/// external plus a public wrapper that unwraps handles and enums on the way in
+/// and re-wraps class returns on the way out.
+fn render_kotlin_free_fn(out: &mut String, m: &ModuleBinding, f: &FnBinding, strip: bool) {
+    let func_name = kotlin_fn_name(&m.path, &f.name, strip);
+    emit_fn_doc(out, &f.doc, &camel_params(&f.params), "        ");
+    if f.is_async {
+        let native = format!("{func_name}Async");
+        let mapper = kotlin_error_mapper(f, m.error.as_ref());
+        render_kotlin_async_fun(
+            out,
+            f,
+            &func_name,
+            &native,
+            false,
+            "@JvmStatic ",
+            true,
+            2,
+            &mapper,
+        );
+    } else if has_enum_involvement(f) {
+        let native_params: Vec<String> = f
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_jni_type(&p.ty)))
+            .collect();
+        let native_ret = f
+            .ret
+            .as_ref()
+            .map(kotlin_jni_type)
+            .unwrap_or_else(|| "Unit".to_string());
+        let _ = writeln!(
+            out,
+            "        @JvmStatic private external fun {}Jni({}): {}",
+            func_name,
+            native_params.join(", "),
+            native_ret
+        );
+        let call_args: Vec<String> = f.params.iter().map(kotlin_unwrap_arg).collect();
+        let call = format!("{}Jni({})", func_name, call_args.join(", "));
+        let mut w = CodeWriter::four_space().with_depth(2);
+        write_kotlin_sync_wrapper(&mut w, f, &format!("@JvmStatic fun {func_name}"), &call);
+        out.push_str(&w.finish());
+    } else {
+        let params_sig: Vec<String> = f
+            .params
+            .iter()
+            .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_type(&p.ty)))
+            .collect();
+        let ret = f
+            .ret
+            .as_ref()
+            .map(kotlin_type)
+            .unwrap_or_else(|| "Unit".to_string());
+        if let Some(msg) = &f.deprecated {
+            let _ = writeln!(out, "        @Deprecated(\"{}\")", msg.replace('"', "\\\""));
+        }
+        let _ = writeln!(
+            out,
+            "        @JvmStatic external fun {}({}): {}",
+            func_name,
+            params_sig.join(", "),
+            ret
+        );
+    }
+}
+
+/// The Kotlin expression that lowers one public argument for a JNI call:
+/// enums pass `.value`, class-wrapped types (typed handles, structs,
+/// interfaces, and optionals of them) pass the raw `.handle`.
+fn kotlin_unwrap_arg(p: &ParamBinding) -> String {
+    let n = lower_camel(&p.name);
+    match &p.ty {
+        TypeRef::Enum(_) => format!("{n}.value"),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            format!("{n}.handle")
+        }
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_)
+            ) =>
+        {
+            format!("{n}?.handle")
+        }
+        _ => n,
+    }
+}
+
+/// The Kotlin expression re-wrapping a lowered JNI value `expr` into the
+/// public return type, or `None` when the lowered value already is the public
+/// type: enums round-trip through `fromValue`, class-wrapped returns through
+/// the class constructor (nullable via `?.let`).
+fn kotlin_wrap_return(ret: Option<&TypeRef>, expr: &str) -> Option<String> {
+    match ret {
+        Some(TypeRef::Enum(name)) => Some(format!("{}.fromValue({expr})", local_type_name(name))),
+        Some(TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Interface(name)) => {
+            Some(format!("{}({expr})", local_type_name(name)))
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::TypedHandle(name) | TypeRef::Struct(name) | TypeRef::Interface(name) => {
+                Some(format!("{expr}?.let {{ {}(it) }}", local_type_name(name)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Write the public wrapper for a sync callable whose lowered JNI call is
+/// `call`. `decl` carries everything before the parameter list (annotations
+/// resolved by the caller, e.g. `"@JvmStatic fun createContact"` or
+/// `"operator fun invoke"`).
+fn write_kotlin_sync_wrapper(w: &mut CodeWriter, f: &FnBinding, decl: &str, call: &str) {
+    let params_sig: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", p.name, kotlin_jni_type(&p.ty)))
+        .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_public_type(&p.ty)))
         .collect();
-    if f.cancellable {
-        native_param_chain.push("cancelToken: Long".to_string());
+    let public_ret = f
+        .ret
+        .as_ref()
+        .map(kotlin_public_type)
+        .unwrap_or_else(|| "Unit".to_string());
+    if let Some(msg) = &f.deprecated {
+        w.line(format!("@Deprecated(\"{}\")", msg.replace('"', "\\\"")));
     }
-    native_param_chain.push("callback: Any".to_string());
-    let native_params = native_param_chain;
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line(format!(
-        "@JvmStatic private external fun {}Async({})",
-        func_name,
-        native_params.join(", ")
-    ));
+    match kotlin_wrap_return(f.ret.as_ref(), call) {
+        Some(wrapped) => {
+            w.line(format!(
+                "{decl}({}): {public_ret} = {wrapped}",
+                params_sig.join(", ")
+            ));
+        }
+        None if f.ret.is_some() => {
+            w.line(format!(
+                "{decl}({}): {public_ret} = {call}",
+                params_sig.join(", ")
+            ));
+        }
+        None => {
+            w.line(format!("{decl}({}) {{ {call} }}", params_sig.join(", ")));
+        }
+    }
+}
+
+/// The `external` JNI launcher parameter list for an async callable: the raw
+/// `handle` receiver for methods, lowered input slots, the optional cancel
+/// token, then the boxed continuation.
+fn kotlin_async_native_params(f: &FnBinding, has_self: bool) -> Vec<String> {
+    let mut chain: Vec<String> = Vec::new();
+    if has_self {
+        chain.push("selfHandle: Long".to_string());
+    }
+    chain.extend(
+        f.params
+            .iter()
+            .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_jni_type(&p.ty))),
+    );
+    if f.cancellable {
+        chain.push("cancelToken: Long".to_string());
+    }
+    chain.push("callback: Any".to_string());
+    chain
+}
+
+/// Render an async callable: the private `external` launcher declaration
+/// (unless the caller declares it elsewhere, as interface companions do) plus
+/// the public `suspend fun` wrapper that resumes through `WeaveContinuation`
+/// and maps error codes to exceptions via `error_mapper`.
+///
+/// The external launcher crosses into JNI C, which declares raw JNI types
+/// (`jlong` for handles/structs/interfaces, `jint` for enums), so its
+/// signature uses the lowered types and the suspend wrapper unwraps
+/// (`.handle` / `.value`) exactly like the sync path. Passing a wrapper object
+/// where the C side reads a `jlong` is undefined behaviour (the pointer-sized
+/// register holds a JVM reference).
+#[allow(clippy::too_many_arguments)]
+fn render_kotlin_async_fun(
+    out: &mut String,
+    f: &FnBinding,
+    public_name: &str,
+    native_name: &str,
+    has_self: bool,
+    modifier: &str,
+    emit_native: bool,
+    depth: usize,
+    error_mapper: &str,
+) {
+    let mut w = CodeWriter::four_space().with_depth(depth);
+    if emit_native {
+        w.line(format!(
+            "@JvmStatic private external fun {}({})",
+            native_name,
+            kotlin_async_native_params(f, has_self).join(", ")
+        ));
+    }
 
     let params_sig: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", p.name, kotlin_public_type(&p.ty)))
+        .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_public_type(&p.ty)))
         .collect();
     let public_ret = f
         .ret
@@ -789,63 +906,40 @@ fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
         .map(kotlin_public_type)
         .unwrap_or_else(|| "Unit".to_string());
     // The continuation resumes with the value the JNI callback boxes (the
-    // lowered type); enum/struct returns are re-wrapped after the await.
+    // lowered type); enum/class returns are re-wrapped after the await.
     let jni_ret = f
         .ret
         .as_ref()
         .map(kotlin_jni_type)
         .unwrap_or_else(|| "Unit".to_string());
-    let mut call_arg_chain: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| {
-            if matches!(&p.ty, TypeRef::Enum(_)) {
-                format!("{}.value", p.name)
-            } else if matches!(&p.ty, TypeRef::TypedHandle(_) | TypeRef::Struct(_)) {
-                format!("{}.handle", p.name)
-            } else {
-                p.name.clone()
-            }
-        })
-        .collect();
-    if f.cancellable {
-        call_arg_chain.push("0L".to_string());
+    let mut call_args: Vec<String> = Vec::new();
+    if has_self {
+        call_args.push("handle".to_string());
     }
-    call_arg_chain.push("WeaveContinuation(cont)".to_string());
-    let call_args = call_arg_chain;
+    call_args.extend(f.params.iter().map(kotlin_unwrap_arg));
+    if f.cancellable {
+        call_args.push("0L".to_string());
+    }
+    call_args.push(format!(
+        "WeaveContinuation(cont) {{ code, message -> {error_mapper} }}"
+    ));
     if let Some(msg) = &f.deprecated {
         w.line(format!("@Deprecated(\"{}\")", msg.replace('"', "\\\"")));
     }
 
     // Map the resumed (lowered) value back to the public type.
-    let wrap_expr: Option<String> = match &f.ret {
-        Some(TypeRef::Enum(name)) => Some(format!("{}.fromValue(raw)", local_type_name(name))),
-        Some(TypeRef::TypedHandle(name) | TypeRef::Struct(name)) => {
-            Some(format!("{}(raw)", local_type_name(name)))
-        }
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::TypedHandle(name) | TypeRef::Struct(name) => {
-                Some(format!("raw?.let {{ {}(it) }}", local_type_name(name)))
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-
-    match wrap_expr {
+    match kotlin_wrap_return(f.ret.as_ref(), "raw") {
         Some(wrap) => {
             w.line(format!(
-                "@JvmStatic suspend fun {}({}): {} {{",
-                func_name,
-                params_sig.join(", "),
-                public_ret
+                "{modifier}suspend fun {public_name}({}): {public_ret} {{",
+                params_sig.join(", ")
             ));
             w.scope(|w| {
                 w.line(format!(
                     "val raw: {jni_ret} = suspendCancellableCoroutine {{ cont ->"
                 ));
                 w.scope(|w| {
-                    w.line(format!("{}Async({})", func_name, call_args.join(", ")));
+                    w.line(format!("{}({})", native_name, call_args.join(", ")));
                 });
                 w.line("}");
                 w.line(format!("return {wrap}"));
@@ -854,13 +948,11 @@ fn render_kotlin_async_fun(out: &mut String, f: &FnBinding, func_name: &str) {
         }
         None => {
             w.line(format!(
-                "@JvmStatic suspend fun {}({}): {} = suspendCancellableCoroutine {{ cont ->",
-                func_name,
-                params_sig.join(", "),
-                public_ret
+                "{modifier}suspend fun {public_name}({}): {public_ret} = suspendCancellableCoroutine {{ cont ->",
+                params_sig.join(", ")
             ));
             w.scope(|w| {
-                w.line(format!("{}Async({})", func_name, call_args.join(", ")));
+                w.line(format!("{}({})", native_name, call_args.join(", ")));
             });
             w.line("}");
         }
@@ -1067,30 +1159,66 @@ fn render_kotlin_rich_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
-fn render_kotlin_error_types(out: &mut String, api: &Api) {
-    let error_codes: Vec<_> = walk_modules(&api.modules)
-        .filter_map(|m| m.errors.as_ref())
-        .flat_map(|e| &e.codes)
-        .collect();
-
+/// Render the exception surface: the open generic brand exception plus one
+/// sealed exception class per *declared* error domain, each with a per-code
+/// subclass and a `fromCode` factory mapping raw ABI codes to typed instances
+/// (unknown codes fall back to the generic exception).
+fn render_kotlin_error_types(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::four_space();
     w.blank();
-    if error_codes.is_empty() {
-        w.line("open class WeaveFFIException(val code: Int, message: String) : Exception(message)");
-    } else {
-        w.line(
-            "sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {",
-        );
+    w.line("/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */");
+    w.line(format!(
+        "open class {}(val code: Int, message: String) : Exception(message)",
+        errors::EXCEPTION_BRAND
+    ));
+    for m in &model.modules {
+        let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) else {
+            continue;
+        };
+        let exc = kotlin_exception_name(eb);
+        w.blank();
+        w.line(format!(
+            "/** Typed error domain `{}` declared by module `{}`. */",
+            eb.name, eb.owner_path
+        ));
+        w.line(format!(
+            "sealed class {exc}(code: Int, message: String) : {}(code, message) {{",
+            errors::EXCEPTION_BRAND
+        ));
         w.scope(|w| {
-            for ec in &error_codes {
+            for ec in &eb.codes {
                 writer_doc(w, &ec.doc);
                 w.line(format!(
-                    "class {}(message: String = \"{}\") : WeaveFFIException({}, message)",
+                    "class {}(message: String = \"{}\") : {exc}({}, message)",
                     errors::pascal(&ec.name),
-                    ec.message,
-                    ec.code
+                    ec.message.replace('"', "\\\""),
+                    ec.value
                 ));
             }
+            w.blank();
+            w.line("companion object {");
+            w.scope(|w| {
+                w.line(format!(
+                    "/** Map a raw `{}` code to its typed exception; unknown codes yield the generic [{}]. */",
+                    eb.name,
+                    errors::EXCEPTION_BRAND
+                ));
+                w.line(format!(
+                    "fun fromCode(code: Int, message: String): {} = when (code) {{",
+                    errors::EXCEPTION_BRAND
+                ));
+                w.scope(|w| {
+                    for ec in &eb.codes {
+                        w.line(format!("{} -> {}(message)", ec.value, errors::pascal(&ec.name)));
+                    }
+                    w.line(format!(
+                        "else -> {}(code, message)",
+                        errors::EXCEPTION_BRAND
+                    ));
+                });
+                w.line("}");
+            });
+            w.line("}");
         });
         w.line("}");
     }
@@ -1098,15 +1226,14 @@ fn render_kotlin_error_types(out: &mut String, api: &Api) {
 }
 
 fn render_jni_c(
-    api: &Api,
+    model: &BindingModel,
     package: &str,
     strip_module_prefix: bool,
     input_basename: &str,
-    c_prefix: &str,
 ) -> String {
+    let c_prefix = model.prefix.as_str();
     let jni_prefix = package.replace('.', "_");
     let jni_pkg_path = package.replace('.', "/");
-    let model = BindingModel::build(api, c_prefix);
     let mut jni_c = render_prelude(CommentStyle::DoubleSlash, input_basename);
     jni_c.push_str("#include <jni.h>\n#include <stdbool.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n");
     if model.modules.iter().any(|m| !m.listeners.is_empty()) {
@@ -1114,46 +1241,19 @@ fn render_jni_c(
     }
     let _ = writeln!(jni_c, "#include \"{c_prefix}.h\"\n");
 
-    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
-    let error_codes: Vec<_> = all_mods
-        .iter()
-        .filter_map(|m| m.errors.as_ref())
-        .flat_map(|e| &e.codes)
-        .collect();
-
-    jni_c.push_str("static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {\n");
-    jni_c.push_str("    const char* msg = err->message ? err->message : \"WeaveFFI error\";\n");
-    if error_codes.is_empty() {
-        jni_c.push_str(
-            "    jclass exClass = (*env)->FindClass(env, \"java/lang/RuntimeException\");\n",
-        );
-    } else {
-        jni_c.push_str("    jclass exClass;\n");
-        jni_c.push_str("    switch (err->code) {\n");
-        for ec in &error_codes {
-            let _ = writeln!(jni_c, "    case {}:", ec.code);
-            let _ = writeln!(
-                jni_c,
-                "        exClass = (*env)->FindClass(env, \"{}/WeaveFFIException${}\");",
-                jni_pkg_path,
-                errors::pascal(&ec.name)
-            );
-            jni_c.push_str("        break;\n");
+    render_jni_generic_thrower(&mut jni_c, &jni_pkg_path);
+    for m in &model.modules {
+        if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
+            if domain_thrower_used(model, &eb.c_tag) {
+                render_jni_domain_thrower(&mut jni_c, eb, &jni_pkg_path);
+            }
         }
-        jni_c.push_str("    default:\n");
-        jni_c.push_str(
-            "        exClass = (*env)->FindClass(env, \"java/lang/RuntimeException\");\n",
-        );
-        jni_c.push_str("        break;\n");
-        jni_c.push_str("    }\n");
     }
-    jni_c.push_str("    (*env)->ThrowNew(env, exClass, msg);\n");
-    jni_c.push_str("    weaveffi_error_clear(err);\n");
-    jni_c.push_str("}\n\n");
 
-    let has_async = all_mods
+    let has_async = model
+        .modules
         .iter()
-        .any(|m| m.functions.iter().any(|f| f.r#async));
+        .any(|m| m.callables().any(|f| f.is_async));
     if has_async {
         jni_c.push_str("typedef struct {\n");
         jni_c.push_str("    JavaVM* jvm;\n");
@@ -1184,93 +1284,37 @@ fn render_jni_c(
 
     for m in &model.modules {
         for f in &m.functions {
+            let thrower = jni_thrower_for(f, m.error.as_ref());
+            let func_name = kotlin_fn_name(&m.path, &f.name, strip_module_prefix);
             if f.is_async {
-                let func_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
                 render_jni_async_function(
                     &mut jni_c,
                     &m.path,
                     f,
-                    &func_name,
+                    "WeaveFFI",
+                    &format!("{func_name}Async"),
+                    None,
                     &jni_prefix,
                     c_prefix,
                 );
                 continue;
             }
-            let jret = jni_ret_type(f.ret.as_ref());
-            let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
-            for p in &f.params {
-                jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
-            }
-            let func_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
             let jni_name = if has_enum_involvement(f) {
-                format!("{}Jni", func_name)
+                format!("{func_name}Jni")
             } else {
                 func_name
             };
-            let _ = writeln!(
-                jni_c,
-                "JNIEXPORT {} JNICALL Java_{}_WeaveFFI_{}({}) {{",
-                jret,
-                jni_prefix,
-                jni_mangle(&jni_name),
-                jparams.join(", ")
+            render_jni_sync_export(
+                &mut jni_c,
+                f,
+                "WeaveFFI",
+                &jni_name,
+                None,
+                &thrower,
+                &jni_prefix,
+                &m.path,
+                c_prefix,
             );
-            let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL}};");
-
-            for p in &f.params {
-                write_param_acquire(&mut jni_c, &p.name, &p.ty);
-            }
-
-            let c_sym = &f.c_base;
-            let mut call_args: Vec<String> = Vec::new();
-            for p in &f.params {
-                build_c_call_args(&mut call_args, &p.name, &p.ty, &m.path, c_prefix);
-            }
-
-            // Iterator-returning functions drain the C iterator into a
-            // `java.util.ArrayList` and hand back its `Iterator` (the Kotlin
-            // surface declares `Iterator<T>`). This needs the launcher/next/
-            // destroy symbols carried by the iterator shape, so it is handled
-            // here rather than in the `TypeRef`-only return dispatcher.
-            if let CallShape::Iterator(it) = &f.shape {
-                write_iterator_return(&mut jni_c, it, &call_args, &f.params, &m.path, c_prefix);
-                let _ = writeln!(jni_c, "}}\n");
-                continue;
-            }
-
-            let needs_out_len = matches!(
-                f.ret,
-                Some(TypeRef::Bytes | TypeRef::BorrowedBytes) | Some(TypeRef::List(_))
-            );
-            if needs_out_len {
-                let _ = writeln!(jni_c, "    size_t out_len = 0;");
-            }
-
-            if let Some(ret_type) = f.ret.as_ref() {
-                write_return_handling(
-                    &mut jni_c,
-                    ret_type,
-                    c_sym,
-                    &call_args,
-                    f.ret.as_ref(),
-                    &f.params,
-                    &m.path,
-                    c_prefix,
-                );
-            } else {
-                let args_str = call_args.join(", ");
-                let _ = writeln!(
-                    jni_c,
-                    "    {}({});",
-                    c_sym,
-                    join_call_args(&args_str, "&err")
-                );
-                write_error_check(&mut jni_c, f.ret.as_ref());
-                release_jni_resources(&mut jni_c, &f.params);
-                let _ = writeln!(jni_c, "    return;");
-            }
-
-            let _ = writeln!(jni_c, "}}\n");
         }
     }
     for m in &model.modules {
@@ -1284,10 +1328,279 @@ fn render_jni_c(
         for s in &m.structs {
             render_jni_struct(&mut jni_c, &m.path, s, &jni_prefix, c_prefix);
         }
+        for i in &m.interfaces {
+            render_jni_interface(&mut jni_c, m, i, &jni_prefix, c_prefix);
+        }
     }
     jni_c.push('\n');
     jni_c.push_str(&render_trailer(CommentStyle::DoubleSlash, "weaveffi_jni.c"));
     jni_c
+}
+
+/// Emit the generic thrower: constructs the brand exception with the raw
+/// `(code, message)` pair via `NewObject` (so unknown codes keep their numeric
+/// code) and throws it. Every non-throwing callable and every infrastructure
+/// symbol (struct create, rich-enum constructors) dispatches here.
+fn render_jni_generic_thrower(out: &mut String, jni_pkg_path: &str) {
+    let mut w = CodeWriter::four_space();
+    w.line("static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {");
+    w.scope(|w| {
+        w.line("const char* msg = err->message ? err->message : \"WeaveFFI error\";");
+        w.line(format!(
+            "jclass exClass = (*env)->FindClass(env, \"{}/{}\");",
+            jni_pkg_path,
+            errors::EXCEPTION_BRAND
+        ));
+        w.block("if (exClass != NULL) {", "}", |w| {
+            w.line("jmethodID ctor = (*env)->GetMethodID(env, exClass, \"<init>\", \"(ILjava/lang/String;)V\");");
+            w.line("jstring jmsg = (*env)->NewStringUTF(env, msg);");
+            w.line("jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);");
+            w.line("if (ex != NULL) { (*env)->Throw(env, ex); }");
+        });
+        w.line("weaveffi_error_clear(err);");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit the thrower for one declared error domain: known codes throw the
+/// matching typed subclass (`{Domain}Exception${Code}`); unknown codes fall
+/// back to the generic thrower.
+fn render_jni_domain_thrower(out: &mut String, eb: &ErrorBinding, jni_pkg_path: &str) {
+    let exc = kotlin_exception_name(eb);
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
+        "static void throw_{}(JNIEnv* env, weaveffi_error* err) {{",
+        eb.c_tag
+    ));
+    w.scope(|w| {
+        w.line("const char* name = NULL;");
+        w.line("switch (err->code) {");
+        for ec in &eb.codes {
+            w.line(format!(
+                "case {}: name = \"{}/{}${}\"; break;",
+                ec.value,
+                jni_pkg_path,
+                exc,
+                errors::pascal(&ec.name)
+            ));
+        }
+        w.line("default: break;");
+        w.line("}");
+        w.line("if (name == NULL) { throw_weaveffi_error(env, err); return; }");
+        w.line("jclass exClass = (*env)->FindClass(env, name);");
+        w.line("if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : \"WeaveFFI error\"); }");
+        w.line("weaveffi_error_clear(err);");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// The C thrower a sync callable's error check dispatches to: the typed
+/// domain thrower for a throwing callable in a module with an error domain,
+/// the generic thrower otherwise.
+fn jni_thrower_for(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
+    match error {
+        Some(eb) if f.throws => format!("throw_{}", eb.c_tag),
+        _ => "throw_weaveffi_error".to_string(),
+    }
+}
+
+/// Whether any sync or iterator callable dispatches to the domain thrower for
+/// `c_tag`, counting inheriting submodules. Async errors bypass the C
+/// throwers (they resume the continuation), so an async-only domain emits no
+/// thrower.
+fn domain_thrower_used(model: &BindingModel, c_tag: &str) -> bool {
+    model.modules.iter().any(|m| {
+        m.error.as_ref().is_some_and(|e| e.c_tag == c_tag)
+            && m.callables().any(|f| f.throws && !f.is_async)
+    })
+}
+
+/// Emit one synchronous JNI export (`Java_<pkg>_<class>_<method>`). Interface
+/// methods pass `self_cast` (the C expression casting `selfHandle` back to the
+/// receiver pointer), which becomes the leading C call argument.
+#[allow(clippy::too_many_arguments)]
+fn render_jni_sync_export(
+    jni_c: &mut String,
+    f: &FnBinding,
+    class_name: &str,
+    jni_method: &str,
+    self_cast: Option<&str>,
+    thrower: &str,
+    jni_prefix: &str,
+    module_path: &str,
+    c_prefix: &str,
+) {
+    let jret = jni_ret_type(f.ret.as_ref());
+    let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
+    if self_cast.is_some() {
+        jparams.push("jlong selfHandle".into());
+    }
+    for p in &f.params {
+        jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
+    }
+    let _ = writeln!(
+        jni_c,
+        "JNIEXPORT {} JNICALL Java_{}_{}_{}({}) {{",
+        jret,
+        jni_prefix,
+        class_name,
+        jni_mangle(jni_method),
+        jparams.join(", ")
+    );
+    let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL}};");
+
+    for p in &f.params {
+        write_param_acquire(jni_c, &p.name, &p.ty);
+    }
+
+    let c_sym = &f.c_base;
+    let mut call_args: Vec<String> = Vec::new();
+    if let Some(cast) = self_cast {
+        call_args.push(cast.to_string());
+    }
+    for p in &f.params {
+        build_c_call_args(&mut call_args, &p.name, &p.ty, module_path, c_prefix);
+    }
+
+    // Iterator-returning callables drain the C iterator into a
+    // `java.util.ArrayList` and hand back its `Iterator` (the Kotlin surface
+    // declares `Iterator<T>`). This needs the launcher/next/destroy symbols
+    // carried by the iterator shape, so it is handled here rather than in the
+    // `TypeRef`-only return dispatcher.
+    if let CallShape::Iterator(it) = &f.shape {
+        write_iterator_return(
+            jni_c,
+            it,
+            &call_args,
+            &f.params,
+            module_path,
+            c_prefix,
+            thrower,
+        );
+        let _ = writeln!(jni_c, "}}\n");
+        return;
+    }
+
+    let needs_out_len = matches!(
+        f.ret,
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) | Some(TypeRef::List(_))
+    );
+    if needs_out_len {
+        let _ = writeln!(jni_c, "    size_t out_len = 0;");
+    }
+
+    if let Some(ret_type) = f.ret.as_ref() {
+        write_return_handling(
+            jni_c,
+            ret_type,
+            c_sym,
+            &call_args,
+            f.ret.as_ref(),
+            &f.params,
+            module_path,
+            c_prefix,
+            thrower,
+        );
+    } else {
+        let args_str = call_args.join(", ");
+        let _ = writeln!(
+            jni_c,
+            "    {}({});",
+            c_sym,
+            join_call_args(&args_str, "&err")
+        );
+        write_error_check(jni_c, f.ret.as_ref(), thrower);
+        release_jni_resources(jni_c, &f.params);
+        let _ = writeln!(jni_c, "    return;");
+    }
+
+    let _ = writeln!(jni_c, "}}\n");
+}
+
+/// Emit the JNI bridge for one interface: constructor, static, and method
+/// exports named `Java_<pkg>_<Class>_native<PascalMember>` (methods take the
+/// leading `selfHandle`), plus the `nativeDestroy` export releasing the
+/// object through the interface's destroy symbol.
+fn render_jni_interface(
+    jni_c: &mut String,
+    m: &ModuleBinding,
+    i: &InterfaceBinding,
+    jni_prefix: &str,
+    c_prefix: &str,
+) {
+    let self_cast = format!("(const {}*)(intptr_t)selfHandle", i.c_tag);
+    for f in i.constructors.iter().chain(i.statics.iter()) {
+        let thrower = jni_thrower_for(f, m.error.as_ref());
+        if f.is_async {
+            render_jni_async_function(
+                jni_c,
+                &m.path,
+                f,
+                &i.name,
+                &interface_native_name(f),
+                None,
+                jni_prefix,
+                c_prefix,
+            );
+        } else {
+            render_jni_sync_export(
+                jni_c,
+                f,
+                &i.name,
+                &interface_native_name(f),
+                None,
+                &thrower,
+                jni_prefix,
+                &m.path,
+                c_prefix,
+            );
+        }
+    }
+    for f in &i.methods {
+        let thrower = jni_thrower_for(f, m.error.as_ref());
+        if f.is_async {
+            render_jni_async_function(
+                jni_c,
+                &m.path,
+                f,
+                &i.name,
+                &interface_native_name(f),
+                Some(&self_cast),
+                jni_prefix,
+                c_prefix,
+            );
+        } else {
+            render_jni_sync_export(
+                jni_c,
+                f,
+                &i.name,
+                &interface_native_name(f),
+                Some(&self_cast),
+                &thrower,
+                jni_prefix,
+                &m.path,
+                c_prefix,
+            );
+        }
+    }
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
+        "JNIEXPORT void JNICALL Java_{}_{}_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {{",
+        jni_prefix, i.name
+    ));
+    w.scope(|w| {
+        w.line(format!(
+            "{}(({}*)(intptr_t)handle);",
+            i.destroy_symbol, i.c_tag
+        ));
+    });
+    w.line("}");
+    w.blank();
+    jni_c.push_str(&w.finish());
 }
 
 fn async_cb_result_params(ret: Option<&TypeRef>) -> String {
@@ -1328,7 +1641,8 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
             | TypeRef::U64
             | TypeRef::Handle
             | TypeRef::TypedHandle(_)
-            | TypeRef::Struct(_),
+            | TypeRef::Struct(_)
+            | TypeRef::Interface(_),
         ) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
@@ -1364,11 +1678,18 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
     out.push_str(&w.finish());
 }
 
+/// Emit one async JNI export: the completion callback trampoline (delivering
+/// `onError(code, message)` or the boxed result to the pinned
+/// `WeaveContinuation`) plus the `Java_<pkg>_<class>_<method>` launcher.
+/// Interface methods pass `self_cast` as the leading C launch argument.
+#[allow(clippy::too_many_arguments)]
 fn render_jni_async_function(
     out: &mut String,
     module_name: &str,
     f: &FnBinding,
-    func_name: &str,
+    class_name: &str,
+    jni_method: &str,
+    self_cast: Option<&str>,
     jni_prefix: &str,
     c_prefix: &str,
 ) {
@@ -1399,11 +1720,14 @@ fn render_jni_async_function(
         );
         w.line("if (err != NULL && err->code != 0) {");
         w.scope(|w| {
+            // The raw `(code, message)` pair crosses to Kotlin, where the
+            // continuation's mapper picks the typed or generic exception;
+            // producer threads cannot `FindClass` app classes themselves.
             w.line("const char* msg = err->message ? err->message : \"WeaveFFI error\";");
             w.line("jstring jmsg = (*env)->NewStringUTF(env, msg);");
             w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
-            w.line("jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(Ljava/lang/String;)V\");");
-            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);");
+            w.line("jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(ILjava/lang/String;)V\");");
+            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);");
         });
         w.line("} else {");
         w.scope(|w| {
@@ -1421,6 +1745,9 @@ fn render_jni_async_function(
     out.push_str(&w.finish());
 
     let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
+    if self_cast.is_some() {
+        jparams.push("jlong selfHandle".into());
+    }
     for p in &f.params {
         jparams.push(format!("{} {}", jni_param_type(&p.ty), p.name));
     }
@@ -1429,12 +1756,12 @@ fn render_jni_async_function(
     }
     jparams.push("jobject callback".to_string());
 
-    let jni_name = format!("{func_name}Async");
     let mut w = CodeWriter::four_space();
     w.line(format!(
-        "JNIEXPORT void JNICALL Java_{}_WeaveFFI_{}({}) {{",
+        "JNIEXPORT void JNICALL Java_{}_{}_{}({}) {{",
         jni_prefix,
-        jni_mangle(&jni_name),
+        class_name,
+        jni_mangle(jni_method),
         jparams.join(", ")
     ));
     w.scope(|w| {
@@ -1447,6 +1774,9 @@ fn render_jni_async_function(
         }
 
         let mut call_args: Vec<String> = Vec::new();
+        if let Some(cast) = self_cast {
+            call_args.push(cast.to_string());
+        }
         for p in &f.params {
             build_c_call_args(&mut call_args, &p.name, &p.ty, module_name, c_prefix);
         }
@@ -1527,7 +1857,7 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
                 "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
             ));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             splice(&mut w, |o| {
                 box_leaf(o, &TypeRef::Handle, var, &format!("(intptr_t){n0}"))
             });
@@ -1551,7 +1881,7 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
                     w.line(format!("{var} = (jobject){var}_arr;"));
                 });
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
                 w.line(format!("jobject {var} = NULL;"));
                 w.block(format!("if ({n0}) {{"), "}", |w| {
                     splice(w, |o| {
@@ -1796,12 +2126,12 @@ fn render_jni_listener_fns(
     jni_prefix: &str,
     strip_module_prefix: bool,
 ) {
-    let register_kt = wrapper_name(
+    let register_kt = kotlin_fn_name(
         module_path,
         &format!("register_{}", l.name),
         strip_module_prefix,
     );
-    let unregister_kt = wrapper_name(
+    let unregister_kt = kotlin_fn_name(
         module_path,
         &format!("unregister_{}", l.name),
         strip_module_prefix,
@@ -1981,7 +2311,8 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
         | TypeRef::U64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
-        | TypeRef::Struct(_) => {
+        | TypeRef::Struct(_)
+        | TypeRef::Interface(_) => {
             w.line(format!("int64_t {n}_val = 0;", n = name));
             w.line(format!("const int64_t* {n}_ptr = NULL;", n = name));
             w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
@@ -2100,7 +2431,8 @@ fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
         | TypeRef::U64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
-        | TypeRef::Struct(_) => {
+        | TypeRef::Struct(_)
+        | TypeRef::Interface(_) => {
             w.line(format!(
                 "jlong* {n}_elems = (*env)->GetLongArrayElements(env, {n}, NULL);",
                 n = name
@@ -2552,6 +2884,12 @@ fn build_c_call_args(
             let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
             args.push(format!("(const {}*)(intptr_t){}", c_struct, name));
         }
+        // An interface argument crosses as a borrowed `const {c_tag}*`: the
+        // Kotlin wrapper keeps ownership and only lends the pointer.
+        TypeRef::Interface(iname) => {
+            let c_struct = weaveffi_core::utils::c_abi_struct_name(iname, module, c_prefix);
+            args.push(format!("(const {}*)(intptr_t){}", c_struct, name));
+        }
         TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -2598,7 +2936,10 @@ fn build_c_call_args(
                 TypeRef::Bool => {
                     args.push(format!("(const bool*){n}_elems", n = name));
                 }
-                TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
+                TypeRef::TypedHandle(_)
+                | TypeRef::Handle
+                | TypeRef::Struct(_)
+                | TypeRef::Interface(_) => {
                     // The C ABI for List<Struct>/List<Handle> is `T* const*`,
                     // but the JNI side stores the elements as a `jlong*` of
                     // opaque handles. The void cast lets the underlying buffer
@@ -2649,6 +2990,7 @@ fn write_return_handling(
     params: &[ParamBinding],
     module: &str,
     c_prefix: &str,
+    thrower: &str,
 ) {
     let args_str = call_args.join(", ");
     let call_with_err = join_call_args(&args_str, "&err");
@@ -2657,7 +2999,7 @@ fn write_return_handling(
     match ret_type {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("const char* rv = {}({});", c_sym, call_with_err));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             w.line("jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");");
             w.line("weaveffi_free_string(rv);");
             splice(&mut w, |o| release_jni_resources(o, params));
@@ -2668,7 +3010,7 @@ fn write_return_handling(
                 "const uint8_t* rv = {}({});",
                 c_sym, call_with_out_len_err
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             w.line("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);");
             w.line("if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }");
             w.line("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);");
@@ -2677,14 +3019,14 @@ fn write_return_handling(
         }
         TypeRef::Bool => {
             w.line(format!("bool rv = {}({});", c_sym, call_with_err));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("return rv ? JNI_TRUE : JNI_FALSE;");
         }
         TypeRef::Struct(name) => {
             let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
             w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("return (jlong)(intptr_t)rv;");
         }
@@ -2695,18 +3037,18 @@ fn write_return_handling(
         TypeRef::TypedHandle(name) => {
             let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
             w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("return (jlong)(intptr_t)rv;");
         }
         TypeRef::Optional(inner) => {
             splice(&mut w, |o| {
-                write_optional_return(o, inner, c_sym, &args_str, returns, params, module)
+                write_optional_return(o, inner, c_sym, &args_str, returns, params, module, thrower)
             });
         }
         TypeRef::List(inner) => {
             splice(&mut w, |o| {
-                write_list_return(o, inner, c_sym, &args_str, returns, params)
+                write_list_return(o, inner, c_sym, &args_str, returns, params, thrower)
             });
         }
         TypeRef::Iterator(_) => {
@@ -2720,14 +3062,14 @@ fn write_return_handling(
         }
         TypeRef::Map(k, v) => {
             splice(&mut w, |o| {
-                write_map_return(o, k, v, c_sym, &args_str, returns, params)
+                write_map_return(o, k, v, c_sym, &args_str, returns, params, thrower)
             });
         }
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
             let jcast = jni_cast_for(ret_type);
             w.line(format!("{} rv = {}({});", c_ty, c_sym, call_with_err));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line(format!("return {} rv;", jcast));
         }
@@ -2740,7 +3082,7 @@ fn write_return_handling(
 fn iter_item_c_type(elem: &TypeRef, module: &str, c_prefix: &str) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".to_string(),
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
             format!(
                 "{}*",
                 weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix)
@@ -2789,7 +3131,7 @@ fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, inde
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", v = var, s = src));
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) | TypeRef::Interface(_) => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
@@ -2831,6 +3173,7 @@ fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, inde
 /// Drain an `iter<T>` into a `java.util.ArrayList<T>` and return its `Iterator`.
 /// The C surface is the launcher (returns an opaque iterator handle), a `next`
 /// that writes one element per call and returns 1/0, and a `destroy`.
+#[allow(clippy::too_many_arguments)]
 fn write_iterator_return(
     out: &mut String,
     it: &IteratorBinding,
@@ -2838,6 +3181,7 @@ fn write_iterator_return(
     params: &[ParamBinding],
     module: &str,
     c_prefix: &str,
+    thrower: &str,
 ) {
     let args_str = call_args.join(", ");
     let launch_call = join_call_args(&args_str, "&err");
@@ -2851,7 +3195,7 @@ fn write_iterator_return(
         sym = it.launch.symbol,
         call = launch_call
     ));
-    splice(&mut w, |o| write_error_check(o, Some(&iter_ret)));
+    splice(&mut w, |o| write_error_check(o, Some(&iter_ret), thrower));
     splice(&mut w, |o| release_jni_resources(o, params));
 
     w.line("jclass _al_cls = (*env)->FindClass(env, \"java/util/ArrayList\");");
@@ -2880,13 +3224,14 @@ fn write_iterator_return(
     );
     w.line(format!("{}(_iter);", it.destroy_symbol));
     w.block("if (_iter_err.code != 0) {", "}", |w| {
-        w.line("throw_weaveffi_error(env, &_iter_err);");
+        w.line(format!("{thrower}(env, &_iter_err);"));
         w.line("return NULL;");
     });
     w.line("return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, \"iterator\", \"()Ljava/util/Iterator;\"));");
     out.push_str(&w.finish());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_optional_return(
     out: &mut String,
     inner: &TypeRef,
@@ -2895,13 +3240,14 @@ fn write_optional_return(
     returns: Option<&TypeRef>,
     params: &[ParamBinding],
     _module: &str,
+    thrower: &str,
 ) {
     let call = join_call_args(args_str, "&err");
     let mut w = CodeWriter::four_space().with_depth(1);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("const char* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jstring result = (*env)->NewStringUTF(env, rv);");
@@ -2913,7 +3259,7 @@ fn write_optional_return(
                 "const int8_t* rv = (const int8_t*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Byte\");");
@@ -2925,7 +3271,7 @@ fn write_optional_return(
                 "const int16_t* rv = (const int16_t*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Short\");");
@@ -2934,18 +3280,19 @@ fn write_optional_return(
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
             w.line(format!("const int32_t* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Integer\");");
             w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(I)Ljava/lang/Integer;\");");
             w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jint)*rv);");
         }
-        // An optional struct/handle return is a *nullable handle pointer*: box
-        // the pointer value itself (do not dereference it as an integer).
-        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) => {
+        // An optional struct/handle/interface return is a *nullable handle
+        // pointer*: box the pointer value itself (do not dereference it as an
+        // integer).
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Struct(_) | TypeRef::Interface(_) => {
             w.line(format!("const void* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Long\");");
@@ -2958,7 +3305,7 @@ fn write_optional_return(
                 "const int64_t* rv = (const int64_t*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Long\");");
@@ -2967,7 +3314,7 @@ fn write_optional_return(
         }
         TypeRef::F32 => {
             w.line(format!("const float* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Float\");");
@@ -2976,7 +3323,7 @@ fn write_optional_return(
         }
         TypeRef::F64 => {
             w.line(format!("const double* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Double\");");
@@ -2985,7 +3332,7 @@ fn write_optional_return(
         }
         TypeRef::Bool => {
             w.line(format!("const bool* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("if (rv == NULL) { return NULL; }");
             w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");");
@@ -2996,7 +3343,7 @@ fn write_optional_return(
         }
         _ => {
             w.line(format!("void* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("return (jobject)rv;");
         }
@@ -3004,6 +3351,7 @@ fn write_optional_return(
     out.push_str(&w.finish());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_list_return(
     out: &mut String,
     inner: &TypeRef,
@@ -3011,6 +3359,7 @@ fn write_list_return(
     args_str: &str,
     returns: Option<&TypeRef>,
     params: &[ParamBinding],
+    thrower: &str,
 ) {
     let call = join_call_args(args_str, "&out_len, &err");
     let mut w = CodeWriter::four_space().with_depth(1);
@@ -3020,7 +3369,7 @@ fn write_list_return(
                 "const int8_t* rv = (const int8_t*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jbyteArray result = (*env)->NewByteArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetByteArrayRegion(env, result, 0, (jsize)out_len, (const jbyte*)rv); }");
@@ -3031,7 +3380,7 @@ fn write_list_return(
                 "const int16_t* rv = (const int16_t*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jshortArray result = (*env)->NewShortArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetShortArrayRegion(env, result, 0, (jsize)out_len, (const jshort*)rv); }");
@@ -3039,7 +3388,7 @@ fn write_list_return(
         }
         TypeRef::I32 | TypeRef::Enum(_) => {
             w.line(format!("const int32_t* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jintArray result = (*env)->NewIntArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetIntArrayRegion(env, result, 0, (jsize)out_len, (const jint*)rv); }");
@@ -3053,12 +3402,13 @@ fn write_list_return(
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
         | TypeRef::Struct(_)
+        | TypeRef::Interface(_)
         | TypeRef::Optional(_) => {
             w.line(format!(
                 "const int64_t* rv = (const int64_t*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }");
@@ -3066,7 +3416,7 @@ fn write_list_return(
         }
         TypeRef::F32 => {
             w.line(format!("const float* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jfloatArray result = (*env)->NewFloatArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetFloatArrayRegion(env, result, 0, (jsize)out_len, (const jfloat*)rv); }");
@@ -3074,7 +3424,7 @@ fn write_list_return(
         }
         TypeRef::F64 => {
             w.line(format!("const double* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jdoubleArray result = (*env)->NewDoubleArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetDoubleArrayRegion(env, result, 0, (jsize)out_len, (const jdouble*)rv); }");
@@ -3082,7 +3432,7 @@ fn write_list_return(
         }
         TypeRef::Bool => {
             w.line(format!("const bool* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jbooleanArray result = (*env)->NewBooleanArray(env, (jsize)out_len);");
             w.line("if (result && rv) { (*env)->SetBooleanArrayRegion(env, result, 0, (jsize)out_len, (const jboolean*)rv); }");
@@ -3093,7 +3443,7 @@ fn write_list_return(
                 "const char* const* rv = (const char* const*){}({});",
                 c_sym, call
             ));
-            splice(&mut w, |o| write_error_check(o, returns));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
             splice(&mut w, |o| release_jni_resources(o, params));
             w.line("jclass _str_cls = (*env)->FindClass(env, \"java/lang/String\");");
             w.line("jobjectArray result = (*env)->NewObjectArray(env, (jsize)out_len, _str_cls, NULL);");
@@ -3115,6 +3465,7 @@ fn write_list_return(
     out.push_str(&w.finish());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_map_return(
     out: &mut String,
     key: &TypeRef,
@@ -3123,6 +3474,7 @@ fn write_map_return(
     args_str: &str,
     returns: Option<&TypeRef>,
     params: &[ParamBinding],
+    thrower: &str,
 ) {
     let key_c = map_elem_c_type(key);
     let val_c = map_elem_c_type(val);
@@ -3135,7 +3487,7 @@ fn write_map_return(
         c_sym,
         join_call_args(args_str, "out_keys, out_vals, &out_map_len, &err")
     ));
-    splice(&mut w, |o| write_error_check(o, returns));
+    splice(&mut w, |o| write_error_check(o, returns, thrower));
     splice(&mut w, |o| release_jni_resources(o, params));
     w.line("jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");");
     w.line("jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_map_len);");
@@ -3192,7 +3544,12 @@ fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
                 a = arr
             ));
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Interface(_) => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
@@ -3243,10 +3600,10 @@ fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
     out.push_str(&w.finish());
 }
 
-fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>) {
+fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>, thrower: &str) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.block("if (err.code != 0) {", "}", |w| {
-        w.line("throw_weaveffi_error(env, &err);");
+        w.line(format!("{thrower}(env, &err);"));
         // The default-return statement may be empty (void functions), in which
         // case the original emitted an indented blank line ("        \n"), so
         // splice the indent verbatim rather than via `line` (which would drop
@@ -3586,6 +3943,188 @@ fn render_kotlin_builder(out: &mut String, s: &StructBinding) {
     out.push_str(&w.finish());
 }
 
+/// Emit [`emit_fn_doc`] at the writer's current depth (KDoc plus `@param`
+/// tags), splicing the pre-indented block verbatim like [`writer_doc`].
+fn writer_fn_doc(w: &mut CodeWriter, doc: &Option<String>, params: &[ParamBinding]) {
+    let mut tmp = String::new();
+    emit_fn_doc(&mut tmp, doc, params, &w.indent_str());
+    w.raw(tmp);
+}
+
+/// The Kotlin `external` declaration name for an interface member: `native` +
+/// the member's PascalCase name, with an `Async` suffix for async members
+/// (`nativeAdd`, `nativeFetchAsync`). The JNI C bridge exports the matching
+/// `Java_<pkg>_<Class>_<name>` symbol.
+fn interface_native_name(f: &FnBinding) -> String {
+    let base = format!("native{}", pascal_case(&f.name));
+    if f.is_async {
+        format!("{base}Async")
+    } else {
+        base
+    }
+}
+
+/// The full `external fun` declaration line for one interface member. Instance
+/// methods take the raw receiver as a leading `selfHandle: Long`; every slot
+/// uses the lowered JNI type, matching the C bridge exactly.
+fn interface_native_decl(f: &FnBinding, has_self: bool) -> String {
+    if f.is_async {
+        return format!(
+            "@JvmStatic private external fun {}({})",
+            interface_native_name(f),
+            kotlin_async_native_params(f, has_self).join(", ")
+        );
+    }
+    let mut params: Vec<String> = Vec::new();
+    if has_self {
+        params.push("selfHandle: Long".to_string());
+    }
+    params.extend(
+        f.params
+            .iter()
+            .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_jni_type(&p.ty))),
+    );
+    let ret = f
+        .ret
+        .as_ref()
+        .map(kotlin_jni_type)
+        .unwrap_or_else(|| "Unit".to_string());
+    format!(
+        "@JvmStatic private external fun {}({}): {}",
+        interface_native_name(f),
+        params.join(", "),
+        ret
+    )
+}
+
+/// The lowered call expression for one interface member: the native name
+/// applied to the receiver handle (when `self_arg` is set) and the unwrapped
+/// public arguments.
+fn interface_native_call(f: &FnBinding, self_arg: Option<&str>) -> String {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(s) = self_arg {
+        args.push(s.to_string());
+    }
+    args.extend(f.params.iter().map(kotlin_unwrap_arg));
+    format!("{}({})", interface_native_name(f), args.join(", "))
+}
+
+/// Render the Kotlin class for one interface, mirroring the opaque-struct
+/// wrapper pattern: an internal `Long` handle, `java.io.Closeable` disposal
+/// backed by the destroy symbol, companion factories for constructors (the
+/// `new` constructor becomes `operator fun invoke`), companion functions for
+/// statics, and instance methods that pass the handle as the leading native
+/// argument. Async members become `suspend fun`s resuming through
+/// `WeaveContinuation` with `error`-typed exception mapping.
+fn render_kotlin_interface(out: &mut String, i: &InterfaceBinding, error: Option<&ErrorBinding>) {
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    writer_doc(&mut w, &i.doc);
+    w.line(format!(
+        "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
+        i.name
+    ));
+    w.scope(|w| {
+        w.line("companion object {");
+        w.scope(|w| {
+            w.line("init { System.loadLibrary(\"weaveffi\") }");
+            w.blank();
+            for f in i.constructors.iter().chain(i.statics.iter()) {
+                w.line(interface_native_decl(f, false));
+            }
+            for f in &i.methods {
+                w.line(interface_native_decl(f, true));
+            }
+            w.line("@JvmStatic private external fun nativeDestroy(handle: Long)");
+
+            // Constructors are never async (validation rejects that), so each
+            // is a plain factory; `new` becomes `operator fun invoke` so
+            // construction reads as `Store(...)`.
+            for c in &i.constructors {
+                w.blank();
+                writer_fn_doc(w, &c.doc, &camel_params(&c.params));
+                let decl = if c.name == "new" {
+                    "operator fun invoke".to_string()
+                } else {
+                    format!("fun {}", lower_camel(&c.name))
+                };
+                let call = interface_native_call(c, None);
+                write_kotlin_sync_wrapper(w, c, &decl, &call);
+            }
+            for f in &i.statics {
+                w.blank();
+                writer_fn_doc(w, &f.doc, &camel_params(&f.params));
+                if f.is_async {
+                    let mapper = kotlin_error_mapper(f, error);
+                    splice(w, |o| {
+                        render_kotlin_async_fun(
+                            o,
+                            f,
+                            &lower_camel(&f.name),
+                            &interface_native_name(f),
+                            false,
+                            "",
+                            false,
+                            2,
+                            &mapper,
+                        )
+                    });
+                } else {
+                    let decl = format!("fun {}", lower_camel(&f.name));
+                    let call = interface_native_call(f, None);
+                    write_kotlin_sync_wrapper(w, f, &decl, &call);
+                }
+            }
+        });
+        w.line("}");
+
+        for f in &i.methods {
+            w.blank();
+            writer_fn_doc(w, &f.doc, &camel_params(&f.params));
+            if f.is_async {
+                let mapper = kotlin_error_mapper(f, error);
+                splice(w, |o| {
+                    render_kotlin_async_fun(
+                        o,
+                        f,
+                        &lower_camel(&f.name),
+                        &interface_native_name(f),
+                        true,
+                        "",
+                        false,
+                        1,
+                        &mapper,
+                    )
+                });
+            } else {
+                let decl = format!("fun {}", lower_camel(&f.name));
+                let call = interface_native_call(f, Some("handle"));
+                write_kotlin_sync_wrapper(w, f, &decl, &call);
+            }
+        }
+        w.blank();
+
+        w.line("override fun close() {");
+        w.scope(|w| {
+            w.line("if (handle != 0L) {");
+            w.scope(|w| {
+                w.line("nativeDestroy(handle)");
+                w.line("handle = 0L");
+            });
+            w.line("}");
+        });
+        w.line("}");
+        w.blank();
+        w.line("protected fun finalize() {");
+        w.scope(|w| {
+            w.line("close()");
+        });
+        w.line("}");
+    });
+    w.line("}");
+    out.push_str(&w.finish());
+}
+
 fn render_jni_struct(
     out: &mut String,
     module_name: &str,
@@ -3696,7 +4235,12 @@ fn render_jni_object_constructor(
             create_symbol,
             join_call_args(&args_str, "&err")
         ));
-        splice(w, |o| write_error_check(o, Some(&TypeRef::Handle)));
+        // Object create/destroy/getter symbols are infrastructure rather than
+        // user callables, so their failures always raise the generic brand
+        // exception.
+        splice(w, |o| {
+            write_error_check(o, Some(&TypeRef::Handle), "throw_weaveffi_error")
+        });
 
         for f in fields {
             splice(w, |o| release_jni_resources_single(o, &f.name, &f.ty));
@@ -4228,11 +4772,39 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".to_string(),
+            version: "0.5.0".to_string(),
             modules,
             generators: None,
             package: None,
         }
+    }
+
+    /// Test-local shim mirroring the driver: build the model once and hand it
+    /// to the renderer (production code never calls `BindingModel::build`).
+    fn render_kotlin(api: &Api, package: &str, strip: bool, input_basename: &str) -> String {
+        super::render_kotlin(
+            &BindingModel::build(api, "weaveffi"),
+            package,
+            strip,
+            input_basename,
+        )
+    }
+
+    /// Test-local shim for the JNI renderer; `c_prefix` seeds the model the
+    /// same way the driver's global prefix does.
+    fn render_jni_c(
+        api: &Api,
+        package: &str,
+        strip: bool,
+        input_basename: &str,
+        c_prefix: &str,
+    ) -> String {
+        super::render_jni_c(
+            &BindingModel::build(api, c_prefix),
+            package,
+            strip,
+            input_basename,
+        )
     }
 
     fn make_struct_api() -> Api {
@@ -4261,6 +4833,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }])
@@ -4335,6 +4908,7 @@ mod tests {
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
                     r#async: false,
+                    throws: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
@@ -4358,6 +4932,7 @@ mod tests {
                     returns: Some(TypeRef::Struct("Shape".into())),
                     doc: None,
                     r#async: false,
+                    throws: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
@@ -4373,6 +4948,7 @@ mod tests {
                     returns: Some(TypeRef::U64),
                     doc: None,
                     r#async: false,
+                    throws: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
@@ -4381,6 +4957,7 @@ mod tests {
             structs: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }])
@@ -4502,18 +5079,20 @@ mod tests {
         // A rich enum passed in unwraps to its handle; one returned is re-wrapped.
         assert!(
             kt.contains(
-                "@JvmStatic fun shapes_describe(shape: Shape): String = shapes_describeJni(shape.handle)"
+                "@JvmStatic fun shapesDescribe(shape: Shape): String = shapesDescribeJni(shape.handle)"
             ),
             "rich-enum param must marshal via `.handle`: {kt}"
         );
         assert!(
             kt.contains(
-                "@JvmStatic fun shapes_scale(shape: Shape, factor: Double): Shape = Shape(shapes_scaleJni(shape.handle, factor))"
+                "@JvmStatic fun shapesScale(shape: Shape, factor: Double): Shape = Shape(shapesScaleJni(shape.handle, factor))"
             ),
             "rich-enum return must re-wrap into the class: {kt}"
         );
         assert!(
-            kt.contains("@JvmStatic private external fun shapes_scaleJni(shape: Long, factor: Double): Long"),
+            kt.contains(
+                "@JvmStatic private external fun shapesScaleJni(shape: Long, factor: Double): Long"
+            ),
             "JNI launcher must carry the rich enum as a raw Long: {kt}"
         );
     }
@@ -4731,6 +5310,7 @@ mod tests {
                 event_callback: "OnMessage".to_string(),
                 doc: None,
             }],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4738,12 +5318,12 @@ mod tests {
         let kt = render_kotlin(&api, "com.weaveffi", false, "weaveffi.yml");
         assert!(
             kt.contains(
-                "@JvmStatic external fun events_register_message_listener(callback: (String) -> Unit): Long"
+                "@JvmStatic external fun eventsRegisterMessageListener(callback: (String) -> Unit): Long"
             ),
             "register external missing: {kt}"
         );
         assert!(
-            kt.contains("@JvmStatic external fun events_unregister_message_listener(id: Long)"),
+            kt.contains("@JvmStatic external fun eventsUnregisterMessageListener(id: Long)"),
             "unregister external missing: {kt}"
         );
 
@@ -4765,7 +5345,7 @@ mod tests {
             "must call the erased Function1.invoke: {jni}"
         );
         assert!(
-            jni.contains("Java_com_weaveffi_WeaveFFI_events_1register_1message_1listener"),
+            jni.contains("Java_com_weaveffi_WeaveFFI_eventsRegisterMessageListener"),
             "register JNI export missing: {jni}"
         );
         assert!(
@@ -4792,6 +5372,7 @@ mod tests {
                 returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -4800,6 +5381,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4814,7 +5396,7 @@ mod tests {
         );
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("fun all_names(): Array<String>"),
+            kt.contains("fun allNames(): Array<String>"),
             "kotlin surface must be Array<String>: {kt}"
         );
     }
@@ -4928,7 +5510,7 @@ mod tests {
     #[test]
     fn kotlin_builder_generated() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -4954,6 +5536,7 @@ mod tests {
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
+                interfaces: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -5087,6 +5670,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5127,6 +5711,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5179,6 +5764,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5187,6 +5773,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5219,6 +5806,7 @@ mod tests {
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5227,6 +5815,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5276,6 +5865,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5326,6 +5916,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5334,6 +5925,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5344,7 +5936,7 @@ mod tests {
             "public wrapper should use enum class name: {kt}"
         );
         assert!(
-            kt.contains("private external fun set_colorJni(color: Int)"),
+            kt.contains("private external fun setColorJni(color: Int)"),
             "native function should use Int for JNI: {kt}"
         );
         assert!(
@@ -5376,6 +5968,7 @@ mod tests {
                 returns: Some(TypeRef::Enum("ContactType".into())),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5384,13 +5977,14 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("contact_type: ContactType"),
+            kt.contains("contactType: ContactType"),
             "public signature should use enum class name, not Int: {kt}"
         );
         assert!(
@@ -5398,15 +5992,15 @@ mod tests {
             "return type should use enum class name: {kt}"
         );
         assert!(
-            !kt.contains("external fun add_contact("),
+            !kt.contains("external fun addContact("),
             "public function should not be external: {kt}"
         );
         assert!(
-            kt.contains("private external fun add_contactJni("),
+            kt.contains("private external fun addContactJni("),
             "native function should be private: {kt}"
         );
         assert!(
-            kt.contains("contact_type.value"),
+            kt.contains("contactType.value"),
             "wrapper should extract int via .value: {kt}"
         );
         assert!(
@@ -5430,6 +6024,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5438,6 +6033,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5452,8 +6048,8 @@ mod tests {
             "missing int32_t cast: {jni}"
         );
         assert!(
-            jni.contains("WeaveFFI_set_1colorJni("),
-            "JNI function name should have Jni suffix and underscore mangling: {jni}"
+            jni.contains("WeaveFFI_setColorJni("),
+            "JNI function name should carry the camelCase Jni suffix: {jni}"
         );
     }
 
@@ -5467,6 +6063,7 @@ mod tests {
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5475,6 +6072,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5486,8 +6084,8 @@ mod tests {
         );
         assert!(jni.contains("(jint)"), "missing jint cast: {jni}");
         assert!(
-            jni.contains("WeaveFFI_get_1colorJni("),
-            "JNI function name should have Jni suffix and underscore mangling: {jni}"
+            jni.contains("WeaveFFI_getColorJni("),
+            "JNI function name should carry the camelCase Jni suffix: {jni}"
         );
     }
 
@@ -5524,6 +6122,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5532,6 +6131,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5555,6 +6155,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5563,6 +6164,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5595,6 +6197,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5603,6 +6206,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5628,6 +6232,7 @@ mod tests {
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5636,6 +6241,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5669,6 +6275,7 @@ mod tests {
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5677,6 +6284,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5734,6 +6342,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5742,6 +6351,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5765,6 +6375,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5773,6 +6384,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5802,6 +6414,7 @@ mod tests {
                 returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5810,6 +6423,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5879,6 +6493,7 @@ mod tests {
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -5934,6 +6549,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6064,6 +6680,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6072,6 +6689,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6098,6 +6716,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6106,6 +6725,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6142,6 +6762,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6189,6 +6810,7 @@ mod tests {
                 )),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6197,6 +6819,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6236,6 +6859,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6244,6 +6868,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6284,36 +6909,52 @@ mod tests {
 
         let jni = std::fs::read_to_string(tmp.join("android/src/main/cpp/weaveffi_jni.c")).unwrap();
         assert!(
-            jni.contains("Java_com_mycompany_ffi_WeaveFFI_math_1add"),
-            "missing custom JNI prefix (with underscore mangling): {jni}"
+            jni.contains("Java_com_mycompany_ffi_WeaveFFI_add"),
+            "missing custom JNI prefix: {jni}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn kotlin_inline_error_types() {
-        let api = make_api(vec![Module {
+    /// One module declaring an error domain, with one throwing and one
+    /// non-throwing function, shared by the typed-error tests.
+    fn make_error_api() -> Api {
+        make_api(vec![Module {
             name: "contacts".to_string(),
-            functions: vec![Function {
-                name: "get".to_string(),
-                params: vec![Param {
-                    name: "id".to_string(),
-                    ty: TypeRef::I32,
-                    mutable: false,
+            functions: vec![
+                Function {
+                    name: "get".to_string(),
+                    params: vec![Param {
+                        name: "id".to_string(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::I32),
                     doc: None,
-                }],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+                    r#async: false,
+                    throws: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "count".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    r#async: false,
+                    throws: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: Some(ErrorDomain {
                 name: "ContactError".to_string(),
                 codes: vec![
@@ -6332,42 +6973,123 @@ mod tests {
                 ],
             }),
             modules: vec![],
-        }]);
+        }])
+    }
 
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
+    #[test]
+    fn kotlin_inline_error_types() {
+        let kt = render_kotlin(&make_error_api(), "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("sealed class WeaveFFIException(val code: Int, message: String) : Exception(message)"),
-            "missing sealed class declaration: {kt}"
+            kt.contains(
+                "open class WeaveFFIException(val code: Int, message: String) : Exception(message)"
+            ),
+            "missing open generic exception: {kt}"
         );
         assert!(
-            kt.contains("class ContactNotFound(message: String = \"Contact not found\") : WeaveFFIException(1001, message)"),
+            kt.contains("sealed class ContactException(code: Int, message: String) : WeaveFFIException(code, message) {"),
+            "missing sealed domain exception: {kt}"
+        );
+        assert!(
+            kt.contains("class ContactNotFound(message: String = \"Contact not found\") : ContactException(1001, message)"),
             "missing ContactNotFound subclass: {kt}"
         );
         assert!(
-            kt.contains("class InvalidInput(message: String = \"Invalid input provided\") : WeaveFFIException(1002, message)"),
+            kt.contains("class InvalidInput(message: String = \"Invalid input provided\") : ContactException(1002, message)"),
             "missing InvalidInput subclass: {kt}"
         );
-
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("throw_weaveffi_error(env, &err)"),
-            "missing throw_weaveffi_error call: {jni}"
+            kt.contains(
+                "fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {"
+            ),
+            "missing fromCode factory: {kt}"
         );
         assert!(
-            jni.contains("case 1001:"),
+            kt.contains("1001 -> ContactNotFound(message)"),
+            "fromCode must map 1001: {kt}"
+        );
+        assert!(
+            kt.contains("else -> WeaveFFIException(code, message)"),
+            "fromCode must fall back to the generic exception: {kt}"
+        );
+    }
+
+    #[test]
+    fn jni_typed_error_throwers() {
+        let jni = render_jni_c(
+            &make_error_api(),
+            "com.weaveffi",
+            true,
+            "weaveffi.yml",
+            "weaveffi",
+        );
+        // The generic thrower constructs the brand exception with (code, message).
+        assert!(
+            jni.contains("static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {"),
+            "missing generic thrower: {jni}"
+        );
+        assert!(
+            jni.contains("FindClass(env, \"com/weaveffi/WeaveFFIException\")"),
+            "generic thrower must construct the brand exception: {jni}"
+        );
+        assert!(
+            jni.contains("\"<init>\", \"(ILjava/lang/String;)V\""),
+            "generic thrower must pass the raw code: {jni}"
+        );
+        // The domain thrower maps known codes to typed subclasses.
+        assert!(
+            jni.contains(
+                "static void throw_weaveffi_contacts_ContactError(JNIEnv* env, weaveffi_error* err) {"
+            ),
+            "missing domain thrower: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "case 1001: name = \"com/weaveffi/ContactException$ContactNotFound\"; break;"
+            ),
             "missing case for ContactNotFound: {jni}"
         );
         assert!(
-            jni.contains("WeaveFFIException$ContactNotFound"),
-            "missing FindClass for ContactNotFound: {jni}"
-        );
-        assert!(
-            jni.contains("case 1002:"),
+            jni.contains(
+                "case 1002: name = \"com/weaveffi/ContactException$InvalidInput\"; break;"
+            ),
             "missing case for InvalidInput: {jni}"
         );
         assert!(
-            jni.contains("WeaveFFIException$InvalidInput"),
-            "missing FindClass for InvalidInput: {jni}"
+            jni.contains("if (name == NULL) { throw_weaveffi_error(env, err); return; }"),
+            "unknown codes must fall back to the generic thrower: {jni}"
+        );
+    }
+
+    #[test]
+    fn jni_throws_split_picks_thrower_per_function() {
+        let jni = render_jni_c(
+            &make_error_api(),
+            "com.weaveffi",
+            true,
+            "weaveffi.yml",
+            "weaveffi",
+        );
+        let get_body = jni
+            .split("Java_com_weaveffi_WeaveFFI_get(")
+            .nth(1)
+            .expect("get export");
+        let get_body = &get_body[..get_body.find("\nJNIEXPORT").unwrap_or(get_body.len())];
+        assert!(
+            get_body.contains("throw_weaveffi_contacts_ContactError(env, &err);"),
+            "throwing function must dispatch to the domain thrower: {jni}"
+        );
+        let count_body = jni
+            .split("Java_com_weaveffi_WeaveFFI_count(")
+            .nth(1)
+            .expect("count export");
+        let count_body = &count_body[..count_body.find("\nJNIEXPORT").unwrap_or(count_body.len())];
+        assert!(
+            count_body.contains("throw_weaveffi_error(env, &err);"),
+            "non-throwing function must dispatch to the generic thrower: {jni}"
+        );
+        assert!(
+            !count_body.contains("throw_weaveffi_contacts_ContactError"),
+            "non-throwing function must not use the domain thrower: {jni}"
         );
     }
 
@@ -6386,6 +7108,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6394,14 +7117,18 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
 
-        let config = AndroidConfig {
-            strip_module_prefix: true,
-            ..AndroidConfig::default()
-        };
+        // Stripping is the default: the config's `Default` must strip, and the
+        // emitted Kotlin name is the bare lowerCamelCase function name.
+        let config = AndroidConfig::default();
+        assert!(
+            config.strip_module_prefix,
+            "strip_module_prefix must default to true"
+        );
 
         let tmp = std::env::temp_dir().join("weaveffi_test_android_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6415,11 +7142,11 @@ mod tests {
                 .unwrap();
 
         assert!(
-            kotlin.contains("fun create_contact("),
-            "stripped name should be create_contact: {kotlin}"
+            kotlin.contains("fun createContact("),
+            "stripped name should be createContact: {kotlin}"
         );
         assert!(
-            !kotlin.contains("fun contacts_create_contact("),
+            !kotlin.contains("fun contactsCreateContact("),
             "should not contain module-prefixed name: {kotlin}"
         );
 
@@ -6430,7 +7157,10 @@ mod tests {
             "C ABI call should still use full name: {jni}"
         );
 
-        let no_strip = AndroidConfig::default();
+        let no_strip = AndroidConfig {
+            strip_module_prefix: false,
+            ..AndroidConfig::default()
+        };
         let tmp2 = std::env::temp_dir().join("weaveffi_test_android_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
@@ -6445,8 +7175,8 @@ mod tests {
                 .unwrap();
 
         assert!(
-            kotlin2.contains("fun contacts_create_contact("),
-            "default should use module-prefixed name: {kotlin2}"
+            kotlin2.contains("fun contactsCreateContact("),
+            "opting out must keep the module-prefixed name: {kotlin2}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -6470,6 +7200,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6488,6 +7219,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6516,6 +7248,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6524,6 +7257,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6552,6 +7286,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6593,6 +7328,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6618,6 +7354,7 @@ mod tests {
                 returns: None,
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6636,6 +7373,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6661,6 +7399,7 @@ mod tests {
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6679,6 +7418,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6698,7 +7438,7 @@ mod tests {
         );
 
         let start = jni
-            .find("Java_com_weaveffi_WeaveFFI_find_1contact")
+            .find("Java_com_weaveffi_WeaveFFI_findContactJni")
             .expect("find_contact JNI symbol");
         let rest = &jni[start..];
         let end = rest.find("\nJNIEXPORT ").unwrap_or(rest.len());
@@ -6737,6 +7477,7 @@ mod tests {
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6745,6 +7486,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6800,6 +7542,7 @@ mod tests {
                 )))),
                 doc: None,
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6818,6 +7561,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6848,6 +7592,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: true,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6856,6 +7601,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6886,6 +7632,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: true,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6894,6 +7641,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6932,6 +7680,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: true,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -6940,6 +7689,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -6987,6 +7737,7 @@ mod tests {
                 returns: Some(TypeRef::I32),
                 doc: Some("Performs a thing.".into()),
                 r#async: false,
+                throws: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
@@ -7014,6 +7765,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: Some(ErrorDomain {
                 name: "DocsErrors".into(),
                 codes: vec![ErrorCode {
@@ -7056,5 +7808,360 @@ mod tests {
     fn android_emits_doc_on_param() {
         let kt = render_kotlin(&doc_api(), "com.weaveffi", true, "weaveffi.yml");
         assert!(kt.contains("@param x the input value"), "{kt}");
+    }
+
+    /// A `kv` module with a `Store` interface exercising every member shape:
+    /// the `new` constructor, a named factory, sync methods (throwing and
+    /// not), an async throwing method, a static, and an interface-typed
+    /// parameter and return.
+    fn make_interface_api() -> Api {
+        use weaveffi_ir::ir::InterfaceDef;
+        make_api(vec![Module {
+            name: "kv".to_string(),
+            functions: vec![Function {
+                name: "merge".to_string(),
+                params: vec![
+                    Param {
+                        name: "left_store".to_string(),
+                        ty: TypeRef::Interface("Store".to_string()),
+                        mutable: false,
+                        doc: None,
+                    },
+                    Param {
+                        name: "right_store".to_string(),
+                        ty: TypeRef::Interface("Store".to_string()),
+                        mutable: false,
+                        doc: None,
+                    },
+                ],
+                returns: Some(TypeRef::Interface("Store".to_string())),
+                doc: None,
+                r#async: false,
+                throws: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![InterfaceDef {
+                name: "Store".to_string(),
+                doc: Some("A key-value store.".to_string()),
+                constructors: vec![
+                    Function {
+                        name: "new".to_string(),
+                        params: vec![Param {
+                            name: "path".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                            doc: None,
+                        }],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        throws: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "open_readonly".to_string(),
+                        params: vec![Param {
+                            name: "path".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                            doc: None,
+                        }],
+                        returns: None,
+                        doc: None,
+                        r#async: false,
+                        throws: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                methods: vec![
+                    Function {
+                        name: "get".to_string(),
+                        params: vec![Param {
+                            name: "key".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                            doc: None,
+                        }],
+                        returns: Some(TypeRef::StringUtf8),
+                        doc: None,
+                        r#async: false,
+                        throws: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "len".to_string(),
+                        params: vec![],
+                        returns: Some(TypeRef::U64),
+                        doc: None,
+                        r#async: false,
+                        throws: false,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                    Function {
+                        name: "fetch".to_string(),
+                        params: vec![Param {
+                            name: "key".to_string(),
+                            ty: TypeRef::StringUtf8,
+                            mutable: false,
+                            doc: None,
+                        }],
+                        returns: Some(TypeRef::StringUtf8),
+                        doc: None,
+                        r#async: true,
+                        throws: true,
+                        cancellable: false,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                statics: vec![Function {
+                    name: "default_path".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    r#async: false,
+                    throws: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+            }],
+            errors: Some(ErrorDomain {
+                name: "KvError".to_string(),
+                codes: vec![ErrorCode {
+                    name: "KeyNotFound".to_string(),
+                    code: 100,
+                    message: "Key not found".to_string(),
+                    doc: None,
+                }],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn kotlin_interface_class_shape() {
+        let kt = render_kotlin(&make_interface_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains(
+                "class Store internal constructor(internal var handle: Long) : java.io.Closeable {"
+            ),
+            "missing handle-backed Closeable class: {kt}"
+        );
+        assert!(
+            kt.contains("@JvmStatic private external fun nativeDestroy(handle: Long)"),
+            "missing destroy external: {kt}"
+        );
+        assert!(
+            kt.contains("override fun close() {") && kt.contains("nativeDestroy(handle)"),
+            "close() must call the destroy symbol: {kt}"
+        );
+        assert!(
+            kt.contains("protected fun finalize() {"),
+            "missing finalizer safety net: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_interface_constructors_and_statics() {
+        let kt = render_kotlin(&make_interface_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains("operator fun invoke(path: String): Store = Store(nativeNew(path))"),
+            "the new constructor must become operator fun invoke: {kt}"
+        );
+        assert!(
+            kt.contains("fun openReadonly(path: String): Store = Store(nativeOpenReadonly(path))"),
+            "named constructors must become companion factories: {kt}"
+        );
+        assert!(
+            kt.contains("fun defaultPath(): String = nativeDefaultPath()"),
+            "statics must become companion functions: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_interface_methods() {
+        let kt = render_kotlin(&make_interface_api(), "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains("fun get(key: String): String = nativeGet(handle, key)"),
+            "methods must pass the handle as the leading native argument: {kt}"
+        );
+        assert!(
+            kt.contains("suspend fun fetch(key: String): String = suspendCancellableCoroutine"),
+            "async methods must be suspend funs: {kt}"
+        );
+        assert!(
+            kt.contains(
+                "nativeFetchAsync(handle, key, WeaveContinuation(cont) { code, message -> KvException.fromCode(code, message) })"
+            ),
+            "async throwing methods must map errors through the typed domain: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_interface_params_and_returns() {
+        let kt = render_kotlin(&make_interface_api(), "com.weaveffi", true, "weaveffi.yml");
+        // Interface-typed parameters accept the class and pass the raw handle;
+        // interface returns re-wrap the owned pointer. Parameter names are
+        // camelCased from the IR's snake_case.
+        assert!(
+            kt.contains(
+                "@JvmStatic fun merge(leftStore: Store, rightStore: Store): Store = Store(mergeJni(leftStore.handle, rightStore.handle))"
+            ),
+            "interface params must unwrap handles and returns must re-wrap: {kt}"
+        );
+    }
+
+    #[test]
+    fn jni_interface_bridge_members() {
+        let jni = render_jni_c(
+            &make_interface_api(),
+            "com.weaveffi",
+            true,
+            "weaveffi.yml",
+            "weaveffi",
+        );
+        assert!(
+            jni.contains("JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeNew(JNIEnv* env, jclass clazz, jstring path)"),
+            "missing constructor export: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_kv_Store_new(path_chars, &err)"),
+            "constructor must call the lowered ABI symbol: {jni}"
+        );
+        assert!(
+            jni.contains("JNIEXPORT jstring JNICALL Java_com_weaveffi_Store_nativeGet(JNIEnv* env, jclass clazz, jlong selfHandle, jstring key)"),
+            "missing method export with leading self slot: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "weaveffi_kv_Store_get((const weaveffi_kv_Store*)(intptr_t)selfHandle, key_chars, &err)"
+            ),
+            "method must pass the receiver as the leading ABI argument: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_kv_Store_default_path(&err)"),
+            "static must call its ABI symbol: {jni}"
+        );
+        assert!(
+            jni.contains("JNIEXPORT void JNICALL Java_com_weaveffi_Store_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle)")
+                && jni.contains("weaveffi_kv_Store_destroy((weaveffi_kv_Store*)(intptr_t)handle);"),
+            "missing destroy export: {jni}"
+        );
+        assert!(
+            jni.contains("JNIEXPORT void JNICALL Java_com_weaveffi_Store_nativeFetchAsync"),
+            "missing async method launcher: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "weaveffi_kv_Store_fetch_async((const weaveffi_kv_Store*)(intptr_t)selfHandle, key_chars, weaveffi_kv_Store_fetch_jni_cb, ctx);"
+            ),
+            "async method must forward the receiver to the ABI launcher: {jni}"
+        );
+    }
+
+    /// Generate the Android and C outputs for the shipped sample IDLs through
+    /// the same parse-validate-generate pipeline the CLI drives, writing into
+    /// the conformance harness's expected layout
+    /// (`target/conformance-gen/<sample>/{android,c}`). Serves two purposes:
+    /// it smoke-tests generation against the real sample surfaces (interfaces,
+    /// typed errors, iterators, listeners, builders, async), and it lets the
+    /// Kotlin conformance lanes run when the full CLI is blocked by other
+    /// in-flight generator crates. Skips silently when the samples are not
+    /// present (for example in a packaged crate).
+    #[test]
+    fn samples_generate_android_and_c_outputs() {
+        let root = Utf8Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let genroot = root.join("target/conformance-gen");
+        for sample in ["events", "kvstore", "shapes"] {
+            let idl = root.join(format!("samples/{sample}/{sample}.yml"));
+            if !idl.as_std_path().exists() {
+                return;
+            }
+            let contents = std::fs::read_to_string(idl.as_std_path()).unwrap();
+            let mut api = weaveffi_ir::parse::parse_api_str(&contents, "yaml")
+                .unwrap_or_else(|e| panic!("parse {sample}: {e}"));
+            weaveffi_core::validate::validate_api(&mut api, None)
+                .unwrap_or_else(|e| panic!("validate {sample}: {e:?}"));
+            let out = genroot.join(sample);
+            let android_cfg = AndroidConfig {
+                input_basename: Some(format!("{sample}.yml")),
+                ..AndroidConfig::default()
+            };
+            AndroidGenerator
+                .generate(&api, &out, &android_cfg)
+                .unwrap_or_else(|e| panic!("android generate {sample}: {e}"));
+            let c_cfg = weaveffi_gen_c::CConfig {
+                input_basename: Some(format!("{sample}.yml")),
+                ..Default::default()
+            };
+            weaveffi_gen_c::CGenerator
+                .generate(&api, &out, &c_cfg)
+                .unwrap_or_else(|e| panic!("c generate {sample}: {e}"));
+            assert!(
+                out.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt")
+                    .as_std_path()
+                    .exists(),
+                "missing Kotlin output for {sample}"
+            );
+            assert!(
+                out.join("c/weaveffi.h").as_std_path().exists(),
+                "missing C header for {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn jni_interface_throws_split() {
+        let jni = render_jni_c(
+            &make_interface_api(),
+            "com.weaveffi",
+            true,
+            "weaveffi.yml",
+            "weaveffi",
+        );
+        let get_body = jni
+            .split("Java_com_weaveffi_Store_nativeGet(")
+            .nth(1)
+            .expect("nativeGet export");
+        let get_body = &get_body[..get_body.find("\nJNIEXPORT").unwrap_or(get_body.len())];
+        assert!(
+            get_body.contains("throw_weaveffi_kv_KvError(env, &err);"),
+            "throwing method must use the domain thrower: {jni}"
+        );
+        let len_body = jni
+            .split("Java_com_weaveffi_Store_nativeLen(")
+            .nth(1)
+            .expect("nativeLen export");
+        let len_body = &len_body[..len_body.find("\nJNIEXPORT").unwrap_or(len_body.len())];
+        assert!(
+            len_body.contains("throw_weaveffi_error(env, &err);"),
+            "non-throwing method must use the generic thrower: {jni}"
+        );
+        // Interface params on free functions borrow: the handles are passed
+        // as const pointers, never destroyed by the bridge.
+        assert!(
+            jni.contains("weaveffi_kv_merge((const weaveffi_kv_Store*)(intptr_t)left_store, (const weaveffi_kv_Store*)(intptr_t)right_store, &err)"),
+            "interface params must be passed as borrowed const pointers: {jni}"
+        );
     }
 }

@@ -7,19 +7,27 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   events: {
     /**
      * Send a message, triggering the OnMessage callback
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    send_message(text: string): void;
+    sendMessage(text: string): void;
     /**
      * Return an iterator over all sent messages
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    get_messages(): string[];
+    getMessages(): string[];
   };
 }
 

@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -65,7 +66,12 @@ WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token
 WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 typedef enum { weaveffi_products_Category_Electronics = 0, weaveffi_products_Category_Clothing = 1, weaveffi_products_Category_Food = 2, weaveffi_products_Category_Books = 3 } weaveffi_products_Category;
+/** Error codes reported by throwing functions in the `products` module tree. */
+typedef enum { weaveffi_products_ProductsError_InvalidPrice = 1, weaveffi_products_ProductsError_ProductNotFound = 2 } weaveffi_products_ProductsError;
+/** Error codes reported by throwing functions in the `orders` module tree. */
+typedef enum { weaveffi_orders_OrdersError_OrderNotFound = 1, weaveffi_orders_OrdersError_EmptyOrder = 2 } weaveffi_orders_OrdersError;
 typedef struct weaveffi_products_Product weaveffi_products_Product;
+typedef struct weaveffi_products_Catalog weaveffi_products_Catalog;
 typedef struct weaveffi_orders_OrderItem weaveffi_orders_OrderItem;
 typedef struct weaveffi_orders_Order weaveffi_orders_Order;
 
@@ -78,11 +84,15 @@ WEAVEFFI_API double weaveffi_products_Product_get_price(const weaveffi_products_
 WEAVEFFI_API weaveffi_products_Category weaveffi_products_Product_get_category(const weaveffi_products_Product* ptr);
 WEAVEFFI_API const char** weaveffi_products_Product_get_tags(const weaveffi_products_Product* ptr, size_t* out_len);
 
-WEAVEFFI_API weaveffi_handle_t weaveffi_products_create_product(const char* name, double price, weaveffi_products_Category category, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_products_Product* weaveffi_products_get_product(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_products_Product** weaveffi_products_search_products(weaveffi_products_Category category, size_t* out_len, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_products_update_price(weaveffi_handle_t id, double price, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_products_delete_product(weaveffi_handle_t id, weaveffi_error* out_err);
+/** A product catalog owning its products */
+WEAVEFFI_API weaveffi_products_Catalog* weaveffi_products_Catalog_new(weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_products_Product* weaveffi_products_Catalog_add_product(const weaveffi_products_Catalog* self, const char* name, double price, weaveffi_products_Category category, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_products_Product* weaveffi_products_Catalog_get_product(const weaveffi_products_Catalog* self, int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_products_Product** weaveffi_products_Catalog_search(const weaveffi_products_Catalog* self, weaveffi_products_Category category, size_t* out_len, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_products_Catalog_update_price(const weaveffi_products_Catalog* self, int64_t id, double price, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_products_Catalog_remove(const weaveffi_products_Catalog* self, int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_products_Catalog_destroy(weaveffi_products_Catalog* self);
+
 
 WEAVEFFI_API weaveffi_orders_OrderItem* weaveffi_orders_OrderItem_create(int64_t product_id, int32_t quantity, double unit_price, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_orders_OrderItem_destroy(weaveffi_orders_OrderItem* ptr);
@@ -97,15 +107,16 @@ WEAVEFFI_API weaveffi_orders_OrderItem** weaveffi_orders_Order_get_items(const w
 WEAVEFFI_API double weaveffi_orders_Order_get_total(const weaveffi_orders_Order* ptr);
 WEAVEFFI_API const char* weaveffi_orders_Order_get_status(const weaveffi_orders_Order* ptr);
 
-WEAVEFFI_API weaveffi_handle_t weaveffi_orders_create_order(weaveffi_orders_OrderItem* const* items, size_t items_len, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_orders_Order* weaveffi_orders_get_order(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_orders_cancel_order(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_orders_add_product_to_order(weaveffi_handle_t order_id, const weaveffi_products_Product* product, weaveffi_error* out_err);
+WEAVEFFI_API int64_t weaveffi_orders_create_order(weaveffi_orders_OrderItem* const* items, size_t items_len, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_orders_Order* weaveffi_orders_get_order(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_orders_cancel_order(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_orders_add_product_to_order(int64_t order_id, const weaveffi_products_Product* product, weaveffi_error* out_err);
 
 } // extern "C"
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -113,6 +124,104 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `products` module's throwing functions. */
+class ProductsError : public WeaveFFIError {
+public:
+    ProductsError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** price must be positive */
+class InvalidPriceError : public ProductsError {
+public:
+    InvalidPriceError(const std::string& msg) : ProductsError(1, msg) {}
+};
+
+/** product not found */
+class ProductNotFoundError : public ProductsError {
+public:
+    ProductNotFoundError(const std::string& msg) : ProductsError(2, msg) {}
+};
+
+namespace detail {
+
+/** Map a `products` error code to its typed exception (ProductsError for unknown codes). */
+inline std::exception_ptr make_products_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(InvalidPriceError(msg));
+    case 2: return std::make_exception_ptr(ProductNotFoundError(msg));
+    default: return std::make_exception_ptr(ProductsError(code, msg));
+    }
+}
+
+/** Throw the typed `products` exception if `err` carries a nonzero code. */
+inline void check_products(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_products_error(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `orders` module's throwing functions. */
+class OrdersError : public WeaveFFIError {
+public:
+    OrdersError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** order not found */
+class OrderNotFoundError : public OrdersError {
+public:
+    OrderNotFoundError(const std::string& msg) : OrdersError(1, msg) {}
+};
+
+/** order must contain at least one item */
+class EmptyOrderError : public OrdersError {
+public:
+    EmptyOrderError(const std::string& msg) : OrdersError(2, msg) {}
+};
+
+namespace detail {
+
+/** Map a `orders` error code to its typed exception (OrdersError for unknown codes). */
+inline std::exception_ptr make_orders_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(OrderNotFoundError(msg));
+    case 2: return std::make_exception_ptr(EmptyOrderError(msg));
+    default: return std::make_exception_ptr(OrdersError(code, msg));
+    }
+}
+
+/** Throw the typed `orders` exception if `err` carries a nonzero code. */
+inline void check_orders(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_orders_error(code, msg));
+}
+
+} // namespace detail
 
 enum class Category : int32_t {
     Electronics = 0,
@@ -183,6 +292,83 @@ public:
         ret.reserve(len);
         for (size_t i = 0; i < len; ++i) ret.emplace_back(raw[i]);
         return ret;
+    }
+
+};
+
+/** A product catalog owning its products */
+class Catalog {
+    void* handle_;
+
+public:
+    explicit Catalog(void* h) : handle_(h) {}
+
+    ~Catalog() {
+        if (handle_) weaveffi_products_Catalog_destroy(static_cast<weaveffi_products_Catalog*>(handle_));
+    }
+
+    Catalog(const Catalog&) = delete;
+    Catalog& operator=(const Catalog&) = delete;
+
+    Catalog(Catalog&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Catalog& operator=(Catalog&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_products_Catalog_destroy(static_cast<weaveffi_products_Catalog*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    Catalog() : handle_(nullptr) {
+        weaveffi_error err{};
+        auto result = weaveffi_products_Catalog_new(&err);
+        detail::check(err);
+        handle_ = result;
+    }
+
+    Product add_product(const std::string& name, double price, Category category) const {
+        weaveffi_error err{};
+        auto result = weaveffi_products_Catalog_add_product(static_cast<const weaveffi_products_Catalog*>(handle_), name.c_str(), price, static_cast<weaveffi_products_Category>(static_cast<int32_t>(category)), &err);
+        detail::check_products(err);
+        return Product(result);
+    }
+
+    Product get_product(int64_t id) const {
+        weaveffi_error err{};
+        auto result = weaveffi_products_Catalog_get_product(static_cast<const weaveffi_products_Catalog*>(handle_), id, &err);
+        detail::check_products(err);
+        return Product(result);
+    }
+
+    std::vector<Product> search(Category category) const {
+        size_t out_len = 0;
+        weaveffi_error err{};
+        auto result = weaveffi_products_Catalog_search(static_cast<const weaveffi_products_Catalog*>(handle_), static_cast<weaveffi_products_Category>(static_cast<int32_t>(category)), &out_len, &err);
+        detail::check(err);
+        std::vector<Product> ret;
+        ret.reserve(out_len);
+        for (size_t i = 0; i < out_len; ++i) ret.emplace_back(Product(result[i]));
+        return ret;
+    }
+
+    bool update_price(int64_t id, double price) const {
+        weaveffi_error err{};
+        auto result = weaveffi_products_Catalog_update_price(static_cast<const weaveffi_products_Catalog*>(handle_), id, price, &err);
+        detail::check_products(err);
+        return result;
+    }
+
+    bool remove(int64_t id) const {
+        weaveffi_error err{};
+        auto result = weaveffi_products_Catalog_remove(static_cast<const weaveffi_products_Catalog*>(handle_), id, &err);
+        detail::check(err);
+        return result;
     }
 
 };
@@ -283,120 +469,40 @@ public:
 
 };
 
-inline void* products_create_product(const std::string& name, double price, Category category) {
-    weaveffi_error err{};
-    auto result = weaveffi_products_create_product(name.c_str(), price, static_cast<weaveffi_products_Category>(static_cast<int32_t>(category)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));
-}
+namespace orders {
 
-inline Product products_get_product(void* id) {
-    weaveffi_error err{};
-    auto result = weaveffi_products_get_product(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return Product(result);
-}
-
-inline std::vector<Product> products_search_products(Category category) {
-    size_t out_len = 0;
-    weaveffi_error err{};
-    auto result = weaveffi_products_search_products(static_cast<weaveffi_products_Category>(static_cast<int32_t>(category)), &out_len, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    std::vector<Product> ret;
-    ret.reserve(out_len);
-    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(Product(result[i]));
-    return ret;
-}
-
-inline bool products_update_price(void* id, double price) {
-    weaveffi_error err{};
-    auto result = weaveffi_products_update_price(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), price, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return result;
-}
-
-inline bool products_delete_product(void* id) {
-    weaveffi_error err{};
-    auto result = weaveffi_products_delete_product(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return result;
-}
-
-inline void* orders_create_order(const std::vector<OrderItem>& items) {
+inline int64_t create_order(const std::vector<OrderItem>& items) {
     std::vector<weaveffi_orders_OrderItem*> items_ptrs;
     items_ptrs.reserve(items.size());
     for (const auto& item : items) items_ptrs.push_back(static_cast<weaveffi_orders_OrderItem*>(item.handle()));
     weaveffi_error err{};
     auto result = weaveffi_orders_create_order(items_ptrs.data(), items_ptrs.size(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));
+    detail::check_orders(err);
+    return result;
 }
 
-inline Order orders_get_order(void* id) {
+inline Order get_order(int64_t id) {
     weaveffi_error err{};
-    auto result = weaveffi_orders_get_order(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    auto result = weaveffi_orders_get_order(id, &err);
+    detail::check_orders(err);
     return Order(result);
 }
 
-inline bool orders_cancel_order(void* id) {
+inline bool cancel_order(int64_t id) {
     weaveffi_error err{};
-    auto result = weaveffi_orders_cancel_order(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    auto result = weaveffi_orders_cancel_order(id, &err);
+    detail::check(err);
     return result;
 }
 
-inline bool orders_add_product_to_order(void* order_id, const Product& product) {
+inline bool add_product_to_order(int64_t order_id, const Product& product) {
     weaveffi_error err{};
-    auto result = weaveffi_orders_add_product_to_order(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(order_id)), static_cast<const weaveffi_products_Product*>(product.handle()), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    auto result = weaveffi_orders_add_product_to_order(order_id, static_cast<const weaveffi_products_Product*>(product.handle()), &err);
+    detail::check(err);
     return result;
 }
+
+} // namespace orders
 
 } // namespace weaveffi
 

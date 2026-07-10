@@ -43,6 +43,7 @@ named `events` produces `lib/events.rb` and `events.gemspec`;
 | `bytes`      | `String` (binary)  | `:pointer` + `:size_t`         |
 | `handle`     | `Integer`          | `:uint64`                      |
 | `Struct`     | `StructName`       | `:pointer`                     |
+| `Interface`  | `InterfaceName`    | `:pointer`                     |
 | `Enum` (plain) | `Integer`        | `:int32`                       |
 | `Enum` (rich)  | `EnumName`       | `:pointer`                     |
 | `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
@@ -56,7 +57,7 @@ directions.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -102,10 +103,17 @@ require 'ffi'
 module WeaveFFI
   extend FFI::Library
 
-  case FFI::Platform::OS
-  when /darwin/  then ffi_lib 'libweaveffi.dylib'
-  when /mswin|mingw/ then ffi_lib 'weaveffi.dll'
-  else ffi_lib 'libweaveffi.so'
+  # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+  # specific build artifact regardless of its file name or location.
+  _wv_override = ENV['WEAVEFFI_LIBRARY']
+  if _wv_override && !_wv_override.empty?
+    ffi_lib _wv_override
+  else
+    case FFI::Platform::OS
+    when /darwin/  then ffi_lib 'libweaveffi.dylib'
+    when /mswin|mingw/ then ffi_lib 'weaveffi.dll'
+    else ffi_lib 'libweaveffi.so'
+    end
   end
 end
 ```
@@ -155,7 +163,11 @@ class Contact
 end
 ```
 
-Functions are class methods on the module and raise on failure:
+Functions are snake_case class methods on the module, with the IDL
+module prefix stripped by default (a `kv.open_store` function surfaces
+as `open_store`, not `kv_open_store`; the `attach_function` bindings
+keep the full C symbol names). Set `strip_module_prefix: false` in the
+Ruby generator config (or under `[global]`) to keep prefixed names:
 
 ```ruby
 def self.create_contact(first_name, email, contact_type)
@@ -211,6 +223,124 @@ begin
 rescue WeaveFFI::Error => e
   puts "Error #{e.code}: #{e.message}"
 end
+```
+
+## Typed errors
+
+A module's error domain adds a base class extending `Error` with one
+nested class per code, each pinning its stable `CODE`, plus a mapper
+that falls back to the generic `Error` for codes outside the domain.
+From the `kvstore` sample:
+
+```ruby
+# Base error for the `kv` module's error domain.
+class KvError < Error
+  # key not found
+  class KeyNotFound < KvError
+    CODE = 1001
+
+    def initialize(message = 'key not found')
+      super(1001, message)
+    end
+  end
+
+  # Expired, StoreFull, IoError follow the same shape.
+end
+
+# Builds the KvError subclass matching `code`, or a generic Error
+# for codes outside the domain (panics, marshalling).
+def self.kv_error_from(code, message)
+  cls = KV_ERROR_CODES[code]
+  return Error.new(code, message) if cls.nil?
+  message.empty? ? cls.new : cls.new(message)
+end
+```
+
+Only callables marked `throws: true` in the IDL raise the typed
+classes: their wrappers call `check_kv_error!`, so you can rescue
+`Kvstore::KvError::KeyNotFound` for one code or `Kvstore::KvError` for
+the whole domain. A callable without `throws` uses the generic
+`check_error!`, which raises `Error` only if the producer misbehaves.
+
+## Interfaces
+
+An `interfaces:` entry becomes a class wrapping an `FFI::AutoPointer`
+subclass, so the C destructor runs when Ruby garbage-collects the
+wrapper. Constructors become class methods (`Store.open`; a
+constructor named `new` maps to the ordinary `Store.new`), methods are
+snake_case instance methods, statics are class methods, and `destroy`
+frees the native object deterministically. From the `kvstore` sample
+(trimmed):
+
+```ruby
+class StorePtr < FFI::AutoPointer
+  def self.release(ptr)
+    Kvstore.weaveffi_kv_Store_destroy(ptr)
+  end
+end
+
+# An embedded key-value store owning its entries
+class Store
+  attr_reader :handle
+
+  # Wraps an owned pointer the producer handed over, without
+  # re-running initialize.
+  def self._from_ptr(ptr)
+    obj = allocate
+    obj.instance_variable_set(:@handle, StorePtr.new(ptr))
+    obj
+  end
+
+  def destroy
+    return if @handle.nil?
+    @handle.free
+    @handle = nil
+  end
+
+  # Open (or create) a store backed by the given filesystem path
+  def self.open(path)
+    err = ErrorStruct.new
+    result = Kvstore.weaveffi_kv_Store_open(path, err)
+    Kvstore.check_kv_error!(err)
+    raise Error.new(-1, 'null pointer') if result.null?
+    _from_ptr(result)
+  end
+
+  def put(key, value, kind, ttl_seconds) # raises typed KvError subclasses
+    # ...
+  end
+
+  def count() # generic check only (no throws)
+    # ...
+  end
+
+  def compact() # blocking async; see Async support
+    # ...
+  end
+
+  # Legacy single-shot put kept for compatibility
+  def legacy_put(key, value)
+    warn "[DEPRECATED] use put() with explicit kind"
+    # ...
+  end
+
+  # The largest number of live entries one store will hold
+  def self.default_capacity()
+    # ...
+  end
+end
+```
+
+Functions elsewhere in the IDL pass the wrapper's `handle` across the
+boundary (`Kvstore.get_stats(store)` returns a new `Stats`).
+Deprecated members print a `[DEPRECATED]` warning at call time:
+
+```ruby
+store = Kvstore::Store.open('/tmp/cache.kv')
+store.put('alpha', "\x01".b, Kvstore::EntryKind::PERSISTENT, nil)
+puts "#{store.count} / #{Kvstore::Store.default_capacity}"
+reclaimed = store.compact
+store.destroy
 ```
 
 ## Rich (algebraic) enums
@@ -359,9 +489,9 @@ gem_name = "my_bindings"
 - **Bytes:** an `FFI::MemoryPointer` is allocated for inputs; outputs
   are read with `read_string(len)` and the Rust side is responsible
   for the buffer it returned.
-- **Structs:** wrappers hold an `FFI::AutoPointer` whose `release`
-  callback invokes the C `_destroy` function on GC. Use the explicit
-  `destroy` method for deterministic cleanup.
+- **Structs and interfaces:** wrappers hold an `FFI::AutoPointer`
+  whose `release` callback invokes the C `_destroy` function on GC.
+  Use the explicit `destroy` method for deterministic cleanup.
 - **Maps:** keys and values are marshalled into parallel
   `FFI::MemoryPointer` buffers; the wrapper rebuilds a Ruby `Hash`
   from the returned arrays.
@@ -371,8 +501,11 @@ gem_name = "my_bindings"
 Async IDL functions (`async: true`) are exposed as blocking wrapper
 methods. The wrapper creates a `Queue`, builds an `FFI::Function`
 completion callback that pushes either the converted result or an
-`Error` onto it, calls the `_async`-suffixed C launcher, then pops the
-queue and raises if the producer reported an error:
+error onto it, calls the `_async`-suffixed C launcher, then pops the
+queue and raises if the producer reported an error. For a callable
+marked `throws: true`, the error goes through the domain mapper
+(`task_error_from` here, `kv_error_from` on `Store#compact`), so the
+raised object is the typed class:
 
 ```ruby
 # Blocks until the async producer completes.
@@ -384,7 +517,7 @@ def self.run_task(name)
     err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
     if err && err[:code] != 0
       # ... read code/message, weaveffi_error_clear ...
-      queue << Error.new(code, msg)
+      queue << task_error_from(code, msg)
     else
       # ... null-pointer guard ...
       queue << TaskResult.new(result)
@@ -414,7 +547,7 @@ For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`
 for it. The token isn't exposed (the generated comment reads
 "cancellation token not exposed; pass-through is NULL"). Cancellation
-tokens are currently surfaced only by the C, C++, and Kotlin targets.
+tokens are currently surfaced only by the C and C++ targets.
 
 ## Callbacks and listeners
 

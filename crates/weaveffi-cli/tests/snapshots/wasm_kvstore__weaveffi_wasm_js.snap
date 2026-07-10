@@ -16,6 +16,71 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+/** Base error for the `kv` module's error domain. */
+export class KvError extends WeaveFFIError {}
+
+// No entry exists for the requested key
+export class KeyNotFound extends KvError {
+  constructor(message = "key not found") {
+    super(1001, message);
+  }
+}
+KeyNotFound.CODE = 1001;
+KvError.KeyNotFound = KeyNotFound;
+
+// The entry exists but its TTL has elapsed
+export class Expired extends KvError {
+  constructor(message = "entry expired") {
+    super(1002, message);
+  }
+}
+Expired.CODE = 1002;
+KvError.Expired = Expired;
+
+// The store has reached its capacity limit
+export class StoreFull extends KvError {
+  constructor(message = "store has reached capacity") {
+    super(1003, message);
+  }
+}
+StoreFull.CODE = 1003;
+KvError.StoreFull = StoreFull;
+
+// Underlying storage reported an I/O failure
+export class IoError extends KvError {
+  constructor(message = "I/O failure") {
+    super(1004, message);
+  }
+}
+IoError.CODE = 1004;
+KvError.IoError = IoError;
+
+const _KV_ERROR_CODES = Object.freeze({
+  1001: KeyNotFound,
+  1002: Expired,
+  1003: StoreFull,
+  1004: IoError,
+});
+
+// Build the KvError subclass matching `code`, or a generic
+// WeaveFFIError for codes outside the domain (panics, marshalling).
+function _kvErrorFrom(code, message) {
+  const _cls = _KV_ERROR_CODES[code];
+  if (!_cls) return new WeaveFFIError(code, message);
+  return message ? new _cls(message) : new _cls();
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -83,6 +148,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -91,7 +159,7 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
@@ -100,16 +168,32 @@ function _freeErr(wasm, errPtr) {
   wasm.weaveffi_dealloc(errPtr, 8);
 }
 
+// Throw the `KvError` domain error (and free the slot) if the error slot
+// carries a non-zero code.
+function _checkKvError(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code !== 0) {
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
+    wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
+    throw _kvErrorFrom(code, msg);
+  }
+}
+
 // Throw if a borrowed (producer-owned) error carries a non-zero
 // code. Used by async callbacks: the producer owns and frees the
 // error struct, so the slot is read but never deallocated here.
-function _checkErrRef(wasm, errPtr) {
+// `mkErr` maps domain codes for throwing callables; without it the
+// generic WeaveFFIError is thrown.
+function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code === 0) return;
   const msgPtr = dv.getUint32(errPtr + 4, true);
   const msg = _readCStr(wasm, msgPtr) || '';
-  throw new Error(`WeaveFFI error ${code}: ${msg}`);
+  throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);
 }
 
 function _registerTrampoline(table, paramTypes, handler) {
@@ -126,25 +210,6 @@ export const EntryKind = Object.freeze({
   Persistent: 1,
   Encrypted: 2,
 });
-
-class Store {
-  constructor(wasm, handle) {
-    this._wasm = wasm;
-    this._handle = handle;
-  }
-  get id() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_Store_get_id(this._handle);
-    return _r;
-  }
-  static create(wasm, id) {
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_kv_Store_create(BigInt(id), _err);
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Store(wasm, _r);
-  }
-}
 
 class Entry {
   constructor(wasm, handle) {
@@ -437,7 +502,7 @@ export async function loadWeaveffiWasm(url) {
     if (!ctx) return;
     _asyncContexts.delete(ctxId);
     try {
-      if (errPtr !== 0) _checkErrRef(wasm, errPtr);
+      if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);
       ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);
     } catch (e) {
       ctx.reject(e);
@@ -446,132 +511,146 @@ export async function loadWeaveffiWasm(url) {
 
   const _cbPtr_i32_i32_i64 = _registerTrampoline(_table, ['i32', 'i32', 'i64'], _asyncHandler);
 
+  // An in-memory key-value store owning its entries; destroying the object releases all of its state
+  class Store {
+    static _wrap(handle) {
+      const _o = Object.create(Store.prototype);
+      _o._handle = handle;
+      return _o;
+    }
+    free() {
+      if (this._handle !== 0) {
+        wasm.weaveffi_kv_Store_destroy(this._handle);
+        this._handle = 0;
+      }
+    }
+    static open(path) {
+      const [a0_p, a0_s] = _cstr(wasm, path);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_open(a0_p, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      _checkKvError(wasm, _err);
+      _freeErr(wasm, _err);
+      return Store._wrap(_r);
+    }
+    put(key, value, kind, ttlSeconds) {
+      const [a0_p, a0_s] = _cstr(wasm, key);
+      const [a1_p, a1_l] = _bytes(wasm, value);
+      let a3_p = 0;
+      if (ttlSeconds !== null && ttlSeconds !== undefined) {
+        a3_p = wasm.weaveffi_alloc(8);
+        const a3_dv = new DataView(wasm.memory.buffer);
+        a3_dv.setBigInt64(a3_p, BigInt(ttlSeconds), true);
+      }
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_put(this._handle, a0_p, a1_p, a1_l, kind, a3_p, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      wasm.weaveffi_dealloc(a1_p, a1_l);
+      if (a3_p !== 0) wasm.weaveffi_dealloc(a3_p, 8);
+      _checkKvError(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r !== 0;
+    }
+    get(key) {
+      const [a0_p, a0_s] = _cstr(wasm, key);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_get(this._handle, a0_p, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      _checkKvError(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r === 0 ? null : new Entry(wasm, _r);
+    }
+    delete(key) {
+      const [a0_p, a0_s] = _cstr(wasm, key);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_delete(this._handle, a0_p, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      _checkKvError(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r !== 0;
+    }
+    listKeys(prefix) {
+      let a0_p = 0, a0_s = 0;
+      if (prefix !== null && prefix !== undefined) { [a0_p, a0_s] = _cstr(wasm, prefix); }
+      const _err = _allocErr(wasm);
+      const _it = wasm.weaveffi_kv_Store_list_keys(this._handle, a0_p, _err);
+      if (a0_p !== 0) wasm.weaveffi_dealloc(a0_p, a0_s);
+      _checkKvError(wasm, _err);
+      _freeErr(wasm, _err);
+      const _out = [];
+      const _ip = wasm.weaveffi_alloc(4);
+      const _ierr = _allocErr(wasm);
+      while (wasm.weaveffi_kv_Store_ListKeysIterator_next(_it, _ip, _ierr) !== 0) {
+        _checkErr(wasm, _ierr);
+        const _dv = new DataView(wasm.memory.buffer);
+        _out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));
+      }
+      _checkErr(wasm, _ierr);
+      _freeErr(wasm, _ierr);
+      wasm.weaveffi_dealloc(_ip, 4);
+      wasm.weaveffi_kv_Store_ListKeysIterator_destroy(_it);
+      return _out;
+    }
+    count() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_count(this._handle, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+    clear() {
+      const _err = _allocErr(wasm);
+      wasm.weaveffi_kv_Store_clear(this._handle, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+    }
+    compact() {
+      return new Promise((resolve, reject) => {
+        const ctxId = _nextCtxId++;
+        _asyncContexts.set(ctxId, { resolve, reject, mkErr: _kvErrorFrom });
+        wasm.weaveffi_kv_Store_compact_async(this._handle, 0, _cbPtr_i32_i32_i64, ctxId);
+      });
+    }
+    /** @deprecated use put() with explicit kind */
+    legacyPut(key, value) {
+      const [a0_p, a0_s] = _cstr(wasm, key);
+      const [a1_p, a1_l] = _bytes(wasm, value);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_legacy_put(this._handle, a0_p, a1_p, a1_l, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      wasm.weaveffi_dealloc(a1_p, a1_l);
+      _checkKvError(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r !== 0;
+    }
+    static defaultCapacity() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kv_Store_default_capacity(_err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+  }
+
   return {
     _raw: wasm,
     kv: {
-      open_store(path) {
-        const [a0_p, a0_s] = _cstr(wasm, path);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kv_open_store(a0_p, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_s);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return new Store(wasm, _r);
-      },
-      close_store(store) {
-        const _err = _allocErr(wasm);
-        wasm.weaveffi_kv_close_store(store._handle, _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-      },
-      put(store, key, value, kind, ttl_seconds) {
-        const [a1_p, a1_s] = _cstr(wasm, key);
-        const [a2_p, a2_l] = _bytes(wasm, value);
-        let a4_p = 0;
-        if (ttl_seconds !== null && ttl_seconds !== undefined) {
-          a4_p = wasm.weaveffi_alloc(8);
-          const a4_dv = new DataView(wasm.memory.buffer);
-          a4_dv.setBigInt64(a4_p, BigInt(ttl_seconds), true);
-        }
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kv_put(store._handle, a1_p, a2_p, a2_l, kind, a4_p, _err);
-        wasm.weaveffi_dealloc(a1_p, a1_s);
-        wasm.weaveffi_dealloc(a2_p, a2_l);
-        if (a4_p !== 0) wasm.weaveffi_dealloc(a4_p, 8);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r !== 0;
-      },
-      get(store, key) {
-        const [a1_p, a1_s] = _cstr(wasm, key);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kv_get(store._handle, a1_p, _err);
-        wasm.weaveffi_dealloc(a1_p, a1_s);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r === 0 ? null : new Entry(wasm, _r);
-      },
-      delete(store, key) {
-        const [a1_p, a1_s] = _cstr(wasm, key);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kv_delete(store._handle, a1_p, _err);
-        wasm.weaveffi_dealloc(a1_p, a1_s);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r !== 0;
-      },
-      list_keys(store, prefix) {
-        let a1_p = 0, a1_s = 0;
-        if (prefix !== null && prefix !== undefined) { [a1_p, a1_s] = _cstr(wasm, prefix); }
-        const _err = _allocErr(wasm);
-        const _it = wasm.weaveffi_kv_list_keys(store._handle, a1_p, _err);
-        if (a1_p !== 0) wasm.weaveffi_dealloc(a1_p, a1_s);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        const _out = [];
-        const _ip = wasm.weaveffi_alloc(4);
-        const _ierr = _allocErr(wasm);
-        while (wasm.weaveffi_kv_ListKeysIterator_next(_it, _ip, _ierr) !== 0) {
-          _checkErr(wasm, _ierr);
-          const _dv = new DataView(wasm.memory.buffer);
-          _out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));
-        }
-        _checkErr(wasm, _ierr);
-        _freeErr(wasm, _ierr);
-        wasm.weaveffi_dealloc(_ip, 4);
-        wasm.weaveffi_kv_ListKeysIterator_destroy(_it);
-        return _out;
-      },
-      count(store) {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kv_count(store._handle, _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r;
-      },
-      clear(store) {
-        const _err = _allocErr(wasm);
-        wasm.weaveffi_kv_clear(store._handle, _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-      },
-      compact_async(store) {
-        return new Promise((resolve, reject) => {
-          const ctxId = _nextCtxId++;
-          _asyncContexts.set(ctxId, { resolve, reject });
-          wasm.weaveffi_kv_compact_async_async(store._handle, 0, _cbPtr_i32_i32_i64, ctxId);
-        });
-      },
-      /** @deprecated use put() with explicit kind */
-      legacy_put(store, key, value) {
-        const [a1_p, a1_s] = _cstr(wasm, key);
-        const [a2_p, a2_l] = _bytes(wasm, value);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kv_legacy_put(store._handle, a1_p, a2_p, a2_l, _err);
-        wasm.weaveffi_dealloc(a1_p, a1_s);
-        wasm.weaveffi_dealloc(a2_p, a2_l);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r !== 0;
-      },
-      register_eviction_listener() {
+      registerEvictionListener() {
         throw new Error("weaveffi: listener 'eviction_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
-      unregister_eviction_listener() {
+      unregisterEvictionListener() {
         throw new Error("weaveffi: listener 'eviction_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
-      Store: {
-        create: (...args) => Store.create(wasm, ...args),
-      },
+      Store: Store,
       Entry: {
         create: (...args) => Entry.create(wasm, ...args),
         builder: () => new EntryBuilder(wasm),
       },
       stats: {
-        get_stats(store) {
+        getStats(store) {
           const _err = _allocErr(wasm);
           const _r = wasm.weaveffi_kv_stats_get_stats(store._handle, _err);
-          _checkErr(wasm, _err);
+          _checkKvError(wasm, _err);
           _freeErr(wasm, _err);
           return new Stats(wasm, _r);
         },

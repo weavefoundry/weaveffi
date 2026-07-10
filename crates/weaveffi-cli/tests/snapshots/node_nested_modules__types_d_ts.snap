@@ -6,6 +6,26 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `graphics` module's throwing functions. */
+export class GraphicsError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class OutOfBoundsError extends GraphicsError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
 /** Top-level struct that references a struct defined one level deeper. */
 export interface Canvas {
   width: number;
@@ -22,7 +42,7 @@ export enum Unit {
  * Construct a Canvas.
  * Maps to C function: weaveffi_graphics_new_canvas
  */
-export function graphics_new_canvas(width: number): Canvas
+export function newCanvas(width: number): Canvas
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
 export interface Shape {
   sides: number;
@@ -36,21 +56,22 @@ export interface Shape {
  * Construct a Shape.
  * Maps to C function: weaveffi_graphics_shapes_make_shape
  */
-export function graphics_shapes_make_shape(sides: number): Shape
+export function makeShape(sides: number): Shape
 /**
  * Nested function returning a struct owned by an ancestor module.
  * Maps to C function: weaveffi_graphics_shapes_describe
  */
-export function graphics_shapes_describe(): Canvas
+export function describe(): Canvas
 /** A struct two levels deep. */
 export interface Detail {
   area: number;
 }
 // module graphics_shapes_geometry
 /**
- * Deeper function taking an ancestor-module struct.
+ * Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
  * Maps to C function: weaveffi_graphics_shapes_geometry_compute
+ * @throws {GraphicsError}
  */
-export function graphics_shapes_geometry_compute(shape: Shape): Detail
+export function compute(shape: Shape): Detail
 
 // END types.d.ts

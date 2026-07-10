@@ -113,6 +113,16 @@ fn find_offending_span(err: &ValidationError, src: &str) -> Option<SourceSpan> {
         ValidationError::BuilderStructEmpty { name, .. } => Some(name.as_str()),
         ValidationError::UnsupportedSchemaVersion { version, .. } => Some(version.as_str()),
         ValidationError::AsyncIteratorReturn { function, .. } => Some(function.as_str()),
+        ValidationError::DuplicateInterfaceName { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateInterfaceMember { name, .. } => Some(name.as_str()),
+        ValidationError::EmptyInterface { name, .. } => Some(name.as_str()),
+        ValidationError::ConstructorHasReturn { constructor, .. } => Some(constructor.as_str()),
+        ValidationError::AsyncConstructor { constructor, .. } => Some(constructor.as_str()),
+        ValidationError::InterfaceInInvalidPosition { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateTypeName { name, .. } => Some(name.as_str()),
+        ValidationError::DuplicateErrorCodeName { name, .. } => Some(name.as_str()),
+        ValidationError::ThrowsWithoutErrorDomain { function, .. } => Some(function.as_str()),
+        ValidationError::AbiSymbolCollision { symbol, .. } => Some(symbol.as_str()),
         _ => None,
     }?;
     let quoted = format!("\"{needle}\"");

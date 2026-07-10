@@ -1,5 +1,5 @@
 fn audit_api_yaml() -> &'static str {
-    r#"version: "0.4.0"
+    r#"version: "0.5.0"
 modules:
   - name: inventory
     structs:

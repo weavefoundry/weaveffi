@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: docs
     enums:
@@ -38,6 +38,37 @@ modules:
       codes:
         - { name: not_found, code: 1, message: "Document not found", doc: Returned when no document matches the requested id }
         - { name: invalid_status, code: 2, message: "Invalid status transition", doc: Raised when attempting to move into a forbidden state }
+    interfaces:
+      - name: Notebook
+        doc: |
+          An ordered collection of documents.
+
+          Notebooks own their documents and release them when destroyed.
+        constructors:
+          - name: new
+            doc: Create an empty notebook
+            params: []
+        methods:
+          - name: insert
+            doc: Add a document, returning its position in the notebook
+            params:
+              - { name: document, type: Document, doc: The document to add }
+            return: i32
+          - name: find
+            doc: Look up a document by identifier, failing when none matches
+            params:
+              - { name: id, type: i64, doc: Identifier of the document to find }
+            return: Document
+            throws: true
+          - name: size
+            doc: The number of documents currently held
+            params: []
+            return: i32
+        statics:
+          - name: max_documents
+            doc: The largest number of documents one notebook will hold
+            params: []
+            return: i32
     functions:
       - name: create_document
         doc: |

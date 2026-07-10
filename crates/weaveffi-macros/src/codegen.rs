@@ -16,8 +16,8 @@ use syn::Ident;
 use weaveffi_core::abi::{AbiParam, CType, ConstPos};
 use weaveffi_core::model::{
     AbiFn, AsyncBinding, BindingModel, BuilderBinding, CallShape, CallbackBinding, EnumBinding,
-    FieldBinding, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    RichEnumBinding, RichVariantBinding, StructBinding,
+    ErrorBinding, FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding,
+    ModuleBinding, ParamBinding, RichEnumBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_ir::ir::{Api, TypeRef, CURRENT_SCHEMA_VERSION};
 
@@ -161,6 +161,9 @@ fn render_symbols(
     let mut fns: HashMap<String, &syn::ItemFn> = HashMap::new();
     let mut structs: HashMap<String, &syn::ItemStruct> = HashMap::new();
     let mut enums: HashMap<String, &syn::ItemEnum> = HashMap::new();
+    // Interface member signatures, keyed by `(type name, fn name)` across all
+    // inherent `impl` blocks of the type.
+    let mut member_sigs: HashMap<(String, String), &syn::Signature> = HashMap::new();
     for item in items {
         match item {
             syn::Item::Fn(f) => {
@@ -172,11 +175,46 @@ fn render_symbols(
             syn::Item::Enum(e) => {
                 enums.insert(e.ident.to_string(), e);
             }
+            syn::Item::Impl(i) if i.trait_.is_none() => {
+                let Some(ty_name) = impl_type_name(i) else {
+                    continue;
+                };
+                for impl_item in &i.items {
+                    if let syn::ImplItem::Fn(f) = impl_item {
+                        member_sigs.insert((ty_name.clone(), f.sig.ident.to_string()), &f.sig);
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    let missing = |what: &str, name: &str| {
+        syn::Error::new_spanned(
+            mod_ident,
+            format!("internal error: no source for exported {what} `{name}`"),
+        )
+    };
+
+    // Mirror the CLI's validation: a `Result`-returning callable needs an
+    // error domain in scope so its codes have a C spelling.
+    if mb.error.is_none() {
+        if let Some(t) = mb.callables().find(|f| f.throws) {
+            return Err(syn::Error::new_spanned(
+                mod_ident,
+                format!(
+                    "weaveffi: `{}` returns a Result but no error domain is in scope; declare \
+                     a #[weaveffi::error] enum in this module (or a parent module)",
+                    t.name
+                ),
+            ));
+        }
+    }
+
     let mut generated = TokenStream::new();
+    if let Some(eb) = mb.error.as_ref().filter(|e| e.declared_here) {
+        generated.extend(gen_error_report(eb));
+    }
     for e in &mb.enums {
         generated.extend(gen_enum(e, enums.get(&e.name).copied())?);
     }
@@ -189,19 +227,89 @@ fn render_symbols(
     for l in &mb.listeners {
         generated.extend(gen_listener(mb, l)?);
     }
+    for i in &mb.interfaces {
+        let ty = ident(&i.name);
+        for (members, target) in [
+            (&i.constructors, CallTarget::Static(ty.clone())),
+            (&i.statics, CallTarget::Static(ty.clone())),
+            (&i.methods, CallTarget::Method(ty.clone())),
+        ] {
+            for m in members {
+                let sig = member_sigs
+                    .get(&(i.name.clone(), m.name.clone()))
+                    .ok_or_else(|| missing("interface member", &m.name))?;
+                generated.extend(gen_function(m, sig, &target)?);
+            }
+        }
+        generated.extend(gen_interface_destroy(i));
+    }
     for f in &mb.functions {
-        let sfn = fns.get(&f.name).ok_or_else(|| {
-            syn::Error::new_spanned(
-                mod_ident,
-                format!(
-                    "internal error: no source for exported function `{}`",
-                    f.name
-                ),
-            )
-        })?;
-        generated.extend(gen_function(f, sfn)?);
+        let sfn = fns
+            .get(&f.name)
+            .ok_or_else(|| missing("function", &f.name))?;
+        generated.extend(gen_function(f, &sfn.sig, &CallTarget::Free)?);
     }
     Ok(generated)
+}
+
+/// The bare type name an inherent `impl` block targets, when it is a plain
+/// path type.
+fn impl_type_name(item_impl: &syn::ItemImpl) -> Option<String> {
+    let syn::Type::Path(p) = item_impl.self_ty.as_ref() else {
+        return None;
+    };
+    p.path.segments.last().map(|s| s.ident.to_string())
+}
+
+/// Generate `{c_tag}_destroy`: release the boxed interface object. A panicking
+/// user `Drop` is swallowed (there is no `out_err` slot to report through, and
+/// a destructor must not take down the process).
+fn gen_interface_destroy(i: &InterfaceBinding) -> TokenStream {
+    let sym = ident(&i.destroy_symbol);
+    let ty = ident(&i.name);
+    quote! {
+        #[no_mangle]
+        #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
+        pub extern "C" fn #sym(ptr: *mut #ty) {
+            if !ptr.is_null() {
+                let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    unsafe { drop(::std::boxed::Box::from_raw(ptr)) }
+                }));
+            }
+        }
+    }
+}
+
+/// Generate the [`ErrorReport`](weaveffi_abi::ErrorReport) implementation for
+/// a module's `#[weaveffi::error]` enum, mapping each unit variant to its
+/// declared code and default message. This is what routes `Err(Domain::Case)`
+/// from a throwing producer function to the matching C error constant.
+fn gen_error_report(eb: &ErrorBinding) -> TokenStream {
+    let ty = ident(&eb.name);
+    let code_arms = eb.codes.iter().map(|c| {
+        let v = ident(&c.name);
+        let value = c.value;
+        quote!(Self::#v => #value,)
+    });
+    let msg_arms = eb.codes.iter().map(|c| {
+        let v = ident(&c.name);
+        let msg = &c.message;
+        quote!(Self::#v => #msg.to_string(),)
+    });
+    quote! {
+        impl ::weaveffi::abi::ErrorReport for #ty {
+            fn code(&self) -> i32 {
+                match self {
+                    #(#code_arms)*
+                }
+            }
+            fn message(&self) -> String {
+                match self {
+                    #(#msg_arms)*
+                }
+            }
+        }
+    }
 }
 
 // ── C type -> Rust FFI type ──────────────────────────────────────────────
@@ -314,16 +422,12 @@ fn rust_type_ident(name: &str) -> Ident {
 }
 
 fn returns_result(output: &syn::ReturnType) -> bool {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return false;
-    };
-    matches!(ty.as_ref(), syn::Type::Path(p)
-        if p.path.segments.last().is_some_and(|s| s.ident == "Result"))
+    weaveffi_bridge::output_is_result(output)
 }
 
 /// The producer's source type for the parameter named `name`, if present.
-fn user_param_type<'a>(sfn: &'a syn::ItemFn, name: &str) -> Option<&'a syn::Type> {
-    sfn.sig.inputs.iter().find_map(|arg| {
+fn user_param_type<'a>(sig: &'a syn::Signature, name: &str) -> Option<&'a syn::Type> {
+    sig.inputs.iter().find_map(|arg| {
         let syn::FnArg::Typed(pt) = arg else {
             return None;
         };
@@ -341,8 +445,15 @@ fn user_param_type<'a>(sfn: &'a syn::ItemFn, name: &str) -> Option<&'a syn::Type
 /// producer chose (importantly `super::T` for a handle owned by a parent
 /// module) in scope where the thunk is emitted, which a synthesized bare `T`
 /// would not be when the thunk lands inside a nested submodule.
-fn slot_tokens_for(p: &AbiParam, f: &FnBinding, sfn: &syn::ItemFn) -> TokenStream {
-    if let Some(ty) = typed_handle_user_type(p, f, sfn) {
+///
+/// The implicit method receiver slot is named `self` at the C level, which is
+/// not a legal Rust parameter name, so it renders as `__wv_self`.
+fn slot_tokens_for(p: &AbiParam, f: &FnBinding, sig: &syn::Signature) -> TokenStream {
+    if p.name == "self" {
+        let t = ctype_to_rust(&p.ty);
+        return quote!(__wv_self: #t);
+    }
+    if let Some(ty) = typed_handle_user_type(p, f, sig) {
         let n = ident(&p.name);
         quote!(#n: #ty)
     } else {
@@ -352,8 +463,8 @@ fn slot_tokens_for(p: &AbiParam, f: &FnBinding, sfn: &syn::ItemFn) -> TokenStrea
 
 /// Render the slot list for a function signature, honoring producer-written
 /// typed-handle types (see [`slot_tokens_for`]).
-fn fn_slots(params: &[AbiParam], f: &FnBinding, sfn: &syn::ItemFn) -> Vec<TokenStream> {
-    params.iter().map(|p| slot_tokens_for(p, f, sfn)).collect()
+fn fn_slots(params: &[AbiParam], f: &FnBinding, sig: &syn::Signature) -> Vec<TokenStream> {
+    params.iter().map(|p| slot_tokens_for(p, f, sig)).collect()
 }
 
 /// The producer's source type for an ABI slot that lowers a `handle<T>`
@@ -361,20 +472,20 @@ fn fn_slots(params: &[AbiParam], f: &FnBinding, sfn: &syn::ItemFn) -> Vec<TokenS
 fn typed_handle_user_type<'a>(
     p: &AbiParam,
     f: &FnBinding,
-    sfn: &'a syn::ItemFn,
+    sig: &'a syn::Signature,
 ) -> Option<&'a syn::Type> {
     let pb = f.params.iter().find(|pb| pb.name == p.name)?;
     if !matches!(pb.ty, TypeRef::TypedHandle(_)) {
         return None;
     }
-    user_param_type(sfn, &p.name)
+    user_param_type(sig, &p.name)
 }
 
 /// Render the `-> T` return clause, preferring the producer's own type for a
 /// typed-handle return (so a parent-module `super::T` stays in scope).
-fn ret_arrow_for(ret: &CType, f: &FnBinding, sfn: &syn::ItemFn) -> TokenStream {
+fn ret_arrow_for(ret: &CType, f: &FnBinding, sig: &syn::Signature) -> TokenStream {
     if matches!(f.ret, Some(TypeRef::TypedHandle(_))) {
-        if let syn::ReturnType::Type(_, ty) = &sfn.sig.output {
+        if let syn::ReturnType::Type(_, ty) = &sig.output {
             let ty = weaveffi_bridge::peel_result(ty);
             return quote!(-> #ty);
         }
@@ -385,8 +496,8 @@ fn ret_arrow_for(ret: &CType, f: &FnBinding, sfn: &syn::ItemFn) -> TokenStream {
 /// Whether a parameter's source type is a shared reference (`&T`), so the call
 /// passes a borrow rather than a clone. `&str`/`&[u8]`/`&mut T` are handled by
 /// the type-specific lift, not here.
-fn param_is_ref(sfn: &syn::ItemFn, name: &str) -> bool {
-    sfn.sig.inputs.iter().any(|arg| {
+fn param_is_ref(sig: &syn::Signature, name: &str) -> bool {
+    sig.inputs.iter().any(|arg| {
         let syn::FnArg::Typed(pt) = arg else {
             return false;
         };
@@ -396,6 +507,68 @@ fn param_is_ref(sfn: &syn::ItemFn, name: &str) -> bool {
         id.ident == name
             && matches!(pt.ty.as_ref(), syn::Type::Reference(r) if r.mutability.is_none())
     })
+}
+
+/// How a generated thunk invokes the producer's code: a free function in the
+/// module, an associated function on a type (constructor or static), or an
+/// instance method on the lifted `self` object.
+enum CallTarget {
+    /// `name(args...)` on a module-level function.
+    Free,
+    /// `Type::name(args...)`.
+    Static(Ident),
+    /// `__wv_obj.name(args...)` where `__wv_obj` is the dereferenced receiver.
+    Method(Ident),
+}
+
+impl CallTarget {
+    /// Build the call expression for this target.
+    fn call(&self, fn_name: &str, args: &[TokenStream]) -> TokenStream {
+        let f = ident(fn_name);
+        match self {
+            CallTarget::Free => quote!(#f(#(#args),*)),
+            CallTarget::Static(ty) => quote!(#ty::#f(#(#args),*)),
+            CallTarget::Method(_) => quote!(__wv_obj.#f(#(#args),*)),
+        }
+    }
+
+    /// The receiver-lift preamble for a method (null-check, report through
+    /// `out_err`, dereference into `__wv_obj`); empty for free functions and
+    /// statics.
+    fn self_preamble(&self, sentinel: &TokenStream) -> TokenStream {
+        match self {
+            CallTarget::Method(ty) => quote! {
+                if __wv_self.is_null() {
+                    ::weaveffi::abi::error_set(out_err, -1, "self is null");
+                    return #sentinel;
+                }
+                let __wv_obj: &#ty = unsafe { &*__wv_self };
+            },
+            _ => TokenStream::new(),
+        }
+    }
+}
+
+/// Wrap a thunk body in `catch_unwind` so a producer panic is reported through
+/// `out_err` (with the reserved panic code) instead of unwinding across the C
+/// boundary and aborting the process. `sentinel` is the value the thunk
+/// returns on the panic path; pass `None` for a void thunk.
+fn wrap_unwind(body: TokenStream, sentinel: Option<&TokenStream>) -> TokenStream {
+    let tail = match sentinel {
+        Some(s) => quote!(#s),
+        None => TokenStream::new(),
+    };
+    quote! {
+        match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(move || {
+            #body
+        })) {
+            ::std::result::Result::Ok(__wv_v) => __wv_v,
+            ::std::result::Result::Err(__wv_panic) => {
+                ::weaveffi::abi::error_set_panic(out_err, &*__wv_panic);
+                #tail
+            }
+        }
+    }
 }
 
 /// Lift a contiguous foreign array (`ptr` + `len`) of `elem` into an owned
@@ -557,6 +730,25 @@ fn lift_param(
             };
             (pre, owned())
         }
+        // An interface parameter borrows the caller-owned object for the call;
+        // the slot is a `const {tag}*`, so the producer must accept `&T`.
+        TypeRef::Interface(_) => {
+            if !is_ref {
+                return Err(unsupported(
+                    &pb.name,
+                    "by-value interface parameter (accept `&T` instead: the caller keeps \
+                     ownership of the object)",
+                ));
+            }
+            let pre = quote! {
+                if #name.is_null() {
+                    ::weaveffi::abi::error_set(out_err, 1, #msg);
+                    return #sentinel;
+                }
+                let #name = unsafe { &*#name };
+            };
+            (pre, owned())
+        }
         TypeRef::TypedHandle(_) => (TokenStream::new(), owned()),
         // A map arrives as two parallel arrays (`{name}_keys`, `{name}_values`)
         // and a shared `{name}_len`. Lift each array, then zip into the user's
@@ -609,7 +801,9 @@ fn lower_value(ty: &TypeRef, value: TokenStream) -> syn::Result<TokenStream> {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             quote!(unsafe { ::weaveffi::abi::lower_bytes(#value, out_len) })
         }
-        TypeRef::Struct(_) => {
+        // A returned interface object moves to the heap; the caller owns the
+        // new reference and releases it with `{tag}_destroy`.
+        TypeRef::Struct(_) | TypeRef::Interface(_) => {
             quote!(::std::boxed::Box::into_raw(::std::boxed::Box::new(#value)))
         }
         TypeRef::TypedHandle(_) => value,
@@ -690,7 +884,7 @@ fn typeref_to_rust(ty: &TypeRef) -> syn::Result<TokenStream> {
         TypeRef::Handle => quote!(u64),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => quote!(::std::string::String),
         TypeRef::Bytes | TypeRef::BorrowedBytes => quote!(::std::vec::Vec<u8>),
-        TypeRef::Struct(s) | TypeRef::Enum(s) => {
+        TypeRef::Struct(s) | TypeRef::Enum(s) | TypeRef::Interface(s) => {
             let ty = rust_type_ident(s);
             quote!(#ty)
         }
@@ -715,43 +909,56 @@ fn typeref_to_rust(ty: &TypeRef) -> syn::Result<TokenStream> {
     })
 }
 
-/// Dispatch one exported function to the codegen for its call shape.
-fn gen_function(f: &FnBinding, sfn: &syn::ItemFn) -> syn::Result<TokenStream> {
+/// Dispatch one callable (free function or interface member) to the codegen
+/// for its call shape.
+fn gen_function(
+    f: &FnBinding,
+    sig: &syn::Signature,
+    target: &CallTarget,
+) -> syn::Result<TokenStream> {
     match &f.shape {
-        CallShape::Sync(abi) => gen_sync_function(f, abi, sfn),
-        CallShape::Iterator(it) => gen_iterator_function(f, it, sfn),
-        CallShape::Async(a) => gen_async_function(f, a, sfn),
+        CallShape::Sync(abi) => gen_sync_function(f, abi, sig, target),
+        CallShape::Iterator(it) => gen_iterator_function(f, it, sig, target),
+        CallShape::Async(a) => gen_async_function(f, a, sig, target),
     }
 }
 
-/// Generate the `extern "C"` thunk for one synchronous exported function.
-fn gen_sync_function(f: &FnBinding, abi: &AbiFn, sfn: &syn::ItemFn) -> syn::Result<TokenStream> {
+/// Generate the `extern "C"` thunk for one synchronous callable.
+fn gen_sync_function(
+    f: &FnBinding,
+    abi: &AbiFn,
+    sig: &syn::Signature,
+    target: &CallTarget,
+) -> syn::Result<TokenStream> {
     let sym = ident(&abi.symbol);
-    let params: Vec<TokenStream> = fn_slots(&abi.params, f, sfn);
-    let arrow = ret_arrow_for(&abi.ret, f, sfn);
+    let params: Vec<TokenStream> = fn_slots(&abi.params, f, sig);
+    let arrow = ret_arrow_for(&abi.ret, f, sig);
     let sentinel = sentinel(&abi.ret);
 
     // Lift each parameter, collecting the preambles and the call arguments.
+    let self_pre = target.self_preamble(&sentinel);
     let mut preamble = TokenStream::new();
     let mut call_args: Vec<TokenStream> = Vec::new();
     for pb in &f.params {
-        let is_ref = param_is_ref(sfn, &pb.name);
+        let is_ref = param_is_ref(sig, &pb.name);
         let (pre, arg) = lift_param(pb, is_ref, &sentinel)?;
         preamble.extend(pre);
         call_args.push(arg);
     }
 
-    let fn_ident = ident(&f.name);
-    let call = quote!(#fn_ident(#(#call_args),*));
-
-    let body = build_call_body(&f.ret, &abi.ret, returns_result(&sfn.sig.output), call)?;
+    let call = target.call(&f.name, &call_args);
+    let body = build_call_body(&f.ret, &abi.ret, returns_result(&sig.output), call)?;
+    let is_void = matches!(abi.ret, CType::Void);
+    let wrapped = wrap_unwind(
+        quote! { #self_pre #preamble #body },
+        (!is_void).then_some(&sentinel),
+    );
 
     Ok(quote! {
         #[no_mangle]
         #[allow(unsafe_code, deprecated, clippy::not_unsafe_ptr_arg_deref, clippy::missing_safety_doc)]
         pub extern "C" fn #sym(#(#params),*) #arrow {
-            #preamble
-            #body
+            #wrapped
         }
     })
 }
@@ -764,27 +971,28 @@ fn gen_sync_function(f: &FnBinding, abi: &AbiFn, sfn: &syn::ItemFn) -> syn::Resu
 fn gen_iterator_function(
     f: &FnBinding,
     it: &IteratorBinding,
-    sfn: &syn::ItemFn,
+    sig: &syn::Signature,
+    target: &CallTarget,
 ) -> syn::Result<TokenStream> {
     let elem_rust = typeref_to_rust(&it.elem)?;
     let iter_rust = quote!(::weaveffi::Iter<#elem_rust>);
 
     // ── launcher: lift inputs, run the user fn, box the iterator ──
     let launch_sym = ident(&it.launch.symbol);
-    let launch_params: Vec<TokenStream> = fn_slots(&it.launch.params, f, sfn);
+    let launch_params: Vec<TokenStream> = fn_slots(&it.launch.params, f, sig);
     let launch_sentinel = quote!(::std::ptr::null_mut());
 
+    let self_pre = target.self_preamble(&launch_sentinel);
     let mut preamble = TokenStream::new();
     let mut call_args: Vec<TokenStream> = Vec::new();
     for pb in &f.params {
-        let is_ref = param_is_ref(sfn, &pb.name);
+        let is_ref = param_is_ref(sig, &pb.name);
         let (pre, arg) = lift_param(pb, is_ref, &launch_sentinel)?;
         preamble.extend(pre);
         call_args.push(arg);
     }
-    let fn_ident = ident(&f.name);
-    let call = quote!(#fn_ident(#(#call_args),*));
-    let bind_iter = if returns_result(&sfn.sig.output) {
+    let call = target.call(&f.name, &call_args);
+    let bind_iter = if returns_result(&sig.output) {
         quote! {
             let __wv_iter = match #call {
                 ::std::result::Result::Ok(__v) => __v,
@@ -801,14 +1009,21 @@ fn gen_iterator_function(
     } else {
         quote!(let __wv_iter = #call;)
     };
-    let launch = quote! {
-        #[no_mangle]
-        #[allow(unsafe_code, deprecated, clippy::not_unsafe_ptr_arg_deref, clippy::missing_safety_doc)]
-        pub extern "C" fn #launch_sym(#(#launch_params),*) -> *mut #iter_rust {
+    let launch_body = wrap_unwind(
+        quote! {
+            #self_pre
             #preamble
             #bind_iter
             ::weaveffi::abi::error_set_ok(out_err);
             ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_iter))
+        },
+        Some(&launch_sentinel),
+    );
+    let launch = quote! {
+        #[no_mangle]
+        #[allow(unsafe_code, deprecated, clippy::not_unsafe_ptr_arg_deref, clippy::missing_safety_doc)]
+        pub extern "C" fn #launch_sym(#(#launch_params),*) -> *mut #iter_rust {
+            #launch_body
         }
     };
 
@@ -822,10 +1037,9 @@ fn gen_iterator_function(
     if matches!(it.elem, TypeRef::Map(_, _)) {
         return Err(unsupported("iterator", "map element type"));
     }
-    let next = quote! {
-        #[no_mangle]
-        #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref, clippy::missing_safety_doc)]
-        pub extern "C" fn #next_sym(iter: *mut #iter_rust, #(#rest_params),*) -> i32 {
+    let next_sentinel = quote!(0);
+    let next_body = wrap_unwind(
+        quote! {
             if iter.is_null() || out_item.is_null() {
                 ::weaveffi::abi::error_set(out_err, -1, "iterator or out_item is null");
                 return 0;
@@ -843,17 +1057,28 @@ fn gen_iterator_function(
                     0
                 }
             }
+        },
+        Some(&next_sentinel),
+    );
+    let next = quote! {
+        #[no_mangle]
+        #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref, clippy::missing_safety_doc)]
+        pub extern "C" fn #next_sym(iter: *mut #iter_rust, #(#rest_params),*) -> i32 {
+            #next_body
         }
     };
 
-    // ── destroy ──
+    // ── destroy: drop the box; a panicking user `Drop` is swallowed (there is
+    // no `out_err` slot to report through, and a destructor must not abort) ──
     let destroy_sym = ident(&it.destroy_symbol);
     let destroy = quote! {
         #[no_mangle]
         #[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn #destroy_sym(iter: *mut #iter_rust) {
             if !iter.is_null() {
-                unsafe { drop(::std::boxed::Box::from_raw(iter)) };
+                let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    unsafe { drop(::std::boxed::Box::from_raw(iter)) }
+                }));
             }
         }
     };
@@ -879,7 +1104,7 @@ fn gen_iterator_function(
 /// error channel, and it fires with the result the future produces.
 fn lift_async_input(
     pb: &ParamBinding,
-    sfn: &syn::ItemFn,
+    sig: &syn::Signature,
 ) -> syn::Result<(TokenStream, TokenStream, TokenStream)> {
     let name = ident(&pb.name);
     let none = TokenStream::new();
@@ -891,7 +1116,7 @@ fn lift_async_input(
         // path stays in scope), mirroring the hand-written async sample.
         TypeRef::TypedHandle(_) => {
             let addr = ident(&format!("__wv_addr_{}", pb.name));
-            let uty = user_param_type(sfn, &pb.name)
+            let uty = user_param_type(sig, &pb.name)
                 .ok_or_else(|| unsupported(&pb.name, "async typed-handle parameter"))?;
             (
                 quote!(let #addr = #name as usize;),
@@ -1049,7 +1274,8 @@ fn async_result_args(
 fn gen_async_function(
     f: &FnBinding,
     a: &AsyncBinding,
-    sfn: &syn::ItemFn,
+    sig: &syn::Signature,
+    target: &CallTarget,
 ) -> syn::Result<TokenStream> {
     let cb_ty = ident(&a.callback_type);
     let cb_slots: Vec<TokenStream> = a
@@ -1064,7 +1290,15 @@ fn gen_async_function(
     };
 
     let launch_sym = ident(&a.launch.symbol);
-    let launch_params: Vec<TokenStream> = fn_slots(&a.launch.params, f, sfn);
+    let launch_params: Vec<TokenStream> = fn_slots(&a.launch.params, f, sig);
+
+    // The error path replays the result slots as their zero/null sentinels.
+    let sentinels: Vec<TokenStream> = a
+        .callback_params
+        .iter()
+        .skip(2)
+        .map(|p| sentinel(&p.ty))
+        .collect();
 
     // Lift each logical input into three parts: a pre-spawn statement that runs
     // on the caller's thread (owning borrowed data, bouncing a non-`Send`
@@ -1073,8 +1307,30 @@ fn gen_async_function(
     let mut pre_spawn = TokenStream::new();
     let mut in_closure = TokenStream::new();
     let mut call_args: Vec<TokenStream> = Vec::new();
+
+    // An async method's receiver crosses the worker-thread boundary the same
+    // way a typed handle does: as a `usize`, rebuilt into `&T` inside the
+    // closure. The object outlives the call by the ABI contract (the consumer
+    // must not destroy it while a call is in flight). A null receiver still
+    // fires the callback (with an error), so the continuation never hangs.
+    if let CallTarget::Method(ty) = target {
+        pre_spawn.extend(quote! {
+            if __wv_self.is_null() {
+                let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
+                ::weaveffi::abi::error_set(&mut __wv_e, -1, "self is null");
+                callback(context, &mut __wv_e #(, #sentinels)*);
+                ::weaveffi::abi::error_clear(&mut __wv_e);
+                return;
+            }
+            let __wv_self_addr = __wv_self as usize;
+        });
+        in_closure.extend(quote! {
+            let __wv_obj: &#ty = unsafe { &*(__wv_self_addr as *const #ty) };
+        });
+    }
+
     for pb in &f.params {
-        let (pre, inc, arg) = lift_async_input(pb, sfn)?;
+        let (pre, inc, arg) = lift_async_input(pb, sig)?;
         pre_spawn.extend(pre);
         in_closure.extend(inc);
         call_args.push(arg);
@@ -1091,17 +1347,7 @@ fn gen_async_function(
         call_args.push(quote!(__wv_cancel));
     }
 
-    let fn_ident = ident(&f.name);
-
-    // The error path replays the result slots as their zero/null sentinels.
-    let sentinels: Vec<TokenStream> = a
-        .callback_params
-        .iter()
-        .skip(2)
-        .map(|p| sentinel(&p.ty))
-        .collect();
-
-    let is_result = returns_result(&sfn.sig.output);
+    let is_result = returns_result(&sig.output);
     let (result_pre, success_args) = match &f.ret {
         Some(ty) => async_result_args(ty, quote!(__wv_val))?,
         None => (TokenStream::new(), Vec::new()),
@@ -1109,6 +1355,11 @@ fn gen_async_function(
     let success_call = quote! {
         #result_pre
         callback(__wv_ctx as *mut ::std::ffi::c_void, ::std::ptr::null_mut() #(, #success_args)*);
+    };
+
+    let fail_call = quote! {
+        callback(__wv_ctx as *mut ::std::ffi::c_void, &mut __wv_e #(, #sentinels)*);
+        ::weaveffi::abi::error_clear(&mut __wv_e);
     };
 
     let dispatch = if is_result {
@@ -1127,8 +1378,7 @@ fn gen_async_function(
                         ::weaveffi::abi::ErrorReport::code(&__wv_err),
                         &::weaveffi::abi::ErrorReport::message(&__wv_err),
                     );
-                    callback(__wv_ctx as *mut ::std::ffi::c_void, &mut __wv_e #(, #sentinels)*);
-                    ::weaveffi::abi::error_clear(&mut __wv_e);
+                    #fail_call
                 }
             }
         }
@@ -1144,6 +1394,8 @@ fn gen_async_function(
         }
     };
 
+    let call = target.call(&f.name, &call_args);
+
     Ok(quote! {
         #callback_typedef
 
@@ -1155,11 +1407,21 @@ fn gen_async_function(
             // Drive the future to completion, then fire the host callback. On a
             // threaded target this happens on a worker thread so the launcher
             // returns immediately; `wasm32` has no threads, so run inline (the
-            // sample futures are ready without awaiting real I/O).
+            // sample futures are ready without awaiting real I/O). A panic in
+            // the producer's future is caught and delivered through the
+            // callback's `err` argument with the reserved panic code, so the
+            // consumer's continuation always fires exactly once.
             let __wv_body = move || {
-                #in_closure
-                let __wv_out = ::weaveffi::abi::block_on(#fn_ident(#(#call_args),*));
-                #dispatch
+                let __wv_run = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                    #in_closure
+                    let __wv_out = ::weaveffi::abi::block_on(#call);
+                    #dispatch
+                }));
+                if let ::std::result::Result::Err(__wv_panic) = __wv_run {
+                    let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
+                    ::weaveffi::abi::error_set_panic(&mut __wv_e, &*__wv_panic);
+                    #fail_call
+                }
             };
             #[cfg(target_arch = "wasm32")]
             {

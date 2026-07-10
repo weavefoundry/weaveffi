@@ -36,12 +36,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -106,6 +107,41 @@ String ping() {
     return result.toDartString();
   } finally {
     calloc.free(err);
+  }
+}
+
+/// Typed error domain `KitchenErrors` declared by module `kitchen`.
+class KitchenErrorsException extends WeaveFFIException {
+  KitchenErrorsException(super.code, super.message);
+}
+
+/// Item not found
+class NotFoundException extends KitchenErrorsException {
+  NotFoundException([String message = 'Item not found']) : super(1, message);
+}
+
+/// Invalid input
+class InvalidInputException extends KitchenErrorsException {
+  InvalidInputException([String message = 'Invalid input']) : super(2, message);
+}
+
+WeaveFFIException _mapKitchenErrorsException(int code, String message) {
+  switch (code) {
+    case 1:
+      return NotFoundException(message);
+    case 2:
+      return InvalidInputException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkKitchenErrorsException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapKitchenErrorsException(code, msg);
   }
 }
 
@@ -466,6 +502,92 @@ class ItemBuilder {
   }
 }
 
+typedef _NativeWeaveffiKitchenGadgetDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiKitchenGadgetDestroy = void Function(Pointer<Void>);
+final _weaveffiKitchenGadgetDestroy = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgetDestroy, _DartWeaveffiKitchenGadgetDestroy>('weaveffi_kitchen_Gadget_destroy');
+
+typedef _NativeWeaveffiKitchenGadgetNew = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenGadgetNew = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenGadgetNew = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgetNew, _DartWeaveffiKitchenGadgetNew>('weaveffi_kitchen_Gadget_new');
+
+typedef _NativeWeaveffiKitchenGadgetDescribe = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenGadgetDescribe = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenGadgetDescribe = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgetDescribe, _DartWeaveffiKitchenGadgetDescribe>('weaveffi_kitchen_Gadget_describe');
+
+typedef _NativeWeaveffiKitchenGadgetPoke = Int32 Function(Pointer<Void>, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenGadgetPoke = int Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenGadgetPoke = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgetPoke, _DartWeaveffiKitchenGadgetPoke>('weaveffi_kitchen_Gadget_poke');
+
+typedef _NativeWeaveffiKitchenGadgetVersion = Pointer<Utf8> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenGadgetVersion = Pointer<Utf8> Function(Pointer<_WeaveFFIError>);
+final _weaveffiKitchenGadgetVersion = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgetVersion, _DartWeaveffiKitchenGadgetVersion>('weaveffi_kitchen_Gadget_version');
+
+/// A pocket-sized interface exercising the object surface
+class Gadget {
+  final Pointer<Void> _handle;
+  Gadget._(this._handle);
+
+  /// Releases the native object reference.
+  void dispose() {
+    _weaveffiKitchenGadgetDestroy(_handle);
+  }
+
+  /// Create a gadget with the given id
+  factory Gadget(int id) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKitchenGadgetNew(id, err);
+      _checkError(err);
+      return Gadget._(result);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Render the gadget as a human-readable string
+  String describe() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKitchenGadgetDescribe(_handle, err);
+      _checkError(err);
+      return result.toDartString();
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Poke the gadget a number of times, failing on a negative count
+  ///
+  /// Throws [KitchenErrorsException] on domain errors.
+  int poke(int times) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKitchenGadgetPoke(_handle, times, err);
+      _checkKitchenErrorsException(err);
+      return result;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// The gadget subsystem version string
+  static String version() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKitchenGadgetVersion(err);
+      _checkError(err);
+      return result.toDartString();
+    } finally {
+      calloc.free(err);
+    }
+  }
+}
+
 typedef _NativeCb_weaveffi_kitchen_OnReady_fn = Void Function(Int32, Pointer<Utf8>, Pointer<Void>);
 
 typedef _NativeWeaveffiKitchenRegisterReadyListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_kitchen_OnReady_fn>>, Pointer<Void>);
@@ -700,11 +822,13 @@ final _weaveffiKitchenMaybeItem = _lib.lookupFunction<
     _NativeWeaveffiKitchenMaybeItem, _DartWeaveffiKitchenMaybeItem>('weaveffi_kitchen_maybe_item');
 
 /// Optional struct return
+///
+/// Throws [KitchenErrorsException] on domain errors.
 Item? maybeItem(int id) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKitchenMaybeItem(id, err);
-    _checkError(err);
+    _checkKitchenErrorsException(err);
     if (result == nullptr) return null;
     return Item._(result);
   } finally {

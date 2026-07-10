@@ -37,8 +37,16 @@ fn generate_dart_contacts() {
         "weaveffi.dart should contain Contact class"
     );
     assert!(
-        dart.contains("weaveffi_contacts_create_contact"),
-        "weaveffi.dart should contain create_contact symbol"
+        dart.contains("class ContactBook {") && dart.contains("factory ContactBook() {"),
+        "weaveffi.dart should contain the ContactBook interface class"
+    );
+    assert!(
+        dart.contains("class ContactsException extends WeaveFFIException {"),
+        "weaveffi.dart should contain the ContactsException domain exception"
+    );
+    assert!(
+        dart.contains("weaveffi_contacts_ContactBook_add"),
+        "weaveffi.dart should contain the ContactBook add member symbol"
     );
 
     assert!(

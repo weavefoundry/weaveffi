@@ -73,7 +73,12 @@ WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
  */
 
 typedef enum { weaveffi_products_Category_Electronics = 0, weaveffi_products_Category_Clothing = 1, weaveffi_products_Category_Food = 2, weaveffi_products_Category_Books = 3 } weaveffi_products_Category;
+/** Error codes reported by throwing functions in the `products` module tree. */
+typedef enum { weaveffi_products_ProductsError_InvalidPrice = 1, weaveffi_products_ProductsError_ProductNotFound = 2 } weaveffi_products_ProductsError;
+/** Error codes reported by throwing functions in the `orders` module tree. */
+typedef enum { weaveffi_orders_OrdersError_OrderNotFound = 1, weaveffi_orders_OrdersError_EmptyOrder = 2 } weaveffi_orders_OrdersError;
 typedef struct weaveffi_products_Product weaveffi_products_Product;
+typedef struct weaveffi_products_Catalog weaveffi_products_Catalog;
 typedef struct weaveffi_orders_OrderItem weaveffi_orders_OrderItem;
 typedef struct weaveffi_orders_Order weaveffi_orders_Order;
 
@@ -87,11 +92,15 @@ WEAVEFFI_API double weaveffi_products_Product_get_price(const weaveffi_products_
 WEAVEFFI_API weaveffi_products_Category weaveffi_products_Product_get_category(const weaveffi_products_Product* ptr);
 WEAVEFFI_API const char** weaveffi_products_Product_get_tags(const weaveffi_products_Product* ptr, size_t* out_len);
 
-WEAVEFFI_API weaveffi_handle_t weaveffi_products_create_product(const char* name, double price, weaveffi_products_Category category, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_products_Product* weaveffi_products_get_product(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_products_Product** weaveffi_products_search_products(weaveffi_products_Category category, size_t* out_len, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_products_update_price(weaveffi_handle_t id, double price, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_products_delete_product(weaveffi_handle_t id, weaveffi_error* out_err);
+/** A product catalog owning its products */
+WEAVEFFI_API weaveffi_products_Catalog* weaveffi_products_Catalog_new(weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_products_Product* weaveffi_products_Catalog_add_product(const weaveffi_products_Catalog* self, const char* name, double price, weaveffi_products_Category category, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_products_Product* weaveffi_products_Catalog_get_product(const weaveffi_products_Catalog* self, int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_products_Product** weaveffi_products_Catalog_search(const weaveffi_products_Catalog* self, weaveffi_products_Category category, size_t* out_len, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_products_Catalog_update_price(const weaveffi_products_Catalog* self, int64_t id, double price, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_products_Catalog_remove(const weaveffi_products_Catalog* self, int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_products_Catalog_destroy(weaveffi_products_Catalog* self);
+
 
 // Module: orders
 WEAVEFFI_API weaveffi_orders_OrderItem* weaveffi_orders_OrderItem_create(int64_t product_id, int32_t quantity, double unit_price, weaveffi_error* out_err);
@@ -107,10 +116,10 @@ WEAVEFFI_API weaveffi_orders_OrderItem** weaveffi_orders_Order_get_items(const w
 WEAVEFFI_API double weaveffi_orders_Order_get_total(const weaveffi_orders_Order* ptr);
 WEAVEFFI_API const char* weaveffi_orders_Order_get_status(const weaveffi_orders_Order* ptr);
 
-WEAVEFFI_API weaveffi_handle_t weaveffi_orders_create_order(weaveffi_orders_OrderItem* const* items, size_t items_len, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_orders_Order* weaveffi_orders_get_order(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_orders_cancel_order(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_orders_add_product_to_order(weaveffi_handle_t order_id, const weaveffi_products_Product* product, weaveffi_error* out_err);
+WEAVEFFI_API int64_t weaveffi_orders_create_order(weaveffi_orders_OrderItem* const* items, size_t items_len, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_orders_Order* weaveffi_orders_get_order(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_orders_cancel_order(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_orders_add_product_to_order(int64_t order_id, const weaveffi_products_Product* product, weaveffi_error* out_err);
 
 
 #ifdef __cplusplus

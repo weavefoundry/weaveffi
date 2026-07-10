@@ -6,6 +6,18 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
 /** A reusable token referenced across modules */
 export interface Token {
   id: number;
@@ -16,7 +28,19 @@ export interface Token {
  * Trivial cross-module helper
  * Maps to C function: weaveffi_shared_ping
  */
-export function shared_ping(): string
+export function ping(): string
+/** Typed errors reported by the `kitchen` module's throwing functions. */
+export class KitchenErrorsError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class NotFoundError extends KitchenErrorsError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
+export class InvalidInputError extends KitchenErrorsError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
 /** Kitchen sink struct exercising every field feature */
 export interface Item {
   /** Stable identifier */
@@ -70,109 +94,136 @@ export enum Priority {
   High = 2,
 }
 // module kitchen
+/** A pocket-sized interface exercising the object surface */
+export class Gadget {
+  /**
+   * Create a gadget with the given id
+   * Maps to C function: weaveffi_kitchen_Gadget_new
+   */
+  constructor(id: number);
+  /**
+   * Render the gadget as a human-readable string
+   * Maps to C function: weaveffi_kitchen_Gadget_describe
+   */
+  describe(): string;
+  /**
+   * Poke the gadget a number of times, failing on a negative count
+   * Maps to C function: weaveffi_kitchen_Gadget_poke
+   * @throws {KitchenErrorsError}
+   */
+  poke(times: number): number;
+  /**
+   * The gadget subsystem version string
+   * Maps to C function: weaveffi_kitchen_Gadget_version
+   */
+  static version(): string;
+  /** Free the underlying native object. */
+  destroy(): void;
+}
 /** Subscribe to OnReady events */
-export function kitchen_register_ready_listener(callback: (code: number, msg: string) => void): number
-export function kitchen_unregister_ready_listener(id: number): void
+export function registerReadyListener(callback: (code: number, msg: string) => void): number
+export function unregisterReadyListener(id: number): void
 /**
  * Identity for bool
  * Maps to C function: weaveffi_kitchen_bool_id
  */
-export function kitchen_bool_id(x: boolean): boolean
+export function boolId(x: boolean): boolean
 /**
  * Maps to C function: weaveffi_kitchen_i32_id
  */
-export function kitchen_i32_id(x: number): number
+export function i32Id(x: number): number
 /**
  * Maps to C function: weaveffi_kitchen_u32_id
  */
-export function kitchen_u32_id(x: number): number
+export function u32Id(x: number): number
 /**
  * Maps to C function: weaveffi_kitchen_i64_id
  */
-export function kitchen_i64_id(x: number): number
+export function i64Id(x: number): number
 /**
  * Maps to C function: weaveffi_kitchen_f64_id
  */
-export function kitchen_f64_id(x: number): number
+export function f64Id(x: number): number
 /**
  * Maps to C function: weaveffi_kitchen_echo_string
  */
-export function kitchen_echo_string(s: string): string
+export function echoString(s: string): string
 /**
  * Maps to C function: weaveffi_kitchen_echo_bytes
  */
-export function kitchen_echo_bytes(b: Buffer): Buffer
+export function echoBytes(b: Buffer): Buffer
 /**
  * Borrowed string parameter
  * Maps to C function: weaveffi_kitchen_echo_borrowed_str
  */
-export function kitchen_echo_borrowed_str(s: string): string
+export function echoBorrowedStr(s: string): string
 /**
  * Borrowed bytes parameter
  * Maps to C function: weaveffi_kitchen_echo_borrowed_bytes
  */
-export function kitchen_echo_borrowed_bytes(b: Buffer): Buffer
+export function echoBorrowedBytes(b: Buffer): Buffer
 /**
  * Returns an opaque handle
  * Maps to C function: weaveffi_kitchen_open_handle
  */
-export function kitchen_open_handle(): bigint
+export function openHandle(): bigint
 /**
  * Returns a typed handle
  * Maps to C function: weaveffi_kitchen_open_typed_handle
  */
-export function kitchen_open_typed_handle(): Token
+export function openTypedHandle(): Token
 /**
  * Optional struct return
  * Maps to C function: weaveffi_kitchen_maybe_item
+ * @throws {KitchenErrorsError}
  */
-export function kitchen_maybe_item(id: number): Item | null
+export function maybeItem(id: number): Item | null
 /**
  * List of structs
  * Maps to C function: weaveffi_kitchen_list_items
  */
-export function kitchen_list_items(): Item[]
+export function listItems(): Item[]
 /**
  * Map return type
  * Maps to C function: weaveffi_kitchen_get_attrs
  */
-export function kitchen_get_attrs(): Record<string, number>
+export function getAttrs(): Record<string, number>
 /**
  * Iterator return type
  * Maps to C function: weaveffi_kitchen_stream_items
  */
-export function kitchen_stream_items(): Item[]
+export function streamItems(): Item[]
 /**
  * Returns the shared Token type from another module
  * Maps to C function: weaveffi_kitchen_cross_module_token
  */
-export function kitchen_cross_module_token(): Token
+export function crossModuleToken(): Token
 /**
  * Async operation
  * Maps to C function: weaveffi_kitchen_do_async
  */
-export function kitchen_do_async(input: string): Promise<string>
+export function doAsync(input: string): Promise<string>
 /**
  * Cancellable async operation
  * Maps to C function: weaveffi_kitchen_do_cancellable
  */
-export function kitchen_do_cancellable(input: string): Promise<string>
+export function doCancellable(input: string): Promise<string>
 /**
  * Legacy operation kept for compatibility
  * Maps to C function: weaveffi_kitchen_legacy_op
  * @deprecated Use new_op instead
  */
-export function kitchen_legacy_op(): number
+export function legacyOp(): number
 /**
  * Replacement for legacy_op
  * Maps to C function: weaveffi_kitchen_new_op
  */
-export function kitchen_new_op(): number
+export function newOp(): number
 // module kitchen_nested
 /**
  * Trivial nested-module function
  * Maps to C function: weaveffi_kitchen_nested_hello
  */
-export function kitchen_nested_hello(): string
+export function hello(): string
 
 // END types.d.ts

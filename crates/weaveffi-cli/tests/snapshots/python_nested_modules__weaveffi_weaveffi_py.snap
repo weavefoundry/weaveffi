@@ -87,6 +87,44 @@ def _bytes_to_string(ptr) -> Optional[str]:
 
 # === Module: graphics ===
 
+class GraphicsError(WeaveFFIError):
+    """Base exception for the `graphics` module's error domain."""
+
+
+class OutOfBounds(GraphicsError):
+    """coordinate out of bounds"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "coordinate out of bounds") -> None:
+        super().__init__(1, message)
+
+
+GraphicsError.OutOfBounds = OutOfBounds
+
+
+_GRAPHICS_ERROR_CODES: Dict[int, type] = {
+    1: OutOfBounds,
+}
+
+
+def _graphics_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the GraphicsError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _GRAPHICS_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_graphics_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _graphics_error_from(code, message)
+
+
 class Unit(IntEnum):
     """A measurement unit shared with nested submodules."""
     pixels = 0
@@ -128,7 +166,7 @@ class Canvas:
 
 
 
-def graphics_new_canvas(width: int) -> "Canvas":
+def new_canvas(width: int) -> "Canvas":
     """Construct a Canvas.
     """
     _fn = _lib.weaveffi_graphics_new_canvas
@@ -189,7 +227,7 @@ class Shape:
 
 
 
-def graphics_shapes_make_shape(sides: int) -> "Shape":
+def make_shape(sides: int) -> "Shape":
     """Construct a Shape.
     """
     _fn = _lib.weaveffi_graphics_shapes_make_shape
@@ -203,7 +241,7 @@ def graphics_shapes_make_shape(sides: int) -> "Shape":
     return Shape(_result)
 
 
-def graphics_shapes_describe() -> "Canvas":
+def describe() -> "Canvas":
     """Nested function returning a struct owned by an ancestor module.
     """
     _fn = _lib.weaveffi_graphics_shapes_describe
@@ -242,15 +280,20 @@ class Detail:
 
 
 
-def graphics_shapes_geometry_compute(shape: "Shape") -> "Detail":
-    """Deeper function taking an ancestor-module struct.
+def compute(shape: "Shape") -> "Detail":
+    """Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
+
+    Raises
+    ------
+    GraphicsError
+        If the call reports one of the domain's error codes.
     """
     _fn = _lib.weaveffi_graphics_shapes_geometry_compute
     _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(shape._ptr, ctypes.byref(_err))
-    _check_error(_err)
+    _check_graphics_error(_err)
     if _result is None:
         raise WeaveFFIError(-1, "null pointer")
     return Detail(_result)

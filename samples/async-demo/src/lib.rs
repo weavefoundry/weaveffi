@@ -12,6 +12,14 @@
 pub mod tasks {
     use std::sync::atomic::{AtomicI64, Ordering};
 
+    /// The task module's error domain.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum TaskError {
+        /// task name must not be empty
+        InvalidName = 1,
+    }
+
     static NEXT_TASK_ID: AtomicI64 = AtomicI64::new(1);
     static ACTIVE_CALLBACKS: AtomicI64 = AtomicI64::new(0);
 
@@ -51,15 +59,19 @@ pub mod tasks {
         pub success: bool,
     }
 
-    /// Run a single named task, completing with its `TaskResult`.
+    /// Run a single named task, completing with its `TaskResult`. An empty
+    /// name is rejected with [`TaskError::InvalidName`].
     #[weaveffi::export]
-    pub async fn run_task(name: String) -> TaskResult {
+    pub async fn run_task(name: String) -> Result<TaskResult, TaskError> {
         let _guard = ActiveGuard::new();
-        TaskResult {
+        if name.is_empty() {
+            return Err(TaskError::InvalidName);
+        }
+        Ok(TaskResult {
             id: next_id(),
             value: format!("completed: {name}"),
             success: true,
-        }
+        })
     }
 
     /// Run a batch of named tasks, completing with one `TaskResult` per name.
@@ -113,7 +125,7 @@ mod tests {
     use std::time::Duration;
     use weaveffi::abi::{self, weaveffi_error};
 
-    type TaskCbMsg = (bool, *mut TaskResult);
+    type TaskCbMsg = (i32, *mut TaskResult);
     type BatchCbMsg = (bool, *mut *mut TaskResult, usize);
 
     extern "C" fn task_callback(
@@ -122,8 +134,12 @@ mod tests {
         result: *mut TaskResult,
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<TaskCbMsg>) };
-        let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        let _ = tx.send((had_error, result));
+        let code = if err.is_null() {
+            0
+        } else {
+            unsafe { (*err).code }
+        };
+        let _ = tx.send((code, result));
     }
 
     extern "C" fn batch_callback(
@@ -178,9 +194,9 @@ mod tests {
 
         weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
 
-        let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
-        assert!(!had_error);
+        assert_eq!(code, 0);
         assert!(!result.is_null());
 
         let r = unsafe { &*result };
@@ -192,21 +208,19 @@ mod tests {
     }
 
     #[test]
-    fn run_task_null_name() {
+    fn run_task_empty_name_reports_invalid_name() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
 
+        // A null string lifts leniently to "" on the async path (the launcher
+        // has no out_err slot), so the producer's empty-name check rejects it
+        // with the TaskError::InvalidName domain code.
         weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
 
-        let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
-        assert!(!had_error);
-        assert!(!result.is_null());
-
-        let r = unsafe { &*result };
-        assert!(r.success);
-
-        weaveffi_tasks_TaskResult_destroy(result);
+        assert_eq!(code, 1, "TaskError::InvalidName's declared code");
+        assert!(result.is_null(), "error path passes a null result");
     }
 
     #[test]

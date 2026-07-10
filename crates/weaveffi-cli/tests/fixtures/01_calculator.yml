@@ -1,6 +1,10 @@
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: calculator
+    errors:
+      name: CalcError
+      codes:
+        - { name: DivisionByZero, code: 1, message: "division by zero" }
     functions:
       - name: add
         doc: Add two integers
@@ -15,11 +19,12 @@ modules:
           - { name: b, type: i32 }
         return: i32
       - name: div
-        doc: Divide two integers
+        doc: Divide two integers, failing on a zero divisor
         params:
           - { name: a, type: i32 }
           - { name: b, type: i32 }
         return: i32
+        throws: true
       - name: echo
         doc: Echo a string back
         params:

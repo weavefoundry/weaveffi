@@ -11,13 +11,6 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        @JvmStatic private external fun contacts_create_contactJni(first_name: String, last_name: String, email: String?, contact_type: Int): Long
-        @JvmStatic fun contacts_create_contact(first_name: String, last_name: String, email: String?, contact_type: ContactType): Long = contacts_create_contactJni(first_name, last_name, email, contact_type.value)
-        @JvmStatic private external fun contacts_get_contactJni(id: Long): Long
-        @JvmStatic fun contacts_get_contact(id: Long): Contact = Contact(contacts_get_contactJni(id))
-        @JvmStatic external fun contacts_list_contacts(): LongArray
-        @JvmStatic external fun contacts_delete_contact(id: Long): Boolean
-        @JvmStatic external fun contacts_count_contacts(): Int
     }
 }
 
@@ -64,6 +57,60 @@ class Contact internal constructor(internal var handle: Long) : java.io.Closeabl
     }
 }
 
+/** An in-memory address book owning its contacts */
+class ContactBook internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNew(): Long
+        @JvmStatic private external fun nativeAdd(selfHandle: Long, firstName: String, lastName: String, email: String?, contactType: Int): Long
+        @JvmStatic private external fun nativeGet(selfHandle: Long, id: Long): Long
+        @JvmStatic private external fun nativeList(selfHandle: Long): LongArray
+        @JvmStatic private external fun nativeRemove(selfHandle: Long, id: Long): Boolean
+        @JvmStatic private external fun nativeCount(selfHandle: Long): Int
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+
+        operator fun invoke(): ContactBook = ContactBook(nativeNew())
+    }
+
+    fun add(firstName: String, lastName: String, email: String?, contactType: ContactType): Contact = Contact(nativeAdd(handle, firstName, lastName, email, contactType.value))
+
+    fun get(id: Long): Contact = Contact(nativeGet(handle, id))
+
+    fun list(): LongArray = nativeList(handle)
+
+    fun remove(id: Long): Boolean = nativeRemove(handle, id)
+
+    fun count(): Int = nativeCount(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `ContactsError` declared by module `contacts`. */
+sealed class ContactsException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class InvalidName(message: String = "name must not be empty") : ContactsException(1, message)
+    class NotFound(message: String = "contact not found") : ContactsException(2, message)
+
+    companion object {
+        /** Map a raw `ContactsError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> InvalidName(message)
+            2 -> NotFound(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
 
 // END WeaveFFI.kt

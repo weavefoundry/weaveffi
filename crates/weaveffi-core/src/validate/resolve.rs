@@ -1,26 +1,30 @@
-//! Type-reference resolution: rewrites bare struct names into enum
-//! references and qualifies cross-module references with the owning
-//! module's dot-joined path. Runs after the rule checks pass.
+//! Type-reference resolution: rewrites bare struct names into enum or
+//! interface references and qualifies cross-module references with the
+//! owning module's dot-joined path. Runs after the rule checks pass.
 
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{Api, Module, TypeRef};
+use weaveffi_ir::ir::{Api, Function, Module, TypeRef};
 
-/// How a bare type name resolves: a struct, a C-style enum, or an algebraic
-/// (rich) enum. The two enum kinds differ in their C ABI lowering: a C-style
-/// enum is a by-value integer ([`TypeRef::Enum`]) while a rich enum is an
-/// opaque object pointer (kept as [`TypeRef::Struct`]), so the resolver must
-/// know which to emit for every reference.
+/// How a bare type name resolves: a struct, a C-style enum, an algebraic
+/// (rich) enum, or an interface. The kinds differ in their C ABI lowering: a
+/// C-style enum is a by-value integer ([`TypeRef::Enum`]), a rich enum is an
+/// opaque object pointer (kept as [`TypeRef::Struct`]), and an interface is
+/// an opaque object reference with its own ownership convention
+/// ([`TypeRef::Interface`]), so the resolver must know which to emit for
+/// every reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeKind {
     Struct,
     Enum,
     RichEnum,
+    Interface,
 }
 
 /// Resolve every type reference in `api` in place.
 ///
 /// Bare names that refer to C-style enums are rewritten to [`TypeRef::Enum`]
-/// (by-value lowering), and cross-module references are qualified with the
+/// (by-value lowering), names that refer to interfaces are rewritten to
+/// [`TypeRef::Interface`], and cross-module references are qualified with the
 /// owning module's dot-joined path. Runs after the rule checks pass.
 pub fn resolve_type_refs(api: &mut Api) {
     let mut global_types: BTreeMap<String, (String, TypeKind)> = BTreeMap::new();
@@ -33,10 +37,11 @@ pub fn resolve_type_refs(api: &mut Api) {
     }
 }
 
-/// Recursively index every struct/enum in the module tree by its bare name,
-/// recording the owner's *dot-joined* module path (e.g. `graphics.shapes`) so
-/// cross-module and nested references can be auto-qualified. First definition
-/// wins on a name clash (pre-existing behavior).
+/// Recursively index every struct/enum/interface in the module tree by its
+/// bare name, recording the owner's *dot-joined* module path (e.g.
+/// `graphics.shapes`) so cross-module and nested references can be
+/// auto-qualified. Bare names are globally unique (validation enforces it),
+/// so the map has one entry per name.
 fn index_module_types(
     module: &Module,
     parent_path: &str,
@@ -54,6 +59,10 @@ fn index_module_types(
             TypeKind::Enum
         };
         out.entry(e.name.clone()).or_insert((path.clone(), kind));
+    }
+    for i in &module.interfaces {
+        out.entry(i.name.clone())
+            .or_insert((path.clone(), TypeKind::Interface));
     }
     for child in &module.modules {
         index_module_types(child, &path, out);
@@ -82,18 +91,35 @@ fn resolve_module_type_refs(
         .collect();
     let local_struct_names: BTreeSet<String> =
         module.structs.iter().map(|s| s.name.clone()).collect();
+    let local_interface_names: BTreeSet<String> =
+        module.interfaces.iter().map(|i| i.name.clone()).collect();
     let ctx = ResolveCtx {
         local_enum_names: &local_enum_names,
         local_struct_names: &local_struct_names,
+        local_interface_names: &local_interface_names,
         current_module: &module_path,
         global_types,
     };
-    for f in &mut module.functions {
+    fn resolve_callable(f: &mut Function, ctx: &ResolveCtx<'_>) {
         for p in &mut f.params {
-            resolve_single_type_ref(&mut p.ty, &ctx);
+            resolve_single_type_ref(&mut p.ty, ctx);
         }
         if let Some(ret) = &mut f.returns {
-            resolve_single_type_ref(ret, &ctx);
+            resolve_single_type_ref(ret, ctx);
+        }
+    }
+    for f in &mut module.functions {
+        resolve_callable(f, &ctx);
+    }
+    for i in &mut module.interfaces {
+        for c in &mut i.constructors {
+            resolve_callable(c, &ctx);
+        }
+        for m in &mut i.methods {
+            resolve_callable(m, &ctx);
+        }
+        for s in &mut i.statics {
+            resolve_callable(s, &ctx);
         }
     }
     for s in &mut module.structs {
@@ -120,6 +146,7 @@ fn resolve_module_type_refs(
 struct ResolveCtx<'a> {
     local_enum_names: &'a BTreeSet<String>,
     local_struct_names: &'a BTreeSet<String>,
+    local_interface_names: &'a BTreeSet<String>,
     current_module: &'a str,
     global_types: &'a BTreeMap<String, (String, TypeKind)>,
 }
@@ -137,11 +164,16 @@ fn join_module_path(parent_path: &str, name: &str) -> String {
 
 fn resolve_single_type_ref(ty: &mut TypeRef, ctx: &ResolveCtx<'_>) {
     match ty {
-        // A bare reference to a local C-style enum becomes a by-value `Enum`.
-        // A local rich enum or struct is left as `Struct` (opaque pointer).
+        // A bare reference to a local C-style enum becomes a by-value `Enum`;
+        // a local interface becomes an `Interface` object reference. A local
+        // rich enum or struct is left as `Struct` (opaque pointer).
         TypeRef::Struct(name) if ctx.local_enum_names.contains(name.as_str()) => {
             let name = std::mem::take(name);
             *ty = TypeRef::Enum(name);
+        }
+        TypeRef::Struct(name) if ctx.local_interface_names.contains(name.as_str()) => {
+            let name = std::mem::take(name);
+            *ty = TypeRef::Interface(name);
         }
         TypeRef::Struct(name) if !ctx.local_struct_names.contains(name.as_str()) => {
             if let Some((mod_name, kind)) = ctx.global_types.get(name.as_str()) {
@@ -150,6 +182,8 @@ fn resolve_single_type_ref(ty: &mut TypeRef, ctx: &ResolveCtx<'_>) {
                     match kind {
                         // C-style enum: by-value reference.
                         TypeKind::Enum => *ty = TypeRef::Enum(qualified),
+                        // Interface: object reference with the owner's path.
+                        TypeKind::Interface => *ty = TypeRef::Interface(qualified),
                         // Struct or rich enum: opaque-pointer reference, kept
                         // as `Struct` with the owner's qualified path.
                         TypeKind::Struct | TypeKind::RichEnum => *name = qualified,
@@ -180,15 +214,18 @@ fn resolve_single_type_ref(ty: &mut TypeRef, ctx: &ResolveCtx<'_>) {
     }
 }
 
-/// Locate a struct or enum by its bare `name` anywhere in `api`.
+/// Locate a struct, enum, or interface by its bare `name` anywhere in `api`.
 ///
 /// Returns the owning module's dot-joined path and a boolean that is `true`
-/// when the match is an enum and `false` when it is a struct, or `None` if no
-/// type with that name exists. The first match wins on a name clash.
+/// when the match is an enum and `false` when it is a struct or interface, or
+/// `None` if no type with that name exists. Bare names are globally unique
+/// (validation enforces it), so at most one declaration can match.
 pub fn find_type_in_api(api: &Api, name: &str) -> Option<(String, bool)> {
     fn search(module: &Module, parent_path: &str, name: &str) -> Option<(String, bool)> {
         let path = join_module_path(parent_path, &module.name);
-        if module.structs.iter().any(|s| s.name == name) {
+        if module.structs.iter().any(|s| s.name == name)
+            || module.interfaces.iter().any(|i| i.name == name)
+        {
             return Some((path, false));
         }
         if module.enums.iter().any(|e| e.name == name) {

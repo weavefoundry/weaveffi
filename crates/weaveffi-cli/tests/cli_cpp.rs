@@ -29,6 +29,40 @@ fn generate_cpp_contacts() {
         "weaveffi.hpp should contain namespace weaveffi"
     );
 
+    // Typed error surface: one domain exception per declaring module plus a
+    // subclass per code, and a domain check helper used by throwing wrappers.
+    assert!(
+        hpp.contains("class WeaveFFIError : public std::runtime_error"),
+        "missing generic exception"
+    );
+    assert!(
+        hpp.contains("class ContactsError : public WeaveFFIError"),
+        "missing domain exception"
+    );
+    assert!(
+        hpp.contains("class NotFoundError : public ContactsError"),
+        "missing per-code exception subclass"
+    );
+    assert!(
+        hpp.contains("inline void check_contacts(weaveffi_error& err)"),
+        "missing per-domain check helper"
+    );
+
+    // Interface: RAII class with the canonical constructor mapped from `new`,
+    // methods on the wrapped handle, and the destroy symbol in the destructor.
+    assert!(
+        hpp.contains("class ContactBook {"),
+        "missing interface class"
+    );
+    assert!(
+        hpp.contains("weaveffi_contacts_ContactBook_destroy"),
+        "interface destructor must call the destroy symbol"
+    );
+    assert!(
+        hpp.contains("detail::check_contacts(err);"),
+        "throwing methods must use the domain check helper"
+    );
+
     assert!(
         out_path.join("cpp/CMakeLists.txt").exists(),
         "missing cpp/CMakeLists.txt"

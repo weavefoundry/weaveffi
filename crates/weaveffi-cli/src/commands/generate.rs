@@ -99,7 +99,7 @@ mod tests {
         std::fs::write(
             &yml,
             concat!(
-                "version: \"0.4.0\"\n",
+                "version: \"0.5.0\"\n",
                 "modules:\n",
                 "  - name: math\n",
                 "    functions:\n",

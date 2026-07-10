@@ -63,6 +63,51 @@ module WeaveFFI
 
   # === Module: docs ===
 
+  # Base error for the `docs` module's error domain.
+  class DocsErrorsError < Error
+    # Returned when no document matches the requested id
+    class NotFound < DocsErrorsError
+      CODE = 1
+
+      def initialize(message = 'Document not found')
+        super(1, message)
+      end
+    end
+
+    # Raised when attempting to move into a forbidden state
+    class InvalidStatus < DocsErrorsError
+      CODE = 2
+
+      def initialize(message = 'Invalid status transition')
+        super(2, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the DocsErrorsError domain to its error class.
+  DOCS_ERRORS_ERROR_CODES = {
+    1 => DocsErrorsError::NotFound,
+    2 => DocsErrorsError::InvalidStatus,
+  }.freeze
+
+  # Builds the DocsErrorsError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.docs_errors_error_from(code, message)
+    cls = DOCS_ERRORS_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed DocsErrorsError for a non-zero error slot.
+  def self.check_docs_errors_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise docs_errors_error_from(code, msg)
+  end
+
   # Lifecycle status of a document.
   #
   # Used to drive UI badges and filters.
@@ -85,6 +130,18 @@ module WeaveFFI
   attach_function :weaveffi_docs_Document_get_status, [:pointer], :int32
   # Free-form tags for grouping
   attach_function :weaveffi_docs_Document_get_tags, [:pointer, :pointer], :pointer
+
+  attach_function :weaveffi_docs_Notebook_destroy, [:pointer], :void
+  # Create an empty notebook
+  attach_function :weaveffi_docs_Notebook_new, [:pointer], :pointer
+  # Add a document, returning its position in the notebook
+  attach_function :weaveffi_docs_Notebook_insert, [:pointer, :pointer, :pointer], :int32
+  # Look up a document by identifier, failing when none matches
+  attach_function :weaveffi_docs_Notebook_find, [:pointer, :int64, :pointer], :pointer
+  # The number of documents currently held
+  attach_function :weaveffi_docs_Notebook_size, [:pointer, :pointer], :int32
+  # The largest number of documents one notebook will hold
+  attach_function :weaveffi_docs_Notebook_max_documents, [:pointer], :int32
   # Fires after a document has been persisted successfully
   callback :weaveffi_docs_OnSaved_fn, [:int64, :int32, :pointer], :void
   attach_function :weaveffi_docs_register_saved_listener, [:weaveffi_docs_OnSaved_fn, :pointer], :uint64
@@ -204,6 +261,77 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_docs_Document_create(id, title, status, tags_buf, tags.length, err)
       WeaveFFI.check_error!(err)
       Document.new(result)
+    end
+  end
+
+  class NotebookPtr < FFI::AutoPointer
+    def self.release(ptr)
+      WeaveFFI.weaveffi_docs_Notebook_destroy(ptr)
+    end
+  end
+
+  # An ordered collection of documents.
+  #
+  # Notebooks own their documents and release them when destroyed.
+  class Notebook
+    attr_reader :handle
+
+    # Wraps an owned pointer the producer handed over, without
+    # re-running initialize.
+    def self._from_ptr(ptr)
+      obj = allocate
+      obj.instance_variable_set(:@handle, NotebookPtr.new(ptr))
+      obj
+    end
+
+    def destroy
+      return if @handle.nil?
+      @handle.free
+      @handle = nil
+    end
+
+    # Create an empty notebook
+    def initialize()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_docs_Notebook_new(err)
+      WeaveFFI.check_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      @handle = NotebookPtr.new(result)
+    end
+
+    # Add a document, returning its position in the notebook
+    # @param document [Object] The document to add
+    def insert(document)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_docs_Notebook_insert(@handle, document.handle, err)
+      WeaveFFI.check_error!(err)
+      result
+    end
+
+    # Look up a document by identifier, failing when none matches
+    # @param id [Object] Identifier of the document to find
+    def find(id)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_docs_Notebook_find(@handle, id, err)
+      WeaveFFI.check_docs_errors_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      Document.new(result)
+    end
+
+    # The number of documents currently held
+    def size()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_docs_Notebook_size(@handle, err)
+      WeaveFFI.check_error!(err)
+      result
+    end
+
+    # The largest number of documents one notebook will hold
+    def self.max_documents()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_docs_Notebook_max_documents(err)
+      WeaveFFI.check_error!(err)
+      result
     end
   end
 

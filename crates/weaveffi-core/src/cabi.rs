@@ -14,7 +14,10 @@ use std::fmt::Write;
 use crate::abi::AbiParam;
 use crate::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use crate::codegen::CodeWriter;
-use crate::model::{AbiFn, CallShape, EnumBinding, ModuleBinding, StructBinding};
+use crate::model::{
+    AbiFn, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
+    StructBinding,
+};
 
 /// Emit a `/** ... */` doc comment at `indent`.
 pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
@@ -292,8 +295,44 @@ fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
     }
 }
 
-/// Phase 1a: enum definitions for one module. Enums reference no other types,
-/// so they are emitted first across all modules.
+/// Render an error domain's code constants as a C `typedef enum` named by the
+/// domain's `c_tag`. These are the values a throwing function stores in
+/// `{prefix}_error.code`.
+fn render_error_domain_decl(out: &mut String, e: &ErrorBinding) {
+    let mut w = CodeWriter::four_space();
+    w.doc(
+        &Some(format!(
+            "Error codes reported by throwing functions in the `{}` module tree.",
+            e.owner_path.replace('_', ".")
+        )),
+        DocCommentStyle::Javadoc,
+    );
+    if e.codes.iter().any(|c| c.doc.is_some()) {
+        w.block("typedef enum {", format!("}} {};", e.c_tag), |w| {
+            let last = e.codes.len();
+            for (i, c) in e.codes.iter().enumerate() {
+                w.doc(&c.doc, DocCommentStyle::Javadoc);
+                let comma = if i + 1 == last { "" } else { "," };
+                w.line(format!("{} = {}{comma}", c.c_const, c.value));
+            }
+        });
+    } else {
+        let codes: Vec<String> = e
+            .codes
+            .iter()
+            .map(|c| format!("{} = {}", c.c_const, c.value))
+            .collect();
+        w.line(format!(
+            "typedef enum {{ {} }} {};",
+            codes.join(", "),
+            e.c_tag
+        ));
+    }
+    out.push_str(&w.finish());
+}
+
+/// Phase 1a: enum and error-code definitions for one module. These reference
+/// no other types, so they are emitted first across all modules.
 pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
     for e in &module.enums {
         if e.is_rich() {
@@ -302,11 +341,16 @@ pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
             render_enum_decl(out, e);
         }
     }
+    if let Some(err) = &module.error {
+        if err.declared_here {
+            render_error_domain_decl(out, err);
+        }
+    }
 }
 
-/// Phase 1b: opaque struct/builder/iterator forward typedefs for one module.
-/// Pointers to these are all the C ABI ever uses, so a forward typedef is
-/// sufficient and lets declarations in any module reference any struct.
+/// Phase 1b: opaque struct/builder/interface/iterator forward typedefs for one
+/// module. Pointers to these are all the C ABI ever uses, so a forward typedef
+/// is sufficient and lets declarations in any module reference any type.
 pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
     // A rich (algebraic) enum is an opaque object, declared like a struct tag.
     for e in &module.enums {
@@ -318,7 +362,11 @@ pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
     for s in &module.structs {
         render_struct_tags(out, s);
     }
-    for f in &module.functions {
+    for i in &module.interfaces {
+        let t = &i.c_tag;
+        let _ = writeln!(out, "typedef struct {t} {t};");
+    }
+    for f in module.callables() {
         if let CallShape::Iterator(it) = &f.shape {
             let t = &it.iter_tag;
             let _ = writeln!(out, "typedef struct {t} {t};");
@@ -339,7 +387,7 @@ pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, pr
             params_str(&cb.abi_params, prefix)
         );
     }
-    for f in &module.functions {
+    for f in module.callables() {
         if let CallShape::Async(a) = &f.shape {
             let _ = writeln!(
                 out,
@@ -351,18 +399,67 @@ pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, pr
     }
 }
 
-/// Phase 2: every function prototype for one module: struct create/destroy/
-/// getters and builders, listeners, then sync/async/iterator functions. All
-/// type tags and callback typedefs are assumed already emitted (phases 1a–1c).
-/// Caller controls the leading `// Module:` comment and any framing.
-pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
+/// Render one callable's prototypes according to its call shape (sync, async
+/// launcher, or iterator launch/next/destroy triple), with doc comment and
+/// deprecation marker.
+fn render_callable_decl(out: &mut String, f: &FnBinding, prefix: &str) {
     let api = export_macro(prefix);
     let deprecated = deprecated_macro(prefix);
+    emit_doc(out, &f.doc, "");
+    if let Some(msg) = &f.deprecated {
+        let _ = writeln!(out, "{deprecated}(\"{}\")", msg.replace('"', "\\\""));
+    }
+    match &f.shape {
+        CallShape::Iterator(it) => {
+            let t = &it.iter_tag;
+            fn_decl(out, &it.launch, prefix);
+            fn_decl(out, &it.next, prefix);
+            let _ = writeln!(out, "{api} void {}({t}* iter);", it.destroy_symbol);
+        }
+        CallShape::Async(a) => {
+            fn_decl(out, &a.launch, prefix);
+        }
+        CallShape::Sync(abi) => {
+            fn_decl(out, abi, prefix);
+        }
+    }
+}
+
+/// Render the function surface of one interface: constructors, statics,
+/// methods, then the destructor. Assumes the opaque tag is already
+/// forward-declared (phase 1b).
+fn render_interface_fn_decls(out: &mut String, i: &InterfaceBinding, prefix: &str) {
+    let api = export_macro(prefix);
+    let tag = &i.c_tag;
+    emit_doc(out, &i.doc, "");
+    for c in &i.constructors {
+        render_callable_decl(out, c, prefix);
+    }
+    for s in &i.statics {
+        render_callable_decl(out, s, prefix);
+    }
+    for m in &i.methods {
+        render_callable_decl(out, m, prefix);
+    }
+    let _ = writeln!(out, "{api} void {}({tag}* self);", i.destroy_symbol);
+    out.push('\n');
+}
+
+/// Phase 2: every function prototype for one module: struct create/destroy/
+/// getters and builders, interface members, listeners, then sync/async/
+/// iterator functions. All type tags and callback typedefs are assumed already
+/// emitted (phases 1a–1c). Caller controls the leading `// Module:` comment
+/// and any framing.
+pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
+    let api = export_macro(prefix);
     for e in &module.enums {
         render_rich_enum_fn_decls(out, e, prefix);
     }
     for s in &module.structs {
         render_struct_fn_decls(out, s, prefix);
+    }
+    for i in &module.interfaces {
+        render_interface_fn_decls(out, i, prefix);
     }
     for l in &module.listeners {
         emit_doc(out, &l.doc, "");
@@ -375,24 +472,7 @@ pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: 
         let _ = writeln!(out, "{api} void {}(uint64_t id);", l.unregister_symbol);
     }
     for f in &module.functions {
-        emit_doc(out, &f.doc, "");
-        if let Some(msg) = &f.deprecated {
-            let _ = writeln!(out, "{deprecated}(\"{}\")", msg.replace('"', "\\\""));
-        }
-        match &f.shape {
-            CallShape::Iterator(it) => {
-                let t = &it.iter_tag;
-                fn_decl(out, &it.launch, prefix);
-                fn_decl(out, &it.next, prefix);
-                let _ = writeln!(out, "{api} void {}({t}* iter);", it.destroy_symbol);
-            }
-            CallShape::Async(a) => {
-                fn_decl(out, &a.launch, prefix);
-            }
-            CallShape::Sync(abi) => {
-                fn_decl(out, abi, prefix);
-            }
-        }
+        render_callable_decl(out, f, prefix);
     }
 }
 

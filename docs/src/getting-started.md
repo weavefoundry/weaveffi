@@ -40,7 +40,7 @@ Describe the API once in a language-neutral IDL. Create `math.yml` with a
 record and a function:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: my-math
   version: "0.1.0"
@@ -62,7 +62,9 @@ modules:
 The optional `package:` block sets the name and version stamped into every
 generated package manifest (`package.json`, `pyproject.toml`, `Package.swift`,
 and so on). The IDL also supports primitives (`i32`, `f64`, `bool`, `string`,
-`bytes`, `handle`), optionals (`string?`), and lists (`[i32]`). See the
+`bytes`, `handle`), optionals (`string?`), lists (`[i32]`), interfaces
+(objects with constructors, methods, and statics), and typed error domains
+(opt in per function with `throws: true`). See the
 [IDL Schema](reference/idl.md#package-metadata) reference for the full
 specification.
 
@@ -103,8 +105,8 @@ generated/
 ### C header (`generated/c/weaveffi.h`)
 
 The C generator produces an opaque struct with lifecycle functions and getters,
-plus a module-level function. Every exported function takes an `out_err`
-parameter for error reporting:
+plus a module-level function. Functions and constructors take an `out_err`
+parameter for error reporting (destructors and getters don't):
 
 ```c
 typedef struct weaveffi_math_Point weaveffi_math_Point;
@@ -118,10 +120,12 @@ double weaveffi_math_Point_get_y(const weaveffi_math_Point* ptr);
 int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);
 ```
 
-### Swift wrapper (`generated/swift/Sources/WeaveFFI/WeaveFFI.swift`)
+### Swift wrapper (`generated/swift/Sources/MyMath/MyMath.swift`)
 
 Structs become classes that own an `OpaquePointer` and free it on `deinit`.
-Module functions are grouped under a Swift enum namespace:
+Module functions are grouped under a Swift enum namespace. Because `add`
+doesn't declare `throws: true`, its Swift wrapper is a plain non-throwing
+function:
 
 ```swift
 public class Point {
@@ -133,7 +137,7 @@ public class Point {
 }
 
 public enum Math {
-    public static func add(a: Int32, b: Int32) throws -> Int32 { ... }
+    public static func add(a: Int32, b: Int32) -> Int32 { ... }
 }
 ```
 

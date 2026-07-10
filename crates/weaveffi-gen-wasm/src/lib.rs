@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use camino::Utf8Path;
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::{self, TargetCapabilities};
@@ -21,9 +21,11 @@ use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, FieldBinding, FnBinding, IteratorBinding,
-    ListenerBinding, ModuleBinding, RichEnumBinding, RichVariantBinding, StructBinding,
+    BindingModel, CallShape, EnumBinding, ErrorBinding, FieldBinding, FnBinding, InterfaceBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichEnumBinding,
+    RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
@@ -124,7 +126,7 @@ impl LanguageBackend for WasmGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
@@ -138,7 +140,7 @@ impl LanguageBackend for WasmGenerator {
         vec![
             OutputFile::new(
                 wasm_dir.join("README.md"),
-                render_wasm_readme(api, prefix, input_basename, config.emscripten),
+                render_wasm_readme(api, model, prefix, input_basename, config.emscripten),
             ),
             OutputFile::new(
                 wasm_dir.join("package.json"),
@@ -148,6 +150,7 @@ impl LanguageBackend for WasmGenerator {
                 wasm_dir.join(&js_filename),
                 render_wasm_js_stub(
                     api,
+                    model,
                     module_name,
                     prefix,
                     input_basename,
@@ -159,6 +162,7 @@ impl LanguageBackend for WasmGenerator {
                 wasm_dir.join(&dts_filename),
                 render_wasm_dts(
                     api,
+                    model,
                     module_name,
                     input_basename,
                     &dts_filename,
@@ -211,6 +215,7 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::Handle
         | TypeRef::TypedHandle(_)
         | TypeRef::Struct(_)
+        | TypeRef::Interface(_)
         | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "i64",
         TypeRef::F32 => "f32",
@@ -248,7 +253,7 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
             "ptr + len in linear memory"
         }
         TypeRef::TypedHandle(_) | TypeRef::Handle => "opaque pointer",
-        TypeRef::Struct(_) => "opaque handle in linear memory",
+        TypeRef::Struct(_) | TypeRef::Interface(_) => "opaque handle in linear memory",
         TypeRef::Enum(_) => "variant discriminant",
         TypeRef::List(_) => "ptr + len in linear memory",
         TypeRef::Map(_, _) => "opaque handle in linear memory",
@@ -286,10 +291,17 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
+        TypeRef::Interface(n) => local_type_name(n).to_string(),
     }
 }
 
-fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str, emscripten: bool) -> String {
+fn render_wasm_readme(
+    api: &Api,
+    model: &BindingModel,
+    prefix: &str,
+    input_basename: &str,
+    emscripten: bool,
+) -> String {
     let mut out = render_prelude(CommentStyle::Xml, input_basename);
     out.push_str("# WeaveFFI Wasm (experimental)\n\n");
     if emscripten {
@@ -358,12 +370,15 @@ fn render_wasm_readme(api: &Api, prefix: &str, input_basename: &str, emscripten:
     out.push_str("export the following functions:\n\n");
     out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");
+    out.push_str("\nWrappers of functions declared `throws` raise the declaring module's typed\n");
+    out.push_str("error class (a `WeaveFFIError` subclass with a per-code subclass, such as\n");
+    out.push_str("`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only\n");
+    out.push_str("for producer panics and marshalling failures.\n");
 
     render_unsupported_section(&mut out, api);
 
     if !api.modules.is_empty() {
-        let model = BindingModel::build(api, prefix);
-        render_api_reference(&mut out, api, &model);
+        render_api_reference(&mut out, api, model);
     }
 
     out.push('\n');
@@ -408,10 +423,21 @@ fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
         out.push_str(&format!("\n### Module: `{}`\n", module.name));
         let mb = by_path[module.name.as_str()];
 
+        if let Some(eb) = mb.error.as_ref().filter(|eb| eb.declared_here) {
+            render_error_ref(out, eb);
+        }
+
         if !mb.functions.is_empty() {
             out.push_str("\n#### Functions\n");
             for f in &mb.functions {
                 render_function_ref(out, f);
+            }
+        }
+
+        if !mb.interfaces.is_empty() {
+            out.push_str("\n#### Interfaces\n");
+            for i in &mb.interfaces {
+                render_interface_ref(out, i);
             }
         }
 
@@ -432,6 +458,54 @@ fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
             }
         }
     }
+}
+
+/// Document a module's declared error domain: the JS class hierarchy it
+/// generates and the stable ABI code of each subclass.
+fn render_error_ref(out: &mut String, eb: &ErrorBinding) {
+    out.push_str(&format!("\n#### Error Domain: `{}`\n\n", eb.type_name));
+    out.push_str(&format!(
+        "Throwing wrappers in this module raise `{}` (a `{ERROR_BRAND}` subclass); \
+         each code below is its own subclass carrying the stable `code`.\n\n",
+        eb.type_name
+    ));
+    out.push_str("| Class | Code | Default Message |\n");
+    out.push_str("|-------|------|-----------------|\n");
+    for c in &eb.codes {
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} |\n",
+            js_code_class_name(&c.name),
+            c.value,
+            c.message
+        ));
+    }
+}
+
+/// Document one interface: an opaque handle wrapped by a JS class, with the
+/// member entry points listed at the ABI level like free functions.
+fn render_interface_ref(out: &mut String, i: &InterfaceBinding) {
+    out.push_str(&format!("\n##### `{}`\n\n", i.name));
+    if let Some(doc) = &i.doc {
+        out.push_str(doc);
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors \
+         return an owned handle; methods pass the handle as the implicit leading `self` \
+         argument; `free()` releases the handle via the destroy symbol.\n",
+    );
+    for f in i
+        .constructors
+        .iter()
+        .chain(i.methods.iter())
+        .chain(i.statics.iter())
+    {
+        render_function_ref(out, f);
+    }
+    out.push_str(&format!(
+        "\n##### `{}`\n\nReleases the object reference. Called by the wrapper's `free()`.\n",
+        i.destroy_symbol
+    ));
 }
 
 fn render_function_ref(out: &mut String, f: &FnBinding) {
@@ -595,11 +669,21 @@ fn api_deep_any(api: &Api, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
             _ => false,
         }
     }
+    fn fn_any(f: &weaveffi_ir::ir::Function, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
+        f.params.iter().any(|p| deep(&p.ty, pred))
+            || f.returns.as_ref().is_some_and(|r| deep(r, pred))
+    }
     fn module_any(m: &Module, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
-        m.functions.iter().any(|f| {
-            f.params.iter().any(|p| deep(&p.ty, pred))
-                || f.returns.as_ref().is_some_and(|r| deep(r, pred))
-        }) || m
+        m.functions.iter().any(|f| fn_any(f, pred))
+            // Interface members marshal exactly like free functions.
+            || m.interfaces.iter().any(|i| {
+                i.constructors
+                    .iter()
+                    .chain(i.methods.iter())
+                    .chain(i.statics.iter())
+                    .any(|f| fn_any(f, pred))
+            })
+            || m
             .structs
             .iter()
             .any(|s| s.fields.iter().any(|f| deep(&f.ty, pred)))
@@ -717,7 +801,7 @@ fn emit_stage_input(
             args.push(format!("{tmp}_l"));
             cleanup.push(format!("wasm.weaveffi_dealloc({tmp}_p, {tmp}_l);"));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             args.push(format!("{value}._handle"));
         }
         TypeRef::Bool
@@ -736,7 +820,7 @@ fn emit_stage_input(
             args.push(js_arg_scalar(ty, value));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
                 args.push(format!("({value} ? {value}._handle : 0)"));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -858,7 +942,7 @@ fn emit_stage_list(
                 "for (const [ep, es] of {tmp}_ep) wasm.weaveffi_dealloc(ep, es);"
             ));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             w.block("{", "}", |w| {
                 w.line("const dv = new DataView(wasm.memory.buffer);");
                 w.line(format!("for (let i = 0; i < {tmp}_n; i++) dv.setInt32({tmp}_base + i * 4, {tmp}_arr[i]._handle, true);"));
@@ -918,6 +1002,16 @@ fn emit_read_list_into(
                 ));
             });
         }
+        TypeRef::Interface(name) => {
+            let cls = local_type_name(name);
+            w.line(format!("const {target} = [];"));
+            w.block("{", "}", |w| {
+                w.line("const dv = new DataView(wasm.memory.buffer);");
+                w.line(format!(
+                    "for (let i = 0; i < {len}; i++) {target}.push({cls}._wrap(dv.getInt32({base} + i * 4, true)));"
+                ));
+            });
+        }
         scalar => {
             w.line(format!("const {target} = [];"));
             let elem = wasm_read_scalar_elem(scalar, "dv", base, "i");
@@ -956,8 +1050,9 @@ fn emit_read_map_into(
 }
 
 /// Emit the body that invokes `symbol` with the already-staged `in_args`, runs
-/// `cleanup`, checks the error slot (when `with_err`), and decodes/returns the
-/// idiomatic value for `ret`. Assumes `wasm` is in scope at `indent`.
+/// `cleanup`, routes the error slot through the `checker` helper (when
+/// `Some`), and decodes/returns the idiomatic value for `ret`. Assumes `wasm`
+/// is in scope at `indent`.
 fn emit_return_decode(
     out: &mut String,
     indent: &str,
@@ -965,7 +1060,7 @@ fn emit_return_decode(
     symbol: &str,
     in_args: &[String],
     cleanup: &[String],
-    with_err: bool,
+    checker: Option<&str>,
 ) {
     // Classify which trailing out-slots the return needs.
     let unwrapped = match ret {
@@ -991,7 +1086,7 @@ fn emit_return_decode(
         call_args.push("_vp".to_string());
         call_args.push("_lp".to_string());
     }
-    if with_err {
+    if checker.is_some() {
         w.line("const _err = _allocErr(wasm);");
         call_args.push("_err".to_string());
     }
@@ -1007,8 +1102,8 @@ fn emit_return_decode(
     for stmt in cleanup {
         w.line(stmt);
     }
-    if with_err {
-        w.line("_checkErr(wasm, _err);");
+    if let Some(checker) = checker {
+        w.line(format!("{checker}(wasm, _err);"));
         w.line("_freeErr(wasm, _err);");
     }
     out.push_str(&w.finish());
@@ -1081,6 +1176,10 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
                 let cls = local_type_name(name);
                 w.line(format!("return {r} === 0 ? null : new {cls}(wasm, {r});"));
             }
+            TypeRef::Interface(name) => {
+                let cls = local_type_name(name);
+                w.line(format!("return {r} === 0 ? null : {cls}._wrap({r});"));
+            }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 w.line(format!("return _takeCStr(wasm, {r});"));
             }
@@ -1099,6 +1198,10 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
             }
         },
         TypeRef::Iterator(_) => unreachable!("iterator returns handled separately"),
+        TypeRef::Interface(name) => {
+            let cls = local_type_name(name);
+            w.line(format!("return {cls}._wrap({r});"));
+        }
     }
     out.push_str(&w.finish());
 }
@@ -1112,20 +1215,23 @@ fn ts_type_for(ty: &TypeRef) -> String {
         | TypeRef::U16
         | TypeRef::U32
         | TypeRef::F32
-        | TypeRef::I64
         | TypeRef::F64 => "number".into(),
         TypeRef::Bool => "boolean".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         // Bytes cross the boundary as plain `Uint8Array` copies; the Node-only
         // `Buffer` type does not exist in browsers and is never returned here.
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Uint8Array".into(),
-        TypeRef::U64 | TypeRef::Handle => "bigint".into(),
-        // Structs, enums, and typed handles surface as bare local TS names; a
-        // cross-module typed handle (resolved to e.g. `kv.Store`) must name the
-        // local `Store`, not the qualified IR name which is undeclared here.
-        TypeRef::TypedHandle(name) | TypeRef::Enum(name) | TypeRef::Struct(name) => {
-            local_type_name(name).to_string()
-        }
+        // Every 64-bit integer crosses the JS boundary as a BigInt: wasm i64
+        // results arrive as BigInt and i64 arguments are BigInt-coerced.
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "bigint".into(),
+        // Structs, enums, typed handles, and interfaces surface as bare local
+        // TS names; a cross-module reference (resolved to e.g. `kv.Store`)
+        // must name the local `Store`, not the qualified IR name which is
+        // undeclared here.
+        TypeRef::TypedHandle(name)
+        | TypeRef::Enum(name)
+        | TypeRef::Struct(name)
+        | TypeRef::Interface(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
             let inner_ts = ts_type_for(inner);
@@ -1150,11 +1256,12 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 }
 
 /// Emits a JSDoc block for a function: function doc, `@param name desc` for
-/// each documented parameter, and an optional trailing tag list.
+/// each documented parameter (named as the camelCase JS parameter), and an
+/// optional trailing tag list.
 fn emit_fn_doc(
     out: &mut String,
     doc: &Option<String>,
-    params: &[weaveffi_ir::ir::Param],
+    params: &[ParamBinding],
     indent: &str,
     extra_tags: &[String],
 ) {
@@ -1182,7 +1289,7 @@ fn emit_fn_doc(
             }
             let mut lines = pdoc.lines();
             if let Some(first) = lines.next() {
-                w.line(format!(" * @param {} {}", p.name, first));
+                w.line(format!(" * @param {} {}", js_param_name(p), first));
             }
             for line in lines {
                 if line.is_empty() {
@@ -1200,8 +1307,100 @@ fn emit_fn_doc(
     out.push_str(&w.finish());
 }
 
+// ── Naming and error-surface policy ──
+
+/// The lowerCamelCase JS name a callable is exposed under (`list_keys` becomes
+/// `listKeys`). Functions are namespaced by module object, so exported names
+/// never carry a module prefix in the first place.
+fn js_fn_name(f: &FnBinding) -> String {
+    f.name.to_lower_camel_case()
+}
+
+/// The camelCase JS spelling of one parameter (`ttl_seconds` becomes
+/// `ttlSeconds`).
+fn js_param_name(p: &ParamBinding) -> String {
+    p.name.to_lower_camel_case()
+}
+
+/// The JS class name for one error code: plain PascalCase with no forced
+/// suffix (`KeyNotFound`, not `KeyNotFoundError`). Code names are validated
+/// to be globally unique across domains, so the flat name cannot collide.
+fn js_code_class_name(name: &str) -> String {
+    weaveffi_core::errors::pascal(name)
+}
+
+/// `_{typeName}From` (lowerCamel): builds the domain error matching an ABI
+/// code, e.g. `_kvErrorFrom`.
+fn js_error_factory_name(eb: &ErrorBinding) -> String {
+    format!("_{}From", eb.type_name.to_lower_camel_case())
+}
+
+/// `_check{TypeName}`: throws the domain error for a non-zero out-err slot,
+/// e.g. `_checkKvError`.
+fn js_error_checker_name(eb: &ErrorBinding) -> String {
+    format!("_check{}", eb.type_name)
+}
+
+/// The error-check helper a callable's out-err slot routes through: the
+/// module domain's typed checker when the callable throws, the generic
+/// `_checkErr` (plain `WeaveFFIError`; panics and marshalling failures only)
+/// otherwise.
+fn js_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
+    match error {
+        Some(eb) if f.throws => js_error_checker_name(eb),
+        _ => "_checkErr".to_string(),
+    }
+}
+
+/// The rejection factory a throwing async callable stores in its context so
+/// the completion callback maps domain codes to the typed error, or `None`
+/// for non-throwing callables (which reject with the generic brand error).
+fn js_err_factory(f: &FnBinding, error: Option<&ErrorBinding>) -> Option<String> {
+    match error {
+        Some(eb) if f.throws => Some(js_error_factory_name(eb)),
+        _ => None,
+    }
+}
+
+/// Escape a string for embedding in a double-quoted JS literal.
+fn js_str_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// How a generated JS callable is declared: as a property of a module object
+/// literal (`name() {...},`), as an instance member of an interface class
+/// (`name() {...}`), or as a static member (`static name() {...}`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsDecl {
+    /// Object-literal property (module objects); comma-terminated.
+    Object,
+    /// Class instance method; no terminator comma.
+    Method,
+    /// Class static method; no terminator comma.
+    Static,
+}
+
+impl JsDecl {
+    /// The declaration keyword prefix (`static ` for statics).
+    fn prefix(self) -> &'static str {
+        match self {
+            JsDecl::Static => "static ",
+            _ => "",
+        }
+    }
+
+    /// The block terminator (object-literal members carry a trailing comma).
+    fn close(self) -> &'static str {
+        match self {
+            JsDecl::Object => "},",
+            _ => "}",
+        }
+    }
+}
+
 fn render_wasm_dts(
     api: &Api,
+    model: &BindingModel,
     module_name: &str,
     input_basename: &str,
     filename: &str,
@@ -1210,10 +1409,14 @@ fn render_wasm_dts(
     let pascal_name = module_name.to_upper_camel_case();
     let interface_name = format!("{pascal_name}Module");
     let load_fn = format!("load{pascal_name}");
+    let by_path: HashMap<&str, &ModuleBinding> =
+        model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str("// Generated TypeScript declarations for WeaveFFI Wasm bindings\n\n");
 
-    for (m, _path) in walk_modules_with_path(&api.modules) {
+    emit_dts_error_classes(&mut out, model);
+
+    for (m, path) in walk_modules_with_path(&api.modules) {
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
@@ -1243,11 +1446,20 @@ fn render_wasm_dts(
             }
             out.push_str("}>;\n\n");
         }
+
+        if let Some(mb) = by_path.get(path.as_str()) {
+            for i in &mb.interfaces {
+                emit_dts_interface_class(&mut out, mb, i, emscripten);
+            }
+        }
     }
 
     out.push_str(&format!("export interface {interface_name} {{\n"));
-    let all_mods = walk_modules(&api.modules).collect::<Vec<_>>();
-    if all_mods.iter().any(|m| !m.functions.is_empty()) {
+    if model
+        .modules
+        .iter()
+        .any(|m| !m.functions.is_empty() || !m.interfaces.is_empty())
+    {
         // In Emscripten mode `_raw` is the loader's export-binding object, a
         // plain record, not a `WebAssembly.Exports`.
         if emscripten {
@@ -1256,7 +1468,7 @@ fn render_wasm_dts(
             out.push_str("  _raw: WebAssembly.Exports;\n");
         }
         for module in &api.modules {
-            render_dts_module_interface(&mut out, module, &module.name, "  ", emscripten);
+            render_dts_module_interface(&mut out, module, &module.name, &by_path, "  ", emscripten);
         }
     }
     out.push_str("}\n\n");
@@ -1312,59 +1524,356 @@ fn emit_dts_rich_enum_class(out: &mut String, e: &EnumDef) {
     out.push_str(&w.finish());
 }
 
+/// The TypeScript parameter list for one callable: camelCase names typed by
+/// [`ts_type_for`].
+fn dts_params(f: &FnBinding) -> String {
+    f.params
+        .iter()
+        .map(|p| format!("{}: {}", js_param_name(p), ts_type_for(&p.ty)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The TypeScript return annotation for one callable (`Promise<...>` when
+/// async, `void` for no return).
+fn dts_ret(f: &FnBinding) -> String {
+    let base = f
+        .ret
+        .as_ref()
+        .map(ts_type_for)
+        .unwrap_or_else(|| "void".into());
+    if f.is_async {
+        format!("Promise<{base}>")
+    } else {
+        base
+    }
+}
+
+/// The JSDoc tag list for one callable: `@deprecated` first when present,
+/// then the `@throws` tag matching the throws split (the typed domain error
+/// for throwing callables, the generic brand error otherwise).
+fn dts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
+    let mut tags = Vec::new();
+    if let Some(msg) = &f.deprecated {
+        tags.push(format!("@deprecated {msg}"));
+    }
+    match error {
+        Some(eb) if f.throws => tags.push(format!(
+            "@throws {{{}}} on a domain error code",
+            eb.type_name
+        )),
+        _ => tags.push(format!(
+            "@throws {{{ERROR_BRAND}}} if the native call fails"
+        )),
+    }
+    tags
+}
+
 fn render_dts_module_interface(
     out: &mut String,
     m: &Module,
     module_path: &str,
+    by_path: &HashMap<&str, &ModuleBinding>,
     indent: &str,
     emscripten: bool,
 ) {
-    let has_content = !m.functions.is_empty()
-        || m.modules
+    fn tree_has_content(m: &Module, path: &str, by_path: &HashMap<&str, &ModuleBinding>) -> bool {
+        let here = by_path
+            .get(path)
+            .is_some_and(|mb| !mb.functions.is_empty() || !mb.interfaces.is_empty());
+        here || m
+            .modules
             .iter()
-            .any(|sub| !sub.functions.is_empty() || !sub.modules.is_empty());
-    if !has_content {
+            .any(|sub| tree_has_content(sub, &format!("{path}_{}", sub.name), by_path))
+    }
+    if !tree_has_content(m, module_path, by_path) {
         return;
     }
+    let mb = by_path[module_path];
+    let error = mb.error.as_ref();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.block(format!("{}: {{", m.name), "};", |w| {
         let inner = w.indent_str();
-        for func in &m.functions {
+        for f in &mb.functions {
             // Async functions are throwing stubs in Emscripten mode; omitting
             // them here makes the gap a compile-time error for TS consumers.
-            if emscripten && func.r#async {
+            if emscripten && f.is_async {
                 continue;
             }
-            let params: Vec<String> = func
-                .params
-                .iter()
-                .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
-                .collect();
-            let base_ret = match &func.returns {
-                Some(ty) => ts_type_for(ty),
-                None => "void".into(),
-            };
-            let ret = if func.r#async {
-                format!("Promise<{base_ret}>")
-            } else {
-                base_ret
-            };
-            let mut tags = vec!["@throws {Error} if the native call fails".to_string()];
-            if let Some(msg) = &func.deprecated {
-                tags.insert(0, format!("@deprecated {msg}"));
-            }
             let mut doc = String::new();
-            emit_fn_doc(&mut doc, &func.doc, &func.params, &inner, &tags);
+            emit_fn_doc(&mut doc, &f.doc, &f.params, &inner, &dts_fn_tags(f, error));
             w.raw(doc);
-            w.line(format!("{}({}): {};", func.name, params.join(", "), ret));
+            w.line(format!(
+                "{}({}): {};",
+                js_fn_name(f),
+                dts_params(f),
+                dts_ret(f)
+            ));
+        }
+        // The module object carries the interface class itself, so statics,
+        // factories, and `new` are reachable as `api.kv.Store...`.
+        for i in &mb.interfaces {
+            w.line(format!("{}: typeof {};", i.name, i.name));
         }
         for sub in &m.modules {
             let sub_path = format!("{module_path}_{}", sub.name);
             let mut tmp = String::new();
-            render_dts_module_interface(&mut tmp, sub, &sub_path, &inner, emscripten);
+            render_dts_module_interface(&mut tmp, sub, &sub_path, by_path, &inner, emscripten);
             w.raw(tmp);
         }
     });
+    out.push_str(&w.finish());
+}
+
+/// Emit the TypeScript declarations for the error surface: the generic brand
+/// error, then one domain class per declaring module with its per-code
+/// subclasses (each carrying a literal-typed `CODE`) and the static aliases
+/// hung on the domain class.
+fn emit_dts_error_classes(out: &mut String, model: &BindingModel) {
+    let mut w = CodeWriter::two_space();
+    w.line("/** Base error for WeaveFFI failures: domain errors extend it, and it is");
+    w.line(" * thrown directly for unknown codes, marshalling failures, and producer");
+    w.line(" * panics. Carries the stable ABI `code`. */");
+    w.block(
+        format!("export declare class {ERROR_BRAND} extends Error {{"),
+        "}",
+        |w| {
+            w.line("constructor(code: number, message?: string);");
+            w.line("code: number;");
+        },
+    );
+    w.blank();
+    for m in &model.modules {
+        let Some(eb) = m.error.as_ref().filter(|eb| eb.declared_here) else {
+            continue;
+        };
+        let domain = &eb.type_name;
+        w.line(format!(
+            "/** Base error for the `{}` module's error domain. */",
+            m.path
+        ));
+        w.block(
+            format!("export declare class {domain} extends {ERROR_BRAND} {{"),
+            "}",
+            |w| {
+                for c in &eb.codes {
+                    let class = js_code_class_name(&c.name);
+                    w.line(format!("static readonly {class}: typeof {class};"));
+                }
+            },
+        );
+        w.blank();
+        for c in &eb.codes {
+            let class = js_code_class_name(&c.name);
+            let doc = c
+                .doc
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .or_else(|| Some(c.message.clone()));
+            w.doc(&doc, DocCommentStyle::Javadoc);
+            w.block(
+                format!("export declare class {class} extends {domain} {{"),
+                "}",
+                |w| {
+                    w.line("constructor(message?: string);");
+                    w.line(format!("static readonly CODE: {};", c.value));
+                },
+            );
+            w.blank();
+        }
+    }
+    out.push_str(&w.finish());
+}
+
+/// Emit the TypeScript declaration for an interface: an ambient class whose
+/// runtime binding is reached through the module object (`api.kv.Store`). The
+/// canonical `new` constructor declares `constructor`; other constructors and
+/// statics are static members; async members are omitted in Emscripten mode
+/// (they are throwing stubs at runtime).
+fn emit_dts_interface_class(
+    out: &mut String,
+    mb: &ModuleBinding,
+    i: &InterfaceBinding,
+    emscripten: bool,
+) {
+    let error = mb.error.as_ref();
+    let mut w = CodeWriter::two_space();
+    w.doc(&i.doc, DocCommentStyle::Javadoc);
+    w.block(format!("export declare class {} {{", i.name), "}", |w| {
+        let inner = w.indent_str();
+        if let Some(c) = i.constructors.iter().find(|c| c.name == "new") {
+            let mut doc = String::new();
+            emit_fn_doc(&mut doc, &c.doc, &c.params, &inner, &dts_fn_tags(c, error));
+            w.raw(doc);
+            w.line(format!("constructor({});", dts_params(c)));
+        }
+        for c in i.constructors.iter().filter(|c| c.name != "new") {
+            let mut doc = String::new();
+            emit_fn_doc(&mut doc, &c.doc, &c.params, &inner, &dts_fn_tags(c, error));
+            w.raw(doc);
+            w.line(format!(
+                "static {}({}): {};",
+                js_fn_name(c),
+                dts_params(c),
+                dts_ret(c)
+            ));
+        }
+        for f in &i.methods {
+            if emscripten && f.is_async {
+                continue;
+            }
+            let mut doc = String::new();
+            emit_fn_doc(&mut doc, &f.doc, &f.params, &inner, &dts_fn_tags(f, error));
+            w.raw(doc);
+            w.line(format!(
+                "{}({}): {};",
+                js_fn_name(f),
+                dts_params(f),
+                dts_ret(f)
+            ));
+        }
+        for f in &i.statics {
+            if emscripten && f.is_async {
+                continue;
+            }
+            let mut doc = String::new();
+            emit_fn_doc(&mut doc, &f.doc, &f.params, &inner, &dts_fn_tags(f, error));
+            w.raw(doc);
+            w.line(format!(
+                "static {}({}): {};",
+                js_fn_name(f),
+                dts_params(f),
+                dts_ret(f)
+            ));
+        }
+        w.line("/** Releases the producer-owned handle exactly once. */");
+        w.line("free(): void;");
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit the module-scope error classes: the generic `WeaveFFIError` base
+/// (unknown codes, marshalling failures, panics), then one domain class per
+/// declaring module (`class KvError extends WeaveFFIError`) with one subclass
+/// per code carrying its stable `CODE` and default message. Each code class
+/// is also aliased onto its domain class (`KvError.KeyNotFound`), which stays
+/// unambiguous even if two domains were to share a code spelling.
+fn emit_js_error_classes(out: &mut String, model: &BindingModel) {
+    let mut w = CodeWriter::two_space();
+    w.line("/** Base error for WeaveFFI failures: domain errors extend it, and it is");
+    w.line(" * thrown directly for unknown codes, marshalling failures, and producer");
+    w.line(" * panics. Carries the stable ABI `code`. */");
+    w.block(format!("export class {ERROR_BRAND} extends Error {{"), "}", |w| {
+        w.block("constructor(code, message) {", "}", |w| {
+            w.line("super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);");
+            w.line("this.name = new.target.name;");
+            w.line("this.code = code;");
+        });
+    });
+    w.blank();
+
+    for m in &model.modules {
+        let Some(eb) = m.error.as_ref().filter(|eb| eb.declared_here) else {
+            continue;
+        };
+        let domain = &eb.type_name;
+        w.line(format!(
+            "/** Base error for the `{}` module's error domain. */",
+            m.path
+        ));
+        w.line(format!("export class {domain} extends {ERROR_BRAND} {{}}"));
+        w.blank();
+        for c in &eb.codes {
+            let class = js_code_class_name(&c.name);
+            let message = js_str_literal(&c.message);
+            let doc = c
+                .doc
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .unwrap_or(&c.message);
+            for line in doc.lines() {
+                w.line(format!("// {line}"));
+            }
+            w.block(
+                format!("export class {class} extends {domain} {{"),
+                "}",
+                |w| {
+                    w.block(
+                        format!("constructor(message = \"{message}\") {{"),
+                        "}",
+                        |w| {
+                            w.line(format!("super({}, message);", c.value));
+                        },
+                    );
+                },
+            );
+            w.line(format!("{class}.CODE = {};", c.value));
+            w.line(format!("{domain}.{class} = {class};"));
+            w.blank();
+        }
+
+        let table = js_error_code_table_name(eb);
+        let factory = js_error_factory_name(eb);
+        w.block(format!("const {table} = Object.freeze({{"), "});", |w| {
+            for c in &eb.codes {
+                w.line(format!("{}: {},", c.value, js_code_class_name(&c.name)));
+            }
+        });
+        w.blank();
+        w.line(format!(
+            "// Build the {domain} subclass matching `code`, or a generic"
+        ));
+        w.line(format!(
+            "// {ERROR_BRAND} for codes outside the domain (panics, marshalling)."
+        ));
+        w.block(format!("function {factory}(code, message) {{"), "}", |w| {
+            w.line(format!("const _cls = {table}[code];"));
+            w.line(format!(
+                "if (!_cls) return new {ERROR_BRAND}(code, message);"
+            ));
+            w.line("return message ? new _cls(message) : new _cls();");
+        });
+        w.blank();
+    }
+    out.push_str(&w.finish());
+}
+
+/// `_{TYPE_NAME}_CODES`: the frozen code-to-class table for one domain.
+fn js_error_code_table_name(eb: &ErrorBinding) -> String {
+    format!("_{}_CODES", eb.type_name.to_shouty_snake_case())
+}
+
+/// Emit one `_check{Domain}(wasm, errPtr)` helper per declaring module:
+/// identical to the generic `_checkErr` except the thrown error is built by
+/// the domain's factory, so domain codes surface as their typed subclasses.
+fn emit_js_error_checkers(out: &mut String, model: &BindingModel) {
+    let mut w = CodeWriter::two_space();
+    for m in &model.modules {
+        let Some(eb) = m.error.as_ref().filter(|eb| eb.declared_here) else {
+            continue;
+        };
+        let checker = js_error_checker_name(eb);
+        let factory = js_error_factory_name(eb);
+        w.line(format!(
+            "// Throw the `{}` domain error (and free the slot) if the error slot",
+            eb.type_name
+        ));
+        w.line("// carries a non-zero code.");
+        w.block(format!("function {checker}(wasm, errPtr) {{"), "}", |w| {
+            w.line("const dv = new DataView(wasm.memory.buffer);");
+            w.line("const code = dv.getInt32(errPtr, true);");
+            w.block("if (code !== 0) {", "}", |w| {
+                w.line("const msgPtr = dv.getUint32(errPtr + 4, true);");
+                w.line("const msg = _readCStr(wasm, msgPtr) || '';");
+                w.line("wasm.weaveffi_error_clear(errPtr);");
+                w.line("wasm.weaveffi_dealloc(errPtr, 8);");
+                w.line(format!("throw {factory}(code, msg);"));
+            });
+        });
+        w.blank();
+    }
     out.push_str(&w.finish());
 }
 
@@ -1406,7 +1915,7 @@ fn collect_called_symbols(model: &BindingModel) -> Vec<String> {
                 push_unique(&mut syms, &b.build_symbol);
             }
         }
-        for f in &m.functions {
+        for f in m.callables() {
             match &f.shape {
                 CallShape::Iterator(it) => {
                     push_unique(&mut syms, &f.c_base);
@@ -1417,12 +1926,16 @@ fn collect_called_symbols(model: &BindingModel) -> Vec<String> {
                 CallShape::Sync(_) => push_unique(&mut syms, &f.c_base),
             }
         }
+        for i in &m.interfaces {
+            push_unique(&mut syms, &i.destroy_symbol);
+        }
     }
     syms
 }
 
 fn render_wasm_js_stub(
     api: &Api,
+    model: &BindingModel,
     module_name: &str,
     prefix: &str,
     input_basename: &str,
@@ -1432,14 +1945,19 @@ fn render_wasm_js_stub(
     let pascal_name = module_name.to_upper_camel_case();
     let load_fn = format!("load{pascal_name}");
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    let model = BindingModel::build(api, prefix);
     let by_path: HashMap<&str, &ModuleBinding> =
         model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
 
-    let has_functions = model.modules.iter().any(|m| !m.functions.is_empty());
+    // Interface members marshal like free functions, so every callable counts.
+    let has_functions = model.modules.iter().any(|m| m.callables().next().is_some());
     // In Emscripten mode async functions are throwing stubs, so none of the
     // trampoline machinery (or its helpers) is emitted.
-    let has_async = !emscripten && model.functions().any(|(_, f)| f.is_async);
+    let has_async = !emscripten
+        && model
+            .modules
+            .iter()
+            .flat_map(ModuleBinding::callables)
+            .any(|f| f.is_async);
     // Opaque-object wrappers (structs and rich/algebraic enums) construct via a
     // fallible `*_new`/`*_create` that threads an `out_err`, so they need the
     // error helpers even in a module that declares no free functions.
@@ -1476,6 +1994,10 @@ fn render_wasm_js_stub(
     out.push_str("//   Bytes     -> i32 data pointer + i32 length (out_len for returns)\n");
     out.push_str("//   Optionals -> null handle / null pointer (0); scalars boxed by pointer\n");
     out.push('\n');
+
+    if needs_err {
+        emit_js_error_classes(&mut out, model);
+    }
 
     if needs_strings {
         out.push_str("const _enc = new TextEncoder();\n");
@@ -1550,6 +2072,9 @@ fn render_wasm_js_stub(
         out.push_str("  return ptr;\n");
         out.push_str("}\n\n");
         out.push_str("// Throw (and free the slot) if the error slot carries a non-zero code.\n");
+        out.push_str("// Non-throwing wrappers route here: a non-zero code can only be a\n");
+        out.push_str("// producer panic or a marshalling failure, surfaced as the generic\n");
+        out.push_str(&format!("// {ERROR_BRAND}.\n"));
         out.push_str("function _checkErr(wasm, errPtr) {\n");
         out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
         out.push_str("  const code = dv.getInt32(errPtr, true);\n");
@@ -1558,24 +2083,29 @@ fn render_wasm_js_stub(
         out.push_str("    const msg = _readCStr(wasm, msgPtr) || '';\n");
         out.push_str("    wasm.weaveffi_error_clear(errPtr);\n");
         out.push_str("    wasm.weaveffi_dealloc(errPtr, 8);\n");
-        out.push_str("    throw new Error(`WeaveFFI error ${code}: ${msg}`);\n");
+        out.push_str(&format!("    throw new {ERROR_BRAND}(code, msg);\n"));
         out.push_str("  }\n");
         out.push_str("}\n\n");
         out.push_str("// Release an error slot on the success path.\n");
         out.push_str("function _freeErr(wasm, errPtr) {\n");
         out.push_str("  wasm.weaveffi_dealloc(errPtr, 8);\n");
         out.push_str("}\n\n");
+        emit_js_error_checkers(&mut out, model);
         if has_async {
             out.push_str("// Throw if a borrowed (producer-owned) error carries a non-zero\n");
             out.push_str("// code. Used by async callbacks: the producer owns and frees the\n");
             out.push_str("// error struct, so the slot is read but never deallocated here.\n");
-            out.push_str("function _checkErrRef(wasm, errPtr) {\n");
+            out.push_str("// `mkErr` maps domain codes for throwing callables; without it the\n");
+            out.push_str(&format!("// generic {ERROR_BRAND} is thrown.\n"));
+            out.push_str("function _checkErrRef(wasm, errPtr, mkErr) {\n");
             out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
             out.push_str("  const code = dv.getInt32(errPtr, true);\n");
             out.push_str("  if (code === 0) return;\n");
             out.push_str("  const msgPtr = dv.getUint32(errPtr + 4, true);\n");
             out.push_str("  const msg = _readCStr(wasm, msgPtr) || '';\n");
-            out.push_str("  throw new Error(`WeaveFFI error ${code}: ${msg}`);\n");
+            out.push_str(&format!(
+                "  throw mkErr ? mkErr(code, msg) : new {ERROR_BRAND}(code, msg);\n"
+            ));
             out.push_str("}\n\n");
         }
     }
@@ -1718,7 +2248,7 @@ fn render_wasm_js_stub(
                     format!("{prefix}_error_clear"),
                 ));
             }
-            bindings.extend(collect_called_symbols(&model).into_iter().map(|s| {
+            bindings.extend(collect_called_symbols(model).into_iter().map(|s| {
                 let export = s.clone();
                 (s, export)
             }));
@@ -1746,7 +2276,7 @@ fn render_wasm_js_stub(
             out.push_str("    if (!ctx) return;\n");
             out.push_str("    _asyncContexts.delete(ctxId);\n");
             out.push_str("    try {\n");
-            out.push_str("      if (errPtr !== 0) _checkErrRef(wasm, errPtr);\n");
+            out.push_str("      if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);\n");
             out.push_str(
                 "      ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);\n",
             );
@@ -1756,7 +2286,7 @@ fn render_wasm_js_stub(
             out.push_str("  }\n\n");
 
             let mut trampolines: Vec<(String, Vec<&'static str>)> = Vec::new();
-            for (_m, f) in model.functions() {
+            for f in model.modules.iter().flat_map(ModuleBinding::callables) {
                 if f.is_async {
                     let params = async_cb_wasm_params(f.ret.as_ref());
                     let key = params.join("_");
@@ -1775,6 +2305,15 @@ fn render_wasm_js_stub(
             out.push('\n');
         }
 
+        // Interface classes close over the loaded `wasm` instance (and the
+        // async machinery above), so they live inside the loader rather than
+        // at module scope like the struct wrappers.
+        for module in &model.modules {
+            for i in &module.interfaces {
+                emit_interface_class(&mut out, module, i, "  ", emscripten);
+            }
+        }
+
         out.push_str("  return {\n");
         out.push_str("    _raw: wasm,\n");
         for module in &api.modules {
@@ -1788,8 +2327,8 @@ fn render_wasm_js_stub(
     out
 }
 
-/// Whether a module subtree exposes anything (functions or struct factories),
-/// so empty namespace objects are not emitted.
+/// Whether a module subtree exposes anything (functions, interface classes,
+/// or struct factories), so empty namespace objects are not emitted.
 fn module_tree_has_content(
     m: &Module,
     path: &str,
@@ -1797,6 +2336,7 @@ fn module_tree_has_content(
 ) -> bool {
     let here = by_path.get(path).is_some_and(|mb| {
         !mb.functions.is_empty()
+            || !mb.interfaces.is_empty()
             || !mb.structs.is_empty()
             || !mb.listeners.is_empty()
             || mb.enums.iter().any(|e| e.is_rich())
@@ -1819,25 +2359,24 @@ fn render_js_module_object(
         return;
     }
     let mb = by_path[module_path];
+    let error = mb.error.as_ref();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.block(format!("{}: {{", m.name), "},", |w| {
         let inner = w.indent_str();
         for f in &mb.functions {
             let mut tmp = String::new();
-            match &f.shape {
-                CallShape::Iterator(ib) => {
-                    emit_js_iterator_function_wrapper(&mut tmp, f, ib, &inner)
-                }
-                _ if f.is_async && emscripten => emit_js_async_stub(&mut tmp, f, &inner),
-                _ if f.is_async => emit_js_async_function_wrapper(&mut tmp, f, &inner),
-                _ => emit_js_function_wrapper(&mut tmp, f, &inner),
-            }
+            emit_js_callable(&mut tmp, f, error, JsDecl::Object, None, &inner, emscripten);
             w.raw(tmp);
         }
         for l in &mb.listeners {
             let mut tmp = String::new();
             emit_js_listener_stub(&mut tmp, l, &inner);
             w.raw(tmp);
+        }
+        // The interface class itself is exposed on the module object, so
+        // factories, statics, and `instanceof` checks all reach it.
+        for i in &mb.interfaces {
+            w.line(format!("{}: {},", i.name, i.name));
         }
         for s in &mb.structs {
             let mut tmp = String::new();
@@ -1861,24 +2400,48 @@ fn render_js_module_object(
     out.push_str(&w.finish());
 }
 
+/// Emit one callable in the shape its [`CallShape`] and the mode call for:
+/// iterator members drain eagerly, async members return a `Promise` (or an
+/// explicit throwing stub in Emscripten mode), and everything else is a plain
+/// synchronous wrapper. `self_arg` threads the instance handle for interface
+/// methods; `error` is the module's effective domain for the throws split.
+fn emit_js_callable(
+    out: &mut String,
+    f: &FnBinding,
+    error: Option<&ErrorBinding>,
+    decl: JsDecl,
+    self_arg: Option<&str>,
+    indent: &str,
+    emscripten: bool,
+) {
+    match &f.shape {
+        CallShape::Iterator(ib) => {
+            emit_js_iterator_function_wrapper(out, f, ib, error, decl, self_arg, indent);
+        }
+        _ if f.is_async && emscripten => emit_js_async_stub(out, f, decl, indent),
+        _ if f.is_async => emit_js_async_function_wrapper(out, f, error, decl, self_arg, indent),
+        _ => emit_js_function_wrapper(out, f, error, decl, self_arg, indent),
+    }
+}
+
 /// Async functions are unsupported in Emscripten mode: the trampoline
 /// registration relies on `WebAssembly.Function` and a growable
 /// `__indirect_function_table`, neither of which an Emscripten module exposes
 /// portably. Each async entry point becomes an explicit stub that throws at
 /// call time, so the gap is impossible to miss from JS even though the
 /// `.d.ts` deliberately omits it (a compile-time error for TS users).
-fn emit_js_async_stub(out: &mut String, f: &FnBinding, indent: &str) {
-    let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+fn emit_js_async_stub(out: &mut String, f: &FnBinding, decl: JsDecl, indent: &str) {
+    let js_params: Vec<String> = f.params.iter().map(js_param_name).collect();
+    let name = js_fn_name(f);
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.block(
-        format!("{}({}) {{", f.name, js_params.join(", ")),
-        "},",
+        format!("{}{name}({}) {{", decl.prefix(), js_params.join(", ")),
+        decl.close(),
         |w| {
             w.line(format!(
-                "throw new Error(\"weaveffi: async function '{}' is not supported in \
+                "throw new Error(\"weaveffi: async function '{name}' is not supported in \
                  Emscripten mode; use the wasm32-unknown-unknown loader or a native \
-                 target\");",
-                f.name
+                 target\");"
             ));
         },
     );
@@ -1893,7 +2456,8 @@ fn emit_js_async_stub(out: &mut String, f: &FnBinding, indent: &str) {
 fn emit_js_listener_stub(out: &mut String, l: &ListenerBinding, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     for op in ["register", "unregister"] {
-        w.block(format!("{op}_{}() {{", l.name), "},", |w| {
+        let name = format!("{op}_{}", l.name).to_lower_camel_case();
+        w.block(format!("{name}() {{"), "},", |w| {
             w.line(format!(
                 "throw new Error(\"weaveffi: listener '{}' is not supported by the wasm \
                  target (single-threaded wasm has no producer thread to deliver events); use a \
@@ -1944,25 +2508,40 @@ fn emit_js_rich_enum_factory(out: &mut String, e: &EnumBinding, indent: &str) {
 
 /// Emit a synchronous function as a method `name(params) { ... }` at `indent`,
 /// staging idiomatic inputs, calling the C symbol, and decoding the return.
-fn emit_js_function_wrapper(out: &mut String, f: &FnBinding, indent: &str) {
+/// `self_arg` (an expression such as `this._handle`) becomes the implicit
+/// leading argument for interface methods; the checker selected by
+/// [`js_checker_name`] enforces the throws split on the out-err slot.
+fn emit_js_function_wrapper(
+    out: &mut String,
+    f: &FnBinding,
+    error: Option<&ErrorBinding>,
+    decl: JsDecl,
+    self_arg: Option<&str>,
+    indent: &str,
+) {
     let body = format!("{indent}  ");
-    let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    let js_params: Vec<String> = f.params.iter().map(js_param_name).collect();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
         w.line(format!("/** @deprecated {msg} */"));
     }
-    w.line(format!("{}({}) {{", f.name, js_params.join(", ")));
+    w.line(format!(
+        "{}{}({}) {{",
+        decl.prefix(),
+        js_fn_name(f),
+        js_params.join(", ")
+    ));
 
     let mut inner = String::new();
-    let mut args = Vec::new();
+    let mut args: Vec<String> = self_arg.iter().map(ToString::to_string).collect();
     let mut cleanup = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
         emit_stage_input(
             &mut inner,
             &body,
             &p.ty,
-            &p.name,
+            &js_param_name(p),
             &format!("a{i}"),
             &mut args,
             &mut cleanup,
@@ -1975,31 +2554,42 @@ fn emit_js_function_wrapper(out: &mut String, f: &FnBinding, indent: &str) {
         &f.c_base,
         &args,
         &cleanup,
-        true,
+        Some(&js_checker_name(f, error)),
     );
     w.raw(inner);
-    w.line("},");
+    w.line(decl.close());
     out.push_str(&w.finish());
 }
 
 /// Emit an iterator-returning function as a method that drains the iterator
-/// eagerly into a JS array (matching the `T[]` TypeScript shape).
+/// eagerly into a JS array (matching the `T[]` TypeScript shape). The acquire
+/// call routes through the throws-aware checker; `next` failures are always
+/// producer panics, so they stay on the generic checker.
 fn emit_js_iterator_function_wrapper(
     out: &mut String,
     f: &FnBinding,
     ib: &IteratorBinding,
+    error: Option<&ErrorBinding>,
+    decl: JsDecl,
+    self_arg: Option<&str>,
     indent: &str,
 ) {
     let body = format!("{indent}  ");
-    let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    let js_params: Vec<String> = f.params.iter().map(js_param_name).collect();
+    let checker = js_checker_name(f, error);
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
         w.line(format!("/** @deprecated {msg} */"));
     }
-    w.line(format!("{}({}) {{", f.name, js_params.join(", ")));
+    w.line(format!(
+        "{}{}({}) {{",
+        decl.prefix(),
+        js_fn_name(f),
+        js_params.join(", ")
+    ));
 
-    let mut args = Vec::new();
+    let mut args: Vec<String> = self_arg.iter().map(ToString::to_string).collect();
     let mut cleanup = Vec::new();
     let mut staged = String::new();
     for (i, p) in f.params.iter().enumerate() {
@@ -2007,7 +2597,7 @@ fn emit_js_iterator_function_wrapper(
             &mut staged,
             &body,
             &p.ty,
-            &p.name,
+            &js_param_name(p),
             &format!("a{i}"),
             &mut args,
             &mut cleanup,
@@ -2029,7 +2619,7 @@ fn emit_js_iterator_function_wrapper(
         for stmt in &cleanup {
             w.line(stmt);
         }
-        w.line("_checkErr(wasm, _err);");
+        w.line(format!("{checker}(wasm, _err);"));
         w.line("_freeErr(wasm, _err);");
         w.line("const _out = [];");
         w.line(format!("const _ip = wasm.weaveffi_alloc({stride});"));
@@ -2050,6 +2640,10 @@ fn emit_js_iterator_function_wrapper(
                             "_out.push(new {cls}(wasm, _dv.getInt32(_ip, true)));"
                         ));
                     }
+                    TypeRef::Interface(name) => {
+                        let cls = local_type_name(name);
+                        w.line(format!("_out.push({cls}._wrap(_dv.getInt32(_ip, true)));"));
+                    }
                     scalar => {
                         let elem = wasm_read_scalar_elem(scalar, "_dv", "_ip", "0")
                             .replace(&format!("_ip + 0 * {stride}"), "_ip");
@@ -2064,7 +2658,7 @@ fn emit_js_iterator_function_wrapper(
         w.line(format!("wasm.{}(_it);", ib.destroy_symbol));
         w.line("return _out;");
     });
-    w.line("},");
+    w.line(decl.close());
     out.push_str(&w.finish());
 }
 
@@ -2087,6 +2681,7 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
             | TypeRef::StringUtf8
             | TypeRef::BorrowedStr
             | TypeRef::Struct(_)
+            | TypeRef::Interface(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::Iterator(_),
         ) => {
@@ -2129,17 +2724,24 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
     params
 }
 
-/// Emit the `unwrap` clause for an async result, or `None` for a void/raw-scalar
+/// Emit the `unwrap` clause for an async result, or none for a void/raw-scalar
 /// result (where `results[0]` is already idiomatic). Assumes the callback was
-/// registered with [`async_cb_wasm_params`] widths.
-fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
+/// registered with [`async_cb_wasm_params`] widths. `mk_err` is the domain
+/// factory stored as the context's `mkErr` for throwing callables, so the
+/// completion callback rejects with the typed error.
+fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_err: Option<&str>) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    let base = match mk_err {
+        Some(factory) => format!("resolve, reject, mkErr: {factory}"),
+        None => "resolve, reject".to_string(),
+    };
+    let plain = format!("_asyncContexts.set(ctxId, {{ {base} }});");
     let Some(ret) = ret else {
-        w.line("_asyncContexts.set(ctxId, { resolve, reject });");
+        w.line(plain);
         out.push_str(&w.finish());
         return;
     };
-    let open = "_asyncContexts.set(ctxId, { resolve, reject, unwrap: ";
+    let open = format!("_asyncContexts.set(ctxId, {{ {base}, unwrap: ");
     match ret {
         TypeRef::Bool => {
             w.line(format!("{open}(w, r) => r !== 0 }});"));
@@ -2156,7 +2758,7 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
         | TypeRef::F64
         | TypeRef::Handle
         | TypeRef::Enum(_) => {
-            w.line("_asyncContexts.set(ctxId, { resolve, reject });");
+            w.line(plain);
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("{open}(w, p) => _takeCStr(w, p) }});"));
@@ -2165,6 +2767,10 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
             let cls = local_type_name(name);
             w.line(format!("{open}(w, h) => new {cls}(w, h) }});"));
         }
+        TypeRef::Interface(name) => {
+            let cls = local_type_name(name);
+            w.line(format!("{open}(w, h) => {cls}._wrap(h) }});"));
+        }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                 let cls = local_type_name(name);
@@ -2172,11 +2778,17 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
                     "{open}(w, h) => h === 0 ? null : new {cls}(w, h) }});"
                 ));
             }
+            TypeRef::Interface(name) => {
+                let cls = local_type_name(name);
+                w.line(format!(
+                    "{open}(w, h) => h === 0 ? null : {cls}._wrap(h) }});"
+                ));
+            }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 w.line(format!("{open}(w, p) => _takeCStr(w, p) }});"));
             }
             _ => {
-                w.line("_asyncContexts.set(ctxId, { resolve, reject });");
+                w.line(plain);
             }
         },
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -2205,16 +2817,26 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>) {
             });
         }
         TypeRef::Iterator(_) => {
-            w.line("_asyncContexts.set(ctxId, { resolve, reject });");
+            w.line(plain);
         }
     }
     out.push_str(&w.finish());
 }
 
 /// Emit an async function as a method returning a `Promise` at `indent`.
-fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str) {
+/// Throwing callables store the domain's error factory in the async context,
+/// so the completion callback rejects with the typed error; non-throwing ones
+/// reject with the generic brand error only for panics.
+fn emit_js_async_function_wrapper(
+    out: &mut String,
+    f: &FnBinding,
+    error: Option<&ErrorBinding>,
+    decl: JsDecl,
+    self_arg: Option<&str>,
+    indent: &str,
+) {
     let body2 = format!("{indent}    ");
-    let js_params: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+    let js_params: Vec<String> = f.params.iter().map(js_param_name).collect();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
@@ -2224,16 +2846,21 @@ fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str)
     // Pre-render the inner-most (depth + 2) fragments that delegate to helpers,
     // so the nested blocks below can splice them at the right depth.
     let mut unwrap = String::new();
-    emit_async_unwrap(&mut unwrap, &body2, f.ret.as_ref());
+    emit_async_unwrap(
+        &mut unwrap,
+        &body2,
+        f.ret.as_ref(),
+        js_err_factory(f, error).as_deref(),
+    );
     let mut staged = String::new();
-    let mut args = Vec::new();
+    let mut args: Vec<String> = self_arg.iter().map(ToString::to_string).collect();
     let mut cleanup = Vec::new();
     for (i, p) in f.params.iter().enumerate() {
         emit_stage_input(
             &mut staged,
             &body2,
             &p.ty,
-            &p.name,
+            &js_param_name(p),
             &format!("a{i}"),
             &mut args,
             &mut cleanup,
@@ -2248,8 +2875,13 @@ fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str)
     args.push("ctxId".to_string());
 
     w.block(
-        format!("{}({}) {{", f.name, js_params.join(", ")),
-        "},",
+        format!(
+            "{}{}({}) {{",
+            decl.prefix(),
+            js_fn_name(f),
+            js_params.join(", ")
+        ),
+        decl.close(),
         |w| {
             w.block("return new Promise((resolve, reject) => {", "});", |w| {
                 w.line("const ctxId = _nextCtxId++;");
@@ -2262,6 +2894,118 @@ fn emit_js_async_function_wrapper(out: &mut String, f: &FnBinding, indent: &str)
             });
         },
     );
+    out.push_str(&w.finish());
+}
+
+/// Emit the loader-scoped `class` for an interface: an opaque-handle wrapper
+/// closing over the loaded `wasm` instance. The canonical `new` constructor
+/// maps to `constructor`; other constructors and statics are static methods;
+/// methods pass `this._handle` as the implicit leading `self` argument. The
+/// internal `_wrap(handle)` adopts an owned handle without invoking the
+/// constructor (mirroring the struct wrappers' raw `(wasm, handle)` path),
+/// and `free()` releases the handle exactly once via the destroy symbol,
+/// matching the rich-enum cleanup idiom.
+fn emit_interface_class(
+    out: &mut String,
+    module: &ModuleBinding,
+    i: &InterfaceBinding,
+    indent: &str,
+    emscripten: bool,
+) {
+    let cls = &i.name;
+    let error = module.error.as_ref();
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    if let Some(doc) = i.doc.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        for line in doc.lines() {
+            w.line(format!("// {line}"));
+        }
+    }
+    w.block(format!("class {cls} {{"), "}", |w| {
+        let inner = w.indent_str();
+
+        // Canonical constructor: `new(...)` becomes `constructor(...)`,
+        // assigning the owned handle rather than returning a wrapped value.
+        if let Some(c) = i.constructors.iter().find(|c| c.name == "new") {
+            let body = format!("{inner}  ");
+            let js_params: Vec<String> = c.params.iter().map(js_param_name).collect();
+            let checker = js_checker_name(c, error);
+            w.block(
+                format!("constructor({}) {{", js_params.join(", ")),
+                "}",
+                |w| {
+                    let mut staged = String::new();
+                    let mut args = Vec::new();
+                    let mut cleanup = Vec::new();
+                    for (idx, p) in c.params.iter().enumerate() {
+                        emit_stage_input(
+                            &mut staged,
+                            &body,
+                            &p.ty,
+                            &js_param_name(p),
+                            &format!("a{idx}"),
+                            &mut args,
+                            &mut cleanup,
+                        );
+                    }
+                    args.push("_err".to_string());
+                    w.raw(staged);
+                    w.line("const _err = _allocErr(wasm);");
+                    w.line(format!(
+                        "const _r = wasm.{}({});",
+                        c.c_base,
+                        args.join(", ")
+                    ));
+                    for stmt in &cleanup {
+                        w.line(stmt);
+                    }
+                    w.line(format!("{checker}(wasm, _err);"));
+                    w.line("_freeErr(wasm, _err);");
+                    w.line("this._handle = _r;");
+                },
+            );
+        }
+
+        // Internal: adopt an owned handle (returns, list/iterator elements)
+        // without running the constructor.
+        w.block("static _wrap(handle) {", "}", |w| {
+            w.line(format!("const _o = Object.create({cls}.prototype);"));
+            w.line("_o._handle = handle;");
+            w.line("return _o;");
+        });
+
+        // Explicit cleanup: release the producer-owned handle exactly once.
+        w.block("free() {", "}", |w| {
+            w.block("if (this._handle !== 0) {", "}", |w| {
+                w.line(format!("wasm.{}(this._handle);", i.destroy_symbol));
+                w.line("this._handle = 0;");
+            });
+        });
+
+        for c in i.constructors.iter().filter(|c| c.name != "new") {
+            let mut tmp = String::new();
+            emit_js_callable(&mut tmp, c, error, JsDecl::Static, None, &inner, emscripten);
+            w.raw(tmp);
+        }
+        for m in &i.methods {
+            let mut tmp = String::new();
+            emit_js_callable(
+                &mut tmp,
+                m,
+                error,
+                JsDecl::Method,
+                Some("this._handle"),
+                &inner,
+                emscripten,
+            );
+            w.raw(tmp);
+        }
+        for s in &i.statics {
+            let mut tmp = String::new();
+            emit_js_callable(&mut tmp, s, error, JsDecl::Static, None, &inner, emscripten);
+            w.raw(tmp);
+        }
+    });
+    w.blank();
     out.push_str(&w.finish());
 }
 
@@ -2323,7 +3067,7 @@ fn emit_rich_enum_class(out: &mut String, e: &EnumBinding) {
                 &rich.tag_symbol,
                 &["this._handle".to_string()],
                 &[],
-                false,
+                None,
             );
             w.raw(tmp);
         });
@@ -2404,7 +3148,7 @@ fn emit_rich_enum_factory(out: &mut String, enum_name: &str, v: &RichVariantBind
             &v.create.symbol,
             &args,
             &cleanup,
-            true,
+            Some("_checkErr"),
         );
         w.raw(inner);
     });
@@ -2425,7 +3169,7 @@ fn emit_struct_getter(out: &mut String, field: &FieldBinding) {
             &field.getter_symbol,
             &["this._handle".to_string()],
             &[],
-            false,
+            None,
         );
         w.raw(tmp);
     });
@@ -2464,7 +3208,7 @@ fn emit_struct_create(out: &mut String, s: &StructBinding) {
                 &s.create.symbol,
                 &args,
                 &cleanup,
-                true,
+                Some("_checkErr"),
             );
             w.raw(inner);
         },
@@ -2520,7 +3264,7 @@ fn emit_builder_class(out: &mut String, s: &StructBinding) {
                 &b.build_symbol,
                 &["this._b".to_string()],
                 &[],
-                true,
+                Some("_checkErr"),
             );
             w.raw(tmp);
         });
@@ -2538,7 +3282,7 @@ mod tests {
 
     fn empty_api() -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![],
             generators: None,
             package: None,
@@ -2547,11 +3291,58 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
         }
+    }
+
+    /// Test-only shim: build the model (the driver's job in production) and
+    /// render the JS stub with the historical argument order.
+    fn js_stub_for(
+        api: &Api,
+        module_name: &str,
+        prefix: &str,
+        input_basename: &str,
+        filename: &str,
+        emscripten: bool,
+    ) -> String {
+        let model = BindingModel::build(api, prefix);
+        render_wasm_js_stub(
+            api,
+            &model,
+            module_name,
+            prefix,
+            input_basename,
+            filename,
+            emscripten,
+        )
+    }
+
+    /// Test-only shim mirroring [`js_stub_for`] for the `.d.ts` renderer.
+    fn dts_for(
+        api: &Api,
+        module_name: &str,
+        input_basename: &str,
+        filename: &str,
+        emscripten: bool,
+    ) -> String {
+        let model = BindingModel::build(api, "weaveffi");
+        render_wasm_dts(
+            api,
+            &model,
+            module_name,
+            input_basename,
+            filename,
+            emscripten,
+        )
+    }
+
+    /// Test-only shim mirroring [`js_stub_for`] for the README renderer.
+    fn readme_for(api: &Api, prefix: &str, input_basename: &str, emscripten: bool) -> String {
+        let model = BindingModel::build(api, prefix);
+        render_wasm_readme(api, &model, prefix, input_basename, emscripten)
     }
 
     fn sample_api() -> Api {
@@ -2575,6 +3366,7 @@ mod tests {
                 ],
                 returns: Some(TypeRef::I32),
                 doc: Some("Add two numbers".into()),
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2626,6 +3418,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }])
     }
@@ -2645,6 +3438,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2668,6 +3462,7 @@ mod tests {
                 doc: None,
             }],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }])
     }
@@ -2696,7 +3491,7 @@ mod tests {
 
     #[test]
     fn listeners_emit_throwing_stubs_in_js() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &listener_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -2704,8 +3499,8 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        assert!(js.contains("register_message_listener() {"), "{js}");
-        assert!(js.contains("unregister_message_listener() {"), "{js}");
+        assert!(js.contains("registerMessageListener() {"), "{js}");
+        assert!(js.contains("unregisterMessageListener() {"), "{js}");
         assert!(
             js.contains("listener 'message_listener' is not supported by the wasm target"),
             "{js}"
@@ -2715,7 +3510,7 @@ mod tests {
     #[test]
     fn listeners_omitted_from_dts() {
         let api = listener_api();
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -2728,7 +3523,7 @@ mod tests {
 
     #[test]
     fn readme_documents_unsupported_features() {
-        let readme = render_wasm_readme(&listener_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&listener_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("## Unsupported Features"), "{readme}");
         assert!(readme.contains("events.message_listener"), "{readme}");
         assert!(readme.contains("events.OnMessage"), "{readme}");
@@ -2737,13 +3532,13 @@ mod tests {
 
     #[test]
     fn supported_only_api_has_no_unsupported_section() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(!readme.contains("## Unsupported Features"));
     }
 
     #[test]
     fn readme_documents_structs() {
-        let readme = render_wasm_readme(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Structs"));
         assert!(readme.contains("opaque handles"));
         assert!(readme.contains("`i64` pointers"));
@@ -2751,7 +3546,7 @@ mod tests {
 
     #[test]
     fn readme_documents_enums() {
-        let readme = render_wasm_readme(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Enums"));
         assert!(readme.contains("`i32` values"));
         assert!(readme.contains("discriminant"));
@@ -2759,7 +3554,7 @@ mod tests {
 
     #[test]
     fn readme_documents_optionals() {
-        let readme = render_wasm_readme(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Optionals"));
         assert!(readme.contains("`0` / `null`"));
         assert!(readme.contains("_is_present"));
@@ -2767,7 +3562,7 @@ mod tests {
 
     #[test]
     fn readme_documents_lists() {
-        let readme = render_wasm_readme(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Lists"));
         assert!(readme.contains("pointer + length"));
         assert!(readme.contains("`i32` pointer, `i32` length"));
@@ -2775,7 +3570,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_jsdoc() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &empty_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -2790,7 +3585,7 @@ mod tests {
 
     #[test]
     fn js_stub_documents_complex_types() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &empty_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -2806,7 +3601,7 @@ mod tests {
 
     #[test]
     fn js_stub_has_type_convention_header() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &empty_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -2842,32 +3637,32 @@ mod tests {
 
     #[test]
     fn empty_api_has_no_api_reference() {
-        let readme = render_wasm_readme(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(!readme.contains("## API Reference"));
     }
 
     #[test]
     fn api_reference_lists_module() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("## API Reference"));
         assert!(readme.contains("### Module: `math`"));
     }
 
     #[test]
     fn api_reference_function_abi_name() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("##### `weaveffi_math_add`"));
     }
 
     #[test]
     fn api_reference_function_signature() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("`weaveffi_math_add(a: i32, b: i32) -> i32`"));
     }
 
     #[test]
     fn api_reference_function_param_table() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("| `a` | `i32` | `i32` | native Wasm i32 |"));
         assert!(readme.contains("| `b` | `i32` | `i32` | native Wasm i32 |"));
         assert!(readme.contains("| _returns_ | `i32` | `i32` | native Wasm i32 |"));
@@ -2875,13 +3670,13 @@ mod tests {
 
     #[test]
     fn api_reference_function_doc() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("Add two numbers"));
     }
 
     #[test]
     fn api_reference_struct_accessors() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("##### `Point`"));
         assert!(readme.contains("opaque handle (`i64`)"));
         assert!(readme.contains("| `weaveffi_math_Point_get_x` | `f64` |"));
@@ -2890,7 +3685,7 @@ mod tests {
 
     #[test]
     fn api_reference_enum_discriminants() {
-        let readme = render_wasm_readme(&sample_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("##### `Color`"));
         assert!(readme.contains("`i32` discriminant"));
         assert!(readme.contains("| `Red` | `0` |"));
@@ -2996,6 +3791,7 @@ mod tests {
                     "Contact".into(),
                 )))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3024,9 +3820,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api, "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&api, "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("| `name` | `string` | `i32, i32` | ptr + len in linear memory |"));
         assert!(readme.contains("| _returns_ | `Contact?` | `i64` | opaque handle, 0 = absent |"));
         assert!(readme.contains("| `weaveffi_contacts_Contact_get_id` | `i32` |"));
@@ -3047,6 +3844,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3057,9 +3855,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let readme = render_wasm_readme(&api, "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&api, "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("-> void`"));
         assert!(!readme.contains("_returns_"));
     }
@@ -3075,6 +3874,7 @@ mod tests {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             },
             Module {
@@ -3085,10 +3885,11 @@ mod tests {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             },
         ]);
-        let readme = render_wasm_readme(&api, "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&api, "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Module: `math`"));
         assert!(readme.contains("### Module: `io`"));
     }
@@ -3115,7 +3916,7 @@ mod tests {
     #[test]
     fn wasm_js_has_api_functions() {
         let api = sample_api();
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3176,6 +3977,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3186,9 +3988,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3210,7 +4013,7 @@ mod tests {
     #[test]
     fn wasm_js_has_error_helpers() {
         let api = sample_api();
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3225,7 +4028,7 @@ mod tests {
     #[test]
     fn wasm_js_function_passes_err() {
         let api = sample_api();
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3240,7 +4043,7 @@ mod tests {
     #[test]
     fn wasm_dts_has_throws_doc() {
         let api = sample_api();
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3251,7 +4054,7 @@ mod tests {
             dts.contains("@throws"),
             "Expected .d.ts to contain @throws JSDoc comment"
         );
-        assert!(dts.contains("@throws {Error} if the native call fails"));
+        assert!(dts.contains("@throws {WeaveFFIError} if the native call fails"));
     }
 
     #[test]
@@ -3297,6 +4100,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3317,9 +4121,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3330,7 +4135,7 @@ mod tests {
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
         );
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3360,6 +4165,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3380,9 +4186,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3412,6 +4219,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3422,9 +4230,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3454,6 +4263,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3497,9 +4307,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3526,6 +4337,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3546,9 +4358,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3596,6 +4409,7 @@ mod tests {
                     "Contact".into(),
                 )))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3616,9 +4430,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3646,6 +4461,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: true,
                 cancellable: false,
                 deprecated: None,
@@ -3656,9 +4472,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3716,6 +4533,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: true,
                 cancellable: false,
                 deprecated: None,
@@ -3726,9 +4544,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3769,6 +4588,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: true,
                     cancellable: false,
                     deprecated: None,
@@ -3792,6 +4612,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3803,9 +4624,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3835,6 +4657,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3845,6 +4668,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![Module {
                 name: "child".into(),
                 functions: vec![Function {
@@ -3852,6 +4676,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3862,10 +4687,11 @@ mod tests {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             }],
         }]);
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -3881,14 +4707,14 @@ mod tests {
             "nested child module in DTS interface missing: {dts}"
         );
         assert!(
-            dts.contains("outer_fn(): number"),
+            dts.contains("outerFn(): number"),
             "parent function in DTS missing: {dts}"
         );
         assert!(
-            dts.contains("inner_fn(): number"),
+            dts.contains("innerFn(): number"),
             "nested child function in DTS missing: {dts}"
         );
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &api,
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -3919,6 +4745,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: Some("Performs a thing.".into()),
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3948,13 +4775,14 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }
     }
 
     #[test]
     fn wasm_emits_doc_on_function() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &make_api(vec![doc_module()]),
             "weaveffi",
             "weaveffi.yml",
@@ -3966,7 +4794,7 @@ mod tests {
 
     #[test]
     fn wasm_emits_doc_on_struct() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &make_api(vec![doc_module()]),
             "weaveffi",
             "weaveffi.yml",
@@ -3978,7 +4806,7 @@ mod tests {
 
     #[test]
     fn wasm_emits_doc_on_enum_variant() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &make_api(vec![doc_module()]),
             "weaveffi",
             "weaveffi.yml",
@@ -3991,7 +4819,7 @@ mod tests {
 
     #[test]
     fn wasm_emits_doc_on_field() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &make_api(vec![doc_module()]),
             "weaveffi",
             "weaveffi.yml",
@@ -4003,7 +4831,7 @@ mod tests {
 
     #[test]
     fn wasm_emits_doc_on_param() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &make_api(vec![doc_module()]),
             "weaveffi",
             "weaveffi.yml",
@@ -4015,7 +4843,7 @@ mod tests {
 
     #[test]
     fn wasm_custom_prefix_threads_to_user_symbols() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &sample_api(),
             DEFAULT_MODULE_NAME,
             "myffi",
@@ -4069,6 +4897,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4092,6 +4921,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Struct("Shape".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4107,6 +4937,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::U64),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4173,13 +5004,14 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }])
     }
 
     #[test]
     fn wasm_rich_enum_emits_wrapper_class() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4256,7 +5088,7 @@ mod tests {
 
     #[test]
     fn wasm_rich_enum_not_emitted_as_plain_enum_object() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4279,7 +5111,7 @@ mod tests {
 
     #[test]
     fn wasm_rich_enum_module_factory_and_tag() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4307,7 +5139,7 @@ mod tests {
 
     #[test]
     fn wasm_rich_enum_function_marshals_handle() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4341,7 +5173,7 @@ mod tests {
 
     #[test]
     fn wasm_rich_enum_dts_class() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -4394,7 +5226,7 @@ mod tests {
 
     #[test]
     fn wasm_rich_enum_readme() {
-        let readme = render_wasm_readme(&rich_enum_api(), "weaveffi", "weaveffi.yml", false);
+        let readme = readme_for(&rich_enum_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("##### `Shape`"), "{readme}");
         assert!(
             readme.contains("Rich (algebraic) enum"),
@@ -4424,6 +5256,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: true,
                 cancellable: false,
                 deprecated: None,
@@ -4434,13 +5267,14 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }])
     }
 
     #[test]
     fn emscripten_loader_accepts_module_and_binds_exports() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &sample_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4482,7 +5316,7 @@ mod tests {
 
     #[test]
     fn emscripten_body_stays_identical_to_standard_mode() {
-        let standard = render_wasm_js_stub(
+        let standard = js_stub_for(
             &sample_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4490,7 +5324,7 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        let emscripten = render_wasm_js_stub(
+        let emscripten = js_stub_for(
             &sample_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4519,7 +5353,7 @@ mod tests {
 
     #[test]
     fn emscripten_binds_prefixed_runtime_helpers() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &sample_api(),
             DEFAULT_MODULE_NAME,
             "acme",
@@ -4541,7 +5375,7 @@ mod tests {
 
     #[test]
     fn emscripten_async_functions_become_throwing_stubs() {
-        let js = render_wasm_js_stub(
+        let js = js_stub_for(
             &async_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi",
@@ -4565,7 +5399,7 @@ mod tests {
 
     #[test]
     fn emscripten_dts_loader_signature_and_async_omission() {
-        let dts = render_wasm_dts(
+        let dts = dts_for(
             &async_api(),
             DEFAULT_MODULE_NAME,
             "weaveffi.yml",
@@ -4591,7 +5425,7 @@ mod tests {
 
     #[test]
     fn emscripten_readme_documents_emcc_build() {
-        let readme = render_wasm_readme(&async_api(), "weaveffi", "weaveffi.yml", true);
+        let readme = readme_for(&async_api(), "weaveffi", "weaveffi.yml", true);
         assert!(
             readme.contains("emcc"),
             "readme should show an emcc invocation: {readme}"
@@ -4610,5 +5444,342 @@ mod tests {
     fn dts_bytes_map_to_uint8array() {
         assert_eq!(ts_type_for(&TypeRef::Bytes), "Uint8Array");
         assert_eq!(ts_type_for(&TypeRef::BorrowedBytes), "Uint8Array");
+    }
+
+    // --- 0.5.0 overhaul: interfaces, typed errors, throws split, naming ---
+
+    fn member(
+        name: &str,
+        params: Vec<Param>,
+        returns: Option<TypeRef>,
+        throws: bool,
+        is_async: bool,
+    ) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            throws,
+            r#async: is_async,
+            cancellable: is_async,
+            deprecated: None,
+            since: None,
+        }
+    }
+
+    fn str_param(name: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: TypeRef::StringUtf8,
+            mutable: false,
+            doc: None,
+        }
+    }
+
+    /// A kvstore-shaped module: a `Store` interface (canonical `new` plus an
+    /// `open` factory, sync/iterator/async methods, one static), a `KvError`
+    /// domain, and one non-throwing free function.
+    fn kv_api() -> Api {
+        make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![member("flush_all", vec![], None, false, false)],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: Some(weaveffi_ir::ir::ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    weaveffi_ir::ir::ErrorCode {
+                        name: "KeyNotFound".into(),
+                        code: 1001,
+                        message: "key not found".into(),
+                        doc: None,
+                    },
+                    weaveffi_ir::ir::ErrorCode {
+                        name: "StoreFull".into(),
+                        code: 1003,
+                        message: "store is full".into(),
+                        doc: None,
+                    },
+                ],
+            }),
+            interfaces: vec![weaveffi_ir::ir::InterfaceDef {
+                name: "Store".into(),
+                doc: Some("A key-value store handle.".into()),
+                constructors: vec![
+                    member("new", vec![str_param("path")], None, true, false),
+                    member("open", vec![str_param("path")], None, true, false),
+                ],
+                methods: vec![
+                    member(
+                        "put",
+                        vec![
+                            str_param("key"),
+                            Param {
+                                name: "ttl_seconds".into(),
+                                ty: TypeRef::I64,
+                                mutable: false,
+                                doc: None,
+                            },
+                        ],
+                        None,
+                        true,
+                        false,
+                    ),
+                    member(
+                        "get",
+                        vec![str_param("key")],
+                        Some(TypeRef::StringUtf8),
+                        true,
+                        false,
+                    ),
+                    member(
+                        "list_keys",
+                        vec![],
+                        Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                        false,
+                        false,
+                    ),
+                    member("compact", vec![], None, true, true),
+                ],
+                statics: vec![member(
+                    "default_capacity",
+                    vec![],
+                    Some(TypeRef::U64),
+                    false,
+                    false,
+                )],
+            }],
+            modules: vec![],
+        }])
+    }
+
+    fn kv_js() -> String {
+        js_stub_for(
+            &kv_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+            false,
+        )
+    }
+
+    #[test]
+    fn interface_class_has_ctor_wrap_free_and_members() {
+        let js = kv_js();
+        assert!(js.contains("class Store {"), "{js}");
+        // Canonical `new` becomes `constructor`, assigning the owned handle.
+        assert!(js.contains("constructor(path) {"), "{js}");
+        assert!(
+            js.contains("const _r = wasm.weaveffi_kv_Store_new(a0_p, _err);"),
+            "{js}"
+        );
+        assert!(js.contains("this._handle = _r;"), "{js}");
+        // Internal adoption path used by returns and element decoding.
+        assert!(js.contains("static _wrap(handle) {"), "{js}");
+        assert!(
+            js.contains("const _o = Object.create(Store.prototype);"),
+            "{js}"
+        );
+        // Non-canonical constructor is a static factory returning a wrapped
+        // owned handle via the ordinary return path.
+        assert!(js.contains("static open(path) {"), "{js}");
+        assert!(js.contains("return Store._wrap(_r);"), "{js}");
+        // Methods pass the instance handle as the implicit leading argument.
+        assert!(js.contains("put(key, ttlSeconds) {"), "{js}");
+        assert!(
+            js.contains("wasm.weaveffi_kv_Store_put(this._handle, "),
+            "{js}"
+        );
+        // Statics are static methods.
+        assert!(js.contains("static defaultCapacity() {"), "{js}");
+        // Disposal mirrors the rich-enum idiom: free() releases exactly once.
+        assert!(js.contains("free() {"), "{js}");
+        assert!(
+            js.contains("wasm.weaveffi_kv_Store_destroy(this._handle);"),
+            "{js}"
+        );
+        // The class itself is exposed on the module object.
+        assert!(js.contains("Store: Store,"), "{js}");
+    }
+
+    #[test]
+    fn interface_iterator_member_drains_with_self() {
+        let js = kv_js();
+        assert!(js.contains("listKeys() {"), "{js}");
+        assert!(
+            js.contains("const _it = wasm.weaveffi_kv_Store_list_keys(this._handle, _err);"),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn typed_error_classes_and_factory() {
+        let js = kv_js();
+        assert!(
+            js.contains("export class WeaveFFIError extends Error {"),
+            "{js}"
+        );
+        assert!(
+            js.contains("export class KvError extends WeaveFFIError {}"),
+            "{js}"
+        );
+        assert!(
+            js.contains("export class KeyNotFound extends KvError {"),
+            "{js}"
+        );
+        assert!(js.contains("KeyNotFound.CODE = 1001;"), "{js}");
+        assert!(js.contains("KvError.KeyNotFound = KeyNotFound;"), "{js}");
+        assert!(js.contains("StoreFull.CODE = 1003;"), "{js}");
+        // The factory maps unknown codes to the generic brand error.
+        assert!(
+            js.contains("function _kvErrorFrom(code, message) {"),
+            "{js}"
+        );
+        assert!(
+            js.contains("if (!_cls) return new WeaveFFIError(code, message);"),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn throws_split_selects_typed_or_generic_checker() {
+        let js = kv_js();
+        // Throwing members route the out-err slot through the domain checker.
+        assert!(
+            js.contains("function _checkKvError(wasm, errPtr) {"),
+            "{js}"
+        );
+        assert!(js.contains("_checkKvError(wasm, _err);"), "{js}");
+        assert!(js.contains("throw _kvErrorFrom(code, msg);"), "{js}");
+        // The non-throwing free function keeps the generic checker.
+        assert!(js.contains("flushAll() {"), "{js}");
+        let flush = js
+            .split("flushAll() {")
+            .nth(1)
+            .and_then(|s| s.split('}').next())
+            .expect("flushAll body");
+        assert!(flush.contains("_checkErr(wasm, _err);"), "{flush}");
+        assert!(!flush.contains("_checkKvError"), "{flush}");
+    }
+
+    #[test]
+    fn async_throwing_member_rejects_with_domain_error() {
+        let js = kv_js();
+        // The async context carries the domain factory for typed rejection.
+        assert!(
+            js.contains("_asyncContexts.set(ctxId, { resolve, reject, mkErr: _kvErrorFrom });"),
+            "{js}"
+        );
+        assert!(
+            js.contains("if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);"),
+            "{js}"
+        );
+        assert!(
+            js.contains("throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);"),
+            "{js}"
+        );
+        // The launcher passes the cancel slot and callback as usual.
+        assert!(
+            js.contains(
+                "wasm.weaveffi_kv_Store_compact_async(this._handle, 0, _cbPtr_i32_i32, ctxId);"
+            ),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn naming_lower_camel_functions_and_params() {
+        let js = kv_js();
+        assert!(js.contains("flushAll() {"), "{js}");
+        assert!(js.contains("put(key, ttlSeconds) {"), "{js}");
+        assert!(!js.contains("ttl_seconds"), "{js}");
+        assert!(!js.contains("list_keys() {"), "{js}");
+    }
+
+    #[test]
+    fn kv_dts_declares_errors_interface_and_throws_tags() {
+        let dts = dts_for(
+            &kv_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+            false,
+        );
+        assert!(
+            dts.contains("export declare class WeaveFFIError extends Error {"),
+            "{dts}"
+        );
+        assert!(
+            dts.contains("export declare class KvError extends WeaveFFIError {"),
+            "{dts}"
+        );
+        assert!(
+            dts.contains("static readonly KeyNotFound: typeof KeyNotFound;"),
+            "{dts}"
+        );
+        assert!(
+            dts.contains("export declare class KeyNotFound extends KvError {"),
+            "{dts}"
+        );
+        assert!(dts.contains("static readonly CODE: 1001;"), "{dts}");
+        assert!(dts.contains("export declare class Store {"), "{dts}");
+        assert!(dts.contains("constructor(path: string);"), "{dts}");
+        assert!(dts.contains("static open(path: string): Store;"), "{dts}");
+        assert!(
+            dts.contains("put(key: string, ttlSeconds: bigint): void;"),
+            "{dts}"
+        );
+        assert!(dts.contains("listKeys(): string[];"), "{dts}");
+        assert!(dts.contains("compact(): Promise<void>;"), "{dts}");
+        assert!(dts.contains("static defaultCapacity(): bigint;"), "{dts}");
+        assert!(dts.contains("free(): void;"), "{dts}");
+        assert!(dts.contains("Store: typeof Store;"), "{dts}");
+        assert!(
+            dts.contains("@throws {KvError} on a domain error code"),
+            "{dts}"
+        );
+        assert!(
+            dts.contains("@throws {WeaveFFIError} if the native call fails"),
+            "{dts}"
+        );
+    }
+
+    #[test]
+    fn kv_readme_documents_error_domain_and_interface() {
+        let readme = readme_for(&kv_api(), "weaveffi", "weaveffi.yml", false);
+        assert!(readme.contains("Error Domain: `KvError`"), "{readme}");
+        assert!(readme.contains("| `KeyNotFound` | `1001` |"), "{readme}");
+        assert!(readme.contains("##### `Store`"), "{readme}");
+        assert!(readme.contains("weaveffi_kv_Store_destroy"), "{readme}");
+    }
+
+    #[test]
+    fn emscripten_binds_interface_member_and_destroy_symbols() {
+        let js = js_stub_for(
+            &kv_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+            true,
+        );
+        assert!(
+            js.contains("weaveffi_kv_Store_put: m['_weaveffi_kv_Store_put'],"),
+            "{js}"
+        );
+        assert!(
+            js.contains("weaveffi_kv_Store_destroy: m['_weaveffi_kv_Store_destroy'],"),
+            "{js}"
+        );
+        // The async member is a throwing stub; its launcher is never bound.
+        assert!(
+            js.contains("async function 'compact' is not supported in Emscripten mode"),
+            "{js}"
+        );
+        assert!(!js.contains("weaveffi_kv_Store_compact_async"), "{js}");
     }
 }

@@ -14,12 +14,29 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1new_1canvasJni(JNIEnv* env, jclass clazz, jint width) {
+static void throw_weaveffi_graphics_GraphicsError(JNIEnv* env, weaveffi_error* err) {
+    const char* name = NULL;
+    switch (err->code) {
+    case 1: name = "com/weaveffi/GraphicsException$OutOfBounds"; break;
+    default: break;
+    }
+    if (name == NULL) { throw_weaveffi_error(env, err); return; }
+    jclass exClass = (*env)->FindClass(env, name);
+    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
+    weaveffi_error_clear(err);
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_newCanvasJni(JNIEnv* env, jclass clazz, jint width) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_Canvas* rv = weaveffi_graphics_new_canvas((int32_t)width, &err);
     if (err.code != 0) {
@@ -29,7 +46,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1new_1canvasJni(JNIE
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1make_1shapeJni(JNIEnv* env, jclass clazz, jint sides) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_makeShapeJni(JNIEnv* env, jclass clazz, jint sides) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_shapes_Shape* rv = weaveffi_graphics_shapes_make_shape((int32_t)sides, &err);
     if (err.code != 0) {
@@ -39,7 +56,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1make_1shape
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1describeJni(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_describeJni(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_Canvas* rv = weaveffi_graphics_shapes_describe(&err);
     if (err.code != 0) {
@@ -49,11 +66,11 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1describeJni
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_graphics_1shapes_1geometry_1computeJni(JNIEnv* env, jclass clazz, jlong shape) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_computeJni(JNIEnv* env, jclass clazz, jlong shape) {
     weaveffi_error err = {0, NULL};
     weaveffi_graphics_shapes_geometry_Detail* rv = weaveffi_graphics_shapes_geometry_compute((const weaveffi_graphics_shapes_Shape*)(intptr_t)shape, &err);
     if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
+        throw_weaveffi_graphics_GraphicsError(env, &err);
         return 0;
     }
     return (jlong)(intptr_t)rv;

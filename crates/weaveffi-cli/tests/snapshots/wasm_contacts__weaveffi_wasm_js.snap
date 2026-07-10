@@ -16,6 +16,51 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+/** Base error for the `contacts` module's error domain. */
+export class ContactsError extends WeaveFFIError {}
+
+// name must not be empty
+export class InvalidName extends ContactsError {
+  constructor(message = "name must not be empty") {
+    super(1, message);
+  }
+}
+InvalidName.CODE = 1;
+ContactsError.InvalidName = InvalidName;
+
+// contact not found
+export class NotFound extends ContactsError {
+  constructor(message = "contact not found") {
+    super(2, message);
+  }
+}
+NotFound.CODE = 2;
+ContactsError.NotFound = NotFound;
+
+const _CONTACTS_ERROR_CODES = Object.freeze({
+  1: InvalidName,
+  2: NotFound,
+});
+
+// Build the ContactsError subclass matching `code`, or a generic
+// WeaveFFIError for codes outside the domain (panics, marshalling).
+function _contactsErrorFrom(code, message) {
+  const _cls = _CONTACTS_ERROR_CODES[code];
+  if (!_cls) return new WeaveFFIError(code, message);
+  return message ? new _cls(message) : new _cls();
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -55,6 +100,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -63,13 +111,27 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
   wasm.weaveffi_dealloc(errPtr, 8);
+}
+
+// Throw the `ContactsError` domain error (and free the slot) if the error slot
+// carries a non-zero code.
+function _checkContactsError(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code !== 0) {
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
+    wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
+    throw _contactsErrorFrom(code, msg);
+  }
 }
 
 export const ContactType = Object.freeze({
@@ -159,60 +221,83 @@ export async function loadWeaveffiWasm(url) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const wasm = instance.exports;
 
+  // An in-memory address book owning its contacts
+  class ContactBook {
+    constructor() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_contacts_ContactBook_new(_err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      this._handle = _r;
+    }
+    static _wrap(handle) {
+      const _o = Object.create(ContactBook.prototype);
+      _o._handle = handle;
+      return _o;
+    }
+    free() {
+      if (this._handle !== 0) {
+        wasm.weaveffi_contacts_ContactBook_destroy(this._handle);
+        this._handle = 0;
+      }
+    }
+    add(firstName, lastName, email, contactType) {
+      const [a0_p, a0_s] = _cstr(wasm, firstName);
+      const [a1_p, a1_s] = _cstr(wasm, lastName);
+      let a2_p = 0, a2_s = 0;
+      if (email !== null && email !== undefined) { [a2_p, a2_s] = _cstr(wasm, email); }
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_contacts_ContactBook_add(this._handle, a0_p, a1_p, a2_p, contactType, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      wasm.weaveffi_dealloc(a1_p, a1_s);
+      if (a2_p !== 0) wasm.weaveffi_dealloc(a2_p, a2_s);
+      _checkContactsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return new Contact(wasm, _r);
+    }
+    get(id) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_contacts_ContactBook_get(this._handle, BigInt(id), _err);
+      _checkContactsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return new Contact(wasm, _r);
+    }
+    list() {
+      const _lp = wasm.weaveffi_alloc(4);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_contacts_ContactBook_list(this._handle, _lp, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      const _dv = new DataView(wasm.memory.buffer);
+      const _len = _dv.getUint32(_lp, true);
+      wasm.weaveffi_dealloc(_lp, 4);
+      const _out = [];
+      {
+        const dv = new DataView(wasm.memory.buffer);
+        for (let i = 0; i < _len; i++) _out.push(new Contact(wasm, dv.getInt32(_r + i * 4, true)));
+      }
+      return _out;
+    }
+    remove(id) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_contacts_ContactBook_remove(this._handle, BigInt(id), _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r !== 0;
+    }
+    count() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_contacts_ContactBook_count(this._handle, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+  }
+
   return {
     _raw: wasm,
     contacts: {
-      create_contact(first_name, last_name, email, contact_type) {
-        const [a0_p, a0_s] = _cstr(wasm, first_name);
-        const [a1_p, a1_s] = _cstr(wasm, last_name);
-        let a2_p = 0, a2_s = 0;
-        if (email !== null && email !== undefined) { [a2_p, a2_s] = _cstr(wasm, email); }
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_contacts_create_contact(a0_p, a1_p, a2_p, contact_type, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_s);
-        wasm.weaveffi_dealloc(a1_p, a1_s);
-        if (a2_p !== 0) wasm.weaveffi_dealloc(a2_p, a2_s);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r;
-      },
-      get_contact(id) {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_contacts_get_contact(BigInt(id), _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return new Contact(wasm, _r);
-      },
-      list_contacts() {
-        const _lp = wasm.weaveffi_alloc(4);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_contacts_list_contacts(_lp, _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        const _dv = new DataView(wasm.memory.buffer);
-        const _len = _dv.getUint32(_lp, true);
-        wasm.weaveffi_dealloc(_lp, 4);
-        const _out = [];
-        {
-          const dv = new DataView(wasm.memory.buffer);
-          for (let i = 0; i < _len; i++) _out.push(new Contact(wasm, dv.getInt32(_r + i * 4, true)));
-        }
-        return _out;
-      },
-      delete_contact(id) {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_contacts_delete_contact(BigInt(id), _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r !== 0;
-      },
-      count_contacts() {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_contacts_count_contacts(_err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r;
-      },
+      ContactBook: ContactBook,
       Contact: {
         create: (...args) => Contact.create(wasm, ...args),
       },

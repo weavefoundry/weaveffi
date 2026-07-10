@@ -3,7 +3,9 @@
 // Exercises the context-boxed listener trampoline (register pins the closure
 // via Unmanaged, the producer fires it synchronously on send, unregister
 // releases it and stops delivery) and the opaque-iterator ABI behind
-// events_get_messages. Exits non-zero on any mismatch.
+// getMessages. The events module declares no error domain and no function
+// throws, so every call is made without `try` (failures would trap). Exits
+// non-zero on any mismatch.
 
 import Foundation
 import Events
@@ -21,30 +23,26 @@ final class Recorder {
     var received: [String] = []
 }
 
-do {
-    let recorder = Recorder()
-    let sub = Events.events_register_message_listener { message in
-        recorder.received.append(message)
-    }
-    expect(sub > 0, "listener id positive")
-
-    try Events.events_send_message("alpha")
-    try Events.events_send_message("beta")
-    expect(recorder.received == ["alpha", "beta"],
-           "listener received sends (got \(recorder.received))")
-
-    let msgs = try Events.events_get_messages()
-    expect(msgs == ["alpha", "beta"],
-           "iterator yields messages in order (got \(msgs))")
-
-    // Unregister stops delivery; the producer still records the message.
-    Events.events_unregister_message_listener(sub)
-    try Events.events_send_message("gamma")
-    expect(recorder.received == ["alpha", "beta"],
-           "no delivery after unregister (got \(recorder.received))")
-    expect(try Events.events_get_messages().count == 3, "producer kept recording")
-
-    print("swift/events: OK")
-} catch {
-    fail("unexpected error: \(error)")
+let recorder = Recorder()
+let sub = Events.registerMessageListener { message in
+    recorder.received.append(message)
 }
+expect(sub > 0, "listener id positive")
+
+Events.sendMessage(text: "alpha")
+Events.sendMessage(text: "beta")
+expect(recorder.received == ["alpha", "beta"],
+       "listener received sends (got \(recorder.received))")
+
+let msgs = Events.getMessages()
+expect(msgs == ["alpha", "beta"],
+       "iterator yields messages in order (got \(msgs))")
+
+// Unregister stops delivery; the producer still records the message.
+Events.unregisterMessageListener(sub)
+Events.sendMessage(text: "gamma")
+expect(recorder.received == ["alpha", "beta"],
+       "no delivery after unregister (got \(recorder.received))")
+expect(Events.getMessages().count == 3, "producer kept recording")
+
+print("swift/events: OK")

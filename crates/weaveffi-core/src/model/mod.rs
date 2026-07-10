@@ -23,12 +23,13 @@
 
 use heck::ToUpperCamelCase;
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, Function, ListenerDef, Module, StructDef, TypeRef,
+    Api, CallbackDef, EnumDef, ErrorDomain, Function, InterfaceDef, ListenerDef, Module, StructDef,
+    TypeRef,
 };
 
 use crate::abi::{
     self, async_callback_params, async_input_params, context_param, error_out_param, lower_param,
-    lower_return, sync_signature, AbiParam, CType,
+    lower_return, sync_signature, AbiParam, CType, ConstPos,
 };
 
 /// A single lowered C symbol: its name, ordered ABI parameter slots, and C
@@ -100,6 +101,12 @@ pub struct ParamBinding {
 }
 
 /// A function, fully lowered.
+///
+/// Free functions and interface members share this shape. For an instance
+/// method, [`has_self`](Self::has_self) is `true` and every [`AbiFn`] in
+/// [`shape`](Self::shape) carries an implicit leading `const {c_tag}* self`
+/// slot that does **not** appear in [`params`](Self::params); a wrapper
+/// passes its own native handle there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnBinding {
     /// The function name as written in the IDL.
@@ -114,13 +121,24 @@ pub struct FnBinding {
     pub cancellable: bool,
     /// Whether the function is `async` (lowered as a callback-completed launcher).
     pub is_async: bool,
+    /// Whether the function reports typed domain errors. A throwing function
+    /// surfaces as `throws`/`raises` in idiomatic wrappers using the module's
+    /// [`ErrorBinding`]; a non-throwing function has a plain signature, and a
+    /// reported error (only ever a producer panic) surfaces as the target's
+    /// unrecoverable-error idiom instead.
+    pub throws: bool,
+    /// `true` for an instance method: the ABI signatures carry an implicit
+    /// leading `self` slot not present in [`params`](Self::params).
+    pub has_self: bool,
     /// IR input parameters with their lowered slots.
     pub params: Vec<ParamBinding>,
     /// The IR return type (`None` = void). For an iterator function this is the
     /// `iter<T>` type itself; the element `T` also lives in [`IteratorBinding`].
+    /// For an interface constructor this is the constructed interface type.
     pub ret: Option<TypeRef>,
-    /// Base C symbol (`{prefix}_{module_path}_{name}`) before any
-    /// `_async`/iterator suffixing.
+    /// Base C symbol (`{prefix}_{module_path}_{name}` for a free function,
+    /// `{c_tag}_{name}` for an interface member) before any `_async`/iterator
+    /// suffixing.
     pub c_base: String,
     /// The call shape (sync / async / iterator).
     pub shape: CallShape,
@@ -292,6 +310,73 @@ pub struct ListenerBinding {
     pub unregister_symbol: String,
 }
 
+/// An interface (opaque object type), fully lowered.
+///
+/// Constructors, methods, and statics are all [`FnBinding`]s sharing the
+/// member symbol scheme `{c_tag}_{name}`. Methods additionally carry an
+/// implicit leading `const {c_tag}* self` ABI slot ([`FnBinding::has_self`]).
+/// A constructor's [`FnBinding::ret`] is synthesized as the interface type
+/// itself, so wrappers can reuse their ordinary return-marshalling path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceBinding {
+    /// The interface name as written in the IDL.
+    pub name: String,
+    /// Optional doc comment carried from the IDL.
+    pub doc: Option<String>,
+    /// `{prefix}_{module_path}_{name}`, the opaque tag.
+    pub c_tag: String,
+    /// Constructors, lowered as statics returning `{c_tag}*`.
+    pub constructors: Vec<FnBinding>,
+    /// Instance methods, each with the implicit `self` slot.
+    pub methods: Vec<FnBinding>,
+    /// Static functions namespaced under the interface.
+    pub statics: Vec<FnBinding>,
+    /// `void {c_tag}_destroy({c_tag}* self)`: releases the object reference.
+    pub destroy_symbol: String,
+}
+
+/// One error code of a module's error domain, with its C constant name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorCodeBinding {
+    /// The code name exactly as written in the IDL (e.g. `KEY_NOT_FOUND`).
+    pub name: String,
+    /// The numeric ABI code carried in `{prefix}_error.code`.
+    pub value: i32,
+    /// The default human-readable message for the code.
+    pub message: String,
+    /// Optional doc comment carried from the IDL.
+    pub doc: Option<String>,
+    /// `{domain_c_tag}_{name}`, the C enum constant.
+    pub c_const: String,
+}
+
+/// The error domain in effect for a module: its own `errors:` block, or the
+/// nearest ancestor's when the module declares none.
+///
+/// Every throwing function in the module reports codes from this domain.
+/// Backends emit one error type per *declaring* module
+/// ([`declared_here`](Self::declared_here) is `true`) and reference the
+/// ancestor's type from inheriting submodules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorBinding {
+    /// The domain name as written in the IDL (e.g. `KvError`).
+    pub name: String,
+    /// PascalCase type name with exactly one `Error` suffix (e.g. `KvError`);
+    /// backends that brand exceptions swap the suffix via
+    /// [`crate::errors::type_name`].
+    pub type_name: String,
+    /// Underscore-joined path of the module that *declares* the domain.
+    pub owner_path: String,
+    /// `true` when this module declares the domain itself; `false` when it
+    /// inherits the domain from an ancestor module.
+    pub declared_here: bool,
+    /// `{prefix}_{owner_path}_{name}`, the C tag naming the domain's code
+    /// constants.
+    pub c_tag: String,
+    /// The domain's codes in declaration order.
+    pub codes: Vec<ErrorCodeBinding>,
+}
+
 /// One module, flattened with its underscore-joined symbol path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleBinding {
@@ -303,10 +388,16 @@ pub struct ModuleBinding {
     pub path: String,
     /// Module doc, taken from the first documented function in the module.
     pub doc: Option<String>,
+    /// The error domain in effect for this module's throwing functions:
+    /// its own domain, the nearest ancestor's, or `None` when no domain is in
+    /// scope (in which case validation has rejected any `throws` here).
+    pub error: Option<ErrorBinding>,
     /// Enums declared in this module, fully lowered.
     pub enums: Vec<EnumBinding>,
     /// Structs declared in this module, fully lowered.
     pub structs: Vec<StructBinding>,
+    /// Interfaces declared in this module, fully lowered.
+    pub interfaces: Vec<InterfaceBinding>,
     /// Callback typedefs declared in this module.
     pub callbacks: Vec<CallbackBinding>,
     /// Listeners declared in this module.
@@ -325,9 +416,30 @@ impl ModuleBinding {
     pub fn is_empty(&self) -> bool {
         self.enums.is_empty()
             && self.structs.is_empty()
+            && self.interfaces.is_empty()
             && self.callbacks.is_empty()
             && self.listeners.is_empty()
             && self.functions.is_empty()
+            && !self.declares_error()
+    }
+
+    /// True when this module declares its own error domain (as opposed to
+    /// inheriting one from an ancestor).
+    pub fn declares_error(&self) -> bool {
+        self.error.as_ref().is_some_and(|e| e.declared_here)
+    }
+
+    /// Every callable in this module: free functions, then each interface's
+    /// constructors, methods, and statics.
+    pub fn callables(&self) -> impl Iterator<Item = &FnBinding> {
+        self.functions
+            .iter()
+            .chain(self.interfaces.iter().flat_map(|i| {
+                i.constructors
+                    .iter()
+                    .chain(i.methods.iter())
+                    .chain(i.statics.iter())
+            }))
     }
 }
 
@@ -350,7 +462,7 @@ impl BindingModel {
     pub fn build(api: &Api, prefix: &str) -> Self {
         let mut modules = Vec::new();
         for m in &api.modules {
-            lower_module(m, &[], prefix, &mut modules);
+            lower_module(m, &[], prefix, None, &mut modules);
         }
         Self {
             prefix: prefix.to_string(),
@@ -369,10 +481,26 @@ impl BindingModel {
 
 /// Recursively lower `module` and its descendants into the flat `out` list,
 /// pre-order (parent before children) so symbol declarations precede uses.
-fn lower_module(module: &Module, parent: &[String], prefix: &str, out: &mut Vec<ModuleBinding>) {
+/// `inherited_error` is the nearest ancestor's error domain, threaded down so
+/// every module knows which domain its throwing functions report.
+fn lower_module(
+    module: &Module,
+    parent: &[String],
+    prefix: &str,
+    inherited_error: Option<&ErrorBinding>,
+    out: &mut Vec<ModuleBinding>,
+) {
     let mut segments = parent.to_vec();
     segments.push(module.name.clone());
     let path = segments.join("_");
+
+    let error = match &module.errors {
+        Some(domain) => Some(lower_error_domain(domain, &path, prefix)),
+        None => inherited_error.cloned().map(|mut e| {
+            e.declared_here = false;
+            e
+        }),
+    };
 
     let enums = module
         .enums
@@ -383,6 +511,11 @@ fn lower_module(module: &Module, parent: &[String], prefix: &str, out: &mut Vec<
         .structs
         .iter()
         .map(|s| lower_struct(s, &path, prefix))
+        .collect();
+    let interfaces = module
+        .interfaces
+        .iter()
+        .map(|i| lower_interface(i, &path, prefix))
         .collect();
     let callbacks: Vec<CallbackBinding> = module
         .callbacks
@@ -409,16 +542,100 @@ fn lower_module(module: &Module, parent: &[String], prefix: &str, out: &mut Vec<
         segments: segments.clone(),
         path,
         doc,
+        error: error.clone(),
         enums,
         structs,
+        interfaces,
         callbacks,
         listeners,
         functions,
     });
 
     for child in &module.modules {
-        lower_module(child, &segments, prefix, out);
+        lower_module(child, &segments, prefix, error.as_ref(), out);
     }
+}
+
+fn lower_error_domain(domain: &ErrorDomain, path: &str, prefix: &str) -> ErrorBinding {
+    let c_tag = format!("{prefix}_{path}_{}", domain.name);
+    ErrorBinding {
+        name: domain.name.clone(),
+        type_name: crate::errors::type_name(&domain.name, "Error"),
+        owner_path: path.to_string(),
+        declared_here: true,
+        c_tag: c_tag.clone(),
+        codes: domain
+            .codes
+            .iter()
+            .map(|c| ErrorCodeBinding {
+                name: c.name.clone(),
+                value: c.code,
+                message: c.message.clone(),
+                doc: c.doc.clone(),
+                c_const: format!("{c_tag}_{}", c.name),
+            })
+            .collect(),
+    }
+}
+
+/// Lower an interface: constructors become statics returning the interface,
+/// methods gain the implicit `self` slot, and all member symbols hang off the
+/// interface's `c_tag`.
+fn lower_interface(iface: &InterfaceDef, path: &str, prefix: &str) -> InterfaceBinding {
+    let c_tag = format!("{prefix}_{path}_{}", iface.name);
+    let self_slot = AbiParam::new(
+        "self",
+        CType::Ptr {
+            konst: ConstPos::West,
+            pointee: Box::new(CType::StructTag {
+                module: path.to_string(),
+                name: iface.name.clone(),
+            }),
+        },
+    );
+    let constructors = iface
+        .constructors
+        .iter()
+        .map(|c| {
+            // Synthesize the return: a constructor yields a new owned
+            // reference to the interface, exactly like a static returning it.
+            let mut f = c.clone();
+            f.returns = Some(TypeRef::Interface(iface.name.clone()));
+            lower_callable(&f, path, prefix, &member_base(&c_tag, &c.name), None)
+        })
+        .collect();
+    let methods = iface
+        .methods
+        .iter()
+        .map(|m| {
+            lower_callable(
+                m,
+                path,
+                prefix,
+                &member_base(&c_tag, &m.name),
+                Some(self_slot.clone()),
+            )
+        })
+        .collect();
+    let statics = iface
+        .statics
+        .iter()
+        .map(|s| lower_callable(s, path, prefix, &member_base(&c_tag, &s.name), None))
+        .collect();
+    InterfaceBinding {
+        name: iface.name.clone(),
+        doc: iface.doc.clone(),
+        c_tag: c_tag.clone(),
+        constructors,
+        methods,
+        statics,
+        destroy_symbol: format!("{c_tag}_destroy"),
+    }
+}
+
+/// The base C symbol of an interface member: `{c_tag}_{name}`.
+fn member_base(c_tag: &str, name: &str) -> String {
+    format!("{c_tag}_{name}")
 }
 
 fn lower_param_binding(p: &weaveffi_ir::ir::Param, module: &str) -> ParamBinding {
@@ -594,19 +811,48 @@ fn lower_listener(l: &ListenerDef, path: &str, prefix: &str) -> ListenerBinding 
 }
 
 fn lower_function(f: &Function, path: &str, prefix: &str) -> FnBinding {
+    let c_base = format!("{prefix}_{path}_{}", f.name);
+    lower_callable(f, path, prefix, &c_base, None)
+}
+
+/// Lower one callable (free function or interface member) whose full base C
+/// symbol is `c_base`. When `self_slot` is given (an instance method), it is
+/// prepended to every ABI signature but never appears in the retained
+/// [`ParamBinding`] list.
+fn lower_callable(
+    f: &Function,
+    path: &str,
+    prefix: &str,
+    c_base: &str,
+    self_slot: Option<AbiParam>,
+) -> FnBinding {
     let params: Vec<ParamBinding> = f
         .params
         .iter()
         .map(|p| lower_param_binding(p, path))
         .collect();
-    let c_base = format!("{prefix}_{path}_{}", f.name);
+    // The prefix-stripped spelling used for `CType::Named` cores (which render
+    // as `{prefix}_{core}`), e.g. `kv_Store_scan` from `weaveffi_kv_Store_scan`.
+    let core_base = c_base
+        .strip_prefix(&format!("{prefix}_"))
+        .expect("c_base always starts with the symbol prefix")
+        .to_string();
+    let with_self = |mut params: Vec<AbiParam>| {
+        if let Some(s) = &self_slot {
+            params.insert(0, s.clone());
+        }
+        params
+    };
 
     let shape = if let Some(TypeRef::Iterator(inner)) = &f.returns {
         let pascal = f.name.to_upper_camel_case();
-        let iter_tag = format!("{prefix}_{path}_{pascal}Iterator");
-        let iter_core = format!("{path}_{pascal}Iterator");
+        // `{owner}_{Pascal}Iterator`, where owner is the module path for a
+        // free function or `{module path}_{Interface}` for a method.
+        let owner = &core_base[..core_base.len() - f.name.len() - 1];
+        let iter_core = format!("{owner}_{pascal}Iterator");
+        let iter_tag = format!("{prefix}_{iter_core}");
 
-        // launcher: input slots + out_err, returns iter_tag*.
+        // launcher: (self,) input slots + out_err, returns iter_tag*.
         let mut launch_params: Vec<AbiParam> = f
             .params
             .iter()
@@ -614,8 +860,8 @@ fn lower_function(f: &Function, path: &str, prefix: &str) -> FnBinding {
             .collect();
         launch_params.push(error_out_param());
         let launch = AbiFn {
-            symbol: c_base.clone(),
-            params: launch_params,
+            symbol: c_base.to_string(),
+            params: with_self(launch_params),
             ret: CType::ptr(CType::Named(iter_core.clone())),
         };
 
@@ -645,12 +891,12 @@ fn lower_function(f: &Function, path: &str, prefix: &str) -> FnBinding {
         let mut launch_params = async_input_params(f, path);
         launch_params.push(AbiParam::new(
             "callback",
-            CType::Named(format!("{path}_{}_callback", f.name)),
+            CType::Named(format!("{core_base}_callback")),
         ));
         launch_params.push(context_param());
         let launch = AbiFn {
             symbol: format!("{c_base}_async"),
-            params: launch_params,
+            params: with_self(launch_params),
             ret: CType::Void,
         };
         CallShape::Async(AsyncBinding {
@@ -661,8 +907,8 @@ fn lower_function(f: &Function, path: &str, prefix: &str) -> FnBinding {
     } else {
         let sig = sync_signature(&f.params, f.returns.as_ref(), path);
         CallShape::Sync(AbiFn {
-            symbol: c_base.clone(),
-            params: sig.params,
+            symbol: c_base.to_string(),
+            params: with_self(sig.params),
             ret: sig.ret,
         })
     };
@@ -674,9 +920,11 @@ fn lower_function(f: &Function, path: &str, prefix: &str) -> FnBinding {
         since: f.since.clone(),
         cancellable: f.cancellable,
         is_async: f.r#async,
+        throws: f.throws,
+        has_self: self_slot.is_some(),
         params,
         ret: f.returns.clone(),
-        c_base,
+        c_base: c_base.to_string(),
         shape,
     }
 }
@@ -710,6 +958,7 @@ mod tests {
             params,
             returns,
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -721,6 +970,7 @@ mod tests {
         Module {
             name: name.into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -732,7 +982,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
@@ -786,6 +1036,7 @@ mod tests {
         let m = Module {
             functions: vec![Function {
                 cancellable: true,
+                throws: false,
                 r#async: true,
                 ..func(
                     "fetch",
@@ -852,6 +1103,7 @@ mod tests {
     #[test]
     fn struct_create_getters_and_builder() {
         let m = Module {
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,

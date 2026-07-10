@@ -3,10 +3,11 @@
 Drives the generated ctypes wrapper for rich (algebraic) enums: the opaque
 `Shape` class whose handle is freed in `__del__`, its nested `Tag` IntEnum +
 `tag` reader, the per-variant `@classmethod` factories (`Shape.circle(...)`)
-and namespaced field accessors (`circle_radius`), plus the free functions that
-take and return `Shape`. Also covers the expanded numerics (f32 fields, u8
-field, u64 return). The generated package is placed on sys.path via WV_PY; the
-cdylib is selected with WEAVEFFI_LIBRARY.
+and namespaced field accessors (`circle_radius`), plus the free functions
+that take and return `Shape` (module-prefix-stripped: `describe`, `scale`,
+`sum_bytes`). Also covers the expanded numerics (f32 fields, u8 field, u64
+return). The generated package is placed on sys.path via WV_PY; the cdylib is
+selected with WEAVEFFI_LIBRARY.
 """
 import os
 import sys
@@ -39,14 +40,14 @@ def main() -> None:
     assert labeled.labeled_count == 6
 
     # Free functions: Shape in, string/Shape out.
-    assert wv.shapes_describe(circle) == "circle(r=2.5)"
+    assert wv.describe(circle) == "circle(r=2.5)"
 
-    big = wv.shapes_scale(circle, 4.0)
+    big = wv.scale(circle, 4.0)
     assert big.tag == wv.Shape.Tag.Circle
     assert abs(big.circle_radius - 10.0) < 1e-9
 
     # Numerics: list<u8> in, u64 out.
-    assert wv.shapes_sum_bytes([250, 250, 250, 250]) == 1000
+    assert wv.sum_bytes([250, 250, 250, 250]) == 1000
 
     print("python/shapes: OK")
 

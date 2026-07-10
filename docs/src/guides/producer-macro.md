@@ -27,7 +27,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-weaveffi = "0.12"
+weaveffi = "0.14"
 ```
 
 ## A complete example
@@ -38,17 +38,25 @@ weaveffi = "0.12"
 /// Arithmetic over 32-bit integers.
 #[weaveffi::module]
 pub mod calculator {
+    /// The calculator's error domain: the codes its throwing functions report.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum CalcError {
+        /// division by zero
+        DivisionByZero = 1,
+    }
+
     /// Add two integers.
     #[weaveffi::export]
     pub fn add(a: i32, b: i32) -> i32 {
         a + b
     }
 
-    /// Divide, reporting division by zero through the ABI's error channel.
+    /// Divide two integers, failing on a zero divisor.
     #[weaveffi::export]
-    pub fn div(a: i32, b: i32) -> Result<i32, String> {
+    pub fn div(a: i32, b: i32) -> Result<i32, CalcError> {
         if b == 0 {
-            return Err("division by zero".to_string());
+            return Err(CalcError::DivisionByZero);
         }
         Ok(a / b)
     }
@@ -61,9 +69,12 @@ weaveffi::export_runtime!();
 
 That is the whole producer. Building it yields a shared library exporting
 `weaveffi_calculator_add` and `weaveffi_calculator_div` with the exact
-signatures the generated C header declares. A `Result<T, E>` return becomes a
-fallible symbol: the IDL return type is `T`, and `Err` is reported through the
-trailing `out_err` parameter.
+signatures the generated C header declares. A `Result<T, E>` return marks the
+function `throws: true` in the IDL: the return type is `T`, and `Err` is
+reported through the trailing `out_err` parameter with the code the
+`#[weaveffi::error]` enum declares, so every binding surfaces it as a typed
+domain error (see [Error Handling](errors.md)). A throwing function needs an
+error domain in scope on its module or an ancestor.
 
 Generate the bindings straight from the same file:
 
@@ -76,8 +87,10 @@ weaveffi generate src/lib.rs -o generated --target c,swift,python
 | Attribute | Where it goes | Effect |
 |-----------|---------------|--------|
 | `#[weaveffi::module]` | inline `mod foo { ... }` | Marks an exported namespace and drives the codegen. Modules may nest. |
-| `#[weaveffi::export]` | `fn` | Exports a function. A `Result<T, E>` return is fallible; `()` (and `Result<(), E>`) is a `void` return. |
+| `#[weaveffi::export]` | `fn` | Exports a function. A `Result<T, E>` return is `throws: true`; `()` (and `Result<(), E>`) is a `void` return. |
 | `#[weaveffi::record]` | named-field `struct` | A by-value record. Generates `create`, `destroy`, and a getter per field. |
+| `#[weaveffi::interface]` | `struct` with an `impl` block | An opaque object type. The `impl` block's `pub fn`s become constructors (those returning `Self`), methods (`&self`), and statics; a `destroy` symbol is implicit. |
+| `#[weaveffi::error]` | unit-variant `enum` | Declares the module's error domain. Every variant needs an explicit `= N` discriminant; the doc comment is the code's default message. |
 | `#[weaveffi::enumeration]` | `#[repr(i32)]` `enum` | A C-style enum. Every variant needs an explicit `= N` discriminant. |
 | `#[weaveffi::callback]` | `fn` | Declares a callback signature (see [roadmap](#feature-support)). |
 | `#[weaveffi::listener(event = "Name")]` | `fn` | Declares an event listener bound to a callback (see [roadmap](#feature-support)). |
@@ -136,6 +149,37 @@ pub struct Contact {
 }
 ```
 
+## Interfaces
+
+A `#[weaveffi::interface]` struct is a first-class object type: the consumer
+holds an opaque pointer to a live instance rather than a copied value. The
+`impl` block defines the surface; the struct's own fields (its state) never
+cross the boundary, so they need no annotations.
+
+```rust
+#[weaveffi::interface]
+pub struct ContactBook {
+    contacts: Mutex<Vec<Contact>>,
+    next_id: AtomicI64,
+}
+
+impl ContactBook {
+    /// Create an empty book.               // -> constructor
+    pub fn new() -> Self { /* ... */ }
+
+    /// Add a contact to the book.          // -> throwing method
+    pub fn add(&self, first_name: String, /* ... */) -> Result<Contact, ContactsError> { /* ... */ }
+
+    /// Number of contacts in the book.     // -> method
+    pub fn count(&self) -> i32 { /* ... */ }
+}
+```
+
+Every binding wraps the pointer in an idiomatic class (Swift `class` with
+`deinit`, Kotlin `Closeable`, Python `__del__`, Go `Close()`, and so on) and
+the implicit `destroy` symbol frees the instance exactly once. See
+`samples/contacts` and `samples/inventory` for complete producers.
+
 ## Cross-module references
 
 Modules can reference each other's records and enums. Import the type with a
@@ -180,6 +224,8 @@ straight to a `weaveffi_*` cdylib with no hand-written `extern "C"` layer.
 |---------|---------------|------------------|
 | Modules, nested modules | Supported | `inventory`, `kvstore` |
 | Sync functions, `Result` errors | Supported | `calculator`, `contacts` |
+| Error domains (`#[weaveffi::error]`) | Supported | `calculator`, `contacts` |
+| Interfaces (constructors / methods / statics) | Supported | `contacts`, `inventory` |
 | Records (create / destroy / getters) | Supported | `contacts` |
 | C-style enums | Supported | `contacts`, `shapes` |
 | Scalars, `string`, `bytes`, handles, typed handles | Supported | `kvstore` |

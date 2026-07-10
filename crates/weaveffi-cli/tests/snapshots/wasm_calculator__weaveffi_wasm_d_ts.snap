@@ -7,27 +7,46 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `calculator` module's error domain. */
+export declare class CalcError extends WeaveFFIError {
+  static readonly DivisionByZero: typeof DivisionByZero;
+}
+
+/** division by zero */
+export declare class DivisionByZero extends CalcError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   calculator: {
     /**
      * Add two integers
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
     add(a: number, b: number): number;
     /**
      * Multiply two integers
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
     mul(a: number, b: number): number;
     /**
-     * Divide two integers
-     * @throws {Error} if the native call fails
+     * Divide two integers, failing on a zero divisor
+     * @throws {CalcError} on a domain error code
      */
     div(a: number, b: number): number;
     /**
      * Echo a string back
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
     echo(s: string): string;
   };

@@ -4,10 +4,12 @@
 
 The Node.js target produces a CommonJS loader, TypeScript type
 definitions, and the complete N-API addon C source (plus a
-`binding.gyp`) that bridges JS to the C ABI. The loader prefers the
-node-gyp build output (`./build/Release/weaveffi.node`) and falls back
-to a prebuilt binary placed next to it as `index.node`
-(`samples/node-addon` provides one for the in-tree examples).
+`binding.gyp`) that bridges JS to the C ABI. The loader honors a
+`WEAVEFFI_ADDON` environment override, then prefers the node-gyp build
+output (`./build/Release/weaveffi.node`), and falls back to a prebuilt
+binary placed next to it as `index.node`. On top of the raw native
+bindings it layers the idiomatic wrappers: error classes, interface and
+rich-enum classes, and camelCased function wrappers.
 
 ## What gets generated
 
@@ -48,7 +50,7 @@ to a prebuilt binary placed next to it as `index.node`
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -103,15 +105,132 @@ export enum Color {
 }
 ```
 
-Functions are exported with a `<module>_` prefix; optional return and
-parameter types use `| null`, arrays use `T[]`:
+Functions are exported flat in lowerCamelCase with the module prefix
+stripped by default (`strip_module_prefix = false` in `[node]` restores
+`<module>_`-prefixed names); parameters are camelCased too. Optional
+return and parameter types use `| null`, arrays use `T[]`:
 
 ```typescript
-export function contacts_get_contact(id: number): Contact | null
-export function contacts_list_contacts(): Contact[]
-export function contacts_set_favorite_color(contact_id: number, color: Color | null): void
-export function contacts_get_tags(contact_id: number): string[]
+export function getContact(id: number): Contact | null
+export function listContacts(): Contact[]
+export function setFavoriteColor(contactId: number, color: Color | null): void
+export function getTags(contactId: number): string[]
 ```
+
+## Typed errors
+
+Every generated `index.js` exports `WeaveFFIError` (extending `Error`
+with a numeric `code` and the raw `errorMessage`). A module's error
+domain adds a class named after the domain plus one subclass per code,
+each carrying its stable `CODE`. From the `kvstore` sample:
+
+```js
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+
+class KvError extends WeaveFFIError { /* ... */ }
+
+class KeyNotFoundError extends KvError {
+  constructor(message) {
+    super(1001, message || 'key not found');
+    this.name = 'KeyNotFoundError';
+  }
+}
+KeyNotFoundError.CODE = 1001;
+// ExpiredError, StoreFullError, IoError follow the same shape.
+```
+
+A callable with `throws: true` rebrands any native failure through the
+domain's code map, so consumers catch the typed class:
+
+```js
+try {
+  store.put('alpha', Buffer.from('1'), EntryKind.Volatile, null);
+} catch (e) {
+  if (e instanceof StoreFullError) {
+    // typed case; e.code === 1003
+  } else if (e instanceof KvError) {
+    // any kv domain error
+  }
+}
+```
+
+A callable without `throws` has the same JS signature (JavaScript has no
+checked exceptions), but its failures can only be producer bugs, which
+surface as the generic `WeaveFFIError`. Unknown codes on the typed path
+fall back to `WeaveFFIError` as well.
+
+## Interfaces
+
+An `interfaces:` entry becomes a JS class owning the native pointer,
+registered with a `FinalizationRegistry` and freed deterministically via
+`destroy()`. Constructors become static factories, methods are instance
+methods, statics are static methods, all camelCased. From the `kvstore`
+sample's `Store` (trimmed from `index.js`):
+
+```js
+class Store {
+  static open(path) {
+    const _r = __invoke(addon.Store_open, [path], __kvErrorFrom);
+    return Store._fromHandle(_r);
+  }
+  put(key, value, kind, ttlSeconds) {
+    return __invoke(addon.Store_put, [this._handle, key, value, kind, ttlSeconds], __kvErrorFrom);
+  }
+  listKeys(prefix) {
+    return __invoke(addon.Store_list_keys, [this._handle, prefix], __kvErrorFrom);
+  }
+  count() {
+    return __invoke(addon.Store_count, [this._handle], __generic);
+  }
+  compact() {
+    return __invokeAsync(addon.Store_compact, [this._handle], __kvErrorFrom);
+  }
+  static defaultCapacity() {
+    return __invoke(addon.Store_default_capacity, [], __generic);
+  }
+  destroy() {
+    if (this._handle) {
+      Store._cleanup.unregister(this);
+      addon.Store_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Store._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.Store_destroy(handle); }
+});
+```
+
+The typed declarations mirror the class, with `@throws` and
+`@deprecated` JSDoc tags:
+
+```typescript
+export class Store {
+  /** @throws {KvError} */
+  static open(path: string): Store;
+  /** @throws {KvError} */
+  put(key: string, value: Buffer, kind: EntryKind, ttlSeconds: number | null): boolean;
+  count(): number;
+  /** @throws {KvError} */
+  compact(): Promise<number>;
+  static defaultCapacity(): number;
+  /** Free the underlying native object. */
+  destroy(): void;
+}
+```
+
+A function elsewhere in the API that takes the interface accepts the
+wrapper instance and unwraps its handle (`getStats(store)` in the nested
+`stats` module); a function returning an interface wraps the new owned
+handle in a fresh instance. Call `destroy()` when you're done; the
+`FinalizationRegistry` is only a GC-timed safety net.
 
 ## Rich (algebraic) enums
 
@@ -130,50 +249,46 @@ discriminant reader, a camelCased getter per variant field, and a
 
 ```js
 class Shape {
-  constructor(handle) {
-    this._handle = handle;
-    Shape._cleanup.register(this, handle, this);
-  }
   static empty() {
-    return new Shape(addon.shapes_Shape_empty_new());
+    return new Shape(__invoke(addon.Shape_empty_new, [], __generic));
   }
   static circle(radius) {
-    return new Shape(addon.shapes_Shape_circle_new(radius));
+    return new Shape(__invoke(addon.Shape_circle_new, [radius], __generic));
   }
   static rectangle(width, height) {
-    return new Shape(addon.shapes_Shape_rectangle_new(width, height));
+    return new Shape(__invoke(addon.Shape_rectangle_new, [width, height], __generic));
   }
   static labeled(label, count) {
-    return new Shape(addon.shapes_Shape_labeled_new(label, count));
+    return new Shape(__invoke(addon.Shape_labeled_new, [label, count], __generic));
   }
   tag() {
-    return addon.shapes_Shape_tag(this._handle);
+    return addon.Shape_tag(this._handle);
   }
   get circleRadius() {
-    return addon.shapes_Shape_circle_get_radius(this._handle);
+    return addon.Shape_circle_get_radius(this._handle);
   }
   get rectangleWidth() {
-    return addon.shapes_Shape_rectangle_get_width(this._handle);
+    return addon.Shape_rectangle_get_width(this._handle);
   }
   get rectangleHeight() {
-    return addon.shapes_Shape_rectangle_get_height(this._handle);
+    return addon.Shape_rectangle_get_height(this._handle);
   }
   get labeledLabel() {
-    return addon.shapes_Shape_labeled_get_label(this._handle);
+    return addon.Shape_labeled_get_label(this._handle);
   }
   get labeledCount() {
-    return addon.shapes_Shape_labeled_get_count(this._handle);
+    return addon.Shape_labeled_get_count(this._handle);
   }
   destroy() {
     if (this._handle) {
       Shape._cleanup.unregister(this);
-      addon.shapes_Shape_destroy(this._handle);
+      addon.Shape_destroy(this._handle);
       this._handle = 0;
     }
   }
 }
 Shape._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.shapes_Shape_destroy(handle); }
+  if (handle) { addon.Shape_destroy(handle); }
 });
 Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 });
 ```
@@ -183,10 +298,10 @@ The active variant is read with `tag()` and compared against the frozen
 Each variant field is a getter named `<variant><Field>`
 (`circleRadius`, `rectangleWidth`, `rectangleHeight`, `labeledLabel`,
 `labeledCount`), delegating to the matching native accessor (e.g.
-`addon.shapes_Shape_circle_get_radius(this._handle)`). Free functions
+`addon.Shape_circle_get_radius(this._handle)`). Free functions
 that take or return the enum accept the wrapper directly:
-`shapes_describe(shape)` unwraps `shape._handle`, and
-`shapes_scale(shape, factor)` wraps its result back into a new `Shape`.
+`describe(shape)` unwraps `shape._handle`, and
+`scale(shape, factor)` wraps its result back into a new `Shape`.
 
 The generated `types.d.ts` types the wrapper as a real `export class`,
 with the `Shape.Tag` constants in a companion namespace:
@@ -219,7 +334,7 @@ A short round-trip that constructs a couple of variants, reads the tag and a
 field, calls `describe` / `scale`, then releases the handles:
 
 ```js
-const { Shape, shapes_describe, shapes_scale } = require('./index.js');
+const { Shape, describe, scale } = require('./index.js');
 
 const circle = Shape.circle(2.0);
 const label = Shape.labeled('unit', 3);
@@ -228,8 +343,8 @@ if (circle.tag() === Shape.Tag.Circle) {
   console.log(circle.circleRadius); // 2
 }
 
-console.log(shapes_describe(circle)); // native-rendered description
-const bigger = shapes_scale(circle, 3.0); // a fresh Shape
+console.log(describe(circle)); // native-rendered description
+const bigger = scale(circle, 3.0); // a fresh Shape
 
 // Done with the handles, release the native objects.
 circle.destroy();
@@ -239,44 +354,35 @@ bigger.destroy();
 
 **Ownership:** each `Shape` owns its native object. Call `destroy()` when
 you are finished to free it deterministically; if you forget, the
-`FinalizationRegistry` calls `shapes_Shape_destroy` once the wrapper is
+`FinalizationRegistry` calls the native destroy once the wrapper is
 garbage-collected, but GC timing isn't guaranteed, so prefer an
 explicit `destroy()`.
 
 ## Build instructions
 
-The runnable example uses the `calculator` sample.
-
-macOS:
-
-```bash
-cargo build -p calculator
-cp target/debug/libindex.dylib generated/node/index.node
-
-cd examples/node
-DYLD_LIBRARY_PATH=../../target/debug npm start
-```
-
-Linux:
+The generated addon is self-contained: run `npm install` (the install
+script runs `node-gyp rebuild` on the generated `binding.gyp`) inside
+`generated/node/` with the generated C headers at `../c` and the
+producer cdylib on the linker path:
 
 ```bash
-cargo build -p calculator
-cp target/debug/libindex.so generated/node/index.node
+cargo build -p kvstore
+weaveffi generate samples/kvstore/kvstore.yml -o generated
 
-cd examples/node
-LD_LIBRARY_PATH=../../target/debug npm start
+cd generated/node
+npm install          # builds build/Release/weaveffi.node
+DYLD_LIBRARY_PATH=../../target/debug node -e "
+  const kv = require('./index.js');
+  const store = kv.Store.open('/tmp/cache.kv');
+  console.log(store.count());
+"
 ```
 
-Windows: copy `target\debug\index.dll` to `generated\node\index.node`
-and run `npm start` from `examples\node`.
-
-For your own project the generated addon is self-contained: run
-`npm install` (the install script runs `node-gyp rebuild` on the
-generated `binding.gyp`) inside `generated/node/` with the generated C
-headers at `../c` and the `weaveffi` cdylib on the linker path. Then
-publish the generated directory as a private npm package or ship it
-inside your app. Copying a prebuilt platform binary in as `index.node`
-(as above) also works.
+(Use `LD_LIBRARY_PATH` on Linux.) Then publish the generated directory
+as a private npm package or ship it inside your app. Copying a prebuilt
+platform binary in as `index.node` also works, and the `WEAVEFFI_ADDON`
+env var can point the loader at any built addon (the
+`conformance/node/` consumers use it; see `conformance/run.sh`).
 
 ## Memory and ownership
 
@@ -286,21 +392,24 @@ inside your app. Copying a prebuilt platform binary in as `index.node`
 - Struct values are returned as plain JS objects: the addon copies the
   fields out and destroys the native struct before the call returns, so
   there is nothing to dispose on the JS side.
+- Interface and rich-enum wrappers own their native pointer; release it
+  with `destroy()` (a `FinalizationRegistry` backstops forgotten
+  handles at GC time).
 - Typed handles (`handle<Struct>`) pass through as opaque values;
-  release them through the API's own teardown function (e.g.
-  `kv_close_store`).
+  release them through the API's own teardown function.
 - `iter<T>` returns are drained eagerly inside the addon: it loops the
   C `_next` function into a JS array, frees each native item, and
   destroys the iterator handle before returning.
 - Errors from the C ABI are converted into JavaScript `Error` instances
-  by the addon before bubbling up to the caller.
+  by the addon, then rebranded into the typed error classes by the
+  loader before bubbling up to the caller.
 
 ## Async support
 
 Async IDL functions are exposed as JS functions that return a Promise:
 
 ```typescript
-export function tasks_run_task(name: string): Promise<TaskResult>
+export function runTask(name: string): Promise<TaskResult>
 ```
 
 The addon creates the promise with `napi_create_promise` and calls the
@@ -324,9 +433,12 @@ static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err, 
 ```
 
 Rejected promises carry the C error message plus a numeric `code`
-property. The settle callback releases the threadsafe function once the
-promise is settled, so a pending async call keeps the event loop alive
-until it completes.
+property; the loader rebrands the rejection into the module's typed
+error class when the callable declares `throws: true` (an async method
+like `Store.compact()` rejects with `KvError` subclasses), and into the
+generic `WeaveFFIError` otherwise. The settle callback releases the
+threadsafe function once the promise is settled, so a pending async
+call keeps the event loop alive until it completes.
 
 For functions marked `cancellable: true` the addon passes `NULL` for
 the C ABI's cancel-token slot; the token is not surfaced to JS and
@@ -340,8 +452,8 @@ takes a plain JS function and returns a numeric subscription id;
 unregistration takes that id back:
 
 ```typescript
-export function events_register_message_listener(callback: (message: string) => void): number
-export function events_unregister_message_listener(id: number): void
+export function registerMessageListener(callback: (message: string) => void): number
+export function unregisterMessageListener(id: number): void
 ```
 
 The id is the `uint64` returned by the C ABI's

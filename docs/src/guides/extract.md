@@ -28,7 +28,7 @@ Author an IDL document (YAML/JSON/TOML) directly when:
 
 - You want to design the API before any Rust exists.
 - You need a feature the extractor cannot infer from Rust syntax, such as
-  iterator return types (`iter<T>`), error domains, struct field defaults, or
+  struct field defaults, package and per-generator configuration, or
   `since:` without an accompanying `#[deprecated]`. See [Pitfalls](#pitfalls).
 
 ## Step-by-step
@@ -150,8 +150,10 @@ macro consumes, and it reads unambiguously.
 | Attribute                                       | Where it goes                       | Effect                                                                                   |
 |-------------------------------------------------|-------------------------------------|------------------------------------------------------------------------------------------|
 | `#[weaveffi::module]`                           | inline `mod`                        | Marks an exported namespace. Required: only modules carrying it are extracted. Modules may nest. |
-| `#[weaveffi::export]`                           | free `fn`                           | Emits a [`Function`] in the enclosing module. `async fn` sets `async: true`; a `Result<T, E>` return is fallible (the IDL return type is `T`). |
+| `#[weaveffi::export]`                           | free `fn`                           | Emits a [`Function`] in the enclosing module. `async fn` sets `async: true`; a `Result<T, E>` return sets `throws: true` (the IDL return type is `T`). |
 | `#[weaveffi::record]`                           | named-field `struct`                | Emits a [`StructDef`].                                                                    |
+| `#[weaveffi::interface]`                        | `struct` with an `impl` block       | Emits an [`InterfaceDef`]. The `impl` block's `pub fn`s become constructors (those returning `Self`), methods (`&self` receivers), and statics. |
+| `#[weaveffi::error]`                            | unit-variant `enum`                 | Emits the module's error domain. Every variant needs an explicit `= N` discriminant; the first doc line is the code's message. |
 | `#[weaveffi::builder]`                          | `struct` (with `#[weaveffi::record]`) | Sets `builder: true` on the emitted struct.                                            |
 | `#[weaveffi::enumeration]` + `#[repr(i32)]`     | `enum`                              | Emits an [`EnumDef`]. Every variant must have an explicit `= N` discriminant.            |
 | `#[weaveffi::cancellable]`                      | exported `async fn`                 | Sets `cancellable: true`.                                                                |
@@ -161,6 +163,7 @@ macro consumes, and it reads unambiguously.
 
 [`Function`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.Function.html
 [`StructDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.StructDef.html
+[`InterfaceDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.InterfaceDef.html
 [`EnumDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.EnumDef.html
 [`CallbackDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.CallbackDef.html
 [`ListenerDef`]: https://weaveffi.com/api/rust/weaveffi_ir/struct.ListenerDef.html
@@ -170,12 +173,13 @@ field in the IR.
 
 > **Macro versus extraction.** Both the CLI extractor and the
 > `#[weaveffi::module]` proc-macro understand the full annotation surface above,
-> including async, callbacks, listeners, iterators, rich enums, maps, and
-> builders. Extraction additionally preserves IDL-only metadata that source
-> can't yet express (error domains, package and per-generator configuration, and
-> standalone `since` tags), which is why the advanced samples keep a committed
-> YAML IDL for generation. See [Feature
-> support](producer-macro.md#feature-support) for the macro's current matrix.
+> including interfaces, error domains, async, callbacks, listeners, iterators,
+> rich enums, maps, and builders. A hand-authored IDL can additionally carry
+> metadata that source can't yet express (package and per-generator
+> configuration, struct field defaults, and standalone `since` tags), which is
+> why the advanced samples keep a committed YAML IDL for generation. See
+> [Feature support](producer-macro.md#feature-support) for the macro's current
+> matrix.
 
 ### Type mapping
 
@@ -199,6 +203,7 @@ field in the IR.
 | `*mut T` / `*const T`| `TypedHandle("T")`       | `handle<T>`      |
 | `Vec<T>`             | `List(T)`                | `[T]`            |
 | `Option<T>`          | `Optional(T)`            | `T?`             |
+| `weaveffi::Iter<T>`  | `Iterator(T)`            | `iter<T>`        |
 | `HashMap<K, V>`      | `Map(K, V)`              | `{K:V}`          |
 | `BTreeMap<K, V>`     | `Map(K, V)`              | `{K:V}`          |
 | `&T` (other)         | inner type               | `T`              |
@@ -220,9 +225,10 @@ The `roundtrip_kitchen_sink` integration test in
 `crates/weaveffi-cli/tests/extract_roundtrip.rs` proves that the
 hand-annotated form of the kitchen-sink IDL round-trips through `weaveffi
 extract` and matches the original IR for every supported feature: modules,
-nested modules, structs (including builders), enums, callbacks, listeners,
-every primitive type, borrowed types, typed handles, optional/list/map
-composites, async, cancellable, and deprecated/since.
+nested modules, structs (including builders), enums, interfaces, error
+domains, per-function `throws`, callbacks, listeners, every primitive type,
+borrowed types, typed handles, optional/list/map composites, async,
+cancellable, and deprecated/since.
 
 ## Pitfalls
 
@@ -230,24 +236,28 @@ The extractor parses syntax, not semantics. The items below cannot be inferred
 from Rust source alone and either must be added to the generated IDL by hand or
 are documented as round-trip gaps.
 
-- **Iterator return types (`iter<T>`).** No equivalent Rust syntax; add the
-  `iter<T>` return manually after extraction.
-- **Error domains (`module.errors`).** The extractor never emits `errors:`
-  blocks; add them by hand.
+- **Package and per-generator configuration.** The `package:` and
+  `generators:` blocks have no source-level spelling; add them to the
+  extracted IDL by hand (this is why the advanced samples commit a YAML).
 - **Struct field default values.** The IDL's `default:` field cannot be
   derived from Rust syntax (Rust struct fields have no default expressions).
 - **Standalone `since:` without `#[deprecated]`.** `since` is only recovered
   when paired with `#[deprecated(since = "...")]`. To set `since` on a
   non-deprecated function, edit the YAML manually.
+- **An error code's `doc:` separate from its `message:`.** In Rust the first
+  doc line on a `#[weaveffi::error]` variant is the code's message; the IDL
+  can carry both, so a distinct `doc:` is dropped on round-trip.
 - **Doc comments on parameters.** Rust accepts `///` on `fn` parameters but
   most formatters strip them; when present, the extractor preserves them, but
   plan for `Param.doc` to be lossy.
 - **Generics, trait `impl` blocks, and macros.** The extractor never resolves
-  generics, walks `impl` blocks, or expands macros. Items produced by
-  proc-macros and declarative macros are invisible.
+  generics or expands macros, and it only reads the inherent `impl` block of
+  a `#[weaveffi::interface]` type. Items produced by proc-macros and
+  declarative macros are invisible.
 - **External `mod foo;` declarations.** Only inline modules (`mod foo { ... }`)
   are processed; declarations that point to other files are skipped.
 - **Tuple and unit structs.** Only structs with named fields work with
   `#[weaveffi::record]`.
-- **Enums must use `#[repr(i32)]` with explicit discriminants.** Rust-style
-  enums with payloads (rich enums) cannot be extracted.
+- **Enum discriminants are mandatory.** C-style enums need `#[repr(i32)]`
+  with explicit `= N` discriminants, and rich (payload-carrying) enum
+  variants must use named fields; tuple-style variants are rejected.

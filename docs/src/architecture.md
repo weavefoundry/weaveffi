@@ -152,15 +152,18 @@ annotations from the generated `weaveffi.schema.json`.
 that matter most:
 
 - `Api { version, modules, generators }`: root node.
-- `Module { name, functions, structs, enums, callbacks, listeners,
-  errors, modules }`: modules can nest.
-- `Function { name, params, returns, doc, async, cancellable,
-  deprecated, since }`.
+- `Module { name, functions, interfaces, structs, enums, callbacks,
+  listeners, errors, modules }`: modules can nest.
+- `Function { name, params, returns, doc, throws, async, cancellable,
+  deprecated, since }`. The same shape describes an interface's
+  constructors, methods, and statics.
+- `InterfaceDef { name, doc, constructors, methods, statics }`: an opaque
+  object type; every interface also receives an implicit destroy symbol.
 - `TypeRef` enumerates every supported type reference: primitives
   (`I32`, `U32`, `I64`, `F64`, `Bool`, `StringUtf8`, `Bytes`, `Handle`,
   `BorrowedStr`, `BorrowedBytes`), user types (`Struct(String)`,
-  `Enum(String)`, `TypedHandle(String)`), and the four composite
-  shapes (`Optional`, `List`, `Map`, `Iterator`).
+  `Enum(String)`, `Interface(String)`, `TypedHandle(String)`), and the
+  four composite shapes (`Optional`, `List`, `Map`, `Iterator`).
 
 Every IR type derives `Debug`, `Clone`, `PartialEq`, `Serialize`, and
 `Deserialize`. `Eq` is derived where possible; a few types (`Api`,
@@ -175,7 +178,7 @@ JSON Schema export rely on it.
 
 ### Schema versioning
 
-`CURRENT_SCHEMA_VERSION` (currently `"0.4.0"`) lives in
+`CURRENT_SCHEMA_VERSION` (currently `"0.5.0"`) lives in
 [`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
 contains exactly the current version; older schema revisions are rejected
 by validation with an actionable error. When you change the schema:
@@ -202,18 +205,29 @@ Errors enforced today:
   `match`, `type`, `return`, `async`, `await`, `break`, `continue`,
   `fn`, `struct`, `enum`, `mod`, `use`).
 - Uniqueness of module/function/parameter/struct/enum/field/variant
-  names within their respective scopes.
-- Structs must have at least one field; enums at least one variant.
+  names within their respective scopes, plus API-wide uniqueness of bare
+  type names (structs, enums, interfaces, and error domains share one
+  global namespace).
+- Structs must have at least one field; enums at least one variant;
+  interfaces at least one member.
 - Enum discriminant uniqueness within an enum.
-- Type references resolve within the enclosing module chain
-  (cross-sibling references are rejected; see
+- Type references resolve by bare name across the whole API and are
+  qualified to their owning module during resolution (see
   [Cross-module references](reference/idl.md#cross-module-type-references)).
+- Interface members (constructors, methods, statics) share one namespace
+  per interface; constructors declare no return and cannot be async;
+  interface types are valid only as parameters, returns, and optionals of
+  those. Free functions and interface members share the module's C symbol
+  namespace.
+- `throws: true` requires an error domain in scope (the module or an
+  ancestor).
 - Iterator return types are valid in return position only.
 - Map keys must be a primitive or enum type.
 - `event_callback` on a listener must reference a callback in the same
   module.
 - Error domain name must not collide with a function name in the same
-  module; codes must be non-zero and unique.
+  module; codes must be non-zero and unique within the domain; code names
+  must be unique across every domain in the API.
 
 Warnings emitted today:
 
@@ -224,11 +238,12 @@ Warnings emitted today:
 - `MutableOnValueType` (`mutable: true` on a non-pointer parameter).
 - `DeprecatedFunction` (informational).
 
-Async functions, cancellable functions, listeners, callbacks,
-iterators (`iter<T>`), typed handles (`handle<T>`), borrowed types
-(`&str`, `&[u8]`), nested modules, and cross-module type references are
-all **first-class**. They pass validation and every generator handles
-them. Do not re-add validator rejections for these features.
+Interfaces, typed error domains, async functions, cancellable functions,
+listeners, callbacks, iterators (`iter<T>`), typed handles (`handle<T>`),
+borrowed types (`&str`, `&[u8]`), nested modules, and cross-module type
+references are all **first-class**. They pass validation and every
+generator handles them. Do not re-add validator rejections for these
+features.
 
 The one exception is per-target capability gating: each generator
 declares a `TargetCapabilities` (async, callbacks, listeners,
@@ -332,13 +347,15 @@ pub trait LanguageBackend: Send + Sync {
     fn files(&self, api: &Api, model: &BindingModel,
              out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile>;
 
-    /// Canonical per-module walk (enums → structs → callbacks → listeners
-    /// → functions) with call-shape dispatch. Single-pass backends override
-    /// the `render_enum`/`render_struct`/`render_function` hooks and call
-    /// this; multi-pass backends build their layout in `files` directly.
+    /// Canonical per-module walk (error → enums → structs → interfaces →
+    /// callbacks → listeners → functions) with call-shape dispatch.
+    /// Single-pass backends override the `render_enum`/`render_struct`/
+    /// `render_function` hooks and call this; multi-pass backends build
+    /// their layout in `files` directly.
     fn emit_members(&self, out: &mut String, module: &ModuleBinding, config: &Self::Config) { /* … */ }
-    // render_enum / render_struct / render_callback / render_listener /
-    // render_function: all default to no-op.
+    // render_error / render_enum / render_struct / render_interface /
+    // render_callback / render_listener / render_function: all default
+    // to no-op.
 }
 ```
 
@@ -514,9 +531,9 @@ non-deterministically on different platforms or insta orderings.
 ## Snapshot tests
 
 `crates/weaveffi-cli/tests/snapshots.rs` runs every generator across a
-nine-fixture corpus (`tests/fixtures/01_calculator` … `09_nested_modules`:
+ten-fixture corpus (`tests/fixtures/01_calculator` … `10_shapes`:
 calculator, contacts, inventory, async-demo, events, kitchen-sink,
-docs-everywhere, kvstore, and nested-modules). Output is diffed via
+docs-everywhere, kvstore, nested-modules, and shapes). Output is diffed via
 [`cargo-insta`][insta]. When a snapshot diff is intentional:
 
 ```bash
@@ -564,8 +581,8 @@ A condensed checklist (the long version lives in
    async-demo, and events sample IDLs.
 5. Document the generator under `docs/src/generators/<lang>.md` and
    link it from `docs/src/SUMMARY.md`.
-6. Add a consumer example under `examples/<lang>/` and wire it into
-   `examples/run_all.sh`.
+6. Add conformance consumers under `conformance/<lang>/` and wire them
+   into `conformance/run.sh`.
 7. Add `scripts/publish-crates.sh` to the dependency-ordered publish
    list (only when the crate is ready to be released).
 

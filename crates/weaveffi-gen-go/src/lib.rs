@@ -14,26 +14,34 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{AbiParam, CType, ConstPos};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, walk_modules, DocCommentStyle};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
+    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding,
+    FieldBinding, FnBinding, InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding,
+    RichVariantBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{
-    c_abi_struct_name, local_type_name, render_prelude, render_trailer, CommentStyle,
+    c_abi_struct_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`GoGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GoConfig {
     /// Go module path written to `go.mod` (default `"weaveffi"`).
     pub module_path: Option<String>,
+    /// When `true` (the default), strip the IR module path from emitted
+    /// package-level function names, so module `kv`'s `delete` surfaces as
+    /// `Delete` rather than `KvDelete`. Set to `false` to restore the
+    /// module-prefixed spelling. Interface members are namespaced by their
+    /// wrapper type and never carry the module prefix.
+    pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the cgo bindings call the same
     /// exported symbols the producer emits.
@@ -41,6 +49,17 @@ pub struct GoConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for GoConfig {
+    fn default() -> Self {
+        Self {
+            module_path: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl GoConfig {
@@ -83,7 +102,7 @@ impl LanguageBackend for GoGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
@@ -92,7 +111,13 @@ impl LanguageBackend for GoGenerator {
         vec![
             OutputFile::new(
                 dir.join("weaveffi.go"),
-                render_go(api, config.prefix(), input_basename),
+                render_go(
+                    api,
+                    model,
+                    config.prefix(),
+                    config.strip_module_prefix,
+                    input_basename,
+                ),
             ),
             OutputFile::new(
                 dir.join("go.mod"),
@@ -113,7 +138,7 @@ impl LanguageBackend for GoGenerator {
     fn package(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -149,7 +174,14 @@ impl LanguageBackend for GoGenerator {
             }
         }
         cgo.push_str(&format!("#cgo LDFLAGS: -l{link_name}\n"));
-        let go_src = render_go(api, prefix, input_basename).replace(&original, &cgo);
+        let go_src = render_go(
+            api,
+            model,
+            prefix,
+            config.strip_module_prefix,
+            input_basename,
+        )
+        .replace(&original, &cgo);
 
         let mut files = vec![
             PackagedFile::text(dir.join("weaveffi.go"), go_src),
@@ -233,14 +265,15 @@ fn go_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "[]byte".into(),
-        // Structs, enums, and typed handles surface as bare local Go types; a
-        // cross-module typed handle (resolved to e.g. `kv.Store`) must name the
-        // local `Store` type rather than the qualified `KvStore`.
-        TypeRef::TypedHandle(n) => format!("*{}", local_type_name(n).to_upper_camel_case()),
-        TypeRef::Struct(n) => format!("*{}", local_type_name(n).to_upper_camel_case()),
+        // Structs, interfaces, enums, and typed handles surface as bare local
+        // Go types; a cross-module reference (resolved to e.g. `kv.Store`)
+        // must name the local `Store` type rather than the qualified `KvStore`.
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+            format!("*{}", local_type_name(n).to_upper_camel_case())
+        }
         TypeRef::Enum(n) => local_type_name(n).to_upper_camel_case(),
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => go_type(inner),
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => go_type(inner),
             TypeRef::List(_) | TypeRef::Map(_, _) => go_type(inner),
             TypeRef::Bytes | TypeRef::BorrowedBytes => go_type(inner),
             _ => format!("*{}", go_type(inner)),
@@ -321,7 +354,9 @@ fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
 
 fn c_opaque_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
     match ty {
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => c_abi_struct_name(n, module, prefix),
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+            c_abi_struct_name(n, module, prefix)
+        }
         _ => String::new(),
     }
 }
@@ -355,69 +390,98 @@ fn type_has_bool(ty: &TypeRef) -> bool {
     }
 }
 
-/// Imports the generated file needs: (`fmt`, `unsafe`, bool helpers, `sync`).
-fn scan_imports(api: &Api) -> (bool, bool, bool, bool) {
-    let has_funcs = walk_modules(&api.modules).any(|m| !m.functions.is_empty());
-    // A builder's `Build` calls the C `create` symbol and returns `(*T, error)`,
-    // so it pulls in `fmt` (error formatting) just like a fallible function.
-    let has_builder = walk_modules(&api.modules).any(|m| m.structs.iter().any(|s| s.builder));
-    // A rich (algebraic) enum emits a `New{Variant}` constructor per variant
-    // that returns `(*T, error)` and formats failures with `fmt`, exactly like
-    // a builder's `Build`.
-    let has_rich_enum = walk_modules(&api.modules).any(|m| m.enums.iter().any(|e| e.is_rich()));
-    let has_async = walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async));
-    let has_listeners = walk_modules(&api.modules).any(|m| !m.listeners.is_empty());
+/// What the generated file's preamble must pull in, computed by one pass over
+/// the lowered model.
+#[derive(Default, Clone, Copy)]
+struct Imports {
+    /// `fmt` (error formatting); implied by [`err_infra`](Self::err_infra).
+    fmt: bool,
+    /// `unsafe` (pointer staging for strings/bytes/lists/maps, callback
+    /// contexts).
+    unsafe_ptr: bool,
+    /// The `boolToC`/`cToBool` helpers.
+    bool_helpers: bool,
+    /// `sync` (the callback registry mutex).
+    sync: bool,
+    /// The shared error plumbing: the [`ERROR_BRAND`] type plus the
+    /// `wvTakeError`/`wvBrandError`/`wvTrap` helpers.
+    err_infra: bool,
+}
 
-    let needs_fmt = has_funcs || has_builder || has_rich_enum;
+/// Scan the lowered model for everything [`Imports`] tracks. Interface
+/// members participate exactly like free functions (via
+/// [`ModuleBinding::callables`]).
+fn scan_imports(model: &BindingModel) -> Imports {
+    let mut any_callable = false;
+    let mut has_async = false;
+    let mut has_listeners = false;
+    let mut has_fallible_ctor = false;
+    let mut has_domain = false;
+    let mut unsafe_ptr = false;
+    let mut bool_helpers = false;
+
+    for m in &model.modules {
+        has_listeners |= !m.listeners.is_empty();
+        has_domain |= m.declares_error();
+        for f in m.callables() {
+            any_callable = true;
+            has_async |= f.is_async;
+            unsafe_ptr |= f.params.iter().any(|p| param_uses_unsafe(&p.ty))
+                || f.ret.as_ref().is_some_and(return_uses_unsafe);
+            bool_helpers |= f.params.iter().any(|p| type_has_bool(&p.ty))
+                || f.ret.as_ref().is_some_and(type_has_bool);
+        }
+        for s in &m.structs {
+            // A builder's `Build` calls the C `create` symbol and returns
+            // `(*T, error)`, so it needs the error plumbing like a fallible
+            // function does; getters can materialize bytes/list/map, and a
+            // builder additionally marshals every field *in* (strings stage
+            // through unsafe.Pointer).
+            has_fallible_ctor |= s.builder.is_some();
+            unsafe_ptr |= s.fields.iter().any(|fld| return_uses_unsafe(&fld.ty))
+                || (s.builder.is_some() && s.fields.iter().any(|fld| param_uses_unsafe(&fld.ty)));
+            bool_helpers |= s.fields.iter().any(|fld| type_has_bool(&fld.ty));
+        }
+        for e in &m.enums {
+            // A rich (algebraic) enum emits a `New{Enum}{Variant}` constructor
+            // per variant that returns `(*T, error)`, and its per-variant field
+            // getters/constructor arguments marshal exactly like struct fields.
+            if let Some(rich) = &e.rich {
+                has_fallible_ctor = true;
+                unsafe_ptr |= rich.variants.iter().any(|v| {
+                    v.fields
+                        .iter()
+                        .any(|fld| return_uses_unsafe(&fld.ty) || param_uses_unsafe(&fld.ty))
+                });
+                bool_helpers |= rich
+                    .variants
+                    .iter()
+                    .any(|v| v.fields.iter().any(|fld| type_has_bool(&fld.ty)));
+            }
+        }
+        for cb in &m.callbacks {
+            // A callback trampoline's signature carries the `void* context`
+            // slot as unsafe.Pointer, and its parameters decode like returns.
+            unsafe_ptr = true;
+            bool_helpers |= cb.params.iter().any(|p| type_has_bool(&p.ty));
+        }
+    }
 
     // Async launchers and listener registration thread the registry id through
     // the C `void* context`, which always stages through unsafe.Pointer.
-    let needs_unsafe = has_async
-        || has_listeners
-        || walk_modules(&api.modules).any(|m| {
-            m.functions.iter().any(|f| {
-                f.params.iter().any(|p| param_uses_unsafe(&p.ty))
-                    || f.returns.as_ref().is_some_and(return_uses_unsafe)
-            }) || m.structs.iter().any(|s| {
-                // Getters can materialize bytes/list/map; a builder additionally
-                // marshals every field *in* (strings stage through unsafe.Pointer).
-                s.fields.iter().any(|fld| return_uses_unsafe(&fld.ty))
-                    || (s.builder && s.fields.iter().any(|fld| param_uses_unsafe(&fld.ty)))
-            }) || m.enums.iter().any(|e| {
-                // A rich enum's per-variant field getters materialize
-                // bytes/list/map, and its constructors marshal those fields *in*
-                // (strings stage through unsafe.Pointer), just like a struct.
-                e.is_rich()
-                    && e.variants.iter().any(|v| {
-                        v.fields
-                            .iter()
-                            .any(|fld| return_uses_unsafe(&fld.ty) || param_uses_unsafe(&fld.ty))
-                    })
-            })
-        });
+    unsafe_ptr |= has_async || has_listeners;
+    // Every callable checks its error slot (returning or trapping), so any
+    // callable at all pulls in the error plumbing; a declared domain also
+    // needs it for the brand-error fallback of its mapping helper.
+    let err_infra = any_callable || has_fallible_ctor || has_domain;
 
-    let needs_bool = walk_modules(&api.modules).any(|m| {
-        m.functions.iter().any(|f| {
-            f.params.iter().any(|p| type_has_bool(&p.ty))
-                || f.returns.as_ref().is_some_and(type_has_bool)
-        }) || m
-            .structs
-            .iter()
-            .any(|s| s.fields.iter().any(|fld| type_has_bool(&fld.ty)))
-            || m.enums.iter().any(|e| {
-                e.is_rich()
-                    && e.variants
-                        .iter()
-                        .any(|v| v.fields.iter().any(|fld| type_has_bool(&fld.ty)))
-            })
-            || m.callbacks
-                .iter()
-                .any(|c| c.params.iter().any(|p| type_has_bool(&p.ty)))
-    });
-
-    let needs_sync = has_async || has_listeners;
-
-    (needs_fmt, needs_unsafe, needs_bool, needs_sync)
+    Imports {
+        fmt: err_infra,
+        unsafe_ptr,
+        bool_helpers,
+        sync: has_async || has_listeners,
+        err_infra,
+    }
 }
 
 // ── Packaging scaffold ──
@@ -573,9 +637,256 @@ fn emit_fn_doc(
     }
 }
 
-fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
-    let model = BindingModel::build(api, prefix);
-    let (needs_fmt, needs_unsafe, needs_bool, needs_sync) = scan_imports(api);
+// ── Errors ──
+
+/// How a wrapper body reports a non-zero `weaveffi_error` slot.
+///
+/// A callable with `throws == true` returns `(T, error)` and maps codes
+/// through the declaring module's typed helper (`wvMapKv`), falling back to
+/// the generic [`ERROR_BRAND`] struct when no domain is in scope (builders and
+/// rich-enum constructors). A callable with `throws == false` has a plain
+/// signature and panics via `wvTrap` instead, since a reported error can only
+/// be a producer panic or an argument-marshalling failure.
+#[derive(Clone, Copy)]
+struct ErrCtx<'a> {
+    /// `true` when the wrapper returns `(T, error)` and surfaces typed errors.
+    throws: bool,
+    /// PascalCase stem of the domain in effect (`Kv` names `wvMapKv`); `None`
+    /// falls back to the generic `wvBrandError` constructor.
+    stem: Option<&'a str>,
+}
+
+impl ErrCtx<'_> {
+    /// The Go expression converting a taken `(code, message)` pair into an
+    /// `error` value.
+    fn map_call(&self, args: &str) -> String {
+        match self.stem {
+            Some(stem) => format!("wvMap{stem}({args})"),
+            None => format!("wvBrandError({args})"),
+        }
+    }
+
+    /// Emit the statement(s) checking the error slot named `slot` at `w`'s
+    /// current depth. A throwing wrapper returns `zero` (when the function
+    /// has a result) plus the mapped error; a plain wrapper traps.
+    fn emit_check(&self, w: &mut CodeWriter, slot: &str, zero: Option<&str>) {
+        if self.throws {
+            let map = self.map_call(&format!("wvTakeError(&{slot})"));
+            w.block(format!("if {slot}.code != 0 {{"), "}", |w| {
+                match zero {
+                    Some(z) => w.line(format!("return {z}, {map}")),
+                    None => w.line(format!("return {map}")),
+                };
+            });
+        } else {
+            w.line(format!("wvTrap(&{slot})"));
+        }
+    }
+
+    /// The Go return-type suffix (including the leading space) of a wrapper
+    /// returning `ret`: `(T, error)`/`error` when throwing, `T`/nothing when
+    /// plain.
+    fn ret_sig(&self, ret: &Option<TypeRef>) -> String {
+        match (ret, self.throws) {
+            (Some(r), true) => format!(" ({}, error)", go_type(r)),
+            (Some(r), false) => format!(" {}", go_type(r)),
+            (None, true) => " error".into(),
+            (None, false) => String::new(),
+        }
+    }
+
+    /// The suffix appended to every successful `return` statement: `, nil`
+    /// when the wrapper also returns an error, empty otherwise.
+    fn ok_tail(&self) -> &'static str {
+        if self.throws {
+            ", nil"
+        } else {
+            ""
+        }
+    }
+}
+
+/// The PascalCase helper stem of the domain in effect for `module`, naming
+/// the per-domain `wvMap{Stem}` helper (derived from the *declaring* module's
+/// path, so inheriting submodules reference the ancestor's helper).
+fn domain_stem(module: &ModuleBinding) -> Option<String> {
+    module
+        .error
+        .as_ref()
+        .map(|e| e.owner_path.to_upper_camel_case())
+}
+
+/// The shared error plumbing: the generic [`ERROR_BRAND`] struct implementing
+/// `error` (unknown codes, marshalling failures, builder/rich-enum failures),
+/// plus the `wvTakeError` slot reader, the `wvBrandError` constructor, and
+/// the `wvTrap` panic helper non-throwing wrappers check their slot with.
+fn render_error_infra(out: &mut String) {
+    let mut w = CodeWriter::tabs();
+    w.line(format!(
+        "// {ERROR_BRAND} reports a failure crossing the C boundary that no typed"
+    ));
+    w.line("// error domain claims: an unknown code, a marshalling failure, or a");
+    w.line("// producer panic.");
+    w.block(format!("type {ERROR_BRAND} struct {{"), "}", |w| {
+        w.line("// Code is the numeric ABI error code.");
+        w.line("Code int32");
+        w.line("// Message is the human-readable error message.");
+        w.line("Message string");
+    });
+    w.blank();
+    w.block(
+        format!("func (e *{ERROR_BRAND}) Error() string {{"),
+        "}",
+        |w| {
+            w.line("return fmt.Sprintf(\"weaveffi: %s (code %d)\", e.Message, e.Code)");
+        },
+    );
+    w.blank();
+
+    w.line("// wvTakeError reads and clears a non-zero C error slot, returning its");
+    w.line("// code and message.");
+    w.block(
+        "func wvTakeError(cErr *C.weaveffi_error) (int32, string) {",
+        "}",
+        |w| {
+            w.line("code := int32(cErr.code)");
+            w.line("msg := \"\"");
+            w.block("if cErr.message != nil {", "}", |w| {
+                w.line("msg = C.GoString(cErr.message)");
+            });
+            w.line("C.weaveffi_error_clear(cErr)");
+            w.line("return code, msg");
+        },
+    );
+    w.blank();
+
+    w.block(
+        "func wvBrandError(code int32, message string) error {",
+        "}",
+        |w| {
+            w.line(format!(
+                "return &{ERROR_BRAND}{{Code: code, Message: message}}"
+            ));
+        },
+    );
+    w.blank();
+
+    w.line("// wvTrap panics when the C error slot reports a failure. Non-throwing");
+    w.line("// wrappers check their slot with it: a non-zero code there can only be");
+    w.line("// a producer panic or a marshalling failure.");
+    w.block("func wvTrap(cErr *C.weaveffi_error) {", "}", |w| {
+        w.block("if cErr.code != 0 {", "}", |w| {
+            w.line("code, msg := wvTakeError(cErr)");
+            w.line("panic(fmt.Sprintf(\"weaveffi: %s (code %d)\", msg, code))");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Render one declaring module's typed error surface: a
+/// `type {TypeName} struct {{ Code int32; Message string }}` implementing
+/// `error` (so `errors.As` selects on the domain), exported `int32` code
+/// constants in the plain-enum const style (`{TypeName}{CodePascal}`), and
+/// the `wvMap{Stem}` helper converting a non-zero slot's `(code, message)`
+/// into the typed error (default message when the slot carried none, generic
+/// [`ERROR_BRAND`] fallback for unknown codes).
+fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
+    let stem = eb.owner_path.to_upper_camel_case();
+    let ty = &eb.type_name;
+    let dotted = module.segments.join(".");
+
+    let mut w = CodeWriter::tabs();
+    w.line(format!(
+        "// {ty} is a typed error reported by the `{dotted}` module."
+    ));
+    w.block(format!("type {ty} struct {{"), "}", |w| {
+        w.line(format!(
+            "// Code is the numeric ABI error code (one of the {ty} constants)."
+        ));
+        w.line("Code int32");
+        w.line("// Message is the human-readable error message.");
+        w.line("Message string");
+    });
+    w.blank();
+    w.block(format!("func (e *{ty}) Error() string {{"), "}", |w| {
+        w.line(format!(
+            "return fmt.Sprintf(\"{dotted}: %s (code %d)\", e.Message, e.Code)"
+        ));
+    });
+    w.blank();
+
+    w.line(format!("// {ty} codes."));
+    w.block("const (", ")", |w| {
+        for c in &eb.codes {
+            let cname = format!("{ty}{}", c.name.to_upper_camel_case());
+            let doc = c.doc.clone().unwrap_or_else(|| c.message.clone());
+            let mut cd = String::new();
+            emit_doc(&mut cd, &Some(doc), "\t", Some(&cname));
+            w.raw(cd);
+            w.line(format!("{cname} int32 = {}", c.value));
+        }
+    });
+    w.blank();
+
+    w.line(format!(
+        "// wvMap{stem} converts a non-zero code from the `{dotted}` domain into a"
+    ));
+    w.line(format!(
+        "// *{ty}, falling back to the generic *{ERROR_BRAND} for unknown codes."
+    ));
+    w.block(
+        format!("func wvMap{stem}(code int32, message string) error {{"),
+        "}",
+        |w| {
+            w.line("switch code {");
+            for c in &eb.codes {
+                let cname = format!("{ty}{}", c.name.to_upper_camel_case());
+                w.line(format!("case {cname}:"));
+                w.indent();
+                w.block("if message == \"\" {", "}", |w| {
+                    w.line(format!("message = {}", go_str(&c.message)));
+                });
+                w.line(format!("return &{ty}{{Code: code, Message: message}}"));
+                w.dedent();
+            }
+            w.line("default:");
+            w.indent();
+            w.line("return wvBrandError(code, message)");
+            w.dedent();
+            w.line("}");
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Quote `s` as a Go string literal, escaping backslashes, quotes, and
+/// newlines.
+fn go_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn render_go(
+    api: &Api,
+    model: &BindingModel,
+    prefix: &str,
+    strip_module_prefix: bool,
+    input_basename: &str,
+) -> String {
+    let imports = scan_imports(model);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
 
     // The Go package clause and the linked library name follow the resolved
@@ -590,7 +901,7 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
     let has_async = model
         .modules
         .iter()
-        .any(|m| m.functions.iter().any(|f| f.is_async));
+        .any(|m| m.callables().any(|f| f.is_async));
 
     out.push_str(&format!("package {go_pkg}\n\n"));
 
@@ -601,29 +912,29 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
     // Forward declarations for the //export trampolines below. These must
     // mirror the prototypes cgo emits into _cgo_export.h (const-free), and the
     // preamble of a file using //export may only contain declarations.
-    for decl in collect_trampoline_externs(&model, prefix) {
+    for decl in collect_trampoline_externs(model, prefix) {
         out.push_str(&decl);
         out.push('\n');
     }
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if needs_fmt || needs_unsafe || needs_sync {
+    if imports.fmt || imports.unsafe_ptr || imports.sync {
         out.push_str("\nimport (\n");
-        if needs_fmt {
+        if imports.fmt {
             out.push_str("\t\"fmt\"\n");
         }
-        if needs_sync {
+        if imports.sync {
             out.push_str("\t\"sync\"\n");
         }
-        if needs_unsafe {
+        if imports.unsafe_ptr {
             out.push_str("\t\"unsafe\"\n");
         }
         out.push_str(")\n");
     }
     out.push('\n');
 
-    if needs_bool {
+    if imports.bool_helpers {
         // cgo models C `_Bool` as a distinct Go type whose underlying kind is
         // bool, so convert with the type itself rather than integer literals.
         out.push_str("func boolToC(b bool) C._Bool {\n");
@@ -634,11 +945,23 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
         out.push_str("}\n\n");
     }
 
+    if imports.err_infra {
+        render_error_infra(&mut out);
+    }
+
     if has_async || has_listeners {
         render_callback_registry(&mut out, has_listeners);
     }
 
     for m in &model.modules {
+        let stem = domain_stem(m);
+        if let Some(eb) = &m.error {
+            // Emit the typed domain once, in its declaring module; inheriting
+            // submodules reference the ancestor's type through `wvMap{Stem}`.
+            if eb.declared_here {
+                render_error(&mut out, m, eb);
+            }
+        }
         for e in &m.enums {
             // A plain C-style enum becomes an `int32` + constants; a rich
             // (algebraic) enum becomes an opaque-object wrapper. Each renderer
@@ -652,17 +975,25 @@ fn render_go(api: &Api, prefix: &str, input_basename: &str) -> String {
                 render_go_builder(&mut out, prefix, &m.path, s);
             }
         }
+        for i in &m.interfaces {
+            render_interface(&mut out, prefix, m, i, stem.as_deref());
+        }
         for cb in &m.callbacks {
             render_callback_trampoline(&mut out, prefix, &m.path, cb);
         }
         for l in &m.listeners {
-            render_listener_api(&mut out, m, l);
+            render_listener_api(&mut out, m, l, strip_module_prefix);
         }
         for f in &m.functions {
+            let go_name = wrapper_name(&m.path, &f.name, strip_module_prefix).to_upper_camel_case();
+            let err = ErrCtx {
+                throws: f.throws,
+                stem: stem.as_deref(),
+            };
             if let CallShape::Async(ab) = &f.shape {
-                render_async_function(&mut out, prefix, &m.path, f, ab);
+                render_async_function(&mut out, prefix, &m.path, f, ab, &go_name, None, err);
             } else {
-                render_function(&mut out, prefix, &m.path, f);
+                render_function(&mut out, prefix, &m.path, f, &go_name, None, err);
             }
         }
     }
@@ -739,14 +1070,15 @@ fn extern_decl(c_type_name: &str, params: &[AbiParam], prefix: &str) -> String {
 }
 
 /// Every `extern` declaration the preamble needs: one per module callback
-/// (shared by all listeners firing it) and one per async completion callback.
+/// (shared by all listeners firing it) and one per async completion callback,
+/// including async interface members.
 fn collect_trampoline_externs(model: &BindingModel, prefix: &str) -> Vec<String> {
     let mut decls = Vec::new();
     for m in &model.modules {
         for cb in &m.callbacks {
             decls.push(extern_decl(&cb.c_fn_type, &cb.abi_params, prefix));
         }
-        for f in &m.functions {
+        for f in m.callables() {
             if let CallShape::Async(ab) = &f.shape {
                 decls.push(extern_decl(&ab.callback_type, &ab.callback_params, prefix));
             }
@@ -866,7 +1198,7 @@ fn emit_cb_param_arg(
         }
         // Opaque pointers are borrowed for the duration of the callback; the
         // wrapper must not be Closed by the consumer.
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
             let g = local_type_name(name).to_upper_camel_case();
             w.line(format!("{arg} := &{g}{{ptr: {n}}}"));
         }
@@ -887,7 +1219,7 @@ fn emit_cb_param_arg(
                     ));
                 });
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
                 let g = local_type_name(name).to_upper_camel_case();
                 w.line(format!("var {arg} *{g}"));
                 w.block(format!("if {n} != nil {{"), "}", |w| {
@@ -981,13 +1313,30 @@ fn render_callback_trampoline(out: &mut String, prefix: &str, module: &str, cb: 
     out.push_str(&w.finish());
 }
 
-/// The register/unregister wrapper pair for one listener.
-fn render_listener_api(out: &mut String, m: &ModuleBinding, l: &ListenerBinding) {
+/// The register/unregister wrapper pair for one listener. The wrapper names
+/// follow the module-prefix-stripping default like free functions
+/// (`RegisterEvictionListener` rather than `KvRegisterEvictionListener`).
+fn render_listener_api(
+    out: &mut String,
+    m: &ModuleBinding,
+    l: &ListenerBinding,
+    strip_module_prefix: bool,
+) {
     let Some(cb) = m.callback(&l.event_callback) else {
         unreachable!("validation guarantees the listener's callback exists");
     };
-    let register_go = format!("{}_register_{}", m.path, l.name).to_upper_camel_case();
-    let unregister_go = format!("{}_unregister_{}", m.path, l.name).to_upper_camel_case();
+    let register_go = wrapper_name(
+        &m.path,
+        &format!("register_{}", l.name),
+        strip_module_prefix,
+    )
+    .to_upper_camel_case();
+    let unregister_go = wrapper_name(
+        &m.path,
+        &format!("unregister_{}", l.name),
+        strip_module_prefix,
+    )
+    .to_upper_camel_case();
     let tramp = trampoline_name(&cb.c_fn_type);
 
     let mut w = CodeWriter::tabs();
@@ -1029,12 +1378,16 @@ fn render_listener_api(out: &mut String, m: &ModuleBinding, l: &ListenerBinding)
     out.push_str(&w.finish());
 }
 
-/// The per-async-function outcome payload type name.
-fn async_outcome_type(module: &str, f: &FnBinding) -> String {
-    format!(
-        "wvOutcome{}",
-        format!("{}_{}", module, f.name).to_upper_camel_case()
-    )
+/// The per-async-function outcome payload type name, derived from the
+/// (unique) base C symbol with the ABI prefix dropped: free function
+/// `weaveffi_io_read` names `wvOutcomeIoRead`, interface member
+/// `weaveffi_kv_Store_compact` names `wvOutcomeKvStoreCompact`.
+fn async_outcome_type(prefix: &str, f: &FnBinding) -> String {
+    let base = f
+        .c_base
+        .strip_prefix(&format!("{prefix}_"))
+        .unwrap_or(&f.c_base);
+    format!("wvOutcome{}", base.to_upper_camel_case())
 }
 
 /// Send the converted async result over the outcome channel. Runs inside the
@@ -1094,7 +1447,7 @@ fn emit_async_result_send(
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
             let g = local_type_name(n).to_upper_camel_case();
             w.line(format!("ch <- {outcome}{{val: &{g}{{ptr: result}}}}"));
         }
@@ -1108,7 +1461,7 @@ fn emit_async_result_send(
                 });
                 w.line(format!("ch <- {outcome}{{val: val}}"));
             }
-            TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+            TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
                 let g = local_type_name(n).to_upper_camel_case();
                 w.line(format!("var val *{g}"));
                 w.block("if result != nil {", "}", |w| {
@@ -1163,18 +1516,28 @@ fn emit_async_result_send(
     out.push_str(&w.finish());
 }
 
-/// An async function: a blocking Go wrapper that launches the C call with a
+/// An async callable: a blocking Go wrapper that launches the C call with a
 /// completion trampoline and waits on a buffered channel, plus the outcome
 /// type and the exported trampoline itself.
+///
+/// A throwing wrapper returns `(T, error)` and the trampoline maps a reported
+/// error through the domain (`wvMap{Stem}`); a plain wrapper returns bare `T`
+/// and panics on the calling goroutine when the outcome carries an error
+/// (the trampoline itself must never panic: it runs on a producer thread
+/// entered from C). With `receiver` set, the wrapper is a method on that
+/// wrapper type passing `s.ptr` as the leading launch argument.
+#[allow(clippy::too_many_arguments)]
 fn render_async_function(
     out: &mut String,
     prefix: &str,
     module: &str,
     f: &FnBinding,
     ab: &AsyncBinding,
+    go_name: &str,
+    receiver: Option<&str>,
+    err: ErrCtx,
 ) {
-    let go_name = format!("{}_{}", module, f.name).to_upper_camel_case();
-    let outcome = async_outcome_type(module, f);
+    let outcome = async_outcome_type(prefix, f);
     let tramp = trampoline_name(&ab.callback_type);
 
     let mut w = CodeWriter::tabs();
@@ -1188,7 +1551,9 @@ fn render_async_function(
     });
     w.blank();
 
-    // The exported completion trampoline.
+    // The exported completion trampoline. It always converts a reported error
+    // into a Go error and sends it over the channel; the wrapper decides
+    // whether to return or panic with it.
     let formals: Vec<String> = ab
         .callback_params
         .iter()
@@ -1196,21 +1561,24 @@ fn render_async_function(
         .collect();
     let mut tramp_body = String::new();
     emit_async_result_send(&mut tramp_body, &f.ret, &outcome, prefix, module);
+    let map_err = err.map_call("wvTakeError(err)");
     w.line(format!("//export {tramp}"));
-    w.block(format!("func {tramp}({}) {{", formals.join(", ")), "}", |w| {
-        w.line("v := wvCallbackTake(uint64(uintptr(context)))");
-        w.block("if v == nil {", "}", |w| {
-            w.line("return");
-        });
-        w.line(format!("ch := v.(chan {outcome})"));
-        w.block("if err != nil && err.code != 0 {", "}", |w| {
-            w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(err.message), int(err.code))");
-            w.line("C.weaveffi_error_clear(err)");
-            w.line(format!("ch <- {outcome}{{err: goErr}}"));
-            w.line("return");
-        });
-        w.raw(tramp_body.as_str());
-    });
+    w.block(
+        format!("func {tramp}({}) {{", formals.join(", ")),
+        "}",
+        |w| {
+            w.line("v := wvCallbackTake(uint64(uintptr(context)))");
+            w.block("if v == nil {", "}", |w| {
+                w.line("return");
+            });
+            w.line(format!("ch := v.(chan {outcome})"));
+            w.block("if err != nil && err.code != 0 {", "}", |w| {
+                w.line(format!("ch <- {outcome}{{err: {map_err}}}"));
+                w.line("return");
+            });
+            w.raw(tramp_body.as_str());
+        },
+    );
     w.blank();
 
     // The blocking wrapper. Cancellation tokens are not surfaced (NULL).
@@ -1219,12 +1587,9 @@ fn render_async_function(
         .iter()
         .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty)))
         .collect();
-    let ret_sig = match &f.ret {
-        Some(ret) => format!("({}, error)", go_type(ret)),
-        None => "error".into(),
-    };
+    let ret_sig = err.ret_sig(&f.ret);
     let mut doc = String::new();
-    emit_fn_doc(&mut doc, &f.doc, &f.params, "", &go_name);
+    emit_fn_doc(&mut doc, &f.doc, &f.params, "", go_name);
     w.raw(doc);
     w.line("// Blocks until the async producer completes.");
     if let Some(msg) = &f.deprecated {
@@ -1233,6 +1598,9 @@ fn render_async_function(
 
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
+    if receiver.is_some() {
+        c_args.push("s.ptr".into());
+    }
     for p in &f.params {
         emit_param(
             &mut pre,
@@ -1250,15 +1618,20 @@ fn render_async_function(
     c_args.push("unsafe.Pointer(uintptr(ctxID))".into());
     let launch_args = c_args.join(", ");
 
-    w.block(
-        format!("func {go_name}({}) {ret_sig} {{", go_params.join(", ")),
-        "}",
-        |w| {
-            w.line(format!("ch := make(chan {outcome}, 1)"));
-            w.line("ctxID := wvCallbackStore(ch)");
-            w.raw(pre.as_str());
-            w.line(format!("C.{}({})", ab.launch.symbol, launch_args));
-            w.line("outcome := <-ch");
+    let header = match receiver {
+        Some(ty) => format!(
+            "func (s *{ty}) {go_name}({}){ret_sig} {{",
+            go_params.join(", ")
+        ),
+        None => format!("func {go_name}({}){ret_sig} {{", go_params.join(", ")),
+    };
+    w.block(header, "}", |w| {
+        w.line(format!("ch := make(chan {outcome}, 1)"));
+        w.line("ctxID := wvCallbackStore(ch)");
+        w.raw(pre.as_str());
+        w.line(format!("C.{}({})", ab.launch.symbol, launch_args));
+        w.line("outcome := <-ch");
+        if err.throws {
             if let Some(ret) = &f.ret {
                 w.block("if outcome.err != nil {", "}", |w| {
                     w.line(format!("return {}, outcome.err", go_zero(ret)));
@@ -1267,8 +1640,15 @@ fn render_async_function(
             } else {
                 w.line("return outcome.err");
             }
-        },
-    );
+        } else {
+            w.block("if outcome.err != nil {", "}", |w| {
+                w.line("panic(outcome.err)");
+            });
+            if f.ret.is_some() {
+                w.line("return outcome.val");
+            }
+        }
+    });
     w.blank();
     out.push_str(&w.finish());
 }
@@ -1419,8 +1799,18 @@ fn render_rich_enum_ctor(
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
 
+    // Variant construction is fallible plumbing (marshalling, producer
+    // allocation), not a typed domain failure, so it reports the generic
+    // brand error.
+    let err = ErrCtx {
+        throws: true,
+        stem: None,
+    };
     w.block(
-        format!("func {ctor}({}) (*{enum_name}, error) {{", go_params.join(", ")),
+        format!(
+            "func {ctor}({}) (*{enum_name}, error) {{",
+            go_params.join(", ")
+        ),
         "}",
         |w| {
             w.raw(&pre);
@@ -1429,11 +1819,7 @@ fn render_rich_enum_ctor(
                 v.create.symbol,
                 c_args.join(", ")
             ));
-            w.block("if cErr.code != 0 {", "}", |w| {
-                w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
-                w.line("C.weaveffi_error_clear(&cErr)");
-                w.line("return nil, goErr");
-            });
+            err.emit_check(w, "cErr", Some("nil"));
             w.line(format!("return &{enum_name}{{ptr: result}}, nil"));
         },
     );
@@ -1531,6 +1917,13 @@ fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBin
     }
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
+    // Build failures (missing required fields, marshalling) are plumbing
+    // errors, not typed domain failures, so they report the generic brand
+    // error.
+    let err = ErrCtx {
+        throws: true,
+        stem: None,
+    };
     w.block(
         format!("func (b *{name}Builder) Build() (*{name}, error) {{"),
         "}",
@@ -1541,11 +1934,7 @@ fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBin
                 s.create.symbol,
                 c_args.join(", ")
             ));
-            w.block("if cErr.code != 0 {", "}", |w| {
-                w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
-                w.line("C.weaveffi_error_clear(&cErr)");
-                w.line("return nil, goErr");
-            });
+            err.emit_check(w, "cErr", Some("nil"));
             w.line(format!("return &{name}{{ptr: result}}, nil"));
         },
     );
@@ -1585,11 +1974,7 @@ fn render_getter(
             TypeRef::Enum(_) => {
                 w.line(format!("return {ret}({getter}(s.ptr))"));
             }
-            TypeRef::TypedHandle(n) => {
-                let inner = local_type_name(n).to_upper_camel_case();
-                w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
-            }
-            TypeRef::Struct(n) => {
+            TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
                 let inner = local_type_name(n).to_upper_camel_case();
                 w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
             }
@@ -1602,15 +1987,7 @@ fn render_getter(
                     w.line("v := C.GoString(cStr)");
                     w.line("return &v");
                 }
-                TypeRef::TypedHandle(n) => {
-                    let inner_go = local_type_name(n).to_upper_camel_case();
-                    w.line(format!("cPtr := {getter}(s.ptr)"));
-                    w.block("if cPtr == nil {", "}", |w| {
-                        w.line("return nil");
-                    });
-                    w.line(format!("return &{inner_go}{{ptr: cPtr}}"));
-                }
-                TypeRef::Struct(n) => {
+                TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
                     let inner_go = local_type_name(n).to_upper_camel_case();
                     w.line(format!("cPtr := {getter}(s.ptr)"));
                     w.block("if cPtr == nil {", "}", |w| {
@@ -1679,11 +2056,102 @@ fn render_getter(
     out.push_str(&w.finish());
 }
 
+// ── Interfaces ──
+
+/// Render one interface as an opaque-object wrapper following the struct
+/// pattern: a struct owning the `*C.{c_tag}` handle, freed by an explicit
+/// `Close` (idempotent, nils the pointer).
+///
+/// Constructors become package-level factory functions named
+/// `{PascalCtor}{Type}` (`new` gives `NewStore`, `open` gives `OpenStore`);
+/// methods are methods on the wrapper passing `s.ptr` as the leading C
+/// argument; statics are package-level functions namespaced by the type
+/// (`StoreDefaultCapacity`). Members reuse the free-function marshalling
+/// paths, including the sync/async/iterator shapes and the throws split.
+fn render_interface(
+    out: &mut String,
+    prefix: &str,
+    m: &ModuleBinding,
+    iface: &InterfaceBinding,
+    stem: Option<&str>,
+) {
+    let name = local_type_name(&iface.name).to_upper_camel_case();
+    let c_tag = &iface.c_tag;
+
+    let mut w = CodeWriter::tabs();
+    let mut d = String::new();
+    emit_doc(&mut d, &iface.doc, "", Some(&name));
+    w.raw(d);
+    w.block(format!("type {name} struct {{"), "}", |w| {
+        w.line(format!("ptr *C.{c_tag}"));
+    });
+    w.blank();
+    out.push_str(&w.finish());
+
+    for c in &iface.constructors {
+        let go_name = format!("{}{name}", c.name.to_upper_camel_case());
+        let err = ErrCtx {
+            throws: c.throws,
+            stem,
+        };
+        render_function(out, prefix, &m.path, c, &go_name, None, err);
+    }
+
+    for f in &iface.methods {
+        let go_name = f.name.to_upper_camel_case();
+        let err = ErrCtx {
+            throws: f.throws,
+            stem,
+        };
+        if let CallShape::Async(ab) = &f.shape {
+            render_async_function(out, prefix, &m.path, f, ab, &go_name, Some(&name), err);
+        } else {
+            render_function(out, prefix, &m.path, f, &go_name, Some(&name), err);
+        }
+    }
+
+    for f in &iface.statics {
+        let go_name = format!("{name}{}", f.name.to_upper_camel_case());
+        let err = ErrCtx {
+            throws: f.throws,
+            stem,
+        };
+        if let CallShape::Async(ab) = &f.shape {
+            render_async_function(out, prefix, &m.path, f, ab, &go_name, None, err);
+        } else {
+            render_function(out, prefix, &m.path, f, &go_name, None, err);
+        }
+    }
+
+    let mut w = CodeWriter::tabs();
+    w.block(format!("func (s *{name}) Close() {{"), "}", |w| {
+        w.block("if s.ptr != nil {", "}", |w| {
+            w.line(format!("C.{}(s.ptr)", iface.destroy_symbol));
+            w.line("s.ptr = nil");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
 // ── Functions ──
 
-fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) {
+/// A sync or iterator callable: the Go wrapper marshalling parameters in,
+/// invoking the C symbol, checking the error slot per `err` (typed
+/// `(T, error)` when throwing, `wvTrap` panic when plain), and converting the
+/// result out. With `receiver` set, the wrapper is a method on that wrapper
+/// type passing `s.ptr` as the leading C argument.
+#[allow(clippy::too_many_arguments)]
+fn render_function(
+    out: &mut String,
+    prefix: &str,
+    module: &str,
+    f: &FnBinding,
+    go_name: &str,
+    receiver: Option<&str>,
+    err: ErrCtx,
+) {
     let c_sym = &f.c_base;
-    let go_name = format!("{}_{}", module, f.name).to_upper_camel_case();
 
     let go_params: Vec<String> = f
         .params
@@ -1691,14 +2159,18 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
         .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty)))
         .collect();
 
-    let ret_sig = match &f.ret {
-        Some(ret) => format!("({}, error)", go_type(ret)),
-        None => "error".into(),
+    let ret_sig = err.ret_sig(&f.ret);
+    let header = match receiver {
+        Some(ty) => format!(
+            "func (s *{ty}) {go_name}({}){ret_sig} {{",
+            go_params.join(", ")
+        ),
+        None => format!("func {go_name}({}){ret_sig} {{", go_params.join(", ")),
     };
 
     let mut w = CodeWriter::tabs();
     let mut doc = String::new();
-    emit_fn_doc(&mut doc, &f.doc, &f.params, "", &go_name);
+    emit_fn_doc(&mut doc, &f.doc, &f.params, "", go_name);
     w.raw(doc);
     if let Some(msg) = &f.deprecated {
         w.line(format!("// Deprecated: {msg}"));
@@ -1706,6 +2178,9 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
 
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
+    if receiver.is_some() {
+        c_args.push("s.ptr".into());
+    }
 
     for p in &f.params {
         emit_param(
@@ -1722,11 +2197,8 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
     // then this wrapper drains it via the `next`/`destroy` symbols into a slice.
     if let CallShape::Iterator(ib) = &f.shape {
         let mut body = String::new();
-        emit_iterator_body(&mut body, &mut pre, &mut c_args, ib, prefix, module);
-        w.line(format!(
-            "func {go_name}({}) {ret_sig} {{",
-            go_params.join(", ")
-        ));
+        emit_iterator_body(&mut body, &mut pre, &mut c_args, ib, prefix, module, err);
+        w.line(header);
         w.raw(body);
         w.line("}");
         w.blank();
@@ -1744,37 +2216,25 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
     let args = c_args.join(", ");
     let c_returns_void = matches!(&f.ret, Some(TypeRef::Map(_, _)));
 
-    w.block(
-        format!("func {go_name}({}) {ret_sig} {{", go_params.join(", ")),
-        "}",
-        |w| {
-            w.raw(pre.as_str());
+    w.block(header, "}", |w| {
+        w.raw(pre.as_str());
 
-            if f.ret.is_some() && !c_returns_void {
-                w.line(format!("result := C.{c_sym}({args})"));
-            } else {
-                w.line(format!("C.{c_sym}({args})"));
-            }
+        if f.ret.is_some() && !c_returns_void {
+            w.line(format!("result := C.{c_sym}({args})"));
+        } else {
+            w.line(format!("C.{c_sym}({args})"));
+        }
 
-            w.block("if cErr.code != 0 {", "}", |w| {
-                w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
-                w.line("C.weaveffi_error_clear(&cErr)");
-                if let Some(ref ret) = f.ret {
-                    w.line(format!("return {}, goErr", go_zero(ret)));
-                } else {
-                    w.line("return goErr");
-                }
-            });
+        err.emit_check(w, "cErr", f.ret.as_ref().map(go_zero).as_deref());
 
-            if let Some(ref ret) = f.ret {
-                let mut tail = String::new();
-                emit_return(&mut tail, ret, prefix, module);
-                w.raw(tail);
-            } else {
-                w.line("return nil");
-            }
-        },
-    );
+        if let Some(ref ret) = f.ret {
+            let mut tail = String::new();
+            emit_return(&mut tail, ret, prefix, module, err.ok_tail());
+            w.raw(tail);
+        } else if err.throws {
+            w.line("return nil");
+        }
+    });
     w.blank();
     out.push_str(&w.finish());
 }
@@ -1784,7 +2244,7 @@ fn render_function(out: &mut String, prefix: &str, module: &str, f: &FnBinding) 
 fn iter_out_item_type(inner: &TypeRef, prefix: &str, module: &str) -> String {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "*C.char".into(),
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
             format!("*C.{}", c_abi_struct_name(n, module, prefix))
         }
         _ => c_scalar_type(inner, prefix, module).unwrap_or_else(|| "C.int64_t".into()),
@@ -1800,7 +2260,7 @@ fn emit_iter_elem_append(out: &mut String, dst: &str, inner: &TypeRef, item: &st
             w.line(format!("{dst} = append({dst}, C.GoString({item}))"));
             w.line(format!("C.weaveffi_free_string({item})"));
         }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) => {
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
             let gs = local_type_name(n).to_upper_camel_case();
             w.line(format!("{dst} = append({dst}, &{gs}{{ptr: {item}}})"));
         }
@@ -1817,7 +2277,10 @@ fn emit_iter_elem_append(out: &mut String, dst: &str, inner: &TypeRef, item: &st
 
 /// Emit the launch + drain + destroy body of an iterator-returning function.
 /// `pre` already holds the input-parameter staging and `c_args` the launch
-/// arguments (before `out_err`).
+/// arguments (before `out_err`). Both the launch's error slot and each
+/// `next`'s are checked per `err`: a throwing wrapper returns
+/// `(nil, mapped)`, a plain one traps and keeps draining.
+#[allow(clippy::too_many_arguments)]
 fn emit_iterator_body(
     out: &mut String,
     pre: &mut String,
@@ -1825,6 +2288,7 @@ fn emit_iterator_body(
     ib: &weaveffi_core::model::IteratorBinding,
     prefix: &str,
     module: &str,
+    err: ErrCtx,
 ) {
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
@@ -1839,11 +2303,7 @@ fn emit_iterator_body(
         ib.launch.symbol,
         c_args.join(", ")
     ));
-    w.block("if cErr.code != 0 {", "}", |w| {
-        w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(cErr.message), int(cErr.code))");
-        w.line("C.weaveffi_error_clear(&cErr)");
-        w.line("return nil, goErr");
-    });
+    err.emit_check(&mut w, "cErr", Some("nil"));
     w.line(format!("defer C.{}(it)", ib.destroy_symbol));
     w.line(format!("goResult := []{}{{}}", go_type(elem)));
     w.block("for {", "}", |w| {
@@ -1856,16 +2316,12 @@ fn emit_iterator_body(
                 w.line("break");
             },
         );
-        w.block("if iterErr.code != 0 {", "}", |w| {
-            w.line("goErr := fmt.Errorf(\"weaveffi: %s (code %d)\", C.GoString(iterErr.message), int(iterErr.code))");
-            w.line("C.weaveffi_error_clear(&iterErr)");
-            w.line("return nil, goErr");
-        });
+        err.emit_check(w, "iterErr", Some("nil"));
         let mut app = String::new();
         emit_iter_elem_append(&mut app, "goResult", elem, "outItem");
         w.raw(app);
     });
-    w.line("return goResult, nil");
+    w.line(format!("return goResult{}", err.ok_tail()));
     out.push_str(&w.finish());
 }
 
@@ -1899,7 +2355,9 @@ fn emit_param(
             "C.{}({name})",
             c_abi_struct_name(n, module, prefix)
         )),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => args.push(format!("{name}.ptr")),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            args.push(format!("{name}.ptr"))
+        }
 
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let cv = format!("c{}", name.to_upper_camel_case());
@@ -1951,7 +2409,7 @@ fn emit_optional_param(
             });
             args.push(cv);
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             let ct = c_opaque_type(inner, prefix, module);
             w.line(format!("var {cv} *C.{ct}"));
             w.block(format!("if {name} != nil {{"), "}", |w| {
@@ -2023,7 +2481,7 @@ fn emit_list_param(
         w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
             w.line(format!("{pv} = (**C.char)(unsafe.Pointer(&{arr}[0]))"));
         });
-    } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) = inner {
+    } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) = inner {
         let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
         let arr = format!("c{cn}Arr");
         w.line(format!("{arr} := make([]*{ct}, len({name}))"));
@@ -2150,7 +2608,9 @@ fn emit_return_out_params(
 
 // ── Return conversion ──
 
-fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
+/// Emit the success-path return conversion. `tail` is [`ErrCtx::ok_tail`]:
+/// `", nil"` when the wrapper also returns an error, empty when plain.
+fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail: &str) {
     let mut w = CodeWriter::tabs().with_depth(1);
     match ty {
         TypeRef::I8
@@ -2165,77 +2625,69 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str) {
         | TypeRef::F32
         | TypeRef::F64 => {
             let conv = go_scalar_conv("result", ty);
-            w.line(format!("return {conv}, nil"));
+            w.line(format!("return {conv}{tail}"));
         }
         TypeRef::Bool => {
-            w.line("return cToBool(result), nil");
+            w.line(format!("return cToBool(result){tail}"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line("goResult := C.GoString(result)");
             w.line("C.weaveffi_free_string(result)");
-            w.line("return goResult, nil");
+            w.line(format!("return goResult{tail}"));
         }
         TypeRef::Enum(_) => {
             let conv = go_scalar_conv("result", ty);
-            w.line(format!("return {conv}, nil"));
+            w.line(format!("return {conv}{tail}"));
         }
-        TypeRef::TypedHandle(n) => {
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("return &{g}{{ptr: result}}, nil"));
+            w.line(format!("return &{g}{{ptr: result}}{tail}"));
         }
-        TypeRef::Struct(n) => {
-            let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("return &{g}{{ptr: result}}, nil"));
-        }
-        TypeRef::Optional(inner) => return emit_optional_return(out, inner, module),
-        TypeRef::List(inner) => return emit_list_return(out, inner, prefix, module),
+        TypeRef::Optional(inner) => return emit_optional_return(out, inner, module, tail),
+        TypeRef::List(inner) => return emit_list_return(out, inner, prefix, module, tail),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.block("if result == nil {", "}", |w| {
-                w.line("return nil, nil");
+                w.line(format!("return nil{tail}"));
             });
             w.line("goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))");
             w.line("C.weaveffi_free_bytes(result, cOutLen)");
-            w.line("return goResult, nil");
+            w.line(format!("return goResult{tail}"));
         }
-        TypeRef::Map(k, v) => return emit_map_return(out, k, v, prefix, module),
-        TypeRef::Iterator(inner) => return emit_list_return(out, inner, prefix, module),
+        TypeRef::Map(k, v) => return emit_map_return(out, k, v, prefix, module, tail),
+        TypeRef::Iterator(inner) => return emit_list_return(out, inner, prefix, module, tail),
     }
     out.push_str(&w.finish());
 }
 
-fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str) {
+fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str, tail: &str) {
     let mut w = CodeWriter::tabs().with_depth(1);
     w.block("if result == nil {", "}", |w| {
-        w.line("return nil, nil");
+        w.line(format!("return nil{tail}"));
     });
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line("v := C.GoString(result)");
             w.line("C.weaveffi_free_string(result)");
-            w.line("return &v, nil");
+            w.line(format!("return &v{tail}"));
         }
-        TypeRef::TypedHandle(n) => {
+        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
             let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("return &{g}{{ptr: result}}, nil"));
-        }
-        TypeRef::Struct(n) => {
-            let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("return &{g}{{ptr: result}}, nil"));
+            w.line(format!("return &{g}{{ptr: result}}{tail}"));
         }
         TypeRef::Bool => {
             w.line("v := cToBool(*result)");
-            w.line("return &v, nil");
+            w.line(format!("return &v{tail}"));
         }
         _ => {
             let gt = go_type(inner);
             w.line(format!("v := {gt}(*result)"));
-            w.line("return &v, nil");
+            w.line(format!("return &v{tail}"));
         }
     }
     out.push_str(&w.finish());
 }
 
-fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &str) {
+fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &str, tail: &str) {
     let mut w = CodeWriter::tabs().with_depth(1);
     w.line("count := int(cOutLen)");
     let mut body = String::new();
@@ -2243,11 +2695,18 @@ fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &st
         &mut body, "goResult", inner, "result", "count", prefix, module,
     );
     w.raw(body);
-    w.line("return goResult, nil");
+    w.line(format!("return goResult{tail}"));
     out.push_str(&w.finish());
 }
 
-fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, prefix: &str, module: &str) {
+fn emit_map_return(
+    out: &mut String,
+    k: &TypeRef,
+    v: &TypeRef,
+    prefix: &str,
+    module: &str,
+    tail: &str,
+) {
     let mut w = CodeWriter::tabs().with_depth(1);
     w.line("count := int(cOutLen)");
     let mut body = String::new();
@@ -2255,7 +2714,7 @@ fn emit_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, prefix: &str, mod
         &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
     );
     w.raw(body);
-    w.line("return goResult, nil");
+    w.line(format!("return goResult{tail}"));
     out.push_str(&w.finish());
 }
 
@@ -2317,7 +2776,7 @@ fn decode_list(
                     w.line(format!("{dst}[i] = C.GoString(v)"));
                 },
             );
-        } else if let TypeRef::TypedHandle(n) | TypeRef::Struct(n) = inner {
+        } else if let TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) = inner {
             let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
             let gs = local_type_name(n).to_upper_camel_case();
             w.block(
@@ -2373,6 +2832,324 @@ mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+    use weaveffi_ir::ir::{
+        Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
+        ListenerDef, Module, Param, StructDef, StructField, TypeRef,
+    };
+
+    // ── Fixture helpers ──
+
+    fn api_of(modules: Vec<Module>) -> Api {
+        Api {
+            version: "0.5.0".into(),
+            modules,
+            generators: None,
+            package: None,
+        }
+    }
+
+    fn module(name: &str) -> Module {
+        Module {
+            name: name.into(),
+            functions: vec![],
+            interfaces: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    fn func_of(name: &str, params: Vec<Param>, returns: Option<TypeRef>) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            throws: false,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }
+    }
+
+    fn throwing(mut f: Function) -> Function {
+        f.throws = true;
+        f
+    }
+
+    fn param(name: &str, ty: TypeRef) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        }
+    }
+
+    fn field(name: &str, ty: TypeRef) -> StructField {
+        StructField {
+            name: name.into(),
+            ty,
+            doc: None,
+            default: None,
+        }
+    }
+
+    fn code(name: &str, value: i32, message: &str) -> ErrorCode {
+        ErrorCode {
+            name: name.into(),
+            code: value,
+            message: message.into(),
+            doc: None,
+        }
+    }
+
+    /// Render with the default surface: `weaveffi` prefix, stripping on.
+    fn rg(api: &Api) -> String {
+        rg_with(api, "weaveffi", true)
+    }
+
+    fn rg_with(api: &Api, prefix: &str, strip: bool) -> String {
+        let model = BindingModel::build(api, prefix);
+        render_go(api, &model, prefix, strip, "weaveffi.yml")
+    }
+
+    fn calculator_api() -> Api {
+        let mut m = module("calculator");
+        m.functions = vec![
+            func_of(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+            ),
+            func_of(
+                "echo",
+                vec![param("msg", TypeRef::StringUtf8)],
+                Some(TypeRef::StringUtf8),
+            ),
+        ];
+        api_of(vec![m])
+    }
+
+    /// Mirrors `samples/kvstore/kvstore.yml`: the `Store` interface (ctor,
+    /// sync/async/iterator methods, a static), the `KvError` domain, the
+    /// `Entry` builder record, the eviction listener, and the nested
+    /// `kv.stats` submodule taking a cross-module interface parameter.
+    fn kv_api() -> Api {
+        let mut stats = module("stats");
+        stats.structs = vec![StructDef {
+            name: "Stats".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field("total_entries", TypeRef::I64)],
+        }];
+        stats.functions = vec![throwing(func_of(
+            "get_stats",
+            // Cross-module references reach generators pre-qualified by the
+            // validator's resolve step; mirror that spelling here.
+            vec![param("store", TypeRef::Interface("kv.Store".into()))],
+            Some(TypeRef::Struct("Stats".into())),
+        ))];
+
+        let mut kv = module("kv");
+        kv.errors = Some(ErrorDomain {
+            name: "KvError".into(),
+            codes: vec![
+                code("KeyNotFound", 1001, "key not found"),
+                code("Expired", 1002, "entry expired"),
+                code("StoreFull", 1003, "store has reached capacity"),
+                code("IoError", 1004, "I/O failure"),
+            ],
+        });
+        kv.structs = vec![StructDef {
+            name: "Entry".into(),
+            doc: None,
+            builder: true,
+            fields: vec![
+                field("id", TypeRef::I64),
+                field("key", TypeRef::StringUtf8),
+                field("value", TypeRef::Bytes),
+                field("expires_at", TypeRef::Optional(Box::new(TypeRef::I64))),
+                field("tags", TypeRef::List(Box::new(TypeRef::StringUtf8))),
+            ],
+        }];
+        kv.enums = vec![EnumDef {
+            name: "EntryKind".into(),
+            doc: None,
+            variants: vec![
+                EnumVariant {
+                    name: "Volatile".into(),
+                    value: 0,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Persistent".into(),
+                    value: 1,
+                    doc: None,
+                    fields: vec![],
+                },
+            ],
+        }];
+        kv.callbacks = vec![CallbackDef {
+            name: "OnEvict".into(),
+            doc: None,
+            params: vec![param("key", TypeRef::StringUtf8)],
+        }];
+        kv.listeners = vec![ListenerDef {
+            name: "eviction_listener".into(),
+            event_callback: "OnEvict".into(),
+            doc: None,
+        }];
+        kv.interfaces = vec![InterfaceDef {
+            name: "Store".into(),
+            doc: Some("An embedded key-value store owning its entries".into()),
+            constructors: vec![throwing(func_of(
+                "open",
+                vec![param("path", TypeRef::StringUtf8)],
+                None,
+            ))],
+            methods: vec![
+                throwing(func_of(
+                    "put",
+                    vec![
+                        param("key", TypeRef::StringUtf8),
+                        param("value", TypeRef::Bytes),
+                        param("kind", TypeRef::Enum("EntryKind".into())),
+                        param("ttl_seconds", TypeRef::Optional(Box::new(TypeRef::I64))),
+                    ],
+                    Some(TypeRef::Bool),
+                )),
+                throwing(func_of(
+                    "get",
+                    vec![param("key", TypeRef::StringUtf8)],
+                    Some(TypeRef::Optional(Box::new(TypeRef::Struct("Entry".into())))),
+                )),
+                throwing(func_of(
+                    "list_keys",
+                    vec![param(
+                        "prefix",
+                        TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                    )],
+                    Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                )),
+                func_of("count", vec![], Some(TypeRef::I64)),
+                func_of("clear", vec![], None),
+                {
+                    let mut f = throwing(func_of("compact", vec![], Some(TypeRef::I64)));
+                    f.r#async = true;
+                    f.cancellable = true;
+                    f
+                },
+                {
+                    let mut f = throwing(func_of(
+                        "legacy_put",
+                        vec![
+                            param("key", TypeRef::StringUtf8),
+                            param("value", TypeRef::Bytes),
+                        ],
+                        Some(TypeRef::Bool),
+                    ));
+                    f.deprecated = Some("use put() with explicit kind".into());
+                    f
+                },
+            ],
+            statics: vec![func_of("default_capacity", vec![], Some(TypeRef::I64))],
+        }];
+        kv.modules = vec![stats];
+        api_of(vec![kv])
+    }
+
+    /// Mirrors `samples/contacts/contacts.yml`, standing in for the CLI test
+    /// (`cli_go.rs`) while the workspace binary is blocked on other generator
+    /// crates mid-overhaul.
+    fn contacts_api() -> Api {
+        let mut m = module("contacts");
+        m.enums = vec![EnumDef {
+            name: "ContactType".into(),
+            doc: None,
+            variants: vec![
+                EnumVariant {
+                    name: "Personal".into(),
+                    value: 0,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Work".into(),
+                    value: 1,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Other".into(),
+                    value: 2,
+                    doc: None,
+                    fields: vec![],
+                },
+            ],
+        }];
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![
+                field("id", TypeRef::I64),
+                field("first_name", TypeRef::StringUtf8),
+                field("last_name", TypeRef::StringUtf8),
+                field("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                field("contact_type", TypeRef::Enum("ContactType".into())),
+            ],
+        }];
+        m.errors = Some(ErrorDomain {
+            name: "ContactsError".into(),
+            codes: vec![
+                code("InvalidName", 1, "name must not be empty"),
+                code("NotFound", 2, "contact not found"),
+            ],
+        });
+        m.interfaces = vec![InterfaceDef {
+            name: "ContactBook".into(),
+            doc: Some("An in-memory address book owning its contacts".into()),
+            constructors: vec![func_of("new", vec![], None)],
+            methods: vec![
+                throwing(func_of(
+                    "add",
+                    vec![
+                        param("first_name", TypeRef::StringUtf8),
+                        param("last_name", TypeRef::StringUtf8),
+                        param("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                        param("contact_type", TypeRef::Enum("ContactType".into())),
+                    ],
+                    Some(TypeRef::Struct("Contact".into())),
+                )),
+                throwing(func_of(
+                    "get",
+                    vec![param("id", TypeRef::I64)],
+                    Some(TypeRef::Struct("Contact".into())),
+                )),
+                func_of(
+                    "list",
+                    vec![],
+                    Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                ),
+                func_of(
+                    "remove",
+                    vec![param("id", TypeRef::I64)],
+                    Some(TypeRef::Bool),
+                ),
+                func_of("count", vec![], Some(TypeRef::I32)),
+            ],
+            statics: vec![],
+        }];
+        api_of(vec![m])
+    }
+
+    // ── Scaffolding and packaging ──
 
     #[test]
     fn package_rewrites_cgo_and_bundles_libs() {
@@ -2419,67 +3196,6 @@ mod tests {
         assert!(src.contains("#cgo windows,amd64 LDFLAGS: -L${SRCDIR}/lib/windows-x64"));
         assert!(src.contains("#cgo LDFLAGS: -lcalculator"));
     }
-    use weaveffi_ir::ir::{
-        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
-        StructField, TypeRef,
-    };
-
-    fn calculator_api() -> Api {
-        Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "calculator".into(),
-                functions: vec![
-                    Function {
-                        name: "add".into(),
-                        params: vec![
-                            Param {
-                                name: "a".into(),
-                                ty: TypeRef::I32,
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "b".into(),
-                                ty: TypeRef::I32,
-                                mutable: false,
-                                doc: None,
-                            },
-                        ],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "echo".into(),
-                        params: vec![Param {
-                            name: "msg".into(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::StringUtf8),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        }
-    }
 
     #[test]
     fn name_returns_go() {
@@ -2503,7 +3219,7 @@ mod tests {
 
     #[test]
     fn package_and_cgo_preamble() {
-        let go = render_go(&calculator_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&calculator_api());
         assert!(go.contains("package weaveffi\n"), "missing package");
         assert!(
             go.contains("#cgo LDFLAGS: -lweaveffi"),
@@ -2516,110 +3232,39 @@ mod tests {
         assert!(go.contains("import \"C\""), "missing import C: {go}");
     }
 
-    /// Async functions get a blocking wrapper: a registry-id context, an
-    /// exported completion trampoline, and a buffered channel the wrapper
-    /// waits on. The channel is buffered so the producer thread never blocks
-    /// on the send even if the waiter has already given up.
-    #[test]
-    fn go_async_generates_blocking_wrapper() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "io".into(),
-                functions: vec![
-                    Function {
-                        name: "read".into(),
-                        params: vec![],
-                        returns: Some(TypeRef::StringUtf8),
-                        doc: None,
-                        r#async: true,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "write".into(),
-                        params: vec![],
-                        returns: None,
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("//export goWv_weaveffi_io_read_callback"),
-            "completion trampoline must be exported: {go}"
-        );
-        assert!(
-            go.contains("extern void goWv_weaveffi_io_read_callback(void* context, weaveffi_error* err, char* result);"),
-            "preamble must declare the trampoline const-free: {go}"
-        );
-        assert!(
-            go.contains("C.weaveffi_io_read_async("),
-            "async launcher must be invoked: {go}"
-        );
-        assert!(
-            go.contains("func IoRead() (string, error) {"),
-            "blocking wrapper must be emitted: {go}"
-        );
-        assert!(
-            go.contains("ch := make(chan wvOutcomeIoRead, 1)"),
-            "wrapper must wait on a buffered outcome channel: {go}"
-        );
-        assert!(
-            go.contains("C.weaveffi_free_string(result)"),
-            "owned string results must be freed: {go}"
-        );
-        assert!(
-            go.contains("weaveffi_io_write"),
-            "sync function should still be emitted: {go}"
-        );
-        assert!(go.contains("\t\"sync\"\n"), "sync import needed: {go}");
-    }
-
     #[test]
     fn imports_fmt_and_unsafe() {
-        let go = render_go(&calculator_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&calculator_api());
         assert!(go.contains("\"fmt\""), "missing fmt import: {go}");
         assert!(go.contains("\"unsafe\""), "missing unsafe import: {go}");
     }
 
+    // ── Plain (non-throwing) functions ──
+
     #[test]
     fn simple_i32_function() {
-        let go = render_go(&calculator_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&calculator_api());
         assert!(
-            go.contains("func CalculatorAdd(a int32, b int32) (int32, error)"),
-            "missing function sig: {go}"
+            go.contains("func Add(a int32, b int32) int32 {"),
+            "missing plain function sig: {go}"
         );
         assert!(
             go.contains("C.weaveffi_calculator_add("),
             "missing C call: {go}"
         );
         assert!(go.contains("C.int32_t(a)"), "missing param cast: {go}");
+        assert!(go.contains("return int32(result)"), "missing return: {go}");
         assert!(
-            go.contains("return int32(result), nil"),
-            "missing return: {go}"
+            !go.contains("return int32(result), nil"),
+            "plain function must not return an error: {go}"
         );
     }
 
     #[test]
     fn string_function() {
-        let go = render_go(&calculator_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&calculator_api());
         assert!(
-            go.contains("func CalculatorEcho(msg string) (string, error)"),
+            go.contains("func Echo(msg string) string {"),
             "missing echo sig: {go}"
         );
         assert!(go.contains("C.CString(msg)"), "missing CString: {go}");
@@ -2635,64 +3280,373 @@ mod tests {
     }
 
     #[test]
-    fn error_handling() {
-        let go = render_go(&calculator_api(), "weaveffi", "weaveffi.yml");
+    fn plain_function_traps_on_error() {
+        let go = rg(&calculator_api());
         assert!(
             go.contains("var cErr C.weaveffi_error"),
             "missing error var: {go}"
         );
+        assert!(go.contains("wvTrap(&cErr)"), "missing trap check: {go}");
         assert!(
-            go.contains("if cErr.code != 0"),
-            "missing error check: {go}"
+            go.contains("func wvTrap(cErr *C.weaveffi_error) {"),
+            "missing wvTrap helper: {go}"
         );
         assert!(
-            go.contains("C.weaveffi_error_clear(&cErr)"),
-            "missing error clear: {go}"
+            go.contains("C.weaveffi_error_clear(cErr)"),
+            "missing error clear in wvTakeError: {go}"
         );
-        assert!(go.contains("fmt.Errorf("), "missing Errorf: {go}");
+        assert!(
+            go.contains("panic(fmt.Sprintf(\"weaveffi: %s (code %d)\", msg, code))"),
+            "wvTrap must panic: {go}"
+        );
     }
 
     #[test]
-    fn enum_generation() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "paint".into(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![EnumDef {
-                    name: "Color".into(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Red".into(),
-                            value: 0,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Green".into(),
-                            value: 1,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Blue".into(),
-                            value: 2,
-                            doc: None,
-                            fields: vec![],
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
+    fn void_function() {
+        let mut m = module("system");
+        m.functions = vec![func_of("reset", vec![], None)];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Reset() {"),
+            "missing plain void sig: {go}"
+        );
+        assert!(
+            go.contains("wvTrap(&cErr)"),
+            "plain void must trap on error: {go}"
+        );
+        assert!(
+            !go.contains("func Reset() error"),
+            "plain void must not return error: {go}"
+        );
+    }
+
+    #[test]
+    fn handle_type() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "create",
+            vec![param("name", TypeRef::StringUtf8)],
+            Some(TypeRef::Handle),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Create(name string) int64 {"),
+            "handle return should be plain int64: {go}"
+        );
+        assert!(
+            go.contains("return int64(result)"),
+            "missing handle return conversion: {go}"
+        );
+    }
+
+    #[test]
+    fn bool_function_generates_helpers() {
+        let mut m = module("logic");
+        m.functions = vec![func_of(
+            "negate",
+            vec![param("val", TypeRef::Bool)],
+            Some(TypeRef::Bool),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(go.contains("func boolToC("), "missing boolToC: {go}");
+        assert!(go.contains("func cToBool("), "missing cToBool: {go}");
+        assert!(
+            go.contains("boolToC(val)"),
+            "missing boolToC call for param: {go}"
+        );
+        assert!(
+            go.contains("cToBool(result)"),
+            "missing cToBool for return: {go}"
+        );
+    }
+
+    #[test]
+    fn enum_param_and_return() {
+        let mut m = module("paint");
+        m.functions = vec![func_of(
+            "mix",
+            vec![param("a", TypeRef::Enum("Color".into()))],
+            Some(TypeRef::Enum("Color".into())),
+        )];
+        m.enums = vec![EnumDef {
+            name: "Color".into(),
+            doc: None,
+            variants: vec![EnumVariant {
+                name: "Red".into(),
+                value: 0,
+                doc: None,
+                fields: vec![],
             }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Mix(a Color) Color {"),
+            "missing enum function sig: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_paint_Color(a)"),
+            "missing enum param conversion: {go}"
+        );
+        assert!(
+            go.contains("Color(result)"),
+            "missing enum return conversion: {go}"
+        );
+    }
+
+    #[test]
+    fn struct_return() {
+        let mut m = module("contacts");
+        m.functions = vec![func_of(
+            "get_contact",
+            vec![param("id", TypeRef::Handle)],
+            Some(TypeRef::Struct("Contact".into())),
+        )];
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func GetContact(id int64) *Contact {"),
+            "plain struct return should be bare *Contact: {go}"
+        );
+        assert!(
+            go.contains("return &Contact{ptr: result}"),
+            "missing struct wrap: {go}"
+        );
+    }
+
+    #[test]
+    fn optional_string_param() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "find",
+            vec![param(
+                "query",
+                TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+            )],
+            None,
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("query *string"),
+            "optional string param should be *string: {go}"
+        );
+        assert!(
+            go.contains("if query != nil"),
+            "missing nil check for optional: {go}"
+        );
+        assert!(
+            go.contains("C.CString(*query)"),
+            "missing CString dereference: {go}"
+        );
+    }
+
+    #[test]
+    fn optional_struct_return() {
+        let mut m = module("contacts");
+        m.functions = vec![func_of(
+            "find",
+            vec![param("id", TypeRef::I32)],
+            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                "Contact".into(),
+            )))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Find(id int32) *Contact {"),
+            "optional struct return: {go}"
+        );
+        assert!(go.contains("if result == nil"), "missing nil check: {go}");
+    }
+
+    #[test]
+    fn list_return() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "list_ids",
+            vec![],
+            Some(TypeRef::List(Box::new(TypeRef::I32))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func ListIds() []int32 {"),
+            "missing plain list return sig: {go}"
+        );
+        assert!(
+            go.contains("var cOutLen C.size_t"),
+            "missing out_len var: {go}"
+        );
+        assert!(go.contains("unsafe.Slice("), "missing unsafe.Slice: {go}");
+    }
+
+    #[test]
+    fn struct_list_return() {
+        let mut m = module("contacts");
+        m.functions = vec![func_of(
+            "list_contacts",
+            vec![],
+            Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+        )];
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func ListContacts() []*Contact {"),
+            "missing struct list return: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_contacts_Contact"),
+            "missing C struct type in list conversion: {go}"
+        );
+    }
+
+    #[test]
+    fn optional_i32_param() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "find",
+            vec![param("id", TypeRef::Optional(Box::new(TypeRef::I32)))],
+            Some(TypeRef::Optional(Box::new(TypeRef::I32))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("id *int32"),
+            "optional i32 param should be *int32: {go}"
+        );
+        assert!(
+            go.contains("var cId *C.int32_t"),
+            "missing C var for optional: {go}"
+        );
+    }
+
+    // ── Throwing functions ──
+
+    fn store_api() -> Api {
+        let mut m = module("store");
+        m.errors = Some(ErrorDomain {
+            name: "StoreError".into(),
+            codes: vec![code("SaveFailed", 1, "save failed")],
+        });
+        m.functions = vec![
+            throwing(func_of(
+                "save",
+                vec![param("data", TypeRef::StringUtf8)],
+                Some(TypeRef::I32),
+            )),
+            throwing(func_of("flush", vec![], None)),
+            func_of("clear", vec![], None),
+        ];
+        api_of(vec![m])
+    }
+
+    #[test]
+    fn throws_split_sync() {
+        let go = rg(&store_api());
+        // throws == true keeps `(T, error)` and maps through the domain.
+        assert!(
+            go.contains("func Save(data string) (int32, error) {"),
+            "missing throwing sig: {go}"
+        );
+        assert!(
+            go.contains("if cErr.code != 0 {"),
+            "missing error check: {go}"
+        );
+        assert!(
+            go.contains("return 0, wvMapStore(wvTakeError(&cErr))"),
+            "throwing wrapper must map the domain error: {go}"
+        );
+        assert!(
+            go.contains("return int32(result), nil"),
+            "throwing wrapper must return `, nil` on success: {go}"
+        );
+        // Throwing void: `error` result, nil on success.
+        assert!(
+            go.contains("func Flush() error {"),
+            "missing throwing void sig: {go}"
+        );
+        assert!(
+            go.contains("return wvMapStore(wvTakeError(&cErr))"),
+            "throwing void must return the mapped error: {go}"
+        );
+        assert!(go.contains("return nil"), "missing nil return: {go}");
+        // throws == false stays plain and traps.
+        assert!(
+            go.contains("func Clear() {"),
+            "missing plain void sig: {go}"
+        );
+        assert!(go.contains("wvTrap(&cErr)"), "missing trap: {go}");
+    }
+
+    #[test]
+    fn typed_error_surface() {
+        let go = rg(&store_api());
+        assert!(
+            go.contains("type StoreError struct {"),
+            "missing typed error struct: {go}"
+        );
+        assert!(
+            go.contains("func (e *StoreError) Error() string {"),
+            "typed error must implement error: {go}"
+        );
+        assert!(
+            go.contains("StoreErrorSaveFailed int32 = 1"),
+            "missing exported code constant: {go}"
+        );
+        assert!(
+            go.contains("func wvMapStore(code int32, message string) error {"),
+            "missing domain mapping helper: {go}"
+        );
+        assert!(
+            go.contains("message = \"save failed\""),
+            "missing default message fill: {go}"
+        );
+        assert!(
+            go.contains("return wvBrandError(code, message)"),
+            "unknown codes must fall back to the brand error: {go}"
+        );
+        assert!(
+            go.contains(&format!("type {ERROR_BRAND} struct {{")),
+            "missing generic brand error: {go}"
+        );
+    }
+
+    // ── Enums, structs, builders ──
+
+    #[test]
+    fn enum_generation() {
+        let mut m = module("paint");
+        m.enums = vec![EnumDef {
+            name: "Color".into(),
+            doc: None,
+            variants: vec![
+                EnumVariant {
+                    name: "Red".into(),
+                    value: 0,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Green".into(),
+                    value: 1,
+                    doc: None,
+                    fields: vec![],
+                },
+                EnumVariant {
+                    name: "Blue".into(),
+                    value: 2,
+                    doc: None,
+                    fields: vec![],
+                },
+            ],
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(
             go.contains("type Color int32"),
             "missing enum typedef: {go}"
@@ -2713,40 +3667,17 @@ mod tests {
 
     #[test]
     fn struct_with_getters_and_close() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![
-                        StructField {
-                            name: "name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "age".into(),
-                            ty: TypeRef::I32,
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![
+                field("name", TypeRef::StringUtf8),
+                field("age", TypeRef::I32),
+            ],
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(go.contains("type Contact struct {"), "missing struct: {go}");
         assert!(
             go.contains("ptr *C.weaveffi_contacts_Contact"),
@@ -2776,32 +3707,14 @@ mod tests {
 
     #[test]
     fn struct_builder_type_and_setters() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "geo".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Point".into(),
-                    doc: None,
-                    builder: true,
-                    fields: vec![StructField {
-                        name: "x".into(),
-                        ty: TypeRef::F64,
-                        doc: None,
-                        default: None,
-                    }],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+        let mut m = module("geo");
+        m.structs = vec![StructDef {
+            name: "Point".into(),
+            doc: None,
+            builder: true,
+            fields: vec![field("x", TypeRef::F64)],
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(
             go.contains("type PointBuilder struct {"),
             "builder type: {go}"
@@ -2824,439 +3737,145 @@ mod tests {
             go.contains("func (b *PointBuilder) Build() (*Point, error)"),
             "Build returns (*Point, error): {go}"
         );
-    }
-
-    #[test]
-    fn void_function() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "system".into(),
-                functions: vec![Function {
-                    name: "reset".into(),
-                    params: vec![],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
         assert!(
-            go.contains("func SystemReset() error"),
-            "missing void function sig: {go}"
-        );
-        assert!(
-            go.contains("return nil"),
-            "missing nil return for void: {go}"
+            go.contains("return nil, wvBrandError(wvTakeError(&cErr))"),
+            "Build failures are brand errors: {go}"
         );
     }
 
     #[test]
-    fn handle_type() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "store".into(),
-                functions: vec![Function {
-                    name: "create".into(),
-                    params: vec![Param {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Handle),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+    fn struct_optional_string_field() {
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field(
+                "email",
+                TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+            )],
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("(int64, error)"),
-            "handle return should be int64: {go}"
+            go.contains("func (s *Contact) Email() *string"),
+            "optional string getter should return *string: {go}"
         );
         assert!(
-            go.contains("return int64(result), nil"),
-            "missing handle return conversion: {go}"
+            go.contains("if cStr == nil"),
+            "should check nil for optional string: {go}"
         );
     }
 
     #[test]
-    fn bool_function_generates_helpers() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "logic".into(),
-                functions: vec![Function {
-                    name: "negate".into(),
-                    params: vec![Param {
-                        name: "val".into(),
-                        ty: TypeRef::Bool,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Bool),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
+    fn struct_enum_field_getter() {
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field("contact_type", TypeRef::Enum("ContactType".into()))],
+        }];
+        m.enums = vec![EnumDef {
+            name: "ContactType".into(),
+            doc: None,
+            variants: vec![EnumVariant {
+                name: "Personal".into(),
+                value: 0,
+                doc: None,
+                fields: vec![],
             }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(go.contains("func boolToC("), "missing boolToC: {go}");
-        assert!(go.contains("func cToBool("), "missing cToBool: {go}");
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("boolToC(val)"),
-            "missing boolToC call for param: {go}"
-        );
-        assert!(
-            go.contains("cToBool(result)"),
-            "missing cToBool for return: {go}"
+            go.contains("func (s *Contact) ContactType() ContactType"),
+            "missing enum field getter: {go}"
         );
     }
 
     #[test]
-    fn enum_param_and_return() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "paint".into(),
-                functions: vec![Function {
-                    name: "mix".into(),
-                    params: vec![Param {
-                        name: "a".into(),
-                        ty: TypeRef::Enum("Color".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Enum("Color".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![EnumDef {
-                    name: "Color".into(),
-                    doc: None,
-                    variants: vec![EnumVariant {
-                        name: "Red".into(),
-                        value: 0,
-                        doc: None,
-                        fields: vec![],
-                    }],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+    fn no_bool_helpers_when_unneeded() {
+        let mut m = module("math");
+        m.functions = vec![func_of(
+            "add",
+            vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+            Some(TypeRef::I32),
+        )];
+        let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func PaintMix(a Color) (Color, error)"),
-            "missing enum function sig: {go}"
-        );
-        assert!(
-            go.contains("C.weaveffi_paint_Color(a)"),
-            "missing enum param conversion: {go}"
-        );
-        assert!(
-            go.contains("Color(result)"),
-            "missing enum return conversion: {go}"
+            !go.contains("boolToC"),
+            "should not include bool helpers: {go}"
         );
     }
 
-    #[test]
-    fn struct_return() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "get_contact".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::Handle,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("(*Contact, error)"),
-            "missing struct return type: {go}"
-        );
-        assert!(
-            go.contains("&Contact{ptr: result}"),
-            "missing struct wrap: {go}"
-        );
-    }
+    // ── Async ──
 
+    /// Async functions get a blocking wrapper: a registry-id context, an
+    /// exported completion trampoline, and a buffered channel the wrapper
+    /// waits on. The channel is buffered so the producer thread never blocks
+    /// on the send even if the waiter has already given up.
     #[test]
-    fn optional_string_param() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "store".into(),
-                functions: vec![Function {
-                    name: "find".into(),
-                    params: vec![Param {
-                        name: "query".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+    fn go_async_generates_blocking_wrapper() {
+        let mut m = module("io");
+        m.functions = vec![
+            {
+                let mut f = func_of("read", vec![], Some(TypeRef::StringUtf8));
+                f.r#async = true;
+                f
+            },
+            func_of("write", vec![], None),
+        ];
+        let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("query *string"),
-            "optional string param should be *string: {go}"
+            go.contains("//export goWv_weaveffi_io_read_callback"),
+            "completion trampoline must be exported: {go}"
         );
         assert!(
-            go.contains("if query != nil"),
-            "missing nil check for optional: {go}"
+            go.contains("extern void goWv_weaveffi_io_read_callback(void* context, weaveffi_error* err, char* result);"),
+            "preamble must declare the trampoline const-free: {go}"
         );
         assert!(
-            go.contains("C.CString(*query)"),
-            "missing CString dereference: {go}"
-        );
-    }
-
-    #[test]
-    fn optional_struct_return() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "find".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
-                        "Contact".into(),
-                    )))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("(*Contact, error)"),
-            "optional struct return: {go}"
-        );
-        assert!(go.contains("if result == nil"), "missing nil check: {go}");
-    }
-
-    #[test]
-    fn list_return() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "store".into(),
-                functions: vec![Function {
-                    name: "list_ids".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("([]int32, error)"),
-            "missing list return type: {go}"
+            go.contains("C.weaveffi_io_read_async("),
+            "async launcher must be invoked: {go}"
         );
         assert!(
-            go.contains("var cOutLen C.size_t"),
-            "missing out_len var: {go}"
-        );
-        assert!(go.contains("unsafe.Slice("), "missing unsafe.Slice: {go}");
-    }
-
-    #[test]
-    fn struct_list_return() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "list_contacts".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("([]*Contact, error)"),
-            "missing struct list return: {go}"
+            go.contains("func Read() string {"),
+            "plain async wrapper must have a bare return: {go}"
         );
         assert!(
-            go.contains("C.weaveffi_contacts_Contact"),
-            "missing C struct type in list conversion: {go}"
+            go.contains("ch := make(chan wvOutcomeIoRead, 1)"),
+            "wrapper must wait on a buffered outcome channel: {go}"
         );
+        assert!(
+            go.contains("panic(outcome.err)"),
+            "plain async wrapper must panic on a reported error: {go}"
+        );
+        assert!(
+            go.contains("return outcome.val"),
+            "plain async wrapper returns the outcome value: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_free_string(result)"),
+            "owned string results must be freed: {go}"
+        );
+        assert!(
+            go.contains("weaveffi_io_write"),
+            "sync function should still be emitted: {go}"
+        );
+        assert!(go.contains("\t\"sync\"\n"), "sync import needed: {go}");
     }
 
     #[test]
     fn async_cancellable_passes_null_token() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "tasks".into(),
-                functions: vec![Function {
-                    name: "run".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    r#async: true,
-                    cancellable: true,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+        let mut m = module("tasks");
+        m.functions = vec![{
+            let mut f = func_of("run", vec![], Some(TypeRef::I32));
+            f.r#async = true;
+            f.cancellable = true;
+            f
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func TasksRun() (int32, error) {"),
+            go.contains("func Run() int32 {"),
             "async wrapper must be generated: {go}"
         );
         assert!(
@@ -3265,37 +3884,22 @@ mod tests {
         );
     }
 
+    // ── Listeners ──
+
     #[test]
     fn listeners_generate_register_unregister() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "events".into(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![CallbackDef {
-                    name: "OnMessage".into(),
-                    doc: None,
-                    params: vec![Param {
-                        name: "message".into(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                }],
-                listeners: vec![ListenerDef {
-                    name: "message_listener".into(),
-                    event_callback: "OnMessage".into(),
-                    doc: None,
-                }],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
+        let mut m = module("events");
+        m.callbacks = vec![CallbackDef {
+            name: "OnMessage".into(),
+            doc: None,
+            params: vec![param("message", TypeRef::StringUtf8)],
+        }];
+        m.listeners = vec![ListenerDef {
+            name: "message_listener".into(),
+            event_callback: "OnMessage".into(),
+            doc: None,
+        }];
+        let go = rg(&api_of(vec![m]));
         assert!(
             go.contains("//export goWv_weaveffi_events_OnMessage_fn"),
             "callback trampoline must be exported: {go}"
@@ -3307,14 +3911,12 @@ mod tests {
             "preamble must declare the trampoline: {go}"
         );
         assert!(
-            go.contains(
-                "func EventsRegisterMessageListener(callback func(message string)) uint64 {"
-            ),
-            "register wrapper must be emitted: {go}"
+            go.contains("func RegisterMessageListener(callback func(message string)) uint64 {"),
+            "register wrapper must be emitted with the stripped name: {go}"
         );
         assert!(
-            go.contains("func EventsUnregisterMessageListener(id uint64) {"),
-            "unregister wrapper must be emitted: {go}"
+            go.contains("func UnregisterMessageListener(id uint64) {"),
+            "unregister wrapper must be emitted with the stripped name: {go}"
         );
         assert!(
             go.contains("C.weaveffi_events_register_message_listener(C.weaveffi_events_OnMessage_fn(unsafe.Pointer(C.goWv_weaveffi_events_OnMessage_fn)), unsafe.Pointer(uintptr(ctxID)))"),
@@ -3325,6 +3927,343 @@ mod tests {
             "subscription must retain the Go callback: {go}"
         );
     }
+
+    // ── Interfaces ──
+
+    #[test]
+    fn interface_wrapper_and_ctor() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("type Store struct {"),
+            "missing interface wrapper struct: {go}"
+        );
+        assert!(
+            go.contains("ptr *C.weaveffi_kv_Store"),
+            "missing wrapped C pointer: {go}"
+        );
+        // Factory constructor: `open` -> `OpenStore`, throwing.
+        assert!(
+            go.contains("func OpenStore(path string) (*Store, error) {"),
+            "missing factory constructor: {go}"
+        );
+        assert!(
+            go.contains("result := C.weaveffi_kv_Store_open(cPath, &cErr)"),
+            "ctor must call the member symbol: {go}"
+        );
+        assert!(
+            go.contains("return nil, wvMapKv(wvTakeError(&cErr))"),
+            "throwing ctor maps the domain error: {go}"
+        );
+        assert!(
+            go.contains("return &Store{ptr: result}, nil"),
+            "ctor wraps the owned pointer: {go}"
+        );
+    }
+
+    #[test]
+    fn interface_new_ctor_naming() {
+        let go = rg(&contacts_api());
+        assert!(
+            go.contains("func NewContactBook() *ContactBook {"),
+            "ctor named `new` must surface as New<Type>: {go}"
+        );
+        assert!(
+            go.contains("result := C.weaveffi_contacts_ContactBook_new(&cErr)"),
+            "missing ctor symbol call: {go}"
+        );
+        assert!(
+            go.contains("return &ContactBook{ptr: result}"),
+            "plain ctor wraps without error: {go}"
+        );
+    }
+
+    #[test]
+    fn interface_methods_pass_self() {
+        let go = rg(&kv_api());
+        // Throwing method: `(T, error)` with the receiver's ptr leading.
+        assert!(
+            go.contains(
+                "func (s *Store) Put(key string, value []byte, kind EntryKind, ttlSeconds *int64) (bool, error) {"
+            ),
+            "missing throwing method: {go}"
+        );
+        assert!(
+            go.contains("result := C.weaveffi_kv_Store_put(s.ptr, cKey, cValuePtr, cValueLen, C.weaveffi_kv_EntryKind(kind), cTtlSeconds, &cErr)"),
+            "method must pass s.ptr as the leading C argument: {go}"
+        );
+        assert!(
+            go.contains("return false, wvMapKv(wvTakeError(&cErr))"),
+            "throwing bool method returns its zero value with the error: {go}"
+        );
+        // Optional struct return through a method.
+        assert!(
+            go.contains("func (s *Store) Get(key string) (*Entry, error) {"),
+            "missing optional-return method: {go}"
+        );
+        // Plain method: bare return, traps.
+        assert!(
+            go.contains("func (s *Store) Count() int64 {"),
+            "missing plain method: {go}"
+        );
+        assert!(
+            go.contains("result := C.weaveffi_kv_Store_count(s.ptr, &cErr)"),
+            "plain method must pass s.ptr: {go}"
+        );
+        // Plain void method.
+        assert!(
+            go.contains("func (s *Store) Clear() {"),
+            "missing plain void method: {go}"
+        );
+        // Deprecated member keeps its notice.
+        assert!(
+            go.contains("// Deprecated: use put() with explicit kind"),
+            "missing deprecation notice: {go}"
+        );
+    }
+
+    #[test]
+    fn interface_static_naming() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("func StoreDefaultCapacity() int64 {"),
+            "statics are package-level, namespaced by the type: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_kv_Store_default_capacity(&cErr)"),
+            "static must call the member symbol without self: {go}"
+        );
+    }
+
+    #[test]
+    fn interface_close_calls_destroy() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("func (s *Store) Close() {"),
+            "missing Close: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_kv_Store_destroy(s.ptr)"),
+            "Close must call the destroy symbol: {go}"
+        );
+    }
+
+    #[test]
+    fn interface_async_method_throws() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("func (s *Store) Compact() (int64, error) {"),
+            "async throwing method keeps (T, error): {go}"
+        );
+        assert!(
+            go.contains("type wvOutcomeKvStoreCompact struct {"),
+            "outcome type derives from the member symbol: {go}"
+        );
+        assert!(
+            go.contains("//export goWv_weaveffi_kv_Store_compact_callback"),
+            "member trampoline must be exported: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_kv_Store_compact_async(s.ptr, nil, "),
+            "launch passes s.ptr then the NULL cancel token: {go}"
+        );
+        assert!(
+            go.contains("ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeError(err))}"),
+            "trampoline maps the domain error: {go}"
+        );
+        assert!(
+            go.contains("return 0, outcome.err"),
+            "throwing async wrapper returns the outcome error: {go}"
+        );
+    }
+
+    #[test]
+    fn interface_iterator_method_throws() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("func (s *Store) ListKeys(prefix *string) ([]string, error) {"),
+            "throwing iterator method keeps ([]T, error): {go}"
+        );
+        assert!(
+            go.contains("it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefix, &cErr)"),
+            "iterator launch passes s.ptr: {go}"
+        );
+        assert!(
+            go.contains("defer C.weaveffi_kv_Store_ListKeysIterator_destroy(it)"),
+            "iterator must be destroyed: {go}"
+        );
+        assert!(
+            go.contains(
+                "if C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) == 0 {"
+            ),
+            "iterator must drain via next: {go}"
+        );
+        assert!(
+            go.contains("return nil, wvMapKv(wvTakeError(&iterErr))"),
+            "per-element errors map through the domain: {go}"
+        );
+        assert!(
+            go.contains("return goResult, nil"),
+            "successful drain returns `, nil`: {go}"
+        );
+    }
+
+    #[test]
+    fn plain_iterator_function_traps() {
+        let mut m = module("events");
+        m.functions = vec![func_of(
+            "get_messages",
+            vec![],
+            Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func GetMessages() []string {"),
+            "plain iterator returns a bare slice: {go}"
+        );
+        assert!(
+            go.contains("wvTrap(&iterErr)"),
+            "plain iterator traps per-element errors: {go}"
+        );
+        assert!(
+            !go.contains("func GetMessages() ([]string, error)"),
+            "plain iterator must not return an error: {go}"
+        );
+    }
+
+    #[test]
+    fn cross_module_interface_param_borrows() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("func GetStats(store *Store) (*Stats, error) {"),
+            "nested-module function takes the wrapper: {go}"
+        );
+        assert!(
+            go.contains("result := C.weaveffi_kv_stats_get_stats(store.ptr, &cErr)"),
+            "interface params borrow the wrapped pointer: {go}"
+        );
+        assert!(
+            go.contains("return nil, wvMapKv(wvTakeError(&cErr))"),
+            "inheriting submodule maps through the ancestor domain: {go}"
+        );
+    }
+
+    #[test]
+    fn typed_error_emitted_once_with_all_codes() {
+        let go = rg(&kv_api());
+        assert_eq!(
+            go.matches("type KvError struct {").count(),
+            1,
+            "domain type must be emitted exactly once: {go}"
+        );
+        assert!(go.contains("KvErrorKeyNotFound int32 = 1001"), "{go}");
+        assert!(go.contains("KvErrorExpired int32 = 1002"), "{go}");
+        assert!(go.contains("KvErrorStoreFull int32 = 1003"), "{go}");
+        assert!(go.contains("KvErrorIoError int32 = 1004"), "{go}");
+        assert!(
+            go.contains("func wvMapKv(code int32, message string) error {"),
+            "missing wvMapKv helper: {go}"
+        );
+        assert!(
+            go.contains("case KvErrorKeyNotFound:"),
+            "mapping must switch on the code constants: {go}"
+        );
+    }
+
+    #[test]
+    fn kv_listener_uses_stripped_names() {
+        let go = rg(&kv_api());
+        assert!(
+            go.contains("func RegisterEvictionListener(callback func(key string)) uint64 {"),
+            "{go}"
+        );
+        assert!(
+            go.contains("func UnregisterEvictionListener(id uint64) {"),
+            "{go}"
+        );
+    }
+
+    // ── Naming ──
+
+    #[test]
+    fn module_prefix_stripping_default_and_knob() {
+        let api = calculator_api();
+        let stripped = rg(&api);
+        assert!(
+            stripped.contains("func Add(a int32, b int32) int32 {"),
+            "stripping is the default: {stripped}"
+        );
+        assert!(
+            !stripped.contains("func CalculatorAdd("),
+            "stripped output must not keep the module prefix: {stripped}"
+        );
+        let prefixed = rg_with(&api, "weaveffi", false);
+        assert!(
+            prefixed.contains("func CalculatorAdd(a int32, b int32) int32 {"),
+            "knob off restores the module prefix: {prefixed}"
+        );
+    }
+
+    #[test]
+    fn nested_module_stripping() {
+        let go = rg_with(&kv_api(), "weaveffi", false);
+        assert!(
+            go.contains("func KvStatsGetStats(store *Store)"),
+            "unstripped nested-module functions carry the full path: {go}"
+        );
+        // Interface members are namespaced by their type, never the module.
+        assert!(
+            go.contains("func (s *Store) Put("),
+            "interface members are unaffected by the knob: {go}"
+        );
+        assert!(
+            go.contains("func OpenStore(path string)"),
+            "constructors are unaffected by the knob: {go}"
+        );
+    }
+
+    #[test]
+    fn contacts_surface_matches_cli_expectations() {
+        let go = rg(&contacts_api());
+        assert!(go.contains("type ContactType int32"), "{go}");
+        assert!(go.contains("type Contact struct {"), "{go}");
+        assert!(go.contains("type ContactBook struct {"), "{go}");
+        assert!(go.contains("ptr *C.weaveffi_contacts_ContactBook"), "{go}");
+        assert!(
+            go.contains("func (s *ContactBook) Add(firstName string, lastName string, email *string, contactType ContactType) (*Contact, error) {"),
+            "{go}"
+        );
+        assert!(
+            go.contains("func (s *ContactBook) Get(id int64) (*Contact, error) {"),
+            "{go}"
+        );
+        assert!(
+            go.contains("func (s *ContactBook) List() []*Contact {"),
+            "{go}"
+        );
+        assert!(
+            go.contains("func (s *ContactBook) Remove(id int64) bool {"),
+            "{go}"
+        );
+        assert!(go.contains("func (s *ContactBook) Count() int32 {"), "{go}");
+        assert!(go.contains("func (s *ContactBook) Close() {"), "{go}");
+        assert!(
+            go.contains("C.weaveffi_contacts_ContactBook_destroy(s.ptr)"),
+            "{go}"
+        );
+        assert!(go.contains("type ContactsError struct {"), "{go}");
+        assert!(go.contains("ContactsErrorInvalidName int32 = 1"), "{go}");
+        assert!(go.contains("ContactsErrorNotFound int32 = 2"), "{go}");
+        assert!(
+            go.contains("func wvMapContacts(code int32, message string) error {"),
+            "{go}"
+        );
+        assert!(
+            go.contains("return nil, wvMapContacts(wvTakeError(&cErr))"),
+            "{go}"
+        );
+    }
+
+    // ── Generate-to-disk paths ──
 
     #[test]
     fn generates_file_on_disk() {
@@ -3386,175 +4325,6 @@ mod tests {
     }
 
     #[test]
-    fn optional_i32_param() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "store".into(),
-                functions: vec![Function {
-                    name: "find".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::I32)),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("id *int32"),
-            "optional i32 param should be *int32: {go}"
-        );
-        assert!(
-            go.contains("var cId *C.int32_t"),
-            "missing C var for optional: {go}"
-        );
-    }
-
-    #[test]
-    fn struct_optional_string_field() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![StructField {
-                        name: "email".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                        doc: None,
-                        default: None,
-                    }],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("func (s *Contact) Email() *string"),
-            "optional string getter should return *string: {go}"
-        );
-        assert!(
-            go.contains("if cStr == nil"),
-            "should check nil for optional string: {go}"
-        );
-    }
-
-    #[test]
-    fn no_bool_helpers_when_unneeded() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "math".into(),
-                functions: vec![Function {
-                    name: "add".into(),
-                    params: vec![
-                        Param {
-                            name: "a".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            !go.contains("boolToC"),
-            "should not include bool helpers: {go}"
-        );
-    }
-
-    #[test]
-    fn struct_enum_field_getter() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![StructField {
-                        name: "contact_type".into(),
-                        ty: TypeRef::Enum("ContactType".into()),
-                        doc: None,
-                        default: None,
-                    }],
-                }],
-                enums: vec![EnumDef {
-                    name: "ContactType".into(),
-                    doc: None,
-                    variants: vec![EnumVariant {
-                        name: "Personal".into(),
-                        value: 0,
-                        doc: None,
-                        fields: vec![],
-                    }],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-        assert!(
-            go.contains("func (s *Contact) ContactType() ContactType"),
-            "missing enum field getter: {go}"
-        );
-    }
-
-    #[test]
     fn generate_go_basic() {
         let api = calculator_api();
         let tmp = std::env::temp_dir().join("weaveffi_test_go_basic");
@@ -3569,11 +4339,11 @@ mod tests {
         let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
         assert!(go.contains("package weaveffi"), "missing package: {go}");
         assert!(
-            go.contains("func CalculatorAdd(a int32, b int32) (int32, error)"),
+            go.contains("func Add(a int32, b int32) int32 {"),
             "missing add function: {go}"
         );
         assert!(
-            go.contains("func CalculatorEcho(msg string) (string, error)"),
+            go.contains("func Echo(msg string) string {"),
             "missing echo function: {go}"
         );
 
@@ -3581,502 +4351,6 @@ mod tests {
         assert!(
             go_mod.contains("module weaveffi"),
             "go.mod should have default module path: {go_mod}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn generate_go_with_structs() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "get_contact".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::Handle,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![
-                        StructField {
-                            name: "first_name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "last_name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "age".into(),
-                            ty: TypeRef::I32,
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let tmp = std::env::temp_dir().join("weaveffi_test_go_structs");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
-
-        GoGenerator
-            .generate(&api, out_dir, &GoConfig::default())
-            .unwrap();
-
-        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
-        assert!(go.contains("type Contact struct {"), "missing struct: {go}");
-        assert!(
-            go.contains("ptr *C.weaveffi_contacts_Contact"),
-            "missing ptr field: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) FirstName() string"),
-            "missing FirstName getter: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) LastName() string"),
-            "missing LastName getter: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) Age() int32"),
-            "missing Age getter: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) Close()"),
-            "missing Close: {go}"
-        );
-        assert!(
-            go.contains("(*Contact, error)"),
-            "missing struct return type: {go}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn generate_go_with_enums() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "classify".into(),
-                    params: vec![Param {
-                        name: "ct".into(),
-                        ty: TypeRef::Enum("ContactType".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Enum("ContactType".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![EnumDef {
-                    name: "ContactType".into(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Personal".into(),
-                            value: 0,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Work".into(),
-                            value: 1,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Other".into(),
-                            value: 2,
-                            doc: None,
-                            fields: vec![],
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let tmp = std::env::temp_dir().join("weaveffi_test_go_enums");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
-
-        GoGenerator
-            .generate(&api, out_dir, &GoConfig::default())
-            .unwrap();
-
-        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
-        assert!(
-            go.contains("type ContactType int32"),
-            "missing enum type: {go}"
-        );
-        assert!(
-            go.contains("ContactTypePersonal ContactType = 0"),
-            "missing Personal variant: {go}"
-        );
-        assert!(
-            go.contains("ContactTypeWork ContactType = 1"),
-            "missing Work variant: {go}"
-        );
-        assert!(
-            go.contains("ContactTypeOther ContactType = 2"),
-            "missing Other variant: {go}"
-        );
-        assert!(
-            go.contains("func ContactsClassify(ct ContactType) (ContactType, error)"),
-            "missing classify function: {go}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn generate_go_error_handling() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "store".into(),
-                functions: vec![
-                    Function {
-                        name: "save".into(),
-                        params: vec![Param {
-                            name: "data".into(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "clear".into(),
-                        params: vec![],
-                        returns: None,
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let tmp = std::env::temp_dir().join("weaveffi_test_go_errors");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
-
-        GoGenerator
-            .generate(&api, out_dir, &GoConfig::default())
-            .unwrap();
-
-        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
-        assert!(
-            go.contains("func StoreSave(data string) (int32, error)"),
-            "missing save sig: {go}"
-        );
-        assert!(
-            go.contains("func StoreClear() error"),
-            "missing void clear sig: {go}"
-        );
-        assert!(
-            go.contains("var cErr C.weaveffi_error"),
-            "missing error var: {go}"
-        );
-        assert!(
-            go.contains("if cErr.code != 0"),
-            "missing error check: {go}"
-        );
-        assert!(
-            go.contains("C.weaveffi_error_clear(&cErr)"),
-            "missing error clear: {go}"
-        );
-        assert!(
-            go.contains("return 0, goErr"),
-            "missing zero-value error return for i32: {go}"
-        );
-        assert!(
-            go.contains("return goErr"),
-            "missing void error return: {go}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn generate_go_full_contacts() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![
-                    Function {
-                        name: "create_contact".into(),
-                        params: vec![
-                            Param {
-                                name: "first_name".into(),
-                                ty: TypeRef::StringUtf8,
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "last_name".into(),
-                                ty: TypeRef::StringUtf8,
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "email".into(),
-                                ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                                mutable: false,
-                                doc: None,
-                            },
-                            Param {
-                                name: "contact_type".into(),
-                                ty: TypeRef::Enum("ContactType".into()),
-                                mutable: false,
-                                doc: None,
-                            },
-                        ],
-                        returns: Some(TypeRef::Handle),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "get_contact".into(),
-                        params: vec![Param {
-                            name: "id".into(),
-                            ty: TypeRef::Handle,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::Struct("Contact".into())),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "list_contacts".into(),
-                        params: vec![],
-                        returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "delete_contact".into(),
-                        params: vec![Param {
-                            name: "id".into(),
-                            ty: TypeRef::Handle,
-                            mutable: false,
-                            doc: None,
-                        }],
-                        returns: Some(TypeRef::Bool),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                    Function {
-                        name: "count_contacts".into(),
-                        params: vec![],
-                        returns: Some(TypeRef::I32),
-                        doc: None,
-                        r#async: false,
-                        cancellable: false,
-                        deprecated: None,
-                        since: None,
-                    },
-                ],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![
-                        StructField {
-                            name: "id".into(),
-                            ty: TypeRef::I64,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "first_name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "last_name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "email".into(),
-                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "contact_type".into(),
-                            ty: TypeRef::Enum("ContactType".into()),
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                }],
-                enums: vec![EnumDef {
-                    name: "ContactType".into(),
-                    doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Personal".into(),
-                            value: 0,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Work".into(),
-                            value: 1,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Other".into(),
-                            value: 2,
-                            doc: None,
-                            fields: vec![],
-                        },
-                    ],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let tmp = std::env::temp_dir().join("weaveffi_test_go_full_contacts");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
-
-        GoGenerator
-            .generate(&api, out_dir, &GoConfig::default())
-            .unwrap();
-
-        let go = std::fs::read_to_string(tmp.join("go/weaveffi.go")).unwrap();
-
-        assert!(
-            go.contains("type ContactType int32"),
-            "missing ContactType enum: {go}"
-        );
-        assert!(
-            go.contains("ContactTypePersonal ContactType = 0"),
-            "missing Personal: {go}"
-        );
-        assert!(
-            go.contains("type Contact struct {"),
-            "missing Contact struct: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) Id() int64"),
-            "missing Id getter: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) FirstName() string"),
-            "missing FirstName getter: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) Email() *string"),
-            "missing optional Email getter: {go}"
-        );
-        assert!(
-            go.contains("func (s *Contact) ContactType() ContactType"),
-            "missing ContactType getter: {go}"
-        );
-        assert!(
-            go.contains("func ContactsCreateContact("),
-            "missing create_contact: {go}"
-        );
-        assert!(
-            go.contains("(int64, error)"),
-            "create_contact should return handle: {go}"
-        );
-        assert!(
-            go.contains("func ContactsGetContact(id int64) (*Contact, error)"),
-            "missing get_contact: {go}"
-        );
-        assert!(
-            go.contains("func ContactsListContacts() ([]*Contact, error)"),
-            "missing list_contacts: {go}"
-        );
-        assert!(
-            go.contains("func ContactsDeleteContact(id int64) (bool, error)"),
-            "missing delete_contact: {go}"
-        );
-        assert!(
-            go.contains("func ContactsCountContacts() (int32, error)"),
-            "missing count_contacts: {go}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4115,53 +4389,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // ── Ordering and memory-safety details ──
+
     #[test]
     fn go_no_double_free_on_error() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    builder: false,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                functions: vec![Function {
-                    name: "find_contact".into(),
-                    params: vec![Param {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
+        m.functions = vec![func_of(
+            "find_contact",
+            vec![param("name", TypeRef::StringUtf8)],
+            Some(TypeRef::Struct("Contact".into())),
+        )];
+        let go = rg(&api_of(vec![m]));
 
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-
-        let fn_start = go
-            .find("func ContactsFindContact(")
-            .expect("ContactsFindContact wrapper");
+        let fn_start = go.find("func FindContact(").expect("FindContact wrapper");
         let fn_body = &go[fn_start..];
         let fn_end = fn_body.find("\n}\n").unwrap();
         let fn_text = &fn_body[..fn_end];
@@ -4172,11 +4418,11 @@ mod tests {
         );
 
         let err_check = fn_text
-            .find("if cErr.code != 0")
-            .expect("error check in ContactsFindContact");
+            .find("wvTrap(&cErr)")
+            .expect("trap check in FindContact");
         let contact_wrap = fn_text
             .find("&Contact{ptr: result}")
-            .expect("Contact wrap in ContactsFindContact");
+            .expect("Contact wrap in FindContact");
         assert!(
             err_check < contact_wrap,
             "error must be checked before wrapping struct return: {fn_text}"
@@ -4191,145 +4437,112 @@ mod tests {
 
     #[test]
     fn go_null_check_on_optional_return() {
-        let api = Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![Function {
-                    name: "find_contact".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
-                        "Contact".into(),
-                    )))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
+        let mut m = module("contacts");
+        m.functions = vec![func_of(
+            "find_contact",
+            vec![param("id", TypeRef::I32)],
+            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                "Contact".into(),
+            )))),
+        )];
+        let go = rg(&api_of(vec![m]));
 
-        let go = render_go(&api, "weaveffi", "weaveffi.yml");
-
-        let fn_start = go
-            .find("func ContactsFindContact(")
-            .expect("ContactsFindContact wrapper");
+        let fn_start = go.find("func FindContact(").expect("FindContact wrapper");
         let fn_body = &go[fn_start..];
         let fn_end = fn_body.find("\n}\n").unwrap();
         let fn_text = &fn_body[..fn_end];
 
         let null_check = fn_text
             .find("if result == nil")
-            .expect("nil check in ContactsFindContact");
+            .expect("nil check in FindContact");
         let contact_wrap = fn_text
             .find("&Contact{ptr: result}")
-            .expect("Contact wrap in ContactsFindContact");
+            .expect("Contact wrap in FindContact");
         assert!(
             null_check < contact_wrap,
             "optional struct return should check nil before wrapping: {fn_text}"
         );
     }
 
+    // ── Docs ──
+
     fn doc_api() -> Api {
-        Api {
-            version: "0.4.0".into(),
-            modules: vec![Module {
-                name: "docs".into(),
-                functions: vec![Function {
-                    name: "do_thing".into(),
-                    params: vec![Param {
-                        name: "x".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: Some("the input value".into()),
-                    }],
-                    returns: Some(TypeRef::I32),
-                    doc: Some("Performs a thing.".into()),
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![StructDef {
-                    name: "Item".into(),
-                    doc: Some("An item we track.".into()),
-                    fields: vec![StructField {
-                        name: "id".into(),
-                        ty: TypeRef::I64,
-                        doc: Some("Stable id".into()),
-                        default: None,
-                    }],
-                    builder: false,
-                }],
-                enums: vec![EnumDef {
-                    name: "Kind".into(),
-                    doc: Some("Kind of item.".into()),
-                    variants: vec![EnumVariant {
-                        name: "Small".into(),
-                        value: 0,
-                        doc: Some("A small one".into()),
-                        fields: vec![],
-                    }],
-                }],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
+        let mut m = module("docs");
+        m.functions = vec![Function {
+            name: "do_thing".into(),
+            params: vec![Param {
+                name: "x".into(),
+                ty: TypeRef::I32,
+                mutable: false,
+                doc: Some("the input value".into()),
             }],
-            generators: None,
-            package: None,
-        }
+            returns: Some(TypeRef::I32),
+            doc: Some("Performs a thing.".into()),
+            throws: false,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }];
+        m.structs = vec![StructDef {
+            name: "Item".into(),
+            doc: Some("An item we track.".into()),
+            fields: vec![StructField {
+                name: "id".into(),
+                ty: TypeRef::I64,
+                doc: Some("Stable id".into()),
+                default: None,
+            }],
+            builder: false,
+        }];
+        m.enums = vec![EnumDef {
+            name: "Kind".into(),
+            doc: Some("Kind of item.".into()),
+            variants: vec![EnumVariant {
+                name: "Small".into(),
+                value: 0,
+                doc: Some("A small one".into()),
+                fields: vec![],
+            }],
+        }];
+        api_of(vec![m])
     }
 
     #[test]
     fn go_emits_doc_on_function() {
-        let go = render_go(&doc_api(), "weaveffi", "weaveffi.yml");
-        assert!(go.contains("// DocsDoThing: Performs a thing."), "{go}");
+        let go = rg(&doc_api());
+        assert!(go.contains("// DoThing: Performs a thing."), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_struct() {
-        let go = render_go(&doc_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&doc_api());
         assert!(go.contains("// Item: An item we track."), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_enum_variant() {
-        let go = render_go(&doc_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&doc_api());
         assert!(go.contains("// Kind: Kind of item."), "{go}");
         assert!(go.contains("// KindSmall: A small one"), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_field() {
-        let go = render_go(&doc_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&doc_api());
         assert!(go.contains("// Id: Stable id"), "{go}");
     }
 
     #[test]
     fn go_emits_doc_on_param() {
-        let go = render_go(&doc_api(), "weaveffi", "weaveffi.yml");
+        let go = rg(&doc_api());
         assert!(go.contains("// Parameters:"), "{go}");
         assert!(go.contains("//   - x: the input value"), "{go}");
     }
 
     #[test]
     fn go_custom_prefix_threads_to_user_symbols() {
-        let go = render_go(&calculator_api(), "myffi", "weaveffi.yml");
+        let go = rg_with(&calculator_api(), "myffi", true);
         // User symbols adopt the configured prefix.
         assert!(
             go.contains("C.myffi_calculator_add("),

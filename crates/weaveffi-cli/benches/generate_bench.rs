@@ -106,6 +106,7 @@ fn build_large_api() -> Api {
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
                         "Struct1".into(),
                     )))),
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -116,6 +117,7 @@ fn build_large_api() -> Api {
             Module {
                 name: format!("mod{m}"),
                 functions,
+                interfaces: vec![],
                 structs,
                 enums,
                 callbacks: vec![],
@@ -127,7 +129,7 @@ fn build_large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.4.0".into(),
+        version: "0.5.0".into(),
         modules,
         generators: None,
         package: None,

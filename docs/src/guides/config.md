@@ -48,16 +48,19 @@ module_name = "myapp_wasm"
 prefix = "myapp"
 
 [global]
-strip_module_prefix = true
+strip_module_prefix = false
 ```
 
 Every section and key is optional; omit anything you want defaulted.
-The `[global]` table accepts the alias `[weaveffi]`.
+The `[global]` table accepts the alias `[weaveffi]`. Module-prefix
+stripping is on by default, so the useful direction for
+`strip_module_prefix` is `false`: one `[global]` line restores
+module-prefixed wrapper names across every supporting target.
 
 ### 2. Embed `generators:` in the IDL
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -85,7 +88,7 @@ generators:
     module_name: MyApp
     gem_name: myapp
   weaveffi:
-    strip_module_prefix: true
+    strip_module_prefix: false
     pre_generate: "cargo build --release"
 ```
 
@@ -125,10 +128,11 @@ prefix = "myapp"
 package_name = "@myorg/myapp-native"
 ```
 
-When you set `[c] prefix = ...` and do not explicitly set
-`[cpp] c_prefix = ...`, the CLI copies the C prefix into the C++ wrapper
-config automatically so the C++ header keeps calling the same symbols
-the C ABI exports.
+The C ABI symbol prefix is global by nature: every consumer must call
+the identical exported symbols. The CLI resolves it once
+(`[global] c_prefix` wins, then `[c] prefix`) and fans it out to every
+per-target config that hasn't set its own `prefix`, so a custom prefix
+is honored across all eleven languages, not just C and C++.
 
 ### 4. Wire it into CI
 
@@ -161,11 +165,11 @@ the keys are identical.
 | Section     | Key                    | Type   | Default            | Description                                                                 |
 |-------------|------------------------|--------|--------------------|-----------------------------------------------------------------------------|
 | `[swift]`   | `module_name`          | string | `"WeaveFFI"`       | Swift module name in `Package.swift` and the `Sources/` directory           |
-| `[swift]`   | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Swift symbols                       |
+| `[swift]`   | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted Swift symbols                       |
 | `[android]` | `package`              | string | `"com.weaveffi"`   | Java/Kotlin package declaration in the JNI wrapper                          |
-| `[android]` | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Java/Kotlin symbols                 |
+| `[android]` | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted Java/Kotlin symbols                 |
 | `[node]`    | `package_name`         | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
-| `[node]`    | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted JS/TS symbols                       |
+| `[node]`    | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted JS/TS symbols                       |
 | `[wasm]`    | `module_name`          | string | `"weaveffi_wasm"`  | Module name in the Wasm JS loader                                           |
 | `[wasm]`    | `allow_unsupported`    | bool   | `false`            | Generate anyway when the IDL uses features Wasm cannot deliver (callbacks, listeners); unsupported entry points become explicit throwing stubs |
 | `[wasm]`    | `emscripten`           | bool   | `false`            | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` URL; async functions become throwing stubs |
@@ -173,15 +177,23 @@ the keys are identical.
 | `[cpp]`     | `namespace`            | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
 | `[cpp]`     | `header_name`          | string | `"weaveffi.hpp"`   | Header file name for the C++ output                                         |
 | `[cpp]`     | `standard`             | string | `"17"`             | C++ standard for the generated `CMakeLists.txt`                             |
-| `[cpp]`     | `c_prefix`             | string | inherits `[c]`     | C ABI prefix that the C++ wrappers call into                                |
 | `[python]`  | `package_name`         | string | `"weaveffi"`       | Python package name                                                         |
-| `[python]`  | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted Python symbols                      |
+| `[python]`  | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted Python symbols                      |
 | `[dotnet]`  | `namespace`            | string | `"WeaveFFI"`       | .NET namespace                                                              |
-| `[dotnet]`  | `strip_module_prefix`  | bool   | `false`            | Strip the IR module prefix from emitted C# symbols                          |
+| `[dotnet]`  | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted C# symbols                          |
 | `[dart]`    | `package_name`         | string | `"weaveffi"`       | Dart package name in `pubspec.yaml`                                         |
+| `[dart]`    | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted Dart symbols                        |
 | `[go]`      | `module_path`          | string | `"weaveffi"`       | Go module path in `go.mod`                                                  |
+| `[go]`      | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted Go symbols                          |
 | `[ruby]`    | `module_name`          | string | `"WeaveFFI"`       | Ruby module that wraps the bindings                                         |
 | `[ruby]`    | `gem_name`             | string | `"weaveffi"`       | Ruby gem name                                                               |
+| `[ruby]`    | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted Ruby symbols                        |
+
+Every per-target section also accepts a `prefix` key naming the C ABI
+symbol prefix its wrappers call. You rarely set it per target: the CLI
+fans the resolved global prefix (`[global] c_prefix`, or `[c] prefix`)
+out to every section that leaves it unset, so all eleven targets call
+the same exported symbols.
 
 > **Package identity.** The name, version, and metadata stamped into every
 > generated manifest are resolved from the IDL
@@ -203,7 +215,8 @@ the keys are identical.
 
 | Key                    | Type   | Default            | Description                                                                 |
 |------------------------|--------|--------------------|-----------------------------------------------------------------------------|
-| `strip_module_prefix`  | bool   | `false`            | Shorthand: enable `strip_module_prefix` on every target that supports it    |
+| `strip_module_prefix`  | bool   | _unset_            | Shorthand: sets `strip_module_prefix` on every target that supports it, overriding their sections. Stripping is on by default, so `false` restores module-prefixed names everywhere at once |
+| `c_prefix`             | string | _unset_            | Global C ABI symbol prefix, fanned out to every per-target `prefix` that is unset; wins over `[c] prefix` as the resolution source |
 | `pre_generate`         | string | _none_             | Shell command run before any generator starts                               |
 | `post_generate`        | string | _none_             | Shell command run after every generator finishes                            |
 
@@ -267,13 +280,16 @@ The alias `[weaveffi]` is accepted for the `[global]` section.
 - **Inline value overrides TOML silently**: there is no warning when
   both are set. If a TOML override "doesn't take", check for an inline
   block in the IDL.
-- **`[c] prefix` rewrites every generator**: picking a custom prefix
+- **The C prefix rewrites every generator**: picking a custom prefix
   also rewrites the runtime symbols (`{prefix}_free_string`, ...). The
-  Rust cdylib must be built with the same prefix. The C++ wrapper picks
-  it up automatically; if you set both `[c] prefix` and
-  `[cpp] c_prefix` make sure they agree.
-- **`strip_module_prefix = true` flattens names**: collisions across
-  modules become possible. Pick one or the other consistently.
+  Rust cdylib must be built with the same prefix. Every wrapper picks
+  it up automatically from the resolved global value; if you also set
+  a per-target `prefix`, make sure they agree.
+- **Module-prefix stripping flattens names**: it's on by default, so
+  two modules that each declare an `open` function collide in targets
+  with a flat namespace. Rename one, or set
+  `strip_module_prefix = false` (globally or per target) to restore
+  prefixed names.
 - **Hooks run shell commands as-is**: `pre_generate` and
   `post_generate` are passed straight to `sh -c`. Quote them
   carefully and never include untrusted input.

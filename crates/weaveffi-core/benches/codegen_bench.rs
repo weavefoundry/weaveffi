@@ -8,7 +8,7 @@ use weaveffi_ir::parse::parse_api_str;
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.4.0".to_string(),
+        version: "0.5.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
             functions: vec![
@@ -32,6 +32,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::I32),
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -55,6 +56,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::I32),
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -78,6 +80,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::I32),
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -93,6 +96,7 @@ fn calculator_api() -> Api {
                     returns: Some(TypeRef::StringUtf8),
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -102,6 +106,7 @@ fn calculator_api() -> Api {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }],
         generators: None,
@@ -197,6 +202,7 @@ fn large_api() -> Api {
                     )))),
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 })
@@ -210,13 +216,14 @@ fn large_api() -> Api {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             }
         })
         .collect();
 
     Api {
-        version: "0.4.0".to_string(),
+        version: "0.5.0".to_string(),
         modules,
         generators: None,
         package: None,

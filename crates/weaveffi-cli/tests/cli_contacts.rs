@@ -23,8 +23,8 @@ fn generate_contacts_produces_all_targets() {
     let header =
         std::fs::read_to_string(out_path.join("c/weaveffi.h")).expect("missing c/weaveffi.h");
     assert!(
-        header.contains("weaveffi_contacts_create_contact"),
-        "c/weaveffi.h should contain weaveffi_contacts_create_contact"
+        header.contains("weaveffi_contacts_ContactBook_new"),
+        "c/weaveffi.h should contain weaveffi_contacts_ContactBook_new"
     );
 
     assert!(

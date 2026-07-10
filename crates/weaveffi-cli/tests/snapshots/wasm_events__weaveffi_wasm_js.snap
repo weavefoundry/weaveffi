@@ -16,6 +16,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -67,6 +78,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -75,7 +89,7 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
@@ -122,7 +136,7 @@ export async function loadWeaveffiWasm(url) {
   return {
     _raw: wasm,
     events: {
-      send_message(text) {
+      sendMessage(text) {
         const [a0_p, a0_s] = _cstr(wasm, text);
         const _err = _allocErr(wasm);
         wasm.weaveffi_events_send_message(a0_p, _err);
@@ -130,7 +144,7 @@ export async function loadWeaveffiWasm(url) {
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
       },
-      get_messages() {
+      getMessages() {
         const _err = _allocErr(wasm);
         const _it = wasm.weaveffi_events_get_messages(_err);
         _checkErr(wasm, _err);
@@ -149,10 +163,10 @@ export async function loadWeaveffiWasm(url) {
         wasm.weaveffi_events_GetMessagesIterator_destroy(_it);
         return _out;
       },
-      register_message_listener() {
+      registerMessageListener() {
         throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
-      unregister_message_listener() {
+      unregisterMessageListener() {
         throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
     },

@@ -5,10 +5,15 @@ ownership across the FFI boundary.
 
 ## Error handling
 
-- Every generated C function ends with an `out_err` parameter of type `weaveffi_error*`.
+- Every generated C function ends with an `out_err` parameter of type
+  `weaveffi_error*`, except `_destroy` symbols and struct field getters.
 - On success: `out_err->code == 0` and `out_err->message == NULL`.
 - On failure: `out_err->code != 0` and `out_err->message` points to a Rust-allocated
   NUL-terminated UTF-8 string that must be cleared.
+- On a `throws: true` function, a non-zero code is one of the module's declared
+  domain codes (the header emits an enum constant per code, such as
+  `weaveffi_kv_KvError_KeyNotFound`); on a non-throwing function a non-zero
+  code only ever reports a producer bug such as a panic.
 
 Relevant declarations (from the generated header):
 
@@ -27,7 +32,8 @@ if (err.code) { fprintf(stderr, "%s\n", err.message ? err.message : ""); weaveff
 
 Notes:
 - The default unspecified error code used by the runtime is `-1`.
-- Future versions may map module error domains to well-known codes.
+- Module error domains declare their own codes in the IDL; see the
+  [Error Handling Guide](../guides/errors.md) for the typed error model.
 
 ## Strings and bytes
 
@@ -55,17 +61,24 @@ void weaveffi_free_string(const char* ptr);
 void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 ```
 
-## Handles
+## Handles and interfaces
 
-Opaque resources are represented as `weaveffi_handle_t` (64-bit). Treat them as
-tokens; their lifecycle APIs are defined by your module.
+Untyped opaque resources are represented as `weaveffi_handle_t` (64-bit).
+Treat them as tokens; their lifecycle APIs are defined by your module.
+Interface objects cross the boundary as typed opaque pointers
+(`weaveffi_kv_Store*`): constructors and methods take `out_err`, methods take
+the receiver as their leading argument, and the `_destroy` symbol frees the
+instance exactly once.
 
 ## Language wrappers
 
-- Swift: the generated wrapper throws `WeaveFFIError` and automatically clears errors
-  and frees returned strings.
-- Node: the provided N-API addon clears errors and frees returned strings; the generated
-  JS loader expects a compiled addon `index.node` placed next to it.
+- Swift: the generated wrapper automatically clears errors and frees returned
+  strings; a `throws: true` function throws the module's typed error enum, and
+  a non-throwing function traps on a poisoned error slot.
+- Node: the generated `weaveffi_addon.c` clears errors and frees returned
+  strings; the JS loader prefers the node-gyp output
+  (`build/Release/weaveffi.node`), honors a `WEAVEFFI_ADDON` path override, and
+  falls back to a prebuilt `index.node` next to it.
 
 ## C-string safety
 

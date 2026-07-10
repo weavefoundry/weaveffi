@@ -33,6 +33,16 @@ func check(_ err: inout weaveffi_error) throws {
 }
 
 @inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
+    }
+}
+
+@inline(__always)
 func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
     guard let value = value else { return try body(nil) }
     return try withUnsafePointer(to: value) { try body($0) }
@@ -53,8 +63,8 @@ var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
 let wvListenerLock = NSLock()
 
 public enum Events {
-    /// - Returns: A subscription id for ``events_unregister_message_listener(_:)``.
-    public static func events_register_message_listener(_ callback: @escaping (String) -> Void) -> UInt64 {
+    /// - Returns: A subscription id for ``unregisterMessageListener(_:)``.
+    public static func registerMessageListener(_ callback: @escaping (String) -> Void) -> UInt64 {
         let box = WvCallbackBox(callback)
         let ctx = Unmanaged.passRetained(box).toOpaque()
         let id = weaveffi_events_register_message_listener({ message, context in
@@ -66,8 +76,8 @@ public enum Events {
         wvListenerLock.unlock()
         return id
     }
-    /// Unregisters a listener previously registered with ``events_register_message_listener(_:)``.
-    public static func events_unregister_message_listener(_ id: UInt64) {
+    /// Unregisters a listener previously registered with ``registerMessageListener(_:)``.
+    public static func unregisterMessageListener(_ id: UInt64) {
         weaveffi_events_unregister_message_listener(id)
         wvListenerLock.lock()
         let ctx = wvListenerContexts.removeValue(forKey: id)
@@ -77,18 +87,18 @@ public enum Events {
         }
     }
     /// Send a message, triggering the OnMessage callback
-    public static func events_send_message(_ text: String) throws -> Void {
+    public static func sendMessage(text: String) -> Void {
         var err = weaveffi_error(code: 0, message: nil)
         text.withCString { text_ptr in
                 weaveffi_events_send_message(text_ptr, &err)
         }
-        try check(&err)
+        trap(&err)
     }
     /// Return an iterator over all sent messages
-    public static func events_get_messages() throws -> [String] {
+    public static func getMessages() -> [String] {
         var err = weaveffi_error(code: 0, message: nil)
         let iter = weaveffi_events_get_messages(&err)
-        try check(&err)
+        trap(&err)
         guard let iter = iter else { return [] }
         var items: [String] = []
         var iterItem: UnsafePointer<CChar>? = nil
@@ -98,7 +108,7 @@ public enum Events {
             weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
         }
         weaveffi_events_GetMessagesIterator_destroy(iter)
-        try check(&iterErr)
+        trap(&iterErr)
         return items
     }
 }

@@ -45,6 +45,7 @@ The package directory follows the IDL `package.name` (a package named
 | `bytes`      | `bytes`              | `ctypes.POINTER(ctypes.c_uint8)` + `ctypes.c_size_t` |
 | `handle`     | `int`                | `ctypes.c_uint64`                  |
 | `Struct`     | `"StructName"`       | `ctypes.c_void_p`                  |
+| `Interface`  | `"InterfaceName"`    | `ctypes.c_void_p`                  |
 | `Enum` (plain) | `"EnumName"`       | `ctypes.c_int32`                   |
 | `Enum` (rich)  | `"EnumName"`       | `ctypes.c_void_p`                  |
 | `T?`         | `Optional[T]`        | `ctypes.POINTER(scalar)` for values; same pointer for strings/structs |
@@ -58,7 +59,7 @@ standard fixed-width boolean type across ABIs.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -99,6 +100,11 @@ The generated module loads the platform-specific shared library:
 
 ```python
 def _load_library() -> ctypes.CDLL:
+    # An explicit path in WEAVEFFI_LIBRARY wins, so callers can point at a
+    # specific build artifact regardless of its file name or location.
+    override = os.environ.get("WEAVEFFI_LIBRARY")
+    if override:
+        return ctypes.CDLL(override)
     system = platform.system()
     if system == "Darwin":
         name = "libweaveffi.dylib"
@@ -111,11 +117,11 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 ```
 
-Functions become Python functions with full type hints; ctypes
-`argtypes`/`restype` are set up at the call site:
+Functions become snake_case Python functions with full type hints;
+ctypes `argtypes`/`restype` are set up at the call site:
 
 ```python
-def contacts_create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int:
+def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int:
     _fn = _lib.weaveffi_contacts_create_contact
     _fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32,
                     ctypes.POINTER(_WeaveFFIErrorStruct)]
@@ -178,12 +184,147 @@ class Contact:
     @property
     def age(self) -> int: ...
 
-def contacts_create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int: ...
+def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int: ...
 ```
 
-Wrapper names carry the IDL module prefix by default
-(`contacts_create_contact`); set `strip_module_prefix: true` in the
-Python generator config to drop it.
+Wrapper names drop the IDL module prefix by default and stay
+snake_case, so `create_contact` in module `contacts` is exported as
+plain `create_contact` (the C symbol keeps its full
+`weaveffi_contacts_create_contact` name). Set
+`strip_module_prefix: false` in the Python generator config (or under
+`[global]`) to restore module-prefixed wrapper names like
+`contacts_create_contact`.
+
+## Typed errors
+
+Every generated module defines `WeaveFFIError(Exception)` with `code`
+and `message` attributes. A module that declares an error domain also
+gets a domain base class and one subclass per code, each pinning its
+stable `CODE`; from the `contacts` sample:
+
+```python
+class ContactsError(WeaveFFIError):
+    """Base exception for the `contacts` module's error domain."""
+
+
+class InvalidName(ContactsError):
+    """name must not be empty"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "name must not be empty") -> None:
+        super().__init__(1, message)
+
+
+class NotFound(ContactsError):
+    """contact not found"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "contact not found") -> None:
+        super().__init__(2, message)
+
+
+ContactsError.InvalidName = InvalidName
+ContactsError.NotFound = NotFound
+```
+
+Only callables marked `throws: true` in the IDL raise these typed
+errors: their wrappers check the error slot with
+`_check_contacts_error`, which maps the code through
+`_contacts_error_from` and raises `NotFound`, `InvalidName`, or (for
+codes outside the domain, such as producer panics) a plain
+`WeaveFFIError`. Their docstrings carry a `Raises` section naming the
+domain. A callable without `throws` uses the generic `_check_error`,
+which raises `WeaveFFIError` only if the producer misbehaves:
+
+```python
+try:
+    contact = book.get(999)
+except NotFound:
+    ...                      # specific code
+except ContactsError as e:
+    print(e.code, e.message) # any domain error
+```
+
+## Interfaces
+
+An `interfaces:` entry becomes a Python class wrapping the opaque
+pointer. A constructor named `new` renders as `__init__`; any other
+constructor becomes a `@classmethod` factory. Methods are instance
+methods, statics are `@staticmethod`s, and `__del__` calls the C
+destructor; `_from_ptr` builds an instance around a pointer the C side
+already owns. From the `kvstore` sample (trimmed):
+
+```python
+class Store:
+    """An embedded key-value store owning its entries"""
+
+    @classmethod
+    def _from_ptr(cls, ptr) -> "Store":
+        _obj = cls.__new__(cls)
+        _obj._ptr = ptr
+        return _obj
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_kv_Store_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_kv_Store_destroy.restype = None
+            _lib.weaveffi_kv_Store_destroy(self._ptr)
+            self._ptr = None
+
+    @classmethod
+    def open(cls, path: str) -> "Store":
+        """Open (or create) a store backed by the given filesystem path
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_open
+        _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(_string_to_bytes(path), ctypes.byref(_err))
+        _check_kv_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return cls._from_ptr(_result)
+
+    def get(self, key: str) -> Optional["Entry"]: ...
+    def delete(self, key: str) -> bool: ...
+
+    async def compact(self) -> int:
+        _loop = asyncio.get_event_loop()
+        return await _loop.run_in_executor(None, self._compact_sync)
+
+    def legacy_put(self, key: str, value: bytes) -> bool:
+        import warnings
+        warnings.warn("use put() with explicit kind", DeprecationWarning, stacklevel=2)
+        ...
+
+    @staticmethod
+    def default_capacity() -> int: ...
+```
+
+A constructor named `new` (as on the `contacts` sample's `ContactBook`)
+lets you write `book = ContactBook()`; named constructors read as
+`store = Store.open("/tmp/cache.kv")`. Methods on the C ABI take the
+receiver as the leading argument (`weaveffi_kv_Store_put(self._ptr,
+...)`), and functions elsewhere in the IDL accept or return the wrapper
+directly (`get_stats(store)` passes `store._ptr`). Deprecated members
+emit `DeprecationWarning` at call time.
+
+```python
+import asyncio
+from kvstore import EntryKind, Store
+
+store = Store.open("/tmp/cache.kv")
+store.put("alpha", b"\x01", EntryKind.Persistent, None)
+print(store.count(), Store.default_capacity())
+reclaimed = asyncio.run(store.compact())
+```
 
 ## Rich (algebraic) enums
 
@@ -259,7 +400,7 @@ Construct a couple of variants, read the tag and a field, then hand the
 wrapper to a free function:
 
 ```python
-from weaveffi import Shape, shapes_describe, shapes_scale
+from weaveffi import Shape, describe, scale
 
 circle = Shape.circle(2.0)
 labeled = Shape.labeled("unit", 3)
@@ -268,13 +409,13 @@ if circle.tag == Shape.Tag.Circle:
     print(circle.circle_radius)      # 2.0
 print(labeled.labeled_count)         # 3
 
-print(shapes_describe(circle))       # render via the C ABI
-bigger = shapes_scale(circle, 3.0)   # returns a brand-new Shape
+print(describe(circle))              # render via the C ABI
+bigger = scale(circle, 3.0)          # returns a brand-new Shape
 ```
 
 **Ownership:** each `Shape` owns its `ctypes.c_void_p`; `__del__` calls
 `weaveffi_shapes_Shape_destroy` once the last Python reference is
-dropped, and the `Shape` returned by `shapes_scale` is owned the same
+dropped, and the `Shape` returned by `scale` is owned the same
 way. The `.pyi` stub mirrors the class (nested `Tag`, `@classmethod`
 constructors, and `@property` getters) for IDE and `mypy` support.
 
@@ -311,15 +452,15 @@ constructors, and `@property` getters) for IDE and `mypy` support.
    ```python
    from weaveffi import (
        ContactType,
-       contacts_create_contact,
-       contacts_get_contact,
-       contacts_count_contacts,
+       count_contacts,
+       create_contact,
+       get_contact,
    )
 
-   handle = contacts_create_contact("Alice", "alice@example.com", ContactType.Work)
-   contact = contacts_get_contact(handle)
+   handle = create_contact("Alice", "alice@example.com", ContactType.Work)
+   contact = get_contact(handle)
    print(f"{contact.name} ({contact.email})")
-   print(f"Total: {contacts_count_contacts()}")
+   print(f"Total: {count_contacts()}")
    ```
 
 ## Memory and ownership
@@ -345,23 +486,31 @@ constructors, and `@property` getters) for IDE and `mypy` support.
 
 Async IDL functions (`async: true`) are exposed as `async def`
 wrappers. Each wrapper delegates to a generated blocking
-`_<module>_<name>_sync` helper via `run_in_executor`, so the asyncio
-event loop stays free while a worker thread waits for the native
-completion callback:
+`_<name>_sync` helper via `run_in_executor`, so the asyncio event loop
+stays free while a worker thread waits for the native completion
+callback:
 
 ```python
-async def tasks_run_task(name: str) -> "TaskResult":
+async def run_task(name: str) -> "TaskResult":
+    """
+    Raises
+    ------
+    TaskError
+        If the call reports one of the domain's error codes.
+    """
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _tasks_run_task_sync, name)
+    return await _loop.run_in_executor(None, _run_task_sync, name)
 ```
 
 The `_sync` helper builds a `ctypes.CFUNCTYPE` completion callback,
 calls the `_async`-suffixed C launcher, and blocks on a
-`threading.Event` until the C side fires the callback. An error
-reported through the callback is re-raised as `WeaveFFIError`:
+`threading.Event` until the C side fires the callback. When the
+callable is marked `throws: true`, an error reported through the
+callback is re-raised through the domain mapper (here
+`_task_error_from`), so `await` raises the typed exception:
 
 ```python
-def _tasks_run_task_sync(name: str) -> "TaskResult":
+def _run_task_sync(name: str) -> "TaskResult":
     _fn = _lib.weaveffi_tasks_run_task_async
     _ev = threading.Event()
     _state = {"err": None, "val": None}
@@ -369,7 +518,7 @@ def _tasks_run_task_sync(name: str) -> "TaskResult":
         try:
             if err and err.contents.code != 0:
                 # ... decode the error, weaveffi_error_clear ...
-                _state["err"] = WeaveFFIError(_code, _msg)
+                _state["err"] = _task_error_from(_code, _msg)
             else:
                 # ... null-pointer guard ...
                 _state["val"] = TaskResult(result)
@@ -388,11 +537,14 @@ def _tasks_run_task_sync(name: str) -> "TaskResult":
     return _state["val"]
 ```
 
+Async interface methods work the same way as bound methods:
+`Store.compact()` is an `async def` delegating to `self._compact_sync`.
+
 For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter; the Python wrapper always passes `None` (NULL)
 for it. The token is not exposed, so cancelling the awaiting asyncio
 task does not stop the native operation. Cancellation tokens are
-currently surfaced only by the C, C++, and Kotlin targets.
+currently surfaced only by the C and C++ targets.
 
 ## Callbacks and listeners
 
@@ -419,7 +571,7 @@ _CFUNC_weaveffi_events_OnMessage_fn = ctypes.CFUNCTYPE(
     None, ctypes.c_char_p, ctypes.c_void_p)
 
 
-def events_register_message_listener(callback: Callable[[str], None]) -> int:
+def register_message_listener(callback: Callable[[str], None]) -> int:
     def _trampoline(message, _context):
         callback(_bytes_to_string(message))
     _cfunc = _CFUNC_weaveffi_events_OnMessage_fn(_trampoline)
@@ -431,7 +583,7 @@ def events_register_message_listener(callback: Callable[[str], None]) -> int:
     return _listener_id
 
 
-def events_unregister_message_listener(listener_id: int) -> None:
+def unregister_message_listener(listener_id: int) -> None:
     _fn = _lib.weaveffi_events_unregister_message_listener
     # ...
     _fn(ctypes.c_uint64(listener_id))
@@ -444,7 +596,7 @@ def events_unregister_message_listener(listener_id: int) -> None:
   call. Unregistering drops the reference.
 - **Subscription ids**: registration returns the `uint64` id produced
   by `weaveffi_events_register_message_listener(fn, context)`; pass it
-  to `events_unregister_message_listener` to stop delivery and release
+  to `unregister_message_listener` to stop delivery and release
   the trampoline.
 - **Threading**: the callback fires on the producer's thread, not the
   thread that registered it. Do not block inside it; if results must
@@ -454,9 +606,9 @@ def events_unregister_message_listener(listener_id: int) -> None:
 Typical round trip:
 
 ```python
-listener_id = events_register_message_listener(lambda m: print(m))
-events_send_message("hello")
-events_unregister_message_listener(listener_id)
+listener_id = register_message_listener(lambda m: print(m))
+send_message("hello")
+unregister_message_listener(listener_id)
 ```
 
 ## Iterators
@@ -469,7 +621,7 @@ returns the collected items; the signature is annotated
 `Iterator[str]`:
 
 ```python
-def events_get_messages() -> Iterator[str]:
+def get_messages() -> Iterator[str]:
     _fn = _lib.weaveffi_events_get_messages
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p

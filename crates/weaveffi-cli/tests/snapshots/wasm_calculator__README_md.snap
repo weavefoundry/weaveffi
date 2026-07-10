@@ -46,9 +46,22 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
 
+Wrappers of functions declared `throws` raise the declaring module's typed
+error class (a `WeaveFFIError` subclass with a per-code subclass, such as
+`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
+for producer panics and marshalling failures.
+
 ## API Reference
 
 ### Module: `calculator`
+
+#### Error Domain: `CalcError`
+
+Throwing wrappers in this module raise `CalcError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+
+| Class | Code | Default Message |
+|-------|------|-----------------|
+| `DivisionByZero` | `1` | division by zero |
 
 #### Functions
 
@@ -78,7 +91,7 @@ Multiply two integers
 
 ##### `weaveffi_calculator_div`
 
-Divide two integers
+Divide two integers, failing on a zero divisor
 
 `weaveffi_calculator_div(a: i32, b: i32) -> i32`
 

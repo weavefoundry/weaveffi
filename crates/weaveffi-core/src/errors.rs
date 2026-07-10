@@ -91,6 +91,20 @@ pub fn type_name(raw: &str, suffix: &str) -> String {
     }
 }
 
+/// Exception-branded type name for an error domain, for targets whose
+/// idiomatic errors are exceptions rather than `*Error` types.
+/// A trailing `Error` stem is replaced instead of stacked:
+/// `KvError` → `KvException`; `Failure` → `FailureException`.
+pub fn exception_type_name(raw: &str) -> String {
+    let pascal = raw.to_upper_camel_case();
+    let stem = pascal.strip_suffix("Error").unwrap_or(&pascal);
+    if stem.is_empty() {
+        "WeaveFFIException".to_string()
+    } else {
+        type_name(stem, "Exception")
+    }
+}
+
 /// All error codes declared anywhere in the API, in module-declaration order
 /// (depth-first), de-duplicated by `raw_name` (first occurrence wins). Returns
 /// an empty vec when the API declares no error domains.
@@ -135,6 +149,7 @@ mod tests {
         Module {
             name: name.into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -157,7 +172,7 @@ mod tests {
 
     fn api_with(mods: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             package: None,
             modules: mods,
             generators: None,
@@ -173,6 +188,15 @@ mod tests {
         );
         assert_eq!(type_name("AlreadyError", "Error"), "AlreadyError");
         assert_eq!(type_name("invalid_input", "Error"), "InvalidInputError");
+    }
+
+    #[test]
+    fn exception_type_name_replaces_error_stem() {
+        assert_eq!(exception_type_name("KvError"), "KvException");
+        assert_eq!(exception_type_name("ContactsError"), "ContactsException");
+        assert_eq!(exception_type_name("Failure"), "FailureException");
+        assert_eq!(exception_type_name("KvException"), "KvException");
+        assert_eq!(exception_type_name("Error"), "WeaveFFIException");
     }
 
     #[test]
@@ -207,6 +231,7 @@ mod tests {
         let api = api_with(vec![Module {
             name: "m".into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],

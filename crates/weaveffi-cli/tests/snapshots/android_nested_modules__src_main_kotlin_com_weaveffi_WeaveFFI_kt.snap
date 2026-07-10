@@ -14,23 +14,23 @@ class WeaveFFI {
         /**
          * Construct a Canvas.
          */
-        @JvmStatic private external fun graphics_new_canvasJni(width: Int): Long
-        @JvmStatic fun graphics_new_canvas(width: Int): Canvas = Canvas(graphics_new_canvasJni(width))
+        @JvmStatic private external fun newCanvasJni(width: Int): Long
+        @JvmStatic fun newCanvas(width: Int): Canvas = Canvas(newCanvasJni(width))
         /**
          * Construct a Shape.
          */
-        @JvmStatic private external fun graphics_shapes_make_shapeJni(sides: Int): Long
-        @JvmStatic fun graphics_shapes_make_shape(sides: Int): Shape = Shape(graphics_shapes_make_shapeJni(sides))
+        @JvmStatic private external fun makeShapeJni(sides: Int): Long
+        @JvmStatic fun makeShape(sides: Int): Shape = Shape(makeShapeJni(sides))
         /**
          * Nested function returning a struct owned by an ancestor module.
          */
-        @JvmStatic private external fun graphics_shapes_describeJni(): Long
-        @JvmStatic fun graphics_shapes_describe(): Canvas = Canvas(graphics_shapes_describeJni())
+        @JvmStatic private external fun describeJni(): Long
+        @JvmStatic fun describe(): Canvas = Canvas(describeJni())
         /**
-         * Deeper function taking an ancestor-module struct.
+         * Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
          */
-        @JvmStatic private external fun graphics_shapes_geometry_computeJni(shape: Long): Long
-        @JvmStatic fun graphics_shapes_geometry_compute(shape: Shape): Detail = Detail(graphics_shapes_geometry_computeJni(shape.handle))
+        @JvmStatic private external fun computeJni(shape: Long): Long
+        @JvmStatic fun compute(shape: Shape): Detail = Detail(computeJni(shape.handle))
     }
 }
 
@@ -131,6 +131,20 @@ class Detail internal constructor(internal var handle: Long) : java.io.Closeable
     }
 }
 
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `GraphicsError` declared by module `graphics`. */
+sealed class GraphicsException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class OutOfBounds(message: String = "coordinate out of bounds") : GraphicsException(1, message)
+
+    companion object {
+        /** Map a raw `GraphicsError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> OutOfBounds(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
 
 // END WeaveFFI.kt

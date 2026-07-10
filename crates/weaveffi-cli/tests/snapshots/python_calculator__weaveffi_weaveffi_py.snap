@@ -87,7 +87,45 @@ def _bytes_to_string(ptr) -> Optional[str]:
 
 # === Module: calculator ===
 
-def calculator_add(a: int, b: int) -> int:
+class CalcError(WeaveFFIError):
+    """Base exception for the `calculator` module's error domain."""
+
+
+class DivisionByZero(CalcError):
+    """division by zero"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "division by zero") -> None:
+        super().__init__(1, message)
+
+
+CalcError.DivisionByZero = DivisionByZero
+
+
+_CALC_ERROR_CODES: Dict[int, type] = {
+    1: DivisionByZero,
+}
+
+
+def _calc_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the CalcError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _CALC_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_calc_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _calc_error_from(code, message)
+
+
+def add(a: int, b: int) -> int:
     """Add two integers
     """
     _fn = _lib.weaveffi_calculator_add
@@ -99,7 +137,7 @@ def calculator_add(a: int, b: int) -> int:
     return _result
 
 
-def calculator_mul(a: int, b: int) -> int:
+def mul(a: int, b: int) -> int:
     """Multiply two integers
     """
     _fn = _lib.weaveffi_calculator_mul
@@ -111,19 +149,24 @@ def calculator_mul(a: int, b: int) -> int:
     return _result
 
 
-def calculator_div(a: int, b: int) -> int:
-    """Divide two integers
+def div(a: int, b: int) -> int:
+    """Divide two integers, failing on a zero divisor
+
+    Raises
+    ------
+    CalcError
+        If the call reports one of the domain's error codes.
     """
     _fn = _lib.weaveffi_calculator_div
     _fn.argtypes = [ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
     _err = _WeaveFFIErrorStruct()
     _result = _fn(a, b, ctypes.byref(_err))
-    _check_error(_err)
+    _check_calc_error(_err)
     return _result
 
 
-def calculator_echo(s: str) -> str:
+def echo(s: str) -> str:
     """Echo a string back
     """
     _fn = _lib.weaveffi_calculator_echo

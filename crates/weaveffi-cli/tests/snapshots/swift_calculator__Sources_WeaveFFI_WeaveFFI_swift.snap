@@ -33,6 +33,16 @@ func check(_ err: inout weaveffi_error) throws {
 }
 
 @inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
+    }
+}
+
+@inline(__always)
 func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
     guard let value = value else { return try body(nil) }
     return try withUnsafePointer(to: value) { try body($0) }
@@ -44,35 +54,69 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+/// Typed errors reported by the `calculator` module.
+public enum CalcError: Error, LocalizedError {
+    case divisionByZero(message: String)
+    public var errorDescription: String? {
+        switch self {
+        case let .divisionByZero(message): return message
+        }
+    }
+    /// The numeric ABI code carried by this error.
+    public var errorCode: Int32 {
+        switch self {
+        case .divisionByZero: return 1
+        }
+    }
+}
+
+@inline(__always)
+func mapCalculator(code: Int32, message: String) -> Error {
+    switch code {
+    case 1: return CalcError.divisionByZero(message: message.isEmpty ? "division by zero" : message)
+    default: return WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func checkCalculator(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        throw mapCalculator(code: code, message: message)
+    }
+}
+
 public enum Calculator {
     /// Add two integers
-    public static func calculator_add(_ a: Int32, _ b: Int32) throws -> Int32 {
+    public static func add(a: Int32, b: Int32) -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_calculator_add(a, b, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
     /// Multiply two integers
-    public static func calculator_mul(_ a: Int32, _ b: Int32) throws -> Int32 {
+    public static func mul(a: Int32, b: Int32) -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_calculator_mul(a, b, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    /// Divide two integers
-    public static func calculator_div(_ a: Int32, _ b: Int32) throws -> Int32 {
+    /// Divide two integers, failing on a zero divisor
+    public static func div(a: Int32, b: Int32) throws -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_calculator_div(a, b, &err)
-        try check(&err)
+        try checkCalculator(&err)
         return rv
     }
     /// Echo a string back
-    public static func calculator_echo(_ s: String) throws -> String {
+    public static func echo(s: String) -> String {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: String = try s.withCString { s_ptr in
+        let result: String = s.withCString { s_ptr in
                 let rv = weaveffi_calculator_echo(s_ptr, &err)
-                try check(&err)
-                guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
+                trap(&err)
+                guard let rv = rv else { fatalError("-1: null string") }
                 defer { weaveffi_free_string(rv) }
                 return String(cString: rv)
         }

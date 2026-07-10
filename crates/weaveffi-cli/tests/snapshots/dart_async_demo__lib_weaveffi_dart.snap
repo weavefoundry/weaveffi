@@ -36,12 +36,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -50,6 +51,34 @@ void _checkError(Pointer<_WeaveFFIError> err) {
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
     throw WeaveFFIException(code, msg);
+  }
+}
+
+/// Typed error domain `TaskError` declared by module `tasks`.
+class TaskException extends WeaveFFIException {
+  TaskException(super.code, super.message);
+}
+
+/// task name must not be empty
+class InvalidNameException extends TaskException {
+  InvalidNameException([String message = 'task name must not be empty']) : super(1, message);
+}
+
+WeaveFFIException _mapTaskException(int code, String message) {
+  switch (code) {
+    case 1:
+      return InvalidNameException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkTaskException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapTaskException(code, msg);
   }
 }
 
@@ -104,6 +133,7 @@ typedef _DartWeaveffiTasksRunTaskAsync = void Function(Pointer<Utf8>, Pointer<Na
 final _weaveffiTasksRunTaskAsync = _lib.lookupFunction<
     _NativeWeaveffiTasksRunTaskAsync, _DartWeaveffiTasksRunTaskAsync>('weaveffi_tasks_run_task_async');
 
+/// Throws [TaskException] on domain errors.
 Future<TaskResult> runTask(String name) {
   final completer = Completer<TaskResult>();
   final namePtr = name.toNativeUtf8();
@@ -114,7 +144,7 @@ Future<TaskResult> runTask(String name) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
         _weaveffiErrorClear(err);
-        completer.completeError(WeaveFFIException(code, msg));
+        completer.completeError(_mapTaskException(code, msg));
         return;
       }
       completer.complete(TaskResult._(result));

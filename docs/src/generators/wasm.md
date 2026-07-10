@@ -57,13 +57,14 @@ import { loadWeaveffiWasm } from './weaveffi_wasm.js';
 const api = await loadWeaveffiWasm('/your_library.wasm');
 ```
 
-Functions are grouped by IDL module and have idiomatic signatures;
-strings, arrays, and error handling are taken care of inside the
-wrapper:
+Functions are grouped by IDL module in lowerCamelCase (nested IDL
+modules nest namespaces, e.g. `api.kv.stats`) and have idiomatic
+signatures; strings, arrays, and error handling are taken care of
+inside the wrapper:
 
 ```javascript
-api.events.send_message('hello');        // throws Error on failure
-const all = api.events.get_messages();   // iter<string> -> string[]
+api.events.sendMessage('hello');        // throws WeaveFFIError on failure
+const all = api.events.getMessages();   // iter<string> -> string[]
 ```
 
 Structs come back as wrapper classes holding the native handle, with a
@@ -71,7 +72,7 @@ getter per field and a static `create` when the struct has a
 constructor:
 
 ```javascript
-const result = await api.tasks.run_task('build');
+const result = await api.tasks.runTask('build');
 console.log(result.id, result.value, result.success);
 ```
 
@@ -89,13 +90,104 @@ consumers:
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   events: {
-    send_message(text: string): void;
-    get_messages(): string[];
+    sendMessage(text: string): void;
+    getMessages(): string[];
   };
 }
 
 export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
 ```
+
+## Typed errors
+
+The module exports `WeaveFFIError` (extending `Error` with a numeric
+`code`). A module's error domain adds an exported base class named after
+the domain plus one exported class per code, each carrying its stable
+`CODE` and reachable both flat and via the domain class. From the
+`kvstore` sample:
+
+```js
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+/** Base error for the `kv` module's error domain. */
+export class KvError extends WeaveFFIError {}
+
+// key not found
+export class KeyNotFound extends KvError {
+  constructor(message = "key not found") {
+    super(1001, message);
+  }
+}
+KeyNotFound.CODE = 1001;
+KvError.KeyNotFound = KeyNotFound;
+// Expired, StoreFull, IoError follow the same shape.
+```
+
+A callable with `throws: true` checks the error slot through the
+domain's mapper (`_kvErrorFrom`), so a failure arrives as the matching
+subclass (`KeyNotFound`), the domain (`KvError`), or, for codes outside
+the domain, the generic `WeaveFFIError`. A callable without `throws`
+uses the generic checker only; a failure there can only be a producer
+bug and throws `WeaveFFIError`.
+
+## Interfaces
+
+An `interfaces:` entry becomes a class exposed on its module's namespace
+(`api.kv.Store`). Constructors are static factories, methods are
+camelCased instance methods, statics are static methods, and `free()`
+releases the native object (there's no `FinalizationRegistry` on this
+target). From the `kvstore` sample (trimmed):
+
+```js
+// An embedded key-value store owning its entries
+class Store {
+  free() {
+    if (this._handle !== 0) {
+      wasm.weaveffi_kv_Store_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+  static open(path) {
+    const [a0_p, a0_s] = _cstr(wasm, path);
+    const _err = _allocErr(wasm);
+    const _r = wasm.weaveffi_kv_Store_open(a0_p, _err);
+    wasm.weaveffi_dealloc(a0_p, a0_s);
+    _checkKvError(wasm, _err);
+    _freeErr(wasm, _err);
+    return Store._wrap(_r);
+  }
+  delete(key) { /* throws typed KvError subclasses */ }
+  count() { /* generic check only (no throws) */ }
+  compact() {
+    return new Promise((resolve, reject) => {
+      const ctxId = _nextCtxId++;
+      _asyncContexts.set(ctxId, { resolve, reject, mkErr: _kvErrorFrom });
+      wasm.weaveffi_kv_Store_compact_async(this._handle, 0, _cbPtr_i32_i32_i64, ctxId);
+    });
+  }
+  /** @deprecated use put() with explicit kind */
+  legacyPut(key, value) { /* ... */ }
+  static defaultCapacity() { /* ... */ }
+}
+```
+
+```js
+const store = api.kv.Store.open('/tmp/cache.kv');
+store.put('alpha', new Uint8Array([1]), api.kv.EntryKind.Volatile, null);
+console.log(store.count());
+store.free();
+```
+
+An interface parameter accepts the wrapper and reads `_handle`
+(`api.kv.stats.getStats(store)`); an interface return wraps the owned
+pointer in a fresh instance. Call `free()` when done; otherwise the
+allocation lives until the module instance is dropped.
 
 ## Rich (algebraic) enums
 
@@ -252,10 +344,10 @@ trampoline per completion-callback signature using the
 `resolve`/`reject` pair in a context map keyed by an integer id:
 
 ```javascript
-run_task(name) {
+runTask(name) {
   return new Promise((resolve, reject) => {
     const ctxId = _nextCtxId++;
-    _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, h) => new TaskResult(w, h) });
+    _asyncContexts.set(ctxId, { resolve, reject, mkErr: _taskErrorFrom, unwrap: (w, h) => new TaskResult(w, h) });
     const [a0_p, a0_s] = _cstr(wasm, name);
     wasm.weaveffi_tasks_run_task_async(a0_p, _cbPtr_i32_i32_i32, ctxId);
     wasm.weaveffi_dealloc(a0_p, a0_s);
@@ -264,7 +356,11 @@ run_task(name) {
 ```
 
 When the producer invokes the completion callback, the trampoline looks
-up the context, settles the promise, and removes the entry.
+up the context, settles the promise, and removes the entry. A callable
+with `throws: true` stores the module's typed error mapper in the
+context (`mkErr`), so the rejection carries the domain error; a
+non-throwing async callable rejects with the generic `WeaveFFIError`
+only when the producer has a bug.
 
 Two caveats apply:
 
@@ -275,8 +371,11 @@ Two caveats apply:
   thread). A producer that spawns OS threads will not work on
   `wasm32-unknown-unknown`.
 
-Cancellable functions expose their cancel entry point as a plain
-function in the same namespace (e.g. `api.tasks.cancel_task(id)`).
+A `cancellable` function's ABI symbol takes a `weaveffi_cancel_token*`
+parameter; the loader passes a null token, so cancellation isn't
+surfaced on this target (`Store.compact()` runs to completion). An IDL
+function that models cancellation itself is exposed as a plain function
+in the same namespace (e.g. `api.tasks.cancelTask(id)`).
 
 ## Capabilities and `allow_unsupported`
 
@@ -302,7 +401,7 @@ generators:
 ```
 
 With the opt-in, unsupported entry points are generated as **explicit
-throwing stubs** (calling `register_message_listener` throws an
+throwing stubs** (calling `registerMessageListener` throws an
 `Error` explaining that listeners need a native target), so the gap is
 visible at the call site instead of failing silently.
 

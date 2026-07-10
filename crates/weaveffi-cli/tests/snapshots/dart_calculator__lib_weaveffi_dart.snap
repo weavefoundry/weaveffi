@@ -35,12 +35,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -49,6 +50,34 @@ void _checkError(Pointer<_WeaveFFIError> err) {
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
     throw WeaveFFIException(code, msg);
+  }
+}
+
+/// Typed error domain `CalcError` declared by module `calculator`.
+class CalcException extends WeaveFFIException {
+  CalcException(super.code, super.message);
+}
+
+/// division by zero
+class DivisionByZeroException extends CalcException {
+  DivisionByZeroException([String message = 'division by zero']) : super(1, message);
+}
+
+WeaveFFIException _mapCalcException(int code, String message) {
+  switch (code) {
+    case 1:
+      return DivisionByZeroException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkCalcException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapCalcException(code, msg);
   }
 }
 
@@ -91,12 +120,14 @@ typedef _DartWeaveffiCalculatorDiv = int Function(int, int, Pointer<_WeaveFFIErr
 final _weaveffiCalculatorDiv = _lib.lookupFunction<
     _NativeWeaveffiCalculatorDiv, _DartWeaveffiCalculatorDiv>('weaveffi_calculator_div');
 
-/// Divide two integers
+/// Divide two integers, failing on a zero divisor
+///
+/// Throws [CalcException] on domain errors.
 int div(int a, int b) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiCalculatorDiv(a, b, err);
-    _checkError(err);
+    _checkCalcException(err);
     return result;
   } finally {
     calloc.free(err);

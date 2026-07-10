@@ -174,7 +174,7 @@ mod tests {
 
     fn expected_api() -> Api {
         Api {
-            version: "0.4.0".to_string(),
+            version: "0.5.0".to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -195,11 +195,13 @@ mod tests {
                     ],
                     returns: Some(TypeRef::I32),
                     doc: Some("Adds two numbers".to_string()),
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 }],
+                interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
                 callbacks: vec![],
@@ -215,7 +217,7 @@ mod tests {
     #[test]
     fn parse_yaml_round_trip() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -234,7 +236,7 @@ modules:
     #[test]
     fn parse_json_round_trip() {
         let json = r#"{
-            "version": "0.4.0",
+            "version": "0.5.0",
             "modules": [{
                 "name": "math",
                 "functions": [{
@@ -254,7 +256,7 @@ modules:
     #[test]
     fn parse_toml_round_trip() {
         let toml_str = r#"
-version = "0.4.0"
+version = "0.5.0"
 
 [[modules]]
 name = "math"
@@ -278,7 +280,7 @@ type = "i32"
     #[test]
     fn parse_missing_optional_fields() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -297,7 +299,7 @@ modules:
     fn parse_contacts_sample() {
         let yaml = std::fs::read_to_string("../../samples/contacts/contacts.yml").unwrap();
         let api = parse_api_str(&yaml, "yml").unwrap();
-        assert_eq!(api.version, "0.4.0");
+        assert_eq!(api.version, "0.5.0");
         assert_eq!(api.modules.len(), 1);
 
         let m = &api.modules[0];
@@ -325,25 +327,58 @@ modules:
         );
         assert_eq!(s.fields[4].ty, TypeRef::Struct("ContactType".to_string()));
 
-        assert_eq!(m.functions.len(), 5);
-        assert_eq!(m.functions[0].name, "create_contact");
-        assert_eq!(m.functions[0].returns, Some(TypeRef::Handle));
-        assert_eq!(m.functions[1].name, "get_contact");
+        // The 0.5.0 surface replaces the handle-based free functions with the
+        // ContactBook interface and a typed error domain.
+        assert!(m.functions.is_empty());
+
+        let errors = m.errors.as_ref().expect("ContactsError domain");
+        assert_eq!(errors.name, "ContactsError");
+        assert_eq!(errors.codes.len(), 2);
+        assert_eq!(errors.codes[0].name, "InvalidName");
+        assert_eq!(errors.codes[0].code, 1);
+        assert_eq!(errors.codes[0].message, "name must not be empty");
+        assert_eq!(errors.codes[1].name, "NotFound");
+        assert_eq!(errors.codes[1].code, 2);
+        assert_eq!(errors.codes[1].message, "contact not found");
+
+        assert_eq!(m.interfaces.len(), 1);
+        let book = &m.interfaces[0];
+        assert_eq!(book.name, "ContactBook");
+        assert_eq!(book.constructors.len(), 1);
+        assert_eq!(book.constructors[0].name, "new");
+        assert!(book.constructors[0].params.is_empty());
+        assert_eq!(book.constructors[0].returns, None);
+        assert!(!book.constructors[0].throws);
+        assert!(book.statics.is_empty());
+
+        assert_eq!(book.methods.len(), 5);
+        let add = &book.methods[0];
+        assert_eq!(add.name, "add");
+        assert_eq!(add.params.len(), 4);
         assert_eq!(
-            m.functions[1].returns,
-            Some(TypeRef::Struct("Contact".to_string()))
+            add.params[2].ty,
+            TypeRef::Optional(Box::new(TypeRef::StringUtf8))
         );
-        assert_eq!(m.functions[2].name, "list_contacts");
+        assert_eq!(add.params[3].ty, TypeRef::Struct("ContactType".to_string()));
+        assert_eq!(add.returns, Some(TypeRef::Struct("Contact".to_string())));
+        assert!(add.throws);
+        let get = &book.methods[1];
+        assert_eq!(get.name, "get");
+        assert_eq!(get.params[0].ty, TypeRef::I64);
+        assert!(get.throws);
+        let list = &book.methods[2];
+        assert_eq!(list.name, "list");
         assert_eq!(
-            m.functions[2].returns,
+            list.returns,
             Some(TypeRef::List(Box::new(TypeRef::Struct(
                 "Contact".to_string()
             ))))
         );
-        assert_eq!(m.functions[3].name, "delete_contact");
-        assert_eq!(m.functions[3].returns, Some(TypeRef::Bool));
-        assert_eq!(m.functions[4].name, "count_contacts");
-        assert_eq!(m.functions[4].returns, Some(TypeRef::I32));
+        assert!(!list.throws);
+        assert_eq!(book.methods[3].name, "remove");
+        assert_eq!(book.methods[3].returns, Some(TypeRef::Bool));
+        assert_eq!(book.methods[4].name, "count");
+        assert_eq!(book.methods[4].returns, Some(TypeRef::I32));
     }
 
     #[test]
@@ -412,7 +447,7 @@ modules:
     #[test]
     fn parse_struct_definitions() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions: []
@@ -441,7 +476,7 @@ modules:
     #[test]
     fn parse_enum_definitions() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: colors
     functions: []
@@ -470,7 +505,7 @@ modules:
     #[test]
     fn parse_optional_types() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: ops
     functions:
@@ -493,7 +528,7 @@ modules:
     #[test]
     fn parse_list_types() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: ops
     functions:
@@ -513,7 +548,7 @@ modules:
     #[test]
     fn parse_struct_ref_in_function() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions:
@@ -536,7 +571,7 @@ modules:
     #[test]
     fn parse_complex_nested_types() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: ops
     functions:
@@ -564,7 +599,7 @@ modules:
     #[test]
     fn doc_example_primitives() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: demo
     functions:
@@ -628,7 +663,7 @@ modules:
     #[test]
     fn doc_example_structs() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: geometry
     structs:
@@ -684,7 +719,7 @@ modules:
     #[test]
     fn doc_example_enums() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -723,7 +758,7 @@ modules:
     #[test]
     fn doc_example_optionals() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     structs:
@@ -766,7 +801,7 @@ modules:
     #[test]
     fn doc_example_lists() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: ops
     structs:
@@ -799,7 +834,7 @@ modules:
     #[test]
     fn doc_example_nested_types() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: ops
     structs:
@@ -843,7 +878,7 @@ modules:
     #[test]
     fn doc_example_error_domain() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     errors:
@@ -896,7 +931,7 @@ modules:
     #[test]
     fn doc_example_complete_contacts() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -938,7 +973,7 @@ modules:
         return: i32
 "#;
         let api = parse_api_str(yaml, "yaml").unwrap();
-        assert_eq!(api.version, "0.4.0");
+        assert_eq!(api.version, "0.5.0");
         let m = &api.modules[0];
         assert_eq!(m.name, "contacts");
         assert_eq!(m.enums.len(), 1);
@@ -962,7 +997,7 @@ modules:
     #[test]
     fn parse_function_with_map_param() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: store
     functions:
@@ -983,7 +1018,7 @@ modules:
     #[test]
     fn parse_function_with_map_return() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: store
     structs:
@@ -1011,14 +1046,17 @@ modules:
     fn parse_inventory_sample() {
         let yaml = std::fs::read_to_string("../../samples/inventory/inventory.yml").unwrap();
         let api = parse_api_str(&yaml, "yml").unwrap();
-        assert_eq!(api.version, "0.4.0");
+        assert_eq!(api.version, "0.5.0");
         assert_eq!(api.modules.len(), 2);
 
         let products = &api.modules[0];
         assert_eq!(products.name, "products");
         assert_eq!(products.enums.len(), 1);
         assert_eq!(products.structs.len(), 1);
-        assert_eq!(products.functions.len(), 5);
+        // The 0.5.0 surface replaces the handle-based free functions with the
+        // Catalog interface.
+        assert!(products.functions.is_empty());
+        assert_eq!(products.interfaces.len(), 1);
 
         let cat = &products.enums[0];
         assert_eq!(cat.name, "Category");
@@ -1047,30 +1085,62 @@ modules:
             TypeRef::List(Box::new(TypeRef::StringUtf8))
         );
 
-        assert_eq!(products.functions[0].name, "create_product");
-        assert_eq!(products.functions[0].returns, Some(TypeRef::Handle));
-        assert_eq!(products.functions[1].name, "get_product");
+        let products_errors = products.errors.as_ref().expect("ProductsError domain");
+        assert_eq!(products_errors.name, "ProductsError");
+        assert_eq!(products_errors.codes.len(), 2);
+        assert_eq!(products_errors.codes[0].name, "InvalidPrice");
+        assert_eq!(products_errors.codes[0].code, 1);
+        assert_eq!(products_errors.codes[1].name, "ProductNotFound");
+        assert_eq!(products_errors.codes[1].code, 2);
+
+        let catalog = &products.interfaces[0];
+        assert_eq!(catalog.name, "Catalog");
+        assert_eq!(catalog.constructors.len(), 1);
+        assert_eq!(catalog.constructors[0].name, "new");
+        assert!(catalog.statics.is_empty());
+        assert_eq!(catalog.methods.len(), 5);
+        let add_product = &catalog.methods[0];
+        assert_eq!(add_product.name, "add_product");
         assert_eq!(
-            products.functions[1].returns,
+            add_product.returns,
             Some(TypeRef::Struct("Product".to_string()))
         );
-        assert_eq!(products.functions[2].name, "search_products");
+        assert!(add_product.throws);
+        let get_product = &catalog.methods[1];
+        assert_eq!(get_product.name, "get_product");
+        assert_eq!(get_product.params[0].ty, TypeRef::I64);
+        assert!(get_product.throws);
+        let search = &catalog.methods[2];
+        assert_eq!(search.name, "search");
         assert_eq!(
-            products.functions[2].returns,
+            search.returns,
             Some(TypeRef::List(Box::new(TypeRef::Struct(
                 "Product".to_string()
             ))))
         );
-        assert_eq!(products.functions[3].name, "update_price");
-        assert_eq!(products.functions[3].returns, Some(TypeRef::Bool));
-        assert_eq!(products.functions[4].name, "delete_product");
-        assert_eq!(products.functions[4].returns, Some(TypeRef::Bool));
+        assert!(!search.throws);
+        let update_price = &catalog.methods[3];
+        assert_eq!(update_price.name, "update_price");
+        assert_eq!(update_price.returns, Some(TypeRef::Bool));
+        assert!(update_price.throws);
+        let remove = &catalog.methods[4];
+        assert_eq!(remove.name, "remove");
+        assert_eq!(remove.returns, Some(TypeRef::Bool));
+        assert!(!remove.throws);
 
         let orders = &api.modules[1];
         assert_eq!(orders.name, "orders");
         assert_eq!(orders.enums.len(), 0);
         assert_eq!(orders.structs.len(), 2);
         assert_eq!(orders.functions.len(), 4);
+
+        let orders_errors = orders.errors.as_ref().expect("OrdersError domain");
+        assert_eq!(orders_errors.name, "OrdersError");
+        assert_eq!(orders_errors.codes.len(), 2);
+        assert_eq!(orders_errors.codes[0].name, "OrderNotFound");
+        assert_eq!(orders_errors.codes[0].code, 1);
+        assert_eq!(orders_errors.codes[1].name, "EmptyOrder");
+        assert_eq!(orders_errors.codes[1].code, 2);
 
         let order_item = &orders.structs[0];
         assert_eq!(order_item.name, "OrderItem");
@@ -1085,19 +1155,22 @@ modules:
         );
 
         assert_eq!(orders.functions[0].name, "create_order");
-        assert_eq!(orders.functions[0].returns, Some(TypeRef::Handle));
+        assert_eq!(orders.functions[0].returns, Some(TypeRef::I64));
+        assert!(orders.functions[0].throws);
         assert_eq!(orders.functions[1].name, "get_order");
         assert_eq!(
             orders.functions[1].returns,
             Some(TypeRef::Struct("Order".to_string()))
         );
+        assert!(orders.functions[1].throws);
         assert_eq!(orders.functions[2].name, "cancel_order");
         assert_eq!(orders.functions[2].returns, Some(TypeRef::Bool));
+        assert!(!orders.functions[2].throws);
         assert_eq!(orders.functions[3].name, "add_product_to_order");
         assert_eq!(orders.functions[3].returns, Some(TypeRef::Bool));
         assert_eq!(orders.functions[3].params.len(), 2);
         assert_eq!(orders.functions[3].params[0].name, "order_id");
-        assert_eq!(orders.functions[3].params[0].ty, TypeRef::Handle);
+        assert_eq!(orders.functions[3].params[0].ty, TypeRef::I64);
         assert_eq!(orders.functions[3].params[1].name, "product");
         assert_eq!(
             orders.functions[3].params[1].ty,
@@ -1109,7 +1182,7 @@ modules:
     fn parse_async_demo_sample() {
         let yaml = std::fs::read_to_string("../../samples/async-demo/async_demo.yml").unwrap();
         let api = parse_api_str(&yaml, "yml").unwrap();
-        assert_eq!(api.version, "0.4.0");
+        assert_eq!(api.version, "0.5.0");
         assert_eq!(api.modules.len(), 1);
 
         let m = &api.modules[0];
@@ -1128,9 +1201,17 @@ modules:
 
         assert_eq!(m.functions.len(), 5);
 
+        let errors = m.errors.as_ref().expect("TaskError domain");
+        assert_eq!(errors.name, "TaskError");
+        assert_eq!(errors.codes.len(), 1);
+        assert_eq!(errors.codes[0].name, "InvalidName");
+        assert_eq!(errors.codes[0].code, 1);
+        assert_eq!(errors.codes[0].message, "task name must not be empty");
+
         let run_task = &m.functions[0];
         assert_eq!(run_task.name, "run_task");
         assert!(run_task.r#async);
+        assert!(run_task.throws);
         assert_eq!(
             run_task.returns,
             Some(TypeRef::Struct("TaskResult".to_string()))
@@ -1165,7 +1246,7 @@ modules:
     #[test]
     fn parse_idl_doc_map_example() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: example
     structs:
@@ -1230,7 +1311,7 @@ modules:
     #[test]
     fn parse_nested_modules() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: parent
     functions:

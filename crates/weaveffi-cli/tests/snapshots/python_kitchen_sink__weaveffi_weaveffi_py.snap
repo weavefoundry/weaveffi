@@ -128,7 +128,7 @@ class Token:
 
 
 
-def shared_ping() -> str:
+def ping() -> str:
     """Trivial cross-module helper
     """
     _fn = _lib.weaveffi_shared_ping
@@ -141,6 +141,55 @@ def shared_ping() -> str:
 
 
 # === Module: kitchen ===
+
+class KitchenErrorsError(WeaveFFIError):
+    """Base exception for the `kitchen` module's error domain."""
+
+
+class NotFound(KitchenErrorsError):
+    """Item not found"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "Item not found") -> None:
+        super().__init__(1, message)
+
+
+class InvalidInput(KitchenErrorsError):
+    """Invalid input"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "Invalid input") -> None:
+        super().__init__(2, message)
+
+
+KitchenErrorsError.NotFound = NotFound
+KitchenErrorsError.InvalidInput = InvalidInput
+
+
+_KITCHEN_ERRORS_ERROR_CODES: Dict[int, type] = {
+    1: NotFound,
+    2: InvalidInput,
+}
+
+
+def _kitchen_errors_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the KitchenErrorsError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _KITCHEN_ERRORS_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_kitchen_errors_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _kitchen_errors_error_from(code, message)
+
 
 class Priority(IntEnum):
     """Task priority levels"""
@@ -396,16 +445,90 @@ class ItemBuilder:
         return Item(_result)
 
 
+class Gadget:
+    """A pocket-sized interface exercising the object surface"""
+
+    @classmethod
+    def _from_ptr(cls, ptr) -> "Gadget":
+        _obj = cls.__new__(cls)
+        _obj._ptr = ptr
+        return _obj
+
+    def __init__(self, id: int) -> None:
+        """Create a gadget with the given id
+        """
+        self._ptr = None
+        _fn = _lib.weaveffi_kitchen_Gadget_new
+        _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(id, ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        self._ptr = _result
+
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_kitchen_Gadget_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_kitchen_Gadget_destroy.restype = None
+            _lib.weaveffi_kitchen_Gadget_destroy(self._ptr)
+            self._ptr = None
+
+    def describe(self) -> str:
+        """Render the gadget as a human-readable string
+        """
+        _fn = _lib.weaveffi_kitchen_Gadget_describe
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_char_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, ctypes.byref(_err))
+        _check_error(_err)
+        return _bytes_to_string(_result) or ""
+
+
+    def poke(self, times: int) -> int:
+        """Poke the gadget a number of times, failing on a negative count
+
+        Raises
+        ------
+        KitchenErrorsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kitchen_Gadget_poke
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, times, ctypes.byref(_err))
+        _check_kitchen_errors_error(_err)
+        return _result
+
+
+    @staticmethod
+    def version() -> str:
+        """The gadget subsystem version string
+        """
+        _fn = _lib.weaveffi_kitchen_Gadget_version
+        _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_char_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(ctypes.byref(_err))
+        _check_error(_err)
+        return _bytes_to_string(_result) or ""
+
+
+
 # Fires when an item is ready
 # Callback type OnReady: Callable[[int, str], None]
 _CFUNC_weaveffi_kitchen_OnReady_fn = ctypes.CFUNCTYPE(None, ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
 
 
-def kitchen_register_ready_listener(callback: Callable[[int, str], None]) -> int:
+def register_ready_listener(callback: Callable[[int, str], None]) -> int:
     """
     Subscribe to OnReady events
 
-    Returns a subscription id for kitchen_unregister_ready_listener().
+    Returns a subscription id for unregister_ready_listener().
     """
     def _trampoline(code, msg, _context):
         callback(code, _bytes_to_string(msg))
@@ -418,8 +541,8 @@ def kitchen_register_ready_listener(callback: Callable[[int, str], None]) -> int
     return _listener_id
 
 
-def kitchen_unregister_ready_listener(listener_id: int) -> None:
-    """Unregister a listener previously registered with kitchen_register_ready_listener()."""
+def unregister_ready_listener(listener_id: int) -> None:
+    """Unregister a listener previously registered with register_ready_listener()."""
     _fn = _lib.weaveffi_kitchen_unregister_ready_listener
     _fn.argtypes = [ctypes.c_uint64]
     _fn.restype = None
@@ -427,7 +550,7 @@ def kitchen_unregister_ready_listener(listener_id: int) -> None:
     _listener_refs.pop(listener_id, None)
 
 
-def kitchen_bool_id(x: bool) -> bool:
+def bool_id(x: bool) -> bool:
     """Identity for bool
     """
     _fn = _lib.weaveffi_kitchen_bool_id
@@ -439,7 +562,7 @@ def kitchen_bool_id(x: bool) -> bool:
     return bool(_result)
 
 
-def kitchen_i32_id(x: int) -> int:
+def i32_id(x: int) -> int:
     _fn = _lib.weaveffi_kitchen_i32_id
     _fn.argtypes = [ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
@@ -449,7 +572,7 @@ def kitchen_i32_id(x: int) -> int:
     return _result
 
 
-def kitchen_u32_id(x: int) -> int:
+def u32_id(x: int) -> int:
     _fn = _lib.weaveffi_kitchen_u32_id
     _fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_uint32
@@ -459,7 +582,7 @@ def kitchen_u32_id(x: int) -> int:
     return _result
 
 
-def kitchen_i64_id(x: int) -> int:
+def i64_id(x: int) -> int:
     _fn = _lib.weaveffi_kitchen_i64_id
     _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int64
@@ -469,7 +592,7 @@ def kitchen_i64_id(x: int) -> int:
     return _result
 
 
-def kitchen_f64_id(x: float) -> float:
+def f64_id(x: float) -> float:
     _fn = _lib.weaveffi_kitchen_f64_id
     _fn.argtypes = [ctypes.c_double, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_double
@@ -479,7 +602,7 @@ def kitchen_f64_id(x: float) -> float:
     return _result
 
 
-def kitchen_echo_string(s: str) -> str:
+def echo_string(s: str) -> str:
     _fn = _lib.weaveffi_kitchen_echo_string
     _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_char_p
@@ -489,7 +612,7 @@ def kitchen_echo_string(s: str) -> str:
     return _bytes_to_string(_result) or ""
 
 
-def kitchen_echo_bytes(b: bytes) -> bytes:
+def echo_bytes(b: bytes) -> bytes:
     _fn = _lib.weaveffi_kitchen_echo_bytes
     _fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.POINTER(ctypes.c_uint8)
@@ -503,7 +626,7 @@ def kitchen_echo_bytes(b: bytes) -> bytes:
     return bytes(_result[:_out_len.value])
 
 
-def kitchen_echo_borrowed_str(s: str) -> str:
+def echo_borrowed_str(s: str) -> str:
     """Borrowed string parameter
     """
     _fn = _lib.weaveffi_kitchen_echo_borrowed_str
@@ -515,7 +638,7 @@ def kitchen_echo_borrowed_str(s: str) -> str:
     return _bytes_to_string(_result) or ""
 
 
-def kitchen_echo_borrowed_bytes(b: bytes) -> bytes:
+def echo_borrowed_bytes(b: bytes) -> bytes:
     """Borrowed bytes parameter
     """
     _fn = _lib.weaveffi_kitchen_echo_borrowed_bytes
@@ -531,7 +654,7 @@ def kitchen_echo_borrowed_bytes(b: bytes) -> bytes:
     return bytes(_result[:_out_len.value])
 
 
-def kitchen_open_handle() -> int:
+def open_handle() -> int:
     """Returns an opaque handle
     """
     _fn = _lib.weaveffi_kitchen_open_handle
@@ -543,7 +666,7 @@ def kitchen_open_handle() -> int:
     return _result
 
 
-def kitchen_open_typed_handle() -> "Token":
+def open_typed_handle() -> "Token":
     """Returns a typed handle
     """
     _fn = _lib.weaveffi_kitchen_open_typed_handle
@@ -557,21 +680,26 @@ def kitchen_open_typed_handle() -> "Token":
     return Token(_result)
 
 
-def kitchen_maybe_item(id: int) -> Optional["Item"]:
+def maybe_item(id: int) -> Optional["Item"]:
     """Optional struct return
+
+    Raises
+    ------
+    KitchenErrorsError
+        If the call reports one of the domain's error codes.
     """
     _fn = _lib.weaveffi_kitchen_maybe_item
     _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
-    _check_error(_err)
+    _check_kitchen_errors_error(_err)
     if _result is None:
         return None
     return Item(_result)
 
 
-def kitchen_list_items() -> List["Item"]:
+def list_items() -> List["Item"]:
     """List of structs
     """
     _fn = _lib.weaveffi_kitchen_list_items
@@ -586,7 +714,7 @@ def kitchen_list_items() -> List["Item"]:
     return [Item(_result[_i]) for _i in range(_out_len.value)]
 
 
-def kitchen_get_attrs() -> Dict[str, int]:
+def get_attrs() -> Dict[str, int]:
     """Map return type
     """
     _fn = _lib.weaveffi_kitchen_get_attrs
@@ -639,7 +767,7 @@ class _StreamItemsIterator:
         self._destroy()
 
 
-def kitchen_stream_items() -> Iterator["Item"]:
+def stream_items() -> Iterator["Item"]:
     """Iterator return type
     """
     _fn = _lib.weaveffi_kitchen_stream_items
@@ -667,7 +795,7 @@ def kitchen_stream_items() -> Iterator["Item"]:
     return _items
 
 
-def kitchen_cross_module_token() -> "Token":
+def cross_module_token() -> "Token":
     """Returns the shared Token type from another module
     """
     _fn = _lib.weaveffi_kitchen_cross_module_token
@@ -681,7 +809,7 @@ def kitchen_cross_module_token() -> "Token":
     return Token(_result)
 
 
-def _kitchen_do_async_sync(input: str) -> str:
+def _do_async_sync(input: str) -> str:
     """Async operation
     """
     _fn = _lib.weaveffi_kitchen_do_async_async
@@ -712,14 +840,14 @@ def _kitchen_do_async_sync(input: str) -> str:
     return _state["val"]
 
 
-async def kitchen_do_async(input: str) -> str:
+async def do_async(input: str) -> str:
     """Async operation
     """
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _kitchen_do_async_sync, input)
+    return await _loop.run_in_executor(None, _do_async_sync, input)
 
 
-def _kitchen_do_cancellable_sync(input: str) -> str:
+def _do_cancellable_sync(input: str) -> str:
     """Cancellable async operation
     """
     _fn = _lib.weaveffi_kitchen_do_cancellable_async
@@ -750,14 +878,14 @@ def _kitchen_do_cancellable_sync(input: str) -> str:
     return _state["val"]
 
 
-async def kitchen_do_cancellable(input: str) -> str:
+async def do_cancellable(input: str) -> str:
     """Cancellable async operation
     """
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _kitchen_do_cancellable_sync, input)
+    return await _loop.run_in_executor(None, _do_cancellable_sync, input)
 
 
-def kitchen_legacy_op() -> int:
+def legacy_op() -> int:
     """Legacy operation kept for compatibility
     """
     import warnings
@@ -771,7 +899,7 @@ def kitchen_legacy_op() -> int:
     return _result
 
 
-def kitchen_new_op() -> int:
+def new_op() -> int:
     """Replacement for legacy_op
     """
     _fn = _lib.weaveffi_kitchen_new_op
@@ -785,7 +913,7 @@ def kitchen_new_op() -> int:
 
 # === Module: kitchen_nested ===
 
-def kitchen_nested_hello() -> str:
+def hello() -> str:
     """Trivial nested-module function
     """
     _fn = _lib.weaveffi_kitchen_nested_hello

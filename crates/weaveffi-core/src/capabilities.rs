@@ -219,6 +219,7 @@ mod tests {
             }],
             returns,
             doc: None,
+            throws: false,
             r#async: is_async,
             cancellable: false,
             deprecated: None,
@@ -230,6 +231,7 @@ mod tests {
         Module {
             name: name.into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -241,7 +243,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,

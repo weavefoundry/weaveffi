@@ -15,23 +15,23 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        @JvmStatic private external fun tasks_run_taskAsync(name: String, callback: Any)
-        @JvmStatic suspend fun tasks_run_task(name: String): TaskResult {
+        @JvmStatic private external fun runTaskAsync(name: String, callback: Any)
+        @JvmStatic suspend fun runTask(name: String): TaskResult {
             val raw: Long = suspendCancellableCoroutine { cont ->
-                tasks_run_taskAsync(name, WeaveContinuation(cont))
+                runTaskAsync(name, WeaveContinuation(cont) { code, message -> TaskException.fromCode(code, message) })
             }
             return TaskResult(raw)
         }
-        @JvmStatic private external fun tasks_run_batchAsync(names: Array<String>, callback: Any)
-        @JvmStatic suspend fun tasks_run_batch(names: Array<String>): LongArray = suspendCancellableCoroutine { cont ->
-            tasks_run_batchAsync(names, WeaveContinuation(cont))
+        @JvmStatic private external fun runBatchAsync(names: Array<String>, callback: Any)
+        @JvmStatic suspend fun runBatch(names: Array<String>): LongArray = suspendCancellableCoroutine { cont ->
+            runBatchAsync(names, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
         }
-        @JvmStatic external fun tasks_cancel_task(id: Long): Boolean
-        @JvmStatic private external fun tasks_run_n_tasksAsync(n: Int, callback: Any)
-        @JvmStatic suspend fun tasks_run_n_tasks(n: Int): Int = suspendCancellableCoroutine { cont ->
-            tasks_run_n_tasksAsync(n, WeaveContinuation(cont))
+        @JvmStatic external fun cancelTask(id: Long): Boolean
+        @JvmStatic private external fun runNTasksAsync(n: Int, callback: Any)
+        @JvmStatic suspend fun runNTasks(n: Int): Int = suspendCancellableCoroutine { cont ->
+            runNTasksAsync(n, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
         }
-        @JvmStatic external fun tasks_active_callbacks(): Long
+        @JvmStatic external fun activeCallbacks(): Long
     }
 }
 
@@ -64,12 +64,29 @@ class TaskResult internal constructor(internal var handle: Long) : java.io.Close
     }
 }
 
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
 
-internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+/** Typed error domain `TaskError` declared by module `tasks`. */
+sealed class TaskException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class InvalidName(message: String = "task name must not be empty") : TaskException(1, message)
+
+    companion object {
+        /** Map a raw `TaskError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> InvalidName(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
+
+internal class WeaveContinuation<T>(
+    private val cont: kotlinx.coroutines.CancellableContinuation<T>,
+    private val mapError: (Int, String) -> Throwable
+) {
     @Suppress("UNCHECKED_CAST")
     fun onSuccess(result: Any?) { cont.resume(result as T) }
-    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }
 }
 
 // END WeaveFFI.kt

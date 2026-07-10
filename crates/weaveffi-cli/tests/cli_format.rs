@@ -16,7 +16,7 @@ fn format_check_passes_for_canonical_input() {
     write(
         &path,
         concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",
@@ -51,7 +51,7 @@ fn format_rewrites_unsorted_keys() {
             "          - { type: i32, name: b }\n",
             "        name: add\n",
             "    name: math\n",
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
         ),
     );
     let original = std::fs::read_to_string(&path).unwrap();
@@ -108,7 +108,7 @@ fn format_check_fails_for_unsorted_input() {
             "        params: []\n",
             "        name: noop\n",
             "    name: math\n",
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
         ),
     );
     let original = std::fs::read_to_string(&path).unwrap();

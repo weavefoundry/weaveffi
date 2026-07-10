@@ -6,10 +6,41 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
-/** Opaque key-value store handle target type */
-export interface Store {
-  /** Internal store identifier */
-  id: number;
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `kv` module's throwing functions. */
+export class KvError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+/** No entry exists for the requested key */
+export class KeyNotFoundError extends KvError {
+  static readonly CODE: 1001;
+  constructor(message?: string);
+}
+/** The entry exists but its TTL has elapsed */
+export class ExpiredError extends KvError {
+  static readonly CODE: 1002;
+  constructor(message?: string);
+}
+/** The store has reached its capacity limit */
+export class StoreFullError extends KvError {
+  static readonly CODE: 1003;
+  constructor(message?: string);
+}
+/** Underlying storage reported an I/O failure */
+export class IoError extends KvError {
+  static readonly CODE: 1004;
+  constructor(message?: string);
 }
 /** A single key-value entry persisted in the store */
 export interface Entry {
@@ -56,60 +87,72 @@ export enum EntryKind {
   Encrypted = 2,
 }
 // module kv
+/** An in-memory key-value store owning its entries; destroying the object releases all of its state */
+export class Store {
+  /**
+   * Open (or create) a store backed by the given filesystem path
+   * Maps to C function: weaveffi_kv_Store_open
+   * @throws {KvError}
+   */
+  static open(path: string): Store;
+  /**
+   * Insert or replace a value, returning true on success
+   * Maps to C function: weaveffi_kv_Store_put
+   * @throws {KvError}
+   */
+  put(key: string, value: Buffer, kind: EntryKind, ttlSeconds: number | null): boolean;
+  /**
+   * Look up an entry by key; returns null if missing or expired
+   * Maps to C function: weaveffi_kv_Store_get
+   * @throws {KvError}
+   */
+  get(key: string): Entry | null;
+  /**
+   * Remove the entry for the given key, returning true if it existed
+   * Maps to C function: weaveffi_kv_Store_delete
+   * @throws {KvError}
+   */
+  delete(key: string): boolean;
+  /**
+   * Stream every key, optionally filtered by a prefix
+   * Maps to C function: weaveffi_kv_Store_list_keys
+   * @throws {KvError}
+   */
+  listKeys(prefix: string | null): string[];
+  /**
+   * Return the number of live entries in the store
+   * Maps to C function: weaveffi_kv_Store_count
+   */
+  count(): number;
+  /**
+   * Drop every entry from the store
+   * Maps to C function: weaveffi_kv_Store_clear
+   */
+  clear(): void;
+  /**
+   * Reclaim space asynchronously; returns the number of bytes reclaimed
+   * Maps to C function: weaveffi_kv_Store_compact
+   * @throws {KvError}
+   */
+  compact(): Promise<number>;
+  /**
+   * Legacy single-shot put kept for compatibility
+   * Maps to C function: weaveffi_kv_Store_legacy_put
+   * @throws {KvError}
+   * @deprecated use put() with explicit kind
+   */
+  legacyPut(key: string, value: Buffer): boolean;
+  /**
+   * The largest number of live entries one store will hold
+   * Maps to C function: weaveffi_kv_Store_default_capacity
+   */
+  static defaultCapacity(): number;
+  /** Free the underlying native object. */
+  destroy(): void;
+}
 /** Subscribe to per-key eviction notifications */
-export function kv_register_eviction_listener(callback: (key: string) => void): number
-export function kv_unregister_eviction_listener(id: number): void
-/**
- * Open (or create) a store backed by the given filesystem path
- * Maps to C function: weaveffi_kv_open_store
- */
-export function kv_open_store(path: string): Store
-/**
- * Close the store and release all in-memory resources
- * Maps to C function: weaveffi_kv_close_store
- */
-export function kv_close_store(store: Store): void
-/**
- * Insert or replace a value, returning true on success
- * Maps to C function: weaveffi_kv_put
- */
-export function kv_put(store: Store, key: string, value: Buffer, kind: EntryKind, ttl_seconds: number | null): boolean
-/**
- * Look up an entry by key; returns null if missing or expired
- * Maps to C function: weaveffi_kv_get
- */
-export function kv_get(store: Store, key: string): Entry | null
-/**
- * Remove the entry for the given key, returning true if it existed
- * Maps to C function: weaveffi_kv_delete
- */
-export function kv_delete(store: Store, key: string): boolean
-/**
- * Stream every key, optionally filtered by a prefix
- * Maps to C function: weaveffi_kv_list_keys
- */
-export function kv_list_keys(store: Store, prefix: string | null): string[]
-/**
- * Return the number of live entries in the store
- * Maps to C function: weaveffi_kv_count
- */
-export function kv_count(store: Store): number
-/**
- * Drop every entry from the store
- * Maps to C function: weaveffi_kv_clear
- */
-export function kv_clear(store: Store): void
-/**
- * Reclaim space asynchronously; returns the number of bytes reclaimed
- * Maps to C function: weaveffi_kv_compact_async
- */
-export function kv_compact_async(store: Store): Promise<number>
-/**
- * Legacy single-shot put kept for compatibility
- * Maps to C function: weaveffi_kv_legacy_put
- * @deprecated use put() with explicit kind
- */
-export function kv_legacy_put(store: Store, key: string, value: Buffer): boolean
+export function registerEvictionListener(callback: (key: string) => void): number
+export function unregisterEvictionListener(id: number): void
 /** Aggregate store statistics */
 export interface Stats {
   /** Number of live entries */
@@ -123,7 +166,8 @@ export interface Stats {
 /**
  * Snapshot the current store statistics
  * Maps to C function: weaveffi_kv_stats_get_stats
+ * @throws {KvError}
  */
-export function kv_stats_get_stats(store: Store): Stats
+export function getStats(store: Store): Stats
 
 // END types.d.ts

@@ -85,8 +85,16 @@ typedef enum {
     /** Document is hidden from listings */
     weaveffi_docs_Status_Archived = 2
 } weaveffi_docs_Status;
+/** Error codes reported by throwing functions in the `docs` module tree. */
+typedef enum {
+    /** Returned when no document matches the requested id */
+    weaveffi_docs_DocsErrors_not_found = 1,
+    /** Raised when attempting to move into a forbidden state */
+    weaveffi_docs_DocsErrors_invalid_status = 2
+} weaveffi_docs_DocsErrors;
 typedef struct weaveffi_docs_Document weaveffi_docs_Document;
 typedef struct weaveffi_docs_DocumentBuilder weaveffi_docs_DocumentBuilder;
+typedef struct weaveffi_docs_Notebook weaveffi_docs_Notebook;
 /** Fires after a document has been persisted successfully */
 typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
 typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
@@ -119,6 +127,23 @@ WEAVEFFI_API void weaveffi_docs_Document_Builder_set_status(weaveffi_docs_Docume
 WEAVEFFI_API void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_DocumentBuilder* builder, const char* const* tags, size_t tags_len);
 WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
+
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+/** Create an empty notebook */
+WEAVEFFI_API weaveffi_docs_Notebook* weaveffi_docs_Notebook_new(weaveffi_error* out_err);
+/** The largest number of documents one notebook will hold */
+WEAVEFFI_API int32_t weaveffi_docs_Notebook_max_documents(weaveffi_error* out_err);
+/** Add a document, returning its position in the notebook */
+WEAVEFFI_API int32_t weaveffi_docs_Notebook_insert(const weaveffi_docs_Notebook* self, const weaveffi_docs_Document* document, weaveffi_error* out_err);
+/** Look up a document by identifier, failing when none matches */
+WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_Notebook_find(const weaveffi_docs_Notebook* self, int64_t id, weaveffi_error* out_err);
+/** The number of documents currently held */
+WEAVEFFI_API int32_t weaveffi_docs_Notebook_size(const weaveffi_docs_Notebook* self, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_docs_Notebook_destroy(weaveffi_docs_Notebook* self);
 
 /** Subscribe to document-saved notifications */
 WEAVEFFI_API uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);

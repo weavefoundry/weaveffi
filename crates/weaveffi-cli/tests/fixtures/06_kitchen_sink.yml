@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: shared
     structs:
@@ -50,8 +50,32 @@ modules:
     errors:
       name: KitchenErrors
       codes:
-        - { name: not_found, code: 1, message: "Item not found" }
-        - { name: invalid_input, code: 2, message: "Invalid input" }
+        - { name: NotFound, code: 1, message: "Item not found" }
+        - { name: InvalidInput, code: 2, message: "Invalid input" }
+    interfaces:
+      - name: Gadget
+        doc: A pocket-sized interface exercising the object surface
+        constructors:
+          - name: new
+            doc: Create a gadget with the given id
+            params:
+              - { name: id, type: i64 }
+        methods:
+          - name: describe
+            doc: Render the gadget as a human-readable string
+            params: []
+            return: string
+          - name: poke
+            doc: Poke the gadget a number of times, failing on a negative count
+            params:
+              - { name: times, type: i32 }
+            return: i32
+            throws: true
+        statics:
+          - name: version
+            doc: The gadget subsystem version string
+            params: []
+            return: string
     functions:
       - name: bool_id
         doc: Identity for bool
@@ -105,6 +129,7 @@ modules:
         params:
           - { name: id, type: i64 }
         return: "Item?"
+        throws: true
       - name: list_items
         doc: List of structs
         params: []

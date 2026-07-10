@@ -80,5 +80,5 @@ pub use weaveffi_abi::CancelToken;
 pub use weaveffi_abi::ErrorReport;
 
 pub use weaveffi_macros::{
-    builder, callback, cancellable, enumeration, export, listener, module, record,
+    builder, callback, cancellable, enumeration, error, export, interface, listener, module, record,
 };

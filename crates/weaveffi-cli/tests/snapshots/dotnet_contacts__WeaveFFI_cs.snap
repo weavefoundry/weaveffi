@@ -23,6 +23,34 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the ContactsError error domain (module contacts).</summary>
+    public class ContactsException : WeaveFFIException
+    {
+        /// <summary>name must not be empty</summary>
+        public const int InvalidName = 1;
+        /// <summary>contact not found</summary>
+        public const int NotFound = 2;
+
+        public ContactsException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case InvalidName:
+                    return new ContactsException(code, string.IsNullOrEmpty(message) ? "name must not be empty" : message);
+                case NotFound:
+                    return new ContactsException(code, string.IsNullOrEmpty(message) ? "contact not found" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -35,6 +63,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckContacts(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw ContactsException.FromCode(err.Code, msg);
             }
         }
     }
@@ -142,6 +179,103 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>An in-memory address book owning its contacts</summary>
+    public class ContactBook : IDisposable
+    {
+        private IntPtr _handle;
+        private bool _disposed;
+
+        internal ContactBook(IntPtr handle)
+        {
+            _handle = handle;
+        }
+
+        internal IntPtr Handle => _handle;
+
+        public ContactBook()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_contacts_ContactBook_new(ref err);
+            WeaveFFIError.Check(err);
+            _handle = result;
+        }
+
+        /// <exception cref="ContactsException">Thrown when the call reports a ContactsError code.</exception>
+        public Contact Add(string firstName, string lastName, string? email, ContactType contactType)
+        {
+            var err = new WeaveFFIError();
+            var firstNamePtr = Marshal.StringToCoTaskMemUTF8(firstName);
+            var lastNamePtr = Marshal.StringToCoTaskMemUTF8(lastName);
+            var emailPtr = email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero;
+            try
+            {
+                var result = NativeMethods.weaveffi_contacts_ContactBook_add(_handle, firstNamePtr, lastNamePtr, emailPtr, (int)contactType, ref err);
+                WeaveFFIError.CheckContacts(err);
+                return new Contact(result);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(firstNamePtr);
+                Marshal.FreeCoTaskMem(lastNamePtr);
+                if (emailPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(emailPtr);
+            }
+        }
+
+        /// <exception cref="ContactsException">Thrown when the call reports a ContactsError code.</exception>
+        public Contact Get(long id)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_contacts_ContactBook_get(_handle, id, ref err);
+            WeaveFFIError.CheckContacts(err);
+            return new Contact(result);
+        }
+
+        public Contact[] List()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_contacts_ContactBook_list(_handle, out var outLen, ref err);
+            WeaveFFIError.Check(err);
+            if (result == IntPtr.Zero) return Array.Empty<Contact>();
+            var arr = new Contact[(int)outLen];
+            for (int i = 0; i < (int)outLen; i++)
+            {
+                arr[i] = new Contact(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+            }
+            return arr;
+        }
+
+        public bool Remove(long id)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_contacts_ContactBook_remove(_handle, id, ref err);
+            WeaveFFIError.Check(err);
+            return result != 0;
+        }
+
+        public int Count()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_contacts_ContactBook_count(_handle, ref err);
+            WeaveFFIError.Check(err);
+            return result;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                NativeMethods.weaveffi_contacts_ContactBook_destroy(_handle);
+                _disposed = true;
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~ContactBook()
+        {
+            Dispose();
+        }
+    }
+
     internal static class NativeMethods
     {
         private const string LibName = "weaveffi";
@@ -173,83 +307,31 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_Contact_get_contact_type", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_contacts_Contact_get_contact_type(IntPtr ptr);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_contacts_create_contact(IntPtr first_name, IntPtr last_name, IntPtr email, int contact_type, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_contacts_ContactBook_destroy(IntPtr self);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_contacts_get_contact", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_contacts_get_contact(ulong id, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_new", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_contacts_ContactBook_new(ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_contacts_list_contacts", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_contacts_list_contacts(out UIntPtr out_len, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_add", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_contacts_ContactBook_add(IntPtr self, IntPtr first_name, IntPtr last_name, IntPtr email, int contact_type, ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_contacts_delete_contact", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_contacts_delete_contact(ulong id, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_get", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_contacts_ContactBook_get(IntPtr self, long id, ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_contacts_count_contacts", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_contacts_count_contacts(ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_list", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_contacts_ContactBook_list(IntPtr self, out UIntPtr out_len, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_remove", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_contacts_ContactBook_remove(IntPtr self, long id, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_count", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_contacts_ContactBook_count(IntPtr self, ref WeaveFFIError err);
 
     }
 
     public static class Contacts
     {
-        public static ulong ContactsCreateContact(string first_name, string last_name, string? email, ContactType contact_type)
-        {
-            var err = new WeaveFFIError();
-            var first_namePtr = Marshal.StringToCoTaskMemUTF8(first_name);
-            var last_namePtr = Marshal.StringToCoTaskMemUTF8(last_name);
-            var emailPtr = email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero;
-            try
-            {
-                var result = NativeMethods.weaveffi_contacts_create_contact(first_namePtr, last_namePtr, emailPtr, (int)contact_type, ref err);
-                WeaveFFIError.Check(err);
-                return result;
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(first_namePtr);
-                Marshal.FreeCoTaskMem(last_namePtr);
-                if (emailPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(emailPtr);
-            }
-        }
-
-        public static Contact ContactsGetContact(ulong id)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_contacts_get_contact(id, ref err);
-            WeaveFFIError.Check(err);
-            return new Contact(result);
-        }
-
-        public static Contact[] ContactsListContacts()
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_contacts_list_contacts(out var outLen, ref err);
-            WeaveFFIError.Check(err);
-            if (result == IntPtr.Zero) return Array.Empty<Contact>();
-            var arr = new Contact[(int)outLen];
-            for (int i = 0; i < (int)outLen; i++)
-            {
-                arr[i] = new Contact(Marshal.ReadIntPtr(result, i * IntPtr.Size));
-            }
-            return arr;
-        }
-
-        public static bool ContactsDeleteContact(ulong id)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_contacts_delete_contact(id, ref err);
-            WeaveFFIError.Check(err);
-            return result != 0;
-        }
-
-        public static int ContactsCountContacts()
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_contacts_count_contacts(ref err);
-            WeaveFFIError.Check(err);
-            return result;
-        }
-
     }
 
 }

@@ -24,9 +24,13 @@ simulator.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: greeter
+    errors:
+      name: GreeterError
+      codes:
+        - { name: UnknownLang, code: 1, message: "unknown language" }
     structs:
       - name: Greeting
         fields:
@@ -38,11 +42,16 @@ modules:
           - { name: name, type: string }
         return: string
       - name: greeting
+        throws: true
         params:
           - { name: name, type: string }
           - { name: lang, type: string }
         return: Greeting
 ```
+
+`hello` can't fail, so it stays non-throwing. `greeting` declares
+`throws: true` and reports codes from the module's `GreeterError`
+domain when the language is unknown.
 
 ### 2. Generate bindings
 
@@ -84,7 +93,7 @@ edition = "2021"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.1" }
+weaveffi-abi = { version = "0.14" }
 ```
 
 `mygreeter/src/lib.rs`:
@@ -99,12 +108,11 @@ use weaveffi_abi::{self as abi, weaveffi_error};
 
 #[no_mangle]
 pub extern "C" fn weaveffi_greeter_hello(
-    name_ptr: *const c_char,
-    _name_len: usize,
+    name: *const c_char,
     out_err: *mut weaveffi_error,
 ) -> *const c_char {
     abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name_ptr) }.to_str().unwrap_or("world");
+    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
     let msg = format!("Hello, {name}!");
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
@@ -172,11 +180,7 @@ struct ContentView: View {
         VStack {
             Text(greeting)
             Button("Greet") {
-                do {
-                    greeting = try Greeter.hello("Swift")
-                } catch {
-                    greeting = "Error: \(error)"
-                }
+                greeting = Greeter.hello(name: "Swift")
             }
         }
         .padding()
@@ -186,10 +190,13 @@ struct ContentView: View {
 
 The generated `WeaveFFI` module exposes:
 
-- `Greeter.hello(_:)`: returns `String`.
-- `Greeter.greeting(_:_:)`: returns a `Greeting` instance with
-  `.message` and `.lang` properties; `deinit` calls the Rust
-  destructor automatically.
+- `Greeter.hello(name:)`: non-throwing, returns `String`.
+- `Greeter.greeting(name:lang:)`: declared `throws` in the IDL, so
+  the Swift wrapper is `throws` and surfaces `GreeterError`; returns
+  a `Greeting` instance with `.message` and `.lang` properties, and
+  `deinit` calls the Rust destructor automatically.
+- `GreeterError`: the module's error domain as a Swift `enum`
+  conforming to `Error` and `LocalizedError`.
 - `Greeting`: the wrapper class around the opaque Rust pointer.
 
 ## Verification

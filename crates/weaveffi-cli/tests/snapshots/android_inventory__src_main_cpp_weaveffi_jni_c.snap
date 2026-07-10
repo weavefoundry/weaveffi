@@ -14,92 +14,68 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_products_1create_1productJni(JNIEnv* env, jclass clazz, jstring name, jdouble price, jint category) {
-    weaveffi_error err = {0, NULL};
-    const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
-    weaveffi_handle_t rv = weaveffi_products_create_product(name_chars, (double)price, (int32_t)category, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
+static void throw_weaveffi_products_ProductsError(JNIEnv* env, weaveffi_error* err) {
+    const char* name = NULL;
+    switch (err->code) {
+    case 1: name = "com/weaveffi/ProductsException$InvalidPrice"; break;
+    case 2: name = "com/weaveffi/ProductsException$ProductNotFound"; break;
+    default: break;
     }
-    (*env)->ReleaseStringUTFChars(env, name, name_chars);
-    return (jlong) rv;
+    if (name == NULL) { throw_weaveffi_error(env, err); return; }
+    jclass exClass = (*env)->FindClass(env, name);
+    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
+    weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_products_1get_1productJni(JNIEnv* env, jclass clazz, jlong id) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_products_Product* rv = weaveffi_products_get_product((weaveffi_handle_t)id, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
+static void throw_weaveffi_orders_OrdersError(JNIEnv* env, weaveffi_error* err) {
+    const char* name = NULL;
+    switch (err->code) {
+    case 1: name = "com/weaveffi/OrdersException$OrderNotFound"; break;
+    case 2: name = "com/weaveffi/OrdersException$EmptyOrder"; break;
+    default: break;
     }
-    return (jlong)(intptr_t)rv;
+    if (name == NULL) { throw_weaveffi_error(env, err); return; }
+    jclass exClass = (*env)->FindClass(env, name);
+    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
+    weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlongArray JNICALL Java_com_weaveffi_WeaveFFI_products_1search_1productsJni(JNIEnv* env, jclass clazz, jint category) {
-    weaveffi_error err = {0, NULL};
-    size_t out_len = 0;
-    const int64_t* rv = (const int64_t*)weaveffi_products_search_products((int32_t)category, &out_len, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return NULL;
-    }
-    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
-    if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }
-    return result;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_products_1update_1price(JNIEnv* env, jclass clazz, jlong id, jdouble price) {
-    weaveffi_error err = {0, NULL};
-    bool rv = weaveffi_products_update_price((weaveffi_handle_t)id, (double)price, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return JNI_FALSE;
-    }
-    return rv ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_products_1delete_1product(JNIEnv* env, jclass clazz, jlong id) {
-    weaveffi_error err = {0, NULL};
-    bool rv = weaveffi_products_delete_product((weaveffi_handle_t)id, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return JNI_FALSE;
-    }
-    return rv ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_orders_1create_1order(JNIEnv* env, jclass clazz, jlongArray items) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_createOrder(JNIEnv* env, jclass clazz, jlongArray items) {
     weaveffi_error err = {0, NULL};
     jlong* items_elems = (*env)->GetLongArrayElements(env, items, NULL);
     jsize items_len = (*env)->GetArrayLength(env, items);
-    weaveffi_handle_t rv = weaveffi_orders_create_order((const void*)items_elems, (size_t)items_len, &err);
+    int64_t rv = weaveffi_orders_create_order((const void*)items_elems, (size_t)items_len, &err);
     if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
+        throw_weaveffi_orders_OrdersError(env, &err);
         return 0;
     }
     (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_orders_1get_1orderJni(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getOrderJni(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
-    weaveffi_orders_Order* rv = weaveffi_orders_get_order((weaveffi_handle_t)id, &err);
+    weaveffi_orders_Order* rv = weaveffi_orders_get_order((int64_t)id, &err);
     if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
+        throw_weaveffi_orders_OrdersError(env, &err);
         return 0;
     }
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_orders_1cancel_1order(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_cancelOrder(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
-    bool rv = weaveffi_orders_cancel_order((weaveffi_handle_t)id, &err);
+    bool rv = weaveffi_orders_cancel_order((int64_t)id, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return JNI_FALSE;
@@ -107,9 +83,9 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_orders_1cancel_1order(JNIE
     return rv ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_orders_1add_1product_1to_1orderJni(JNIEnv* env, jclass clazz, jlong order_id, jlong product) {
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_addProductToOrderJni(JNIEnv* env, jclass clazz, jlong order_id, jlong product) {
     weaveffi_error err = {0, NULL};
-    bool rv = weaveffi_orders_add_product_to_order((weaveffi_handle_t)order_id, (const weaveffi_products_Product*)(intptr_t)product, &err);
+    bool rv = weaveffi_orders_add_product_to_order((int64_t)order_id, (const weaveffi_products_Product*)(intptr_t)product, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return JNI_FALSE;
@@ -194,6 +170,75 @@ JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_Product_nativeGetTags(JNIEnv* e
         }
     }
     return jout;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeNew(JNIEnv* env, jclass clazz) {
+    weaveffi_error err = {0, NULL};
+    void* rv = weaveffi_products_Catalog_new(&err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jlong)(intptr_t) rv;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeAddProduct(JNIEnv* env, jclass clazz, jlong selfHandle, jstring name, jdouble price, jint category) {
+    weaveffi_error err = {0, NULL};
+    const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
+    weaveffi_products_Product* rv = weaveffi_products_Catalog_add_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, name_chars, (double)price, (int32_t)category, &err);
+    if (err.code != 0) {
+        throw_weaveffi_products_ProductsError(env, &err);
+        return 0;
+    }
+    (*env)->ReleaseStringUTFChars(env, name, name_chars);
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeGetProduct(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id) {
+    weaveffi_error err = {0, NULL};
+    weaveffi_products_Product* rv = weaveffi_products_Catalog_get_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, &err);
+    if (err.code != 0) {
+        throw_weaveffi_products_ProductsError(env, &err);
+        return 0;
+    }
+    return (jlong)(intptr_t)rv;
+}
+
+JNIEXPORT jlongArray JNICALL Java_com_weaveffi_Catalog_nativeSearch(JNIEnv* env, jclass clazz, jlong selfHandle, jint category) {
+    weaveffi_error err = {0, NULL};
+    size_t out_len = 0;
+    const int64_t* rv = (const int64_t*)weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int32_t)category, &out_len, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return NULL;
+    }
+    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
+    if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_Catalog_nativeUpdatePrice(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id, jdouble price) {
+    weaveffi_error err = {0, NULL};
+    bool rv = weaveffi_products_Catalog_update_price((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, (double)price, &err);
+    if (err.code != 0) {
+        throw_weaveffi_products_ProductsError(env, &err);
+        return JNI_FALSE;
+    }
+    return rv ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_Catalog_nativeRemove(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id) {
+    weaveffi_error err = {0, NULL};
+    bool rv = weaveffi_products_Catalog_remove((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return JNI_FALSE;
+    }
+    return rv ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_Catalog_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
+    weaveffi_products_Catalog_destroy((weaveffi_products_Catalog*)(intptr_t)handle);
 }
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_OrderItem_nativeCreate(JNIEnv* env, jclass clazz, jlong product_id, jint quantity, jdouble unit_price) {

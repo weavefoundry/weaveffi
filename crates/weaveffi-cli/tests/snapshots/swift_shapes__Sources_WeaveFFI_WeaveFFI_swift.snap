@@ -33,6 +33,16 @@ func check(_ err: inout weaveffi_error) throws {
 }
 
 @inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
+    }
+}
+
+@inline(__always)
 func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
     guard let value = value else { return try body(nil) }
     return try withUnsafePointer(to: value) { try body($0) }
@@ -84,7 +94,7 @@ public class Shape {
     }
 
     /// A circle with a radius
-    public static func circle(_ radius: Double) throws -> Shape {
+    public static func circle(radius: Double) throws -> Shape {
         var err = weaveffi_error(code: 0, message: nil)
         let ptr = weaveffi_shapes_Shape_Circle_new(radius, &err)
         try check(&err)
@@ -93,7 +103,7 @@ public class Shape {
     }
 
     /// An axis-aligned rectangle
-    public static func rectangle(_ width: Float, _ height: Float) throws -> Shape {
+    public static func rectangle(width: Float, height: Float) throws -> Shape {
         var err = weaveffi_error(code: 0, message: nil)
         let ptr = weaveffi_shapes_Shape_Rectangle_new(width, height, &err)
         try check(&err)
@@ -102,7 +112,7 @@ public class Shape {
     }
 
     /// An integer-bounded shape (exercises narrow + wide ints)
-    public static func bounded(_ min: Int16, _ max: Int16, _ weight: UInt64) throws -> Shape {
+    public static func bounded(min: Int16, max: Int16, weight: UInt64) throws -> Shape {
         var err = weaveffi_error(code: 0, message: nil)
         let ptr = weaveffi_shapes_Shape_Bounded_new(min, max, weight, &err)
         try check(&err)
@@ -111,7 +121,7 @@ public class Shape {
     }
 
     /// A labeled shape with a small count
-    public static func labeled(_ label: String, _ count: UInt8) throws -> Shape {
+    public static func labeled(label: String, count: UInt8) throws -> Shape {
         var err = weaveffi_error(code: 0, message: nil)
         let result: OpaquePointer? = label.withCString { label_ptr in
                 return weaveffi_shapes_Shape_Labeled_new(label_ptr, count, &err)
@@ -221,39 +231,39 @@ public class Numerics {
 
 public enum Shapes {
     /// Render a shape to a string
-    public static func shapes_describe(_ shape: Shape) throws -> String {
+    public static func describe(shape: Shape) -> String {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_shapes_describe(shape.ptr, &err)
-        try check(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null string") }
         defer { weaveffi_free_string(rv) }
         return String(cString: rv)
     }
     /// Scale a shape by a factor, returning a new shape
-    public static func shapes_scale(_ shape: Shape, _ factor: Double) throws -> Shape {
+    public static func scale(shape: Shape, factor: Double) -> Shape {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_shapes_scale(shape.ptr, factor, &err)
-        try check(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null pointer") }
         return Shape(ptr: rv)
     }
     /// Sum a list of bytes into a wide integer (numerics smoke)
-    public static func shapes_sum_bytes(_ values: [UInt8]) throws -> UInt64 {
+    public static func sumBytes(values: [UInt8]) -> UInt64 {
         var err = weaveffi_error(code: 0, message: nil)
         let result: UInt64 = values.withUnsafeBufferPointer { values_buf in
             let values_ptr = values_buf.baseAddress
             let values_len = values_buf.count
                 return weaveffi_shapes_sum_bytes(values_ptr, values_len, &err)
         }
-        try check(&err)
+        trap(&err)
         return result
     }
     /// Build a Numerics struct from every numeric primitive
-    public static func shapes_make_numerics(_ a: Int8, _ b: Int16, _ c: Int32, _ d: Int64, _ e: UInt8, _ f: UInt16, _ g: UInt32, _ h: UInt64, _ i: Float, _ j: Double) throws -> Numerics {
+    public static func makeNumerics(a: Int8, b: Int16, c: Int32, d: Int64, e: UInt8, f: UInt16, g: UInt32, h: UInt64, i: Float, j: Double) -> Numerics {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, &err)
-        try check(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null pointer") }
         return Numerics(ptr: rv)
     }
 }

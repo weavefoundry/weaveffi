@@ -24,9 +24,13 @@ emulator or a physical device.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: greeter
+    errors:
+      name: GreeterError
+      codes:
+        - { name: UnknownLang, code: 1, message: "unknown language" }
     structs:
       - name: Greeting
         fields:
@@ -38,11 +42,16 @@ modules:
           - { name: name, type: string }
         return: string
       - name: greeting
+        throws: true
         params:
           - { name: name, type: string }
           - { name: lang, type: string }
         return: Greeting
 ```
+
+`hello` can't fail, so it stays non-throwing. `greeting` declares
+`throws: true` and reports codes from the module's `GreeterError`
+domain when the language is unknown.
 
 ### 2. Generate bindings
 
@@ -85,7 +94,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.1" }
+weaveffi-abi = { version = "0.14" }
 ```
 
 `mygreeter/src/lib.rs`:
@@ -100,12 +109,11 @@ use weaveffi_abi::{self as abi, weaveffi_error};
 
 #[no_mangle]
 pub extern "C" fn weaveffi_greeter_hello(
-    name_ptr: *const c_char,
-    _name_len: usize,
+    name: *const c_char,
     out_err: *mut weaveffi_error,
 ) -> *const c_char {
     abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name_ptr) }.to_str().unwrap_or("world");
+    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
     let msg = format!("Hello, {name}!");
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
@@ -194,7 +202,7 @@ target/x86_64-linux-android/release/libmygreeter.so
 
 ```kotlin
 import com.weaveffi.WeaveFFI
-import com.weaveffi.Greeting
+import com.weaveffi.GreeterException
 
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -203,19 +211,25 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<TextView>(R.id.textView).text = WeaveFFI.hello("Android")
 
-        Greeting.create("Hi", "en").use { g ->
-            println("${g.message} (${g.lang})")
+        try {
+            WeaveFFI.greeting("Hi", "en").use { g ->
+                println("${g.message} (${g.lang})")
+            }
+        } catch (e: GreeterException) {
+            println("greeting failed: ${e.message}")
         }
     }
 }
 ```
 
-The generated `WeaveFFI` companion object loads the cdylib lazily and
-exposes:
+The generated `WeaveFFI` companion object loads the JNI library
+lazily and exposes:
 
-- `WeaveFFI.hello(name: String): String`
-- `WeaveFFI.greeting(name: String, lang: String): Long`: opaque
-  handle that the `Greeting` wrapper consumes.
+- `WeaveFFI.hello(name: String): String`: non-throwing.
+- `WeaveFFI.greeting(name: String, lang: String): Greeting`: declared
+  `throws` in the IDL, so the JNI shim raises `GreeterException`
+  subclasses (a sealed class extending `WeaveFFIException`, one
+  nested class per error code) on failure.
 
 `Greeting` implements `Closeable`; either call `.close()` or use
 `use { ... }` for deterministic cleanup.
@@ -231,7 +245,7 @@ exposes:
   | Symptom                                            | Likely cause                                                                |
   |----------------------------------------------------|-----------------------------------------------------------------------------|
   | `UnsatisfiedLinkError: dlopen failed`              | The cdylib is missing from `jniLibs/` or built for the wrong ABI.            |
-  | `RuntimeException` from JNI                        | A WeaveFFI error was raised; inspect the message.                             |
+  | `WeaveFFIException` from JNI                       | A WeaveFFI error was raised; inspect the code and message.                    |
   | Linker errors during `cargo build`                 | `ANDROID_NDK_HOME` is not set or the NDK toolchain is missing from `PATH`.    |
   | `No implementation found for native method`         | JNI symbol names do not match the Kotlin package; re-run `weaveffi generate`. |
 
@@ -251,7 +265,8 @@ generated bindings around.
 - See the [Android generator reference](../generators/android.md) for
   the full type mapping and JNI conventions.
 - Read [Error Handling](../guides/errors.md): JNI shims convert C
-  errors to `RuntimeException` automatically.
+  errors to `WeaveFFIException` (or a typed domain exception)
+  automatically.
 - Try the [Calculator tutorial](calculator.md) for a simpler
   end-to-end walkthrough or [Swift iOS](swift.md) for a sibling
   mobile target.

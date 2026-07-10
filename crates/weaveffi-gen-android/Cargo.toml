@@ -17,6 +17,7 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+weaveffi-gen-c = { path = "../weaveffi-gen-c", version = "0.14.1" }
 
 [lints]
 workspace = true

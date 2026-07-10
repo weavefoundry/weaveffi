@@ -14,22 +14,36 @@ class WeaveFFI {
         /**
          * Add two integers
          */
-        @JvmStatic external fun calculator_add(a: Int, b: Int): Int
+        @JvmStatic external fun add(a: Int, b: Int): Int
         /**
          * Multiply two integers
          */
-        @JvmStatic external fun calculator_mul(a: Int, b: Int): Int
+        @JvmStatic external fun mul(a: Int, b: Int): Int
         /**
-         * Divide two integers
+         * Divide two integers, failing on a zero divisor
          */
-        @JvmStatic external fun calculator_div(a: Int, b: Int): Int
+        @JvmStatic external fun div(a: Int, b: Int): Int
         /**
          * Echo a string back
          */
-        @JvmStatic external fun calculator_echo(s: String): String
+        @JvmStatic external fun echo(s: String): String
     }
 }
 
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `CalcError` declared by module `calculator`. */
+sealed class CalcException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class DivisionByZero(message: String = "division by zero") : CalcException(1, message)
+
+    companion object {
+        /** Map a raw `CalcError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> DivisionByZero(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
 
 // END WeaveFFI.kt

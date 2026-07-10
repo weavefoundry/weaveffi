@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -318,30 +318,34 @@ fn summary_md_all_links_resolve() {
     );
 }
 
+/// The README quickstart IDL, kept in sync with the `kvstore.yml` snippet in
+/// `README.md` step 2 (trimmed `Store` interface plus `KvError` domain).
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
-  - name: contacts
-    structs:
-      - name: Contact
-        fields:
-          - name: id
-            type: i64
-          - name: name
-            type: string
-          - name: email
-            type: "string?"
-    functions:
-      - name: create_contact
-        params:
-          - name: name
-            type: string
-          - name: email
-            type: "string?"
-        return: Contact
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
+  - name: kv
+    errors:
+      name: KvError
+      codes:
+        - { name: KeyNotFound, code: 1001, message: "key not found" }
+        - { name: StoreFull, code: 1003, message: "store has reached capacity" }
+    interfaces:
+      - name: Store
+        constructors:
+          - name: open
+            params:
+              - { name: path, type: string }
+            throws: true
+        methods:
+          - name: put
+            params:
+              - { name: key, type: string }
+              - { name: value, type: bytes }
+            return: bool
+            throws: true
+          - name: count
+            params: []
+            return: i64
 "#;
 
 #[test]
@@ -353,20 +357,37 @@ fn readme_quickstart_yaml_parses_and_validates() {
 
     assert_eq!(api.modules.len(), 1);
     let m = &api.modules[0];
-    assert_eq!(m.name, "contacts");
-    assert_eq!(m.structs.len(), 1);
-    assert_eq!(m.structs[0].name, "Contact");
-    assert_eq!(m.structs[0].fields.len(), 3);
-    assert_eq!(m.functions.len(), 2);
-    assert_eq!(m.functions[0].name, "create_contact");
-    assert_eq!(m.functions[1].name, "list_contacts");
+    assert_eq!(m.name, "kv");
+    assert_eq!(m.interfaces.len(), 1);
+    let store = &m.interfaces[0];
+    assert_eq!(store.name, "Store");
+    assert_eq!(store.constructors.len(), 1);
+    assert_eq!(store.constructors[0].name, "open");
+    assert!(store.constructors[0].throws);
+    assert_eq!(store.methods.len(), 2);
+    assert!(store.methods[0].throws);
+    assert!(!store.methods[1].throws);
+    let domain = m.errors.as_ref().expect("KvError domain");
+    assert_eq!(domain.name, "KvError");
+    assert_eq!(domain.codes.len(), 2);
+}
+
+/// The README quickstart YAML must match the snippet in `README.md` verbatim
+/// so the docs cannot drift from what this suite verifies.
+#[test]
+fn readme_quickstart_yaml_matches_readme_snippet() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains(README_QUICKSTART_YAML.trim()),
+        "README.md quickstart YAML differs from README_QUICKSTART_YAML in this test"
+    );
 }
 
 #[test]
 fn readme_quickstart_generates_c_header() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
-    let yml_path = out_path.join("contacts.yml");
+    let yml_path = out_path.join("kvstore.yml");
     std::fs::write(&yml_path, README_QUICKSTART_YAML).unwrap();
 
     assert_cmd::Command::cargo_bin("weaveffi")
@@ -383,33 +404,33 @@ fn readme_quickstart_generates_c_header() {
     let header = std::fs::read_to_string(out_path.join("generated/c/weaveffi.h")).unwrap();
 
     assert!(
-        header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
-        "opaque struct typedef missing: {header}"
+        header.contains("typedef struct weaveffi_kv_Store weaveffi_kv_Store;"),
+        "opaque interface typedef missing: {header}"
     );
     assert!(
-        header.contains("weaveffi_contacts_Contact_create("),
-        "Contact_create missing: {header}"
+        header.contains("weaveffi_kv_KvError_KeyNotFound = 1001"),
+        "error domain enum missing: {header}"
     );
     assert!(
-        header.contains("weaveffi_contacts_Contact_destroy("),
-        "Contact_destroy missing: {header}"
+        header.contains("weaveffi_kv_Store_open("),
+        "Store_open constructor missing: {header}"
     );
     assert!(
-        header.contains("weaveffi_contacts_Contact_get_name("),
-        "Contact_get_name missing: {header}"
+        header.contains("weaveffi_kv_Store_put(const weaveffi_kv_Store* self,"),
+        "Store_put method with self receiver missing: {header}"
     );
     assert!(
-        header.contains("weaveffi_contacts_create_contact("),
-        "create_contact missing: {header}"
+        header.contains("weaveffi_kv_Store_count("),
+        "Store_count missing: {header}"
     );
     assert!(
-        header.contains("weaveffi_contacts_list_contacts("),
-        "list_contacts missing: {header}"
+        header.contains("void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);"),
+        "Store_destroy missing: {header}"
     );
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     structs:
@@ -489,8 +510,8 @@ fn getting_started_yaml_generates_all_targets() {
         "types.d.ts should contain Point interface"
     );
     assert!(
-        dts.contains("function math_add"),
-        "types.d.ts should contain math_add function"
+        dts.contains("function add(a: number, b: number): number"),
+        "types.d.ts should contain the prefix-stripped add function"
     );
 
     let scaffold = std::fs::read_to_string(gen.join("scaffold.rs")).unwrap();
@@ -529,8 +550,11 @@ fn workspace_root() -> std::path::PathBuf {
 
 fn read_workspace_file(rel: &str) -> String {
     let path = workspace_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    // Windows checkouts may carry CRLF while Rust normalizes multiline string
+    // literals to LF; normalize so verbatim-snippet comparisons match.
+    contents.replace("\r\n", "\n")
 }
 
 #[test]
@@ -552,17 +576,15 @@ fn readme_states_value_proposition() {
 fn readme_uses_only_current_schema_version() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("\"0.4.0\""),
-        "README should reference schema version 0.4.0"
+        readme.contains("\"0.5.0\""),
+        "README should reference schema version 0.5.0"
     );
-    assert!(
-        !readme.contains("\"0.1.0\""),
-        "README should not reference older schema version 0.1.0"
-    );
-    assert!(
-        !readme.contains("\"0.2.0\""),
-        "README should not reference older schema version 0.2.0"
-    );
+    for old in ["\"0.1.0\"", "\"0.2.0\"", "\"0.3.0\"", "\"0.4.0\""] {
+        assert!(
+            !readme.contains(old),
+            "README should not reference older schema version {old}"
+        );
+    }
 }
 
 #[test]
@@ -674,7 +696,7 @@ fn readme_comparison_link_points_to_docs() {
 fn readme_quickstart_command_emits_all_advertised_targets() {
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
-    let yml_path = out_path.join("contacts.yml");
+    let yml_path = out_path.join("kvstore.yml");
     std::fs::write(&yml_path, README_QUICKSTART_YAML).unwrap();
 
     assert_cmd::Command::cargo_bin("weaveffi")
@@ -697,8 +719,8 @@ fn readme_quickstart_command_emits_all_advertised_targets() {
         "missing swift/Sources/WeaveFFI/WeaveFFI.swift"
     );
     assert!(
-        gen.join("python/contacts/weaveffi.pyi").exists(),
-        "missing python/contacts/weaveffi.pyi"
+        gen.join("python/kvstore/weaveffi.pyi").exists(),
+        "missing python/kvstore/weaveffi.pyi"
     );
     assert!(
         gen.join("node/types.d.ts").exists(),
@@ -715,7 +737,7 @@ fn readme_quickstart_snippets_match_actual_output() {
     let readme = read_workspace_file("README.md");
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
-    let yml_path = out_path.join("contacts.yml");
+    let yml_path = out_path.join("kvstore.yml");
     std::fs::write(&yml_path, README_QUICKSTART_YAML).unwrap();
 
     assert_cmd::Command::cargo_bin("weaveffi")
@@ -726,7 +748,7 @@ fn readme_quickstart_snippets_match_actual_output() {
             "-o",
             out_path.join("generated").to_str().unwrap(),
             "--target",
-            "c,swift,python,node,dart",
+            "c,swift,python",
         ])
         .assert()
         .success();
@@ -737,8 +759,9 @@ fn readme_quickstart_snippets_match_actual_output() {
     // generated output, proving the README is in sync with the CLI.
     let c_header = std::fs::read_to_string(gen.join("c/weaveffi.h")).unwrap();
     for needle in [
-        "typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;",
-        "void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);",
+        "typedef struct weaveffi_kv_Store weaveffi_kv_Store;",
+        "weaveffi_kv_KvError_KeyNotFound = 1001",
+        "void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);",
     ] {
         assert!(
             readme.contains(needle),
@@ -752,9 +775,9 @@ fn readme_quickstart_snippets_match_actual_output() {
 
     let swift = std::fs::read_to_string(gen.join("swift/Sources/WeaveFFI/WeaveFFI.swift")).unwrap();
     for needle in [
-        "public class Contact {",
-        "    let ptr: OpaquePointer",
-        "        weaveffi_contacts_Contact_destroy(ptr)",
+        "public enum KvError: Error, LocalizedError {",
+        "public final class Store {",
+        "public static func open(path: String) throws -> Store {",
     ] {
         assert!(
             readme.contains(needle),
@@ -766,11 +789,8 @@ fn readme_quickstart_snippets_match_actual_output() {
         );
     }
 
-    let pyi = std::fs::read_to_string(gen.join("python/contacts/weaveffi.pyi")).unwrap();
-    for needle in [
-        "class Contact:",
-        "def contacts_create_contact(name: str, email: Optional[str]) -> \"Contact\": ...",
-    ] {
+    let pyi = std::fs::read_to_string(gen.join("python/kvstore/weaveffi.pyi")).unwrap();
+    for needle in ["class KeyNotFound(KvError):", "class Store:"] {
         assert!(
             readme.contains(needle),
             "README Python snippet missing line: {needle}"
@@ -778,30 +798,6 @@ fn readme_quickstart_snippets_match_actual_output() {
         assert!(
             pyi.contains(needle),
             "Generated Python .pyi missing line: {needle}"
-        );
-    }
-
-    let dts = std::fs::read_to_string(gen.join("node/types.d.ts")).unwrap();
-    for needle in ["export interface Contact {", "  email: string | null;"] {
-        assert!(
-            readme.contains(needle),
-            "README TypeScript snippet missing line: {needle}"
-        );
-        assert!(
-            dts.contains(needle),
-            "Generated types.d.ts missing line: {needle}"
-        );
-    }
-
-    let dart = std::fs::read_to_string(gen.join("dart/lib/weaveffi.dart")).unwrap();
-    for needle in ["class Contact {", "final Pointer<Void> _handle;"] {
-        assert!(
-            readme.contains(needle),
-            "README Dart snippet missing line: {needle}"
-        );
-        assert!(
-            dart.contains(needle),
-            "Generated Dart file missing line: {needle}"
         );
     }
 }

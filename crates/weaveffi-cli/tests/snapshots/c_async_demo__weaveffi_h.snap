@@ -72,6 +72,8 @@ WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
  *   K** out_keys, V** out_values, size_t* out_len
  */
 
+/** Error codes reported by throwing functions in the `tasks` module tree. */
+typedef enum { weaveffi_tasks_TaskError_InvalidName = 1 } weaveffi_tasks_TaskError;
 typedef struct weaveffi_tasks_TaskResult weaveffi_tasks_TaskResult;
 typedef void (*weaveffi_tasks_run_task_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result);
 typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);

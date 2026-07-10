@@ -11,8 +11,8 @@ way to inspect what the IDL compiles to.
 
 | File | Purpose |
 |------|---------|
-| `generated/c/weaveffi.h` | Public header: opaque types, enums, function prototypes, error/memory helpers |
-| `generated/c/weaveffi.c` | Empty placeholder for future convenience wrappers (kept so projects can link a single TU if desired) |
+| `generated/c/weaveffi.h` | Public header: opaque types, enums, interfaces, function prototypes, error/memory helpers |
+| `generated/c/weaveffi.c` | Default `weaveffi_alloc`/`weaveffi_dealloc` implementations (used by the Wasm JS glue); producers that ship their own allocator can omit it |
 
 ## Type mapping
 
@@ -33,6 +33,7 @@ way to inspect what the IDL compiles to.
 | `bytes`      | `const uint8_t* ptr, size_t len`        | `const uint8_t*` + `size_t* out_len`|
 | `handle`     | `weaveffi_handle_t`                     | `weaveffi_handle_t`                |
 | `Struct`     | `const weaveffi_m_S*`                   | `weaveffi_m_S*`                    |
+| `Interface`  | `const weaveffi_m_I*` (borrowed)        | `weaveffi_m_I*` (owned)            |
 | `Enum` (plain) | `weaveffi_m_E`                        | `weaveffi_m_E`                     |
 | `Enum` (rich)  | `const weaveffi_m_E*`                 | `weaveffi_m_E*`                    |
 | `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
@@ -50,6 +51,11 @@ C ABI symbol naming follows a strict convention:
 | Struct getter     | `weaveffi_{module}_{Struct}_get_{field}`          | `weaveffi_contacts_Contact_get_name`          |
 | Enum type         | `weaveffi_{module}_{Enum}`                        | `weaveffi_contacts_ContactType`               |
 | Enum variant      | `weaveffi_{module}_{Enum}_{Variant}`              | `weaveffi_contacts_ContactType_Personal`      |
+| Interface type    | `weaveffi_{module}_{Interface}`                   | `weaveffi_kv_Store`                           |
+| Interface member  | `weaveffi_{module}_{Interface}_{member}`          | `weaveffi_kv_Store_open`                      |
+| Interface destroy | `weaveffi_{module}_{Interface}_destroy`           | `weaveffi_kv_Store_destroy`                   |
+| Error enum        | `weaveffi_{module}_{Domain}`                      | `weaveffi_kv_KvError`                         |
+| Error constant    | `weaveffi_{module}_{Domain}_{Code}`               | `weaveffi_kv_KvError_KeyNotFound`             |
 | Callback typedef  | `weaveffi_{module}_{Callback}_fn`                 | `weaveffi_events_OnMessage_fn`                |
 | Listener register | `weaveffi_{module}_register_{listener}`           | `weaveffi_events_register_message_listener`   |
 | Listener unregister | `weaveffi_{module}_unregister_{listener}`       | `weaveffi_events_unregister_message_listener` |
@@ -60,7 +66,10 @@ C ABI symbol naming follows a strict convention:
 | Iterator destroy  | `weaveffi_{module}_{Function}Iterator_destroy`    | `weaveffi_events_GetMessagesIterator_destroy` |
 
 `{Function}` is the function name converted to PascalCase
-(`get_messages` → `GetMessages`).
+(`get_messages` → `GetMessages`). An iterator returned by an interface
+method nests under the interface instead:
+`weaveffi_kv_Store_ListKeysIterator`. Interface members and async
+launchers compose the same way (`weaveffi_kv_Store_compact_async`).
 
 When the IDL sets `c_prefix`, every symbol, including the runtime
 helpers, is rewritten with the new prefix.
@@ -68,7 +77,7 @@ helpers, is rewritten with the new prefix.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -190,6 +199,65 @@ if (err.code != 0) {
 }
 ```
 
+## Interfaces
+
+An `interfaces:` entry lowers to a forward-declared opaque struct plus one
+prototype per member. Constructors return an owned pointer, methods take a
+leading `const {tag}* self` argument before their declared parameters,
+statics take no `self`, and every interface gets an implicit `_destroy`.
+From the `kvstore` sample's `Store`:
+
+```c
+typedef struct weaveffi_kv_Store weaveffi_kv_Store;
+
+/* Constructor: returns a new owned instance. */
+weaveffi_kv_Store* weaveffi_kv_Store_open(const char* path, weaveffi_error* out_err);
+
+/* Static: no self slot. */
+int64_t weaveffi_kv_Store_default_capacity(weaveffi_error* out_err);
+
+/* Methods: an implicit leading self slot. */
+bool weaveffi_kv_Store_delete(const weaveffi_kv_Store* self, const char* key,
+                              weaveffi_error* out_err);
+int64_t weaveffi_kv_Store_count(const weaveffi_kv_Store* self, weaveffi_error* out_err);
+
+/* Implicit destructor: releases the object. */
+void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);
+```
+
+Ownership follows the reference direction: an interface parameter (such as
+`const weaveffi_kv_Store* store` on `weaveffi_kv_stats_get_stats`) is
+borrowed for the duration of the call, while every pointer returned by a
+constructor or function is owned by the consumer, who must eventually pass
+it to `_destroy`. Iterator-returning and async methods follow the same
+shapes as free functions with the `self` slot in front: `Store.list_keys`
+yields a `weaveffi_kv_Store_ListKeysIterator` handle, and the async
+`Store.compact` appears under [Async support](#async-support).
+
+## Typed errors
+
+C is the raw ABI surface, so throwing and non-throwing callables look
+identical: every prototype carries the trailing `weaveffi_error* out_err`,
+and the consumer checks `err.code` after each call. What a module's error
+domain adds is a typed C enum naming the codes its `throws: true` callables
+can report, so consumers match on names instead of magic numbers. From the
+`kvstore` sample's `KvError` domain:
+
+```c
+/** Error codes reported by throwing functions in the `kv` module tree. */
+typedef enum {
+    weaveffi_kv_KvError_KeyNotFound = 1001,
+    weaveffi_kv_KvError_Expired = 1002,
+    weaveffi_kv_KvError_StoreFull = 1003,
+    weaveffi_kv_KvError_IoError = 1004
+} weaveffi_kv_KvError;
+```
+
+A callable declared with `throws: true` can set any of these codes; a
+callable without `throws` can only fail with the reserved codes (`-2` for a
+producer panic, `1` for a marshalling failure). See the
+[Error Handling guide](../guides/errors.md) for the full code table.
+
 ## Symbol visibility
 
 Every function prototype is tagged with a `WEAVEFFI_API` macro that the header
@@ -301,38 +369,39 @@ a function such as `weaveffi_shapes_scale`; release each one with
 
 ## Build instructions
 
-The runnable example uses the `calculator` sample crate.
+The runnable consumer uses the `contacts` sample crate and its
+conformance program.
 
 macOS:
 
 ```bash
-cargo build -p calculator
+cargo build -p contacts
+weaveffi generate samples/contacts/contacts.yml -o generated
 
-cd examples/c
-cc -I ../../generated/c main.c -L ../../target/debug -lcalculator -o c_example
-DYLD_LIBRARY_PATH=../../target/debug ./c_example
+cc -I generated/c conformance/c/contacts.c -L target/debug -lcontacts -o c_contacts
+DYLD_LIBRARY_PATH=target/debug ./c_contacts
 ```
 
 Linux:
 
 ```bash
-cargo build -p calculator
+cargo build -p contacts
+weaveffi generate samples/contacts/contacts.yml -o generated
 
-cd examples/c
-cc -I ../../generated/c main.c -L ../../target/debug -lcalculator -o c_example
-LD_LIBRARY_PATH=../../target/debug ./c_example
+cc -I generated/c conformance/c/contacts.c -L target/debug -lcontacts -o c_contacts
+LD_LIBRARY_PATH=target/debug ./c_contacts
 ```
 
 Windows:
 
 ```powershell
-cargo build -p calculator
-cd examples\c
-cl /I ..\..\generated\c main.c /link calculator.lib
-.\main.exe
+cargo build -p contacts
+weaveffi generate samples\contacts\contacts.yml -o generated
+cl /I generated\c conformance\c\contacts.c /link contacts.lib
+.\contacts.exe
 ```
 
-See `examples/c/main.c` for end-to-end usage.
+See `conformance/c/` for end-to-end consumers of every sample.
 
 ## Memory and ownership
 
@@ -422,14 +491,20 @@ producer's worker thread.
 
 For `cancellable: true` functions the launcher gains a
 `weaveffi_cancel_token*` slot before the callback, and the runtime
-provides the token lifecycle (from the `kvstore` sample, whose
-function is named `compact_async`, hence the doubled suffix):
+provides the token lifecycle. Async interface methods follow the same
+shape with the leading `self` slot; from the `kvstore` sample's async
+cancellable `Store.compact`:
 
 ```c
-void weaveffi_kv_compact_async_async(
-    weaveffi_kv_Store* store,
+typedef void (*weaveffi_kv_Store_compact_callback)(
+    void* context,
+    weaveffi_error* err,
+    int64_t result);
+
+void weaveffi_kv_Store_compact_async(
+    const weaveffi_kv_Store* self,
     weaveffi_cancel_token* cancel_token,
-    weaveffi_kv_compact_async_callback callback,
+    weaveffi_kv_Store_compact_callback callback,
     void* context);
 
 weaveffi_cancel_token* weaveffi_cancel_token_create(void);
@@ -488,5 +563,6 @@ weaveffi_events_GetMessagesIterator_destroy(iter);
 - **`error: unknown type weaveffi_handle_t`**: the consumer included
   the header without `<stdint.h>`. Include order matters; the generated
   header pulls in the standard integer typedefs explicitly.
-- **`weaveffi.c` is empty**: that file is intentionally a placeholder.
+- **`weaveffi.c` looks nearly empty**: that file only carries the default
+  `weaveffi_alloc`/`weaveffi_dealloc` implementations for Wasm producers.
   All declarations live in `weaveffi.h`.

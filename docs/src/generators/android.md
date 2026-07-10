@@ -47,7 +47,7 @@ layer bridges them to the C ABI.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -77,11 +77,13 @@ modules:
 
 The Kotlin wrapper declares `external fun` entries inside a companion
 object and loads the JNI library on first use. Function names are
-prefixed with the module name. Where a parameter or return value needs
-wrapping (enums, structs), the external entry is a private `...Jni`
-function with lowered types and a public wrapper converts at the
-boundary. Struct returns come back as handles and are wrapped in the
-struct class; `[Contact]` stays a `LongArray` of handles:
+lowerCamelCase with the module prefix stripped by default
+(`strip_module_prefix = false` in `[android]` restores prefixed names).
+Where a parameter or return value needs wrapping (enums, structs), the
+external entry is a private `...Jni` function with lowered types and a
+public wrapper converts at the boundary. Struct returns come back as
+handles and are wrapped in the struct class; `[Contact]` stays a
+`LongArray` of handles:
 
 ```kotlin
 package com.weaveffi
@@ -90,10 +92,10 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        @JvmStatic private external fun contacts_get_contactJni(id: Int): Long
-        @JvmStatic fun contacts_get_contact(id: Int): Contact = Contact(contacts_get_contactJni(id))
-        @JvmStatic private external fun contacts_find_by_typeJni(contact_type: Int): LongArray
-        @JvmStatic fun contacts_find_by_type(contact_type: ContactType): LongArray = contacts_find_by_typeJni(contact_type.value)
+        @JvmStatic private external fun getContactJni(id: Int): Long
+        @JvmStatic fun getContact(id: Int): Contact = Contact(getContactJni(id))
+        @JvmStatic private external fun findByTypeJni(contactType: Int): LongArray
+        @JvmStatic fun findByType(contactType: ContactType): LongArray = findByTypeJni(contactType.value)
     }
 }
 ```
@@ -146,17 +148,22 @@ class Contact internal constructor(internal var handle: Long) : java.io.Closeabl
 
 The JNI shims (`weaveffi_jni.c`) bridge each Kotlin `external fun` into
 the C ABI and route errors through a shared `throw_weaveffi_error`
-helper:
+helper that throws the generic `WeaveFFIException`:
 
 ```c
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_contacts_1get_1contactJni(JNIEnv* env, jclass clazz, jint id) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getContactJni(JNIEnv* env, jclass clazz, jint id) {
     weaveffi_error err = {0, NULL};
     weaveffi_contacts_Contact* rv = weaveffi_contacts_get_contact((int32_t)id, &err);
     if (err.code != 0) {
@@ -167,14 +174,6 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_contacts_1get_1contactJni(JNI
 }
 ```
 
-When the module declares an [error domain](../guides/errors.md), the
-generator emits a `sealed class WeaveFFIException` with one PascalCased
-subclass per code (`KEY_NOT_FOUND` → `WeaveFFIException.KeyNotFound`), and
-the shim resolves the matching subclass by code
-(`FindClass(env, "com/weaveffi/WeaveFFIException$KeyNotFound")`). Modules
-without a declared domain get an `open class WeaveFFIException`, and unknown
-codes fall back to `java.lang.RuntimeException`.
-
 The CMake file links the JNI shim against the generated C header:
 
 ```cmake
@@ -183,6 +182,119 @@ project(weaveffi)
 add_library(weaveffi SHARED weaveffi_jni.c)
 target_include_directories(weaveffi PRIVATE ../../../../c)
 ```
+
+## Typed errors
+
+Every generated file carries the generic
+`open class WeaveFFIException(val code: Int, message: String)`. A module's
+[error domain](../guides/errors.md) adds a sealed exception hierarchy
+named after the domain with the trailing `Error` stem replaced by
+`Exception` (`KvError` becomes `KvException`), one nested class per code,
+and a `fromCode` mapper. From the `kvstore` sample:
+
+```kotlin
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `KvError` declared by module `kv`. */
+sealed class KvException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class KeyNotFound(message: String = "key not found") : KvException(1001, message)
+    class Expired(message: String = "entry expired") : KvException(1002, message)
+    class StoreFull(message: String = "store has reached capacity") : KvException(1003, message)
+    class IoError(message: String = "I/O failure") : KvException(1004, message)
+
+    companion object {
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1001 -> KeyNotFound(message)
+            1002 -> Expired(message)
+            1003 -> StoreFull(message)
+            1004 -> IoError(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
+```
+
+A callable with `throws: true` throws the matching subclass from its JNI
+shim (a per-domain `throw_weaveffi_kv_KvError` helper resolves
+`com/weaveffi/KvException$KeyNotFound` and friends by code); catch the
+specific class, the sealed domain, or the generic base:
+
+```kotlin
+try {
+    store.put("alpha", byteArrayOf(1), EntryKind.Volatile, null)
+} catch (e: KvException.StoreFull) {
+    // typed case
+} catch (e: KvException) {
+    // any kv domain error
+}
+```
+
+A callable without `throws` keeps a plain signature; its only possible
+failures are producer bugs (a panic or a marshalling failure), which
+arrive as the generic `WeaveFFIException`. Unknown codes on the typed
+path fall back to `WeaveFFIException` too.
+
+## Interfaces
+
+An `interfaces:` entry becomes a Kotlin class holding a `Long` handle and
+implementing `java.io.Closeable`, exactly like a struct wrapper. Its
+members live on the class: constructors become companion factories (a
+constructor named `new` becomes `operator fun invoke`, so `ContactBook()`
+reads like a real constructor), methods are instance functions, statics
+are companion functions, and `close()` calls the implicit destroy symbol.
+From the `kvstore` sample's `Store` (trimmed):
+
+```kotlin
+/** An embedded key-value store owning its entries */
+class Store internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeOpen(path: String): Long
+        @JvmStatic private external fun nativeDefaultCapacity(): Long
+        @JvmStatic private external fun nativeDelete(selfHandle: Long, key: String): Boolean
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+
+        /** Open (or create) a store backed by the given filesystem path */
+        fun open(path: String): Store = Store(nativeOpen(path))
+
+        /** The largest number of live entries one store will hold */
+        fun defaultCapacity(): Long = nativeDefaultCapacity()
+    }
+
+    /** Remove the entry for the given key, returning true if it existed */
+    fun delete(key: String): Boolean = nativeDelete(handle, key)
+
+    /** Reclaim space asynchronously; returns the number of bytes reclaimed */
+    suspend fun compact(): Long = suspendCancellableCoroutine { cont ->
+        nativeCompactAsync(handle, 0L, WeaveContinuation(cont) { code, message -> KvException.fromCode(code, message) })
+    }
+
+    /** Legacy single-shot put kept for compatibility */
+    @Deprecated("use put() with explicit kind")
+    fun legacyPut(key: String, value: ByteArray): Boolean = nativeLegacyPut(handle, key, value)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+}
+```
+
+```kotlin
+Store.open("/tmp/cache.kv").use { store ->
+    store.put("alpha", byteArrayOf(1), EntryKind.Volatile, null)
+    println(store.count())
+}
+```
+
+The JNI externals pass the wrapper's handle as the leading `selfHandle`
+argument. An interface parameter elsewhere in the API takes the wrapper
+class (`WeaveFFI.getStats(store: Store)` in the nested `stats` module);
+an interface return wraps the new owned handle.
 
 ## Rich (algebraic) enums
 
@@ -283,16 +395,16 @@ JNIEXPORT void JNICALL Java_com_weaveffi_Shape_nativeDestroy(JNIEnv* env, jclass
 
 Free functions that take or return the enum pass the handle across the
 boundary; on the `WeaveFFI` companion they are
-`shapes_describe(shape: Shape): String` and
-`shapes_scale(shape: Shape, factor: Double): Shape`:
+`describe(shape: Shape): String` and
+`scale(shape: Shape, factor: Double): Shape`:
 
 ```kotlin
 Shape.circle(2.0).use { c ->
     println(c.tag)            // Tag.Circle
     println(c.circleRadius)   // 2.0
-    val bigger = WeaveFFI.shapes_scale(c, 3.0)   // returns a new Shape
+    val bigger = WeaveFFI.scale(c, 3.0)   // returns a new Shape
     try {
-        println(WeaveFFI.shapes_describe(bigger))
+        println(WeaveFFI.describe(bigger))
     } finally {
         bigger.close()
     }
@@ -301,7 +413,7 @@ Shape.circle(2.0).use { c ->
 
 **Ownership:** a `Shape` owns its native handle, so call `close()` (or use
 `use { ... }`) on every `Shape` you construct or receive, including the
-new `Shape` returned by `shapes_scale`. The `finalize()` safety net runs
+new `Shape` returned by `scale`. The `finalize()` safety net runs
 during GC but is not a substitute for deterministic cleanup.
 
 ## Build instructions
@@ -325,9 +437,9 @@ during GC but is not a substitute for deterministic cleanup.
 
 ## Memory and ownership
 
-- Struct wrappers implement `Closeable`; either call `.close()`
-  explicitly or use `use { ... }`. The `finalize()` safety net runs
-  during GC but is not a substitute for deterministic cleanup.
+- Struct and interface wrappers implement `Closeable`; either call
+  `.close()` explicitly or use `use { ... }`. The `finalize()` safety net
+  runs during GC but is not a substitute for deterministic cleanup.
 - Strings returned from JNI are fresh Java strings; the JNI shim frees
   the underlying Rust pointer with `weaveffi_free_string` before
   returning.
@@ -347,20 +459,27 @@ resume as raw handles and are re-wrapped after the await. From the
 `async-demo` sample (`WeaveFFI.kt`):
 
 ```kotlin
-@JvmStatic private external fun tasks_run_taskAsync(name: String, callback: Any)
-@JvmStatic suspend fun tasks_run_task(name: String): TaskResult {
+@JvmStatic private external fun runTaskAsync(name: String, callback: Any)
+@JvmStatic suspend fun runTask(name: String): TaskResult {
     val raw: Long = suspendCancellableCoroutine { cont ->
-        tasks_run_taskAsync(name, WeaveContinuation(cont))
+        runTaskAsync(name, WeaveContinuation(cont) { code, message -> TaskException.fromCode(code, message) })
     }
     return TaskResult(raw)
 }
 
-internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+internal class WeaveContinuation<T>(
+    private val cont: kotlinx.coroutines.CancellableContinuation<T>,
+    private val mapError: (Int, String) -> Throwable
+) {
     @Suppress("UNCHECKED_CAST")
     fun onSuccess(result: Any?) { cont.resume(result as T) }
-    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }
 }
 ```
+
+`run_task` declares `throws: true`, so a failed suspend call resumes with
+the typed `TaskException`; an async callable without `throws` maps its
+(producer-bug-only) failures to the generic `WeaveFFIException`.
 
 The JNI launcher allocates a per-call context holding the `JavaVM` and
 a `NewGlobalRef` to the `WeaveContinuation`, then hands the C ABI a
@@ -375,7 +494,7 @@ typedef struct {
     jobject callback;
 } weaveffi_jni_async_ctx;
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1taskAsync(JNIEnv* env, jclass clazz, jstring name, jobject callback) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_runTaskAsync(JNIEnv* env, jclass clazz, jstring name, jobject callback) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -405,17 +524,19 @@ The generated `build.gradle` does not declare a coroutines dependency;
 add `org.jetbrains.kotlinx:kotlinx-coroutines-android` (or `-core`) to
 the consuming project.
 
-For functions marked `cancellable: true`, the C ABI takes an extra
+For callables marked `cancellable: true`, the C ABI takes an extra
 `weaveffi_cancel_token*` parameter. The private external launcher
 carries it as `cancelToken: Long` and the shim casts it to
 `weaveffi_cancel_token*`, but the public suspend wrapper currently
 passes `0L` (no token); coroutine cancellation isn't wired to the
-native cancel token:
+native cancel token. From the `kvstore` sample's async method
+`Store.compact`:
 
 ```kotlin
-@JvmStatic private external fun kv_compact_asyncAsync(store: Long, cancelToken: Long, callback: Any)
-@JvmStatic suspend fun kv_compact_async(store: Store): Long = suspendCancellableCoroutine { cont ->
-    kv_compact_asyncAsync(store.handle, 0L, WeaveContinuation(cont))
+@JvmStatic private external fun nativeCompactAsync(selfHandle: Long, cancelToken: Long, callback: Any)
+
+suspend fun compact(): Long = suspendCancellableCoroutine { cont ->
+    nativeCompactAsync(handle, 0L, WeaveContinuation(cont) { code, message -> KvException.fromCode(code, message) })
 }
 ```
 
@@ -440,8 +561,8 @@ The Kotlin surface takes a lambda and returns a `Long` subscription id;
 pass that id back to unregister:
 
 ```kotlin
-@JvmStatic external fun events_register_message_listener(callback: (String) -> Unit): Long
-@JvmStatic external fun events_unregister_message_listener(id: Long)
+@JvmStatic external fun registerMessageListener(callback: (String) -> Unit): Long
+@JvmStatic external fun unregisterMessageListener(id: Long)
 ```
 
 The JNI shim keeps the lambda alive with a `NewGlobalRef` stored in a
@@ -474,7 +595,7 @@ static void weaveffi_events_OnMessage_fn_jni_tramp(const char* message, void* co
     if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_events_1register_1message_1listener(JNIEnv* env, jclass clazz, jobject callback) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_registerMessageListener(JNIEnv* env, jclass clazz, jobject callback) {
     weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -498,7 +619,7 @@ the iterator handle, and returns the list's `iterator()`. From the
 `events` sample (`get_messages` returns `iter<string>`):
 
 ```kotlin
-@JvmStatic external fun events_get_messages(): Iterator<String>
+@JvmStatic external fun getMessages(): Iterator<String>
 ```
 
 ```c

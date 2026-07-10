@@ -14,12 +14,29 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_calculator_1add(JNIEnv* env, jclass clazz, jint a, jint b) {
+static void throw_weaveffi_calculator_CalcError(JNIEnv* env, weaveffi_error* err) {
+    const char* name = NULL;
+    switch (err->code) {
+    case 1: name = "com/weaveffi/CalcException$DivisionByZero"; break;
+    default: break;
+    }
+    if (name == NULL) { throw_weaveffi_error(env, err); return; }
+    jclass exClass = (*env)->FindClass(env, name);
+    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
+    weaveffi_error_clear(err);
+}
+
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_add(JNIEnv* env, jclass clazz, jint a, jint b) {
     weaveffi_error err = {0, NULL};
     int32_t rv = weaveffi_calculator_add((int32_t)a, (int32_t)b, &err);
     if (err.code != 0) {
@@ -29,7 +46,7 @@ JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_calculator_1add(JNIEnv* env, j
     return (jint) rv;
 }
 
-JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_calculator_1mul(JNIEnv* env, jclass clazz, jint a, jint b) {
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_mul(JNIEnv* env, jclass clazz, jint a, jint b) {
     weaveffi_error err = {0, NULL};
     int32_t rv = weaveffi_calculator_mul((int32_t)a, (int32_t)b, &err);
     if (err.code != 0) {
@@ -39,17 +56,17 @@ JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_calculator_1mul(JNIEnv* env, j
     return (jint) rv;
 }
 
-JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_calculator_1div(JNIEnv* env, jclass clazz, jint a, jint b) {
+JNIEXPORT jint JNICALL Java_com_weaveffi_WeaveFFI_div(JNIEnv* env, jclass clazz, jint a, jint b) {
     weaveffi_error err = {0, NULL};
     int32_t rv = weaveffi_calculator_div((int32_t)a, (int32_t)b, &err);
     if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
+        throw_weaveffi_calculator_CalcError(env, &err);
         return 0;
     }
     return (jint) rv;
 }
 
-JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_calculator_1echo(JNIEnv* env, jclass clazz, jstring s) {
+JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_echo(JNIEnv* env, jclass clazz, jstring s) {
     weaveffi_error err = {0, NULL};
     const char* s_chars = (*env)->GetStringUTFChars(env, s, NULL);
     const char* rv = weaveffi_calculator_echo(s_chars, &err);

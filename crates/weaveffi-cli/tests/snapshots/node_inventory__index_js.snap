@@ -5,14 +5,167 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
-module.exports = addon;
+
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
+const wv = {};
+for (const _name of Object.getOwnPropertyNames(addon)) {
+  wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
+}
+
+class ProductsError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'ProductsError';
+  }
+}
+wv.ProductsError = ProductsError;
+class InvalidPriceError extends ProductsError {
+  constructor(message) {
+    super(1, message || 'price must be positive');
+    this.name = 'InvalidPriceError';
+  }
+}
+InvalidPriceError.CODE = 1;
+wv.InvalidPriceError = InvalidPriceError;
+class ProductNotFoundError extends ProductsError {
+  constructor(message) {
+    super(2, message || 'product not found');
+    this.name = 'ProductNotFoundError';
+  }
+}
+ProductNotFoundError.CODE = 2;
+wv.ProductNotFoundError = ProductNotFoundError;
+const __productsErrorCodes = Object.freeze({ 1: InvalidPriceError, 2: ProductNotFoundError });
+function __productsErrorFrom(code, message) {
+  const _cls = __productsErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+class Catalog {
+  constructor() {
+    this._handle = __invoke(addon.Catalog_new, [], __generic);
+    Catalog._cleanup.register(this, this._handle, this);
+  }
+  addProduct(name, price, category) {
+    return __invoke(addon.Catalog_add_product, [this._handle, name, price, category], __productsErrorFrom);
+  }
+  getProduct(id) {
+    return __invoke(addon.Catalog_get_product, [this._handle, id], __productsErrorFrom);
+  }
+  search(category) {
+    return __invoke(addon.Catalog_search, [this._handle, category], __generic);
+  }
+  updatePrice(id, price) {
+    return __invoke(addon.Catalog_update_price, [this._handle, id, price], __productsErrorFrom);
+  }
+  remove(id) {
+    return __invoke(addon.Catalog_remove, [this._handle, id], __generic);
+  }
+  destroy() {
+    if (this._handle) {
+      Catalog._cleanup.unregister(this);
+      addon.Catalog_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Catalog._fromHandle = function (handle) {
+  const _o = Object.create(Catalog.prototype);
+  _o._handle = handle;
+  Catalog._cleanup.register(_o, handle, _o);
+  return _o;
+};
+Catalog._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.Catalog_destroy(handle); }
+});
+wv.Catalog = Catalog;
+
+class OrdersError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'OrdersError';
+  }
+}
+wv.OrdersError = OrdersError;
+class OrderNotFoundError extends OrdersError {
+  constructor(message) {
+    super(1, message || 'order not found');
+    this.name = 'OrderNotFoundError';
+  }
+}
+OrderNotFoundError.CODE = 1;
+wv.OrderNotFoundError = OrderNotFoundError;
+class EmptyOrderError extends OrdersError {
+  constructor(message) {
+    super(2, message || 'order must contain at least one item');
+    this.name = 'EmptyOrderError';
+  }
+}
+EmptyOrderError.CODE = 2;
+wv.EmptyOrderError = EmptyOrderError;
+const __ordersErrorCodes = Object.freeze({ 1: OrderNotFoundError, 2: EmptyOrderError });
+function __ordersErrorFrom(code, message) {
+  const _cls = __ordersErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+wv.createOrder = function (items) {
+  return __invoke(addon.createOrder, [items], __ordersErrorFrom);
+};
+wv.getOrder = function (id) {
+  return __invoke(addon.getOrder, [id], __ordersErrorFrom);
+};
+wv.cancelOrder = function (id) {
+  return __invoke(addon.cancelOrder, [id], __generic);
+};
+wv.addProductToOrder = function (orderId, product) {
+  return __invoke(addon.addProductToOrder, [orderId, product], __generic);
+};
+
+module.exports = wv;
 
 // END index.js

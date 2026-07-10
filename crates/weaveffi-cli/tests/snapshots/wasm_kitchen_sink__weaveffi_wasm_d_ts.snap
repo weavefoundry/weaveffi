@@ -7,16 +7,42 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `kitchen` module's error domain. */
+export declare class KitchenErrorsError extends WeaveFFIError {
+  static readonly NotFound: typeof NotFound;
+  static readonly InvalidInput: typeof InvalidInput;
+}
+
+/** Item not found */
+export declare class NotFound extends KitchenErrorsError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
+/** Invalid input */
+export declare class InvalidInput extends KitchenErrorsError {
+  constructor(message?: string);
+  static readonly CODE: 2;
+}
+
 /** A reusable token referenced across modules */
 export interface Token {
-  readonly id: number;
+  readonly id: bigint;
   readonly label: string;
 }
 
 /** Kitchen sink struct exercising every field feature */
 export interface Item {
   /** Stable identifier */
-  readonly id: number;
+  readonly id: bigint;
   /** Display name */
   readonly name: string;
   /** Initial count */
@@ -29,7 +55,7 @@ export interface Item {
   readonly payload: Uint8Array;
   readonly tags: string[];
   readonly attrs: Record<string, string>;
-  readonly parent: number | null;
+  readonly parent: bigint | null;
   /** Cross-module struct reference */
   readonly token: Token;
   readonly priority: Priority;
@@ -45,115 +71,142 @@ export declare const Priority: Readonly<{
   High: 2;
 }>;
 
+/** A pocket-sized interface exercising the object surface */
+export declare class Gadget {
+  /**
+   * Create a gadget with the given id
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  constructor(id: bigint);
+  /**
+   * Render the gadget as a human-readable string
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  describe(): string;
+  /**
+   * Poke the gadget a number of times, failing on a negative count
+   * @throws {KitchenErrorsError} on a domain error code
+   */
+  poke(times: number): number;
+  /**
+   * The gadget subsystem version string
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  static version(): string;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
+}
+
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   shared: {
     /**
      * Trivial cross-module helper
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
     ping(): string;
   };
   kitchen: {
     /**
      * Identity for bool
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    bool_id(x: boolean): boolean;
+    boolId(x: boolean): boolean;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    i32_id(x: number): number;
+    i32Id(x: number): number;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    u32_id(x: number): number;
+    u32Id(x: number): number;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    i64_id(x: number): number;
+    i64Id(x: bigint): bigint;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    f64_id(x: number): number;
+    f64Id(x: number): number;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    echo_string(s: string): string;
+    echoString(s: string): string;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    echo_bytes(b: Uint8Array): Uint8Array;
+    echoBytes(b: Uint8Array): Uint8Array;
     /**
      * Borrowed string parameter
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    echo_borrowed_str(s: string): string;
+    echoBorrowedStr(s: string): string;
     /**
      * Borrowed bytes parameter
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    echo_borrowed_bytes(b: Uint8Array): Uint8Array;
+    echoBorrowedBytes(b: Uint8Array): Uint8Array;
     /**
      * Returns an opaque handle
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    open_handle(): bigint;
+    openHandle(): bigint;
     /**
      * Returns a typed handle
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    open_typed_handle(): Token;
+    openTypedHandle(): Token;
     /**
      * Optional struct return
-     * @throws {Error} if the native call fails
+     * @throws {KitchenErrorsError} on a domain error code
      */
-    maybe_item(id: number): Item | null;
+    maybeItem(id: bigint): Item | null;
     /**
      * List of structs
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    list_items(): Item[];
+    listItems(): Item[];
     /**
      * Map return type
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    get_attrs(): Record<string, number>;
+    getAttrs(): Record<string, number>;
     /**
      * Iterator return type
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    stream_items(): Item[];
+    streamItems(): Item[];
     /**
      * Returns the shared Token type from another module
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    cross_module_token(): Token;
+    crossModuleToken(): Token;
     /**
      * Async operation
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    do_async(input: string): Promise<string>;
+    doAsync(input: string): Promise<string>;
     /**
      * Cancellable async operation
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    do_cancellable(input: string): Promise<string>;
+    doCancellable(input: string): Promise<string>;
     /**
      * Legacy operation kept for compatibility
      * @deprecated Use new_op instead
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    legacy_op(): number;
+    legacyOp(): number;
     /**
      * Replacement for legacy_op
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    new_op(): number;
+    newOp(): number;
+    Gadget: typeof Gadget;
     nested: {
       /**
        * Trivial nested-module function
-       * @throws {Error} if the native call fails
+       * @throws {WeaveFFIError} if the native call fails
        */
       hello(): string;
     };

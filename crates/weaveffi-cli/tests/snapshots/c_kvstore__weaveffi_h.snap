@@ -81,22 +81,27 @@ typedef enum {
     /** Persistent and encrypted at rest */
     weaveffi_kv_EntryKind_Encrypted = 2
 } weaveffi_kv_EntryKind;
-typedef struct weaveffi_kv_Store weaveffi_kv_Store;
+/** Error codes reported by throwing functions in the `kv` module tree. */
+typedef enum {
+    /** No entry exists for the requested key */
+    weaveffi_kv_KvError_KeyNotFound = 1001,
+    /** The entry exists but its TTL has elapsed */
+    weaveffi_kv_KvError_Expired = 1002,
+    /** The store has reached its capacity limit */
+    weaveffi_kv_KvError_StoreFull = 1003,
+    /** Underlying storage reported an I/O failure */
+    weaveffi_kv_KvError_IoError = 1004
+} weaveffi_kv_KvError;
 typedef struct weaveffi_kv_Entry weaveffi_kv_Entry;
 typedef struct weaveffi_kv_EntryBuilder weaveffi_kv_EntryBuilder;
-typedef struct weaveffi_kv_ListKeysIterator weaveffi_kv_ListKeysIterator;
+typedef struct weaveffi_kv_Store weaveffi_kv_Store;
+typedef struct weaveffi_kv_Store_ListKeysIterator weaveffi_kv_Store_ListKeysIterator;
 typedef struct weaveffi_kv_stats_Stats weaveffi_kv_stats_Stats;
 /** Fires when an entry is evicted from the store */
 typedef void (*weaveffi_kv_OnEvict_fn)(const char* key, void* context);
-typedef void (*weaveffi_kv_compact_async_callback)(void* context, weaveffi_error* err, int64_t result);
+typedef void (*weaveffi_kv_Store_compact_callback)(void* context, weaveffi_error* err, int64_t result);
 
 // Module: kv
-/** Opaque key-value store handle target type */
-WEAVEFFI_API weaveffi_kv_Store* weaveffi_kv_Store_create(int64_t id, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_kv_Store_destroy(weaveffi_kv_Store* ptr);
-/** Internal store identifier */
-WEAVEFFI_API int64_t weaveffi_kv_Store_get_id(const weaveffi_kv_Store* ptr);
-
 /** A single key-value entry persisted in the store */
 WEAVEFFI_API weaveffi_kv_Entry* weaveffi_kv_Entry_create(int64_t id, const char* key, const uint8_t* value_ptr, size_t value_len, int64_t created_at, const int64_t* expires_at, const char* const* tags, size_t tags_len, const char* const* metadata_keys, const char* const* metadata_values, size_t metadata_len, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_kv_Entry_destroy(weaveffi_kv_Entry* ptr);
@@ -133,33 +138,36 @@ WEAVEFFI_API void weaveffi_kv_Entry_Builder_set_metadata(weaveffi_kv_EntryBuilde
 WEAVEFFI_API weaveffi_kv_Entry* weaveffi_kv_Entry_Builder_build(weaveffi_kv_EntryBuilder* builder, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_kv_Entry_Builder_destroy(weaveffi_kv_EntryBuilder* builder);
 
+/** An in-memory key-value store owning its entries; destroying the object releases all of its state */
+/** Open (or create) a store backed by the given filesystem path */
+WEAVEFFI_API weaveffi_kv_Store* weaveffi_kv_Store_open(const char* path, weaveffi_error* out_err);
+/** The largest number of live entries one store will hold */
+WEAVEFFI_API int64_t weaveffi_kv_Store_default_capacity(weaveffi_error* out_err);
+/** Insert or replace a value, returning true on success */
+WEAVEFFI_API bool weaveffi_kv_Store_put(const weaveffi_kv_Store* self, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_kv_EntryKind kind, const int64_t* ttl_seconds, weaveffi_error* out_err);
+/** Look up an entry by key; returns null if missing or expired */
+WEAVEFFI_API weaveffi_kv_Entry* weaveffi_kv_Store_get(const weaveffi_kv_Store* self, const char* key, weaveffi_error* out_err);
+/** Remove the entry for the given key, returning true if it existed */
+WEAVEFFI_API bool weaveffi_kv_Store_delete(const weaveffi_kv_Store* self, const char* key, weaveffi_error* out_err);
+/** Stream every key, optionally filtered by a prefix */
+WEAVEFFI_API weaveffi_kv_Store_ListKeysIterator* weaveffi_kv_Store_list_keys(const weaveffi_kv_Store* self, const char* prefix, weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_kv_Store_ListKeysIterator_next(weaveffi_kv_Store_ListKeysIterator* iter, const char** out_item, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_kv_Store_ListKeysIterator_destroy(weaveffi_kv_Store_ListKeysIterator* iter);
+/** Return the number of live entries in the store */
+WEAVEFFI_API int64_t weaveffi_kv_Store_count(const weaveffi_kv_Store* self, weaveffi_error* out_err);
+/** Drop every entry from the store */
+WEAVEFFI_API void weaveffi_kv_Store_clear(const weaveffi_kv_Store* self, weaveffi_error* out_err);
+/** Reclaim space asynchronously; returns the number of bytes reclaimed */
+WEAVEFFI_API void weaveffi_kv_Store_compact_async(const weaveffi_kv_Store* self, weaveffi_cancel_token* cancel_token, weaveffi_kv_Store_compact_callback callback, void* context);
+/** Legacy single-shot put kept for compatibility */
+WEAVEFFI_DEPRECATED("use put() with explicit kind")
+WEAVEFFI_API bool weaveffi_kv_Store_legacy_put(const weaveffi_kv_Store* self, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);
+
 /** Subscribe to per-key eviction notifications */
 WEAVEFFI_API uint64_t weaveffi_kv_register_eviction_listener(weaveffi_kv_OnEvict_fn callback, void* context);
 /** Subscribe to per-key eviction notifications */
 WEAVEFFI_API void weaveffi_kv_unregister_eviction_listener(uint64_t id);
-/** Open (or create) a store backed by the given filesystem path */
-WEAVEFFI_API weaveffi_kv_Store* weaveffi_kv_open_store(const char* path, weaveffi_error* out_err);
-/** Close the store and release all in-memory resources */
-WEAVEFFI_API void weaveffi_kv_close_store(weaveffi_kv_Store* store, weaveffi_error* out_err);
-/** Insert or replace a value, returning true on success */
-WEAVEFFI_API bool weaveffi_kv_put(weaveffi_kv_Store* store, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_kv_EntryKind kind, const int64_t* ttl_seconds, weaveffi_error* out_err);
-/** Look up an entry by key; returns null if missing or expired */
-WEAVEFFI_API weaveffi_kv_Entry* weaveffi_kv_get(weaveffi_kv_Store* store, const char* key, weaveffi_error* out_err);
-/** Remove the entry for the given key, returning true if it existed */
-WEAVEFFI_API bool weaveffi_kv_delete(weaveffi_kv_Store* store, const char* key, weaveffi_error* out_err);
-/** Stream every key, optionally filtered by a prefix */
-WEAVEFFI_API weaveffi_kv_ListKeysIterator* weaveffi_kv_list_keys(weaveffi_kv_Store* store, const char* prefix, weaveffi_error* out_err);
-WEAVEFFI_API int32_t weaveffi_kv_ListKeysIterator_next(weaveffi_kv_ListKeysIterator* iter, const char** out_item, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_kv_ListKeysIterator_destroy(weaveffi_kv_ListKeysIterator* iter);
-/** Return the number of live entries in the store */
-WEAVEFFI_API int64_t weaveffi_kv_count(weaveffi_kv_Store* store, weaveffi_error* out_err);
-/** Drop every entry from the store */
-WEAVEFFI_API void weaveffi_kv_clear(weaveffi_kv_Store* store, weaveffi_error* out_err);
-/** Reclaim space asynchronously; returns the number of bytes reclaimed */
-WEAVEFFI_API void weaveffi_kv_compact_async_async(weaveffi_kv_Store* store, weaveffi_cancel_token* cancel_token, weaveffi_kv_compact_async_callback callback, void* context);
-/** Legacy single-shot put kept for compatibility */
-WEAVEFFI_DEPRECATED("use put() with explicit kind")
-WEAVEFFI_API bool weaveffi_kv_legacy_put(weaveffi_kv_Store* store, const char* key, const uint8_t* value_ptr, size_t value_len, weaveffi_error* out_err);
 
 // Module: kv_stats
 /** Aggregate store statistics */
@@ -173,7 +181,7 @@ WEAVEFFI_API int64_t weaveffi_kv_stats_Stats_get_total_bytes(const weaveffi_kv_s
 WEAVEFFI_API int64_t weaveffi_kv_stats_Stats_get_expired_entries(const weaveffi_kv_stats_Stats* ptr);
 
 /** Snapshot the current store statistics */
-WEAVEFFI_API weaveffi_kv_stats_Stats* weaveffi_kv_stats_get_stats(weaveffi_kv_Store* store, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_kv_stats_Stats* weaveffi_kv_stats_get_stats(const weaveffi_kv_Store* store, weaveffi_error* out_err);
 
 
 #ifdef __cplusplus

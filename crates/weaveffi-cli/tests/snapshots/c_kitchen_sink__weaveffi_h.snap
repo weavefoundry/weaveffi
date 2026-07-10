@@ -81,9 +81,12 @@ typedef enum {
     /** High priority */
     weaveffi_kitchen_Priority_High = 2
 } weaveffi_kitchen_Priority;
+/** Error codes reported by throwing functions in the `kitchen` module tree. */
+typedef enum { weaveffi_kitchen_KitchenErrors_NotFound = 1, weaveffi_kitchen_KitchenErrors_InvalidInput = 2 } weaveffi_kitchen_KitchenErrors;
 typedef struct weaveffi_shared_Token weaveffi_shared_Token;
 typedef struct weaveffi_kitchen_Item weaveffi_kitchen_Item;
 typedef struct weaveffi_kitchen_ItemBuilder weaveffi_kitchen_ItemBuilder;
+typedef struct weaveffi_kitchen_Gadget weaveffi_kitchen_Gadget;
 typedef struct weaveffi_kitchen_StreamItemsIterator weaveffi_kitchen_StreamItemsIterator;
 /** Fires when an item is ready */
 typedef void (*weaveffi_kitchen_OnReady_fn)(int32_t code, const char* msg, void* context);
@@ -144,6 +147,17 @@ WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_token(weaveffi_kitchen_ItemB
 WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_ItemBuilder* builder, weaveffi_kitchen_Priority priority);
 WEAVEFFI_API weaveffi_kitchen_Item* weaveffi_kitchen_Item_Builder_build(weaveffi_kitchen_ItemBuilder* builder, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_kitchen_Item_Builder_destroy(weaveffi_kitchen_ItemBuilder* builder);
+
+/** A pocket-sized interface exercising the object surface */
+/** Create a gadget with the given id */
+WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_Gadget_new(int64_t id, weaveffi_error* out_err);
+/** The gadget subsystem version string */
+WEAVEFFI_API const char* weaveffi_kitchen_Gadget_version(weaveffi_error* out_err);
+/** Render the gadget as a human-readable string */
+WEAVEFFI_API const char* weaveffi_kitchen_Gadget_describe(const weaveffi_kitchen_Gadget* self, weaveffi_error* out_err);
+/** Poke the gadget a number of times, failing on a negative count */
+WEAVEFFI_API int32_t weaveffi_kitchen_Gadget_poke(const weaveffi_kitchen_Gadget* self, int32_t times, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_kitchen_Gadget_destroy(weaveffi_kitchen_Gadget* self);
 
 /** Subscribe to OnReady events */
 WEAVEFFI_API uint64_t weaveffi_kitchen_register_ready_listener(weaveffi_kitchen_OnReady_fn callback, void* context);

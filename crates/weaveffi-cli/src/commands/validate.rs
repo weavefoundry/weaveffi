@@ -42,16 +42,20 @@ pub(crate) fn cmd_validate(
             }
             Ok(())
         }
-        Err(diag) => {
+        Err(diags) => {
             if json_mode {
                 let json = serde_json::json!({
                     "ok": false,
-                    "errors": [validation_error_to_json(&diag.error)],
+                    "errors": diags
+                        .diagnostics
+                        .iter()
+                        .map(|d| validation_error_to_json(&d.error))
+                        .collect::<Vec<_>>(),
                 });
                 println!("{json}");
                 std::process::exit(1);
             }
-            Err(Report::new(diag))
+            Err(Report::new(diags))
         }
     }
 }
@@ -127,6 +131,16 @@ fn validation_error_code(err: &ValidationError) -> &'static str {
         ValidationError::AsyncIteratorReturn { .. } => "AsyncIteratorReturn",
         ValidationError::BuilderStructEmpty { .. } => "BuilderStructEmpty",
         ValidationError::UnsupportedSchemaVersion { .. } => "UnsupportedSchemaVersion",
+        ValidationError::DuplicateInterfaceName { .. } => "DuplicateInterfaceName",
+        ValidationError::DuplicateInterfaceMember { .. } => "DuplicateInterfaceMember",
+        ValidationError::EmptyInterface { .. } => "EmptyInterface",
+        ValidationError::ConstructorHasReturn { .. } => "ConstructorHasReturn",
+        ValidationError::AsyncConstructor { .. } => "AsyncConstructor",
+        ValidationError::InterfaceInInvalidPosition { .. } => "InterfaceInInvalidPosition",
+        ValidationError::DuplicateTypeName { .. } => "DuplicateTypeName",
+        ValidationError::DuplicateErrorCodeName { .. } => "DuplicateErrorCodeName",
+        ValidationError::ThrowsWithoutErrorDomain { .. } => "ThrowsWithoutErrorDomain",
+        ValidationError::AbiSymbolCollision { .. } => "AbiSymbolCollision",
     }
 }
 
@@ -249,6 +263,52 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
         ValidationError::UnsupportedSchemaVersion { version, supported } => {
             obj.insert("version".into(), Value::String(version.clone()));
             obj.insert("supported".into(), Value::String(supported.clone()));
+        }
+        ValidationError::DuplicateInterfaceName { module, name }
+        | ValidationError::EmptyInterface { module, name } => {
+            obj.insert("module".into(), Value::String(module.clone()));
+            obj.insert("name".into(), Value::String(name.clone()));
+        }
+        ValidationError::DuplicateInterfaceMember { interface, name } => {
+            obj.insert("interface".into(), Value::String(interface.clone()));
+            obj.insert("name".into(), Value::String(name.clone()));
+        }
+        ValidationError::ConstructorHasReturn {
+            interface,
+            constructor,
+        }
+        | ValidationError::AsyncConstructor {
+            interface,
+            constructor,
+        } => {
+            obj.insert("interface".into(), Value::String(interface.clone()));
+            obj.insert("constructor".into(), Value::String(constructor.clone()));
+        }
+        ValidationError::InterfaceInInvalidPosition { name, location } => {
+            obj.insert("name".into(), Value::String(name.clone()));
+            obj.insert("location".into(), Value::String(location.clone()));
+        }
+        ValidationError::DuplicateTypeName {
+            name,
+            first,
+            second,
+        }
+        | ValidationError::DuplicateErrorCodeName {
+            name,
+            first,
+            second,
+        } => {
+            obj.insert("name".into(), Value::String(name.clone()));
+            obj.insert("first".into(), Value::String(first.clone()));
+            obj.insert("second".into(), Value::String(second.clone()));
+        }
+        ValidationError::ThrowsWithoutErrorDomain { module, function } => {
+            obj.insert("module".into(), Value::String(module.clone()));
+            obj.insert("function".into(), Value::String(function.clone()));
+        }
+        ValidationError::AbiSymbolCollision { module, symbol } => {
+            obj.insert("module".into(), Value::String(module.clone()));
+            obj.insert("symbol".into(), Value::String(symbol.clone()));
         }
     }
     obj.insert("message".into(), Value::String(err.to_string()));

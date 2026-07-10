@@ -6,9 +6,12 @@ WeaveFFI exposes asynchronous Rust operations through a single
 callback-based C ABI and language-native async wrappers in every
 target. Mark a function with `async: true` (and optionally
 `cancellable: true`) in the IDL and the generators emit the right
-shape per target: `async throws` in Swift, `suspend fun` in Kotlin,
-`Promise<T>` in JS, `async def` in Python, `Task<T>` in .NET, and so
-on.
+shape per target: `async` in Swift (`async throws` when the function
+also declares `throws: true`), `suspend fun` in Kotlin, `Promise<T>`
+in JS, `async def` in Python, `Task<T>` in .NET, and so on. When an
+async function declares `throws: true`, the failure that settles the
+future is the module's typed domain error (see the
+[Error Handling Guide](errors.md)).
 
 ## When to use
 
@@ -32,15 +35,20 @@ Avoid async for:
 ### 1. Declare the function in the IDL
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: net
+    errors:
+      name: NetError
+      codes:
+        - { name: Unreachable, code: 1, message: "host unreachable" }
     functions:
       - name: fetch_data
         params:
           - { name: url, type: string }
         return: string
         async: true
+        throws: true
         doc: "Fetches data from the given URL"
 
       - name: upload_file
@@ -57,12 +65,20 @@ modules:
 |---------------|--------|---------|------------------------------------------------|
 | `async`       | bool   | `false` | Mark the function as asynchronous              |
 | `cancellable` | bool   | `false` | Allow the async operation to be cancelled      |
+| `throws`      | bool   | `false` | Deliver failures as the module's typed domain error |
+
+Here `fetch_data` fails with a typed `NetError`, while `upload_file`
+is non-throwing: apart from cancellation, the only failures it can
+surface are producer bugs.
 
 ### 2. Implement it in Rust
 
 The generated C ABI symbol takes a callback pointer and an opaque
 `void* context`. The Rust worker invokes the callback exactly once
-when it is done. The pattern from `samples/async-demo/src/lib.rs`:
+when it is done. With the `#[weaveffi::module]` macro you write a
+plain `async fn` (see `samples/async-demo/src/lib.rs`) and the
+launcher below is generated for you; a hand-written producer
+implements the same pattern:
 
 ```rust
 #![allow(unsafe_code)]
@@ -135,6 +151,11 @@ Dart:
 final payload = await fetchData('https://example.com/data');
 ```
 
+Because `fetch_data` declares `throws: true`, the error that rejects
+the promise (or resumes the continuation, or fails the task) is the
+typed `NetError`, so a Swift consumer writes `catch NetError.unreachable`
+and a Python consumer writes `except NetError.Unreachable`.
+
 ### 4. Cancel a running operation
 
 For `cancellable: true` functions the C launcher gains a
@@ -154,10 +175,10 @@ either with the result or with a `Cancelled` error. The pin/unpin pair
 (see Reference) runs on the cancellation path identically to the
 success path.
 
-Today the **C, C++, and Kotlin** surfaces expose the token (C++ as a
-trailing `cancel_token = nullptr` parameter, Kotlin as a `cancelToken:
-Long`); the other wrappers pass `NULL`. The operation runs to
-completion even if the consumer-side future is abandoned.
+Today the **C and C++** surfaces expose the token (C++ as a trailing
+`cancel_token = nullptr` parameter); the other wrappers pass `NULL`.
+The operation runs to completion even if the consumer-side future is
+abandoned.
 
 ## Reference
 
@@ -177,6 +198,10 @@ void weaveffi_net_fetch_data_async(
     weaveffi_net_fetch_data_callback callback,
     void* context);
 ```
+
+The `err` argument of the callback carries the domain code for a
+`throws: true` function; on a non-throwing function a non-zero code
+only ever reports a producer bug.
 
 For `cancellable: true` the launcher takes a token slot before the
 callback, and the runtime provides the token lifecycle:
@@ -201,8 +226,8 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 |---------|--------------------------------------------|-------------------------------------------|
 | C       | Raw callback + `_async` launcher            | `weaveffi_cancel_token*` slot before the callback |
 | C++     | `std::future<T>`                            | trailing `cancel_token = nullptr` parameter |
-| Swift   | `async throws`                              | not exposed; wrapper passes `nil`        |
-| Kotlin  | `suspend fun`                               | `cancelToken: Long` parameter (raw token pointer) |
+| Swift   | `async` (`async throws` with `throws: true`) | not exposed; wrapper passes `nil`        |
+| Kotlin  | `suspend fun`                               | not exposed; wrapper passes `0L`          |
 | Node.js | `Promise<T>` (thread-safe function settling) | not exposed; wrapper passes `NULL`      |
 | Python  | `async def` (executor thread + event)       | not exposed; wrapper passes `None`       |
 | .NET    | `Task<T>`                                   | not exposed; wrapper passes `IntPtr.Zero` |
@@ -222,8 +247,7 @@ Every binding pins the user-supplied `void* context` and the callback
 closure for the lifetime of the operation, then releases them exactly
 once on the callback path. The matrix below is the contract every
 generator implements; each row is verified by a
-`{generator}_async_pins_callback_for_lifetime` unit test plus the
-1000-call stress test under `examples/{target}/async_stress.{ext}`.
+`{generator}_async_pins_callback_for_lifetime` unit test.
 
 | Target  | Pin (allocate / retain)                                | Unpin (free / release) on callback             | Notes |
 |---------|---------------------------------------------------------|------------------------------------------------|-------|
@@ -249,8 +273,9 @@ For every async-capable target:
    released by the matching "-1" exactly once on the callback path.
 3. Synchronous failure of the C call (the callback never fires) is
    handled in a `catch` / `try` that frees the pin so it does not leak.
-4. The stress test asserts `weaveffi_tasks_active_callbacks()` returns
-   to zero after 1000 concurrent calls.
+4. The async-demo sample exports `weaveffi_tasks_active_callbacks()`
+   so a harness can assert the count returns to zero after a burst of
+   concurrent calls.
 
 ## Pitfalls
 

@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 #include <functional>
 #include <mutex>
 
@@ -82,6 +83,7 @@ WEAVEFFI_API void weaveffi_events_GetMessagesIterator_destroy(weaveffi_events_Ge
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -89,6 +91,24 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
 
 namespace detail {
 
@@ -104,8 +124,10 @@ inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry
 
 } // namespace detail
 
-/** @return A subscription id for events_unregister_message_listener(). */
-inline uint64_t events_register_message_listener(std::function<void(std::string)> callback) {
+namespace events {
+
+/** @return A subscription id for unregister_message_listener(). */
+inline uint64_t register_message_listener(std::function<void(std::string)> callback) {
     auto fn = std::make_shared<std::function<void(std::string)>>(std::move(callback));
     uint64_t id = weaveffi_events_register_message_listener(
         [](const char* message, void* context) {
@@ -118,45 +140,32 @@ inline uint64_t events_register_message_listener(std::function<void(std::string)
     return id;
 }
 
-/** Unregisters a listener previously registered with events_register_message_listener(). */
-inline void events_unregister_message_listener(uint64_t id) {
+/** Unregisters a listener previously registered with register_message_listener(). */
+inline void unregister_message_listener(uint64_t id) {
     weaveffi_events_unregister_message_listener(id);
     std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
     detail::wv_listener_registry().erase(id);
 }
 
 /** Send a message, triggering the OnMessage callback */
-inline void events_send_message(const std::string& text) {
+inline void send_message(const std::string& text) {
     weaveffi_error err{};
     weaveffi_events_send_message(text.c_str(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
 }
 
 /** Return an iterator over all sent messages */
-inline std::vector<std::string> events_get_messages() {
+inline std::vector<std::string> get_messages() {
     weaveffi_error err{};
     weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     std::vector<std::string> ret;
     while (true) {
         const char* item{};
         int32_t has_item = weaveffi_events_GetMessagesIterator_next(iter, &item, &err);
         if (err.code != 0) {
             weaveffi_events_GetMessagesIterator_destroy(iter);
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            throw WeaveFFIError(code, msg);
+            detail::check(err);
         }
         if (has_item == 0) break;
         ret.emplace_back(item);
@@ -165,6 +174,8 @@ inline std::vector<std::string> events_get_messages() {
     weaveffi_events_GetMessagesIterator_destroy(iter);
     return ret;
 }
+
+} // namespace events
 
 } // namespace weaveffi
 

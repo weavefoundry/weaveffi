@@ -24,6 +24,42 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the KvError error domain (module kv).</summary>
+    public class KvException : WeaveFFIException
+    {
+        /// <summary>No entry exists for the requested key</summary>
+        public const int KeyNotFound = 1001;
+        /// <summary>The entry exists but its TTL has elapsed</summary>
+        public const int Expired = 1002;
+        /// <summary>The store has reached its capacity limit</summary>
+        public const int StoreFull = 1003;
+        /// <summary>Underlying storage reported an I/O failure</summary>
+        public const int IoError = 1004;
+
+        public KvException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case KeyNotFound:
+                    return new KvException(code, string.IsNullOrEmpty(message) ? "key not found" : message);
+                case Expired:
+                    return new KvException(code, string.IsNullOrEmpty(message) ? "entry expired" : message);
+                case StoreFull:
+                    return new KvException(code, string.IsNullOrEmpty(message) ? "store has reached capacity" : message);
+                case IoError:
+                    return new KvException(code, string.IsNullOrEmpty(message) ? "I/O failure" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -36,6 +72,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckKv(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw KvException.FromCode(err.Code, msg);
             }
         }
     }
@@ -67,44 +112,6 @@ namespace WeaveFFI
         Persistent = 1,
         /// <summary>Persistent and encrypted at rest</summary>
         Encrypted = 2,
-    }
-
-    /// <summary>Opaque key-value store handle target type</summary>
-    public class Store : IDisposable
-    {
-        private IntPtr _handle;
-        private bool _disposed;
-
-        internal Store(IntPtr handle)
-        {
-            _handle = handle;
-        }
-
-        internal IntPtr Handle => _handle;
-
-        /// <summary>Internal store identifier</summary>
-        public long Id
-        {
-            get
-            {
-                return NativeMethods.weaveffi_kv_Store_get_id(_handle);
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_kv_Store_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        ~Store()
-        {
-            Dispose();
-        }
     }
 
     /// <summary>A single key-value entry persisted in the store</summary>
@@ -335,6 +342,248 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>An in-memory key-value store owning its entries; destroying the object releases all of its state</summary>
+    public class Store : IDisposable
+    {
+        private IntPtr _handle;
+        private bool _disposed;
+
+        internal Store(IntPtr handle)
+        {
+            _handle = handle;
+        }
+
+        internal IntPtr Handle => _handle;
+
+        /// <summary>Open (or create) a store backed by the given filesystem path</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public static Store Open(string path)
+        {
+            var err = new WeaveFFIError();
+            var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+            try
+            {
+                var result = NativeMethods.weaveffi_kv_Store_open(pathPtr, ref err);
+                WeaveFFIError.CheckKv(err);
+                return new Store(result);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(pathPtr);
+            }
+        }
+
+        /// <summary>Insert or replace a value, returning true on success</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public bool Put(string key, byte[] value, EntryKind kind, long? ttlSeconds)
+        {
+            var err = new WeaveFFIError();
+            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
+            var valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
+            var ttlSecondsPtr = IntPtr.Zero;
+            if (ttlSeconds.HasValue)
+            {
+                ttlSecondsPtr = Marshal.AllocHGlobal(sizeof(long));
+                Marshal.WriteInt64(ttlSecondsPtr, ttlSeconds.Value);
+            }
+            try
+            {
+                var result = NativeMethods.weaveffi_kv_Store_put(_handle, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, (int)kind, ttlSecondsPtr, ref err);
+                WeaveFFIError.CheckKv(err);
+                return result != 0;
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(keyPtr);
+                valuePin.Free();
+                if (ttlSecondsPtr != IntPtr.Zero) Marshal.FreeHGlobal(ttlSecondsPtr);
+            }
+        }
+
+        /// <summary>Look up an entry by key; returns null if missing or expired</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public Entry? Get(string key)
+        {
+            var err = new WeaveFFIError();
+            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
+            try
+            {
+                var result = NativeMethods.weaveffi_kv_Store_get(_handle, keyPtr, ref err);
+                WeaveFFIError.CheckKv(err);
+                return result == IntPtr.Zero ? null : new Entry(result);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(keyPtr);
+            }
+        }
+
+        /// <summary>Remove the entry for the given key, returning true if it existed</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public bool Delete(string key)
+        {
+            var err = new WeaveFFIError();
+            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
+            try
+            {
+                var result = NativeMethods.weaveffi_kv_Store_delete(_handle, keyPtr, ref err);
+                WeaveFFIError.CheckKv(err);
+                return result != 0;
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(keyPtr);
+            }
+        }
+
+        /// <summary>Stream every key, optionally filtered by a prefix</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public IEnumerable<string> ListKeys(string? prefix)
+        {
+            var err = new WeaveFFIError();
+            var prefixPtr = prefix != null ? Marshal.StringToCoTaskMemUTF8(prefix) : IntPtr.Zero;
+            try
+            {
+                var iter = NativeMethods.weaveffi_kv_Store_list_keys(_handle, prefixPtr, ref err);
+                WeaveFFIError.CheckKv(err);
+                return EnumerateListKeys(iter);
+            }
+            finally
+            {
+                if (prefixPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(prefixPtr);
+            }
+        }
+
+        private static IEnumerable<string> EnumerateListKeys(IntPtr iter)
+        {
+            try
+            {
+                while (true)
+                {
+                    var iterErr = new WeaveFFIError();
+                    if (NativeMethods.weaveffi_kv_Store_ListKeysIterator_next(iter, out var out_item, ref iterErr) == 0)
+                    {
+                        WeaveFFIError.CheckKv(iterErr);
+                        yield break;
+                    }
+                    WeaveFFIError.CheckKv(iterErr);
+                    var item = Marshal.PtrToStringUTF8(out_item) ?? "";
+                    NativeMethods.weaveffi_free_string(out_item);
+                    yield return item;
+                }
+            }
+            finally
+            {
+                NativeMethods.weaveffi_kv_Store_ListKeysIterator_destroy(iter);
+            }
+        }
+
+        /// <summary>Return the number of live entries in the store</summary>
+        public long Count()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kv_Store_count(_handle, ref err);
+            WeaveFFIError.Check(err);
+            return result;
+        }
+
+        /// <summary>Drop every entry from the store</summary>
+        public void Clear()
+        {
+            var err = new WeaveFFIError();
+            NativeMethods.weaveffi_kv_Store_clear(_handle, ref err);
+            WeaveFFIError.Check(err);
+        }
+
+        /// <summary>Reclaim space asynchronously; returns the number of bytes reclaimed</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public async Task<long> Compact()
+        {
+            var tcs = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+            NativeMethods.AsyncCb_weaveffi_kv_Store_compact callback = (context, err, result) =>
+            {
+                try
+                {
+                    if (err != IntPtr.Zero)
+                    {
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
+                        if (wErr.Code != 0)
+                        {
+                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            tcs.SetException(KvException.FromCode(wErr.Code, msg));
+                            return;
+                        }
+                    }
+                    tcs.SetResult(result);
+                }
+                finally
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        GCHandle.FromIntPtr(context).Free();
+                    }
+                }
+            };
+            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+            var ctx = GCHandle.ToIntPtr(gcHandle);
+            try
+            {
+                NativeMethods.weaveffi_kv_Store_compact_async(_handle, IntPtr.Zero, callback, ctx);
+            }
+            catch
+            {
+                if (gcHandle.IsAllocated) gcHandle.Free();
+                throw;
+            }
+            return await tcs.Task;
+        }
+
+        /// <summary>Legacy single-shot put kept for compatibility</summary>
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        [Obsolete("use put() with explicit kind")]
+        public bool LegacyPut(string key, byte[] value)
+        {
+            var err = new WeaveFFIError();
+            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
+            var valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
+            try
+            {
+                var result = NativeMethods.weaveffi_kv_Store_legacy_put(_handle, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, ref err);
+                WeaveFFIError.CheckKv(err);
+                return result != 0;
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(keyPtr);
+                valuePin.Free();
+            }
+        }
+
+        /// <summary>The largest number of live entries one store will hold</summary>
+        public static long DefaultCapacity()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kv_Store_default_capacity(ref err);
+            WeaveFFIError.Check(err);
+            return result;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                NativeMethods.weaveffi_kv_Store_destroy(_handle);
+                _disposed = true;
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~Store()
+        {
+            Dispose();
+        }
+    }
+
     /// <summary>Aggregate store statistics</summary>
     public class Stats : IDisposable
     {
@@ -401,15 +650,6 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Store_create(long id, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_Store_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_get_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_Store_get_id(IntPtr ptr);
-
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_create", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kv_Entry_create(long id, IntPtr key, IntPtr value_ptr, UIntPtr value_len, long created_at, IntPtr expires_at, IntPtr tags, UIntPtr tags_len, IntPtr metadata_keys, IntPtr metadata_values, UIntPtr metadata_len, ref WeaveFFIError err);
 
@@ -437,6 +677,48 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_metadata", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kv_Entry_get_metadata(IntPtr ptr, out IntPtr out_keys, out IntPtr out_values, out UIntPtr out_len);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kv_Store_destroy(IntPtr self);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_open", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kv_Store_open(IntPtr path, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_put", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kv_Store_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, int kind, IntPtr ttl_seconds, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_get", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kv_Store_get(IntPtr self, IntPtr key, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_delete", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kv_Store_delete(IntPtr self, IntPtr key, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_list_keys", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kv_Store_list_keys(IntPtr self, IntPtr prefix, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_ListKeysIterator_next", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kv_Store_ListKeysIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_ListKeysIterator_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kv_Store_ListKeysIterator_destroy(IntPtr iter);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_count", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long weaveffi_kv_Store_count(IntPtr self, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_clear", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kv_Store_clear(IntPtr self, ref WeaveFFIError err);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void AsyncCb_weaveffi_kv_Store_compact(IntPtr context, IntPtr err, long result);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_compact_async", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kv_Store_compact_async(IntPtr self, IntPtr cancel_token, AsyncCb_weaveffi_kv_Store_compact callback, IntPtr context);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_legacy_put", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kv_Store_legacy_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_default_capacity", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern long weaveffi_kv_Store_default_capacity(ref WeaveFFIError err);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void Cb_weaveffi_kv_OnEvict_fn(IntPtr key, IntPtr context);
 
@@ -445,48 +727,6 @@ namespace WeaveFFI
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_unregister_eviction_listener", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kv_unregister_eviction_listener(ulong id);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_open_store", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_open_store(IntPtr path, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_close_store", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_close_store(IntPtr store, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_put", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_put(IntPtr store, IntPtr key, IntPtr value_ptr, UIntPtr value_len, int kind, IntPtr ttl_seconds, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_get", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_get(IntPtr store, IntPtr key, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_delete", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_delete(IntPtr store, IntPtr key, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_list_keys", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_list_keys(IntPtr store, IntPtr prefix, ref WeaveFFIError out_err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_ListKeysIterator_next", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_ListKeysIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_ListKeysIterator_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_ListKeysIterator_destroy(IntPtr iter);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_count", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_count(IntPtr store, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_clear", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_clear(IntPtr store, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_compact_async", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_compact_async(IntPtr store, ref WeaveFFIError err);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void AsyncCb_weaveffi_kv_compact_async(IntPtr context, IntPtr err, long result);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_compact_async_async", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_compact_async_async(IntPtr store, IntPtr cancel_token, AsyncCb_weaveffi_kv_compact_async callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_legacy_put", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_legacy_put(IntPtr store, IntPtr key, IntPtr value_ptr, UIntPtr value_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_Stats_create", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kv_stats_Stats_create(long total_entries, long total_bytes, long expired_entries, ref WeaveFFIError err);
@@ -517,8 +757,8 @@ namespace WeaveFFI
         private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
 
         /// <summary>Subscribe to per-key eviction notifications</summary>
-        /// <returns>A subscription id for KvUnregisterEvictionListener().</returns>
-        public static ulong KvRegisterEvictionListener(Action<string> callback)
+        /// <returns>A subscription id for UnregisterEvictionListener().</returns>
+        public static ulong RegisterEvictionListener(Action<string> callback)
         {
             NativeMethods.Cb_weaveffi_kv_OnEvict_fn trampoline = (key, context) =>
             {
@@ -533,8 +773,8 @@ namespace WeaveFFI
             return id;
         }
 
-        /// <summary>Unregisters a listener previously registered with KvRegisterEvictionListener().</summary>
-        public static void KvUnregisterEvictionListener(ulong id)
+        /// <summary>Unregisters a listener previously registered with RegisterEvictionListener().</summary>
+        public static void UnregisterEvictionListener(ulong id)
         {
             NativeMethods.weaveffi_kv_unregister_eviction_listener(id);
             lock (_listenerLock)
@@ -543,221 +783,17 @@ namespace WeaveFFI
             }
         }
 
-        /// <summary>Open (or create) a store backed by the given filesystem path</summary>
-        public static Store KvOpenStore(string path)
-        {
-            var err = new WeaveFFIError();
-            var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
-            try
-            {
-                var result = NativeMethods.weaveffi_kv_open_store(pathPtr, ref err);
-                WeaveFFIError.Check(err);
-                return new Store(result);
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(pathPtr);
-            }
-        }
-
-        /// <summary>Close the store and release all in-memory resources</summary>
-        public static void KvCloseStore(Store store)
-        {
-            var err = new WeaveFFIError();
-            NativeMethods.weaveffi_kv_close_store(store.Handle, ref err);
-            WeaveFFIError.Check(err);
-        }
-
-        /// <summary>Insert or replace a value, returning true on success</summary>
-        public static bool KvPut(Store store, string key, byte[] value, EntryKind kind, long? ttl_seconds)
-        {
-            var err = new WeaveFFIError();
-            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
-            var valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
-            var ttl_secondsPtr = IntPtr.Zero;
-            if (ttl_seconds.HasValue)
-            {
-                ttl_secondsPtr = Marshal.AllocHGlobal(sizeof(long));
-                Marshal.WriteInt64(ttl_secondsPtr, ttl_seconds.Value);
-            }
-            try
-            {
-                var result = NativeMethods.weaveffi_kv_put(store.Handle, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, (int)kind, ttl_secondsPtr, ref err);
-                WeaveFFIError.Check(err);
-                return result != 0;
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(keyPtr);
-                valuePin.Free();
-                if (ttl_secondsPtr != IntPtr.Zero) Marshal.FreeHGlobal(ttl_secondsPtr);
-            }
-        }
-
-        /// <summary>Look up an entry by key; returns null if missing or expired</summary>
-        public static Entry? KvGet(Store store, string key)
-        {
-            var err = new WeaveFFIError();
-            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
-            try
-            {
-                var result = NativeMethods.weaveffi_kv_get(store.Handle, keyPtr, ref err);
-                WeaveFFIError.Check(err);
-                return result == IntPtr.Zero ? null : new Entry(result);
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(keyPtr);
-            }
-        }
-
-        /// <summary>Remove the entry for the given key, returning true if it existed</summary>
-        public static bool KvDelete(Store store, string key)
-        {
-            var err = new WeaveFFIError();
-            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
-            try
-            {
-                var result = NativeMethods.weaveffi_kv_delete(store.Handle, keyPtr, ref err);
-                WeaveFFIError.Check(err);
-                return result != 0;
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(keyPtr);
-            }
-        }
-
-        /// <summary>Stream every key, optionally filtered by a prefix</summary>
-        public static IEnumerable<string> KvListKeys(Store store, string? prefix)
-        {
-            var err = new WeaveFFIError();
-            var prefixPtr = prefix != null ? Marshal.StringToCoTaskMemUTF8(prefix) : IntPtr.Zero;
-            try
-            {
-                var iter = NativeMethods.weaveffi_kv_list_keys(store.Handle, prefixPtr, ref err);
-                WeaveFFIError.Check(err);
-                return EnumerateKvListKeys(iter);
-            }
-            finally
-            {
-                if (prefixPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(prefixPtr);
-            }
-        }
-
-        private static IEnumerable<string> EnumerateKvListKeys(IntPtr iter)
-        {
-            try
-            {
-                while (true)
-                {
-                    var iterErr = new WeaveFFIError();
-                    if (NativeMethods.weaveffi_kv_ListKeysIterator_next(iter, out var out_item, ref iterErr) == 0)
-                    {
-                        WeaveFFIError.Check(iterErr);
-                        yield break;
-                    }
-                    WeaveFFIError.Check(iterErr);
-                    var item = Marshal.PtrToStringUTF8(out_item) ?? "";
-                    NativeMethods.weaveffi_free_string(out_item);
-                    yield return item;
-                }
-            }
-            finally
-            {
-                NativeMethods.weaveffi_kv_ListKeysIterator_destroy(iter);
-            }
-        }
-
-        /// <summary>Return the number of live entries in the store</summary>
-        public static long KvCount(Store store)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kv_count(store.Handle, ref err);
-            WeaveFFIError.Check(err);
-            return result;
-        }
-
-        /// <summary>Drop every entry from the store</summary>
-        public static void KvClear(Store store)
-        {
-            var err = new WeaveFFIError();
-            NativeMethods.weaveffi_kv_clear(store.Handle, ref err);
-            WeaveFFIError.Check(err);
-        }
-
-        /// <summary>Reclaim space asynchronously; returns the number of bytes reclaimed</summary>
-        public static async Task<long> KvCompactAsync(Store store)
-        {
-            var tcs = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
-            NativeMethods.AsyncCb_weaveffi_kv_compact_async callback = (context, err, result) =>
-            {
-                try
-                {
-                    if (err != IntPtr.Zero)
-                    {
-                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
-                        if (wErr.Code != 0)
-                        {
-                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
-                            return;
-                        }
-                    }
-                    tcs.SetResult(result);
-                }
-                finally
-                {
-                    if (context != IntPtr.Zero)
-                    {
-                        GCHandle.FromIntPtr(context).Free();
-                    }
-                }
-            };
-            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
-            var ctx = GCHandle.ToIntPtr(gcHandle);
-            try
-            {
-                NativeMethods.weaveffi_kv_compact_async_async(store.Handle, IntPtr.Zero, callback, ctx);
-            }
-            catch
-            {
-                if (gcHandle.IsAllocated) gcHandle.Free();
-                throw;
-            }
-            return await tcs.Task;
-        }
-
-        /// <summary>Legacy single-shot put kept for compatibility</summary>
-        [Obsolete("use put() with explicit kind")]
-        public static bool KvLegacyPut(Store store, string key, byte[] value)
-        {
-            var err = new WeaveFFIError();
-            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
-            var valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
-            try
-            {
-                var result = NativeMethods.weaveffi_kv_legacy_put(store.Handle, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, ref err);
-                WeaveFFIError.Check(err);
-                return result != 0;
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(keyPtr);
-                valuePin.Free();
-            }
-        }
-
     }
 
     public static class KvStats
     {
         /// <summary>Snapshot the current store statistics</summary>
-        public static Stats KvStatsGetStats(Store store)
+        /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+        public static Stats GetStats(Store store)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kv_stats_get_stats(store.Handle, ref err);
-            WeaveFFIError.Check(err);
+            WeaveFFIError.CheckKv(err);
             return new Stats(result);
         }
 

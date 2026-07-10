@@ -24,6 +24,34 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the DocsErrorsError error domain (module docs).</summary>
+    public class DocsErrorsException : WeaveFFIException
+    {
+        /// <summary>Returned when no document matches the requested id</summary>
+        public const int NotFound = 1;
+        /// <summary>Raised when attempting to move into a forbidden state</summary>
+        public const int InvalidStatus = 2;
+
+        public DocsErrorsException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case NotFound:
+                    return new DocsErrorsException(code, string.IsNullOrEmpty(message) ? "Document not found" : message);
+                case InvalidStatus:
+                    return new DocsErrorsException(code, string.IsNullOrEmpty(message) ? "Invalid status transition" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -36,6 +64,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckDocsErrors(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw DocsErrorsException.FromCode(err.Code, msg);
             }
         }
     }
@@ -218,6 +255,87 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>
+    /// An ordered collection of documents.
+    /// 
+    /// Notebooks own their documents and release them when destroyed.
+    /// </summary>
+    public class Notebook : IDisposable
+    {
+        private IntPtr _handle;
+        private bool _disposed;
+
+        internal Notebook(IntPtr handle)
+        {
+            _handle = handle;
+        }
+
+        internal IntPtr Handle => _handle;
+
+        /// <summary>Create an empty notebook</summary>
+        public Notebook()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_docs_Notebook_new(ref err);
+            WeaveFFIError.Check(err);
+            _handle = result;
+        }
+
+        /// <summary>Add a document, returning its position in the notebook</summary>
+        /// <param name="document">The document to add</param>
+        public int Insert(Document document)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_docs_Notebook_insert(_handle, document.Handle, ref err);
+            WeaveFFIError.Check(err);
+            return result;
+        }
+
+        /// <summary>Look up a document by identifier, failing when none matches</summary>
+        /// <param name="id">Identifier of the document to find</param>
+        /// <exception cref="DocsErrorsException">Thrown when the call reports a DocsErrorsError code.</exception>
+        public Document Find(long id)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_docs_Notebook_find(_handle, id, ref err);
+            WeaveFFIError.CheckDocsErrors(err);
+            return new Document(result);
+        }
+
+        /// <summary>The number of documents currently held</summary>
+        public int Size()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_docs_Notebook_size(_handle, ref err);
+            WeaveFFIError.Check(err);
+            return result;
+        }
+
+        /// <summary>The largest number of documents one notebook will hold</summary>
+        public static int MaxDocuments()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_docs_Notebook_max_documents(ref err);
+            WeaveFFIError.Check(err);
+            return result;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                NativeMethods.weaveffi_docs_Notebook_destroy(_handle);
+                _disposed = true;
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~Notebook()
+        {
+            Dispose();
+        }
+    }
+
     internal static class NativeMethods
     {
         private const string LibName = "weaveffi";
@@ -246,6 +364,24 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Document_get_tags", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_docs_Document_get_tags(IntPtr ptr, out UIntPtr out_len);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_docs_Notebook_destroy(IntPtr self);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_new", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_docs_Notebook_new(ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_insert", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_docs_Notebook_insert(IntPtr self, IntPtr document, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_find", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_docs_Notebook_find(IntPtr self, long id, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_size", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_docs_Notebook_size(IntPtr self, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_max_documents", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_docs_Notebook_max_documents(ref WeaveFFIError err);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void Cb_weaveffi_docs_OnSaved_fn(long doc_id, int revision, IntPtr context);
 
@@ -260,9 +396,6 @@ namespace WeaveFFI
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_get_document", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_docs_get_document(long id, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_docs_publish_async", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_docs_publish_async(long id, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_docs_publish_async(IntPtr context, IntPtr err, int result);
@@ -281,8 +414,8 @@ namespace WeaveFFI
         private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
 
         /// <summary>Subscribe to document-saved notifications</summary>
-        /// <returns>A subscription id for DocsUnregisterSavedListener().</returns>
-        public static ulong DocsRegisterSavedListener(Action<long, int> callback)
+        /// <returns>A subscription id for UnregisterSavedListener().</returns>
+        public static ulong RegisterSavedListener(Action<long, int> callback)
         {
             NativeMethods.Cb_weaveffi_docs_OnSaved_fn trampoline = (doc_id, revision, context) =>
             {
@@ -297,8 +430,8 @@ namespace WeaveFFI
             return id;
         }
 
-        /// <summary>Unregisters a listener previously registered with DocsRegisterSavedListener().</summary>
-        public static void DocsUnregisterSavedListener(ulong id)
+        /// <summary>Unregisters a listener previously registered with RegisterSavedListener().</summary>
+        public static void UnregisterSavedListener(ulong id)
         {
             NativeMethods.weaveffi_docs_unregister_saved_listener(id);
             lock (_listenerLock)
@@ -315,7 +448,7 @@ namespace WeaveFFI
         /// </summary>
         /// <param name="title">Human-readable title for the new document</param>
         /// <param name="tags">Initial set of tags (may be empty)</param>
-        public static Document DocsCreateDocument(string title, string[] tags)
+        public static Document CreateDocument(string title, string[] tags)
         {
             var err = new WeaveFFIError();
             var titlePtr = Marshal.StringToCoTaskMemUTF8(title);
@@ -338,7 +471,7 @@ namespace WeaveFFI
 
         /// <summary>Look up a document by identifier</summary>
         /// <param name="id">Identifier returned from create_document</param>
-        public static Document? DocsGetDocument(long id)
+        public static Document? GetDocument(long id)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_docs_get_document(id, ref err);
@@ -348,7 +481,7 @@ namespace WeaveFFI
 
         /// <summary>Publish a document in the background</summary>
         /// <param name="id">Identifier of the document to publish</param>
-        public static async Task<bool> DocsPublishAsync(long id)
+        public static async Task<bool> PublishAsync(long id)
         {
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_docs_publish_async callback = (context, err, result) =>

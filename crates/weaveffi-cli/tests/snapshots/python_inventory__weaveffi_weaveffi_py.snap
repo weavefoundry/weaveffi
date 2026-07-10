@@ -87,6 +87,55 @@ def _bytes_to_string(ptr) -> Optional[str]:
 
 # === Module: products ===
 
+class ProductsError(WeaveFFIError):
+    """Base exception for the `products` module's error domain."""
+
+
+class InvalidPrice(ProductsError):
+    """price must be positive"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "price must be positive") -> None:
+        super().__init__(1, message)
+
+
+class ProductNotFound(ProductsError):
+    """product not found"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "product not found") -> None:
+        super().__init__(2, message)
+
+
+ProductsError.InvalidPrice = InvalidPrice
+ProductsError.ProductNotFound = ProductNotFound
+
+
+_PRODUCTS_ERROR_CODES: Dict[int, type] = {
+    1: InvalidPrice,
+    2: ProductNotFound,
+}
+
+
+def _products_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the ProductsError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _PRODUCTS_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_products_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _products_error_from(code, message)
+
+
 class Category(IntEnum):
     Electronics = 0
     Clothing = 1
@@ -164,62 +213,161 @@ class Product:
 
 
 
-def products_create_product(name: str, price: float, category: "Category") -> int:
-    _fn = _lib.weaveffi_products_create_product
-    _fn.argtypes = [ctypes.c_char_p, ctypes.c_double, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_uint64
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(_string_to_bytes(name), price, category.value, ctypes.byref(_err))
-    _check_error(_err)
-    return _result
+class Catalog:
+    """A product catalog owning its products"""
+
+    @classmethod
+    def _from_ptr(cls, ptr) -> "Catalog":
+        _obj = cls.__new__(cls)
+        _obj._ptr = ptr
+        return _obj
+
+    def __init__(self) -> None:
+        self._ptr = None
+        _fn = _lib.weaveffi_products_Catalog_new
+        _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        self._ptr = _result
 
 
-def products_get_product(id: int) -> "Product":
-    _fn = _lib.weaveffi_products_get_product
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(id, ctypes.byref(_err))
-    _check_error(_err)
-    if _result is None:
-        raise WeaveFFIError(-1, "null pointer")
-    return Product(_result)
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_products_Catalog_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_products_Catalog_destroy.restype = None
+            _lib.weaveffi_products_Catalog_destroy(self._ptr)
+            self._ptr = None
+
+    def add_product(self, name: str, price: float, category: "Category") -> "Product":
+        """
+        Raises
+        ------
+        ProductsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_products_Catalog_add_product
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _string_to_bytes(name), price, category.value, ctypes.byref(_err))
+        _check_products_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Product(_result)
 
 
-def products_search_products(category: "Category") -> List["Product"]:
-    _fn = _lib.weaveffi_products_search_products
-    _fn.argtypes = [ctypes.c_int32, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.POINTER(ctypes.c_void_p)
-    _err = _WeaveFFIErrorStruct()
-    _out_len = ctypes.c_size_t(0)
-    _result = _fn(category.value, ctypes.byref(_out_len), ctypes.byref(_err))
-    _check_error(_err)
-    if not _result:
-        return []
-    return [Product(_result[_i]) for _i in range(_out_len.value)]
+    def get_product(self, id: int) -> "Product":
+        """
+        Raises
+        ------
+        ProductsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_products_Catalog_get_product
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, id, ctypes.byref(_err))
+        _check_products_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Product(_result)
 
 
-def products_update_price(id: int, price: float) -> bool:
-    _fn = _lib.weaveffi_products_update_price
-    _fn.argtypes = [ctypes.c_uint64, ctypes.c_double, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(id, price, ctypes.byref(_err))
-    _check_error(_err)
-    return bool(_result)
+    def search(self, category: "Category") -> List["Product"]:
+        _fn = _lib.weaveffi_products_Catalog_search
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.POINTER(ctypes.c_void_p)
+        _err = _WeaveFFIErrorStruct()
+        _out_len = ctypes.c_size_t(0)
+        _result = _fn(self._ptr, category.value, ctypes.byref(_out_len), ctypes.byref(_err))
+        _check_error(_err)
+        if not _result:
+            return []
+        return [Product(_result[_i]) for _i in range(_out_len.value)]
 
 
-def products_delete_product(id: int) -> bool:
-    _fn = _lib.weaveffi_products_delete_product
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(id, ctypes.byref(_err))
-    _check_error(_err)
-    return bool(_result)
+    def update_price(self, id: int, price: float) -> bool:
+        """
+        Raises
+        ------
+        ProductsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_products_Catalog_update_price
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_double, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, id, price, ctypes.byref(_err))
+        _check_products_error(_err)
+        return bool(_result)
+
+
+    def remove(self, id: int) -> bool:
+        _fn = _lib.weaveffi_products_Catalog_remove
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, id, ctypes.byref(_err))
+        _check_error(_err)
+        return bool(_result)
+
 
 
 # === Module: orders ===
+
+class OrdersError(WeaveFFIError):
+    """Base exception for the `orders` module's error domain."""
+
+
+class OrderNotFound(OrdersError):
+    """order not found"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "order not found") -> None:
+        super().__init__(1, message)
+
+
+class EmptyOrder(OrdersError):
+    """order must contain at least one item"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "order must contain at least one item") -> None:
+        super().__init__(2, message)
+
+
+OrdersError.OrderNotFound = OrderNotFound
+OrdersError.EmptyOrder = EmptyOrder
+
+
+_ORDERS_ERROR_CODES: Dict[int, type] = {
+    1: OrderNotFound,
+    2: EmptyOrder,
+}
+
+
+def _orders_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the OrdersError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _ORDERS_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_orders_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _orders_error_from(code, message)
+
 
 class OrderItem:
 
@@ -313,32 +461,44 @@ class Order:
 
 
 
-def orders_create_order(items: List["OrderItem"]) -> int:
+def create_order(items: List["OrderItem"]) -> int:
+    """
+    Raises
+    ------
+    OrdersError
+        If the call reports one of the domain's error codes.
+    """
     _fn = _lib.weaveffi_orders_create_order
     _fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_uint64
+    _fn.restype = ctypes.c_int64
     _items_arr = (ctypes.c_void_p * len(items))(*[v._ptr for v in items])
     _err = _WeaveFFIErrorStruct()
     _result = _fn(_items_arr, len(items), ctypes.byref(_err))
-    _check_error(_err)
+    _check_orders_error(_err)
     return _result
 
 
-def orders_get_order(id: int) -> "Order":
+def get_order(id: int) -> "Order":
+    """
+    Raises
+    ------
+    OrdersError
+        If the call reports one of the domain's error codes.
+    """
     _fn = _lib.weaveffi_orders_get_order
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
-    _check_error(_err)
+    _check_orders_error(_err)
     if _result is None:
         raise WeaveFFIError(-1, "null pointer")
     return Order(_result)
 
 
-def orders_cancel_order(id: int) -> bool:
+def cancel_order(id: int) -> bool:
     _fn = _lib.weaveffi_orders_cancel_order
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
     _err = _WeaveFFIErrorStruct()
     _result = _fn(id, ctypes.byref(_err))
@@ -346,9 +506,9 @@ def orders_cancel_order(id: int) -> bool:
     return bool(_result)
 
 
-def orders_add_product_to_order(order_id: int, product: "Product") -> bool:
+def add_product_to_order(order_id: int, product: "Product") -> bool:
     _fn = _lib.weaveffi_orders_add_product_to_order
-    _fn.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.argtypes = [ctypes.c_int64, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
     _err = _WeaveFFIErrorStruct()
     _result = _fn(order_id, product._ptr, ctypes.byref(_err))

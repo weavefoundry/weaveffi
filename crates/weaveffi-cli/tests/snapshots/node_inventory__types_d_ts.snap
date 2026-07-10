@@ -6,6 +6,30 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `products` module's throwing functions. */
+export class ProductsError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class InvalidPriceError extends ProductsError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
+export class ProductNotFoundError extends ProductsError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
 export interface Product {
   id: number;
   name: string;
@@ -21,26 +45,50 @@ export enum Category {
   Books = 3,
 }
 // module products
-/**
- * Maps to C function: weaveffi_products_create_product
- */
-export function products_create_product(name: string, price: number, category: Category): bigint
-/**
- * Maps to C function: weaveffi_products_get_product
- */
-export function products_get_product(id: bigint): Product
-/**
- * Maps to C function: weaveffi_products_search_products
- */
-export function products_search_products(category: Category): Product[]
-/**
- * Maps to C function: weaveffi_products_update_price
- */
-export function products_update_price(id: bigint, price: number): boolean
-/**
- * Maps to C function: weaveffi_products_delete_product
- */
-export function products_delete_product(id: bigint): boolean
+/** A product catalog owning its products */
+export class Catalog {
+  /**
+   * Maps to C function: weaveffi_products_Catalog_new
+   */
+  constructor();
+  /**
+   * Maps to C function: weaveffi_products_Catalog_add_product
+   * @throws {ProductsError}
+   */
+  addProduct(name: string, price: number, category: Category): Product;
+  /**
+   * Maps to C function: weaveffi_products_Catalog_get_product
+   * @throws {ProductsError}
+   */
+  getProduct(id: number): Product;
+  /**
+   * Maps to C function: weaveffi_products_Catalog_search
+   */
+  search(category: Category): Product[];
+  /**
+   * Maps to C function: weaveffi_products_Catalog_update_price
+   * @throws {ProductsError}
+   */
+  updatePrice(id: number, price: number): boolean;
+  /**
+   * Maps to C function: weaveffi_products_Catalog_remove
+   */
+  remove(id: number): boolean;
+  /** Free the underlying native object. */
+  destroy(): void;
+}
+/** Typed errors reported by the `orders` module's throwing functions. */
+export class OrdersError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class OrderNotFoundError extends OrdersError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
+export class EmptyOrderError extends OrdersError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
 export interface OrderItem {
   product_id: number;
   quantity: number;
@@ -55,19 +103,21 @@ export interface Order {
 // module orders
 /**
  * Maps to C function: weaveffi_orders_create_order
+ * @throws {OrdersError}
  */
-export function orders_create_order(items: OrderItem[]): bigint
+export function createOrder(items: OrderItem[]): number
 /**
  * Maps to C function: weaveffi_orders_get_order
+ * @throws {OrdersError}
  */
-export function orders_get_order(id: bigint): Order
+export function getOrder(id: number): Order
 /**
  * Maps to C function: weaveffi_orders_cancel_order
  */
-export function orders_cancel_order(id: bigint): boolean
+export function cancelOrder(id: number): boolean
 /**
  * Maps to C function: weaveffi_orders_add_product_to_order
  */
-export function orders_add_product_to_order(order_id: bigint, product: Product): boolean
+export function addProductToOrder(orderId: number, product: Product): boolean
 
 // END types.d.ts

@@ -7,6 +7,32 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated types for WeaveFFI functions
 /**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `docs` module's throwing functions. */
+export class DocsErrorsError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+/** Returned when no document matches the requested id */
+export class NotFoundError extends DocsErrorsError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
+/** Raised when attempting to move into a forbidden state */
+export class InvalidStatusError extends DocsErrorsError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
+/**
  * Represents a single document tracked by the system.
  *
  * Documents are persisted to disk and exposed via the public API.
@@ -51,9 +77,46 @@ export enum Status {
   Archived = 2,
 }
 // module docs
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+export class Notebook {
+  /**
+   * Create an empty notebook
+   * Maps to C function: weaveffi_docs_Notebook_new
+   */
+  constructor();
+  /**
+   * Add a document, returning its position in the notebook
+   * @param document The document to add
+   * Maps to C function: weaveffi_docs_Notebook_insert
+   */
+  insert(document: Document): number;
+  /**
+   * Look up a document by identifier, failing when none matches
+   * @param id Identifier of the document to find
+   * Maps to C function: weaveffi_docs_Notebook_find
+   * @throws {DocsErrorsError}
+   */
+  find(id: number): Document;
+  /**
+   * The number of documents currently held
+   * Maps to C function: weaveffi_docs_Notebook_size
+   */
+  size(): number;
+  /**
+   * The largest number of documents one notebook will hold
+   * Maps to C function: weaveffi_docs_Notebook_max_documents
+   */
+  static maxDocuments(): number;
+  /** Free the underlying native object. */
+  destroy(): void;
+}
 /** Subscribe to document-saved notifications */
-export function docs_register_saved_listener(callback: (doc_id: number, revision: number) => void): number
-export function docs_unregister_saved_listener(id: number): void
+export function registerSavedListener(callback: (docId: number, revision: number) => void): number
+export function unregisterSavedListener(id: number): void
 /**
  * Create a brand new document.
  *
@@ -63,18 +126,18 @@ export function docs_unregister_saved_listener(id: number): void
  * @param tags Initial set of tags (may be empty)
  * Maps to C function: weaveffi_docs_create_document
  */
-export function docs_create_document(title: string, tags: string[]): Document
+export function createDocument(title: string, tags: string[]): Document
 /**
  * Look up a document by identifier
  * @param id Identifier returned from create_document
  * Maps to C function: weaveffi_docs_get_document
  */
-export function docs_get_document(id: number): Document | null
+export function getDocument(id: number): Document | null
 /**
  * Publish a document in the background
  * @param id Identifier of the document to publish
  * Maps to C function: weaveffi_docs_publish_async
  */
-export function docs_publish_async(id: number): Promise<boolean>
+export function publishAsync(id: number): Promise<boolean>
 
 // END types.d.ts

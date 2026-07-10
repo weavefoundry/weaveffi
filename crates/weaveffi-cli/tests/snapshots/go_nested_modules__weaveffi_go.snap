@@ -18,6 +18,78 @@ import (
 	"fmt"
 )
 
+// WeaveFFIError reports a failure crossing the C boundary that no typed
+// error domain claims: an unknown code, a marshalling failure, or a
+// producer panic.
+type WeaveFFIError struct {
+	// Code is the numeric ABI error code.
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *WeaveFFIError) Error() string {
+	return fmt.Sprintf("weaveffi: %s (code %d)", e.Message, e.Code)
+}
+
+// wvTakeError reads and clears a non-zero C error slot, returning its
+// code and message.
+func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+	code := int32(cErr.code)
+	msg := ""
+	if cErr.message != nil {
+		msg = C.GoString(cErr.message)
+	}
+	C.weaveffi_error_clear(cErr)
+	return code, msg
+}
+
+func wvBrandError(code int32, message string) error {
+	return &WeaveFFIError{Code: code, Message: message}
+}
+
+// wvTrap panics when the C error slot reports a failure. Non-throwing
+// wrappers check their slot with it: a non-zero code there can only be
+// a producer panic or a marshalling failure.
+func wvTrap(cErr *C.weaveffi_error) {
+	if cErr.code != 0 {
+		code, msg := wvTakeError(cErr)
+		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
+	}
+}
+
+// GraphicsError is a typed error reported by the `graphics` module.
+type GraphicsError struct {
+	// Code is the numeric ABI error code (one of the GraphicsError constants).
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *GraphicsError) Error() string {
+	return fmt.Sprintf("graphics: %s (code %d)", e.Message, e.Code)
+}
+
+// GraphicsError codes.
+const (
+	// GraphicsErrorOutOfBounds coordinate out of bounds
+	GraphicsErrorOutOfBounds int32 = 1
+)
+
+// wvMapGraphics converts a non-zero code from the `graphics` domain into a
+// *GraphicsError, falling back to the generic *WeaveFFIError for unknown codes.
+func wvMapGraphics(code int32, message string) error {
+	switch code {
+	case GraphicsErrorOutOfBounds:
+		if message == "" {
+			message = "coordinate out of bounds"
+		}
+		return &GraphicsError{Code: code, Message: message}
+	default:
+		return wvBrandError(code, message)
+	}
+}
+
 // Unit: A measurement unit shared with nested submodules.
 type Unit int32
 
@@ -47,16 +119,12 @@ func (s *Canvas) Close() {
 	}
 }
 
-// GraphicsNewCanvas: Construct a Canvas.
-func GraphicsNewCanvas(width int32) (*Canvas, error) {
+// NewCanvas: Construct a Canvas.
+func NewCanvas(width int32) *Canvas {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_graphics_new_canvas(C.int32_t(width), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	return &Canvas{ptr: result}, nil
+	wvTrap(&cErr)
+	return &Canvas{ptr: result}
 }
 
 // Shape: A struct one level deep that references both an ancestor enum and a deeper struct.
@@ -85,28 +153,20 @@ func (s *Shape) Close() {
 	}
 }
 
-// GraphicsShapesMakeShape: Construct a Shape.
-func GraphicsShapesMakeShape(sides int32) (*Shape, error) {
+// MakeShape: Construct a Shape.
+func MakeShape(sides int32) *Shape {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_graphics_shapes_make_shape(C.int32_t(sides), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	return &Shape{ptr: result}, nil
+	wvTrap(&cErr)
+	return &Shape{ptr: result}
 }
 
-// GraphicsShapesDescribe: Nested function returning a struct owned by an ancestor module.
-func GraphicsShapesDescribe() (*Canvas, error) {
+// Describe: Nested function returning a struct owned by an ancestor module.
+func Describe() *Canvas {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_graphics_shapes_describe(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	return &Canvas{ptr: result}, nil
+	wvTrap(&cErr)
+	return &Canvas{ptr: result}
 }
 
 // Detail: A struct two levels deep.
@@ -125,14 +185,12 @@ func (s *Detail) Close() {
 	}
 }
 
-// GraphicsShapesGeometryCompute: Deeper function taking an ancestor-module struct.
-func GraphicsShapesGeometryCompute(shape *Shape) (*Detail, error) {
+// Compute: Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
+func Compute(shape *Shape) (*Detail, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_graphics_shapes_geometry_compute(shape.ptr, &cErr)
 	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
+		return nil, wvMapGraphics(wvTakeError(&cErr))
 	}
 	return &Detail{ptr: result}, nil
 }

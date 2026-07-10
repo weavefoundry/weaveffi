@@ -32,15 +32,15 @@ fn generate_kvstore_all_targets() {
     let c_header =
         std::fs::read_to_string(out_path.join("c/weaveffi.h")).expect("missing c/weaveffi.h");
     assert!(
-        c_header.contains("weaveffi_kv_compact_async_async"),
+        c_header.contains("weaveffi_kv_Store_compact_async"),
         "c/weaveffi.h should declare the cancellable async compact entry point"
     );
     assert!(
         c_header.contains("weaveffi_cancel_token* cancel_token"),
-        "c/weaveffi.h should pass a cancel_token to compact_async"
+        "c/weaveffi.h should pass a cancel_token to compact"
     );
     assert!(
-        c_header.contains("typedef struct weaveffi_kv_ListKeysIterator"),
+        c_header.contains("typedef struct weaveffi_kv_Store_ListKeysIterator"),
         "c/weaveffi.h should define the streaming iterator type"
     );
 
@@ -89,8 +89,8 @@ fn generate_kvstore_all_targets() {
     let python = std::fs::read_to_string(out_path.join("python/kvstore/weaveffi.py"))
         .expect("missing python/kvstore/weaveffi.py");
     assert!(
-        python.contains("async def kv_compact_async"),
-        "weaveffi.py should expose compact_async as an async def"
+        python.contains("async def compact"),
+        "weaveffi.py should expose Store.compact as an async def"
     );
 
     let dotnet_path = out_path.join("dotnet/Kvstore.cs");
@@ -122,8 +122,8 @@ fn generate_kvstore_all_targets() {
     let go =
         std::fs::read_to_string(out_path.join("go/weaveffi.go")).expect("missing go/weaveffi.go");
     assert!(
-        go.contains("KvPut") && go.contains("KvStatsGetStats"),
-        "go/weaveffi.go should expose both top-level and nested-module functions"
+        go.contains("func (s *Store) Put(") && go.contains("func GetStats("),
+        "go/weaveffi.go should expose Store methods and nested-module functions"
     );
     let go_mod = std::fs::read_to_string(out_path.join("go/go.mod")).expect("missing go/go.mod");
     assert!(
@@ -138,7 +138,7 @@ fn generate_kvstore_all_targets() {
         "ruby/lib/weaveffi.rb should pick up inline ruby.module_name override"
     );
     assert!(
-        ruby.contains(":weaveffi_kv_open_store") && ruby.contains(":weaveffi_kv_legacy_put"),
-        "ruby/lib/weaveffi.rb should attach top-level kv functions including legacy_put"
+        ruby.contains(":weaveffi_kv_Store_open") && ruby.contains(":weaveffi_kv_Store_legacy_put"),
+        "ruby/lib/weaveffi.rb should attach Store interface entry points including legacy_put"
     );
 }

@@ -14,22 +14,22 @@ class WeaveFFI {
         /**
          * Render a shape to a string
          */
-        @JvmStatic private external fun shapes_describeJni(shape: Long): String
-        @JvmStatic fun shapes_describe(shape: Shape): String = shapes_describeJni(shape.handle)
+        @JvmStatic private external fun describeJni(shape: Long): String
+        @JvmStatic fun describe(shape: Shape): String = describeJni(shape.handle)
         /**
          * Scale a shape by a factor, returning a new shape
          */
-        @JvmStatic private external fun shapes_scaleJni(shape: Long, factor: Double): Long
-        @JvmStatic fun shapes_scale(shape: Shape, factor: Double): Shape = Shape(shapes_scaleJni(shape.handle, factor))
+        @JvmStatic private external fun scaleJni(shape: Long, factor: Double): Long
+        @JvmStatic fun scale(shape: Shape, factor: Double): Shape = Shape(scaleJni(shape.handle, factor))
         /**
          * Sum a list of bytes into a wide integer (numerics smoke)
          */
-        @JvmStatic external fun shapes_sum_bytes(values: ByteArray): Long
+        @JvmStatic external fun sumBytes(values: ByteArray): Long
         /**
          * Build a Numerics struct from every numeric primitive
          */
-        @JvmStatic private external fun shapes_make_numericsJni(a: Byte, b: Short, c: Int, d: Long, e: Byte, f: Short, g: Long, h: Long, i: Float, j: Double): Long
-        @JvmStatic fun shapes_make_numerics(a: Byte, b: Short, c: Int, d: Long, e: Byte, f: Short, g: Long, h: Long, i: Float, j: Double): Numerics = Numerics(shapes_make_numericsJni(a, b, c, d, e, f, g, h, i, j))
+        @JvmStatic private external fun makeNumericsJni(a: Byte, b: Short, c: Int, d: Long, e: Byte, f: Short, g: Long, h: Long, i: Float, j: Double): Long
+        @JvmStatic fun makeNumerics(a: Byte, b: Short, c: Int, d: Long, e: Byte, f: Short, g: Long, h: Long, i: Float, j: Double): Numerics = Numerics(makeNumericsJni(a, b, c, d, e, f, g, h, i, j))
     }
 }
 
@@ -162,6 +162,7 @@ class Numerics internal constructor(internal var handle: Long) : java.io.Closeab
     }
 }
 
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
 
 // END WeaveFFI.kt

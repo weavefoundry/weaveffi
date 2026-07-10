@@ -3,7 +3,7 @@
 Exercises the full events surface: the ctypes CFUNCTYPE listener trampoline
 (register -> fire synchronously on send -> unregister stops delivery) and the
 opaque-iterator ABI (`next(iter, &out_item, &err) -> int32`) behind
-`events_get_messages()`.
+`get_messages()`.
 """
 import os
 import sys
@@ -15,24 +15,24 @@ import events as wv  # noqa: E402
 
 def main() -> None:
     received: list[str] = []
-    sub = wv.events_register_message_listener(received.append)
+    sub = wv.register_message_listener(received.append)
     assert sub > 0, sub
 
-    wv.events_send_message("alpha")
-    wv.events_send_message("beta")
+    wv.send_message("alpha")
+    wv.send_message("beta")
     assert received == ["alpha", "beta"], received
 
-    wv.events_send_message("gamma")
+    wv.send_message("gamma")
     assert received == ["alpha", "beta", "gamma"], received
 
-    msgs = list(wv.events_get_messages())
+    msgs = list(wv.get_messages())
     assert msgs == ["alpha", "beta", "gamma"], msgs
 
     # Unregister stops delivery; messages still accumulate producer-side.
-    wv.events_unregister_message_listener(sub)
-    wv.events_send_message("delta")
+    wv.unregister_message_listener(sub)
+    wv.send_message("delta")
     assert received == ["alpha", "beta", "gamma"], received
-    assert list(wv.events_get_messages()) == ["alpha", "beta", "gamma", "delta"]
+    assert list(wv.get_messages()) == ["alpha", "beta", "gamma", "delta"]
 
     print("python/events: OK")
 

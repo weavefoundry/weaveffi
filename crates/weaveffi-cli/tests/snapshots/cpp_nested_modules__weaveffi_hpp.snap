@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -66,6 +67,8 @@ WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /** A measurement unit shared with nested submodules. */
 typedef enum { weaveffi_graphics_Unit_pixels = 0, weaveffi_graphics_Unit_points = 1 } weaveffi_graphics_Unit;
+/** Error codes reported by throwing functions in the `graphics` module tree. */
+typedef enum { weaveffi_graphics_GraphicsError_OutOfBounds = 1 } weaveffi_graphics_GraphicsError;
 typedef struct weaveffi_graphics_Canvas weaveffi_graphics_Canvas;
 typedef struct weaveffi_graphics_shapes_Shape weaveffi_graphics_shapes_Shape;
 typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes_geometry_Detail;
@@ -99,13 +102,14 @@ WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_
 WEAVEFFI_API void weaveffi_graphics_shapes_geometry_Detail_destroy(weaveffi_graphics_shapes_geometry_Detail* ptr);
 WEAVEFFI_API double weaveffi_graphics_shapes_geometry_Detail_get_area(const weaveffi_graphics_shapes_geometry_Detail* ptr);
 
-/** Deeper function taking an ancestor-module struct. */
+/** Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain. */
 WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_compute(const weaveffi_graphics_shapes_Shape* shape, weaveffi_error* out_err);
 
 } // extern "C"
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -113,6 +117,57 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `graphics` module's throwing functions. */
+class GraphicsError : public WeaveFFIError {
+public:
+    GraphicsError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** coordinate out of bounds */
+class OutOfBoundsError : public GraphicsError {
+public:
+    OutOfBoundsError(const std::string& msg) : GraphicsError(1, msg) {}
+};
+
+namespace detail {
+
+/** Map a `graphics` error code to its typed exception (GraphicsError for unknown codes). */
+inline std::exception_ptr make_graphics_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(OutOfBoundsError(msg));
+    default: return std::make_exception_ptr(GraphicsError(code, msg));
+    }
+}
+
+/** Throw the typed `graphics` exception if `err` carries a nonzero code. */
+inline void check_graphics(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_graphics_error(code, msg));
+}
+
+} // namespace detail
 
 /** A measurement unit shared with nested submodules. */
 enum class Unit : int32_t {
@@ -240,57 +295,49 @@ public:
 
 };
 
+namespace graphics {
+
 /** Construct a Canvas. */
-inline Canvas graphics_new_canvas(int32_t width) {
+inline Canvas new_canvas(int32_t width) {
     weaveffi_error err{};
     auto result = weaveffi_graphics_new_canvas(width, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return Canvas(result);
 }
 
+} // namespace graphics
+
+namespace graphics::shapes {
+
 /** Construct a Shape. */
-inline Shape graphics_shapes_make_shape(int32_t sides) {
+inline Shape make_shape(int32_t sides) {
     weaveffi_error err{};
     auto result = weaveffi_graphics_shapes_make_shape(sides, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return Shape(result);
 }
 
 /** Nested function returning a struct owned by an ancestor module. */
-inline Canvas graphics_shapes_describe() {
+inline Canvas describe() {
     weaveffi_error err{};
     auto result = weaveffi_graphics_shapes_describe(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return Canvas(result);
 }
 
-/** Deeper function taking an ancestor-module struct. */
-inline Detail graphics_shapes_geometry_compute(const Shape& shape) {
+} // namespace graphics::shapes
+
+namespace graphics::shapes::geometry {
+
+/** Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain. */
+inline Detail compute(const Shape& shape) {
     weaveffi_error err{};
     auto result = weaveffi_graphics_shapes_geometry_compute(static_cast<const weaveffi_graphics_shapes_Shape*>(shape.handle()), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check_graphics(err);
     return Detail(result);
 }
+
+} // namespace graphics::shapes::geometry
 
 } // namespace weaveffi
 

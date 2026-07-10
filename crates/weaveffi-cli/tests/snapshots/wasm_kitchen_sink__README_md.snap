@@ -46,6 +46,11 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
 
+Wrappers of functions declared `throws` raise the declaring module's typed
+error class (a `WeaveFFIError` subclass with a per-code subclass, such as
+`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
+for producer panics and marshalling failures.
+
 ## Unsupported Features
 
 This IDL uses features the wasm target does not support (generated because
@@ -89,6 +94,15 @@ Passed as opaque handle (`i64`).
 | `weaveffi_shared_Token_get_label` | `i32, i32` |
 
 ### Module: `kitchen`
+
+#### Error Domain: `KitchenErrorsError`
+
+Throwing wrappers in this module raise `KitchenErrorsError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+
+| Class | Code | Default Message |
+|-------|------|-----------------|
+| `NotFound` | `1` | Item not found |
+| `InvalidInput` | `2` | Invalid input |
 
 #### Functions
 
@@ -293,6 +307,60 @@ Replacement for legacy_op
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `i32` | `i32` | native Wasm i32 |
+
+#### Interfaces
+
+##### `Gadget`
+
+A pocket-sized interface exercising the object surface
+
+Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+
+##### `weaveffi_kitchen_Gadget_new`
+
+Create a gadget with the given id
+
+`weaveffi_kitchen_Gadget_new(id: i64) -> i64`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| `id` | `i64` | `i64` | native Wasm i64 |
+| _returns_ | `Gadget` | `i64` | opaque handle in linear memory |
+
+##### `weaveffi_kitchen_Gadget_describe`
+
+Render the gadget as a human-readable string
+
+`weaveffi_kitchen_Gadget_describe() -> i32, i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+
+##### `weaveffi_kitchen_Gadget_poke`
+
+Poke the gadget a number of times, failing on a negative count
+
+`weaveffi_kitchen_Gadget_poke(times: i32) -> i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| `times` | `i32` | `i32` | native Wasm i32 |
+| _returns_ | `i32` | `i32` | native Wasm i32 |
+
+##### `weaveffi_kitchen_Gadget_version`
+
+The gadget subsystem version string
+
+`weaveffi_kitchen_Gadget_version() -> i32, i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+
+##### `weaveffi_kitchen_Gadget_destroy`
+
+Releases the object reference. Called by the wrapper's `free()`.
 
 #### Structs
 

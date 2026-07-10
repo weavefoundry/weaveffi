@@ -46,6 +46,11 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
 
+Wrappers of functions declared `throws` raise the declaring module's typed
+error class (a `WeaveFFIError` subclass with a per-code subclass, such as
+`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
+for producer panics and marshalling failures.
+
 ## Unsupported Features
 
 This IDL uses features the wasm target does not support (generated because
@@ -62,6 +67,15 @@ you need them.
 ## API Reference
 
 ### Module: `docs`
+
+#### Error Domain: `DocsErrorsError`
+
+Throwing wrappers in this module raise `DocsErrorsError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+
+| Class | Code | Default Message |
+|-------|------|-----------------|
+| `NotFound` | `1` | Document not found |
+| `InvalidStatus` | `2` | Invalid status transition |
 
 #### Functions
 
@@ -102,6 +116,73 @@ Publish a document in the background
 |-------|----------|------|-------|
 | `id` | `i64` | `i64` | native Wasm i64 |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
+
+#### Interfaces
+
+##### `Notebook`
+
+An ordered collection of documents.
+
+Notebooks own their documents and release them when destroyed.
+
+
+Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+
+##### `weaveffi_docs_Notebook_new`
+
+Create an empty notebook
+
+`weaveffi_docs_Notebook_new() -> i64`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `Notebook` | `i64` | opaque handle in linear memory |
+
+##### `weaveffi_docs_Notebook_insert`
+
+Add a document, returning its position in the notebook
+
+`weaveffi_docs_Notebook_insert(document: i64) -> i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| `document` | `Document` | `i64` | opaque handle in linear memory |
+| _returns_ | `i32` | `i32` | native Wasm i32 |
+
+##### `weaveffi_docs_Notebook_find`
+
+Look up a document by identifier, failing when none matches
+
+`weaveffi_docs_Notebook_find(id: i64) -> i64`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| `id` | `i64` | `i64` | native Wasm i64 |
+| _returns_ | `Document` | `i64` | opaque handle in linear memory |
+
+##### `weaveffi_docs_Notebook_size`
+
+The number of documents currently held
+
+`weaveffi_docs_Notebook_size() -> i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `i32` | `i32` | native Wasm i32 |
+
+##### `weaveffi_docs_Notebook_max_documents`
+
+The largest number of documents one notebook will hold
+
+`weaveffi_docs_Notebook_max_documents() -> i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `i32` | `i32` | native Wasm i32 |
+
+##### `weaveffi_docs_Notebook_destroy`
+
+Releases the object reference. Called by the wrapper's `free()`.
 
 #### Structs
 

@@ -2,15 +2,17 @@
 //!
 //! `roundtrip_kitchen_sink` proves the extractor recovers the same shape
 //! as the original kitchen-sink IDL when run on the hand-annotated Rust
-//! file at `crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`.
-//! Lossy fields (struct field defaults, error domains, iterator returns,
-//! standalone `since` without `#[deprecated]`, callback param docs) are
-//! documented in `docs/src/guides/extract.md` and skipped by name in the
-//! assertions below.
+//! file at `crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`,
+//! including the 0.5.0 surface: the `Gadget` interface, the `KitchenErrors`
+//! domain, and per-function `throws`. Lossy fields (struct field defaults,
+//! iterator returns, standalone `since` without `#[deprecated]`, callback
+//! param docs, error-code `doc:` separate from `message:`) are documented
+//! in `docs/src/guides/extract.md` and skipped by name in the assertions
+//! below.
 
 use std::collections::BTreeMap;
 
-use weaveffi_ir::ir::{Api, Function, Module, StructDef, TypeRef};
+use weaveffi_ir::ir::{Api, Function, InterfaceDef, Module, StructDef, TypeRef};
 use weaveffi_ir::parse::parse_api_str;
 
 /// The validator that runs inside `weaveffi extract` rewrites cross-module
@@ -63,6 +65,41 @@ fn function_by_name<'a>(module: &'a Module, name: &str) -> &'a Function {
         .iter()
         .find(|f| f.name == name)
         .unwrap_or_else(|| panic!("function {name} missing in module {}", module.name))
+}
+
+fn interface_by_name<'a>(module: &'a Module, name: &str) -> &'a InterfaceDef {
+    module
+        .interfaces
+        .iter()
+        .find(|i| i.name == name)
+        .unwrap_or_else(|| panic!("interface {name} missing in module {}", module.name))
+}
+
+/// Assert one extracted callable matches its original: name, params (name +
+/// type), return, throws, async, cancellable, and doc.
+fn assert_functions_equivalent(extracted: &Function, orig: &Function, ctx: &str) {
+    assert_eq!(extracted.name, orig.name, "{ctx} name mismatch");
+    assert_eq!(
+        extracted.params.len(),
+        orig.params.len(),
+        "{ctx} param count mismatch"
+    );
+    for (a, b) in extracted.params.iter().zip(orig.params.iter()) {
+        assert_eq!(a.name, b.name, "{ctx} param name mismatch");
+        assert_types_equivalent(&a.ty, &b.ty, &format!("{ctx} param {}", b.name));
+    }
+    match (&extracted.returns, &orig.returns) {
+        (Some(a), Some(b)) => assert_types_equivalent(a, b, &format!("{ctx} return")),
+        (None, None) => {}
+        (a, b) => panic!("{ctx} return mismatch: {a:?} vs {b:?}"),
+    }
+    assert_eq!(extracted.throws, orig.throws, "{ctx} throws mismatch");
+    assert_eq!(extracted.r#async, orig.r#async, "{ctx} async mismatch");
+    assert_eq!(
+        extracted.cancellable, orig.cancellable,
+        "{ctx} cancellable mismatch"
+    );
+    assert_eq!(extracted.doc, orig.doc, "{ctx} doc mismatch");
 }
 
 #[test]
@@ -220,6 +257,11 @@ fn roundtrip_kitchen_sink() {
             "{} cancellable mismatch",
             orig.name
         );
+        assert_eq!(
+            extracted.throws, orig.throws,
+            "{} throws mismatch",
+            orig.name
+        );
         // `since` without an accompanying `#[deprecated(since = ...)]` is
         // not recoverable: `new_op` has `since: 0.3.0` in the IDL but no
         // way to express that in Rust syntax alone.
@@ -230,6 +272,62 @@ fn roundtrip_kitchen_sink() {
                 orig.name
             );
             assert_eq!(extracted.since, orig.since, "{} since mismatch", orig.name);
+        }
+    }
+
+    // Error domain: `#[weaveffi::error]` makes the domain derivable, so name,
+    // code names, values, and messages must all round-trip. A code's `doc:` is
+    // skipped: Rust spells the message as the first doc line, so the extracted
+    // doc always includes the message and cannot match an IDL doc that omits it.
+    let errors_orig = kitchen_orig
+        .errors
+        .as_ref()
+        .expect("KitchenErrors in original");
+    let errors_ex = kitchen_ex
+        .errors
+        .as_ref()
+        .expect("KitchenErrors in extracted output");
+    assert_eq!(errors_ex.name, errors_orig.name);
+    assert_eq!(errors_ex.codes.len(), errors_orig.codes.len());
+    for (a, b) in errors_ex.codes.iter().zip(errors_orig.codes.iter()) {
+        assert_eq!(a.name, b.name, "error code name mismatch");
+        assert_eq!(a.code, b.code, "error code {} value mismatch", b.name);
+        assert_eq!(
+            a.message, b.message,
+            "error code {} message mismatch",
+            b.name
+        );
+    }
+
+    // The `maybe_item` throws flag rides through the loop above; assert it
+    // explicitly too so a regression names the feature, not just the function.
+    assert!(
+        function_by_name(kitchen_ex, "maybe_item").throws,
+        "maybe_item should round-trip as throws: true"
+    );
+
+    // Interface: constructors, methods, and statics with their shapes.
+    let gadget_orig = interface_by_name(kitchen_orig, "Gadget");
+    let gadget_ex = interface_by_name(kitchen_ex, "Gadget");
+    assert_eq!(gadget_ex.doc, gadget_orig.doc, "Gadget doc mismatch");
+    for (kind, ex, orig) in [
+        (
+            "constructor",
+            &gadget_ex.constructors,
+            &gadget_orig.constructors,
+        ),
+        ("method", &gadget_ex.methods, &gadget_orig.methods),
+        ("static", &gadget_ex.statics, &gadget_orig.statics),
+    ] {
+        assert_eq!(
+            ex.len(),
+            orig.len(),
+            "Gadget {kind} count mismatch: {:?} vs {:?}",
+            ex.iter().map(|f| &f.name).collect::<Vec<_>>(),
+            orig.iter().map(|f| &f.name).collect::<Vec<_>>(),
+        );
+        for (a, b) in ex.iter().zip(orig.iter()) {
+            assert_functions_equivalent(a, b, &format!("Gadget {kind} {}", b.name));
         }
     }
 

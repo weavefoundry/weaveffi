@@ -11,20 +11,12 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        @JvmStatic private external fun products_create_productJni(name: String, price: Double, category: Int): Long
-        @JvmStatic fun products_create_product(name: String, price: Double, category: Category): Long = products_create_productJni(name, price, category.value)
-        @JvmStatic private external fun products_get_productJni(id: Long): Long
-        @JvmStatic fun products_get_product(id: Long): Product = Product(products_get_productJni(id))
-        @JvmStatic private external fun products_search_productsJni(category: Int): LongArray
-        @JvmStatic fun products_search_products(category: Category): LongArray = products_search_productsJni(category.value)
-        @JvmStatic external fun products_update_price(id: Long, price: Double): Boolean
-        @JvmStatic external fun products_delete_product(id: Long): Boolean
-        @JvmStatic external fun orders_create_order(items: LongArray): Long
-        @JvmStatic private external fun orders_get_orderJni(id: Long): Long
-        @JvmStatic fun orders_get_order(id: Long): Order = Order(orders_get_orderJni(id))
-        @JvmStatic external fun orders_cancel_order(id: Long): Boolean
-        @JvmStatic private external fun orders_add_product_to_orderJni(order_id: Long, product: Long): Boolean
-        @JvmStatic fun orders_add_product_to_order(order_id: Long, product: Product): Boolean = orders_add_product_to_orderJni(order_id, product.handle)
+        @JvmStatic external fun createOrder(items: LongArray): Long
+        @JvmStatic private external fun getOrderJni(id: Long): Long
+        @JvmStatic fun getOrder(id: Long): Order = Order(getOrderJni(id))
+        @JvmStatic external fun cancelOrder(id: Long): Boolean
+        @JvmStatic private external fun addProductToOrderJni(orderId: Long, product: Long): Boolean
+        @JvmStatic fun addProductToOrder(orderId: Long, product: Product): Boolean = addProductToOrderJni(orderId, product.handle)
     }
 }
 
@@ -61,6 +53,44 @@ class Product internal constructor(internal var handle: Long) : java.io.Closeabl
     val price: Double get() = nativeGetPrice(handle)
     val category: Category get() = Category.fromValue(nativeGetCategory(handle))
     val tags: Array<String> get() = nativeGetTags(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
+/** A product catalog owning its products */
+class Catalog internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNew(): Long
+        @JvmStatic private external fun nativeAddProduct(selfHandle: Long, name: String, price: Double, category: Int): Long
+        @JvmStatic private external fun nativeGetProduct(selfHandle: Long, id: Long): Long
+        @JvmStatic private external fun nativeSearch(selfHandle: Long, category: Int): LongArray
+        @JvmStatic private external fun nativeUpdatePrice(selfHandle: Long, id: Long, price: Double): Boolean
+        @JvmStatic private external fun nativeRemove(selfHandle: Long, id: Long): Boolean
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+
+        operator fun invoke(): Catalog = Catalog(nativeNew())
+    }
+
+    fun addProduct(name: String, price: Double, category: Category): Product = Product(nativeAddProduct(handle, name, price, category.value))
+
+    fun getProduct(id: Long): Product = Product(nativeGetProduct(handle, id))
+
+    fun search(category: Category): LongArray = nativeSearch(handle, category.value)
+
+    fun updatePrice(id: Long, price: Double): Boolean = nativeUpdatePrice(handle, id, price)
+
+    fun remove(id: Long): Boolean = nativeRemove(handle, id)
 
     override fun close() {
         if (handle != 0L) {
@@ -134,6 +164,37 @@ class Order internal constructor(internal var handle: Long) : java.io.Closeable 
     }
 }
 
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `ProductsError` declared by module `products`. */
+sealed class ProductsException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class InvalidPrice(message: String = "price must be positive") : ProductsException(1, message)
+    class ProductNotFound(message: String = "product not found") : ProductsException(2, message)
+
+    companion object {
+        /** Map a raw `ProductsError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> InvalidPrice(message)
+            2 -> ProductNotFound(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
+
+/** Typed error domain `OrdersError` declared by module `orders`. */
+sealed class OrdersException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class OrderNotFound(message: String = "order not found") : OrdersException(1, message)
+    class EmptyOrder(message: String = "order must contain at least one item") : OrdersException(2, message)
+
+    companion object {
+        /** Map a raw `OrdersError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> OrderNotFound(message)
+            2 -> EmptyOrder(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
 
 // END WeaveFFI.kt

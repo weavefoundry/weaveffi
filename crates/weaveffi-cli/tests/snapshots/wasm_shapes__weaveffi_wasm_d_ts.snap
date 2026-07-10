@@ -7,12 +7,20 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
 /** One field per supported numeric primitive */
 export interface Numerics {
   readonly a: number;
   readonly b: number;
   readonly c: number;
-  readonly d: number;
+  readonly d: bigint;
   readonly e: number;
   readonly f: number;
   readonly g: number;
@@ -64,24 +72,24 @@ export interface WeaveffiWasmModule {
   shapes: {
     /**
      * Render a shape to a string
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
     describe(shape: Shape): string;
     /**
      * Scale a shape by a factor, returning a new shape
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
     scale(shape: Shape, factor: number): Shape;
     /**
      * Sum a list of bytes into a wide integer (numerics smoke)
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    sum_bytes(values: number[]): bigint;
+    sumBytes(values: number[]): bigint;
     /**
      * Build a Numerics struct from every numeric primitive
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    make_numerics(a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: bigint, i: number, j: number): Numerics;
+    makeNumerics(a: number, b: number, c: number, d: bigint, e: number, f: number, g: number, h: bigint, i: number, j: number): Numerics;
   };
 }
 

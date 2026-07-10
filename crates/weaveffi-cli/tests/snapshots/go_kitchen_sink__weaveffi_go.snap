@@ -31,6 +31,46 @@ func cToBool(b C._Bool) bool {
 	return bool(b)
 }
 
+// WeaveFFIError reports a failure crossing the C boundary that no typed
+// error domain claims: an unknown code, a marshalling failure, or a
+// producer panic.
+type WeaveFFIError struct {
+	// Code is the numeric ABI error code.
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *WeaveFFIError) Error() string {
+	return fmt.Sprintf("weaveffi: %s (code %d)", e.Message, e.Code)
+}
+
+// wvTakeError reads and clears a non-zero C error slot, returning its
+// code and message.
+func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+	code := int32(cErr.code)
+	msg := ""
+	if cErr.message != nil {
+		msg = C.GoString(cErr.message)
+	}
+	C.weaveffi_error_clear(cErr)
+	return code, msg
+}
+
+func wvBrandError(code int32, message string) error {
+	return &WeaveFFIError{Code: code, Message: message}
+}
+
+// wvTrap panics when the C error slot reports a failure. Non-throwing
+// wrappers check their slot with it: a non-zero code there can only be
+// a producer panic or a marshalling failure.
+func wvTrap(cErr *C.weaveffi_error) {
+	if cErr.code != 0 {
+		code, msg := wvTakeError(cErr)
+		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
+	}
+}
+
 var (
 	wvCallbackMu  sync.Mutex
 	wvCallbackSeq uint64
@@ -87,18 +127,53 @@ func (s *Token) Close() {
 	}
 }
 
-// SharedPing: Trivial cross-module helper
-func SharedPing() (string, error) {
+// Ping: Trivial cross-module helper
+func Ping() string {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_shared_ping(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return "", goErr
-	}
+	wvTrap(&cErr)
 	goResult := C.GoString(result)
 	C.weaveffi_free_string(result)
-	return goResult, nil
+	return goResult
+}
+
+// KitchenErrorsError is a typed error reported by the `kitchen` module.
+type KitchenErrorsError struct {
+	// Code is the numeric ABI error code (one of the KitchenErrorsError constants).
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *KitchenErrorsError) Error() string {
+	return fmt.Sprintf("kitchen: %s (code %d)", e.Message, e.Code)
+}
+
+// KitchenErrorsError codes.
+const (
+	// KitchenErrorsErrorNotFound: Item not found
+	KitchenErrorsErrorNotFound int32 = 1
+	// KitchenErrorsErrorInvalidInput: Invalid input
+	KitchenErrorsErrorInvalidInput int32 = 2
+)
+
+// wvMapKitchen converts a non-zero code from the `kitchen` domain into a
+// *KitchenErrorsError, falling back to the generic *WeaveFFIError for unknown codes.
+func wvMapKitchen(code int32, message string) error {
+	switch code {
+	case KitchenErrorsErrorNotFound:
+		if message == "" {
+			message = "Item not found"
+		}
+		return &KitchenErrorsError{Code: code, Message: message}
+	case KitchenErrorsErrorInvalidInput:
+		if message == "" {
+			message = "Invalid input"
+		}
+		return &KitchenErrorsError{Code: code, Message: message}
+	default:
+		return wvBrandError(code, message)
+	}
 }
 
 // Priority: Task priority levels
@@ -372,11 +447,59 @@ func (b *ItemBuilder) Build() (*Item, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_Item_create(C.int64_t(id), cName, C.int32_t(count), boolToC(enabled), C.double(ratio), C.uint32_t(nick), cPayloadPtr, cPayloadLen, cTagsPtr, cTagsLen, cAttrsKeysPtr, cAttrsValsPtr, cAttrsLen, cParent, token.ptr, C.weaveffi_kitchen_Priority(priority), &cErr)
 	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
+		return nil, wvBrandError(wvTakeError(&cErr))
 	}
 	return &Item{ptr: result}, nil
+}
+
+// Gadget: A pocket-sized interface exercising the object surface
+type Gadget struct {
+	ptr *C.weaveffi_kitchen_Gadget
+}
+
+// NewGadget: Create a gadget with the given id
+func NewGadget(id int64) *Gadget {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_Gadget_new(C.int64_t(id), &cErr)
+	wvTrap(&cErr)
+	return &Gadget{ptr: result}
+}
+
+// Describe: Render the gadget as a human-readable string
+func (s *Gadget) Describe() string {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_Gadget_describe(s.ptr, &cErr)
+	wvTrap(&cErr)
+	goResult := C.GoString(result)
+	C.weaveffi_free_string(result)
+	return goResult
+}
+
+// Poke: Poke the gadget a number of times, failing on a negative count
+func (s *Gadget) Poke(times int32) (int32, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_Gadget_poke(s.ptr, C.int32_t(times), &cErr)
+	if cErr.code != 0 {
+		return 0, wvMapKitchen(wvTakeError(&cErr))
+	}
+	return int32(result), nil
+}
+
+// GadgetVersion: The gadget subsystem version string
+func GadgetVersion() string {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kitchen_Gadget_version(&cErr)
+	wvTrap(&cErr)
+	goResult := C.GoString(result)
+	C.weaveffi_free_string(result)
+	return goResult
+}
+
+func (s *Gadget) Close() {
+	if s.ptr != nil {
+		C.weaveffi_kitchen_Gadget_destroy(s.ptr)
+		s.ptr = nil
+	}
 }
 
 //export goWv_weaveffi_kitchen_OnReady_fn
@@ -394,9 +517,9 @@ func goWv_weaveffi_kitchen_OnReady_fn(code C.int32_t, msg *C.char, context unsaf
 	cb(arg0, arg1)
 }
 
-// KitchenRegisterReadyListener: Subscribe to OnReady events
-// Returns a subscription id for KitchenUnregisterReadyListener.
-func KitchenRegisterReadyListener(callback func(code int32, msg string)) uint64 {
+// RegisterReadyListener: Subscribe to OnReady events
+// Returns a subscription id for UnregisterReadyListener.
+func RegisterReadyListener(callback func(code int32, msg string)) uint64 {
 	ctxID := wvCallbackStore(callback)
 	id := uint64(C.weaveffi_kitchen_register_ready_listener(C.weaveffi_kitchen_OnReady_fn(unsafe.Pointer(C.goWv_weaveffi_kitchen_OnReady_fn)), unsafe.Pointer(uintptr(ctxID))))
 	wvCallbackMu.Lock()
@@ -405,8 +528,8 @@ func KitchenRegisterReadyListener(callback func(code int32, msg string)) uint64 
 	return id
 }
 
-// KitchenUnregisterReadyListener unregisters a listener previously registered with KitchenRegisterReadyListener.
-func KitchenUnregisterReadyListener(id uint64) {
+// UnregisterReadyListener unregisters a listener previously registered with RegisterReadyListener.
+func UnregisterReadyListener(id uint64) {
 	C.weaveffi_kitchen_unregister_ready_listener(C.uint64_t(id))
 	wvCallbackMu.Lock()
 	ctxID, ok := wvListenerCtx[id]
@@ -417,78 +540,54 @@ func KitchenUnregisterReadyListener(id uint64) {
 	}
 }
 
-// KitchenBoolId: Identity for bool
-func KitchenBoolId(x bool) (bool, error) {
+// BoolId: Identity for bool
+func BoolId(x bool) bool {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_bool_id(boolToC(x), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return false, goErr
-	}
-	return cToBool(result), nil
+	wvTrap(&cErr)
+	return cToBool(result)
 }
 
-func KitchenI32Id(x int32) (int32, error) {
+func I32Id(x int32) int32 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_i32_id(C.int32_t(x), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return int32(result), nil
+	wvTrap(&cErr)
+	return int32(result)
 }
 
-func KitchenU32Id(x uint32) (uint32, error) {
+func U32Id(x uint32) uint32 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_u32_id(C.uint32_t(x), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return uint32(result), nil
+	wvTrap(&cErr)
+	return uint32(result)
 }
 
-func KitchenI64Id(x int64) (int64, error) {
+func I64Id(x int64) int64 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_i64_id(C.int64_t(x), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return int64(result), nil
+	wvTrap(&cErr)
+	return int64(result)
 }
 
-func KitchenF64Id(x float64) (float64, error) {
+func F64Id(x float64) float64 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_f64_id(C.double(x), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return float64(result), nil
+	wvTrap(&cErr)
+	return float64(result)
 }
 
-func KitchenEchoString(s string) (string, error) {
+func EchoString(s string) string {
 	cS := C.CString(s)
 	defer C.free(unsafe.Pointer(cS))
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_echo_string(cS, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return "", goErr
-	}
+	wvTrap(&cErr)
 	goResult := C.GoString(result)
 	C.weaveffi_free_string(result)
-	return goResult, nil
+	return goResult
 }
 
-func KitchenEchoBytes(b []byte) ([]byte, error) {
+func EchoBytes(b []byte) []byte {
 	var cBPtr *C.uint8_t
 	cBLen := C.size_t(len(b))
 	if len(b) > 0 {
@@ -497,37 +596,29 @@ func KitchenEchoBytes(b []byte) ([]byte, error) {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_echo_bytes(cBPtr, cBLen, &cOutLen, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	if result == nil {
-		return nil, nil
+		return nil
 	}
 	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
 	C.weaveffi_free_bytes(result, cOutLen)
-	return goResult, nil
+	return goResult
 }
 
-// KitchenEchoBorrowedStr: Borrowed string parameter
-func KitchenEchoBorrowedStr(s string) (string, error) {
+// EchoBorrowedStr: Borrowed string parameter
+func EchoBorrowedStr(s string) string {
 	cS := C.CString(s)
 	defer C.free(unsafe.Pointer(cS))
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_echo_borrowed_str(cS, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return "", goErr
-	}
+	wvTrap(&cErr)
 	goResult := C.GoString(result)
 	C.weaveffi_free_string(result)
-	return goResult, nil
+	return goResult
 }
 
-// KitchenEchoBorrowedBytes: Borrowed bytes parameter
-func KitchenEchoBorrowedBytes(b []byte) ([]byte, error) {
+// EchoBorrowedBytes: Borrowed bytes parameter
+func EchoBorrowedBytes(b []byte) []byte {
 	var cBPtr *C.uint8_t
 	cBLen := C.size_t(len(b))
 	if len(b) > 0 {
@@ -536,51 +627,37 @@ func KitchenEchoBorrowedBytes(b []byte) ([]byte, error) {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_echo_borrowed_bytes(cBPtr, cBLen, &cOutLen, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	if result == nil {
-		return nil, nil
+		return nil
 	}
 	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
 	C.weaveffi_free_bytes(result, cOutLen)
-	return goResult, nil
+	return goResult
 }
 
-// KitchenOpenHandle: Returns an opaque handle
-func KitchenOpenHandle() (int64, error) {
+// OpenHandle: Returns an opaque handle
+func OpenHandle() int64 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_open_handle(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return int64(result), nil
+	wvTrap(&cErr)
+	return int64(result)
 }
 
-// KitchenOpenTypedHandle: Returns a typed handle
-func KitchenOpenTypedHandle() (*Token, error) {
+// OpenTypedHandle: Returns a typed handle
+func OpenTypedHandle() *Token {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_open_typed_handle(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	return &Token{ptr: result}, nil
+	wvTrap(&cErr)
+	return &Token{ptr: result}
 }
 
-// KitchenMaybeItem: Optional struct return
-func KitchenMaybeItem(id int64) (*Item, error) {
+// MaybeItem: Optional struct return
+func MaybeItem(id int64) (*Item, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_maybe_item(C.int64_t(id), &cErr)
 	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
+		return nil, wvMapKitchen(wvTakeError(&cErr))
 	}
 	if result == nil {
 		return nil, nil
@@ -588,16 +665,12 @@ func KitchenMaybeItem(id int64) (*Item, error) {
 	return &Item{ptr: result}, nil
 }
 
-// KitchenListItems: List of structs
-func KitchenListItems() ([]*Item, error) {
+// ListItems: List of structs
+func ListItems() []*Item {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_list_items(&cOutLen, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	count := int(cOutLen)
 	goResult := make([]*Item, count)
 	if count > 0 && result != nil {
@@ -605,21 +678,17 @@ func KitchenListItems() ([]*Item, error) {
 			goResult[i] = &Item{ptr: v}
 		}
 	}
-	return goResult, nil
+	return goResult
 }
 
-// KitchenGetAttrs: Map return type
-func KitchenGetAttrs() (map[string]int32, error) {
+// GetAttrs: Map return type
+func GetAttrs() map[string]int32 {
 	var cMapKeys **C.char
 	var cMapVals *C.int32_t
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
 	C.weaveffi_kitchen_get_attrs(&cMapKeys, &cMapVals, &cOutLen, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	count := int(cOutLen)
 	goResult := make(map[string]int32, count)
 	if count > 0 && cMapKeys != nil && cMapVals != nil {
@@ -629,18 +698,14 @@ func KitchenGetAttrs() (map[string]int32, error) {
 			goResult[C.GoString(keySlice[i])] = int32(valSlice[i])
 		}
 	}
-	return goResult, nil
+	return goResult
 }
 
-// KitchenStreamItems: Iterator return type
-func KitchenStreamItems() ([]*Item, error) {
+// StreamItems: Iterator return type
+func StreamItems() []*Item {
 	var cErr C.weaveffi_error
 	it := C.weaveffi_kitchen_stream_items(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	defer C.weaveffi_kitchen_StreamItemsIterator_destroy(it)
 	goResult := []*Item{}
 	for {
@@ -649,26 +714,18 @@ func KitchenStreamItems() ([]*Item, error) {
 		if C.weaveffi_kitchen_StreamItemsIterator_next(it, &outItem, &iterErr) == 0 {
 			break
 		}
-		if iterErr.code != 0 {
-			goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(iterErr.message), int(iterErr.code))
-			C.weaveffi_error_clear(&iterErr)
-			return nil, goErr
-		}
+		wvTrap(&iterErr)
 		goResult = append(goResult, &Item{ptr: outItem})
 	}
-	return goResult, nil
+	return goResult
 }
 
-// KitchenCrossModuleToken: Returns the shared Token type from another module
-func KitchenCrossModuleToken() (*Token, error) {
+// CrossModuleToken: Returns the shared Token type from another module
+func CrossModuleToken() *Token {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_cross_module_token(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	return &Token{ptr: result}, nil
+	wvTrap(&cErr)
+	return &Token{ptr: result}
 }
 
 type wvOutcomeKitchenDoAsync struct {
@@ -684,9 +741,7 @@ func goWv_weaveffi_kitchen_do_async_callback(context unsafe.Pointer, err *C.weav
 	}
 	ch := v.(chan wvOutcomeKitchenDoAsync)
 	if err != nil && err.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
-		C.weaveffi_error_clear(err)
-		ch <- wvOutcomeKitchenDoAsync{err: goErr}
+		ch <- wvOutcomeKitchenDoAsync{err: wvMapKitchen(wvTakeError(err))}
 		return
 	}
 	val := ""
@@ -697,9 +752,9 @@ func goWv_weaveffi_kitchen_do_async_callback(context unsafe.Pointer, err *C.weav
 	ch <- wvOutcomeKitchenDoAsync{val: val}
 }
 
-// KitchenDoAsync: Async operation
+// DoAsync: Async operation
 // Blocks until the async producer completes.
-func KitchenDoAsync(input string) (string, error) {
+func DoAsync(input string) string {
 	ch := make(chan wvOutcomeKitchenDoAsync, 1)
 	ctxID := wvCallbackStore(ch)
 	cInput := C.CString(input)
@@ -707,9 +762,9 @@ func KitchenDoAsync(input string) (string, error) {
 	C.weaveffi_kitchen_do_async_async(cInput, C.weaveffi_kitchen_do_async_callback(unsafe.Pointer(C.goWv_weaveffi_kitchen_do_async_callback)), unsafe.Pointer(uintptr(ctxID)))
 	outcome := <-ch
 	if outcome.err != nil {
-		return "", outcome.err
+		panic(outcome.err)
 	}
-	return outcome.val, nil
+	return outcome.val
 }
 
 type wvOutcomeKitchenDoCancellable struct {
@@ -725,9 +780,7 @@ func goWv_weaveffi_kitchen_do_cancellable_callback(context unsafe.Pointer, err *
 	}
 	ch := v.(chan wvOutcomeKitchenDoCancellable)
 	if err != nil && err.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
-		C.weaveffi_error_clear(err)
-		ch <- wvOutcomeKitchenDoCancellable{err: goErr}
+		ch <- wvOutcomeKitchenDoCancellable{err: wvMapKitchen(wvTakeError(err))}
 		return
 	}
 	val := ""
@@ -738,9 +791,9 @@ func goWv_weaveffi_kitchen_do_cancellable_callback(context unsafe.Pointer, err *
 	ch <- wvOutcomeKitchenDoCancellable{val: val}
 }
 
-// KitchenDoCancellable: Cancellable async operation
+// DoCancellable: Cancellable async operation
 // Blocks until the async producer completes.
-func KitchenDoCancellable(input string) (string, error) {
+func DoCancellable(input string) string {
 	ch := make(chan wvOutcomeKitchenDoCancellable, 1)
 	ctxID := wvCallbackStore(ch)
 	cInput := C.CString(input)
@@ -748,48 +801,36 @@ func KitchenDoCancellable(input string) (string, error) {
 	C.weaveffi_kitchen_do_cancellable_async(cInput, nil, C.weaveffi_kitchen_do_cancellable_callback(unsafe.Pointer(C.goWv_weaveffi_kitchen_do_cancellable_callback)), unsafe.Pointer(uintptr(ctxID)))
 	outcome := <-ch
 	if outcome.err != nil {
-		return "", outcome.err
+		panic(outcome.err)
 	}
-	return outcome.val, nil
+	return outcome.val
 }
 
-// KitchenLegacyOp: Legacy operation kept for compatibility
+// LegacyOp: Legacy operation kept for compatibility
 // Deprecated: Use new_op instead
-func KitchenLegacyOp() (int32, error) {
+func LegacyOp() int32 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_legacy_op(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return int32(result), nil
+	wvTrap(&cErr)
+	return int32(result)
 }
 
-// KitchenNewOp: Replacement for legacy_op
-func KitchenNewOp() (int32, error) {
+// NewOp: Replacement for legacy_op
+func NewOp() int32 {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_new_op(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return int32(result), nil
+	wvTrap(&cErr)
+	return int32(result)
 }
 
-// KitchenNestedHello: Trivial nested-module function
-func KitchenNestedHello() (string, error) {
+// Hello: Trivial nested-module function
+func Hello() string {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_nested_hello(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return "", goErr
-	}
+	wvTrap(&cErr)
 	goResult := C.GoString(result)
 	C.weaveffi_free_string(result)
-	return goResult, nil
+	return goResult
 }
 
 

@@ -16,6 +16,51 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+/** Base error for the `docs` module's error domain. */
+export class DocsErrorsError extends WeaveFFIError {}
+
+// Returned when no document matches the requested id
+export class NotFound extends DocsErrorsError {
+  constructor(message = "Document not found") {
+    super(1, message);
+  }
+}
+NotFound.CODE = 1;
+DocsErrorsError.NotFound = NotFound;
+
+// Raised when attempting to move into a forbidden state
+export class InvalidStatus extends DocsErrorsError {
+  constructor(message = "Invalid status transition") {
+    super(2, message);
+  }
+}
+InvalidStatus.CODE = 2;
+DocsErrorsError.InvalidStatus = InvalidStatus;
+
+const _DOCS_ERRORS_ERROR_CODES = Object.freeze({
+  1: NotFound,
+  2: InvalidStatus,
+});
+
+// Build the DocsErrorsError subclass matching `code`, or a generic
+// WeaveFFIError for codes outside the domain (panics, marshalling).
+function _docsErrorsErrorFrom(code, message) {
+  const _cls = _DOCS_ERRORS_ERROR_CODES[code];
+  if (!_cls) return new WeaveFFIError(code, message);
+  return message ? new _cls(message) : new _cls();
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -67,6 +112,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -75,7 +123,7 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
@@ -84,16 +132,32 @@ function _freeErr(wasm, errPtr) {
   wasm.weaveffi_dealloc(errPtr, 8);
 }
 
+// Throw the `DocsErrorsError` domain error (and free the slot) if the error slot
+// carries a non-zero code.
+function _checkDocsErrorsError(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code !== 0) {
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
+    wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
+    throw _docsErrorsErrorFrom(code, msg);
+  }
+}
+
 // Throw if a borrowed (producer-owned) error carries a non-zero
 // code. Used by async callbacks: the producer owns and frees the
 // error struct, so the slot is read but never deallocated here.
-function _checkErrRef(wasm, errPtr) {
+// `mkErr` maps domain codes for throwing callables; without it the
+// generic WeaveFFIError is thrown.
+function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code === 0) return;
   const msgPtr = dv.getUint32(errPtr + 4, true);
   const msg = _readCStr(wasm, msgPtr) || '';
-  throw new Error(`WeaveFFI error ${code}: ${msg}`);
+  throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);
 }
 
 function _registerTrampoline(table, paramTypes, handler) {
@@ -255,7 +319,7 @@ export async function loadWeaveffiWasm(url) {
     if (!ctx) return;
     _asyncContexts.delete(ctxId);
     try {
-      if (errPtr !== 0) _checkErrRef(wasm, errPtr);
+      if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);
       ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);
     } catch (e) {
       ctx.reject(e);
@@ -264,10 +328,62 @@ export async function loadWeaveffiWasm(url) {
 
   const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], _asyncHandler);
 
+  // An ordered collection of documents.
+  // 
+  // Notebooks own their documents and release them when destroyed.
+  class Notebook {
+    constructor() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_docs_Notebook_new(_err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      this._handle = _r;
+    }
+    static _wrap(handle) {
+      const _o = Object.create(Notebook.prototype);
+      _o._handle = handle;
+      return _o;
+    }
+    free() {
+      if (this._handle !== 0) {
+        wasm.weaveffi_docs_Notebook_destroy(this._handle);
+        this._handle = 0;
+      }
+    }
+    insert(document) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_docs_Notebook_insert(this._handle, document._handle, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+    find(id) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_docs_Notebook_find(this._handle, BigInt(id), _err);
+      _checkDocsErrorsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return new Document(wasm, _r);
+    }
+    size() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_docs_Notebook_size(this._handle, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+    static maxDocuments() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_docs_Notebook_max_documents(_err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+  }
+
   return {
     _raw: wasm,
     docs: {
-      create_document(title, tags) {
+      createDocument(title, tags) {
         const [a0_p, a0_s] = _cstr(wasm, title);
         const a1_arr = tags || [];
         const a1_n = a1_arr.length;
@@ -287,26 +403,27 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return new Document(wasm, _r);
       },
-      get_document(id) {
+      getDocument(id) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_docs_get_document(BigInt(id), _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r === 0 ? null : new Document(wasm, _r);
       },
-      publish_async(id) {
+      publishAsync(id) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, r) => r !== 0 });
           wasm.weaveffi_docs_publish_async_async(BigInt(id), _cbPtr_i32_i32_i32, ctxId);
         });
       },
-      register_saved_listener() {
+      registerSavedListener() {
         throw new Error("weaveffi: listener 'saved_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
-      unregister_saved_listener() {
+      unregisterSavedListener() {
         throw new Error("weaveffi: listener 'saved_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
+      Notebook: Notebook,
       Document: {
         create: (...args) => Document.create(wasm, ...args),
         builder: () => new DocumentBuilder(wasm),

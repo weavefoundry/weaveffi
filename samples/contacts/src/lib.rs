@@ -2,15 +2,26 @@
 //!
 //! `#[weaveffi::module]` reads the annotated items and generates the
 //! `#[no_mangle] extern "C"` thunks that back the stable C ABI (and every
-//! generated language binding). The producer keeps its own in-memory store in
-//! safe Rust and writes no `unsafe` FFI glue: opaque `u64` handles are just
-//! integer keys into the store, and `Result` returns surface as the ABI's
-//! `out_err` channel.
+//! generated language binding). The address book is exported as an interface:
+//! each `ContactBook` object owns its contacts directly (methods take `&self`
+//! and guard the state with a `Mutex`, because the object is shared across the
+//! FFI boundary), and fallible methods report typed `ContactsError` codes
+//! through the ABI's error channel. The producer writes no `unsafe` glue.
 
 #[weaveffi::module]
 pub mod contacts {
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::Mutex;
+
+    /// The address book's error domain.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum ContactsError {
+        /// name must not be empty
+        InvalidName = 1,
+        /// contact not found
+        NotFound = 2,
+    }
 
     /// How a contact is classified.
     #[weaveffi::enumeration]
@@ -41,66 +52,84 @@ pub mod contacts {
         pub contact_type: ContactType,
     }
 
-    static STORE: Mutex<Vec<Contact>> = Mutex::new(Vec::new());
-    static NEXT_ID: AtomicI64 = AtomicI64::new(1);
-
-    /// Create a contact, returning its opaque handle.
-    #[weaveffi::export]
-    pub fn create_contact(
-        first_name: String,
-        last_name: String,
-        email: Option<String>,
-        contact_type: ContactType,
-    ) -> u64 {
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        STORE.lock().unwrap().push(Contact {
-            id,
-            first_name,
-            last_name,
-            email,
-            contact_type,
-        });
-        id as u64
+    /// An in-memory address book exported as an interface. Each book owns its
+    /// contacts and id counter directly; destroying the object (via the
+    /// generated destroy symbol) releases that state.
+    #[weaveffi::interface]
+    pub struct ContactBook {
+        contacts: Mutex<Vec<Contact>>,
+        next_id: AtomicI64,
     }
 
-    /// Look up a contact by handle, erroring if none exists.
-    #[weaveffi::export]
-    pub fn get_contact(id: u64) -> Result<Contact, String> {
-        STORE
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|c| c.id == id as i64)
-            .cloned()
-            .ok_or_else(|| format!("contact {id} not found"))
+    impl Default for ContactBook {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
-    /// List every stored contact.
-    #[weaveffi::export]
-    pub fn list_contacts() -> Vec<Contact> {
-        STORE.lock().unwrap().clone()
-    }
+    impl ContactBook {
+        /// Create an empty address book.
+        pub fn new() -> Self {
+            ContactBook {
+                contacts: Mutex::new(Vec::new()),
+                next_id: AtomicI64::new(1),
+            }
+        }
 
-    /// Delete a contact by handle, returning whether it existed.
-    #[weaveffi::export]
-    pub fn delete_contact(id: u64) -> bool {
-        let mut store = STORE.lock().unwrap();
-        let before = store.len();
-        store.retain(|c| c.id != id as i64);
-        store.len() < before
-    }
+        /// Add a contact, returning the stored record with its assigned id.
+        /// An empty first or last name is rejected with
+        /// [`ContactsError::InvalidName`].
+        pub fn add(
+            &self,
+            first_name: String,
+            last_name: String,
+            email: Option<String>,
+            contact_type: ContactType,
+        ) -> Result<Contact, ContactsError> {
+            if first_name.is_empty() || last_name.is_empty() {
+                return Err(ContactsError::InvalidName);
+            }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let contact = Contact {
+                id,
+                first_name,
+                last_name,
+                email,
+                contact_type,
+            };
+            self.contacts.lock().unwrap().push(contact.clone());
+            Ok(contact)
+        }
 
-    /// Count the stored contacts.
-    #[weaveffi::export]
-    pub fn count_contacts() -> i32 {
-        STORE.lock().unwrap().len() as i32
-    }
+        /// Look up a contact by id, failing with [`ContactsError::NotFound`]
+        /// when none exists.
+        pub fn get(&self, id: i64) -> Result<Contact, ContactsError> {
+            self.contacts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.id == id)
+                .cloned()
+                .ok_or(ContactsError::NotFound)
+        }
 
-    /// Reset the in-memory store. Test-only helper (not part of the ABI).
-    #[cfg(test)]
-    pub(crate) fn reset() {
-        STORE.lock().unwrap().clear();
-        NEXT_ID.store(1, Ordering::Relaxed);
+        /// List every stored contact.
+        pub fn list(&self) -> Vec<Contact> {
+            self.contacts.lock().unwrap().clone()
+        }
+
+        /// Remove a contact by id, returning whether it existed.
+        pub fn remove(&self, id: i64) -> bool {
+            let mut contacts = self.contacts.lock().unwrap();
+            let before = contacts.len();
+            contacts.retain(|c| c.id != id);
+            contacts.len() < before
+        }
+
+        /// Count the stored contacts.
+        pub fn count(&self) -> i32 {
+            self.contacts.lock().unwrap().len() as i32
+        }
     }
 }
 
@@ -108,32 +137,21 @@ weaveffi::export_runtime!();
 
 #[cfg(test)]
 mod tests {
-    use super::contacts::{
-        count_contacts, create_contact, delete_contact, get_contact, list_contacts, reset,
-        ContactType,
-    };
-    use std::sync::Mutex;
-
-    // The store is process-global, so serialize the tests that touch it.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn guard() -> std::sync::MutexGuard<'static, ()> {
-        let g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset();
-        g
-    }
+    use super::contacts::{ContactBook, ContactType, ContactsError};
 
     #[test]
     fn create_and_get() {
-        let _g = guard();
-        let id = create_contact(
-            "Alice".into(),
-            "Smith".into(),
-            Some("alice@example.com".into()),
-            ContactType::Work,
-        );
-        assert!(id > 0);
-        let c = get_contact(id).expect("contact exists");
+        let book = ContactBook::new();
+        let added = book
+            .add(
+                "Alice".into(),
+                "Smith".into(),
+                Some("alice@example.com".into()),
+                ContactType::Work,
+            )
+            .expect("valid contact");
+        assert!(added.id > 0);
+        let c = book.get(added.id).expect("contact exists");
         assert_eq!(c.first_name, "Alice");
         assert_eq!(c.last_name, "Smith");
         assert_eq!(c.email.as_deref(), Some("alice@example.com"));
@@ -142,53 +160,81 @@ mod tests {
 
     #[test]
     fn create_without_email() {
-        let _g = guard();
-        let id = create_contact("Bob".into(), "Jones".into(), None, ContactType::Personal);
-        assert_eq!(get_contact(id).unwrap().email, None);
+        let book = ContactBook::new();
+        let added = book
+            .add("Bob".into(), "Jones".into(), None, ContactType::Personal)
+            .unwrap();
+        assert_eq!(book.get(added.id).unwrap().email, None);
     }
 
     #[test]
-    fn get_missing_is_err() {
-        let _g = guard();
-        assert!(get_contact(999).is_err());
+    fn add_empty_name_is_invalid() {
+        let book = ContactBook::new();
+        assert!(matches!(
+            book.add("".into(), "Smith".into(), None, ContactType::Personal),
+            Err(ContactsError::InvalidName)
+        ));
+        assert!(matches!(
+            book.add("Ada".into(), "".into(), None, ContactType::Personal),
+            Err(ContactsError::InvalidName)
+        ));
+        assert_eq!(book.count(), 0);
+    }
+
+    #[test]
+    fn get_missing_is_not_found() {
+        let book = ContactBook::new();
+        assert!(matches!(book.get(999), Err(ContactsError::NotFound)));
     }
 
     #[test]
     fn count_and_list() {
-        let _g = guard();
-        assert_eq!(count_contacts(), 0);
-        create_contact("A".into(), "B".into(), None, ContactType::Personal);
-        create_contact("C".into(), "D".into(), None, ContactType::Work);
-        assert_eq!(count_contacts(), 2);
-        assert_eq!(list_contacts().len(), 2);
+        let book = ContactBook::new();
+        assert_eq!(book.count(), 0);
+        book.add("A".into(), "B".into(), None, ContactType::Personal)
+            .unwrap();
+        book.add("C".into(), "D".into(), None, ContactType::Work)
+            .unwrap();
+        assert_eq!(book.count(), 2);
+        assert_eq!(book.list().len(), 2);
     }
 
     #[test]
-    fn delete_removes() {
-        let _g = guard();
-        let id = create_contact("Del".into(), "Me".into(), None, ContactType::Other);
-        assert_eq!(count_contacts(), 1);
-        assert!(delete_contact(id));
-        assert_eq!(count_contacts(), 0);
-        assert!(!delete_contact(id));
+    fn remove_deletes() {
+        let book = ContactBook::new();
+        let added = book
+            .add("Del".into(), "Me".into(), None, ContactType::Other)
+            .unwrap();
+        assert_eq!(book.count(), 1);
+        assert!(book.remove(added.id));
+        assert_eq!(book.count(), 0);
+        assert!(!book.remove(added.id));
     }
 
-    // A direct exercise of the generated C ABI thunks: create through the
-    // `extern "C"` entry point, read a field getter, and free the result.
+    // A direct exercise of the generated C ABI thunks: construct a book
+    // through the interface constructor, drive its methods (including the
+    // typed error path), read a field getter, and destroy every object.
     #[test]
     fn ffi_surface_smoke() {
         use super::contacts::{
+            weaveffi_contacts_ContactBook_add, weaveffi_contacts_ContactBook_count,
+            weaveffi_contacts_ContactBook_destroy, weaveffi_contacts_ContactBook_get,
+            weaveffi_contacts_ContactBook_new, weaveffi_contacts_ContactBook_remove,
             weaveffi_contacts_Contact_destroy, weaveffi_contacts_Contact_get_first_name,
-            weaveffi_contacts_create_contact, weaveffi_contacts_get_contact,
+            weaveffi_contacts_Contact_get_id, ContactType,
         };
         use std::ffi::CString;
-        use weaveffi::abi::{c_ptr_to_string, free_string, weaveffi_error};
+        use weaveffi::abi::{self, c_ptr_to_string, free_string, weaveffi_error};
 
-        let _g = guard();
         let mut err = weaveffi_error::default();
+        let book = weaveffi_contacts_ContactBook_new(&mut err);
+        assert_eq!(err.code, 0);
+        assert!(!book.is_null());
+
         let first = CString::new("Zoe").unwrap();
         let last = CString::new("Quinn").unwrap();
-        let handle = weaveffi_contacts_create_contact(
+        let added = weaveffi_contacts_ContactBook_add(
+            book,
             first.as_ptr(),
             last.as_ptr(),
             std::ptr::null(),
@@ -196,16 +242,42 @@ mod tests {
             &mut err,
         );
         assert_eq!(err.code, 0);
-        assert!(handle > 0);
+        assert!(!added.is_null());
+        let id = weaveffi_contacts_Contact_get_id(added);
+        assert!(id > 0);
 
-        let c = weaveffi_contacts_get_contact(handle, &mut err);
+        // An empty first name reports the InvalidName domain code.
+        let empty = CString::new("").unwrap();
+        let rejected = weaveffi_contacts_ContactBook_add(
+            book,
+            empty.as_ptr(),
+            last.as_ptr(),
+            std::ptr::null(),
+            ContactType::Work as i32,
+            &mut err,
+        );
+        assert!(rejected.is_null());
+        assert_eq!(err.code, 1);
+        abi::error_clear(&mut err);
+
+        let fetched = weaveffi_contacts_ContactBook_get(book, id, &mut err);
         assert_eq!(err.code, 0);
-        assert!(!c.is_null());
-
-        let fname = weaveffi_contacts_Contact_get_first_name(c);
+        assert!(!fetched.is_null());
+        let fname = weaveffi_contacts_Contact_get_first_name(fetched);
         assert_eq!(c_ptr_to_string(fname).unwrap(), "Zoe");
         free_string(fname);
 
-        weaveffi_contacts_Contact_destroy(c);
+        assert_eq!(weaveffi_contacts_ContactBook_count(book, &mut err), 1);
+        assert!(weaveffi_contacts_ContactBook_remove(book, id, &mut err));
+
+        // A missing id reports the NotFound domain code.
+        let missing = weaveffi_contacts_ContactBook_get(book, id, &mut err);
+        assert!(missing.is_null());
+        assert_eq!(err.code, 2);
+        abi::error_clear(&mut err);
+
+        weaveffi_contacts_Contact_destroy(added);
+        weaveffi_contacts_Contact_destroy(fetched);
+        weaveffi_contacts_ContactBook_destroy(book);
     }
 }

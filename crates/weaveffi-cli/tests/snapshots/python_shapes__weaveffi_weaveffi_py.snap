@@ -374,7 +374,7 @@ class Numerics:
 
 
 
-def shapes_describe(shape: "Shape") -> str:
+def describe(shape: "Shape") -> str:
     """Render a shape to a string
     """
     _fn = _lib.weaveffi_shapes_describe
@@ -386,7 +386,7 @@ def shapes_describe(shape: "Shape") -> str:
     return _bytes_to_string(_result) or ""
 
 
-def shapes_scale(shape: "Shape", factor: float) -> "Shape":
+def scale(shape: "Shape", factor: float) -> "Shape":
     """Scale a shape by a factor, returning a new shape
     """
     _fn = _lib.weaveffi_shapes_scale
@@ -400,7 +400,7 @@ def shapes_scale(shape: "Shape", factor: float) -> "Shape":
     return Shape(_result)
 
 
-def shapes_sum_bytes(values: List[int]) -> int:
+def sum_bytes(values: List[int]) -> int:
     """Sum a list of bytes into a wide integer (numerics smoke)
     """
     _fn = _lib.weaveffi_shapes_sum_bytes
@@ -413,7 +413,7 @@ def shapes_sum_bytes(values: List[int]) -> int:
     return _result
 
 
-def shapes_make_numerics(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: float, j: float) -> "Numerics":
+def make_numerics(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: float, j: float) -> "Numerics":
     """Build a Numerics struct from every numeric primitive
     """
     _fn = _lib.weaveffi_shapes_make_numerics

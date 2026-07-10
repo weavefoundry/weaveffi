@@ -90,6 +90,44 @@ import threading
 
 # === Module: tasks ===
 
+class TaskError(WeaveFFIError):
+    """Base exception for the `tasks` module's error domain."""
+
+
+class InvalidName(TaskError):
+    """task name must not be empty"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "task name must not be empty") -> None:
+        super().__init__(1, message)
+
+
+TaskError.InvalidName = InvalidName
+
+
+_TASK_ERROR_CODES: Dict[int, type] = {
+    1: InvalidName,
+}
+
+
+def _task_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the TaskError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _TASK_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_task_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _task_error_from(code, message)
+
+
 class TaskResult:
 
     def __init__(self, _ptr: int) -> None:
@@ -130,7 +168,13 @@ class TaskResult:
 
 
 
-def _tasks_run_task_sync(name: str) -> "TaskResult":
+def _run_task_sync(name: str) -> "TaskResult":
+    """
+    Raises
+    ------
+    TaskError
+        If the call reports one of the domain's error codes.
+    """
     _fn = _lib.weaveffi_tasks_run_task_async
     _ev = threading.Event()
     _state = {"err": None, "val": None}
@@ -140,7 +184,7 @@ def _tasks_run_task_sync(name: str) -> "TaskResult":
                 _code = err.contents.code
                 _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
                 _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveFFIError(_code, _msg)
+                _state["err"] = _task_error_from(_code, _msg)
             else:
                 if result is None:
                     _state["err"] = WeaveFFIError(-1, "null pointer")
@@ -159,12 +203,18 @@ def _tasks_run_task_sync(name: str) -> "TaskResult":
     return _state["val"]
 
 
-async def tasks_run_task(name: str) -> "TaskResult":
+async def run_task(name: str) -> "TaskResult":
+    """
+    Raises
+    ------
+    TaskError
+        If the call reports one of the domain's error codes.
+    """
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _tasks_run_task_sync, name)
+    return await _loop.run_in_executor(None, _run_task_sync, name)
 
 
-def _tasks_run_batch_sync(names: List[str]) -> List["TaskResult"]:
+def _run_batch_sync(names: List[str]) -> List["TaskResult"]:
     _fn = _lib.weaveffi_tasks_run_batch_async
     _ev = threading.Event()
     _state = {"err": None, "val": None}
@@ -195,12 +245,12 @@ def _tasks_run_batch_sync(names: List[str]) -> List["TaskResult"]:
     return _state["val"]
 
 
-async def tasks_run_batch(names: List[str]) -> List["TaskResult"]:
+async def run_batch(names: List[str]) -> List["TaskResult"]:
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _tasks_run_batch_sync, names)
+    return await _loop.run_in_executor(None, _run_batch_sync, names)
 
 
-def tasks_cancel_task(id: int) -> bool:
+def cancel_task(id: int) -> bool:
     _fn = _lib.weaveffi_tasks_cancel_task
     _fn.argtypes = [ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int32
@@ -210,7 +260,7 @@ def tasks_cancel_task(id: int) -> bool:
     return bool(_result)
 
 
-def _tasks_run_n_tasks_sync(n: int) -> int:
+def _run_n_tasks_sync(n: int) -> int:
     _fn = _lib.weaveffi_tasks_run_n_tasks_async
     _ev = threading.Event()
     _state = {"err": None, "val": None}
@@ -236,12 +286,12 @@ def _tasks_run_n_tasks_sync(n: int) -> int:
     return _state["val"]
 
 
-async def tasks_run_n_tasks(n: int) -> int:
+async def run_n_tasks(n: int) -> int:
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _tasks_run_n_tasks_sync, n)
+    return await _loop.run_in_executor(None, _run_n_tasks_sync, n)
 
 
-def tasks_active_callbacks() -> int:
+def active_callbacks() -> int:
     _fn = _lib.weaveffi_tasks_active_callbacks
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_int64

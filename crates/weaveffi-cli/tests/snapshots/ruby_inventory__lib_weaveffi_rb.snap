@@ -58,6 +58,51 @@ module WeaveFFI
 
   # === Module: products ===
 
+  # Base error for the `products` module's error domain.
+  class ProductsError < Error
+    # price must be positive
+    class InvalidPrice < ProductsError
+      CODE = 1
+
+      def initialize(message = 'price must be positive')
+        super(1, message)
+      end
+    end
+
+    # product not found
+    class ProductNotFound < ProductsError
+      CODE = 2
+
+      def initialize(message = 'product not found')
+        super(2, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the ProductsError domain to its error class.
+  PRODUCTS_ERROR_CODES = {
+    1 => ProductsError::InvalidPrice,
+    2 => ProductsError::ProductNotFound,
+  }.freeze
+
+  # Builds the ProductsError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.products_error_from(code, message)
+    cls = PRODUCTS_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed ProductsError for a non-zero error slot.
+  def self.check_products_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise products_error_from(code, msg)
+  end
+
   module Category
     ELECTRONICS = 0
     CLOTHING = 1
@@ -72,11 +117,14 @@ module WeaveFFI
   attach_function :weaveffi_products_Product_get_price, [:pointer], :double
   attach_function :weaveffi_products_Product_get_category, [:pointer], :int32
   attach_function :weaveffi_products_Product_get_tags, [:pointer, :pointer], :pointer
-  attach_function :weaveffi_products_create_product, [:string, :double, :int32, :pointer], :uint64
-  attach_function :weaveffi_products_get_product, [:uint64, :pointer], :pointer
-  attach_function :weaveffi_products_search_products, [:int32, :pointer, :pointer], :pointer
-  attach_function :weaveffi_products_update_price, [:uint64, :double, :pointer], :int32
-  attach_function :weaveffi_products_delete_product, [:uint64, :pointer], :int32
+
+  attach_function :weaveffi_products_Catalog_destroy, [:pointer], :void
+  attach_function :weaveffi_products_Catalog_new, [:pointer], :pointer
+  attach_function :weaveffi_products_Catalog_add_product, [:pointer, :string, :double, :int32, :pointer], :pointer
+  attach_function :weaveffi_products_Catalog_get_product, [:pointer, :int64, :pointer], :pointer
+  attach_function :weaveffi_products_Catalog_search, [:pointer, :int32, :pointer, :pointer], :pointer
+  attach_function :weaveffi_products_Catalog_update_price, [:pointer, :int64, :double, :pointer], :int32
+  attach_function :weaveffi_products_Catalog_remove, [:pointer, :int64, :pointer], :int32
 
   class ProductPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -141,46 +189,125 @@ module WeaveFFI
     end
   end
 
-  def self.create_product(name, price, category)
-    err = ErrorStruct.new
-    result = weaveffi_products_create_product(name, price, category, err)
-    check_error!(err)
-    result
+  class CatalogPtr < FFI::AutoPointer
+    def self.release(ptr)
+      WeaveFFI.weaveffi_products_Catalog_destroy(ptr)
+    end
   end
 
-  def self.get_product(id)
-    err = ErrorStruct.new
-    result = weaveffi_products_get_product(id, err)
-    check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Product.new(result)
-  end
+  # A product catalog owning its products
+  class Catalog
+    attr_reader :handle
 
-  def self.search_products(category)
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_products_search_products(category, out_len, err)
-    check_error!(err)
-    return [] if result.null?
-    len = out_len.read(:size_t)
-    result.read_array_of_pointer(len).map { |p| Product.new(p) }
-  end
+    # Wraps an owned pointer the producer handed over, without
+    # re-running initialize.
+    def self._from_ptr(ptr)
+      obj = allocate
+      obj.instance_variable_set(:@handle, CatalogPtr.new(ptr))
+      obj
+    end
 
-  def self.update_price(id, price)
-    err = ErrorStruct.new
-    result = weaveffi_products_update_price(id, price, err)
-    check_error!(err)
-    result != 0
-  end
+    def destroy
+      return if @handle.nil?
+      @handle.free
+      @handle = nil
+    end
 
-  def self.delete_product(id)
-    err = ErrorStruct.new
-    result = weaveffi_products_delete_product(id, err)
-    check_error!(err)
-    result != 0
+    def initialize()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_products_Catalog_new(err)
+      WeaveFFI.check_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      @handle = CatalogPtr.new(result)
+    end
+
+    def add_product(name, price, category)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_products_Catalog_add_product(@handle, name, price, category, err)
+      WeaveFFI.check_products_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      Product.new(result)
+    end
+
+    def get_product(id)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_products_Catalog_get_product(@handle, id, err)
+      WeaveFFI.check_products_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      Product.new(result)
+    end
+
+    def search(category)
+      err = ErrorStruct.new
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_products_Catalog_search(@handle, category, out_len, err)
+      WeaveFFI.check_error!(err)
+      return [] if result.null?
+      len = out_len.read(:size_t)
+      result.read_array_of_pointer(len).map { |p| Product.new(p) }
+    end
+
+    def update_price(id, price)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_products_Catalog_update_price(@handle, id, price, err)
+      WeaveFFI.check_products_error!(err)
+      result != 0
+    end
+
+    def remove(id)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_products_Catalog_remove(@handle, id, err)
+      WeaveFFI.check_error!(err)
+      result != 0
+    end
   end
 
   # === Module: orders ===
+
+  # Base error for the `orders` module's error domain.
+  class OrdersError < Error
+    # order not found
+    class OrderNotFound < OrdersError
+      CODE = 1
+
+      def initialize(message = 'order not found')
+        super(1, message)
+      end
+    end
+
+    # order must contain at least one item
+    class EmptyOrder < OrdersError
+      CODE = 2
+
+      def initialize(message = 'order must contain at least one item')
+        super(2, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the OrdersError domain to its error class.
+  ORDERS_ERROR_CODES = {
+    1 => OrdersError::OrderNotFound,
+    2 => OrdersError::EmptyOrder,
+  }.freeze
+
+  # Builds the OrdersError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.orders_error_from(code, message)
+    cls = ORDERS_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed OrdersError for a non-zero error slot.
+  def self.check_orders_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise orders_error_from(code, msg)
+  end
 
   attach_function :weaveffi_orders_OrderItem_destroy, [:pointer], :void
   attach_function :weaveffi_orders_OrderItem_get_product_id, [:pointer], :int64
@@ -192,10 +319,10 @@ module WeaveFFI
   attach_function :weaveffi_orders_Order_get_items, [:pointer, :pointer], :pointer
   attach_function :weaveffi_orders_Order_get_total, [:pointer], :double
   attach_function :weaveffi_orders_Order_get_status, [:pointer], :pointer
-  attach_function :weaveffi_orders_create_order, [:pointer, :size_t, :pointer], :uint64
-  attach_function :weaveffi_orders_get_order, [:uint64, :pointer], :pointer
-  attach_function :weaveffi_orders_cancel_order, [:uint64, :pointer], :int32
-  attach_function :weaveffi_orders_add_product_to_order, [:uint64, :pointer, :pointer], :int32
+  attach_function :weaveffi_orders_create_order, [:pointer, :size_t, :pointer], :int64
+  attach_function :weaveffi_orders_get_order, [:int64, :pointer], :pointer
+  attach_function :weaveffi_orders_cancel_order, [:int64, :pointer], :int32
+  attach_function :weaveffi_orders_add_product_to_order, [:int64, :pointer, :pointer], :int32
 
   class OrderItemPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -291,14 +418,14 @@ module WeaveFFI
     items_buf = FFI::MemoryPointer.new(:pointer, items.length)
     items_buf.write_array_of_pointer(items.map(&:handle))
     result = weaveffi_orders_create_order(items_buf, items.length, err)
-    check_error!(err)
+    check_orders_error!(err)
     result
   end
 
   def self.get_order(id)
     err = ErrorStruct.new
     result = weaveffi_orders_get_order(id, err)
-    check_error!(err)
+    check_orders_error!(err)
     raise Error.new(-1, 'null pointer') if result.null?
     Order.new(result)
   end

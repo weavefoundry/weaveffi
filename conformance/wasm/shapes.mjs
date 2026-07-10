@@ -77,8 +77,8 @@ const big = api.shapes.scale(circle, 4.0);
 expect(big.tag === Tag.Circle, 'scaled.tag === Circle');
 expect(approx(big.circleRadius, 10.0, 1e-9), 'scaled.circleRadius == 10.0');
 
-// numerics: list<u8> in, u64 out (BigInt).
-expect(api.shapes.sum_bytes([250, 250, 250, 250]) === 1000n, 'sum_bytes == 1000n');
+// numerics: list<u8> in, u64 out (BigInt); lowerCamelCase wrapper name.
+expect(api.shapes.sumBytes([250, 250, 250, 250]) === 1000n, 'sumBytes == 1000n');
 
 // Cleanup: release every producer-owned handle exactly once.
 big.free();

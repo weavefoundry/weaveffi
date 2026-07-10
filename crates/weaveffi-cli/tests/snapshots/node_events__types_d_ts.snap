@@ -6,18 +6,30 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
 // module events
-export function events_register_message_listener(callback: (message: string) => void): number
-export function events_unregister_message_listener(id: number): void
+export function registerMessageListener(callback: (message: string) => void): number
+export function unregisterMessageListener(id: number): void
 /**
  * Send a message, triggering the OnMessage callback
  * Maps to C function: weaveffi_events_send_message
  */
-export function events_send_message(text: string): void
+export function sendMessage(text: string): void
 /**
  * Return an iterator over all sent messages
  * Maps to C function: weaveffi_events_get_messages
  */
-export function events_get_messages(): string[]
+export function getMessages(): string[]
 
 // END types.d.ts

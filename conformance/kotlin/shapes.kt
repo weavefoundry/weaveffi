@@ -7,7 +7,8 @@
 // `labeledCount`) over every variant: unit (`Empty`), f64 (`Circle`), two f32
 // (`Rectangle`), and string + u8 (`Labeled`). Also drives the free functions
 // that take and return a `Shape` by opaque handle (`describe`, `scale`) plus the
-// expanded numerics (`sum_bytes`: list<u8> in, u64 out). Mirrors the C and C++
+// expanded numerics (`sumBytes`: list<u8> in, u64 out); function names are the
+// 0.5.0 defaults (lowerCamelCase, module prefix stripped). Mirrors the C and C++
 // consumers' assertions. Compiled in-module with the generated `WeaveFFI.kt`, so
 // the `internal` constructor used to re-wrap returned handles is reachable.
 @file:JvmName("Main")
@@ -47,20 +48,20 @@ fun main() {
     expect(labeled.labeledCount.toInt() == 6, "labeled count (got ${labeled.labeledCount})")
 
     // describe: dispatch on the active variant, rich enum in -> string out.
-    val desc = WeaveFFI.shapes_describe(circle)
+    val desc = WeaveFFI.describe(circle)
     expect(desc == "circle(r=2.5)", "describe circle (got $desc)")
 
     // scale: rich enum in and out (opaque handle round-trips through the class).
-    val big = WeaveFFI.shapes_scale(circle, 4.0)
+    val big = WeaveFFI.scale(circle, 4.0)
     expect(big.tag == Shape.Tag.Circle, "scaled tag")
     expect(abs(big.circleRadius - 10.0) < 1e-9, "scaled radius (got ${big.circleRadius})")
 
     // numerics: list<u8> in, u64 out. 250 wraps to a signed -6 byte but the JNI
     // shim reinterprets it as uint8_t, so the producer sums 250 * 4 == 1000.
-    val total = WeaveFFI.shapes_sum_bytes(
+    val total = WeaveFFI.sumBytes(
         byteArrayOf(250.toByte(), 250.toByte(), 250.toByte(), 250.toByte())
     )
-    expect(total == 1000L, "sum_bytes (got $total)")
+    expect(total == 1000L, "sumBytes (got $total)")
 
     // Release the native handles (also exercises close()/nativeDestroy).
     big.close()

@@ -46,15 +46,43 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
 
+Wrappers of functions declared `throws` raise the declaring module's typed
+error class (a `WeaveFFIError` subclass with a per-code subclass, such as
+`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
+for producer panics and marshalling failures.
+
 ## API Reference
 
 ### Module: `contacts`
 
-#### Functions
+#### Error Domain: `ContactsError`
 
-##### `weaveffi_contacts_create_contact`
+Throwing wrappers in this module raise `ContactsError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
 
-`weaveffi_contacts_create_contact(first_name: i32, i32, last_name: i32, i32, email: i32, i32, contact_type: i32) -> i64`
+| Class | Code | Default Message |
+|-------|------|-----------------|
+| `InvalidName` | `1` | name must not be empty |
+| `NotFound` | `2` | contact not found |
+
+#### Interfaces
+
+##### `ContactBook`
+
+An in-memory address book owning its contacts
+
+Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+
+##### `weaveffi_contacts_ContactBook_new`
+
+`weaveffi_contacts_ContactBook_new() -> i64`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `ContactBook` | `i64` | opaque handle in linear memory |
+
+##### `weaveffi_contacts_ContactBook_add`
+
+`weaveffi_contacts_ContactBook_add(first_name: i32, i32, last_name: i32, i32, email: i32, i32, contact_type: i32) -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
@@ -62,41 +90,45 @@ export the following functions:
 | `last_name` | `string` | `i32, i32` | ptr + len in linear memory |
 | `email` | `string?` | `i32, i32` | is_present flag + value |
 | `contact_type` | `ContactType` | `i32` | variant discriminant |
-| _returns_ | `handle` | `i64` | opaque pointer |
+| _returns_ | `Contact` | `i64` | opaque handle in linear memory |
 
-##### `weaveffi_contacts_get_contact`
+##### `weaveffi_contacts_ContactBook_get`
 
-`weaveffi_contacts_get_contact(id: i64) -> i64`
+`weaveffi_contacts_ContactBook_get(id: i64) -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `id` | `handle` | `i64` | opaque pointer |
+| `id` | `i64` | `i64` | native Wasm i64 |
 | _returns_ | `Contact` | `i64` | opaque handle in linear memory |
 
-##### `weaveffi_contacts_list_contacts`
+##### `weaveffi_contacts_ContactBook_list`
 
-`weaveffi_contacts_list_contacts() -> i32, i32`
+`weaveffi_contacts_ContactBook_list() -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `[Contact]` | `i32, i32` | ptr + len in linear memory |
 
-##### `weaveffi_contacts_delete_contact`
+##### `weaveffi_contacts_ContactBook_remove`
 
-`weaveffi_contacts_delete_contact(id: i64) -> i32`
+`weaveffi_contacts_ContactBook_remove(id: i64) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `id` | `handle` | `i64` | opaque pointer |
+| `id` | `i64` | `i64` | native Wasm i64 |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
-##### `weaveffi_contacts_count_contacts`
+##### `weaveffi_contacts_ContactBook_count`
 
-`weaveffi_contacts_count_contacts() -> i32`
+`weaveffi_contacts_ContactBook_count() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | _returns_ | `i32` | `i32` | native Wasm i32 |
+
+##### `weaveffi_contacts_ContactBook_destroy`
+
+Releases the object reference. Called by the wrapper's `free()`.
 
 #### Structs
 

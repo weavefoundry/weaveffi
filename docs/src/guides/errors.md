@@ -2,19 +2,29 @@
 
 ## Overview
 
-WeaveFFI uses a uniform error model across the FFI boundary. Every
-generated function carries an out-error parameter (`weaveffi_error*`)
-that reports success or failure through an integer code and an
-optional message string. Each generator maps that to its target's
-idiomatic error mechanism (exceptions, `throws`, `Result`, etc.) so
-consumers rarely touch the C-level struct directly.
+WeaveFFI's error model is typed and opt-in. A module declares an **error
+domain**: a named set of symbolic codes. A function, method, or constructor
+opts into that domain by declaring `throws: true`, and every generator then
+surfaces its failures through the target's idiomatic error mechanism
+(`throws` in Swift, `raise` in Python, `(T, error)` in Go, exceptions
+elsewhere) carrying a *typed* error derived from the domain, so consumers
+catch and match on the codes you declared.
+
+A callable **without** `throws` has a plain signature: no `throws` clause,
+no error return. It cannot report a domain error; the only failures it can
+experience are producer bugs (a panic, a marshalling failure), and those
+surface as a generic branded error or a trap rather than a typed error.
+
+Underneath, every generated symbol still reports through the C-level
+out-error parameter (`weaveffi_error*`) with an integer code and an
+optional message string; the typed surface is built on top of it.
 
 ## When to use
 
 Reach for this guide when:
 
 - You are designing an IDL and want to surface stable, named error
-  codes to consumers.
+  codes to consumers as typed errors.
 - You are writing the Rust implementation of a module and need to
   return errors over the C ABI.
 - You are debugging an "unknown error" surface in a generated
@@ -24,53 +34,99 @@ Reach for this guide when:
 
 ## Step-by-step
 
-### Define an error domain in the IDL
+### Declare a domain and opt in with `throws`
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     errors:
-      name: ContactErrors
+      name: ContactsError
       codes:
-        - name: not_found
+        - name: InvalidName
           code: 1
-          message: "Contact not found"
-        - name: duplicate
+          message: "name must not be empty"
+        - name: NotFound
           code: 2
-          message: "Contact already exists"
-        - name: invalid_email
-          code: 3
-          message: "Email address is invalid"
+          message: "contact not found"
 
     functions:
       - name: get_contact
         params:
-          - { name: id, type: handle }
+          - { name: id, type: i64 }
         return: string
+        throws: true
+
+      - name: count_contacts
+        params: []
+        return: i32
 ```
+
+`get_contact` is fallible and delivers `ContactsError` values;
+`count_contacts` has a plain signature in every target. Code names are
+PascalCase by convention (`NotFound`, not `not_found`); each generator
+re-cases them into its own idiom.
+
+The domain is in scope for its module and every module nested inside it,
+so one domain on a parent module can serve a whole subtree. Interface
+constructors and methods opt in with the same `throws: true` flag.
 
 The validator enforces:
 
-- `code = 0` is reserved for success; non-zero is required.
-- All names within a domain are unique.
-- All numeric codes within a domain are unique.
-- The domain `name` must not collide with any function name in the
-  module.
-- The domain `name` must not be empty.
+- `code = 0` is reserved for success and `-2` for producer panics;
+  any other non-zero value is allowed.
+- Numeric codes are unique within a domain.
+- Code names are unique within a domain **and across every domain in the
+  API**. Backends with flat namespaces derive one error class or constant
+  per code, so two domains both declaring `NotFound` would collide;
+  qualify one of them (e.g. `OrderNotFound`).
+- The domain `name` must not be empty, must not collide with any function
+  name in the module, and shares the API-wide type namespace with struct,
+  enum, and interface names.
+- `throws: true` with no domain in scope (on the module or an ancestor)
+  is an error.
 
-### Set errors from the Rust implementation
+### Report errors from the producer
+
+**With the Rust macro**, declare the domain as a `#[weaveffi::error]` enum
+whose discriminants are the ABI codes (doc comments become the default
+messages), and return `Result<T, YourError>` from fallible functions:
+
+```rust
+#[weaveffi::module]
+pub mod contacts {
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum ContactsError {
+        /// name must not be empty
+        InvalidName = 1,
+        /// contact not found
+        NotFound = 2,
+    }
+
+    #[weaveffi::export]
+    pub fn get_contact(id: i64) -> Result<String, ContactsError> {
+        Err(ContactsError::NotFound)
+    }
+}
+```
+
+The macro generates the `ErrorReport` implementation and the C ABI thunks
+that write the matching code and message into `out_err`.
+
+**If you hand-implement the C ABI** (a non-Rust producer, or Rust without
+the macro), report through the `weaveffi-abi` helpers, preferring the
+codes you declared in the IDL:
 
 ```rust
 use weaveffi_abi::{self as abi, weaveffi_error};
 
 #[no_mangle]
 pub extern "C" fn weaveffi_contacts_get_contact(
-    id: u64,
+    id: i64,
     out_err: *mut weaveffi_error,
 ) -> *const std::ffi::c_char {
-    abi::error_set_ok(out_err);
-    abi::error_set(out_err, 1, "Contact not found");
+    abi::error_set(out_err, 2, "contact not found");
     std::ptr::null()
 }
 ```
@@ -79,12 +135,12 @@ pub extern "C" fn weaveffi_contacts_get_contact(
 |----------------------------------------|-----------------------------------------------------|
 | `error_set_ok(out_err)`                | Sets `code = 0`, frees any prior message            |
 | `error_set(out_err, code, msg)`        | Sets a non-zero code and allocates a message        |
-| `result_to_out_err(result, out_err)`   | Maps `Result<T, E>` (Ok clears, Err sets `-1`)      |
-
-Prefer the codes you defined in the IDL (e.g. `not_found = 1`) so
-consumers can react meaningfully.
+| `result_to_out_err(result, out_err)`   | Maps `Result<T, E>` through `ErrorReport` (domain code for implementors, generic `-1` for plain `Display` errors) |
+| `error_set_panic(out_err, payload)`    | Reports a caught panic with the reserved code `-2`  |
 
 ### Handle errors in C
+
+The C surface is the raw out-error struct:
 
 ```c
 weaveffi_error err = {0, NULL};
@@ -109,91 +165,104 @@ The pattern is always:
    `weaveffi_error_clear(&err)`.
 4. Reuse the struct for subsequent calls.
 
-### Handle errors in Swift
+The domain's codes are also emitted as a C enum, so a consumer can match
+on names instead of magic numbers:
+
+```c
+typedef enum {
+    weaveffi_contacts_ContactsError_InvalidName = 1,
+    weaveffi_contacts_ContactsError_NotFound = 2
+} weaveffi_contacts_ContactsError;
+```
+
+### What consumers see
+
+Every other target wraps that struct into a typed error construct named
+after the domain. In Swift, the domain becomes an error enum with one
+case per code (named in lowerCamelCase), and throwing wrappers `throw`
+it:
 
 ```swift
+public enum ContactsError: Error, LocalizedError {
+    case invalidName(message: String)
+    case notFound(message: String)
+}
+
 do {
-    let contact = try Contacts.getContact(id: handle)
+    let contact = try Contacts.getContact(id: 42)
     print(contact)
-} catch let e as WeaveFFIError {
-    print("Failed: \(e)")
+} catch ContactsError.notFound {
+    print("no such contact")
 }
 ```
 
-The generated wrapper calls `try check(&err)` after every C call,
-which throws `WeaveFFIError` and clears the C-side struct.
+In Python, the domain becomes an exception class (subclassing the generic
+`WeaveFFIError`) with one subclass per code carrying its stable `CODE`:
 
-### Handle errors in Kotlin / Android
-
-```kotlin
-try {
-    val contact = Contacts.getContact(id)
-    println(contact)
-} catch (e: WeaveFFIException.NotFound) {
-    println("No such contact")
-} catch (e: WeaveFFIException) {
-    println("Failed: ${e.message}")
-}
+```python
+try:
+    contact = contacts_get_contact(42)
+except ContactsError.NotFound:
+    print("no such contact")
 ```
 
-The JNI shim maps each declared error code to a `WeaveFFIException`
-subclass (e.g. `WeaveFFIException.NotFound`), throws it with the message,
-and clears the C-side struct before returning. Codes outside the declared
-domain fall back to the base `WeaveFFIException`.
+The remaining targets follow the same conceptual shape in their own
+idiom: one typed error construct per domain, one case or subclass per
+code, delivered through the language's native error channel. Ecosystems
+that suffix exceptions rename the domain accordingly (`ContactsError`
+becomes `ContactsException` in Kotlin, .NET, and Dart). A code the
+consumer doesn't recognize (from a newer producer, for example) falls
+back to the generic branded error rather than being dropped.
 
-### Handle errors in Node.js
+### Producer panics
 
-```typescript
-import { Contacts } from "weaveffi";
-
-try {
-    const contact = Contacts.getContact(id);
-    console.log(contact);
-} catch (e) {
-    console.error("Failed:", (e as Error).message);
-}
-```
-
-The N-API addon throws a JavaScript `Error` carrying the message.
-
-### Handle errors in Wasm
-
-The minimal Wasm target uses numeric return codes. Inspect the return
-value after each call:
-
-```javascript
-const result = instance.exports.weaveffi_contacts_get_contact(id);
-if (result === 0) {
-    console.error("call failed: inspect log");
-}
-```
-
-The Wasm error surface is still evolving. Future versions will surface
-richer error information.
+Generated Rust thunks wrap the producer call in `catch_unwind`. A panic is
+reported through `out_err` with the reserved code `-2`
+(`weaveffi_abi::PANIC_ERROR_CODE`) and the panic message, so a consumer
+can always distinguish "the producer has a bug" from any declared domain
+error. Panics never surface as typed domain errors: on a throwing
+callable they arrive as the generic branded error, and on a non-throwing
+callable they surface as the target's unrecoverable idiom (a Swift
+`fatalError`, a Go `panic`, a generic exception elsewhere).
 
 ## Reference
 
-| Layer        | Error mechanism                          | How a non-zero code surfaces                   |
-|--------------|------------------------------------------|-----------------------------------------------|
-| C ABI        | `weaveffi_error { code, message }`        | Consumer inspects struct after every call      |
-| Swift        | `WeaveFFIError` enum (`throws`)           | `try` raises a Swift `Error`; per-code cases   |
-| C++          | `WeaveFFIError` + per-code subclasses     | `try`/`catch (const WeaveFFIError&)`           |
-| Kotlin       | `WeaveFFIException` + per-code subclasses  | `try`/`catch` (rethrown by the JNI shim)       |
-| Node.js      | JavaScript `Error`                        | N-API addon throws                             |
-| Python       | `WeaveFFIError` exception                  | `try`/`except`                                 |
-| Ruby         | `WeaveFFI::Error` (`StandardError`)        | `begin`/`rescue`                              |
-| Dart         | `WeaveFFIException`                        | `try`/`on WeaveFFIException catch`            |
-| .NET         | `WeaveFFIException`                        | `try`/`catch`                                  |
-| Go           | `error` return value                      | Standard `if err != nil { ... }`               |
-| Wasm         | JavaScript `Error`                        | Caller wraps calls in `try`/`catch`            |
+At the ABI level, `weaveffi_error.code` means:
+
+| Code               | Meaning                                              |
+|--------------------|------------------------------------------------------|
+| `0`                | Success                                              |
+| a declared code    | A typed producer error from the module's domain      |
+| `-1`               | Generic error (null self, bad input, string errors)  |
+| `-2`               | Producer panic (`PANIC_ERROR_CODE`)                  |
+| `1`                | Invalid argument from marshalling                    |
+
+On the typed path, a wrapper maps a non-zero code to the matching declared
+case of the domain type and falls back to the generic branded error for
+any code the domain doesn't declare.
+
+Per target, the two error paths surface as:
+
+| Target   | Throwing callable (`throws: true`)          | Non-throwing failure (producer bug)      |
+|----------|----------------------------------------------|------------------------------------------|
+| C        | `weaveffi_error { code, message }` struct    | same struct (code `-2` or `1`)           |
+| Swift    | `throws`, typed domain enum                  | `fatalError`                             |
+| Python   | `raise`, domain exception subclass           | `raise WeaveFFIError`                    |
+| Kotlin   | `throw`, typed domain exception              | `throw WeaveFFIException`                |
+| C#       | `throw`, typed domain exception              | `throw WeaveFFIException`                |
+| Dart     | `throw`, typed domain exception              | `throw WeaveFFIException`                |
+| JS/TS    | `throw`, typed domain error                  | `throw WeaveFFIError`                    |
+| Ruby     | `raise`, typed domain error                  | `raise WeaveFFI::Error`                  |
+| Go       | `(T, error)` return, typed domain error      | `panic`                                  |
+| C++      | `throw`, typed domain error                  | `throw weaveffi::Error`                  |
 
 All targets share the canonical `WeaveFFI` brand (never the `heck`-derived
-`Weaveffi`). Error type names are derived from a single naming policy:
-ecosystems that suffix with `Error` (Swift, C++, Python, Node, Ruby, Go) use
-`WeaveFFIError`; ecosystems that suffix with `Exception` (Kotlin, .NET, Dart)
-use `WeaveFFIException`. Per-code names are PascalCased from the IDL
-(`KEY_NOT_FOUND` → `KeyNotFound`/`KeyNotFoundError`), never raw
-SCREAMING_SNAKE.
+`Weaveffi`) for the generic fallback type. Error type names are derived
+from a single naming policy: ecosystems that suffix with `Error` (Swift,
+C++, Python, Node, Ruby, Go) use `WeaveFFIError`; ecosystems that suffix
+with `Exception` (Kotlin, .NET, Dart) use `WeaveFFIException`. Per-code
+names are PascalCased from the IDL, and domain type names keep exactly one
+`Error` (or `Exception`) suffix.
 
 | Field     | Type           | Description                                       |
 |-----------|----------------|---------------------------------------------------|
@@ -209,11 +278,17 @@ on `err.message`.
   Rust-allocated. Skipping the clear leaks the string.
 - **Reading `err.message` after clearing**: the pointer is invalid as
   soon as `weaveffi_error_clear` returns.
-- **Using `code = 0` as a domain value**: the validator rejects this
-  because `0` always means success.
-- **Reusing custom codes across modules and assuming they are
-  unique**: error domains are scoped to a single module. Document
-  cross-module conventions if you need them.
+- **Using `code = 0` or `code = -2` as a domain value**: the validator
+  rejects both; `0` always means success and `-2` is reserved for
+  producer panics.
+- **Reusing a code name in two domains**: code names are unique across
+  the whole API, so the validator rejects a second `NotFound`. Qualify
+  one of them (`OrderNotFound`).
+- **Declaring `throws: true` without a domain in scope**: a throwing
+  callable needs an `errors:` block on its module or an ancestor.
+- **Expecting a typed error from a non-throwing function**: a callable
+  without `throws` cannot deliver a domain error; a failure there is a
+  producer bug and surfaces as the generic brand or a trap.
 - **Not initialising the struct**: always start with
   `{0, NULL}` (or the language equivalent). Stale `code` values from
   earlier calls produce confusing failures.

@@ -1,11 +1,7 @@
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: kv
     structs:
-      - name: Store
-        doc: Opaque key-value store handle target type
-        fields:
-          - { name: id, type: i64, doc: Internal store identifier }
       - name: Entry
         doc: A single key-value entry persisted in the store
         builder: true
@@ -36,80 +32,74 @@ modules:
     errors:
       name: KvError
       codes:
-        - { name: KEY_NOT_FOUND, code: 1001, message: "Key not found", doc: No entry exists for the requested key }
-        - { name: EXPIRED, code: 1002, message: "Entry expired", doc: The entry exists but its TTL has elapsed }
-        - { name: STORE_FULL, code: 1003, message: "Store is full", doc: The store has reached its capacity limit }
-        - { name: IO_ERROR, code: 1004, message: "I/O error", doc: Underlying storage reported an I/O failure }
-    functions:
-      - name: open_store
-        doc: Open (or create) a store backed by the given filesystem path
-        since: "0.3.0"
-        params:
-          - { name: path, type: string }
-        return: "handle<Store>"
-      - name: close_store
-        doc: Close the store and release all in-memory resources
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-      - name: put
-        doc: Insert or replace a value, returning true on success
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-          - { name: key, type: string }
-          - { name: value, type: bytes }
-          - { name: kind, type: EntryKind }
-          - { name: ttl_seconds, type: "i64?" }
-        return: bool
-      - name: get
-        doc: Look up an entry by key; returns null if missing or expired
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-          - { name: key, type: string }
-        return: "Entry?"
-      - name: delete
-        doc: Remove the entry for the given key, returning true if it existed
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-          - { name: key, type: string }
-        return: bool
-      - name: list_keys
-        doc: Stream every key, optionally filtered by a prefix
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-          - { name: prefix, type: "string?" }
-        return: "iter<string>"
-      - name: count
-        doc: Return the number of live entries in the store
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-        return: i64
-      - name: clear
-        doc: Drop every entry from the store
-        since: "0.3.0"
-        params:
-          - { name: store, type: "handle<Store>" }
-      - name: compact_async
-        doc: Reclaim space asynchronously; returns the number of bytes reclaimed
-        since: "0.3.0"
-        async: true
-        cancellable: true
-        params:
-          - { name: store, type: "handle<Store>" }
-        return: i64
-      - name: legacy_put
-        doc: Legacy single-shot put kept for compatibility
-        deprecated: "use put() with explicit kind"
-        params:
-          - { name: store, type: "handle<Store>" }
-          - { name: key, type: string }
-          - { name: value, type: bytes }
-        return: bool
+        - { name: KeyNotFound, code: 1001, message: "key not found", doc: No entry exists for the requested key }
+        - { name: Expired, code: 1002, message: "entry expired", doc: The entry exists but its TTL has elapsed }
+        - { name: StoreFull, code: 1003, message: "store has reached capacity", doc: The store has reached its capacity limit }
+        - { name: IoError, code: 1004, message: "I/O failure", doc: Underlying storage reported an I/O failure }
+    interfaces:
+      - name: Store
+        doc: An in-memory key-value store owning its entries; destroying the object releases all of its state
+        constructors:
+          - name: open
+            doc: Open (or create) a store backed by the given filesystem path
+            params:
+              - { name: path, type: string }
+            throws: true
+        methods:
+          - name: put
+            doc: Insert or replace a value, returning true on success
+            params:
+              - { name: key, type: string }
+              - { name: value, type: bytes }
+              - { name: kind, type: EntryKind }
+              - { name: ttl_seconds, type: "i64?" }
+            return: bool
+            throws: true
+          - name: get
+            doc: Look up an entry by key; returns null if missing or expired
+            params:
+              - { name: key, type: string }
+            return: "Entry?"
+            throws: true
+          - name: delete
+            doc: Remove the entry for the given key, returning true if it existed
+            params:
+              - { name: key, type: string }
+            return: bool
+            throws: true
+          - name: list_keys
+            doc: Stream every key, optionally filtered by a prefix
+            params:
+              - { name: prefix, type: "string?" }
+            return: "iter<string>"
+            throws: true
+          - name: count
+            doc: Return the number of live entries in the store
+            params: []
+            return: i64
+          - name: clear
+            doc: Drop every entry from the store
+            params: []
+          - name: compact
+            doc: Reclaim space asynchronously; returns the number of bytes reclaimed
+            async: true
+            cancellable: true
+            params: []
+            return: i64
+            throws: true
+          - name: legacy_put
+            doc: Legacy single-shot put kept for compatibility
+            deprecated: "use put() with explicit kind"
+            params:
+              - { name: key, type: string }
+              - { name: value, type: bytes }
+            return: bool
+            throws: true
+        statics:
+          - name: default_capacity
+            doc: The largest number of live entries one store will hold
+            params: []
+            return: i64
     modules:
       - name: stats
         structs:
@@ -122,20 +112,7 @@ modules:
         functions:
           - name: get_stats
             doc: Snapshot the current store statistics
-            since: "0.3.0"
             params:
-              - { name: store, type: "handle<Store>" }
+              - { name: store, type: Store }
             return: Stats
-generators:
-  ruby:
-    module_name: Kvstore
-  dotnet:
-    namespace: Kvstore
-  swift:
-    module_name: Kvstore
-  cpp:
-    namespace: kvstore
-  dart:
-    package_name: kvstore
-  go:
-    module_path: github.com/example/kvstore
+            throws: true

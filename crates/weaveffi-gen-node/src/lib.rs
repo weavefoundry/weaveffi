@@ -2,8 +2,10 @@
 //!
 //! Emits a JavaScript loader plus TypeScript type definitions for the
 //! companion N-API addon. Async functions surface as `Promise`-returning
-//! methods. Implements [`LanguageBackend`]; the shared driver bridges it into
-//! the generator pipeline.
+//! functions, interfaces surface as JS classes over opaque native handles,
+//! and each declared error domain surfaces as an `Error` subclass extending
+//! the generic `WeaveFFIError` brand. Implements [`LanguageBackend`]; the
+//! shared driver bridges it into the generator pipeline.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
@@ -19,9 +21,10 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::errors::{type_name as error_type_name, ERROR_BRAND};
 use weaveffi_core::model::{
-    BindingModel, CallbackBinding, EnumBinding, FnBinding, ListenerBinding, ParamBinding,
-    StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
@@ -32,13 +35,15 @@ use weaveffi_core::utils::{
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`NodeGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeConfig {
     /// npm package name (default `"weaveffi"`).
     pub package_name: Option<String>,
-    /// When `true`, strip the IR module name prefix from emitted
-    /// JS/TS function names.
+    /// When `true` (the default), strip the IR module name prefix from
+    /// emitted JS/TS function names, so module `kv`'s `open_store` exports as
+    /// `openStore` rather than `kvOpenStore`. Set to `false` to keep
+    /// module-prefixed names.
     pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the native addon calls the same
@@ -47,6 +52,17 @@ pub struct NodeConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            package_name: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl NodeConfig {
@@ -90,22 +106,21 @@ impl LanguageBackend for NodeGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
         let dir = out_dir.join("node");
         let input_basename = config.input_basename();
-        let prefix = config.prefix();
         let strip = config.strip_module_prefix;
         vec![
             OutputFile::new(
                 dir.join("index.js"),
-                render_node_index(api, prefix, strip, input_basename),
+                render_node_index(model, strip, input_basename),
             ),
             OutputFile::new(
                 dir.join("types.d.ts"),
-                render_node_dts(api, prefix, strip, input_basename),
+                render_node_dts(model, strip, input_basename),
             ),
             OutputFile::new(
                 dir.join("package.json"),
@@ -121,7 +136,7 @@ impl LanguageBackend for NodeGenerator {
             OutputFile::new(dir.join("binding.gyp"), render_binding_gyp(input_basename)),
             OutputFile::new(
                 dir.join("weaveffi_addon.c"),
-                render_addon_c(api, prefix, strip, input_basename),
+                render_addon_c(model, strip, input_basename),
             ),
         ]
     }
@@ -129,14 +144,13 @@ impl LanguageBackend for NodeGenerator {
     fn package(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Option<Vec<PackagedFile>> {
         let dir = out_dir.join("node");
         let input_basename = config.input_basename();
-        let prefix = config.prefix();
         let strip = config.strip_module_prefix;
         let package = pkg::resolve(
             api,
@@ -162,11 +176,11 @@ impl LanguageBackend for NodeGenerator {
         let mut files = vec![
             PackagedFile::text(
                 dir.join("index.js"),
-                render_node_index(api, prefix, strip, input_basename),
+                render_node_index(model, strip, input_basename),
             ),
             PackagedFile::text(
                 dir.join("types.d.ts"),
-                render_node_dts(api, prefix, strip, input_basename),
+                render_node_dts(model, strip, input_basename),
             ),
             PackagedFile::text(
                 dir.join("package.json"),
@@ -178,7 +192,7 @@ impl LanguageBackend for NodeGenerator {
             ),
             PackagedFile::text(
                 dir.join("weaveffi_addon.c"),
-                render_addon_c(api, prefix, strip, input_basename),
+                render_addon_c(model, strip, input_basename),
             ),
             PackagedFile::text(
                 dir.join("README.md"),
@@ -356,12 +370,41 @@ fn render_binding_gyp(input_basename: &str) -> String {
     )
 }
 
+/// The exported JS name of a free function or listener endpoint:
+/// [`wrapper_name`] (module-prefixed or stripped per config) converted to
+/// lowerCamelCase, so module `kv`'s `open_store` exports as `openStore`
+/// (stripped, the default) or `kvOpenStore`.
+fn js_fn_name(module: &str, func: &str, strip: bool) -> String {
+    wrapper_name(module, func, strip).to_lower_camel_case()
+}
+
+/// The camelCase JS spelling of an IDL parameter name.
+fn js_param_name(name: &str) -> String {
+    name.to_lower_camel_case()
+}
+
+/// The addon-internal JS export base of an interface member
+/// (`{Interface}_{member}`). These names are wiring between the addon and the
+/// generated classes, not public API, so they keep the raw member spelling
+/// exactly like the rich-enum helper exports.
+fn iface_member_base(iface: &str, member: &str) -> String {
+    format!("{iface}_{member}")
+}
+
+/// Escape a string for embedding in a single-quoted JS literal.
+fn js_str_literal(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+}
+
 fn is_c_ptr_type(ty: &TypeRef) -> bool {
     matches!(
         ty,
         TypeRef::StringUtf8
             | TypeRef::Bytes
             | TypeRef::Struct(_)
+            | TypeRef::Interface(_)
             | TypeRef::List(_)
             | TypeRef::Map(_, _)
             | TypeRef::Iterator(_)
@@ -388,7 +431,11 @@ fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
+        // Structs and interfaces share the opaque-pointer lowering; only the
+        // ownership convention differs, which element contexts don't touch.
+        TypeRef::Struct(s) | TypeRef::Interface(s) => {
+            format!("{}*", c_abi_struct_name(s, module, prefix))
+        }
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             c_elem_type(inner, module, prefix)
@@ -414,7 +461,11 @@ fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
         TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
-        TypeRef::Struct(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
+        // A returned interface transfers ownership of a new object reference;
+        // the pointer spelling matches a struct return.
+        TypeRef::Struct(s) | TypeRef::Interface(s) => {
+            format!("{}*", c_abi_struct_name(s, module, prefix))
+        }
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) => {
             if is_c_ptr_type(inner) {
@@ -472,20 +523,91 @@ fn needs_narrowing_read(ty: &TypeRef) -> bool {
     )
 }
 
-fn render_addon_c(
-    api: &Api,
+/// Emit `{prefix}_napi_error_value`, the shared constructor of the JS error
+/// object every failure path produces: a plain `Error` carrying the numeric
+/// ABI code as a `code` property. The JS loader rebrands it as the generic
+/// `WeaveFFIError` or the module's typed domain class.
+fn render_error_value_helper_c(out: &mut String, prefix: &str) {
+    out.push_str(&format!(
+        "static napi_value {prefix}_napi_error_value(napi_env env, int32_t code, const char* message) {{\n"
+    ));
+    out.push_str("    napi_value msg;\n");
+    out.push_str(
+        "    napi_create_string_utf8(env, message ? message : \"\", NAPI_AUTO_LENGTH, &msg);\n",
+    );
+    out.push_str("    napi_value err;\n");
+    out.push_str("    napi_create_error(env, NULL, msg, &err);\n");
+    out.push_str("    napi_value code_val;\n");
+    out.push_str("    napi_create_int32(env, code, &code_val);\n");
+    out.push_str("    napi_set_named_property(env, err, \"code\", code_val);\n");
+    out.push_str("    return err;\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit the post-call `out_err` check: throw the code-carrying JS error and
+/// bail on a non-zero slot. The JS loader maps the `code` property to the
+/// module's typed domain class (throwing callables) or the generic brand.
+fn emit_error_check_c(out: &mut String, prefix: &str) {
+    out.push_str("  if (err.code != 0) {\n");
+    out.push_str(&format!(
+        "    napi_throw(env, {prefix}_napi_error_value(env, err.code, err.message));\n"
+    ));
+    out.push_str("    weaveffi_error_clear(&err);\n");
+    out.push_str("    return NULL;\n");
+    out.push_str("  }\n");
+}
+
+/// Emit one callable's `Napi_*` entry point (plus its async machinery when
+/// needed) and register its JS export. `self_tag` is the interface `c_tag`
+/// for an instance method, whose wrapped pointer arrives as `args[0]`.
+#[allow(clippy::too_many_arguments)]
+fn render_callable_napi(
+    out: &mut String,
+    all_exports: &mut Vec<(String, String)>,
+    f: &FnBinding,
+    js_name: String,
+    module: &str,
     prefix: &str,
-    strip_module_prefix: bool,
-    input_basename: &str,
-) -> String {
+    structs: &HashMap<String, StructBinding>,
+    self_tag: Option<&str>,
+) {
+    let c_name = &f.c_base;
+    let napi_name = format!("Napi_{c_name}");
+    all_exports.push((js_name, napi_name.clone()));
+
+    if f.is_async {
+        render_async_machinery(out, f, c_name, module, prefix, structs);
+    }
+
+    out.push_str(&format!(
+        "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    if f.is_async {
+        render_async_napi_body(out, f, module, prefix, self_tag);
+    } else {
+        render_napi_body(out, f, module, prefix, structs, self_tag);
+    }
+    out.push_str("}\n\n");
+}
+
+fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basename: &str) -> String {
+    let prefix = model.prefix.as_str();
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str(&format!(
         "#include <node_api.h>\n#include \"{prefix}.h\"\n#include <stdlib.h>\n#include <string.h>\n\n"
     ));
 
-    let model = BindingModel::build(api, prefix);
     let mut all_exports: Vec<(String, String)> = Vec::new();
-    let structs = struct_registry(&model);
+    let structs = struct_registry(model);
+
+    // Every error path (sync throws, async rejections, rich-enum constructor
+    // failures) funnels through one code-carrying error constructor.
+    let has_error_paths = model.modules.iter().any(|m| {
+        !m.functions.is_empty() || !m.interfaces.is_empty() || m.enums.iter().any(|e| e.is_rich())
+    });
+    if has_error_paths {
+        render_error_value_helper_c(&mut out, prefix);
+    }
 
     let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
     if has_listeners {
@@ -510,6 +632,53 @@ fn render_addon_c(
                 );
             }
         }
+        // Interfaces get one native entry point per member (constructors and
+        // statics marshal like free functions; methods additionally read the
+        // wrapped pointer from the leading argument) plus the destructor the
+        // JS class's disposal path calls.
+        for i in &m.interfaces {
+            for f in i.constructors.iter().chain(i.statics.iter()) {
+                render_callable_napi(
+                    &mut out,
+                    &mut all_exports,
+                    f,
+                    wrapper_name(
+                        &m.path,
+                        &iface_member_base(&i.name, &f.name),
+                        strip_module_prefix,
+                    ),
+                    &m.path,
+                    prefix,
+                    &structs,
+                    None,
+                );
+            }
+            for f in &i.methods {
+                render_callable_napi(
+                    &mut out,
+                    &mut all_exports,
+                    f,
+                    wrapper_name(
+                        &m.path,
+                        &iface_member_base(&i.name, &f.name),
+                        strip_module_prefix,
+                    ),
+                    &m.path,
+                    prefix,
+                    &structs,
+                    Some(&i.c_tag),
+                );
+            }
+            render_interface_destroy_napi(&mut out, i);
+            all_exports.push((
+                wrapper_name(
+                    &m.path,
+                    &iface_member_base(&i.name, "destroy"),
+                    strip_module_prefix,
+                ),
+                format!("Napi_{}", i.destroy_symbol),
+            ));
+        }
         // Callbacks referenced by listeners get a payload struct, a producer-
         // thread trampoline, and a JS-thread marshaller (threadsafe function).
         let used_callbacks: Vec<&CallbackBinding> = m
@@ -528,7 +697,7 @@ fn render_addon_c(
             };
             render_listener_napi_fns(&mut out, l, cb, prefix);
             all_exports.push((
-                wrapper_name(
+                js_fn_name(
                     &m.path,
                     &format!("register_{}", l.name),
                     strip_module_prefix,
@@ -536,7 +705,7 @@ fn render_addon_c(
                 format!("Napi_{}", l.register_symbol),
             ));
             all_exports.push((
-                wrapper_name(
+                js_fn_name(
                     &m.path,
                     &format!("unregister_{}", l.name),
                     strip_module_prefix,
@@ -545,24 +714,16 @@ fn render_addon_c(
             ));
         }
         for f in &m.functions {
-            let c_name = &f.c_base;
-            let napi_name = format!("Napi_{c_name}");
-            let js_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
-            all_exports.push((js_name, napi_name.clone()));
-
-            if f.is_async {
-                render_async_machinery(&mut out, f, c_name, &m.path, prefix, &structs);
-            }
-
-            out.push_str(&format!(
-                "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
-            ));
-            if f.is_async {
-                render_async_napi_body(&mut out, f, c_name, &m.path, prefix);
-            } else {
-                render_napi_body(&mut out, f, c_name, &m.path, prefix, &structs);
-            }
-            out.push_str("}\n\n");
+            render_callable_napi(
+                &mut out,
+                &mut all_exports,
+                f,
+                js_fn_name(&m.path, &f.name, strip_module_prefix),
+                &m.path,
+                prefix,
+                &structs,
+                None,
+            );
         }
     }
 
@@ -707,11 +868,7 @@ fn render_rich_enum_napi_fns(
         for cleanup in &cleanups {
             out.push_str(cleanup);
         }
-        out.push_str("  if (err.code != 0) {\n");
-        out.push_str("    napi_throw_error(env, NULL, err.message);\n");
-        out.push_str("    weaveffi_error_clear(&err);\n");
-        out.push_str("    return NULL;\n");
-        out.push_str("  }\n");
+        emit_error_check_c(out, prefix);
         out.push_str("  napi_value ret;\n");
         out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         out.push_str("  return ret;\n}\n\n");
@@ -766,6 +923,21 @@ fn render_rich_enum_napi_fns(
         wrapper_name(module, &rich_destroy_base(name), strip),
         napi_destroy,
     ));
+}
+
+/// The `Napi_*` destructor entry point for one interface: reads the wrapped
+/// pointer from `args[0]` and releases the object via the destroy symbol.
+/// Called by the JS class's `destroy()` and its `FinalizationRegistry` net.
+fn render_interface_destroy_napi(out: &mut String, i: &InterfaceBinding) {
+    let napi_destroy = format!("Napi_{}", i.destroy_symbol);
+    out.push_str(&format!(
+        "static napi_value {napi_destroy}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    emit_rich_self_read(out, &i.c_tag);
+    out.push_str(&format!("  {}(self);\n", i.destroy_symbol));
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n}\n\n");
 }
 
 /// The listener context + registry shared by every generated listener. The
@@ -876,6 +1048,9 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
                     }
                     TypeRef::Iterator(_) => {
                         unreachable!("validated: iterator not a callback param")
+                    }
+                    TypeRef::Interface(_) => {
+                        unreachable!("validated: interface not a callback param")
                     }
                 }
             }
@@ -1001,6 +1176,7 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
                 }
             }
             TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
+            TypeRef::Interface(_) => unreachable!("validated: interface not a callback param"),
         }
     }
     out.push_str("    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);\n");
@@ -1112,6 +1288,7 @@ fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize, prefix: 
             out.push_str("        }\n");
         }
         TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
+        TypeRef::Interface(_) => unreachable!("validated: interface not a callback param"),
     }
 }
 
@@ -1366,15 +1543,18 @@ fn render_async_machinery(
             out.push_str("    size_t result_len;\n");
         }
         Some(TypeRef::Handle) => out.push_str("    uint64_t result;\n"),
-        Some(TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Iterator(_)) => {
-            out.push_str("    void* result;\n")
-        }
+        Some(
+            TypeRef::TypedHandle(_)
+            | TypeRef::Struct(_)
+            | TypeRef::Interface(_)
+            | TypeRef::Iterator(_),
+        ) => out.push_str("    void* result;\n"),
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str("    char* result;\n");
                 out.push_str("    int result_null;\n");
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Struct(_) | TypeRef::Interface(_) | TypeRef::TypedHandle(_) => {
                 out.push_str("    void* result;\n");
             }
             other => {
@@ -1448,9 +1628,14 @@ fn render_async_machinery(
                 "        if (result != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result, result_len); }\n",
             );
         }
-        // Ownership of struct/handle/iterator results transfers to the
-        // receiver, so the pointer stays valid across the thread hop.
-        Some(TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Iterator(_)) => {
+        // Ownership of struct/interface/handle/iterator results transfers to
+        // the receiver, so the pointer stays valid across the thread hop.
+        Some(
+            TypeRef::TypedHandle(_)
+            | TypeRef::Struct(_)
+            | TypeRef::Interface(_)
+            | TypeRef::Iterator(_),
+        ) => {
             out.push_str("        ctx->result = (void*)result;\n");
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
@@ -1458,7 +1643,7 @@ fn render_async_machinery(
                 out.push_str("        ctx->result_null = result == NULL;\n");
                 out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Struct(_) | TypeRef::Interface(_) | TypeRef::TypedHandle(_) => {
                 out.push_str("        ctx->result = (void*)result;\n");
             }
             _ => {
@@ -1515,15 +1700,9 @@ fn render_async_machinery(
     out.push_str(&format!("    {actx}* ctx = ({actx}*)data;\n"));
     out.push_str("    if (env != NULL) {\n");
     out.push_str("    if (ctx->err_code != 0) {\n");
-    out.push_str("        napi_value err_msg;\n");
-    out.push_str(
-        "        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : \"\", NAPI_AUTO_LENGTH, &err_msg);\n",
-    );
-    out.push_str("        napi_value err_obj;\n");
-    out.push_str("        napi_create_error(env, NULL, err_msg, &err_obj);\n");
-    out.push_str("        napi_value err_code;\n");
-    out.push_str("        napi_create_int32(env, ctx->err_code, &err_code);\n");
-    out.push_str("        napi_set_named_property(env, err_obj, \"code\", err_code);\n");
+    out.push_str(&format!(
+        "        napi_value err_obj = {prefix}_napi_error_value(env, ctx->err_code, ctx->err_msg);\n"
+    ));
     out.push_str("        napi_reject_deferred(env, ctx->deferred, err_obj);\n");
     out.push_str("    } else {\n");
     out.push_str("        napi_value val;\n");
@@ -1560,7 +1739,9 @@ fn render_async_machinery(
         Some(TypeRef::Handle) => {
             out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
         }
-        Some(TypeRef::TypedHandle(_) | TypeRef::Iterator(_)) => {
+        // An interface result stays the raw owned pointer here; the JS loader
+        // wraps the settled handle in the interface class.
+        Some(TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Iterator(_)) => {
             out.push_str("        napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n");
         }
         Some(TypeRef::Struct(name)) => {
@@ -1601,7 +1782,7 @@ fn render_async_machinery(
                 );
                 out.push_str("        }\n");
             }
-            TypeRef::TypedHandle(_) => {
+            TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
                 out.push_str(
                     "        if (ctx->result == NULL) napi_get_null(env, &val); else napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
                 );
@@ -1678,14 +1859,19 @@ fn render_async_machinery(
     out.push_str("}\n\n");
 }
 
-fn render_async_napi_body(
-    out: &mut String,
-    f: &FnBinding,
-    c_name: &str,
-    module: &str,
-    prefix: &str,
-) {
-    let n = f.params.len();
+/// Read the wrapped interface pointer from `args[0]` and push it as the
+/// leading C argument. Instance methods carry this implicit `self` slot in
+/// their [`AbiFn`](weaveffi_core::model::AbiFn) signatures; the JS class
+/// passes its own handle there.
+fn emit_self_arg(out: &mut String, c_args: &mut Vec<String>, self_tag: &str) {
+    out.push_str("  int64_t self_raw;\n");
+    out.push_str("  napi_get_value_int64(env, args[0], &self_raw);\n");
+    c_args.push(format!("(const {self_tag}*)(intptr_t)self_raw"));
+}
+
+/// Read `argc`/`args` for a callable with `n` incoming JS arguments
+/// (including the leading handle of an instance method).
+fn emit_args_read(out: &mut String, n: usize) {
     if n > 0 {
         out.push_str(&format!("  size_t argc = {n};\n"));
         out.push_str(&format!("  napi_value args[{n}];\n"));
@@ -1694,9 +1880,27 @@ fn render_async_napi_body(
         out.push_str("  size_t argc = 0;\n");
         out.push_str("  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);\n");
     }
+}
+
+fn render_async_napi_body(
+    out: &mut String,
+    f: &FnBinding,
+    module: &str,
+    prefix: &str,
+    self_tag: Option<&str>,
+) {
+    let c_name = &f.c_base;
+    let CallShape::Async(ab) = &f.shape else {
+        unreachable!("async body rendered for a non-async callable");
+    };
+    let offset = usize::from(self_tag.is_some());
+    emit_args_read(out, f.params.len() + offset);
 
     let mut c_args: Vec<String> = Vec::new();
     let mut cleanups: Vec<String> = Vec::new();
+    if let Some(tag) = self_tag {
+        emit_self_arg(out, &mut c_args, tag);
+    }
     for (i, p) in f.params.iter().enumerate() {
         emit_param(
             out,
@@ -1704,7 +1908,7 @@ fn render_async_napi_body(
             &mut cleanups,
             &p.ty,
             &p.name,
-            i,
+            i + offset,
             module,
             prefix,
         );
@@ -1733,7 +1937,7 @@ fn render_async_napi_body(
     c_args.push(cb_name);
     c_args.push("ctx".into());
     let args_str = c_args.join(", ");
-    out.push_str(&format!("  {c_name}_async({args_str});\n"));
+    out.push_str(&format!("  {}({args_str});\n", ab.launch.symbol));
 
     for cleanup in &cleanups {
         out.push_str(cleanup);
@@ -1745,23 +1949,26 @@ fn render_async_napi_body(
 fn render_napi_body(
     out: &mut String,
     f: &FnBinding,
-    c_name: &str,
     module: &str,
     prefix: &str,
     structs: &HashMap<String, StructBinding>,
+    self_tag: Option<&str>,
 ) {
-    let n = f.params.len();
-    if n > 0 {
-        out.push_str(&format!("  size_t argc = {n};\n"));
-        out.push_str(&format!("  napi_value args[{n}];\n"));
-        out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
-    } else {
-        out.push_str("  size_t argc = 0;\n");
-        out.push_str("  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);\n");
-    }
+    // The launcher symbol comes from the lowered shape rather than being
+    // rebuilt from the name, so interface members call the right entry point.
+    let symbol = match &f.shape {
+        CallShape::Sync(abi) => &abi.symbol,
+        CallShape::Iterator(ib) => &ib.launch.symbol,
+        CallShape::Async(_) => unreachable!("sync body rendered for an async callable"),
+    };
+    let offset = usize::from(self_tag.is_some());
+    emit_args_read(out, f.params.len() + offset);
 
     let mut c_args: Vec<String> = Vec::new();
     let mut cleanups: Vec<String> = Vec::new();
+    if let Some(tag) = self_tag {
+        emit_self_arg(out, &mut c_args, tag);
+    }
     for (i, p) in f.params.iter().enumerate() {
         emit_param(
             out,
@@ -1769,7 +1976,7 @@ fn render_napi_body(
             &mut cleanups,
             &p.ty,
             &p.name,
-            i,
+            i + offset,
             module,
             prefix,
         );
@@ -1786,10 +1993,10 @@ fn render_napi_body(
     let ret_type = f.ret.as_ref().map(|r| c_ret_type_str(r, module, prefix));
     match &ret_type {
         Some(rt) if rt != "void" => {
-            out.push_str(&format!("  {rt} result = {c_name}({args_str});\n"));
+            out.push_str(&format!("  {rt} result = {symbol}({args_str});\n"));
         }
         _ => {
-            out.push_str(&format!("  {c_name}({args_str});\n"));
+            out.push_str(&format!("  {symbol}({args_str});\n"));
         }
     }
 
@@ -1797,14 +2004,10 @@ fn render_napi_body(
         out.push_str(cleanup);
     }
 
-    out.push_str("  if (err.code != 0) {\n");
-    out.push_str("    napi_throw_error(env, NULL, err.message);\n");
-    out.push_str("    weaveffi_error_clear(&err);\n");
-    out.push_str("    return NULL;\n");
-    out.push_str("  }\n");
+    emit_error_check_c(out, prefix);
 
     match &f.ret {
-        Some(ret) => emit_ret_to_napi(out, ret, module, prefix, &f.name, structs),
+        Some(ret) => emit_ret_to_napi(out, ret, module, prefix, f, structs),
         None => {
             out.push_str("  napi_value ret;\n");
             out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -1878,7 +2081,10 @@ fn emit_param(
             ));
             c_args.push(format!("({prefix}_{module}_{e}){name}"));
         }
-        TypeRef::Struct(s) => {
+        // Structs and interfaces arrive as int64 handles wrapping the opaque
+        // pointer; interfaces additionally get unwrapped from their JS class
+        // by the loader before reaching the addon (borrow: pointer only).
+        TypeRef::Struct(s) | TypeRef::Interface(s) => {
             let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
@@ -2020,7 +2226,9 @@ fn emit_optional_param(
             c_args.push(name.into());
             cleanups.push(format!("  free({name});\n"));
         }
-        TypeRef::Struct(s) => {
+        // An optional struct or interface is a nullable opaque pointer: JS
+        // null/undefined passes NULL, anything else the wrapped handle.
+        TypeRef::Struct(s) | TypeRef::Interface(s) => {
             let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!(
@@ -2715,7 +2923,7 @@ fn emit_ret_to_napi(
     ty: &TypeRef,
     module: &str,
     prefix: &str,
-    fn_name: &str,
+    f: &FnBinding,
     structs: &HashMap<String, StructBinding>,
 ) {
     out.push_str("  napi_value ret;\n");
@@ -2736,7 +2944,10 @@ fn emit_ret_to_napi(
         TypeRef::BorrowedStr => {
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
+        // A returned interface is an owned object reference surfaced as the
+        // raw handle; the JS loader wraps it in the interface class (which
+        // owns disposal), so the addon must not destroy it here.
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Interface(_) => {
             out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         }
         TypeRef::Struct(name) => {
@@ -2766,8 +2977,12 @@ fn emit_ret_to_napi(
             out.push_str("  napi_create_object(env, &ret);\n");
         }
         TypeRef::Iterator(inner) => {
-            let fn_pascal = fn_name.to_upper_camel_case();
-            let iter_type = format!("{prefix}_{module}_{fn_pascal}Iterator");
+            // The `next`/`destroy` symbols come from the lowered shape: an
+            // interface method's iterator tag hangs off the interface `c_tag`,
+            // which a name-based reconstruction would get wrong.
+            let CallShape::Iterator(ib) = &f.shape else {
+                unreachable!("iterator return on a non-iterator shape");
+            };
             let et = c_elem_type(inner, module, prefix);
             out.push_str("  napi_create_array(env, &ret);\n");
             out.push_str("  uint32_t iter_idx = 0;\n");
@@ -2777,7 +2992,8 @@ fn emit_ret_to_napi(
             // threaded through even when we surface drained items as an array.
             out.push_str("  weaveffi_error iter_err = {0};\n");
             out.push_str(&format!(
-                "  while ({iter_type}_next(result, &iter_item, &iter_err)) {{\n"
+                "  while ({}(result, &iter_item, &iter_err)) {{\n",
+                ib.next.symbol
             ));
             out.push_str("    napi_value elem;\n");
             match inner.as_ref() {
@@ -2830,7 +3046,17 @@ fn emit_ret_to_napi(
             }
             out.push_str("    napi_set_element(env, ret, iter_idx++, elem);\n");
             out.push_str("  }\n");
-            out.push_str(&format!("  {iter_type}_destroy(result);\n"));
+            out.push_str(&format!("  {}(result);\n", ib.destroy_symbol));
+            // A per-step fault ends the drain with a non-zero `iter_err`; the
+            // iterator is already freed above, so throw the code-carrying
+            // error instead of returning the partial array.
+            out.push_str("  if (iter_err.code != 0) {\n");
+            out.push_str(&format!(
+                "    napi_throw(env, {prefix}_napi_error_value(env, iter_err.code, iter_err.message));\n"
+            ));
+            out.push_str("    weaveffi_error_clear(&iter_err);\n");
+            out.push_str("    return NULL;\n");
+            out.push_str("  }\n");
         }
     }
     out.push_str("  return ret;\n");
@@ -2896,6 +3122,12 @@ fn emit_optional_ret_inner(
             emit_struct_to_object(
                 out, "env", name, "result", "ret", module, prefix, structs, "    ", true,
             );
+        }
+        // An optional interface lowers to one nullable owned pointer, so
+        // `result` is the object itself (the NULL case was already handled):
+        // surface the raw handle without dereferencing or freeing it.
+        TypeRef::Interface(_) => {
+            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         }
         TypeRef::List(li) => emit_list_ret(out, li, module, prefix, "    ", structs),
         _ => out.push_str("    napi_get_null(env, &ret);\n"),
@@ -2999,12 +3231,13 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
-        // Structs, enums, and typed handles surface as bare local TS names. A
-        // cross-module reference (e.g. `handle<Store>` resolved to `kv.Store`)
-        // must annotate the *local* interface `Store`; the qualified IR name is
-        // not a declared TS type in this module.
+        // Structs, enums, interfaces, and typed handles surface as bare local
+        // TS names. A cross-module reference (e.g. `handle<Store>` resolved to
+        // `kv.Store`) must annotate the *local* type `Store`; the qualified IR
+        // name is not a declared TS type in this module.
         TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
         TypeRef::Struct(name) => local_type_name(name).to_string(),
+        TypeRef::Interface(name) => local_type_name(name).to_string(),
         TypeRef::Enum(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
@@ -3066,7 +3299,7 @@ fn emit_fn_doc(
             let mut lines = pdoc.lines();
             if let Some(first) = lines.next() {
                 out.push_str(indent);
-                out.push_str(&format!(" * @param {} {}\n", p.name, first));
+                out.push_str(&format!(" * @param {} {}\n", js_param_name(&p.name), first));
             }
             for line in lines {
                 out.push_str(indent);
@@ -3182,113 +3415,399 @@ fn rich_enum_names(model: &BindingModel) -> HashSet<String> {
         .collect()
 }
 
-/// If `ty` is a rich enum carried directly (or as an `Optional`), return its
-/// local class name plus whether it was optional. Deeper nestings (list/map)
-/// return `None`: those flow through the raw addon binding unwrapped.
-fn rich_struct_ref(ty: &TypeRef, rich: &HashSet<String>) -> Option<(String, bool)> {
-    match ty {
-        TypeRef::Struct(n) if rich.contains(local_type_name(n)) => {
-            Some((local_type_name(n).to_string(), false))
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(n) if rich.contains(local_type_name(n)) => {
-                Some((local_type_name(n).to_string(), true))
-            }
+/// How a wrapper rebuilds a class-typed result from the raw addon value.
+struct RetWrap {
+    /// The local JS class name.
+    cls: String,
+    /// `true` for `T?`: the addon surfaces `null` for the absent case.
+    optional: bool,
+    /// `true` for an interface (wrap via `_fromHandle`); `false` for a rich
+    /// enum (wrap via the class constructor).
+    iface: bool,
+}
+
+/// Recognize a class-typed return carried directly or as an `Optional`.
+/// Deeper nestings (list/map elements) are rejected by validation for
+/// interfaces and flow through unwrapped for rich enums.
+fn js_ret_wrap(ret: Option<&TypeRef>, rich: &HashSet<String>) -> Option<RetWrap> {
+    fn direct(ty: &TypeRef, rich: &HashSet<String>, optional: bool) -> Option<RetWrap> {
+        match ty {
+            TypeRef::Struct(n) if rich.contains(local_type_name(n)) => Some(RetWrap {
+                cls: local_type_name(n).to_string(),
+                optional,
+                iface: false,
+            }),
+            TypeRef::Interface(n) => Some(RetWrap {
+                cls: local_type_name(n).to_string(),
+                optional,
+                iface: true,
+            }),
             _ => None,
-        },
-        _ => None,
+        }
+    }
+    match ret? {
+        TypeRef::Optional(inner) => direct(inner, rich, true),
+        ty => direct(ty, rich, false),
     }
 }
 
-/// The JS loader (`index.js`). Without rich enums it simply re-exports the
-/// native addon (the historical behavior). With rich enums it layers idiomatic
-/// wrapper classes, opaque-handle objects with per-variant factories, a `tag()`
-/// reader, namespaced field getters, and `destroy()` (plus a
-/// `FinalizationRegistry` safety net), and rewraps the handful of module
-/// functions that take or return a rich enum so they speak the class, not the
-/// raw handle.
-fn render_node_index(api: &Api, prefix: &str, strip: bool, input_basename: &str) -> String {
-    let model = BindingModel::build(api, prefix);
+/// The addon-argument expression for one logical parameter: interface and
+/// rich-enum instances are unwrapped to their raw `_handle` (a borrow; the
+/// callee never takes ownership), everything else passes through.
+fn js_arg_expr(js_name: &str, ty: &TypeRef, rich: &HashSet<String>) -> String {
+    fn wrapper_class<'t>(ty: &'t TypeRef, rich: &HashSet<String>) -> Option<&'t str> {
+        match ty {
+            TypeRef::Struct(n) if rich.contains(local_type_name(n)) => Some(local_type_name(n)),
+            TypeRef::Interface(n) => Some(local_type_name(n)),
+            _ => None,
+        }
+    }
+    let cls = match ty {
+        TypeRef::Optional(inner) => wrapper_class(inner, rich),
+        ty => wrapper_class(ty, rich),
+    };
+    match cls {
+        Some(c) => format!("{js_name} instanceof {c} ? {js_name}._handle : {js_name}"),
+        None => js_name.to_string(),
+    }
+}
+
+/// The rebranding factory a callable's failures route through: the declaring
+/// module's domain factory when the callable `throws`, the generic
+/// [`ERROR_BRAND`] constructor otherwise (panics and marshalling failures).
+fn js_error_map_expr(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
+    match error {
+        Some(eb) if f.throws => js_error_factory_name(eb),
+        _ => "__generic".to_string(),
+    }
+}
+
+/// `__kvErrorFrom`, the code-to-class factory of the domain declared by
+/// `owner_path`. Derived from the owner so inheriting submodules name the
+/// same function.
+fn js_error_factory_name(eb: &ErrorBinding) -> String {
+    format!("__{}ErrorFrom", eb.owner_path.to_lower_camel_case())
+}
+
+/// Emit one declaring module's typed error surface onto `wv`: the domain
+/// class extending the generic brand, one subclass per code carrying its
+/// stable `CODE` and default message, and the factory mapping a raw ABI code
+/// to the matching class (or the generic brand for codes outside the domain:
+/// panics and marshalling failures).
+fn render_error_classes_js(out: &mut String, eb: &ErrorBinding) {
+    let domain = &eb.type_name;
+    let factory = js_error_factory_name(eb);
+    let table = format!("__{}ErrorCodes", eb.owner_path.to_lower_camel_case());
+
+    let mut w = CodeWriter::two_space();
+    w.block(
+        format!("class {domain} extends {ERROR_BRAND} {{"),
+        "}",
+        |w| {
+            w.block("constructor(code, message) {", "}", |w| {
+                w.line("super(code, message);");
+                w.line(format!("this.name = '{domain}';"));
+            });
+        },
+    );
+    w.line(format!("wv.{domain} = {domain};"));
+    for c in &eb.codes {
+        let class = error_type_name(&c.name, "Error");
+        let default_msg = js_str_literal(&c.message);
+        w.block(format!("class {class} extends {domain} {{"), "}", |w| {
+            w.block("constructor(message) {", "}", |w| {
+                w.line(format!("super({}, message || '{default_msg}');", c.value));
+                w.line(format!("this.name = '{class}';"));
+            });
+        });
+        w.line(format!("{class}.CODE = {};", c.value));
+        w.line(format!("wv.{class} = {class};"));
+    }
+    let entries: Vec<String> = eb
+        .codes
+        .iter()
+        .map(|c| format!("{}: {}", c.value, error_type_name(&c.name, "Error")))
+        .collect();
+    w.line(format!(
+        "const {table} = Object.freeze({{ {} }});",
+        entries.join(", ")
+    ));
+    w.block(format!("function {factory}(code, message) {{"), "}", |w| {
+        w.line(format!("const _cls = {table}[code];"));
+        w.line(format!(
+            "return _cls === undefined ? new {ERROR_BRAND}(code, message) : new _cls(message);"
+        ));
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit one wrapper callable's body: unwrap class-typed arguments to raw
+/// handles, invoke the addon binding through the rebranding helper, and wrap
+/// a class-typed result. Shared by free functions and interface members
+/// (`self_expr` supplies the leading handle of an instance method).
+fn emit_wrapper_body_js(
+    w: &mut CodeWriter,
+    f: &FnBinding,
+    addon_name: &str,
+    self_expr: Option<&str>,
+    map_expr: &str,
+    rich: &HashSet<String>,
+) {
+    let mut args: Vec<String> = Vec::new();
+    if let Some(s) = self_expr {
+        args.push(s.to_string());
+    }
+    for p in &f.params {
+        args.push(js_arg_expr(&js_param_name(&p.name), &p.ty, rich));
+    }
+    let args = args.join(", ");
+    let invoke = if f.is_async {
+        "__invokeAsync"
+    } else {
+        "__invoke"
+    };
+    let call = format!("{invoke}(addon.{addon_name}, [{args}], {map_expr})");
+
+    let Some(wrap) = js_ret_wrap(f.ret.as_ref(), rich) else {
+        w.line(format!("return {call};"));
+        return;
+    };
+    let cls = &wrap.cls;
+    let rewrap = if wrap.iface {
+        format!("{cls}._fromHandle(_r)")
+    } else {
+        format!("new {cls}(_r)")
+    };
+    match (f.is_async, wrap.optional) {
+        (false, false) => {
+            w.line(format!("const _r = {call};"));
+            w.line(format!("return {rewrap};"));
+        }
+        (false, true) => {
+            w.line(format!("const _r = {call};"));
+            w.line(format!("return _r == null ? null : {rewrap};"));
+        }
+        (true, false) => {
+            w.line(format!("return {call}.then((_r) => {rewrap});"));
+        }
+        (true, true) => {
+            w.line(format!(
+                "return {call}.then((_r) => (_r == null ? null : {rewrap}));"
+            ));
+        }
+    }
+}
+
+/// Emit one interface's JS class onto `wv`, following the rich-enum wrapper
+/// pattern: the class owns the opaque handle and frees it once, via explicit
+/// `destroy()` or a `FinalizationRegistry` safety net. A sync constructor
+/// named `new` becomes the JS `constructor`; every other constructor becomes
+/// a static factory; methods pass the wrapped handle as the leading addon
+/// argument; statics are static methods.
+fn render_interface_class_js(
+    out: &mut String,
+    i: &InterfaceBinding,
+    m: &ModuleBinding,
+    strip: bool,
+    rich: &HashSet<String>,
+) {
+    let name = &i.name;
+    let destroy_js = wrapper_name(&m.path, &iface_member_base(name, "destroy"), strip);
+    let error = m.error.as_ref();
+
+    let mut w = CodeWriter::two_space();
+    w.block(format!("class {name} {{"), "}", |w| {
+        let canonical = i
+            .constructors
+            .iter()
+            .find(|c| c.name == "new" && !c.is_async);
+        if let Some(c) = canonical {
+            let addon_name = wrapper_name(&m.path, &iface_member_base(name, &c.name), strip);
+            let params: Vec<String> = c.params.iter().map(|p| js_param_name(&p.name)).collect();
+            let args: Vec<String> = c
+                .params
+                .iter()
+                .map(|p| js_arg_expr(&js_param_name(&p.name), &p.ty, rich))
+                .collect();
+            let map = js_error_map_expr(c, error);
+            w.block(format!("constructor({}) {{", params.join(", ")), "}", |w| {
+                w.line(format!(
+                    "this._handle = __invoke(addon.{addon_name}, [{}], {map});",
+                    args.join(", ")
+                ));
+                w.line(format!(
+                    "{name}._cleanup.register(this, this._handle, this);"
+                ));
+            });
+        }
+        for c in &i.constructors {
+            if canonical.is_some_and(|canon| std::ptr::eq(canon, c)) {
+                continue;
+            }
+            let addon_name = wrapper_name(&m.path, &iface_member_base(name, &c.name), strip);
+            let factory = c.name.to_lower_camel_case();
+            let params: Vec<String> = c.params.iter().map(|p| js_param_name(&p.name)).collect();
+            let map = js_error_map_expr(c, error);
+            w.block(
+                format!("static {factory}({}) {{", params.join(", ")),
+                "}",
+                |w| {
+                    emit_wrapper_body_js(w, c, &addon_name, None, &map, rich);
+                },
+            );
+        }
+        for f in &i.methods {
+            let addon_name = wrapper_name(&m.path, &iface_member_base(name, &f.name), strip);
+            let method = f.name.to_lower_camel_case();
+            let params: Vec<String> = f.params.iter().map(|p| js_param_name(&p.name)).collect();
+            let map = js_error_map_expr(f, error);
+            w.block(format!("{method}({}) {{", params.join(", ")), "}", |w| {
+                emit_wrapper_body_js(w, f, &addon_name, Some("this._handle"), &map, rich);
+            });
+        }
+        for f in &i.statics {
+            let addon_name = wrapper_name(&m.path, &iface_member_base(name, &f.name), strip);
+            let method = f.name.to_lower_camel_case();
+            let params: Vec<String> = f.params.iter().map(|p| js_param_name(&p.name)).collect();
+            let map = js_error_map_expr(f, error);
+            w.block(
+                format!("static {method}({}) {{", params.join(", ")),
+                "}",
+                |w| {
+                    emit_wrapper_body_js(w, f, &addon_name, None, &map, rich);
+                },
+            );
+        }
+        // Explicit cleanup; guarded so a double `destroy()` (or destroy-then-GC)
+        // is a no-op rather than a double free.
+        w.block("destroy() {", "}", |w| {
+            w.block("if (this._handle) {", "}", |w| {
+                w.line(format!("{name}._cleanup.unregister(this);"));
+                w.line(format!("addon.{destroy_js}(this._handle);"));
+                w.line("this._handle = 0;");
+            });
+        });
+    });
+
+    // Wrap an owned handle returned by the addon without running the public
+    // constructor (which would invoke the native constructor again).
+    w.block(
+        format!("{name}._fromHandle = function (handle) {{"),
+        "};",
+        |w| {
+            w.line(format!("const _o = Object.create({name}.prototype);"));
+            w.line("_o._handle = handle;");
+            w.line(format!("{name}._cleanup.register(_o, handle, _o);"));
+            w.line("return _o;");
+        },
+    );
+    w.block(
+        format!("{name}._cleanup = new FinalizationRegistry((handle) => {{"),
+        "});",
+        |w| {
+            w.line(format!("if (handle) {{ addon.{destroy_js}(handle); }}"));
+        },
+    );
+    w.line(format!("wv.{name} = {name};"));
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// The JS loader (`index.js`). Re-exports the native addon's bindings, then
+/// layers the idiomatic surface on top: the generic error brand plus one
+/// typed error class per declared domain, wrapper classes for rich enums and
+/// interfaces, and one wrapper per module function so failures rebrand as the
+/// right error class and class-typed values cross as instances rather than
+/// raw handles.
+fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) -> String {
     let dbl = CommentStyle::DoubleSlash;
     let mut out = render_prelude(dbl, input_basename);
     out.push_str(
-        "// Prefer the default node-gyp output path; fall back to a\n\
-         // prebuilt index.node placed next to this file.\n\
+        "// The WEAVEFFI_ADDON environment variable overrides the addon location\n\
+         // (an absolute path to the built .node file); otherwise prefer the\n\
+         // default node-gyp output path and fall back to a prebuilt index.node\n\
+         // placed next to this file.\n\
          let addon;\n\
-         try {\n  addon = require('./build/Release/weaveffi.node');\n} catch (e) {\n  addon = require('./index.node');\n}\n",
+         if (process.env.WEAVEFFI_ADDON) {\n  addon = require(process.env.WEAVEFFI_ADDON);\n} else {\n  try {\n    addon = require('./build/Release/weaveffi.node');\n  } catch (e) {\n    addon = require('./index.node');\n  }\n}\n",
     );
-
-    let rich = rich_enum_names(&model);
-    if rich.is_empty() {
-        out.push_str("module.exports = addon;\n\n");
-        out.push_str(&render_trailer(dbl, "index.js"));
-        return out;
-    }
 
     // The native bindings are defined as non-enumerable properties, so copy
     // them by explicit own-name lookup before layering the idiomatic wrappers.
     out.push_str(
-        "\n// Re-export every native binding, then layer idiomatic wrappers for\n\
-         // rich (algebraic) enums on top.\n\
+        "\n// Re-export every native binding, then layer the idiomatic wrappers\n\
+         // (error classes, interface and rich-enum classes, function wrappers)\n\
+         // on top.\n\
          const wv = {};\n\
          for (const _name of Object.getOwnPropertyNames(addon)) {\n  wv[_name] = addon[_name];\n}\n\n",
     );
 
+    // The generic brand and the shared invoke helpers. Every wrapper funnels
+    // addon failures (JS errors carrying the numeric ABI `code`) through a
+    // mapping factory: the module domain's for throwing callables, the
+    // generic constructor otherwise.
+    out.push_str(&format!(
+        "class {ERROR_BRAND} extends Error {{\n  \
+           constructor(code, message) {{\n    \
+             super('(' + code + ') ' + (message || ''));\n    \
+             this.name = '{ERROR_BRAND}';\n    \
+             this.code = code;\n    \
+             this.errorMessage = message || '';\n  \
+           }}\n\
+         }}\n\
+         wv.{ERROR_BRAND} = {ERROR_BRAND};\n\
+         function __generic(code, message) {{\n  \
+           return new {ERROR_BRAND}(code, message);\n\
+         }}\n\
+         function __rebrand(e, map) {{\n  \
+           return e && typeof e.code === 'number' ? map(e.code, e.message) : e;\n\
+         }}\n\
+         function __invoke(fn, args, map) {{\n  \
+           try {{\n    \
+             return fn.apply(null, args);\n  \
+           }} catch (e) {{\n    \
+             throw __rebrand(e, map);\n  \
+           }}\n\
+         }}\n\
+         function __invokeAsync(fn, args, map) {{\n  \
+           return fn.apply(null, args).catch((e) => {{\n    \
+             throw __rebrand(e, map);\n  \
+           }});\n\
+         }}\n\n"
+    ));
+
+    let rich = rich_enum_names(model);
+
     for m in &model.modules {
+        if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
+            render_error_classes_js(&mut out, eb);
+        }
         for e in &m.enums {
             if e.is_rich() {
                 render_rich_enum_class_js(&mut out, e, &m.path, strip);
             }
         }
+        for i in &m.interfaces {
+            render_interface_class_js(&mut out, i, m, strip, &rich);
+        }
     }
 
-    // Rewrap module functions whose parameters or return carry a rich enum so
-    // callers pass and receive the class instead of the raw opaque handle.
+    // One wrapper per module function, so every failure is rebranded and
+    // class-typed parameters and returns cross as instances.
     for m in &model.modules {
         for f in &m.functions {
-            if f.is_async {
-                continue;
-            }
-            let ret_rich = f.ret.as_ref().and_then(|r| rich_struct_ref(r, &rich));
-            let param_rich: Vec<Option<(String, bool)>> = f
-                .params
-                .iter()
-                .map(|p| rich_struct_ref(&p.ty, &rich))
-                .collect();
-            if ret_rich.is_none() && param_rich.iter().all(Option::is_none) {
-                continue;
-            }
-            let js = wrapper_name(&m.path, &f.name, strip);
-            let param_names: Vec<String> = f.params.iter().map(|p| p.name.clone()).collect();
-            let call_args: Vec<String> = f
-                .params
-                .iter()
-                .zip(&param_rich)
-                .map(|(p, r)| match r {
-                    Some((en, _)) => {
-                        format!("{n} instanceof {en} ? {n}._handle : {n}", n = p.name)
-                    }
-                    None => p.name.clone(),
-                })
-                .collect();
-            let inner = format!("addon.{js}({})", call_args.join(", "));
-            out.push_str(&format!(
-                "wv.{js} = function ({}) {{\n",
-                param_names.join(", ")
-            ));
-            match ret_rich {
-                Some((en, false)) => {
-                    out.push_str(&format!("  return new {en}({inner});\n"));
-                }
-                Some((en, true)) => {
-                    out.push_str(&format!("  const _r = {inner};\n"));
-                    out.push_str(&format!("  return _r == null ? null : new {en}(_r);\n"));
-                }
-                None => {
-                    out.push_str(&format!("  return {inner};\n"));
-                }
-            }
-            out.push_str("};\n");
+            let js = js_fn_name(&m.path, &f.name, strip);
+            let params: Vec<String> = f.params.iter().map(|p| js_param_name(&p.name)).collect();
+            let map = js_error_map_expr(f, m.error.as_ref());
+            let mut w = CodeWriter::two_space();
+            w.block(
+                format!("wv.{js} = function ({}) {{", params.join(", ")),
+                "};",
+                |w| {
+                    emit_wrapper_body_js(w, f, &js, None, &map, &rich);
+                },
+            );
+            out.push_str(&w.finish());
         }
     }
 
@@ -3314,14 +3833,17 @@ fn render_rich_enum_class_js(out: &mut String, e: &EnumBinding, module: &str, st
             w.line(format!("{name}._cleanup.register(this, handle, this);"));
         });
 
-        // Per-variant factories (`Shape.circle(radius)`).
+        // Per-variant factories (`Shape.circle(radius)`). A constructor
+        // failure can only be marshalling or a panic, so it rebrands generic.
         for v in &rich.variants {
             let factory = v.name.to_lower_camel_case();
             let ctor_js = wrapper_name(module, &rich_ctor_base(name, &v.name), strip);
             let params: Vec<String> = v.fields.iter().map(|f| f.name.clone()).collect();
             let joined = params.join(", ");
             w.block(format!("static {factory}({joined}) {{"), "}", |w| {
-                w.line(format!("return new {name}(addon.{ctor_js}({joined}));"));
+                w.line(format!(
+                    "return new {name}(__invoke(addon.{ctor_js}, [{joined}], __generic));"
+                ));
             });
         }
 
@@ -3381,16 +3903,155 @@ fn render_rich_enum_class_js(out: &mut String, e: &EnumBinding, module: &str, st
     out.push_str(&w.finish());
 }
 
+/// The TS parameter list of a callable, camel-cased.
+fn ts_params(f: &FnBinding) -> String {
+    f.params
+        .iter()
+        .map(|p| format!("{}: {}", js_param_name(&p.name), ts_type_for(&p.ty)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The TS return annotation of a callable (`Promise`-wrapped when async).
+fn ts_ret(f: &FnBinding) -> String {
+    let base = match &f.ret {
+        Some(ty) => ts_type_for(ty),
+        None => "void".into(),
+    };
+    if f.is_async {
+        format!("Promise<{base}>")
+    } else {
+        base
+    }
+}
+
+/// The standard JSDoc tag list of a callable: the C mapping, a `@throws` tag
+/// naming the module's domain class for throwing callables, and any
+/// deprecation notice.
+fn ts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
+    let mut tags = vec![format!("Maps to C function: {}", f.c_base)];
+    if let (true, Some(eb)) = (f.throws, error) {
+        tags.push(format!("@throws {{{}}}", eb.type_name));
+    }
+    if let Some(msg) = &f.deprecated {
+        tags.push(format!("@deprecated {}", msg));
+    }
+    tags
+}
+
+/// `.d.ts` for one declaring module's error surface: the domain class
+/// extending the generic brand plus one subclass per code carrying its
+/// stable `CODE`.
+fn render_error_dts(out: &mut String, eb: &ErrorBinding) {
+    let domain = &eb.type_name;
+    out.push_str(&format!(
+        "/** Typed errors reported by the `{}` module's throwing functions. */\n",
+        eb.owner_path
+    ));
+    out.push_str(&format!("export class {domain} extends {ERROR_BRAND} {{\n"));
+    out.push_str("  constructor(code: number, message: string);\n");
+    out.push_str("}\n");
+    for c in &eb.codes {
+        let class = error_type_name(&c.name, "Error");
+        emit_doc(out, &c.doc, "");
+        out.push_str(&format!("export class {class} extends {domain} {{\n"));
+        out.push_str(&format!("  static readonly CODE: {};\n", c.value));
+        out.push_str("  constructor(message?: string);\n");
+        out.push_str("}\n");
+    }
+}
+
+/// `.d.ts` for one interface: a class whose canonical `new` constructor,
+/// static factories, methods, and statics mirror the JS class in
+/// [`render_interface_class_js`].
+fn render_interface_dts(out: &mut String, i: &InterfaceBinding, error: Option<&ErrorBinding>) {
+    let name = &i.name;
+    let mut w = CodeWriter::two_space();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &i.doc, "");
+        w.raw(d);
+    }
+    w.block(format!("export class {name} {{"), "}", |w| {
+        let canonical = i
+            .constructors
+            .iter()
+            .find(|c| c.name == "new" && !c.is_async);
+        if let Some(c) = canonical {
+            let mut d = String::new();
+            emit_fn_doc(&mut d, &c.doc, &c.params, "  ", &ts_fn_tags(c, error));
+            w.raw(d);
+            w.line(format!("constructor({});", ts_params(c)));
+        }
+        for c in &i.constructors {
+            if canonical.is_some_and(|canon| std::ptr::eq(canon, c)) {
+                continue;
+            }
+            let mut d = String::new();
+            emit_fn_doc(&mut d, &c.doc, &c.params, "  ", &ts_fn_tags(c, error));
+            w.raw(d);
+            let ret = if c.is_async {
+                format!("Promise<{name}>")
+            } else {
+                name.to_string()
+            };
+            w.line(format!(
+                "static {}({}): {ret};",
+                c.name.to_lower_camel_case(),
+                ts_params(c)
+            ));
+        }
+        for f in &i.methods {
+            let mut d = String::new();
+            emit_fn_doc(&mut d, &f.doc, &f.params, "  ", &ts_fn_tags(f, error));
+            w.raw(d);
+            w.line(format!(
+                "{}({}): {};",
+                f.name.to_lower_camel_case(),
+                ts_params(f),
+                ts_ret(f)
+            ));
+        }
+        for f in &i.statics {
+            let mut d = String::new();
+            emit_fn_doc(&mut d, &f.doc, &f.params, "  ", &ts_fn_tags(f, error));
+            w.raw(d);
+            w.line(format!(
+                "static {}({}): {};",
+                f.name.to_lower_camel_case(),
+                ts_params(f),
+                ts_ret(f)
+            ));
+        }
+        w.line("/** Free the underlying native object. */");
+        w.line("destroy(): void;");
+    });
+    out.push_str(&w.finish());
+}
+
 fn render_node_dts(
-    api: &Api,
-    prefix: &str,
+    model: &BindingModel,
     strip_module_prefix: bool,
     input_basename: &str,
 ) -> String {
-    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str("// Generated types for WeaveFFI functions\n");
+    out.push_str("/**\n");
+    out.push_str(" * Base class of every error thrown by these bindings. Non-throwing\n");
+    out.push_str(" * functions reject or throw it directly for panics and marshalling\n");
+    out.push_str(" * failures; throwing functions surface a module domain subclass.\n");
+    out.push_str(" */\n");
+    out.push_str(&format!("export class {ERROR_BRAND} extends Error {{\n"));
+    out.push_str("  /** The numeric ABI error code. */\n");
+    out.push_str("  code: number;\n");
+    out.push_str("  /** The raw producer message, without the code prefix. */\n");
+    out.push_str("  errorMessage: string;\n");
+    out.push_str("  constructor(code: number, message: string);\n");
+    out.push_str("}\n");
     for m in &model.modules {
+        if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
+            render_error_dts(&mut out, eb);
+        }
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
@@ -3419,6 +4080,9 @@ fn render_node_dts(
             out.push_str("}\n");
         }
         out.push_str(&format!("// module {}\n", m.path));
+        for i in &m.interfaces {
+            render_interface_dts(&mut out, i, m.error.as_ref());
+        }
         for l in &m.listeners {
             let Some(cb) = m.callback(&l.event_callback) else {
                 continue;
@@ -3426,14 +4090,14 @@ fn render_node_dts(
             let cb_params: Vec<String> = cb
                 .params
                 .iter()
-                .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
+                .map(|p| format!("{}: {}", js_param_name(&p.name), ts_type_for(&p.ty)))
                 .collect();
-            let register = wrapper_name(
+            let register = js_fn_name(
                 &m.path,
                 &format!("register_{}", l.name),
                 strip_module_prefix,
             );
-            let unregister = wrapper_name(
+            let unregister = js_fn_name(
                 &m.path,
                 &format!("unregister_{}", l.name),
                 strip_module_prefix,
@@ -3446,31 +4110,19 @@ fn render_node_dts(
             out.push_str(&format!("export function {unregister}(id: number): void\n"));
         }
         for f in &m.functions {
-            let params: Vec<String> = f
-                .params
-                .iter()
-                .map(|p| format!("{}: {}", p.name, ts_type_for(&p.ty)))
-                .collect();
-            let base_ret = match &f.ret {
-                Some(ty) => ts_type_for(ty),
-                None => "void".into(),
-            };
-            let ret = if f.is_async {
-                format!("Promise<{base_ret}>")
-            } else {
-                base_ret
-            };
-            let ts_name = wrapper_name(&m.path, &f.name, strip_module_prefix);
-            let mut tags = vec![format!("Maps to C function: {}", f.c_base)];
-            if let Some(msg) = &f.deprecated {
-                tags.push(format!("@deprecated {}", msg));
-            }
-            emit_fn_doc(&mut out, &f.doc, &f.params, "", &tags);
+            let ts_name = js_fn_name(&m.path, &f.name, strip_module_prefix);
+            emit_fn_doc(
+                &mut out,
+                &f.doc,
+                &f.params,
+                "",
+                &ts_fn_tags(f, m.error.as_ref()),
+            );
             out.push_str(&format!(
                 "export function {}({}): {}\n",
                 ts_name,
-                params.join(", "),
-                ret
+                ts_params(f),
+                ts_ret(f)
             ));
         }
     }
@@ -3483,7 +4135,10 @@ fn render_node_dts(
 mod tests {
     use super::*;
     use weaveffi_core::codegen::Generator;
-    use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
+    use weaveffi_ir::ir::{
+        EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef, Module, Param,
+        StructDef, StructField,
+    };
 
     #[test]
     fn package_uses_optional_dependencies_per_platform() {
@@ -3540,7 +4195,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
@@ -3556,8 +4211,27 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }
+    }
+
+    /// Test-only bridge from an inline [`Api`] literal to the model the
+    /// production path receives from the driver.
+    fn build_model(api: &Api) -> BindingModel {
+        BindingModel::build(api, "weaveffi")
+    }
+
+    fn index_for(api: &Api, strip: bool) -> String {
+        render_node_index(&build_model(api), strip, "weaveffi.yml")
+    }
+
+    fn dts_for(api: &Api, strip: bool) -> String {
+        render_node_dts(&build_model(api), strip, "weaveffi.yml")
+    }
+
+    fn addon_for(api: &Api, strip: bool) -> String {
+        render_addon_c(&build_model(api), strip, "weaveffi.yml")
     }
 
     #[test]
@@ -3584,6 +4258,7 @@ mod tests {
                 doc: None,
             }],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let dir = tempfile::tempdir().unwrap();
@@ -3615,12 +4290,12 @@ mod tests {
         let dts = std::fs::read_to_string(dir.path().join("node/types.d.ts")).unwrap();
         assert!(
             dts.contains(
-                "export function events_register_message_listener(callback: (message: string) => void): number"
+                "export function registerMessageListener(callback: (message: string) => void): number"
             ),
             "register dts missing: {dts}"
         );
         assert!(
-            dts.contains("export function events_unregister_message_listener(id: number): void"),
+            dts.contains("export function unregisterMessageListener(id: number): void"),
             "unregister dts missing: {dts}"
         );
     }
@@ -3752,6 +4427,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         });
@@ -3762,11 +4438,12 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         });
 
-        let dts = render_node_dts(&make_api(vec![m]), "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&make_api(vec![m]), true);
 
         assert!(dts.contains("export interface Contact {"));
         assert!(dts.contains("  name: string;"));
@@ -3776,12 +4453,12 @@ mod tests {
         assert!(dts.contains("  Red = 0,"));
         assert!(dts.contains("  Green = 1,"));
         assert!(dts.contains("  Blue = 2,"));
-        assert!(dts.contains("export function get_contact(id: number): Contact | null"));
-        assert!(dts.contains("export function list_contacts(): Contact[]"));
+        assert!(dts.contains("export function getContact(id: number): Contact | null"));
+        assert!(dts.contains("export function listContacts(): Contact[]"));
 
         let iface_pos = dts.find("export interface Contact").unwrap();
         let enum_pos = dts.find("export enum Color").unwrap();
-        let fn_pos = dts.find("export function get_contact").unwrap();
+        let fn_pos = dts.find("export function getContact").unwrap();
         assert!(
             iface_pos < fn_pos,
             "interface should appear before functions"
@@ -3813,6 +4490,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
@@ -3881,6 +4559,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -3891,6 +4570,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -3914,6 +4594,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -3929,6 +4610,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -3985,6 +4667,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4029,27 +4712,27 @@ mod tests {
         assert!(dts.contains("  Blue = 2,"), "missing Blue variant: {dts}");
 
         assert!(
-            dts.contains("export function get_contact(id: number): Contact | null"),
-            "missing get_contact with optional return: {dts}"
+            dts.contains("export function getContact(id: number): Contact | null"),
+            "missing getContact with optional return: {dts}"
         );
         assert!(
-            dts.contains("export function list_contacts(): Contact[]"),
-            "missing list_contacts with list return: {dts}"
+            dts.contains("export function listContacts(): Contact[]"),
+            "missing listContacts with list return: {dts}"
         );
         assert!(
             dts.contains(
-                "export function set_favorite_color(contact_id: number, color: Color | null): void"
+                "export function setFavoriteColor(contactId: number, color: Color | null): void"
             ),
-            "missing set_favorite_color with optional enum param: {dts}"
+            "missing setFavoriteColor with optional enum param: {dts}"
         );
         assert!(
-            dts.contains("export function get_tags(contact_id: number): string[]"),
-            "missing get_tags with list return: {dts}"
+            dts.contains("export function getTags(contactId: number): string[]"),
+            "missing getTags with list return: {dts}"
         );
 
         let iface_pos = dts.find("export interface Contact").unwrap();
         let enum_pos = dts.find("export enum Color").unwrap();
-        let fn_pos = dts.find("export function get_contact").unwrap();
+        let fn_pos = dts.find("export function getContact").unwrap();
         assert!(
             iface_pos < fn_pos,
             "interface should appear before functions"
@@ -4111,6 +4794,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
@@ -4134,13 +4818,14 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
 
-        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&api, true);
 
         assert!(
             dts.contains("Maps to C function: weaveffi_math_add"),
@@ -4176,12 +4861,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             !addon.contains("// TODO: implement"),
             "generated addon.c should not contain TODO comments: {addon}"
@@ -4212,12 +4898,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             addon.contains("napi_get_cb_info"),
             "generated addon.c should call napi_get_cb_info: {addon}"
@@ -4240,12 +4927,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             addon.contains("weaveffi_free_string(result)"),
             "generated addon should free returned strings: {addon}"
@@ -4280,6 +4968,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
@@ -4353,12 +5042,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             addon.contains("err.code"),
             "generated addon.c should check err.code: {addon}"
@@ -4381,6 +5071,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
@@ -4401,17 +5092,17 @@ mod tests {
 
         let dts = std::fs::read_to_string(tmp.join("node/types.d.ts")).unwrap();
         assert!(
-            dts.contains("export function create_contact("),
-            "stripped name should be create_contact: {dts}"
+            dts.contains("export function createContact("),
+            "stripped name should be createContact: {dts}"
         );
         assert!(
-            !dts.contains("export function contacts_create_contact("),
+            !dts.contains("export function contactsCreateContact("),
             "should not contain module-prefixed name: {dts}"
         );
 
         let addon = std::fs::read_to_string(tmp.join("node/weaveffi_addon.c")).unwrap();
         assert!(
-            addon.contains("\"create_contact\""),
+            addon.contains("\"createContact\""),
             "JS export name should be stripped: {addon}"
         );
         assert!(
@@ -4419,7 +5110,17 @@ mod tests {
             "C ABI call should still use full name: {addon}"
         );
 
-        let no_strip = NodeConfig::default();
+        // Stripping is the default; `strip_module_prefix: false` restores
+        // module-prefixed (still lowerCamelCase) names.
+        let default_cfg = NodeConfig::default();
+        assert!(
+            default_cfg.strip_module_prefix,
+            "stripping must be the default"
+        );
+        let no_strip = NodeConfig {
+            strip_module_prefix: false,
+            ..NodeConfig::default()
+        };
         let tmp2 = std::env::temp_dir().join("weaveffi_test_node_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
@@ -4429,8 +5130,8 @@ mod tests {
 
         let dts2 = std::fs::read_to_string(tmp2.join("node/types.d.ts")).unwrap();
         assert!(
-            dts2.contains("export function contacts_create_contact("),
-            "default should use module-prefixed name: {dts2}"
+            dts2.contains("export function contactsCreateContact("),
+            "opting out should restore module-prefixed names: {dts2}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4464,12 +5165,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&api, true);
         assert!(
             dts.contains("contact: Contact"),
             "TypedHandle should use class type not bigint: {dts}"
@@ -4494,6 +5196,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4512,9 +5215,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&api, true);
         assert!(
             dts.contains("(Contact | null)[] | null"),
             "should contain deeply nested optional type: {dts}"
@@ -4540,6 +5244,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4548,9 +5253,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&api, true);
         assert!(
             dts.contains("Record<string, number[]>"),
             "should contain map of lists type: {dts}"
@@ -4576,6 +5282,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4617,9 +5324,10 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
-        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&api, true);
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
@@ -4653,12 +5361,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             addon.contains("free(name)"),
             "malloc'd JS string copy should be freed after the C call: {addon}"
@@ -4720,12 +5429,13 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             addon.contains("if (result == NULL)"),
             "optional struct return should null-check before wrapping: {addon}"
@@ -4752,6 +5462,7 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
@@ -4762,12 +5473,13 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let dts = render_node_dts(&api, "weaveffi", true, "weaveffi.yml");
+        let dts = dts_for(&api, true);
         assert!(
             dts.contains("Promise<"),
             "async function should return Promise in .d.ts: {dts}"
@@ -4798,12 +5510,13 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         assert!(
             addon.contains("napi_create_promise"),
             "async addon should call napi_create_promise: {addon}"
@@ -4861,12 +5574,13 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             });
             m
         }]);
-        let addon = render_addon_c(&api, "weaveffi", true, "weaveffi.yml");
+        let addon = addon_for(&api, true);
         let create_count = addon.matches("napi_create_promise").count();
         let resolve_count = addon.matches("napi_resolve_deferred").count();
         let reject_count = addon.matches("napi_reject_deferred").count();
@@ -4914,6 +5628,7 @@ mod tests {
                 doc: Some("Performs a thing.".into()),
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4941,63 +5656,39 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }
     }
 
     #[test]
     fn node_emits_doc_on_function() {
-        let dts = render_node_dts(
-            &make_api(vec![doc_module()]),
-            "weaveffi",
-            true,
-            "weaveffi.yml",
-        );
+        let dts = dts_for(&make_api(vec![doc_module()]), true);
         assert!(dts.contains("Performs a thing."), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_struct() {
-        let dts = render_node_dts(
-            &make_api(vec![doc_module()]),
-            "weaveffi",
-            true,
-            "weaveffi.yml",
-        );
+        let dts = dts_for(&make_api(vec![doc_module()]), true);
         assert!(dts.contains("/** An item we track. */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_enum_variant() {
-        let dts = render_node_dts(
-            &make_api(vec![doc_module()]),
-            "weaveffi",
-            true,
-            "weaveffi.yml",
-        );
+        let dts = dts_for(&make_api(vec![doc_module()]), true);
         assert!(dts.contains("/** Kind of item. */"), "{dts}");
         assert!(dts.contains("/** A small one */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_field() {
-        let dts = render_node_dts(
-            &make_api(vec![doc_module()]),
-            "weaveffi",
-            true,
-            "weaveffi.yml",
-        );
+        let dts = dts_for(&make_api(vec![doc_module()]), true);
         assert!(dts.contains("/** Stable id */"), "{dts}");
     }
 
     #[test]
     fn node_emits_doc_on_param() {
-        let dts = render_node_dts(
-            &make_api(vec![doc_module()]),
-            "weaveffi",
-            true,
-            "weaveffi.yml",
-        );
+        let dts = dts_for(&make_api(vec![doc_module()]), true);
         assert!(dts.contains("@param x the input value"), "{dts}");
     }
 
@@ -5038,6 +5729,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5061,6 +5753,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5076,6 +5769,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5125,18 +5819,14 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }
     }
 
     #[test]
     fn rich_enum_addon_exposes_native_helpers() {
-        let addon = render_addon_c(
-            &make_api(vec![shapes_module()]),
-            "weaveffi",
-            false,
-            "shapes.yml",
-        );
+        let addon = addon_for(&make_api(vec![shapes_module()]), false);
 
         // Tag reader, per-variant constructors, per-variant field getters, and
         // the destructor are all defined as native functions over the C ABI.
@@ -5174,12 +5864,7 @@ mod tests {
 
     #[test]
     fn rich_enum_addon_calls_c_abi_correctly() {
-        let addon = render_addon_c(
-            &make_api(vec![shapes_module()]),
-            "weaveffi",
-            false,
-            "shapes.yml",
-        );
+        let addon = addon_for(&make_api(vec![shapes_module()]), false);
 
         // Constructors thread out_err and return the owned pointer as a handle.
         assert!(
@@ -5242,12 +5927,7 @@ mod tests {
 
     #[test]
     fn rich_enum_index_js_exposes_class() {
-        let index = render_node_index(
-            &make_api(vec![shapes_module()]),
-            "weaveffi",
-            false,
-            "shapes.yml",
-        );
+        let index = index_for(&make_api(vec![shapes_module()]), false);
 
         assert!(
             index.contains("class Shape {"),
@@ -5265,9 +5945,12 @@ mod tests {
                 "missing factory `{factory}`: {index}"
             );
         }
-        // The factories call the native constructors.
+        // The factories call the native constructors through the generic
+        // rebranding helper (a failure is marshalling or a panic).
         assert!(
-            index.contains("return new Shape(addon.shapes_Shape_circle_new(radius));"),
+            index.contains(
+                "return new Shape(__invoke(addon.shapes_Shape_circle_new, [radius], __generic));"
+            ),
             "circle factory must call the native ctor: {index}"
         );
         // tag reader + namespaced per-variant getters.
@@ -5304,26 +5987,26 @@ mod tests {
         // Module functions that carry the rich enum are rewrapped to speak the
         // class; `scale` returns a wrapped instance, `describe` unwraps its arg.
         assert!(
-            index.contains("wv.shapes_scale = function (shape, factor) {")
-                && index.contains("return new Shape(addon.shapes_scale(shape instanceof Shape ? shape._handle : shape, factor));"),
+            index.contains("wv.shapesScale = function (shape, factor) {")
+                && index.contains(
+                    "__invoke(addon.shapesScale, [shape instanceof Shape ? shape._handle : shape, factor], __generic)"
+                )
+                && index.contains("return new Shape(_r);"),
             "scale must be rewrapped to return a Shape: {index}"
         );
         assert!(
             index.contains(
-                "return addon.shapes_describe(shape instanceof Shape ? shape._handle : shape);"
+                "return __invoke(addon.shapesDescribe, [shape instanceof Shape ? shape._handle : shape], __generic);"
             ),
             "describe must unwrap a Shape argument: {index}"
-        );
-        // A function with no rich enum is left as the raw native binding.
-        assert!(
-            !index.contains("wv.shapes_sum_bytes = function"),
-            "sum_bytes must not be rewrapped: {index}"
         );
     }
 
     #[test]
-    fn rich_enum_index_js_without_rich_is_plain_reexport() {
-        // A model with no rich enums keeps the historical `module.exports = addon`.
+    fn index_js_without_domains_wraps_with_generic_brand() {
+        // Even with no rich enums, interfaces, or error domains, every
+        // function gets a wrapper so a non-zero error slot (panic or
+        // marshalling failure) surfaces as the generic brand class.
         let mut m = make_module("math");
         m.functions.push(Function {
             name: "add".into(),
@@ -5337,28 +6020,29 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         });
-        let index = render_node_index(&make_api(vec![m]), "weaveffi", false, "weaveffi.yml");
+        let index = index_for(&make_api(vec![m]), false);
         assert!(
-            index.contains("module.exports = addon;"),
-            "no-rich-enum index must re-export the addon directly: {index}"
+            index.contains("class WeaveFFIError extends Error {"),
+            "generic brand class missing: {index}"
         );
         assert!(
-            !index.contains("class "),
-            "no class should be emitted: {index}"
+            index.contains("wv.mathAdd = function (a) {")
+                && index.contains("return __invoke(addon.mathAdd, [a], __generic);"),
+            "non-throwing fn must wrap through the generic brand: {index}"
+        );
+        assert!(
+            index.contains("module.exports = wv;"),
+            "index must export the wrapper namespace: {index}"
         );
     }
 
     #[test]
     fn rich_enum_dts_emits_class_not_enum() {
-        let dts = render_node_dts(
-            &make_api(vec![shapes_module()]),
-            "weaveffi",
-            false,
-            "shapes.yml",
-        );
+        let dts = dts_for(&make_api(vec![shapes_module()]), false);
 
         // Rich enum -> class with factories, tag(), getters, destroy().
         assert!(
@@ -5388,14 +6072,427 @@ mod tests {
             "plain enum stays an enum: {dts}"
         );
 
-        // Free functions are typed in terms of the class.
+        // Free functions are typed in terms of the class; unstripped names
+        // keep the module prefix but are still lowerCamelCase.
         assert!(
-            dts.contains("export function shapes_describe(shape: Shape): string"),
+            dts.contains("export function shapesDescribe(shape: Shape): string"),
             "{dts}"
         );
         assert!(
-            dts.contains("export function shapes_scale(shape: Shape, factor: number): Shape"),
+            dts.contains("export function shapesScale(shape: Shape, factor: number): Shape"),
             "{dts}"
+        );
+    }
+
+    // --- Interfaces and typed errors ----------------------------------------
+
+    /// A module mirroring the kvstore sample's shape: a `KvError` domain, a
+    /// `Store` interface (canonical `new` + non-throwing factory + throwing
+    /// and non-throwing methods + an async method + a static), and free
+    /// functions exercising the throws split and interface params/returns.
+    fn kv_module() -> Module {
+        fn param(name: &str, ty: TypeRef) -> Param {
+            Param {
+                name: name.into(),
+                ty,
+                mutable: false,
+                doc: None,
+            }
+        }
+        fn func(
+            name: &str,
+            params: Vec<Param>,
+            returns: Option<TypeRef>,
+            throws: bool,
+        ) -> Function {
+            Function {
+                name: name.into(),
+                params,
+                returns,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                throws,
+                deprecated: None,
+                since: None,
+            }
+        }
+        Module {
+            name: "kv".into(),
+            functions: vec![
+                func("ping", vec![], Some(TypeRef::Bool), false),
+                func(
+                    "clone_store",
+                    vec![param("source_store", TypeRef::Interface("Store".into()))],
+                    Some(TypeRef::Interface("Store".into())),
+                    true,
+                ),
+            ],
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: Some("A key-value store.".into()),
+                constructors: vec![
+                    func("new", vec![param("path", TypeRef::StringUtf8)], None, true),
+                    func(
+                        "open_readonly",
+                        vec![param("path", TypeRef::StringUtf8)],
+                        None,
+                        false,
+                    ),
+                ],
+                methods: vec![
+                    func(
+                        "put",
+                        vec![
+                            param("key", TypeRef::StringUtf8),
+                            param("the_value", TypeRef::StringUtf8),
+                        ],
+                        None,
+                        true,
+                    ),
+                    func("count", vec![], Some(TypeRef::I64), false),
+                    func(
+                        "list_keys",
+                        vec![param(
+                            "prefix",
+                            TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                        )],
+                        Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                        true,
+                    ),
+                    Function {
+                        name: "compact".into(),
+                        params: vec![],
+                        returns: Some(TypeRef::I64),
+                        doc: None,
+                        r#async: true,
+                        cancellable: false,
+                        throws: true,
+                        deprecated: None,
+                        since: None,
+                    },
+                ],
+                statics: vec![func("default_capacity", vec![], Some(TypeRef::I64), false)],
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KeyNotFound".into(),
+                        code: 1001,
+                        message: "key not found".into(),
+                        doc: Some("The requested key does not exist.".into()),
+                    },
+                    ErrorCode {
+                        name: "StoreFull".into(),
+                        code: 1003,
+                        message: "store is full".into(),
+                        doc: None,
+                    },
+                ],
+            }),
+            modules: vec![],
+        }
+    }
+
+    #[test]
+    fn interface_addon_exposes_member_entry_points() {
+        let addon = addon_for(&make_api(vec![kv_module()]), true);
+
+        // One native entry point per member plus the destructor, all named
+        // from the model's `{c_tag}_{member}` symbols.
+        for sym in [
+            "static napi_value Napi_weaveffi_kv_Store_new(",
+            "static napi_value Napi_weaveffi_kv_Store_open_readonly(",
+            "static napi_value Napi_weaveffi_kv_Store_put(",
+            "static napi_value Napi_weaveffi_kv_Store_count(",
+            "static napi_value Napi_weaveffi_kv_Store_compact(",
+            "static napi_value Napi_weaveffi_kv_Store_default_capacity(",
+            "static napi_value Napi_weaveffi_kv_Store_destroy(",
+        ] {
+            assert!(addon.contains(sym), "missing entry point {sym}: {addon}");
+        }
+
+        // Constructors return the owned object pointer as an int64 handle.
+        assert!(
+            addon.contains("weaveffi_kv_Store* result = weaveffi_kv_Store_new(path, &err);"),
+            "ctor must call the C constructor: {addon}"
+        );
+        // Methods read the wrapped pointer from args[0] and pass it as the
+        // leading C argument, ahead of the logical parameters.
+        assert!(
+            addon.contains(
+                "weaveffi_kv_Store_put((const weaveffi_kv_Store*)(intptr_t)self_raw, key, the_value, &err);"
+            ),
+            "method must pass self first: {addon}"
+        );
+        // The async launcher symbol comes from the model (member base plus
+        // `_async`), with the self slot leading.
+        assert!(
+            addon.contains("weaveffi_kv_Store_compact_async((const weaveffi_kv_Store*)(intptr_t)self_raw, weaveffi_kv_Store_compact_napi_cb, ctx);"),
+            "async method must call the model's launcher with self: {addon}"
+        );
+        // The destructor frees the object.
+        assert!(
+            addon.contains("weaveffi_kv_Store_destroy(self);"),
+            "destroy must free the object: {addon}"
+        );
+
+        // Members export under stripped, interface-scoped JS names.
+        for js in [
+            "\"Store_new\"",
+            "\"Store_open_readonly\"",
+            "\"Store_put\"",
+            "\"Store_default_capacity\"",
+            "\"Store_destroy\"",
+        ] {
+            assert!(addon.contains(js), "missing JS export {js}: {addon}");
+        }
+
+        // Every failure path throws the code-carrying error object.
+        assert!(
+            addon.contains(
+                "napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));"
+            ),
+            "sync errors must carry the ABI code: {addon}"
+        );
+        assert!(
+            addon.contains("napi_set_named_property(env, err, \"code\", code_val);"),
+            "the error helper must attach the numeric code: {addon}"
+        );
+    }
+
+    #[test]
+    fn iterator_drain_checks_per_step_error() {
+        let addon = addon_for(&make_api(vec![kv_module()]), true);
+
+        // The drain threads the per-step error slot through the model's
+        // `next` symbol (hanging off the interface tag, not the member name).
+        assert!(
+            addon.contains(
+                "while (weaveffi_kv_Store_ListKeysIterator_next(result, &iter_item, &iter_err)) {"
+            ),
+            "drain must pass the error slot to next: {addon}"
+        );
+        // A non-zero slot after the drain throws the code-carrying error
+        // (list_keys is `throws`, so the JS layer maps it to the domain).
+        assert!(
+            addon.contains(
+                "napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));"
+            ),
+            "drain must throw the per-step error: {addon}"
+        );
+        // The iterator is destroyed before the check, so the error path does
+        // not leak the handle.
+        let destroy = addon
+            .find("weaveffi_kv_Store_ListKeysIterator_destroy(result);")
+            .expect("drain must destroy the iterator");
+        let check = addon
+            .find("if (iter_err.code != 0) {")
+            .expect("drain must check iter_err");
+        assert!(
+            destroy < check,
+            "destroy must precede the error check: {addon}"
+        );
+    }
+
+    #[test]
+    fn interface_index_js_class() {
+        let index = index_for(&make_api(vec![kv_module()]), true);
+
+        assert!(
+            index.contains("class Store {"),
+            "missing Store class: {index}"
+        );
+        // The canonical `new` constructor maps to the JS constructor and
+        // routes failures through the domain factory (it throws).
+        assert!(
+            index.contains("constructor(path) {")
+                && index
+                    .contains("this._handle = __invoke(addon.Store_new, [path], __kvErrorFrom);"),
+            "missing canonical constructor: {index}"
+        );
+        // Other constructors become static factories; this one does not
+        // throw, so failures rebrand as the generic class.
+        assert!(
+            index.contains("static openReadonly(path) {")
+                && index.contains("__invoke(addon.Store_open_readonly, [path], __generic)")
+                && index.contains("return Store._fromHandle(_r);"),
+            "missing factory wrapping the owned handle: {index}"
+        );
+        // Methods pass the wrapped handle as the leading argument.
+        assert!(
+            index.contains("put(key, theValue) {")
+                && index.contains(
+                    "return __invoke(addon.Store_put, [this._handle, key, theValue], __kvErrorFrom);"
+                ),
+            "missing method with leading self handle: {index}"
+        );
+        // The async method rejects typed (it throws).
+        assert!(
+            index.contains("compact() {")
+                && index.contains(
+                    "return __invokeAsync(addon.Store_compact, [this._handle], __kvErrorFrom);"
+                ),
+            "missing async method: {index}"
+        );
+        // Statics are static methods.
+        assert!(
+            index.contains("static defaultCapacity() {")
+                && index.contains("return __invoke(addon.Store_default_capacity, [], __generic);"),
+            "missing static method: {index}"
+        );
+        // Disposal follows the opaque-wrapper idiom: explicit destroy plus a
+        // FinalizationRegistry safety net calling the destroy export.
+        assert!(
+            index.contains("destroy() {") && index.contains("addon.Store_destroy(this._handle);"),
+            "missing destroy(): {index}"
+        );
+        assert!(
+            index.contains("Store._cleanup = new FinalizationRegistry"),
+            "missing FinalizationRegistry: {index}"
+        );
+
+        // A free function borrowing an interface unwraps the class argument
+        // and wraps the owned returned handle in a new instance.
+        assert!(
+            index.contains("wv.cloneStore = function (sourceStore) {")
+                && index.contains(
+                    "__invoke(addon.cloneStore, [sourceStore instanceof Store ? sourceStore._handle : sourceStore], __kvErrorFrom)"
+                )
+                && index.contains("return Store._fromHandle(_r);"),
+            "interface param/return must cross as instances: {index}"
+        );
+    }
+
+    #[test]
+    fn typed_error_classes_js() {
+        let index = index_for(&make_api(vec![kv_module()]), true);
+
+        // Domain class extends the generic brand; per-code subclasses carry
+        // their stable CODE and default message.
+        assert!(
+            index.contains("class KvError extends WeaveFFIError {"),
+            "missing domain class: {index}"
+        );
+        assert!(
+            index.contains("class KeyNotFoundError extends KvError {"),
+            "missing per-code class: {index}"
+        );
+        assert!(
+            index.contains("KeyNotFoundError.CODE = 1001;")
+                && index.contains("StoreFullError.CODE = 1003;"),
+            "missing stable code constants: {index}"
+        );
+        assert!(
+            index.contains("super(1001, message || 'key not found');"),
+            "per-code class must default its message: {index}"
+        );
+        // The factory maps a raw code to the matching class and falls back to
+        // the generic brand for unknown codes (panics, marshalling).
+        assert!(
+            index.contains("function __kvErrorFrom(code, message) {"),
+            "missing domain factory: {index}"
+        );
+        assert!(
+            index.contains("1001: KeyNotFoundError, 1003: StoreFullError"),
+            "missing code table: {index}"
+        );
+        assert!(
+            index.contains(
+                "return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);"
+            ),
+            "factory must fall back to the generic brand: {index}"
+        );
+        // Both surfaces are exported.
+        assert!(
+            index.contains("wv.KvError = KvError;")
+                && index.contains("wv.KeyNotFoundError = KeyNotFoundError;"),
+            "error classes must be exported: {index}"
+        );
+    }
+
+    #[test]
+    fn throws_split_picks_the_error_surface() {
+        let index = index_for(&make_api(vec![kv_module()]), true);
+
+        // throws == false: plain wrapper; a non-zero error slot (panic or
+        // marshalling failure only) still rebrands as the generic class.
+        assert!(
+            index.contains("wv.ping = function () {")
+                && index.contains("return __invoke(addon.ping, [], __generic);"),
+            "non-throwing fn must use the generic map: {index}"
+        );
+        // throws == true: failures map through the module's domain factory.
+        assert!(
+            index.contains("__invoke(addon.cloneStore, [sourceStore instanceof Store ? sourceStore._handle : sourceStore], __kvErrorFrom)"),
+            "throwing fn must use the domain map: {index}"
+        );
+    }
+
+    #[test]
+    fn typed_error_and_interface_dts() {
+        let dts = dts_for(&make_api(vec![kv_module()]), true);
+
+        // The generic brand plus the domain surface.
+        assert!(
+            dts.contains("export class WeaveFFIError extends Error {"),
+            "missing generic brand: {dts}"
+        );
+        assert!(
+            dts.contains("export class KvError extends WeaveFFIError {"),
+            "missing domain class: {dts}"
+        );
+        assert!(
+            dts.contains("export class KeyNotFoundError extends KvError {")
+                && dts.contains("static readonly CODE: 1001;"),
+            "missing per-code class: {dts}"
+        );
+
+        // The interface class mirrors the JS surface.
+        assert!(
+            dts.contains("export class Store {"),
+            "missing Store class: {dts}"
+        );
+        assert!(
+            dts.contains("constructor(path: string);"),
+            "missing canonical constructor: {dts}"
+        );
+        assert!(
+            dts.contains("static openReadonly(path: string): Store;"),
+            "missing factory: {dts}"
+        );
+        assert!(
+            dts.contains("put(key: string, theValue: string): void;"),
+            "missing method with camel params: {dts}"
+        );
+        assert!(
+            dts.contains("compact(): Promise<number>;"),
+            "missing async method: {dts}"
+        );
+        assert!(
+            dts.contains("static defaultCapacity(): number;"),
+            "missing static: {dts}"
+        );
+        assert!(dts.contains("destroy(): void;"), "missing destroy: {dts}");
+
+        // Throwing callables document their domain; interface params and
+        // returns are typed as the class.
+        assert!(
+            dts.contains("@throws {KvError}"),
+            "missing @throws tag: {dts}"
+        );
+        assert!(
+            dts.contains("export function cloneStore(sourceStore: Store): Store"),
+            "missing interface-typed free function: {dts}"
+        );
+        assert!(
+            dts.contains("export function ping(): boolean"),
+            "missing plain function: {dts}"
         );
     }
 }

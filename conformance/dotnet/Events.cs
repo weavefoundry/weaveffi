@@ -3,7 +3,7 @@
 // Exercises the delegate + GCHandle listener trampoline (register pins the
 // Action<string>, the producer fires it synchronously on send, unregister
 // frees the handle and stops delivery) and the opaque-iterator ABI behind
-// EventsGetMessages. The producer cdylib is resolved by absolute path via a
+// Events.GetMessages. The producer cdylib is resolved by absolute path via a
 // DllImportResolver reading WEAVEFFI_LIBRARY.
 
 using System;
@@ -34,23 +34,23 @@ internal static class Program
         });
 
         var received = new List<string>();
-        ulong sub = Events.EventsRegisterMessageListener(received.Add);
+        ulong sub = Events.RegisterMessageListener(received.Add);
         Expect(sub > 0, "listener id positive");
 
-        Events.EventsSendMessage("alpha");
-        Events.EventsSendMessage("beta");
+        Events.SendMessage("alpha");
+        Events.SendMessage("beta");
         Expect(received.SequenceEqual(new[] { "alpha", "beta" }),
             $"listener received sends (got [{string.Join(", ", received)}])");
 
-        var msgs = Events.EventsGetMessages().ToList();
+        var msgs = Events.GetMessages().ToList();
         Expect(msgs.SequenceEqual(new[] { "alpha", "beta" }),
             $"iterator yields messages in order (got [{string.Join(", ", msgs)}])");
 
         // Unregister stops delivery; the producer still records the message.
-        Events.EventsUnregisterMessageListener(sub);
-        Events.EventsSendMessage("gamma");
+        Events.UnregisterMessageListener(sub);
+        Events.SendMessage("gamma");
         Expect(received.Count == 2, "no delivery after unregister");
-        Expect(Events.EventsGetMessages().Count() == 3, "producer kept recording");
+        Expect(Events.GetMessages().Count() == 3, "producer kept recording");
 
         Console.WriteLine("dotnet/events: OK");
         return 0;

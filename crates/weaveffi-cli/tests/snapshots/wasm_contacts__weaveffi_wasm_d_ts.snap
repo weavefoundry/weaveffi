@@ -7,8 +7,34 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `contacts` module's error domain. */
+export declare class ContactsError extends WeaveFFIError {
+  static readonly InvalidName: typeof InvalidName;
+  static readonly NotFound: typeof NotFound;
+}
+
+/** name must not be empty */
+export declare class InvalidName extends ContactsError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
+/** contact not found */
+export declare class NotFound extends ContactsError {
+  constructor(message?: string);
+  static readonly CODE: 2;
+}
+
 export interface Contact {
-  readonly id: number;
+  readonly id: bigint;
   readonly first_name: string;
   readonly last_name: string;
   readonly email: string | null;
@@ -21,29 +47,40 @@ export declare const ContactType: Readonly<{
   Other: 2;
 }>;
 
+/** An in-memory address book owning its contacts */
+export declare class ContactBook {
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  constructor();
+  /**
+   * @throws {ContactsError} on a domain error code
+   */
+  add(firstName: string, lastName: string, email: string | null, contactType: ContactType): Contact;
+  /**
+   * @throws {ContactsError} on a domain error code
+   */
+  get(id: bigint): Contact;
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  list(): Contact[];
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  remove(id: bigint): boolean;
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  count(): number;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
+}
+
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   contacts: {
-    /**
-     * @throws {Error} if the native call fails
-     */
-    create_contact(first_name: string, last_name: string, email: string | null, contact_type: ContactType): bigint;
-    /**
-     * @throws {Error} if the native call fails
-     */
-    get_contact(id: bigint): Contact;
-    /**
-     * @throws {Error} if the native call fails
-     */
-    list_contacts(): Contact[];
-    /**
-     * @throws {Error} if the native call fails
-     */
-    delete_contact(id: bigint): boolean;
-    /**
-     * @throws {Error} if the native call fails
-     */
-    count_contacts(): number;
+    ContactBook: typeof ContactBook;
   };
 }
 

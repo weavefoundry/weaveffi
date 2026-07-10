@@ -63,6 +63,71 @@ module WeaveFFI
 
   # === Module: kv ===
 
+  # Base error for the `kv` module's error domain.
+  class KvError < Error
+    # No entry exists for the requested key
+    class KeyNotFound < KvError
+      CODE = 1001
+
+      def initialize(message = 'key not found')
+        super(1001, message)
+      end
+    end
+
+    # The entry exists but its TTL has elapsed
+    class Expired < KvError
+      CODE = 1002
+
+      def initialize(message = 'entry expired')
+        super(1002, message)
+      end
+    end
+
+    # The store has reached its capacity limit
+    class StoreFull < KvError
+      CODE = 1003
+
+      def initialize(message = 'store has reached capacity')
+        super(1003, message)
+      end
+    end
+
+    # Underlying storage reported an I/O failure
+    class IoError < KvError
+      CODE = 1004
+
+      def initialize(message = 'I/O failure')
+        super(1004, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the KvError domain to its error class.
+  KV_ERROR_CODES = {
+    1001 => KvError::KeyNotFound,
+    1002 => KvError::Expired,
+    1003 => KvError::StoreFull,
+    1004 => KvError::IoError,
+  }.freeze
+
+  # Builds the KvError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.kv_error_from(code, message)
+    cls = KV_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed KvError for a non-zero error slot.
+  def self.check_kv_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise kv_error_from(code, msg)
+  end
+
   # Persistence semantics applied to a stored entry
   module EntryKind
     # In-memory only; lost on close
@@ -72,10 +137,6 @@ module WeaveFFI
     # Persistent and encrypted at rest
     ENCRYPTED = 2
   end
-
-  attach_function :weaveffi_kv_Store_destroy, [:pointer], :void
-  # Internal store identifier
-  attach_function :weaveffi_kv_Store_get_id, [:pointer], :int64
 
   attach_function :weaveffi_kv_Entry_destroy, [:pointer], :void
   attach_function :weaveffi_kv_Entry_create, [:int64, :string, :pointer, :size_t, :int64, :pointer, :pointer, :size_t, :pointer, :pointer, :size_t, :pointer], :pointer
@@ -93,64 +154,35 @@ module WeaveFFI
   attach_function :weaveffi_kv_Entry_get_tags, [:pointer, :pointer], :pointer
   # Arbitrary string-valued metadata pairs
   attach_function :weaveffi_kv_Entry_get_metadata, [:pointer, :pointer, :pointer, :pointer], :void
+
+  attach_function :weaveffi_kv_Store_destroy, [:pointer], :void
+  # Open (or create) a store backed by the given filesystem path
+  attach_function :weaveffi_kv_Store_open, [:string, :pointer], :pointer
+  # Insert or replace a value, returning true on success
+  attach_function :weaveffi_kv_Store_put, [:pointer, :string, :pointer, :size_t, :int32, :pointer, :pointer], :int32
+  # Look up an entry by key; returns null if missing or expired
+  attach_function :weaveffi_kv_Store_get, [:pointer, :string, :pointer], :pointer
+  # Remove the entry for the given key, returning true if it existed
+  attach_function :weaveffi_kv_Store_delete, [:pointer, :string, :pointer], :int32
+  # Stream every key, optionally filtered by a prefix
+  attach_function :weaveffi_kv_Store_list_keys, [:pointer, :string, :pointer], :pointer
+  attach_function :weaveffi_kv_Store_ListKeysIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_kv_Store_ListKeysIterator_destroy, [:pointer], :void
+  # Return the number of live entries in the store
+  attach_function :weaveffi_kv_Store_count, [:pointer, :pointer], :int64
+  # Drop every entry from the store
+  attach_function :weaveffi_kv_Store_clear, [:pointer, :pointer], :void
+  # Reclaim space asynchronously; returns the number of bytes reclaimed
+  callback :weaveffi_kv_Store_compact_callback, [:pointer, :pointer, :int64], :void
+  attach_function :weaveffi_kv_Store_compact_async, [:pointer, :pointer, :weaveffi_kv_Store_compact_callback, :pointer], :void
+  # Legacy single-shot put kept for compatibility
+  attach_function :weaveffi_kv_Store_legacy_put, [:pointer, :string, :pointer, :size_t, :pointer], :int32
+  # The largest number of live entries one store will hold
+  attach_function :weaveffi_kv_Store_default_capacity, [:pointer], :int64
   # Fires when an entry is evicted from the store
   callback :weaveffi_kv_OnEvict_fn, [:string, :pointer], :void
   attach_function :weaveffi_kv_register_eviction_listener, [:weaveffi_kv_OnEvict_fn, :pointer], :uint64
   attach_function :weaveffi_kv_unregister_eviction_listener, [:uint64], :void
-  # Open (or create) a store backed by the given filesystem path
-  attach_function :weaveffi_kv_open_store, [:string, :pointer], :pointer
-  # Close the store and release all in-memory resources
-  attach_function :weaveffi_kv_close_store, [:pointer, :pointer], :void
-  # Insert or replace a value, returning true on success
-  attach_function :weaveffi_kv_put, [:pointer, :string, :pointer, :size_t, :int32, :pointer, :pointer], :int32
-  # Look up an entry by key; returns null if missing or expired
-  attach_function :weaveffi_kv_get, [:pointer, :string, :pointer], :pointer
-  # Remove the entry for the given key, returning true if it existed
-  attach_function :weaveffi_kv_delete, [:pointer, :string, :pointer], :int32
-  # Stream every key, optionally filtered by a prefix
-  attach_function :weaveffi_kv_list_keys, [:pointer, :string, :pointer], :pointer
-  attach_function :weaveffi_kv_ListKeysIterator_next, [:pointer, :pointer, :pointer], :int32
-  attach_function :weaveffi_kv_ListKeysIterator_destroy, [:pointer], :void
-  # Return the number of live entries in the store
-  attach_function :weaveffi_kv_count, [:pointer, :pointer], :int64
-  # Drop every entry from the store
-  attach_function :weaveffi_kv_clear, [:pointer, :pointer], :void
-  # Reclaim space asynchronously; returns the number of bytes reclaimed
-  callback :weaveffi_kv_compact_async_callback, [:pointer, :pointer, :int64], :void
-  attach_function :weaveffi_kv_compact_async_async, [:pointer, :pointer, :weaveffi_kv_compact_async_callback, :pointer], :void
-  # Legacy single-shot put kept for compatibility
-  attach_function :weaveffi_kv_legacy_put, [:pointer, :string, :pointer, :size_t, :pointer], :int32
-
-  class StorePtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_kv_Store_destroy(ptr)
-    end
-  end
-
-  # Opaque key-value store handle target type
-  class Store
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = StorePtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    # Internal store identifier
-    def id
-      result = WeaveFFI.weaveffi_kv_Store_get_id(@handle)
-      result
-    end
-  end
 
   class EntryPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -321,6 +353,151 @@ module WeaveFFI
     end
   end
 
+  class StorePtr < FFI::AutoPointer
+    def self.release(ptr)
+      WeaveFFI.weaveffi_kv_Store_destroy(ptr)
+    end
+  end
+
+  # An in-memory key-value store owning its entries; destroying the object releases all of its state
+  class Store
+    attr_reader :handle
+
+    # Wraps an owned pointer the producer handed over, without
+    # re-running initialize.
+    def self._from_ptr(ptr)
+      obj = allocate
+      obj.instance_variable_set(:@handle, StorePtr.new(ptr))
+      obj
+    end
+
+    def destroy
+      return if @handle.nil?
+      @handle.free
+      @handle = nil
+    end
+
+    # Open (or create) a store backed by the given filesystem path
+    def self.open(path)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kv_Store_open(path, err)
+      WeaveFFI.check_kv_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      _from_ptr(result)
+    end
+
+    # Insert or replace a value, returning true on success
+    def put(key, value, kind, ttl_seconds)
+      err = ErrorStruct.new
+      value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
+      value_buf.put_bytes(0, value)
+      ttl_seconds_c = ttl_seconds.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(ttl_seconds); p; end
+      result = WeaveFFI.weaveffi_kv_Store_put(@handle, key, value_buf, value.bytesize, kind, ttl_seconds_c, err)
+      WeaveFFI.check_kv_error!(err)
+      result != 0
+    end
+
+    # Look up an entry by key; returns null if missing or expired
+    def get(key)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kv_Store_get(@handle, key, err)
+      WeaveFFI.check_kv_error!(err)
+      return nil if result.null?
+      Entry.new(result)
+    end
+
+    # Remove the entry for the given key, returning true if it existed
+    def delete(key)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kv_Store_delete(@handle, key, err)
+      WeaveFFI.check_kv_error!(err)
+      result != 0
+    end
+
+    # Stream every key, optionally filtered by a prefix
+    def list_keys(prefix)
+      err = ErrorStruct.new
+      iter = WeaveFFI.weaveffi_kv_Store_list_keys(@handle, prefix, err)
+      WeaveFFI.check_kv_error!(err)
+      items = []
+      return items if iter.null?
+      loop do
+        out_item = FFI::MemoryPointer.new(:pointer)
+        item_err = ErrorStruct.new
+        has_item = WeaveFFI.weaveffi_kv_Store_ListKeysIterator_next(iter, out_item, item_err)
+        if item_err[:code] != 0
+          WeaveFFI.weaveffi_kv_Store_ListKeysIterator_destroy(iter)
+          WeaveFFI.check_kv_error!(item_err)
+        end
+        break if has_item.zero?
+        item_ptr = out_item.read_pointer
+        if item_ptr.null?
+          items << ''
+        else
+          items << item_ptr.read_string
+          WeaveFFI.weaveffi_free_string(item_ptr)
+        end
+      end
+      WeaveFFI.weaveffi_kv_Store_ListKeysIterator_destroy(iter)
+      items
+    end
+
+    # Return the number of live entries in the store
+    def count()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kv_Store_count(@handle, err)
+      WeaveFFI.check_error!(err)
+      result
+    end
+
+    # Drop every entry from the store
+    def clear()
+      err = ErrorStruct.new
+      WeaveFFI.weaveffi_kv_Store_clear(@handle, err)
+      WeaveFFI.check_error!(err)
+    end
+
+    # Reclaim space asynchronously; returns the number of bytes reclaimed
+    # Blocks until the async producer completes (cancellation token not exposed; pass-through is NULL).
+    def compact()
+      queue = Queue.new
+      callback = FFI::Function.new(:void, [:pointer, :pointer, :int64]) do |_context, err_ptr, result|
+        err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+        if err && err[:code] != 0
+          code = err[:code]
+          msg = err[:message].null? ? '' : err[:message].read_string
+          WeaveFFI.weaveffi_error_clear(err_ptr)
+          queue << WeaveFFI.kv_error_from(code, msg)
+        else
+          queue << result
+        end
+      end
+      WeaveFFI.weaveffi_kv_Store_compact_async(@handle, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)
+      value = queue.pop
+      raise value if value.is_a?(Error)
+      value
+    end
+
+    # Legacy single-shot put kept for compatibility
+    def legacy_put(key, value)
+      warn "[DEPRECATED] use put() with explicit kind"
+      err = ErrorStruct.new
+      value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
+      value_buf.put_bytes(0, value)
+      result = WeaveFFI.weaveffi_kv_Store_legacy_put(@handle, key, value_buf, value.bytesize, err)
+      WeaveFFI.check_kv_error!(err)
+      result != 0
+    end
+
+    # The largest number of live entries one store will hold
+    def self.default_capacity()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kv_Store_default_capacity(err)
+      WeaveFFI.check_error!(err)
+      result
+    end
+  end
+
   # Subscribe to per-key eviction notifications
   # Registers a OnEvict listener block. Returns a subscription id for
   # unregister_eviction_listener.
@@ -338,125 +515,6 @@ module WeaveFFI
     weaveffi_kv_unregister_eviction_listener(listener_id)
     @listener_refs.delete(listener_id)
     nil
-  end
-
-  # Open (or create) a store backed by the given filesystem path
-  def self.open_store(path)
-    err = ErrorStruct.new
-    result = weaveffi_kv_open_store(path, err)
-    check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Store.new(result)
-  end
-
-  # Close the store and release all in-memory resources
-  def self.close_store(store)
-    err = ErrorStruct.new
-    weaveffi_kv_close_store(store.handle, err)
-    check_error!(err)
-  end
-
-  # Insert or replace a value, returning true on success
-  def self.put(store, key, value, kind, ttl_seconds)
-    err = ErrorStruct.new
-    value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
-    value_buf.put_bytes(0, value)
-    ttl_seconds_c = ttl_seconds.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(ttl_seconds); p; end
-    result = weaveffi_kv_put(store.handle, key, value_buf, value.bytesize, kind, ttl_seconds_c, err)
-    check_error!(err)
-    result != 0
-  end
-
-  # Look up an entry by key; returns null if missing or expired
-  def self.get(store, key)
-    err = ErrorStruct.new
-    result = weaveffi_kv_get(store.handle, key, err)
-    check_error!(err)
-    return nil if result.null?
-    Entry.new(result)
-  end
-
-  # Remove the entry for the given key, returning true if it existed
-  def self.delete(store, key)
-    err = ErrorStruct.new
-    result = weaveffi_kv_delete(store.handle, key, err)
-    check_error!(err)
-    result != 0
-  end
-
-  # Stream every key, optionally filtered by a prefix
-  def self.list_keys(store, prefix)
-    err = ErrorStruct.new
-    iter = weaveffi_kv_list_keys(store.handle, prefix, err)
-    check_error!(err)
-    items = []
-    return items if iter.null?
-    loop do
-      out_item = FFI::MemoryPointer.new(:pointer)
-      item_err = ErrorStruct.new
-      has_item = weaveffi_kv_ListKeysIterator_next(iter, out_item, item_err)
-      if item_err[:code] != 0
-        weaveffi_kv_ListKeysIterator_destroy(iter)
-        check_error!(item_err)
-      end
-      break if has_item.zero?
-      item_ptr = out_item.read_pointer
-      if item_ptr.null?
-        items << ''
-      else
-        items << item_ptr.read_string
-        weaveffi_free_string(item_ptr)
-      end
-    end
-    weaveffi_kv_ListKeysIterator_destroy(iter)
-    items
-  end
-
-  # Return the number of live entries in the store
-  def self.count(store)
-    err = ErrorStruct.new
-    result = weaveffi_kv_count(store.handle, err)
-    check_error!(err)
-    result
-  end
-
-  # Drop every entry from the store
-  def self.clear(store)
-    err = ErrorStruct.new
-    weaveffi_kv_clear(store.handle, err)
-    check_error!(err)
-  end
-
-  # Reclaim space asynchronously; returns the number of bytes reclaimed
-  # Blocks until the async producer completes (cancellation token not exposed; pass-through is NULL).
-  def self.compact_async(store)
-    queue = Queue.new
-    callback = FFI::Function.new(:void, [:pointer, :pointer, :int64]) do |_context, err_ptr, result|
-      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
-      if err && err[:code] != 0
-        code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
-        weaveffi_error_clear(err_ptr)
-        queue << Error.new(code, msg)
-      else
-        queue << result
-      end
-    end
-    weaveffi_kv_compact_async_async(store.handle, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)
-    value = queue.pop
-    raise value if value.is_a?(Error)
-    value
-  end
-
-  # Legacy single-shot put kept for compatibility
-  def self.legacy_put(store, key, value)
-    warn "[DEPRECATED] use put() with explicit kind"
-    err = ErrorStruct.new
-    value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
-    value_buf.put_bytes(0, value)
-    result = weaveffi_kv_legacy_put(store.handle, key, value_buf, value.bytesize, err)
-    check_error!(err)
-    result != 0
   end
 
   # === Module: kv_stats ===
@@ -518,7 +576,7 @@ module WeaveFFI
   def self.get_stats(store)
     err = ErrorStruct.new
     result = weaveffi_kv_stats_get_stats(store.handle, err)
-    check_error!(err)
+    check_kv_error!(err)
     raise Error.new(-1, 'null pointer') if result.null?
     Stats.new(result)
   end

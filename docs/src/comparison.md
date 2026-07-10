@@ -13,7 +13,7 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 |                                    | **WeaveFFI** | **UniFFI** | **cbindgen** | **diplomat** | **SWIG** | **autocxx** |
 |------------------------------------|:------------:|:----------:|:------------:|:------------:|:--------:|:-----------:|
 | Source language                    | Rust / C / C++ / Zig (anything with a C ABI) | Rust | Rust | Rust | C / C++ | C++ |
-| Input format                       | YAML / JSON / TOML IDL | UDL or proc-macro on Rust | Rust source (annotated) | Rust source (annotated) | C/C++ headers + `.i` interface | C++ headers |
+| Input format                       | YAML / JSON / TOML IDL or annotated Rust | UDL or proc-macro on Rust | Rust source (annotated) | Rust source (annotated) | C/C++ headers + `.i` interface | C++ headers |
 | **Languages**                      |              |            |              |              |          |             |
 | C                                  | ✓            | ✗          | ✓            | ✓            | ✓        | ✗           |
 | C++                                | ✓ (RAII, `std::optional/vector/unordered_map`) | ✗ | ✓ (header) | ✓            | ✓        | ✓ (its purpose) |
@@ -30,6 +30,8 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | Primitives + `string`              | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
 | `bytes` / byte slices              | ✓            | ✓          | ✓ (raw)      | ✓            | partial  | ✓           |
 | Structs                            | ✓ (opaque + getters) | ✓ (records & objects) | ✓ (`#[repr(C)]`) | ✓ (opaque) | ✓ | ✓ |
+| Interfaces (objects w/ methods)    | ✓ (constructors, methods, statics, implicit destroy) | ✓ (objects) | ✗ | ✓ (opaque types w/ methods) | ✓ (classes) | ✓ (C++ classes) |
+| Typed error domains                | ✓ (per-module codes, opt-in `throws`, native error types) | ✓ (error enums) | ✗ | partial (`Result`) | ✗ | ✗ |
 | Enums w/ explicit discriminants    | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
 | Optionals                          | ✓ (`T?`)     | ✓          | partial      | ✓            | partial  | ✓           |
 | Lists                              | ✓ (`[T]`)    | ✓          | partial      | ✓            | ✓        | ✓           |

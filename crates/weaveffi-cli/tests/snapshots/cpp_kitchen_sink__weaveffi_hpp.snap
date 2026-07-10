@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 #include <future>
 #include <functional>
 #include <mutex>
@@ -76,9 +77,12 @@ typedef enum {
     /** High priority */
     weaveffi_kitchen_Priority_High = 2
 } weaveffi_kitchen_Priority;
+/** Error codes reported by throwing functions in the `kitchen` module tree. */
+typedef enum { weaveffi_kitchen_KitchenErrors_NotFound = 1, weaveffi_kitchen_KitchenErrors_InvalidInput = 2 } weaveffi_kitchen_KitchenErrors;
 typedef struct weaveffi_shared_Token weaveffi_shared_Token;
 typedef struct weaveffi_kitchen_Item weaveffi_kitchen_Item;
 typedef struct weaveffi_kitchen_ItemBuilder weaveffi_kitchen_ItemBuilder;
+typedef struct weaveffi_kitchen_Gadget weaveffi_kitchen_Gadget;
 typedef struct weaveffi_kitchen_StreamItemsIterator weaveffi_kitchen_StreamItemsIterator;
 /** Fires when an item is ready */
 typedef void (*weaveffi_kitchen_OnReady_fn)(int32_t code, const char* msg, void* context);
@@ -138,6 +142,17 @@ WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_It
 WEAVEFFI_API weaveffi_kitchen_Item* weaveffi_kitchen_Item_Builder_build(weaveffi_kitchen_ItemBuilder* builder, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_kitchen_Item_Builder_destroy(weaveffi_kitchen_ItemBuilder* builder);
 
+/** A pocket-sized interface exercising the object surface */
+/** Create a gadget with the given id */
+WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_Gadget_new(int64_t id, weaveffi_error* out_err);
+/** The gadget subsystem version string */
+WEAVEFFI_API const char* weaveffi_kitchen_Gadget_version(weaveffi_error* out_err);
+/** Render the gadget as a human-readable string */
+WEAVEFFI_API const char* weaveffi_kitchen_Gadget_describe(const weaveffi_kitchen_Gadget* self, weaveffi_error* out_err);
+/** Poke the gadget a number of times, failing on a negative count */
+WEAVEFFI_API int32_t weaveffi_kitchen_Gadget_poke(const weaveffi_kitchen_Gadget* self, int32_t times, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_kitchen_Gadget_destroy(weaveffi_kitchen_Gadget* self);
+
 /** Subscribe to OnReady events */
 WEAVEFFI_API uint64_t weaveffi_kitchen_register_ready_listener(weaveffi_kitchen_OnReady_fn callback, void* context);
 /** Subscribe to OnReady events */
@@ -187,6 +202,7 @@ WEAVEFFI_API const char* weaveffi_kitchen_nested_hello(weaveffi_error* out_err);
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -195,15 +211,63 @@ public:
     int32_t code() const { return code_; }
 };
 
-class NotFoundError : public WeaveFFIError {
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `kitchen` module's throwing functions. */
+class KitchenErrorsError : public WeaveFFIError {
 public:
-    NotFoundError(const std::string& msg) : WeaveFFIError(1, msg) {}
+    KitchenErrorsError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
 };
 
-class InvalidInputError : public WeaveFFIError {
+/** Item not found */
+class NotFoundError : public KitchenErrorsError {
 public:
-    InvalidInputError(const std::string& msg) : WeaveFFIError(2, msg) {}
+    NotFoundError(const std::string& msg) : KitchenErrorsError(1, msg) {}
 };
+
+/** Invalid input */
+class InvalidInputError : public KitchenErrorsError {
+public:
+    InvalidInputError(const std::string& msg) : KitchenErrorsError(2, msg) {}
+};
+
+namespace detail {
+
+/** Map a `kitchen` error code to its typed exception (KitchenErrorsError for unknown codes). */
+inline std::exception_ptr make_kitchen_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(NotFoundError(msg));
+    case 2: return std::make_exception_ptr(InvalidInputError(msg));
+    default: return std::make_exception_ptr(KitchenErrorsError(code, msg));
+    }
+}
+
+/** Throw the typed `kitchen` exception if `err` carries a nonzero code. */
+inline void check_kitchen(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_kitchen_error(code, msg));
+}
+
+} // namespace detail
 
 namespace detail {
 
@@ -481,33 +545,97 @@ public:
     Item build() {
         weaveffi_error err{};
         auto* ptr = weaveffi_kitchen_Item_Builder_build(static_cast<weaveffi_kitchen_ItemBuilder*>(handle_), &err);
-        if (err.code != 0) throw std::runtime_error(err.message ? err.message : "build failed");
+        detail::check(err);
         return Item(ptr);
     }
 };
 
+/** A pocket-sized interface exercising the object surface */
+class Gadget {
+    void* handle_;
+
+public:
+    explicit Gadget(void* h) : handle_(h) {}
+
+    ~Gadget() {
+        if (handle_) weaveffi_kitchen_Gadget_destroy(static_cast<weaveffi_kitchen_Gadget*>(handle_));
+    }
+
+    Gadget(const Gadget&) = delete;
+    Gadget& operator=(const Gadget&) = delete;
+
+    Gadget(Gadget&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Gadget& operator=(Gadget&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kitchen_Gadget_destroy(static_cast<weaveffi_kitchen_Gadget*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    /** Create a gadget with the given id */
+    Gadget(int64_t id) : handle_(nullptr) {
+        weaveffi_error err{};
+        auto result = weaveffi_kitchen_Gadget_new(id, &err);
+        detail::check(err);
+        handle_ = result;
+    }
+
+    /** Render the gadget as a human-readable string */
+    std::string describe() const {
+        weaveffi_error err{};
+        auto result = weaveffi_kitchen_Gadget_describe(static_cast<const weaveffi_kitchen_Gadget*>(handle_), &err);
+        detail::check(err);
+        std::string ret(result);
+        weaveffi_free_string(result);
+        return ret;
+    }
+
+    /** Poke the gadget a number of times, failing on a negative count */
+    int32_t poke(int32_t times) const {
+        weaveffi_error err{};
+        auto result = weaveffi_kitchen_Gadget_poke(static_cast<const weaveffi_kitchen_Gadget*>(handle_), times, &err);
+        detail::check_kitchen(err);
+        return result;
+    }
+
+    /** The gadget subsystem version string */
+    static std::string version() {
+        weaveffi_error err{};
+        auto result = weaveffi_kitchen_Gadget_version(&err);
+        detail::check(err);
+        std::string ret(result);
+        weaveffi_free_string(result);
+        return ret;
+    }
+
+};
+
+namespace shared {
+
 /** Trivial cross-module helper */
-inline std::string shared_ping() {
+inline std::string ping() {
     weaveffi_error err{};
     auto result = weaveffi_shared_ping(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
 }
 
+} // namespace shared
+
+namespace kitchen {
+
 /** Subscribe to OnReady events */
-/** @return A subscription id for kitchen_unregister_ready_listener(). */
-inline uint64_t kitchen_register_ready_listener(std::function<void(int32_t, std::string)> callback) {
+/** @return A subscription id for unregister_ready_listener(). */
+inline uint64_t register_ready_listener(std::function<void(int32_t, std::string)> callback) {
     auto fn = std::make_shared<std::function<void(int32_t, std::string)>>(std::move(callback));
     uint64_t id = weaveffi_kitchen_register_ready_listener(
         [](int32_t code, const char* msg, void* context) {
@@ -520,237 +648,120 @@ inline uint64_t kitchen_register_ready_listener(std::function<void(int32_t, std:
     return id;
 }
 
-/** Unregisters a listener previously registered with kitchen_register_ready_listener(). */
-inline void kitchen_unregister_ready_listener(uint64_t id) {
+/** Unregisters a listener previously registered with register_ready_listener(). */
+inline void unregister_ready_listener(uint64_t id) {
     weaveffi_kitchen_unregister_ready_listener(id);
     std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
     detail::wv_listener_registry().erase(id);
 }
 
 /** Identity for bool */
-inline bool kitchen_bool_id(bool x) {
+inline bool bool_id(bool x) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_bool_id(x, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
-inline int32_t kitchen_i32_id(int32_t x) {
+inline int32_t i32_id(int32_t x) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_i32_id(x, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
-inline uint32_t kitchen_u32_id(uint32_t x) {
+inline uint32_t u32_id(uint32_t x) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_u32_id(x, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
-inline int64_t kitchen_i64_id(int64_t x) {
+inline int64_t i64_id(int64_t x) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_i64_id(x, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
-inline double kitchen_f64_id(double x) {
+inline double f64_id(double x) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_f64_id(x, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
-inline std::string kitchen_echo_string(const std::string& s) {
+inline std::string echo_string(const std::string& s) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_echo_string(s.c_str(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
 }
 
-inline std::vector<uint8_t> kitchen_echo_bytes(const std::vector<uint8_t>& b) {
+inline std::vector<uint8_t> echo_bytes(const std::vector<uint8_t>& b) {
     size_t out_len = 0;
     weaveffi_error err{};
     auto result = weaveffi_kitchen_echo_bytes(b.data(), b.size(), &out_len, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::vector<uint8_t> ret(result, result + out_len);
     weaveffi_free_bytes(const_cast<uint8_t*>(result), out_len);
     return ret;
 }
 
 /** Borrowed string parameter */
-inline std::string kitchen_echo_borrowed_str(const std::string& s) {
+inline std::string echo_borrowed_str(const std::string& s) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_echo_borrowed_str(s.c_str(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
 }
 
 /** Borrowed bytes parameter */
-inline std::vector<uint8_t> kitchen_echo_borrowed_bytes(const std::vector<uint8_t>& b) {
+inline std::vector<uint8_t> echo_borrowed_bytes(const std::vector<uint8_t>& b) {
     size_t out_len = 0;
     weaveffi_error err{};
     auto result = weaveffi_kitchen_echo_borrowed_bytes(b.data(), b.size(), &out_len, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::vector<uint8_t> ret(result, result + out_len);
     weaveffi_free_bytes(const_cast<uint8_t*>(result), out_len);
     return ret;
 }
 
 /** Returns an opaque handle */
-inline void* kitchen_open_handle() {
+inline void* open_handle() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_open_handle(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return reinterpret_cast<void*>(static_cast<uintptr_t>(result));
 }
 
 /** Returns a typed handle */
-inline Token kitchen_open_typed_handle() {
+inline Token open_typed_handle() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_open_typed_handle(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return Token(result);
 }
 
 /** Optional struct return */
-inline std::optional<Item> kitchen_maybe_item(int64_t id) {
+inline std::optional<Item> maybe_item(int64_t id) {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_maybe_item(id, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check_kitchen(err);
     if (!result) return std::nullopt;
     return Item(result);
 }
 
 /** List of structs */
-inline std::vector<Item> kitchen_list_items() {
+inline std::vector<Item> list_items() {
     size_t out_len = 0;
     weaveffi_error err{};
     auto result = weaveffi_kitchen_list_items(&out_len, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::vector<Item> ret;
     ret.reserve(out_len);
     for (size_t i = 0; i < out_len; ++i) ret.emplace_back(Item(result[i]));
@@ -758,22 +769,13 @@ inline std::vector<Item> kitchen_list_items() {
 }
 
 /** Map return type */
-inline std::unordered_map<std::string, int32_t> kitchen_get_attrs() {
+inline std::unordered_map<std::string, int32_t> get_attrs() {
     const char** out_keys = nullptr;
     int32_t* out_values = nullptr;
     size_t out_len = 0;
     weaveffi_error err{};
     weaveffi_kitchen_get_attrs(&out_keys, &out_values, &out_len, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::unordered_map<std::string, int32_t> ret;
     for (size_t i = 0; i < out_len; ++i) {
         ret[std::string(out_keys[i])] = out_values[i];
@@ -782,33 +784,17 @@ inline std::unordered_map<std::string, int32_t> kitchen_get_attrs() {
 }
 
 /** Iterator return type */
-inline std::vector<Item> kitchen_stream_items() {
+inline std::vector<Item> stream_items() {
     weaveffi_error err{};
     weaveffi_kitchen_StreamItemsIterator* iter = weaveffi_kitchen_stream_items(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::vector<Item> ret;
     while (true) {
         weaveffi_kitchen_Item* item{};
         int32_t has_item = weaveffi_kitchen_StreamItemsIterator_next(iter, &item, &err);
         if (err.code != 0) {
             weaveffi_kitchen_StreamItemsIterator_destroy(iter);
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            switch (code) {
-            case 1: throw NotFoundError(msg);
-            case 2: throw InvalidInputError(msg);
-            default: throw WeaveFFIError(code, msg);
-            }
+            detail::check(err);
         }
         if (has_item == 0) break;
         ret.emplace_back(Item(item));
@@ -818,31 +804,22 @@ inline std::vector<Item> kitchen_stream_items() {
 }
 
 /** Returns the shared Token type from another module */
-inline Token kitchen_cross_module_token() {
+inline Token cross_module_token() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_cross_module_token(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return Token(result);
 }
 
 /** Async operation */
-inline std::future<std::string> kitchen_do_async(const std::string& input) {
+inline std::future<std::string> do_async(const std::string& input) {
     auto* promise_ptr = new std::promise<std::string>();
     auto future = promise_ptr->get_future();
     weaveffi_kitchen_do_async_async(input.c_str(), [](void* context, weaveffi_error* err, const char* result) {
         auto* p = static_cast<std::promise<std::string>*>(context);
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+            p->set_exception(detail::make_error(err->code, msg));
         } else {
             std::string ret(result);
             weaveffi_free_string(result);
@@ -854,14 +831,14 @@ inline std::future<std::string> kitchen_do_async(const std::string& input) {
 }
 
 /** Cancellable async operation */
-inline std::future<std::string> kitchen_do_cancellable(const std::string& input, weaveffi_cancel_token* cancel_token = nullptr) {
+inline std::future<std::string> do_cancellable(const std::string& input, weaveffi_cancel_token* cancel_token = nullptr) {
     auto* promise_ptr = new std::promise<std::string>();
     auto future = promise_ptr->get_future();
     weaveffi_kitchen_do_cancellable_async(input.c_str(), cancel_token, [](void* context, weaveffi_error* err, const char* result) {
         auto* p = static_cast<std::promise<std::string>*>(context);
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+            p->set_exception(detail::make_error(err->code, msg));
         } else {
             std::string ret(result);
             weaveffi_free_string(result);
@@ -874,57 +851,36 @@ inline std::future<std::string> kitchen_do_cancellable(const std::string& input,
 
 /** Legacy operation kept for compatibility */
 [[deprecated("Use new_op instead")]]
-inline int32_t kitchen_legacy_op() {
+inline int32_t legacy_op() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_legacy_op(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
 /** Replacement for legacy_op */
-inline int32_t kitchen_new_op() {
+inline int32_t new_op() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_new_op(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return result;
 }
 
+} // namespace kitchen
+
+namespace kitchen::nested {
+
 /** Trivial nested-module function */
-inline std::string kitchen_nested_hello() {
+inline std::string hello() {
     weaveffi_error err{};
     auto result = weaveffi_kitchen_nested_hello(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidInputError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
 }
+
+} // namespace kitchen::nested
 
 } // namespace weaveffi
 

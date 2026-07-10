@@ -58,6 +58,41 @@ module WeaveFFI
 
   # === Module: tasks ===
 
+  # Base error for the `tasks` module's error domain.
+  class TaskError < Error
+    # task name must not be empty
+    class InvalidName < TaskError
+      CODE = 1
+
+      def initialize(message = 'task name must not be empty')
+        super(1, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the TaskError domain to its error class.
+  TASK_ERROR_CODES = {
+    1 => TaskError::InvalidName,
+  }.freeze
+
+  # Builds the TaskError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.task_error_from(code, message)
+    cls = TASK_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed TaskError for a non-zero error slot.
+  def self.check_task_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise task_error_from(code, msg)
+  end
+
   attach_function :weaveffi_tasks_TaskResult_destroy, [:pointer], :void
   attach_function :weaveffi_tasks_TaskResult_get_id, [:pointer], :int64
   attach_function :weaveffi_tasks_TaskResult_get_value, [:pointer], :pointer
@@ -122,7 +157,7 @@ module WeaveFFI
         code = err[:code]
         msg = err[:message].null? ? '' : err[:message].read_string
         weaveffi_error_clear(err_ptr)
-        queue << Error.new(code, msg)
+        queue << task_error_from(code, msg)
       else
         if result.null?
           queue << Error.new(-1, 'null pointer')

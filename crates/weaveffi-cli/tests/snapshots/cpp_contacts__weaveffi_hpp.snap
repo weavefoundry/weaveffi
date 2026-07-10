@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -65,7 +66,10 @@ WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token
 WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 typedef enum { weaveffi_contacts_ContactType_Personal = 0, weaveffi_contacts_ContactType_Work = 1, weaveffi_contacts_ContactType_Other = 2 } weaveffi_contacts_ContactType;
+/** Error codes reported by throwing functions in the `contacts` module tree. */
+typedef enum { weaveffi_contacts_ContactsError_InvalidName = 1, weaveffi_contacts_ContactsError_NotFound = 2 } weaveffi_contacts_ContactsError;
 typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
+typedef struct weaveffi_contacts_ContactBook weaveffi_contacts_ContactBook;
 
 WEAVEFFI_API weaveffi_contacts_Contact* weaveffi_contacts_Contact_create(int64_t id, const char* first_name, const char* last_name, const char* email, weaveffi_contacts_ContactType contact_type, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);
@@ -75,16 +79,21 @@ WEAVEFFI_API const char* weaveffi_contacts_Contact_get_last_name(const weaveffi_
 WEAVEFFI_API const char* weaveffi_contacts_Contact_get_email(const weaveffi_contacts_Contact* ptr);
 WEAVEFFI_API weaveffi_contacts_ContactType weaveffi_contacts_Contact_get_contact_type(const weaveffi_contacts_Contact* ptr);
 
-WEAVEFFI_API weaveffi_handle_t weaveffi_contacts_create_contact(const char* first_name, const char* last_name, const char* email, weaveffi_contacts_ContactType contact_type, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_contacts_Contact* weaveffi_contacts_get_contact(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(size_t* out_len, weaveffi_error* out_err);
-WEAVEFFI_API bool weaveffi_contacts_delete_contact(weaveffi_handle_t id, weaveffi_error* out_err);
-WEAVEFFI_API int32_t weaveffi_contacts_count_contacts(weaveffi_error* out_err);
+/** An in-memory address book owning its contacts */
+WEAVEFFI_API weaveffi_contacts_ContactBook* weaveffi_contacts_ContactBook_new(weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_contacts_Contact* weaveffi_contacts_ContactBook_add(const weaveffi_contacts_ContactBook* self, const char* first_name, const char* last_name, const char* email, weaveffi_contacts_ContactType contact_type, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_contacts_Contact* weaveffi_contacts_ContactBook_get(const weaveffi_contacts_ContactBook* self, int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API weaveffi_contacts_Contact** weaveffi_contacts_ContactBook_list(const weaveffi_contacts_ContactBook* self, size_t* out_len, weaveffi_error* out_err);
+WEAVEFFI_API bool weaveffi_contacts_ContactBook_remove(const weaveffi_contacts_ContactBook* self, int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_contacts_ContactBook_count(const weaveffi_contacts_ContactBook* self, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_contacts_ContactBook_destroy(weaveffi_contacts_ContactBook* self);
+
 
 } // extern "C"
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -92,6 +101,64 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `contacts` module's throwing functions. */
+class ContactsError : public WeaveFFIError {
+public:
+    ContactsError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** name must not be empty */
+class InvalidNameError : public ContactsError {
+public:
+    InvalidNameError(const std::string& msg) : ContactsError(1, msg) {}
+};
+
+/** contact not found */
+class NotFoundError : public ContactsError {
+public:
+    NotFoundError(const std::string& msg) : ContactsError(2, msg) {}
+};
+
+namespace detail {
+
+/** Map a `contacts` error code to its typed exception (ContactsError for unknown codes). */
+inline std::exception_ptr make_contacts_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(InvalidNameError(msg));
+    case 2: return std::make_exception_ptr(NotFoundError(msg));
+    default: return std::make_exception_ptr(ContactsError(code, msg));
+    }
+}
+
+/** Throw the typed `contacts` exception if `err` carries a nonzero code. */
+inline void check_contacts(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_contacts_error(code, msg));
+}
+
+} // namespace detail
 
 enum class ContactType : int32_t {
     Personal = 0,
@@ -159,69 +226,82 @@ public:
 
 };
 
-inline void* contacts_create_contact(const std::string& first_name, const std::string& last_name, const std::optional<std::string>& email, ContactType contact_type) {
-    weaveffi_error err{};
-    auto result = weaveffi_contacts_create_contact(first_name.c_str(), last_name.c_str(), email.has_value() ? email.value().c_str() : nullptr, static_cast<weaveffi_contacts_ContactType>(static_cast<int32_t>(contact_type)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));
-}
+/** An in-memory address book owning its contacts */
+class ContactBook {
+    void* handle_;
 
-inline Contact contacts_get_contact(void* id) {
-    weaveffi_error err{};
-    auto result = weaveffi_contacts_get_contact(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return Contact(result);
-}
+public:
+    explicit ContactBook(void* h) : handle_(h) {}
 
-inline std::vector<Contact> contacts_list_contacts() {
-    size_t out_len = 0;
-    weaveffi_error err{};
-    auto result = weaveffi_contacts_list_contacts(&out_len, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
+    ~ContactBook() {
+        if (handle_) weaveffi_contacts_ContactBook_destroy(static_cast<weaveffi_contacts_ContactBook*>(handle_));
     }
-    std::vector<Contact> ret;
-    ret.reserve(out_len);
-    for (size_t i = 0; i < out_len; ++i) ret.emplace_back(Contact(result[i]));
-    return ret;
-}
 
-inline bool contacts_delete_contact(void* id) {
-    weaveffi_error err{};
-    auto result = weaveffi_contacts_delete_contact(static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(id)), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
-    return result;
-}
+    ContactBook(const ContactBook&) = delete;
+    ContactBook& operator=(const ContactBook&) = delete;
 
-inline int32_t contacts_count_contacts() {
-    weaveffi_error err{};
-    auto result = weaveffi_contacts_count_contacts(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
+    ContactBook(ContactBook&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
     }
-    return result;
-}
+
+    ContactBook& operator=(ContactBook&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_contacts_ContactBook_destroy(static_cast<weaveffi_contacts_ContactBook*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    ContactBook() : handle_(nullptr) {
+        weaveffi_error err{};
+        auto result = weaveffi_contacts_ContactBook_new(&err);
+        detail::check(err);
+        handle_ = result;
+    }
+
+    Contact add(const std::string& first_name, const std::string& last_name, const std::optional<std::string>& email, ContactType contact_type) const {
+        weaveffi_error err{};
+        auto result = weaveffi_contacts_ContactBook_add(static_cast<const weaveffi_contacts_ContactBook*>(handle_), first_name.c_str(), last_name.c_str(), email.has_value() ? email.value().c_str() : nullptr, static_cast<weaveffi_contacts_ContactType>(static_cast<int32_t>(contact_type)), &err);
+        detail::check_contacts(err);
+        return Contact(result);
+    }
+
+    Contact get(int64_t id) const {
+        weaveffi_error err{};
+        auto result = weaveffi_contacts_ContactBook_get(static_cast<const weaveffi_contacts_ContactBook*>(handle_), id, &err);
+        detail::check_contacts(err);
+        return Contact(result);
+    }
+
+    std::vector<Contact> list() const {
+        size_t out_len = 0;
+        weaveffi_error err{};
+        auto result = weaveffi_contacts_ContactBook_list(static_cast<const weaveffi_contacts_ContactBook*>(handle_), &out_len, &err);
+        detail::check(err);
+        std::vector<Contact> ret;
+        ret.reserve(out_len);
+        for (size_t i = 0; i < out_len; ++i) ret.emplace_back(Contact(result[i]));
+        return ret;
+    }
+
+    bool remove(int64_t id) const {
+        weaveffi_error err{};
+        auto result = weaveffi_contacts_ContactBook_remove(static_cast<const weaveffi_contacts_ContactBook*>(handle_), id, &err);
+        detail::check(err);
+        return result;
+    }
+
+    int32_t count() const {
+        weaveffi_error err{};
+        auto result = weaveffi_contacts_ContactBook_count(static_cast<const weaveffi_contacts_ContactBook*>(handle_), &err);
+        detail::check(err);
+        return result;
+    }
+
+};
 
 } // namespace weaveffi
 

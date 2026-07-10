@@ -5,14 +5,132 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
-module.exports = addon;
+
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
+const wv = {};
+for (const _name of Object.getOwnPropertyNames(addon)) {
+  wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
+}
+
+class DocsErrorsError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'DocsErrorsError';
+  }
+}
+wv.DocsErrorsError = DocsErrorsError;
+class NotFoundError extends DocsErrorsError {
+  constructor(message) {
+    super(1, message || 'Document not found');
+    this.name = 'NotFoundError';
+  }
+}
+NotFoundError.CODE = 1;
+wv.NotFoundError = NotFoundError;
+class InvalidStatusError extends DocsErrorsError {
+  constructor(message) {
+    super(2, message || 'Invalid status transition');
+    this.name = 'InvalidStatusError';
+  }
+}
+InvalidStatusError.CODE = 2;
+wv.InvalidStatusError = InvalidStatusError;
+const __docsErrorCodes = Object.freeze({ 1: NotFoundError, 2: InvalidStatusError });
+function __docsErrorFrom(code, message) {
+  const _cls = __docsErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+class Notebook {
+  constructor() {
+    this._handle = __invoke(addon.Notebook_new, [], __generic);
+    Notebook._cleanup.register(this, this._handle, this);
+  }
+  insert(document) {
+    return __invoke(addon.Notebook_insert, [this._handle, document], __generic);
+  }
+  find(id) {
+    return __invoke(addon.Notebook_find, [this._handle, id], __docsErrorFrom);
+  }
+  size() {
+    return __invoke(addon.Notebook_size, [this._handle], __generic);
+  }
+  static maxDocuments() {
+    return __invoke(addon.Notebook_max_documents, [], __generic);
+  }
+  destroy() {
+    if (this._handle) {
+      Notebook._cleanup.unregister(this);
+      addon.Notebook_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Notebook._fromHandle = function (handle) {
+  const _o = Object.create(Notebook.prototype);
+  _o._handle = handle;
+  Notebook._cleanup.register(_o, handle, _o);
+  return _o;
+};
+Notebook._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.Notebook_destroy(handle); }
+});
+wv.Notebook = Notebook;
+
+wv.createDocument = function (title, tags) {
+  return __invoke(addon.createDocument, [title, tags], __generic);
+};
+wv.getDocument = function (id) {
+  return __invoke(addon.getDocument, [id], __generic);
+};
+wv.publishAsync = function (id) {
+  return __invokeAsync(addon.publishAsync, [id], __generic);
+};
+
+module.exports = wv;
 
 // END index.js

@@ -1,16 +1,19 @@
 # WeaveFFI
 
-[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.4.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
+[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.5.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
 WeaveFFI generates type-safe bindings for 11 languages for any native library
 that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or anything
 else: no hand-written JNI, no duplicate implementations, no unsafe boilerplate.
 Define your API once as an IDL in YAML, JSON, or TOML and ship idiomatic
 packages for C, C++, Swift, Kotlin/Android, Node.js, WebAssembly, Python, .NET,
-Dart, Go, and Ruby that all talk to the same stable C ABI. Writing your producer
-in Rust? Annotate a normal module with `#[weaveffi::module]` and the macro
-generates both the C ABI and the IDL for you. Every path shares one engine, so
-the library you build and the bindings you ship cannot drift.
+Dart, Go, and Ruby that all talk to the same stable C ABI. Interfaces become
+real classes with methods and automatic cleanup, and error domains become
+typed errors consumers can catch and match on, not flat functions and raw
+integer codes. Writing your producer in Rust? Annotate a normal module with
+`#[weaveffi::module]` and the macro generates both the C ABI and the IDL for
+you. Every path shares one engine, so the library you build and the bindings
+you ship cannot drift.
 
 ## Quickstart
 
@@ -20,34 +23,37 @@ the library you build and the bindings you ship cannot drift.
 cargo install weaveffi-cli
 ```
 
-**2. Define your API as an IDL** in `contacts.yml`. Any native library that
+**2. Define your API as an IDL** in `kvstore.yml`. Any native library that
 exposes a C ABI (written in C, C++, Zig, Rust, ...) implements the symbols it
-declares:
+declares. An interface is a real object with methods; an error domain plus
+`throws: true` gives its fallible members typed errors:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
-  - name: contacts
-    structs:
-      - name: Contact
-        fields:
-          - name: id
-            type: i64
-          - name: name
-            type: string
-          - name: email
-            type: "string?"
-    functions:
-      - name: create_contact
-        params:
-          - name: name
-            type: string
-          - name: email
-            type: "string?"
-        return: Contact
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
+  - name: kv
+    errors:
+      name: KvError
+      codes:
+        - { name: KeyNotFound, code: 1001, message: "key not found" }
+        - { name: StoreFull, code: 1003, message: "store has reached capacity" }
+    interfaces:
+      - name: Store
+        constructors:
+          - name: open
+            params:
+              - { name: path, type: string }
+            throws: true
+        methods:
+          - name: put
+            params:
+              - { name: key, type: string }
+              - { name: value, type: bytes }
+            return: bool
+            throws: true
+          - name: count
+            params: []
+            return: i64
 ```
 
 **Producing in Rust?** Skip the hand-written IDL: annotate a normal module with
@@ -58,23 +64,41 @@ walkthrough.
 
 ```rust
 #[weaveffi::module]
-pub mod contacts {
-    #[weaveffi::record]
-    #[derive(Clone)]
-    pub struct Contact {
-        pub id: i64,
-        pub name: String,
-        pub email: Option<String>,
+pub mod kv {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum KvError {
+        /// key not found
+        KeyNotFound = 1001,
+        /// store has reached capacity
+        StoreFull = 1003,
     }
 
-    #[weaveffi::export]
-    pub fn create_contact(name: String, email: Option<String>) -> Contact {
-        Contact { id: 1, name, email }
+    #[weaveffi::interface]
+    pub struct Store {
+        entries: Mutex<BTreeMap<String, Vec<u8>>>,
     }
 
-    #[weaveffi::export]
-    pub fn list_contacts() -> Vec<Contact> {
-        Vec::new()
+    impl Store {
+        pub fn open(path: String) -> Result<Store, KvError> {
+            let _ = path; // in-memory demo
+            Ok(Store { entries: Mutex::new(BTreeMap::new()) })
+        }
+
+        pub fn put(&self, key: String, value: Vec<u8>) -> Result<bool, KvError> {
+            let mut entries = self.entries.lock().unwrap();
+            if entries.len() >= 1024 && !entries.contains_key(&key) {
+                return Err(KvError::StoreFull);
+            }
+            Ok(entries.insert(key, value).is_none())
+        }
+
+        pub fn count(&self) -> i64 {
+            self.entries.lock().unwrap().len() as i64
+        }
     }
 }
 
@@ -86,37 +110,40 @@ weaveffi::export_runtime!();
 the annotated source):
 
 ```bash
-weaveffi generate contacts.yml -o generated --target c,swift,python,node,dart
+weaveffi generate kvstore.yml -o generated --target c,swift,python
 # Rust producer: point generate at the annotated source instead
-weaveffi generate src/lib.rs  -o generated --target c,swift,python,node,dart
+weaveffi generate src/lib.rs  -o generated --target c,swift,python
 ```
 
 **4. Use the generated code from any of the eleven supported languages.**
-Click each block below to see what WeaveFFI emits.
+Every target gets a real `Store` class whose objects clean up after
+themselves, and a typed `KvError` consumers can catch and match on. Click
+each block below to see what WeaveFFI emits.
 
 <details>
 <summary><strong>C</strong>: <code>generated/c/weaveffi.h</code></summary>
 
 ```c
-typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
+typedef struct weaveffi_kv_Store weaveffi_kv_Store;
 
-weaveffi_contacts_Contact* weaveffi_contacts_Contact_create(
-    int64_t id,
-    const char* name,
-    const char* email,
+typedef enum {
+    weaveffi_kv_KvError_KeyNotFound = 1001,
+    weaveffi_kv_KvError_StoreFull = 1003
+} weaveffi_kv_KvError;
+
+weaveffi_kv_Store* weaveffi_kv_Store_open(
+    const char* path, weaveffi_error* out_err);
+
+bool weaveffi_kv_Store_put(
+    const weaveffi_kv_Store* self,
+    const char* key,
+    const uint8_t* value_ptr, size_t value_len,
     weaveffi_error* out_err);
-void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);
 
-const char* weaveffi_contacts_Contact_get_name(
-    const weaveffi_contacts_Contact* ptr);
+int64_t weaveffi_kv_Store_count(
+    const weaveffi_kv_Store* self, weaveffi_error* out_err);
 
-weaveffi_contacts_Contact* weaveffi_contacts_create_contact(
-    const char* name,
-    const char* email,
-    weaveffi_error* out_err);
-
-weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(
-    size_t* out_len, weaveffi_error* out_err);
+void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);
 ```
 
 </details>
@@ -125,34 +152,19 @@ weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(
 <summary><strong>Swift</strong>: <code>generated/swift/Sources/WeaveFFI/WeaveFFI.swift</code></summary>
 
 ```swift
-public class Contact {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_contacts_Contact_destroy(ptr)
-    }
-
-    public var id: Int64 {
-        return weaveffi_contacts_Contact_get_id(ptr)
-    }
-
-    public var name: String {
-        let raw = weaveffi_contacts_Contact_get_name(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
-    public var email: String? { /* ... */ }
+public enum KvError: Error, LocalizedError {
+    case keyNotFound(message: String)
+    case storeFull(message: String)
 }
 
-public enum Contacts {
-    public static func contacts_create_contact(_ name: String, _ email: String?) throws -> Contact { /* ... */ }
-    public static func contacts_list_contacts() throws -> [Contact] { /* ... */ }
+public final class Store {
+    // The native object is released automatically on deinit.
+
+    public static func open(path: String) throws -> Store { /* ... */ }
+
+    public func put(key: String, value: Data) throws -> Bool { /* ... */ }
+
+    public func count() -> Int64 { /* ... */ }
 }
 ```
 
@@ -162,62 +174,26 @@ public enum Contacts {
 <summary><strong>Python</strong>: <code>generated/python/weaveffi/weaveffi.pyi</code></summary>
 
 ```python
-from typing import List, Optional
+class KvError(WeaveFFIError): ...
 
-class Contact:
-    @property
-    def id(self) -> int: ...
-    @property
-    def name(self) -> str: ...
-    @property
-    def email(self) -> Optional[str]: ...
+class KeyNotFound(KvError):
+    CODE: int  # 1001
 
-def contacts_create_contact(name: str, email: Optional[str]) -> "Contact": ...
-def contacts_list_contacts() -> List["Contact"]: ...
+class StoreFull(KvError):
+    CODE: int  # 1003
+
+class Store:
+    @classmethod
+    def open(cls, path: str) -> "Store": ...
+    def put(self, key: str, value: bytes) -> bool: ...
+    def count(self) -> int: ...
 ```
 
 </details>
 
-<details>
-<summary><strong>TypeScript</strong>: <code>generated/node/types.d.ts</code></summary>
-
-```typescript
-export interface Contact {
-  id: number;
-  name: string;
-  email: string | null;
-}
-
-export function contacts_create_contact(
-  name: string,
-  email: string | null,
-): Contact;
-
-export function contacts_list_contacts(): Contact[];
-```
-
-</details>
-
-<details>
-<summary><strong>Dart</strong>: <code>generated/dart/lib/weaveffi.dart</code></summary>
-
-```dart
-class Contact {
-  final Pointer<Void> _handle;
-  Contact._(this._handle);
-
-  void dispose() { /* destroy native handle */ }
-
-  int get id { /* ... */ }
-  String get name { /* ... */ }
-  String? get email { /* ... */ }
-}
-
-Contact createContact(String name, String? email) { /* ... */ }
-List<Contact> listContacts() { /* ... */ }
-```
-
-</details>
+The remaining targets follow the same pattern with their own idioms: an
+owned class (or the closest analogue) wired to the object's destructor, and
+the module's error domain as a typed error or exception.
 
 ## Why WeaveFFI?
 
@@ -231,15 +207,19 @@ List<Contact> listContacts() { /* ... */ }
   `#[weaveffi::module]` macro; any other backend that can expose a C ABI (C,
   C++, Zig) implements the generated header directly.
 - **Idiomatic per-target output.** No lowest-common-denominator surface area.
-  Swift gets `async/await` and `throws`, Kotlin gets `suspend` and JNI glue,
-  Python gets typed `.pyi` stubs, TypeScript gets `Promise`s, and Dart gets
+  Interfaces become real classes with methods and automatic disposal, and
+  error domains become typed errors (a Swift error enum, Python exception
+  classes, and each remaining target's own exception idiom). Swift gets
+  `async/await` and `throws`, Kotlin gets `suspend` and JNI glue, Python
+  gets typed `.pyi` stubs, TypeScript gets `Promise`s, and Dart gets
   `dart:ffi`, all from the same definition.
-- **The whole IDL surface, on every target.** Async functions, iterators,
-  callbacks, and event listeners work across all eleven languages (Wasm
-  excepts callbacks/listeners and says so loudly). Generators declare
-  their capabilities and `weaveffi generate` fails with a clear error
-  (never a silent skip) if a target can't deliver a feature you use. See
-  the [feature matrix](docs/src/generators/README.md#feature-support-matrix).
+- **The whole IDL surface, on every target.** Interfaces, typed error
+  domains, async functions, iterators, callbacks, and event listeners work
+  across all eleven languages (Wasm excepts callbacks/listeners and says so
+  loudly). Generators declare their capabilities and `weaveffi generate`
+  fails with a clear error (never a silent skip) if a target can't deliver
+  a feature you use. See the
+  [feature matrix](docs/src/generators/README.md#feature-support-matrix).
 
 ## How does it compare?
 
@@ -280,7 +260,7 @@ Verify the install:
 
 ```bash
 weaveffi --version
-weaveffi schema-version    # prints 0.4.0
+weaveffi schema-version    # prints 0.5.0
 ```
 
 ## CLI reference
@@ -297,7 +277,7 @@ weaveffi schema-version    # prints 0.4.0
 | `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
 | `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
-| `weaveffi schema-version` | Print the current IR schema version (`0.4.0`) |
+| `weaveffi schema-version` | Print the current IR schema version (`0.5.0`) |
 | `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
 | `weaveffi completions <shell>` | Print shell completion scripts (`bash`, `zsh`, `fish`, `powershell`, `elvish`) |
 
@@ -305,7 +285,7 @@ Reference the JSON Schema from your IDL for editor autocompletion:
 
 ```yaml
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.4.0"
+version: "0.5.0"
 modules: ...
 ```
 

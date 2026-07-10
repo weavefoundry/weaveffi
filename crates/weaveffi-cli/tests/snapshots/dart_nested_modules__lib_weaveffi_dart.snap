@@ -35,12 +35,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -49,6 +50,34 @@ void _checkError(Pointer<_WeaveFFIError> err) {
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
     throw WeaveFFIException(code, msg);
+  }
+}
+
+/// Typed error domain `GraphicsError` declared by module `graphics`.
+class GraphicsException extends WeaveFFIException {
+  GraphicsException(super.code, super.message);
+}
+
+/// coordinate out of bounds
+class OutOfBoundsException extends GraphicsException {
+  OutOfBoundsException([String message = 'coordinate out of bounds']) : super(1, message);
+}
+
+WeaveFFIException _mapGraphicsException(int code, String message) {
+  switch (code) {
+    case 1:
+      return OutOfBoundsException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkGraphicsException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapGraphicsException(code, msg);
   }
 }
 
@@ -228,12 +257,14 @@ typedef _DartWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Poin
 final _weaveffiGraphicsShapesGeometryCompute = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesGeometryCompute, _DartWeaveffiGraphicsShapesGeometryCompute>('weaveffi_graphics_shapes_geometry_compute');
 
-/// Deeper function taking an ancestor-module struct.
+/// Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
+///
+/// Throws [GraphicsException] on domain errors.
 Detail compute(Shape shape) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiGraphicsShapesGeometryCompute(shape._handle, err);
-    _checkError(err);
+    _checkGraphicsException(err);
     return Detail._(result);
   } finally {
     calloc.free(err);

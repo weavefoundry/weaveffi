@@ -5,8 +5,9 @@
 The Go target produces idiomatic Go bindings that use CGo to call the C
 ABI. The generator emits one Go source file (`weaveffi.go`) plus a
 `go.mod` so the result can be imported by any Go module. Functions
-return `(value, error)` to match Go conventions; struct wrappers expose
-methods plus an explicit `Close()`.
+marked `throws: true` return `(value, error)` to match Go conventions;
+all other wrappers return plain values. Struct and interface wrappers
+expose methods plus an explicit `Close()`.
 
 ## What gets generated
 
@@ -35,6 +36,7 @@ methods plus an explicit `Close()`.
 | `bytes`      | `[]byte`      | `*C.uint8_t` + `C.size_t`  |
 | `handle`     | `int64`       | `C.weaveffi_handle_t`      |
 | `Struct`     | `*StructName` | `*C.weaveffi_mod_Struct`   |
+| `Interface`  | `*InterfaceName` | `*C.weaveffi_mod_Interface` |
 | `Enum` (plain) | `EnumName`  | `C.weaveffi_mod_Enum`      |
 | `Enum` (rich)  | `*EnumName` | `*C.weaveffi_mod_Enum`     |
 | `T?`         | `*T`          | pointer to scalar; nil-able pointer for strings/structs |
@@ -47,7 +49,7 @@ Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -143,10 +145,16 @@ func (s *Contact) Close() {
 }
 ```
 
-Functions return `(value, error)`:
+Function wrappers are PascalCase with the IDL module prefix stripped
+(`CreateContact`, not `ContactsCreateContact`); set
+`strip_module_prefix: false` in the Go generator config (or under
+`[global]`) to keep prefixed names. A function without `throws` returns
+a plain value; its error slot is checked by `wvTrap`, which panics,
+because a non-zero code there can only be a producer panic or a
+marshalling failure:
 
 ```go
-func ContactsCreateContact(firstName string, email *string, contactType ContactType) (int64, error) {
+func CreateContact(firstName string, email *string, contactType ContactType) int64 {
 	cFirstName := C.CString(firstName)
 	defer C.free(unsafe.Pointer(cFirstName))
 	var cEmail *C.char
@@ -157,15 +165,13 @@ func ContactsCreateContact(firstName string, email *string, contactType ContactT
 	var cErr C.weaveffi_error
 	result := C.weaveffi_contacts_create_contact(
 		cFirstName, cEmail, C.weaveffi_contacts_ContactType(contactType), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)",
-			C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return 0, goErr
-	}
-	return int64(result), nil
+	wvTrap(&cErr)
+	return int64(result)
 }
 ```
+
+A function marked `throws: true` returns `(value, error)` instead; see
+[Typed errors](#typed-errors).
 
 Lists round-trip through `unsafe.Slice`:
 
@@ -183,7 +189,7 @@ The Go module path defaults to `weaveffi`; override it via the
 generator config:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -195,6 +201,129 @@ modules:
 generators:
   go:
     module_path: "github.com/myorg/mylib"
+```
+
+## Typed errors
+
+The package defines a generic `WeaveFFIError` struct with `Code` and
+`Message` fields. A module's error domain adds a typed error struct
+named after the domain, package-level code constants, and a mapper
+that falls back to `*WeaveFFIError` for codes outside the domain. From
+the `kvstore` sample:
+
+```go
+// KvError is a typed error reported by the `kv` module.
+type KvError struct {
+	// Code is the numeric ABI error code (one of the KvError constants).
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *KvError) Error() string {
+	return fmt.Sprintf("kv: %s (code %d)", e.Message, e.Code)
+}
+
+// KvError codes.
+const (
+	// KvErrorKeyNotFound key not found
+	KvErrorKeyNotFound int32 = 1001
+	// KvErrorExpired entry expired
+	KvErrorExpired int32 = 1002
+	// KvErrorStoreFull store has reached capacity
+	KvErrorStoreFull int32 = 1003
+	// KvErrorIoError: I/O failure
+	KvErrorIoError int32 = 1004
+)
+```
+
+A callable marked `throws: true` returns `(value, error)` and maps a
+non-zero error slot through the domain mapper (`wvMapKv`); match it
+with `errors.As` and compare the code constants:
+
+```go
+_, err := store.Delete("missing")
+var kvErr *KvError
+if errors.As(err, &kvErr) && kvErr.Code == KvErrorKeyNotFound {
+	// specific code
+}
+```
+
+A callable without `throws` returns a plain value and checks its slot
+with `wvTrap`, which panics on the codes that can only mean a producer
+bug.
+
+## Interfaces
+
+An `interfaces:` entry becomes a struct holding the typed C pointer.
+Constructors become package-level factory functions combining the
+constructor and type names (`open` becomes `OpenStore`, `new` becomes
+`NewContactBook`), methods hang off the wrapper, statics become
+package-level functions prefixed by the type name
+(`StoreDefaultCapacity`), and `Close()` frees the native object. From
+the `kvstore` sample (trimmed):
+
+```go
+type Store struct {
+	ptr *C.weaveffi_kv_Store
+}
+
+// OpenStore: Open (or create) a store backed by the given filesystem path
+func OpenStore(path string) (*Store, error) {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kv_Store_open(cPath, &cErr)
+	if cErr.code != 0 {
+		return nil, wvMapKv(wvTakeError(&cErr))
+	}
+	return &Store{ptr: result}, nil
+}
+
+// Put: Insert or replace a value, returning true on success
+func (s *Store) Put(key string, value []byte, kind EntryKind, ttlSeconds *int64) (bool, error) { /* ... */ }
+
+// Count: Return the number of live entries in the store
+func (s *Store) Count() int64 {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_kv_Store_count(s.ptr, &cErr)
+	wvTrap(&cErr)
+	return int64(result)
+}
+
+// Compact: Reclaim space asynchronously; returns the number of bytes reclaimed
+// Blocks until the async producer completes.
+func (s *Store) Compact() (int64, error) { /* see Async support */ }
+
+// LegacyPut: Legacy single-shot put kept for compatibility
+// Deprecated: use put() with explicit kind
+func (s *Store) LegacyPut(key string, value []byte) (bool, error) { /* ... */ }
+
+// StoreDefaultCapacity: The largest number of live entries one store will hold
+func StoreDefaultCapacity() int64 { /* ... */ }
+
+func (s *Store) Close() {
+	if s.ptr != nil {
+		C.weaveffi_kv_Store_destroy(s.ptr)
+		s.ptr = nil
+	}
+}
+```
+
+Functions elsewhere in the IDL pass the wrapper's pointer across the
+boundary (`GetStats(store)` returns a new `*Stats`). Deprecated
+members carry a standard `// Deprecated:` comment that `go vet` and
+editors understand. As with structs, pair every wrapper with
+`defer store.Close()`:
+
+```go
+store, err := OpenStore("/tmp/cache.kv")
+if err != nil {
+	return err
+}
+defer store.Close()
+ok, err := store.Put("alpha", []byte{1}, EntryKindPersistent, nil)
+fmt.Println(store.Count(), StoreDefaultCapacity())
 ```
 
 ## Rich (algebraic) enums
@@ -284,7 +413,8 @@ getter methods read one variant field
 (`weaveffi_shapes_Shape_<Variant>_get_<field>`); and `Close()` frees the
 pointer (`weaveffi_shapes_Shape_destroy`). Free functions that take or
 return the enum pass the wrapper's pointer across the boundary
-(`ShapesDescribe(*Shape)`, `ShapesScale(*Shape, float64)`):
+(`Describe(*Shape)`, `Scale(*Shape, float64)`; both are non-throwing
+here, so they return plain values):
 
 ```go
 c, err := NewShapeCircle(2.0)
@@ -295,21 +425,14 @@ defer c.Close()
 fmt.Println(c.Tag() == ShapeCircle) // true
 fmt.Println(c.CircleRadius())       // 2
 
-bigger, err := ShapesScale(c, 3.0) // returns a new *Shape
-if err != nil {
-	return err
-}
+bigger := Scale(c, 3.0) // returns a new *Shape
 defer bigger.Close()
-desc, err := ShapesDescribe(bigger)
-if err != nil {
-	return err
-}
-fmt.Println(desc)
+fmt.Println(Describe(bigger))
 ```
 
 **Ownership:** a `*Shape` owns its native pointer. Go has no deterministic
 destructors, so pair every constructor (and every `*Shape` returned by
-`ShapesScale`) with `defer s.Close()`.
+`Scale`) with `defer s.Close()`.
 
 ## Build instructions
 
@@ -352,8 +475,9 @@ use a MinGW-w64 toolchain or the MSVC build provided by `go env`.
 - **Bytes:** input slices are passed by pointer for the duration of
   the call (no copy); returned bytes are copied with `C.GoBytes` and
   then `weaveffi_free_bytes` is called.
-- **Structs:** wrappers hold a typed C pointer. Always pair with
-  `defer s.Close()` because Go has no deterministic destructors.
+- **Structs and interfaces:** wrappers hold a typed C pointer. Always
+  pair with `defer s.Close()` because Go has no deterministic
+  destructors.
 - **Optionals:** scalar optionals are `*T`; struct/string optionals
   rely on a nil pointer to indicate absence.
 
@@ -380,8 +504,8 @@ void* context)`, which returns a `uint64_t` subscription id, plus
 takes a closure and returns that id:
 
 ```go
-// Returns a subscription id for EventsUnregisterMessageListener.
-func EventsRegisterMessageListener(callback func(message string)) uint64 {
+// Returns a subscription id for UnregisterMessageListener.
+func RegisterMessageListener(callback func(message string)) uint64 {
 	ctxID := wvCallbackStore(callback)
 	id := uint64(C.weaveffi_events_register_message_listener(
 		C.weaveffi_events_OnMessage_fn(unsafe.Pointer(C.goWv_weaveffi_events_OnMessage_fn)),
@@ -392,7 +516,7 @@ func EventsRegisterMessageListener(callback func(message string)) uint64 {
 	return id
 }
 
-func EventsUnregisterMessageListener(id uint64) {
+func UnregisterMessageListener(id uint64) {
 	C.weaveffi_events_unregister_message_listener(C.uint64_t(id))
 	wvCallbackMu.Lock()
 	ctxID, ok := wvListenerCtx[id]
@@ -436,7 +560,7 @@ func goWv_weaveffi_events_OnMessage_fn(message *C.char, context unsafe.Pointer) 
   leaked subscription pins the closure forever.
 - **Threading:** the callback runs as a CGo callback on whatever thread
 the producer fires it from (in the events sample, synchronously
-inside `EventsSendMessage`). Don't block in it; forward to a channel
+inside `SendMessage`). Don't block in it; forward to a channel
   or goroutine if handling is slow.
 
 ## Async support
@@ -450,7 +574,7 @@ integer context id, then receives from the channel:
 
 ```go
 // Blocks until the async producer completes.
-func TasksRunTask(name string) (*TaskResult, error) {
+func RunTask(name string) (*TaskResult, error) {
 	ch := make(chan wvOutcomeTasksRunTask, 1)
 	ctxID := wvCallbackStore(ch)
 	cName := C.CString(name)
@@ -468,26 +592,30 @@ func TasksRunTask(name string) (*TaskResult, error) {
 
 The completion trampoline removes the channel from the registry with
 `wvCallbackTake` (one-shot), converts the C error or result, and sends
-a single `wvOutcome…` value. The native producer already runs on its
-own thread, so the wrapper simply blocks the calling goroutine; callers
-that want concurrency run the call from a goroutine of their own.
+a single `wvOutcome…` value. For a callable marked `throws: true`, the
+trampoline maps the error through the domain mapper, so the returned
+`error` is the typed one (`*KvError` from `store.Compact()`). The
+native producer already runs on its own thread, so the wrapper simply
+blocks the calling goroutine; callers that want concurrency run the
+call from a goroutine of their own.
 
 For functions marked `cancellable: true` the C launcher gains a
 `weaveffi_cancel_token*` parameter. The Go wrapper passes `nil` for it
-and doesn't expose the token; only the C, C++, and Kotlin targets
+and doesn't expose the token; only the C and C++ targets
 surface cancellation tokens.
 
 ## Iterators
 
-`iter<T>` returns map to plain `[]T`. The wrapper obtains the opaque
-iterator pointer, drains it eagerly through the generated `_next`
-symbol, and destroys it before returning:
+`iter<T>` returns map to plain `[]T` (plus an `error` when the
+function throws, as with `Store.ListKeys`). The wrapper obtains the
+opaque iterator pointer, drains it eagerly through the generated
+`_next` symbol, and destroys it before returning:
 
 ```go
-func EventsGetMessages() ([]string, error) {
+func GetMessages() []string {
 	var cErr C.weaveffi_error
 	it := C.weaveffi_events_get_messages(&cErr)
-	// ... error check ...
+	wvTrap(&cErr)
 	defer C.weaveffi_events_GetMessagesIterator_destroy(it)
 	goResult := []string{}
 	for {
@@ -496,11 +624,11 @@ func EventsGetMessages() ([]string, error) {
 		if C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) == 0 {
 			break
 		}
-		// ... error check ...
+		wvTrap(&iterErr)
 		goResult = append(goResult, C.GoString(outItem))
 		C.weaveffi_free_string(outItem)
 	}
-	return goResult, nil
+	return goResult
 }
 ```
 

@@ -400,6 +400,101 @@ mod events {
 }
 
 #[test]
+fn extract_interface_with_error_domain() {
+    let (_dir, src_path) = write_src(
+        r#"
+#[weaveffi::module]
+mod store {
+    #[weaveffi::error]
+    enum StoreError {
+        /// resource is missing
+        Missing = 1,
+    }
+
+    /// A tiny stateful object.
+    #[weaveffi::interface]
+    struct Session {
+        id: i64,
+    }
+
+    impl Session {
+        /// Open a session, failing when the id is invalid.
+        pub fn open(id: i64) -> Result<Session, StoreError> {
+            Ok(Session { id })
+        }
+
+        /// Fetch a value, failing when it is missing.
+        pub fn fetch(&self, key: String) -> Result<i64, StoreError> {
+            Err(StoreError::Missing)
+        }
+
+        /// The session subsystem version.
+        pub fn version() -> i32 {
+            1
+        }
+    }
+}
+"#,
+    );
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(output.status.success(), "extract command failed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let api: serde_yaml::Value =
+        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
+    let module = &api["modules"].as_sequence().unwrap()[0];
+
+    let errors = &module["errors"];
+    assert_eq!(errors["name"].as_str().unwrap(), "StoreError");
+    let codes = errors["codes"].as_sequence().unwrap();
+    assert_eq!(codes.len(), 1);
+    assert_eq!(codes[0]["name"].as_str().unwrap(), "Missing");
+    assert_eq!(codes[0]["code"].as_i64(), Some(1));
+    assert_eq!(
+        codes[0]["message"].as_str().unwrap(),
+        "resource is missing",
+        "the variant's doc comment becomes the default message"
+    );
+
+    let interfaces = module["interfaces"].as_sequence().unwrap();
+    assert_eq!(interfaces.len(), 1);
+    let session = &interfaces[0];
+    assert_eq!(session["name"].as_str().unwrap(), "Session");
+    assert_eq!(session["doc"].as_str(), Some("A tiny stateful object."));
+
+    let constructors = session["constructors"].as_sequence().unwrap();
+    assert_eq!(constructors.len(), 1);
+    assert_eq!(constructors[0]["name"].as_str().unwrap(), "open");
+    assert_eq!(
+        constructors[0]["throws"].as_bool(),
+        Some(true),
+        "a Result<Self, E> constructor should extract as throws: true"
+    );
+
+    let methods = session["methods"].as_sequence().unwrap();
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0]["name"].as_str().unwrap(), "fetch");
+    assert_eq!(methods[0]["throws"].as_bool(), Some(true));
+    assert_eq!(
+        methods[0]["params"].as_sequence().unwrap()[0]["type"]
+            .as_str()
+            .unwrap(),
+        "string"
+    );
+    assert_eq!(methods[0]["return"].as_str().unwrap(), "i64");
+
+    let statics = session["statics"].as_sequence().unwrap();
+    assert_eq!(statics.len(), 1);
+    assert_eq!(statics[0]["name"].as_str().unwrap(), "version");
+    assert_eq!(statics[0]["return"].as_str().unwrap(), "i32");
+}
+
+#[test]
 fn extract_deprecated_attribute_to_since() {
     let (_dir, src_path) = write_src(
         r#"

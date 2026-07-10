@@ -10,6 +10,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+    napi_value msg;
+    napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
+    napi_value err;
+    napi_create_error(env, NULL, msg, &err);
+    napi_value code_val;
+    napi_create_int32(env, code, &code_val);
+    napi_set_named_property(env, err, "code", code_val);
+    return err;
+}
+
 static napi_value Napi_weaveffi_graphics_new_canvas(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -19,7 +30,7 @@ static napi_value Napi_weaveffi_graphics_new_canvas(napi_env env, napi_callback_
   weaveffi_error err = {0};
   weaveffi_graphics_Canvas* result = weaveffi_graphics_new_canvas(width, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -67,7 +78,7 @@ static napi_value Napi_weaveffi_graphics_shapes_make_shape(napi_env env, napi_ca
   weaveffi_error err = {0};
   weaveffi_graphics_shapes_Shape* result = weaveffi_graphics_shapes_make_shape(sides, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -102,7 +113,7 @@ static napi_value Napi_weaveffi_graphics_shapes_describe(napi_env env, napi_call
   weaveffi_error err = {0};
   weaveffi_graphics_Canvas* result = weaveffi_graphics_shapes_describe(&err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -150,7 +161,7 @@ static napi_value Napi_weaveffi_graphics_shapes_geometry_compute(napi_env env, n
   weaveffi_error err = {0};
   weaveffi_graphics_shapes_geometry_Detail* result = weaveffi_graphics_shapes_geometry_compute((const weaveffi_graphics_shapes_Shape*)(intptr_t)shape_raw, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -168,10 +179,10 @@ static napi_value Napi_weaveffi_graphics_shapes_geometry_compute(napi_env env, n
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
-    { "graphics_new_canvas", NULL, Napi_weaveffi_graphics_new_canvas, NULL, NULL, NULL, napi_default, NULL },
-    { "graphics_shapes_make_shape", NULL, Napi_weaveffi_graphics_shapes_make_shape, NULL, NULL, NULL, napi_default, NULL },
-    { "graphics_shapes_describe", NULL, Napi_weaveffi_graphics_shapes_describe, NULL, NULL, NULL, napi_default, NULL },
-    { "graphics_shapes_geometry_compute", NULL, Napi_weaveffi_graphics_shapes_geometry_compute, NULL, NULL, NULL, napi_default, NULL },
+    { "newCanvas", NULL, Napi_weaveffi_graphics_new_canvas, NULL, NULL, NULL, napi_default, NULL },
+    { "makeShape", NULL, Napi_weaveffi_graphics_shapes_make_shape, NULL, NULL, NULL, napi_default, NULL },
+    { "describe", NULL, Napi_weaveffi_graphics_shapes_describe, NULL, NULL, NULL, napi_default, NULL },
+    { "compute", NULL, Napi_weaveffi_graphics_shapes_geometry_compute, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, 4, props);
   return exports;

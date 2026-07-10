@@ -39,8 +39,7 @@ via `CString::into_raw`. The consumer must free them with
 
 ```c
 weaveffi_error err = {0, NULL};
-const char* echoed = weaveffi_calculator_echo(
-    (const uint8_t*)"hello", 5, &err);
+const char* echoed = weaveffi_calculator_echo("hello", &err);
 if (err.code) {
     fprintf(stderr, "%s\n", err.message);
     weaveffi_error_clear(&err);
@@ -77,39 +76,42 @@ process_data(buf, out_len);
 weaveffi_free_bytes((uint8_t*)buf, out_len);
 ```
 
-### Struct lifecycle
+### Struct and interface lifecycle
 
-Structs are opaque on the consumer side. The lifecycle is:
+Structs and interface objects are opaque on the consumer side. The
+lifecycle is:
 
-1. `*_create` allocates and returns a pointer; the consumer owns it.
-2. `*_destroy` frees the struct. Call exactly once.
-3. `*_get_<field>` getters read fields. Primitive getters (`i32`,
-   `f64`, `bool`) return values directly. String/bytes getters return
-   **new owned copies** that must be freed.
+1. `*_create` (structs) or a declared constructor such as `*_open`
+   (interfaces) allocates and returns a pointer; the consumer owns it.
+2. `*_destroy` frees the object. Call exactly once.
+3. `*_get_<field>` getters read struct fields, and interface methods
+   take the receiver as their leading argument. Primitive getters
+   (`i32`, `f64`, `bool`) return values directly. String/bytes getters
+   return **new owned copies** that must be freed.
 
-Functions that take a `handle<T>` parameter always **borrow** it: the
-producer must never free a handle it receives, even for `close`-style
-functions. The only function that frees a handle is its `*_destroy`
-symbol. Generated wrappers call `*_destroy` automatically (Swift
-`deinit`, Python `__del__`, Ruby `FFI::AutoPointer`, ...), so a
-producer that frees a handle inside an ordinary function causes a
-double-free as soon as the wrapper is garbage collected.
+Functions that take an interface or `handle<T>` parameter always
+**borrow** it: the producer must never free a receiver it is passed,
+even for `close`-style functions. The only function that frees an
+object is its `*_destroy` symbol. Generated wrappers call `*_destroy`
+automatically (Swift `deinit`, Python `__del__`, Ruby
+`FFI::AutoPointer`, ...), so a producer that frees a receiver inside
+an ordinary function causes a double-free as soon as the wrapper is
+garbage collected.
 
 ```c
 weaveffi_error err = {0, NULL};
 
 weaveffi_contacts_Contact* contact = weaveffi_contacts_Contact_create(
-    (const uint8_t*)"Alice", 5,
-    (const uint8_t*)"alice@example.com", 17,
-    30,
+    1, "Alice", "Smith", "alice@example.com",
+    weaveffi_contacts_ContactType_Personal,
     &err);
 if (err.code) {
     weaveffi_error_clear(&err);
     return 1;
 }
 
-int32_t age = weaveffi_contacts_Contact_get_age(contact);
-const char* name = weaveffi_contacts_Contact_get_name(contact);
+int64_t id = weaveffi_contacts_Contact_get_id(contact);
+const char* name = weaveffi_contacts_Contact_get_first_name(contact);
 weaveffi_free_string(name);
 
 weaveffi_contacts_Contact_destroy(contact);
@@ -124,8 +126,8 @@ public class Contact {
     init(ptr: OpaquePointer) { self.ptr = ptr }
     deinit { weaveffi_contacts_Contact_destroy(ptr) }
 
-    public var name: String {
-        let raw = weaveffi_contacts_Contact_get_name(ptr)
+    public var first_name: String {
+        let raw = weaveffi_contacts_Contact_get_first_name(ptr)
         guard let raw = raw else { return "" }
         defer { weaveffi_free_string(raw) }
         return String(cString: raw)
@@ -151,8 +153,11 @@ if (err.code) {
 result = weaveffi_calculator_add(1, 2, &err);
 ```
 
-Generated wrappers convert non-zero codes into language-native
-exceptions (`throw`, `raise`, `Result::Err`).
+Generated wrappers clear the slot for you. On a `throws: true`
+function they convert non-zero codes into the module's typed domain
+error (`throw`, `raise`, `(T, error)`); on a non-throwing function a
+non-zero code only ever reports a producer bug, so the wrapper panics
+or traps instead. See the [Error Handling Guide](errors.md).
 
 ### Thread safety
 
@@ -165,7 +170,7 @@ serial dispatch queue:
 ```swift
 let queue = DispatchQueue(label: "com.app.weaveffi")
 queue.sync {
-    let result = try? Calculator.add(a: 1, b: 2)
+    let result = Calculator.add(a: 1, b: 2)
 }
 ```
 
@@ -176,6 +181,7 @@ queue.sync {
 | Returned string    | Rust      | `weaveffi_free_string`     | Every `const char*` return           |
 | Returned bytes     | Rust      | `weaveffi_free_bytes`      | Pass both pointer and length         |
 | Struct instance    | Rust      | `*_destroy`                | Call exactly once                    |
+| Interface instance | Rust      | `*_destroy`                | Call exactly once; methods borrow    |
 | String from getter | Rust      | `weaveffi_free_string`     | Getter returns an owned copy         |
 | Error message      | Rust      | `weaveffi_error_clear`     | Clears code and frees message        |
 

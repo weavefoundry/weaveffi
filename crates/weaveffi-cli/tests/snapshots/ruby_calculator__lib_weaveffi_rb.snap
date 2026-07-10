@@ -57,11 +57,46 @@ module WeaveFFI
   end
 
   # === Module: calculator ===
+
+  # Base error for the `calculator` module's error domain.
+  class CalcError < Error
+    # division by zero
+    class DivisionByZero < CalcError
+      CODE = 1
+
+      def initialize(message = 'division by zero')
+        super(1, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the CalcError domain to its error class.
+  CALC_ERROR_CODES = {
+    1 => CalcError::DivisionByZero,
+  }.freeze
+
+  # Builds the CalcError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.calc_error_from(code, message)
+    cls = CALC_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed CalcError for a non-zero error slot.
+  def self.check_calc_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise calc_error_from(code, msg)
+  end
   # Add two integers
   attach_function :weaveffi_calculator_add, [:int32, :int32, :pointer], :int32
   # Multiply two integers
   attach_function :weaveffi_calculator_mul, [:int32, :int32, :pointer], :int32
-  # Divide two integers
+  # Divide two integers, failing on a zero divisor
   attach_function :weaveffi_calculator_div, [:int32, :int32, :pointer], :int32
   # Echo a string back
   attach_function :weaveffi_calculator_echo, [:string, :pointer], :pointer
@@ -82,11 +117,11 @@ module WeaveFFI
     result
   end
 
-  # Divide two integers
+  # Divide two integers, failing on a zero divisor
   def self.div(a, b)
     err = ErrorStruct.new
     result = weaveffi_calculator_div(a, b, err)
-    check_error!(err)
+    check_calc_error!(err)
     result
   end
 

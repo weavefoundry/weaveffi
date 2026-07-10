@@ -35,6 +35,7 @@ required; the generated `.dart` file is ready to import.
 | `bytes`      | `List<int>`         | `Pointer<Uint8>`       | `Pointer<Uint8>`     |
 | `handle`     | `int`               | `Int64`                | `int`                |
 | `StructName` | `StructName`        | `Pointer<Void>`        | `Pointer<Void>`      |
+| `InterfaceName` | `InterfaceName`  | `Pointer<Void>`        | `Pointer<Void>`      |
 | `EnumName` (plain) | `EnumName`    | `Int32`                | `int`                |
 | `EnumName` (rich)  | `EnumName`    | `Pointer<Void>`        | `Pointer<Void>`      |
 | `T?`         | `T?`                | same as inner type     | same as inner type   |
@@ -47,7 +48,7 @@ Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -127,17 +128,13 @@ class Contact {
   final Pointer<Void> _handle;
   Contact._(this._handle);
 
-  void dispose() { _weaveffiContactsContactDestroy(_handle); }
+  void dispose() {
+    _weaveffiContactsContactDestroy(_handle);
+  }
 
   String get name {
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiContactsContactGetName(_handle, err);
-      _checkError(err);
-      return result.toDartString();
-    } finally {
-      calloc.free(err);
-    }
+    final result = _weaveffiContactsContactGetName(_handle);
+    return result.toDartString();
   }
 }
 ```
@@ -166,6 +163,118 @@ int createContact(String name, String? email, ContactType contactType) {
     calloc.free(namePtr);
     calloc.free(err);
   }
+}
+```
+
+Wrapper names are lowerCamelCase with the IDL module prefix stripped
+by default (a `kv.open_store` function would surface as `openStore`,
+not `kvOpenStore`); the C symbols keep their full names. Set
+`strip_module_prefix: false` in the Dart generator config (or under
+`[global]`) to keep module-prefixed wrapper names.
+
+## Typed errors
+
+The package defines `WeaveFFIException` with `code` and `message`
+fields. A module's error domain adds an exception subclass named by
+replacing the trailing `Error` stem with `Exception` (`KvError`
+becomes `KvException`) plus one subclass per code, and a mapper that
+falls back to `WeaveFFIException` for codes outside the domain. From
+the `kvstore` sample:
+
+```dart
+/// Typed error domain `KvError` declared by module `kv`.
+class KvException extends WeaveFFIException {
+  KvException(super.code, super.message);
+}
+
+/// key not found
+class KeyNotFoundException extends KvException {
+  KeyNotFoundException([String message = 'key not found']) : super(1001, message);
+}
+
+// ExpiredException, StoreFullException, IoException follow the same shape.
+
+WeaveFFIException _mapKvException(int code, String message) {
+  switch (code) {
+    case 1001:
+      return KeyNotFoundException(message);
+    // ... 1002, 1003, 1004 ...
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+```
+
+Only callables marked `throws: true` in the IDL check their error slot
+with `_checkKvException` (their doc comments read
+`Throws [KvException] on domain errors.`); catching
+`KeyNotFoundException` or `KvException` works as usual. A callable
+without `throws` uses the generic `_checkError`, which throws
+`WeaveFFIException` only if the producer misbehaves.
+
+## Interfaces
+
+An `interfaces:` entry becomes a class holding the opaque pointer. A
+constructor named `new` renders as an unnamed `factory` (so
+`ContactBook()` just works); other constructors become named factories
+(`Store.open(path)`). Methods are lowerCamelCase instance methods,
+statics are static methods, and `dispose()` releases the native
+object. From the `kvstore` sample (trimmed):
+
+```dart
+/// An embedded key-value store owning its entries
+class Store {
+  final Pointer<Void> _handle;
+  Store._(this._handle);
+
+  /// Releases the native object reference.
+  void dispose() {
+    _weaveffiKvStoreDestroy(_handle);
+  }
+
+  /// Open (or create) a store backed by the given filesystem path
+  ///
+  /// Throws [KvException] on domain errors.
+  factory Store.open(String path) {
+    final pathPtr = path.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreOpen(pathPtr, err);
+      _checkKvException(err);
+      return Store._(result);
+    } finally {
+      calloc.free(pathPtr);
+      calloc.free(err);
+    }
+  }
+
+  bool put(String key, List<int> value, EntryKind kind, int? ttlSeconds) { /* throws KvException */ }
+  Entry? get(String key) { /* throws KvException */ }
+  int count() { /* generic check only (no throws) */ }
+
+  /// Throws [KvException] on domain errors.
+  Future<int> compact() { /* see Async support */ }
+
+  @Deprecated('use put() with explicit kind')
+  bool legacyPut(String key, List<int> value) { /* ... */ }
+
+  /// The largest number of live entries one store will hold
+  static int defaultCapacity() { /* ... */ }
+}
+```
+
+Functions elsewhere in the IDL pass the wrapper's handle across the
+boundary (`getStats(store)` returns a new `Stats`). There's no
+finalizer; call `dispose()` when done, ideally in `try`/`finally`:
+
+```dart
+final store = Store.open('/tmp/cache.kv');
+try {
+  store.put('alpha', [1], EntryKind.persistent, null);
+  print('${store.count()} / ${Store.defaultCapacity()}');
+  final reclaimed = await store.compact();
+} finally {
+  store.dispose();
 }
 ```
 
@@ -319,9 +428,9 @@ Flutter:
   `toNativeUtf8()`. The wrapper frees the resulting pointer in a
   `finally` block. Returned UTF-8 pointers are decoded with
   `toDartString()`.
-- **Structs:** wrappers hold a `Pointer<Void>`. The `dispose()` method
-  calls the corresponding `_destroy` C function. Always wrap usage in
-  `try`/`finally`:
+- **Structs and interfaces:** wrappers hold a `Pointer<Void>`. The
+  `dispose()` method calls the corresponding `_destroy` C function.
+  Always wrap usage in `try`/`finally`:
 
   ```dart
   final contact = getContact(id);
@@ -397,6 +506,7 @@ thread: the event is posted to the owning isolate's event loop, where
 it completes the `Completer`:
 
 ```dart
+/// Throws [TaskException] on domain errors.
 Future<TaskResult> runTask(String name) {
   final completer = Completer<TaskResult>();
   final namePtr = name.toNativeUtf8();
@@ -408,7 +518,7 @@ Future<TaskResult> runTask(String name) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
         _weaveffiErrorClear(err);
-        completer.completeError(WeaveFFIException(code, msg));
+        completer.completeError(_mapTaskException(code, msg));
         return;
       }
       completer.complete(TaskResult._(result));
@@ -437,9 +547,16 @@ once; input buffers are released in `whenComplete` once the future
 settles. The `dart:async` import is only emitted when the IDL contains
 at least one async function.
 
+For a callable marked `throws: true`, the completion callback maps an
+error through the domain mapper (`_mapTaskException` above,
+`_mapKvException` on `Store.compact()`), so the future fails with the
+typed exception; a non-throwing async callable can only fail with
+`WeaveFFIException` on a producer bug. Async interface methods follow
+the same pattern as instance methods returning `Future<T>`.
+
 For functions marked `cancellable: true` the C launcher gains a
 `weaveffi_cancel_token*` parameter. The Dart wrapper passes `nullptr`
-for it and doesn't expose the token; only the C, C++, and Kotlin
+for it and doesn't expose the token; only the C and C++
 targets surface cancellation tokens.
 
 ## Iterators

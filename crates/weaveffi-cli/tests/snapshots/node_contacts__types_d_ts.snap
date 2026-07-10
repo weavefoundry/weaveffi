@@ -6,6 +6,30 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `contacts` module's throwing functions. */
+export class ContactsError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class InvalidNameError extends ContactsError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
+export class NotFoundError extends ContactsError {
+  static readonly CODE: 2;
+  constructor(message?: string);
+}
 export interface Contact {
   id: number;
   first_name: string;
@@ -19,25 +43,36 @@ export enum ContactType {
   Other = 2,
 }
 // module contacts
-/**
- * Maps to C function: weaveffi_contacts_create_contact
- */
-export function contacts_create_contact(first_name: string, last_name: string, email: string | null, contact_type: ContactType): bigint
-/**
- * Maps to C function: weaveffi_contacts_get_contact
- */
-export function contacts_get_contact(id: bigint): Contact
-/**
- * Maps to C function: weaveffi_contacts_list_contacts
- */
-export function contacts_list_contacts(): Contact[]
-/**
- * Maps to C function: weaveffi_contacts_delete_contact
- */
-export function contacts_delete_contact(id: bigint): boolean
-/**
- * Maps to C function: weaveffi_contacts_count_contacts
- */
-export function contacts_count_contacts(): number
+/** An in-memory address book owning its contacts */
+export class ContactBook {
+  /**
+   * Maps to C function: weaveffi_contacts_ContactBook_new
+   */
+  constructor();
+  /**
+   * Maps to C function: weaveffi_contacts_ContactBook_add
+   * @throws {ContactsError}
+   */
+  add(firstName: string, lastName: string, email: string | null, contactType: ContactType): Contact;
+  /**
+   * Maps to C function: weaveffi_contacts_ContactBook_get
+   * @throws {ContactsError}
+   */
+  get(id: number): Contact;
+  /**
+   * Maps to C function: weaveffi_contacts_ContactBook_list
+   */
+  list(): Contact[];
+  /**
+   * Maps to C function: weaveffi_contacts_ContactBook_remove
+   */
+  remove(id: number): boolean;
+  /**
+   * Maps to C function: weaveffi_contacts_ContactBook_count
+   */
+  count(): number;
+  /** Free the underlying native object. */
+  destroy(): void;
+}
 
 // END types.d.ts

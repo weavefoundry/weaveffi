@@ -10,6 +10,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+    napi_value msg;
+    napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
+    napi_value err;
+    napi_create_error(env, NULL, msg, &err);
+    napi_value code_val;
+    napi_create_int32(env, code, &code_val);
+    napi_set_named_property(env, err, "code", code_val);
+    return err;
+}
+
 static napi_value Napi_weaveffi_shapes_Shape_tag(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -28,7 +39,7 @@ static napi_value Napi_weaveffi_shapes_Shape_Empty_new(napi_env env, napi_callba
   weaveffi_error err = {0};
   weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Empty_new(&err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -46,7 +57,7 @@ static napi_value Napi_weaveffi_shapes_Shape_Circle_new(napi_env env, napi_callb
   weaveffi_error err = {0};
   weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Circle_new(radius, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -66,7 +77,7 @@ static napi_value Napi_weaveffi_shapes_Shape_Rectangle_new(napi_env env, napi_ca
   weaveffi_error err = {0};
   weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Rectangle_new((float)width_raw, (float)height_raw, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -88,7 +99,7 @@ static napi_value Napi_weaveffi_shapes_Shape_Bounded_new(napi_env env, napi_call
   weaveffi_error err = {0};
   weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Bounded_new((int16_t)min_raw, (int16_t)max_raw, (uint64_t)weight_raw, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -111,7 +122,7 @@ static napi_value Napi_weaveffi_shapes_Shape_Labeled_new(napi_env env, napi_call
   weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Labeled_new(label, (uint8_t)count_raw, &err);
   free(label);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -242,7 +253,7 @@ static napi_value Napi_weaveffi_shapes_describe(napi_env env, napi_callback_info
   weaveffi_error err = {0};
   const char* result = weaveffi_shapes_describe((const weaveffi_shapes_Shape*)(intptr_t)shape_raw, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -263,7 +274,7 @@ static napi_value Napi_weaveffi_shapes_scale(napi_env env, napi_callback_info in
   weaveffi_error err = {0};
   weaveffi_shapes_Shape* result = weaveffi_shapes_scale((const weaveffi_shapes_Shape*)(intptr_t)shape_raw, factor, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -290,7 +301,7 @@ static napi_value Napi_weaveffi_shapes_sum_bytes(napi_env env, napi_callback_inf
   uint64_t result = weaveffi_shapes_sum_bytes(values_arr, (size_t)values_count, &err);
   free(values_arr);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -326,7 +337,7 @@ static napi_value Napi_weaveffi_shapes_make_numerics(napi_env env, napi_callback
   weaveffi_error err = {0};
   weaveffi_shapes_Numerics* result = weaveffi_shapes_make_numerics((int8_t)a_raw, (int16_t)b_raw, c, d, (uint8_t)e_raw, (uint16_t)f_raw, g, (uint64_t)h_raw, (float)i_raw, j, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -371,25 +382,25 @@ static napi_value Napi_weaveffi_shapes_make_numerics(napi_env env, napi_callback
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
-    { "shapes_Shape_tag", NULL, Napi_weaveffi_shapes_Shape_tag, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_empty_new", NULL, Napi_weaveffi_shapes_Shape_Empty_new, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_circle_new", NULL, Napi_weaveffi_shapes_Shape_Circle_new, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_rectangle_new", NULL, Napi_weaveffi_shapes_Shape_Rectangle_new, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_bounded_new", NULL, Napi_weaveffi_shapes_Shape_Bounded_new, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_labeled_new", NULL, Napi_weaveffi_shapes_Shape_Labeled_new, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_circle_get_radius", NULL, Napi_weaveffi_shapes_Shape_Circle_get_radius, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_rectangle_get_width", NULL, Napi_weaveffi_shapes_Shape_Rectangle_get_width, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_rectangle_get_height", NULL, Napi_weaveffi_shapes_Shape_Rectangle_get_height, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_bounded_get_min", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_min, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_bounded_get_max", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_max, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_bounded_get_weight", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_weight, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_labeled_get_label", NULL, Napi_weaveffi_shapes_Shape_Labeled_get_label, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_labeled_get_count", NULL, Napi_weaveffi_shapes_Shape_Labeled_get_count, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_Shape_destroy", NULL, Napi_weaveffi_shapes_Shape_destroy, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_describe", NULL, Napi_weaveffi_shapes_describe, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_scale", NULL, Napi_weaveffi_shapes_scale, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_sum_bytes", NULL, Napi_weaveffi_shapes_sum_bytes, NULL, NULL, NULL, napi_default, NULL },
-    { "shapes_make_numerics", NULL, Napi_weaveffi_shapes_make_numerics, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_tag", NULL, Napi_weaveffi_shapes_Shape_tag, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_empty_new", NULL, Napi_weaveffi_shapes_Shape_Empty_new, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_circle_new", NULL, Napi_weaveffi_shapes_Shape_Circle_new, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_rectangle_new", NULL, Napi_weaveffi_shapes_Shape_Rectangle_new, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_bounded_new", NULL, Napi_weaveffi_shapes_Shape_Bounded_new, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_labeled_new", NULL, Napi_weaveffi_shapes_Shape_Labeled_new, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_circle_get_radius", NULL, Napi_weaveffi_shapes_Shape_Circle_get_radius, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_rectangle_get_width", NULL, Napi_weaveffi_shapes_Shape_Rectangle_get_width, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_rectangle_get_height", NULL, Napi_weaveffi_shapes_Shape_Rectangle_get_height, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_bounded_get_min", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_min, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_bounded_get_max", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_max, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_bounded_get_weight", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_weight, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_labeled_get_label", NULL, Napi_weaveffi_shapes_Shape_Labeled_get_label, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_labeled_get_count", NULL, Napi_weaveffi_shapes_Shape_Labeled_get_count, NULL, NULL, NULL, napi_default, NULL },
+    { "Shape_destroy", NULL, Napi_weaveffi_shapes_Shape_destroy, NULL, NULL, NULL, napi_default, NULL },
+    { "describe", NULL, Napi_weaveffi_shapes_describe, NULL, NULL, NULL, napi_default, NULL },
+    { "scale", NULL, Napi_weaveffi_shapes_scale, NULL, NULL, NULL, napi_default, NULL },
+    { "sumBytes", NULL, Napi_weaveffi_shapes_sum_bytes, NULL, NULL, NULL, napi_default, NULL },
+    { "makeNumerics", NULL, Napi_weaveffi_shapes_make_numerics, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, 19, props);
   return exports;
