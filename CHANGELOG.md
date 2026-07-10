@@ -1,3 +1,13 @@
+## [0.15.0](https://github.com/weavefoundry/weaveffi/compare/v0.14.1...v0.15.0) (2026-07-10)
+
+### ⚠ BREAKING CHANGES
+
+* add interfaces, typed error domains, and idiomatic naming (#28)
+
+### Features
+
+* add interfaces, typed error domains, and idiomatic naming ([#28](https://github.com/weavefoundry/weaveffi/issues/28)) ([97e809a](https://github.com/weavefoundry/weaveffi/commit/97e809a9aeb9eee535133503aeb46cfa2d24665e))
+
 ## [0.14.1](https://github.com/weavefoundry/weaveffi/compare/v0.14.0...v0.14.1) (2026-07-07)
 
 ### Bug Fixes
