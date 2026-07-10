@@ -22,9 +22,13 @@ package shape ready to publish.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: greeter
+    errors:
+      name: GreeterError
+      codes:
+        - { name: UnknownLang, code: 1, message: "unknown language" }
     structs:
       - name: Greeting
         fields:
@@ -36,11 +40,16 @@ modules:
           - { name: name, type: string }
         return: string
       - name: greeting
+        throws: true
         params:
           - { name: name, type: string }
           - { name: lang, type: string }
         return: Greeting
 ```
+
+`hello` can't fail, so it stays non-throwing. `greeting` declares
+`throws: true` and reports codes from the module's `GreeterError`
+domain when the language is unknown.
 
 ### 2. Generate bindings
 
@@ -55,11 +64,17 @@ generated/
 ├── c/
 │   └── weaveffi.h
 ├── node/
+│   ├── binding.gyp
 │   ├── index.js
+│   ├── package.json
 │   ├── types.d.ts
-│   └── package.json
+│   └── weaveffi_addon.c
 └── scaffold.rs
 ```
+
+`weaveffi_addon.c` is a complete N-API addon that bridges Node's
+runtime to the C ABI, and `binding.gyp` builds it with `node-gyp`; you
+don't write any addon code yourself.
 
 ### 3. Implement the Rust library
 
@@ -79,7 +94,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.1" }
+weaveffi-abi = { version = "0.14" }
 ```
 
 `mygreeter/src/lib.rs`:
@@ -94,12 +109,11 @@ use weaveffi_abi::{self as abi, weaveffi_error};
 
 #[no_mangle]
 pub extern "C" fn weaveffi_greeter_hello(
-    name_ptr: *const c_char,
-    _name_len: usize,
+    name: *const c_char,
     out_err: *mut weaveffi_error,
 ) -> *const c_char {
     abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name_ptr) }.to_str().unwrap_or("world");
+    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
     let msg = format!("Hello, {name}!");
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
@@ -109,50 +123,58 @@ pub extern "C" fn weaveffi_greeter_hello(
 abi::export_runtime!();
 ```
 
-Use `scaffold.rs` for the rest of the API. You also need an N-API
-addon crate that bridges Node's runtime to the C ABI. See
-`samples/node-addon` in the WeaveFFI repository for a working example
-to copy.
+Use `scaffold.rs` for the rest of the API; it lists every symbol the
+addon expects, with exact signatures.
 
 ### 4. Build the cdylib and the N-API addon
 
 ```bash
 cargo build -p mygreeter --release
-cargo build -p node-addon --release
 ```
 
-Copy the addon into the generated package as `index.node`:
-
-macOS:
+The generated `binding.gyp` links against `libweaveffi`, so give the
+cdylib that name with a symlink, then build the addon in place
+(`npm install` runs `node-gyp rebuild`; `LIBRARY_PATH` tells the
+linker where to find the alias):
 
 ```bash
-cp target/release/libindex.dylib generated/node/index.node
+ln -sf libmygreeter.dylib target/release/libweaveffi.dylib   # .so on Linux
+cd generated/node
+LIBRARY_PATH="$PWD/../../target/release" npm install
 ```
 
-Linux:
-
-```bash
-cp target/release/libindex.so generated/node/index.node
-```
-
-Windows:
-
-```powershell
-copy target\release\index.dll generated\node\index.node
-```
+The compiled addon lands at `build/Release/weaveffi.node`, which is
+the first place the generated `index.js` looks. You can also point
+the loader at any built addon with the `WEAVEFFI_ADDON` environment
+variable, or ship a prebuilt binary as `index.node` next to
+`index.js` (the fallback location).
 
 ### 5. Run the bindings locally
 
-Save as `generated/node/demo.js`:
+Save as `generated/node/demo.js`. Function names are camelCase with
+the module prefix stripped, and the throwing `greeting` raises typed
+error classes (`GreeterError` extends `WeaveFFIError`, with an
+`UnknownLangError` subclass per code):
 
 ```javascript
-const weaveffi = require("./index");
+const greeter = require("./index");
 
-const msg = weaveffi.hello("Node");
-console.log(msg);
+console.log(greeter.hello("Node"));
+
+try {
+  const g = greeter.greeting("Node", "en");
+  console.log(`${g.message} (${g.lang})`);
+} catch (e) {
+  if (e instanceof greeter.GreeterError) {
+    console.log(`${e.name}: ${e.errorMessage}`);
+  } else {
+    throw e;
+  }
+}
 ```
 
-Run it (the cdylib must be on the loader path):
+Run it (the cdylib must be on the loader path so the addon's
+`libweaveffi` reference resolves):
 
 macOS:
 
@@ -171,16 +193,23 @@ LD_LIBRARY_PATH=../../target/release node demo.js
 For TypeScript consumers, the generated `types.d.ts` is enough:
 
 ```typescript
-import * as weaveffi from "./index";
+import * as greeter from "./index";
 
-const msg: string = weaveffi.hello("TypeScript");
-const g: weaveffi.Greeting = weaveffi.greeting("TS", "en");
+const msg: string = greeter.hello("TypeScript");
+const g: greeter.Greeting = greeter.greeting("TS", "en");
 console.log(`${g.message} (${g.lang})`);
 ```
 
 ### 6. Prepare for publishing
 
-Edit `generated/node/package.json`:
+Copy the built addon to the fallback location the loader checks, so
+consumers don't need node-gyp:
+
+```bash
+cp build/Release/weaveffi.node index.node
+```
+
+Then edit `generated/node/package.json`:
 
 ```json
 {
@@ -233,9 +262,9 @@ console.log(hello("npm"));
 
   | Symptom                                                  | Likely cause                                                                  |
   |----------------------------------------------------------|-------------------------------------------------------------------------------|
-  | `Error: Cannot find module './index.node'`               | The compiled addon is missing; copy the platform-specific binary in.           |
+  | `Error: Cannot find module './index.node'`               | The addon isn't built; run `npm install` or set `WEAVEFFI_ADDON`.              |
   | `Error: dlopen ... not found`                            | Cdylib not on the loader path; set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`.    |
-  | `TypeError: weaveffi.hello is not a function`            | The N-API addon did not export the expected symbols; rebuild after IDL edits.  |
+  | `TypeError: greeter.hello is not a function`             | The addon is stale; rerun `npm install` after IDL edits.                       |
   | Crashes on `require()`                                   | Addon built for the wrong Node.js version or architecture; rebuild.            |
 
 ## Cleanup
@@ -243,7 +272,6 @@ console.log(hello("npm"));
 ```bash
 rm -rf generated/
 cargo clean -p mygreeter
-cargo clean -p node-addon
 ```
 
 If you published a test version, mark it as deprecated with

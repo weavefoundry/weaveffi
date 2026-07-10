@@ -5,14 +5,91 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
-module.exports = addon;
+
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
+const wv = {};
+for (const _name of Object.getOwnPropertyNames(addon)) {
+  wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
+}
+
+class CalcError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'CalcError';
+  }
+}
+wv.CalcError = CalcError;
+class DivisionByZeroError extends CalcError {
+  constructor(message) {
+    super(1, message || 'division by zero');
+    this.name = 'DivisionByZeroError';
+  }
+}
+DivisionByZeroError.CODE = 1;
+wv.DivisionByZeroError = DivisionByZeroError;
+const __calculatorErrorCodes = Object.freeze({ 1: DivisionByZeroError });
+function __calculatorErrorFrom(code, message) {
+  const _cls = __calculatorErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+wv.add = function (a, b) {
+  return __invoke(addon.add, [a, b], __generic);
+};
+wv.mul = function (a, b) {
+  return __invoke(addon.mul, [a, b], __generic);
+};
+wv.div = function (a, b) {
+  return __invoke(addon.div, [a, b], __calculatorErrorFrom);
+};
+wv.echo = function (s) {
+  return __invoke(addon.echo, [s], __generic);
+};
+
+module.exports = wv;
 
 // END index.js

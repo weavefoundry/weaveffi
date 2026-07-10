@@ -6,18 +6,31 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 from enum import IntEnum
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Type
+
+class WeaveFFIError(Exception):
+    code: int
+    message: str
+    def __init__(self, code: int, message: str) -> None: ...
+
+class CalcError(WeaveFFIError):
+    DivisionByZero: Type["DivisionByZero"]
+    def __init__(self, code: int, message: str) -> None: ...
+
+class DivisionByZero(CalcError):
+    CODE: int
+    def __init__(self, message: str = ...) -> None: ...
 
 # Add two integers
-def calculator_add(a: int, b: int) -> int: ...
+def add(a: int, b: int) -> int: ...
 
 # Multiply two integers
-def calculator_mul(a: int, b: int) -> int: ...
+def mul(a: int, b: int) -> int: ...
 
-# Divide two integers
-def calculator_div(a: int, b: int) -> int: ...
+# Divide two integers, failing on a zero divisor
+def div(a: int, b: int) -> int: ...
 
 # Echo a string back
-def calculator_echo(s: str) -> str: ...
+def echo(s: str) -> str: ...
 
 # END weaveffi.pyi

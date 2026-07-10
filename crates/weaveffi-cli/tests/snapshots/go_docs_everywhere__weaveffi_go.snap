@@ -30,6 +30,46 @@ func cToBool(b C._Bool) bool {
 	return bool(b)
 }
 
+// WeaveFFIError reports a failure crossing the C boundary that no typed
+// error domain claims: an unknown code, a marshalling failure, or a
+// producer panic.
+type WeaveFFIError struct {
+	// Code is the numeric ABI error code.
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *WeaveFFIError) Error() string {
+	return fmt.Sprintf("weaveffi: %s (code %d)", e.Message, e.Code)
+}
+
+// wvTakeError reads and clears a non-zero C error slot, returning its
+// code and message.
+func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+	code := int32(cErr.code)
+	msg := ""
+	if cErr.message != nil {
+		msg = C.GoString(cErr.message)
+	}
+	C.weaveffi_error_clear(cErr)
+	return code, msg
+}
+
+func wvBrandError(code int32, message string) error {
+	return &WeaveFFIError{Code: code, Message: message}
+}
+
+// wvTrap panics when the C error slot reports a failure. Non-throwing
+// wrappers check their slot with it: a non-zero code there can only be
+// a producer panic or a marshalling failure.
+func wvTrap(cErr *C.weaveffi_error) {
+	if cErr.code != 0 {
+		code, msg := wvTakeError(cErr)
+		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
+	}
+}
+
 var (
 	wvCallbackMu  sync.Mutex
 	wvCallbackSeq uint64
@@ -64,6 +104,45 @@ func wvCallbackDelete(id uint64) {
 	wvCallbackMu.Lock()
 	defer wvCallbackMu.Unlock()
 	delete(wvCallbacks, id)
+}
+
+// DocsErrorsError is a typed error reported by the `docs` module.
+type DocsErrorsError struct {
+	// Code is the numeric ABI error code (one of the DocsErrorsError constants).
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *DocsErrorsError) Error() string {
+	return fmt.Sprintf("docs: %s (code %d)", e.Message, e.Code)
+}
+
+// DocsErrorsError codes.
+const (
+	// DocsErrorsErrorNotFound: Returned when no document matches the requested id
+	DocsErrorsErrorNotFound int32 = 1
+	// DocsErrorsErrorInvalidStatus: Raised when attempting to move into a forbidden state
+	DocsErrorsErrorInvalidStatus int32 = 2
+)
+
+// wvMapDocs converts a non-zero code from the `docs` domain into a
+// *DocsErrorsError, falling back to the generic *WeaveFFIError for unknown codes.
+func wvMapDocs(code int32, message string) error {
+	switch code {
+	case DocsErrorsErrorNotFound:
+		if message == "" {
+			message = "Document not found"
+		}
+		return &DocsErrorsError{Code: code, Message: message}
+	case DocsErrorsErrorInvalidStatus:
+		if message == "" {
+			message = "Invalid status transition"
+		}
+		return &DocsErrorsError{Code: code, Message: message}
+	default:
+		return wvBrandError(code, message)
+	}
 }
 
 // Status: Lifecycle status of a document.
@@ -185,11 +264,71 @@ func (b *DocumentBuilder) Build() (*Document, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_docs_Document_create(C.int64_t(id), cTitle, C.weaveffi_docs_Status(status), cTagsPtr, cTagsLen, &cErr)
 	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
+		return nil, wvBrandError(wvTakeError(&cErr))
 	}
 	return &Document{ptr: result}, nil
+}
+
+// Notebook: An ordered collection of documents.
+//
+// Notebooks own their documents and release them when destroyed.
+type Notebook struct {
+	ptr *C.weaveffi_docs_Notebook
+}
+
+// NewNotebook: Create an empty notebook
+func NewNotebook() *Notebook {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_docs_Notebook_new(&cErr)
+	wvTrap(&cErr)
+	return &Notebook{ptr: result}
+}
+
+// Insert: Add a document, returning its position in the notebook
+//
+// Parameters:
+//   - document: The document to add
+func (s *Notebook) Insert(document *Document) int32 {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_docs_Notebook_insert(s.ptr, document.ptr, &cErr)
+	wvTrap(&cErr)
+	return int32(result)
+}
+
+// Find: Look up a document by identifier, failing when none matches
+//
+// Parameters:
+//   - id: Identifier of the document to find
+func (s *Notebook) Find(id int64) (*Document, error) {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_docs_Notebook_find(s.ptr, C.int64_t(id), &cErr)
+	if cErr.code != 0 {
+		return nil, wvMapDocs(wvTakeError(&cErr))
+	}
+	return &Document{ptr: result}, nil
+}
+
+// Size: The number of documents currently held
+func (s *Notebook) Size() int32 {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_docs_Notebook_size(s.ptr, &cErr)
+	wvTrap(&cErr)
+	return int32(result)
+}
+
+// NotebookMaxDocuments: The largest number of documents one notebook will hold
+func NotebookMaxDocuments() int32 {
+	var cErr C.weaveffi_error
+	result := C.weaveffi_docs_Notebook_max_documents(&cErr)
+	wvTrap(&cErr)
+	return int32(result)
+}
+
+func (s *Notebook) Close() {
+	if s.ptr != nil {
+		C.weaveffi_docs_Notebook_destroy(s.ptr)
+		s.ptr = nil
+	}
 }
 
 //export goWv_weaveffi_docs_OnSaved_fn
@@ -204,9 +343,9 @@ func goWv_weaveffi_docs_OnSaved_fn(doc_id C.int64_t, revision C.int32_t, context
 	cb(arg0, arg1)
 }
 
-// DocsRegisterSavedListener: Subscribe to document-saved notifications
-// Returns a subscription id for DocsUnregisterSavedListener.
-func DocsRegisterSavedListener(callback func(docId int64, revision int32)) uint64 {
+// RegisterSavedListener: Subscribe to document-saved notifications
+// Returns a subscription id for UnregisterSavedListener.
+func RegisterSavedListener(callback func(docId int64, revision int32)) uint64 {
 	ctxID := wvCallbackStore(callback)
 	id := uint64(C.weaveffi_docs_register_saved_listener(C.weaveffi_docs_OnSaved_fn(unsafe.Pointer(C.goWv_weaveffi_docs_OnSaved_fn)), unsafe.Pointer(uintptr(ctxID))))
 	wvCallbackMu.Lock()
@@ -215,8 +354,8 @@ func DocsRegisterSavedListener(callback func(docId int64, revision int32)) uint6
 	return id
 }
 
-// DocsUnregisterSavedListener unregisters a listener previously registered with DocsRegisterSavedListener.
-func DocsUnregisterSavedListener(id uint64) {
+// UnregisterSavedListener unregisters a listener previously registered with RegisterSavedListener.
+func UnregisterSavedListener(id uint64) {
 	C.weaveffi_docs_unregister_saved_listener(C.uint64_t(id))
 	wvCallbackMu.Lock()
 	ctxID, ok := wvListenerCtx[id]
@@ -227,7 +366,7 @@ func DocsUnregisterSavedListener(id uint64) {
 	}
 }
 
-// DocsCreateDocument: Create a brand new document.
+// CreateDocument: Create a brand new document.
 //
 // The document starts in `Draft` status; callers must publish
 // it explicitly to make it visible.
@@ -235,7 +374,7 @@ func DocsUnregisterSavedListener(id uint64) {
 // Parameters:
 //   - title: Human-readable title for the new document
 //   - tags: Initial set of tags (may be empty)
-func DocsCreateDocument(title string, tags []string) (*Document, error) {
+func CreateDocument(title string, tags []string) *Document {
 	cTitle := C.CString(title)
 	defer C.free(unsafe.Pointer(cTitle))
 	cTagsLen := C.size_t(len(tags))
@@ -254,30 +393,22 @@ func DocsCreateDocument(title string, tags []string) (*Document, error) {
 	}
 	var cErr C.weaveffi_error
 	result := C.weaveffi_docs_create_document(cTitle, cTagsPtr, cTagsLen, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
-	return &Document{ptr: result}, nil
+	wvTrap(&cErr)
+	return &Document{ptr: result}
 }
 
-// DocsGetDocument: Look up a document by identifier
+// GetDocument: Look up a document by identifier
 //
 // Parameters:
 //   - id: Identifier returned from create_document
-func DocsGetDocument(id int64) (*Document, error) {
+func GetDocument(id int64) *Document {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_docs_get_document(C.int64_t(id), &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	if result == nil {
-		return nil, nil
+		return nil
 	}
-	return &Document{ptr: result}, nil
+	return &Document{ptr: result}
 }
 
 type wvOutcomeDocsPublishAsync struct {
@@ -293,28 +424,26 @@ func goWv_weaveffi_docs_publish_async_callback(context unsafe.Pointer, err *C.we
 	}
 	ch := v.(chan wvOutcomeDocsPublishAsync)
 	if err != nil && err.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(err.message), int(err.code))
-		C.weaveffi_error_clear(err)
-		ch <- wvOutcomeDocsPublishAsync{err: goErr}
+		ch <- wvOutcomeDocsPublishAsync{err: wvMapDocs(wvTakeError(err))}
 		return
 	}
 	ch <- wvOutcomeDocsPublishAsync{val: cToBool(result)}
 }
 
-// DocsPublishAsync: Publish a document in the background
+// PublishAsync: Publish a document in the background
 //
 // Parameters:
 //   - id: Identifier of the document to publish
 // Blocks until the async producer completes.
-func DocsPublishAsync(id int64) (bool, error) {
+func PublishAsync(id int64) bool {
 	ch := make(chan wvOutcomeDocsPublishAsync, 1)
 	ctxID := wvCallbackStore(ch)
 	C.weaveffi_docs_publish_async_async(C.int64_t(id), C.weaveffi_docs_publish_async_callback(unsafe.Pointer(C.goWv_weaveffi_docs_publish_async_callback)), unsafe.Pointer(uintptr(ctxID)))
 	outcome := <-ch
 	if outcome.err != nil {
-		return false, outcome.err
+		panic(outcome.err)
 	}
-	return outcome.val, nil
+	return outcome.val
 }
 
 

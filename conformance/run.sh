@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # WeaveFFI conformance harness.
 #
-# Unlike examples/run_all.sh (hand-written smoke programs), every consumer here
-# binds through the *generated* WeaveFFI wrappers and asserts concrete results,
-# then exits non-zero on any mismatch. The harness:
+# Every consumer here binds through the *generated* WeaveFFI wrappers and
+# asserts concrete results, then exits non-zero on any mismatch. The harness:
 #
 #   1. builds each producer cdylib from samples/,
 #   2. runs `weaveffi generate` for that sample into the cargo target dir, and

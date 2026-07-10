@@ -23,6 +23,62 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the ProductsError error domain (module products).</summary>
+    public class ProductsException : WeaveFFIException
+    {
+        /// <summary>price must be positive</summary>
+        public const int InvalidPrice = 1;
+        /// <summary>product not found</summary>
+        public const int ProductNotFound = 2;
+
+        public ProductsException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case InvalidPrice:
+                    return new ProductsException(code, string.IsNullOrEmpty(message) ? "price must be positive" : message);
+                case ProductNotFound:
+                    return new ProductsException(code, string.IsNullOrEmpty(message) ? "product not found" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
+    /// <summary>Typed exception for the OrdersError error domain (module orders).</summary>
+    public class OrdersException : WeaveFFIException
+    {
+        /// <summary>order not found</summary>
+        public const int OrderNotFound = 1;
+        /// <summary>order must contain at least one item</summary>
+        public const int EmptyOrder = 2;
+
+        public OrdersException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case OrderNotFound:
+                    return new OrdersException(code, string.IsNullOrEmpty(message) ? "order not found" : message);
+                case EmptyOrder:
+                    return new OrdersException(code, string.IsNullOrEmpty(message) ? "order must contain at least one item" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -35,6 +91,24 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckProducts(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw ProductsException.FromCode(err.Code, msg);
+            }
+        }
+
+        internal static void CheckOrders(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw OrdersException.FromCode(err.Code, msg);
             }
         }
     }
@@ -150,6 +224,100 @@ namespace WeaveFFI
         }
 
         ~Product()
+        {
+            Dispose();
+        }
+    }
+
+    /// <summary>A product catalog owning its products</summary>
+    public class Catalog : IDisposable
+    {
+        private IntPtr _handle;
+        private bool _disposed;
+
+        internal Catalog(IntPtr handle)
+        {
+            _handle = handle;
+        }
+
+        internal IntPtr Handle => _handle;
+
+        public Catalog()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_products_Catalog_new(ref err);
+            WeaveFFIError.Check(err);
+            _handle = result;
+        }
+
+        /// <exception cref="ProductsException">Thrown when the call reports a ProductsError code.</exception>
+        public Product AddProduct(string name, double price, Category category)
+        {
+            var err = new WeaveFFIError();
+            var namePtr = Marshal.StringToCoTaskMemUTF8(name);
+            try
+            {
+                var result = NativeMethods.weaveffi_products_Catalog_add_product(_handle, namePtr, price, (int)category, ref err);
+                WeaveFFIError.CheckProducts(err);
+                return new Product(result);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(namePtr);
+            }
+        }
+
+        /// <exception cref="ProductsException">Thrown when the call reports a ProductsError code.</exception>
+        public Product GetProduct(long id)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_products_Catalog_get_product(_handle, id, ref err);
+            WeaveFFIError.CheckProducts(err);
+            return new Product(result);
+        }
+
+        public Product[] Search(Category category)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_products_Catalog_search(_handle, (int)category, out var outLen, ref err);
+            WeaveFFIError.Check(err);
+            if (result == IntPtr.Zero) return Array.Empty<Product>();
+            var arr = new Product[(int)outLen];
+            for (int i = 0; i < (int)outLen; i++)
+            {
+                arr[i] = new Product(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+            }
+            return arr;
+        }
+
+        /// <exception cref="ProductsException">Thrown when the call reports a ProductsError code.</exception>
+        public bool UpdatePrice(long id, double price)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_products_Catalog_update_price(_handle, id, price, ref err);
+            WeaveFFIError.CheckProducts(err);
+            return result != 0;
+        }
+
+        public bool Remove(long id)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_products_Catalog_remove(_handle, id, ref err);
+            WeaveFFIError.Check(err);
+            return result != 0;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                NativeMethods.weaveffi_products_Catalog_destroy(_handle);
+                _disposed = true;
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~Catalog()
         {
             Dispose();
         }
@@ -311,20 +479,26 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_tags", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_products_Product_get_tags(IntPtr ptr, out UIntPtr out_len);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_products_create_product", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_products_create_product(IntPtr name, double price, int category, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_products_Catalog_destroy(IntPtr self);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_products_get_product", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_get_product(ulong id, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_new", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_products_Catalog_new(ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_products_search_products", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_search_products(int category, out UIntPtr out_len, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_add_product", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_products_Catalog_add_product(IntPtr self, IntPtr name, double price, int category, ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_products_update_price", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_products_update_price(ulong id, double price, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_get_product", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_products_Catalog_get_product(IntPtr self, long id, ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_products_delete_product", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_products_delete_product(ulong id, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_search", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_products_Catalog_search(IntPtr self, int category, out UIntPtr out_len, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_update_price", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_products_Catalog_update_price(IntPtr self, long id, double price, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_remove", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_products_Catalog_remove(IntPtr self, long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_create", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_orders_OrderItem_create(long product_id, int quantity, double unit_price, ref WeaveFFIError err);
@@ -360,80 +534,27 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_orders_Order_get_status(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_create_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_orders_create_order(IntPtr items, UIntPtr items_len, ref WeaveFFIError err);
+        internal static extern long weaveffi_orders_create_order(IntPtr items, UIntPtr items_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_get_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_orders_get_order(ulong id, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_orders_get_order(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_cancel_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_orders_cancel_order(ulong id, ref WeaveFFIError err);
+        internal static extern int weaveffi_orders_cancel_order(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_add_product_to_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_orders_add_product_to_order(ulong order_id, IntPtr product, ref WeaveFFIError err);
+        internal static extern int weaveffi_orders_add_product_to_order(long order_id, IntPtr product, ref WeaveFFIError err);
 
     }
 
     public static class Products
     {
-        public static ulong ProductsCreateProduct(string name, double price, Category category)
-        {
-            var err = new WeaveFFIError();
-            var namePtr = Marshal.StringToCoTaskMemUTF8(name);
-            try
-            {
-                var result = NativeMethods.weaveffi_products_create_product(namePtr, price, (int)category, ref err);
-                WeaveFFIError.Check(err);
-                return result;
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(namePtr);
-            }
-        }
-
-        public static Product ProductsGetProduct(ulong id)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_products_get_product(id, ref err);
-            WeaveFFIError.Check(err);
-            return new Product(result);
-        }
-
-        public static Product[] ProductsSearchProducts(Category category)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_products_search_products((int)category, out var outLen, ref err);
-            WeaveFFIError.Check(err);
-            if (result == IntPtr.Zero) return Array.Empty<Product>();
-            var arr = new Product[(int)outLen];
-            for (int i = 0; i < (int)outLen; i++)
-            {
-                arr[i] = new Product(Marshal.ReadIntPtr(result, i * IntPtr.Size));
-            }
-            return arr;
-        }
-
-        public static bool ProductsUpdatePrice(ulong id, double price)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_products_update_price(id, price, ref err);
-            WeaveFFIError.Check(err);
-            return result != 0;
-        }
-
-        public static bool ProductsDeleteProduct(ulong id)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_products_delete_product(id, ref err);
-            WeaveFFIError.Check(err);
-            return result != 0;
-        }
-
     }
 
     public static class Orders
     {
-        public static ulong OrdersCreateOrder(OrderItem[] items)
+        /// <exception cref="OrdersException">Thrown when the call reports a OrdersError code.</exception>
+        public static long CreateOrder(OrderItem[] items)
         {
             var err = new WeaveFFIError();
             var itemsArr = new IntPtr[items.Length];
@@ -442,7 +563,7 @@ namespace WeaveFFI
             try
             {
                 var result = NativeMethods.weaveffi_orders_create_order(items.Length == 0 ? IntPtr.Zero : itemsPin.AddrOfPinnedObject(), (UIntPtr)items.Length, ref err);
-                WeaveFFIError.Check(err);
+                WeaveFFIError.CheckOrders(err);
                 return result;
             }
             finally
@@ -451,15 +572,16 @@ namespace WeaveFFI
             }
         }
 
-        public static Order OrdersGetOrder(ulong id)
+        /// <exception cref="OrdersException">Thrown when the call reports a OrdersError code.</exception>
+        public static Order GetOrder(long id)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_orders_get_order(id, ref err);
-            WeaveFFIError.Check(err);
+            WeaveFFIError.CheckOrders(err);
             return new Order(result);
         }
 
-        public static bool OrdersCancelOrder(ulong id)
+        public static bool CancelOrder(long id)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_orders_cancel_order(id, ref err);
@@ -467,10 +589,10 @@ namespace WeaveFFI
             return result != 0;
         }
 
-        public static bool OrdersAddProductToOrder(ulong order_id, Product product)
+        public static bool AddProductToOrder(long orderId, Product product)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_orders_add_product_to_order(order_id, product.Handle, ref err);
+            var result = NativeMethods.weaveffi_orders_add_product_to_order(orderId, product.Handle, ref err);
             WeaveFFIError.Check(err);
             return result != 0;
         }

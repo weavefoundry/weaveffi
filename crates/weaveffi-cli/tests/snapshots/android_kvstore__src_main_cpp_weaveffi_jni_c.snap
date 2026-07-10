@@ -15,25 +15,28 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass;
-    switch (err->code) {
-    case 1001:
-        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$KeyNotFound");
-        break;
-    case 1002:
-        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$Expired");
-        break;
-    case 1003:
-        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$StoreFull");
-        break;
-    case 1004:
-        exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException$IoError");
-        break;
-    default:
-        exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-        break;
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
     }
-    (*env)->ThrowNew(env, exClass, msg);
+    weaveffi_error_clear(err);
+}
+
+static void throw_weaveffi_kv_KvError(JNIEnv* env, weaveffi_error* err) {
+    const char* name = NULL;
+    switch (err->code) {
+    case 1001: name = "com/weaveffi/KvException$KeyNotFound"; break;
+    case 1002: name = "com/weaveffi/KvException$Expired"; break;
+    case 1003: name = "com/weaveffi/KvException$StoreFull"; break;
+    case 1004: name = "com/weaveffi/KvException$IoError"; break;
+    default: break;
+    }
+    if (name == NULL) { throw_weaveffi_error(env, err); return; }
+    jclass exClass = (*env)->FindClass(env, name);
+    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
     weaveffi_error_clear(err);
 }
 
@@ -73,7 +76,7 @@ static void weaveffi_kv_OnEvict_fn_jni_tramp(const char* key, void* context) {
     if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1register_1eviction_1listener(JNIEnv* env, jclass clazz, jobject callback) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_registerEvictionListener(JNIEnv* env, jclass clazz, jobject callback) {
     weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -86,7 +89,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1register_1eviction_1liste
     return (jlong)id;
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1unregister_1eviction_1listener(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_unregisterEvictionListener(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_kv_unregister_eviction_listener((uint64_t)id);
     pthread_mutex_lock(&weaveffi_jni_listener_lock);
     weaveffi_jni_listener_ctx** link = &weaveffi_jni_listeners;
@@ -103,209 +106,14 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1unregister_1eviction_1list
     pthread_mutex_unlock(&weaveffi_jni_listener_lock);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1open_1storeJni(JNIEnv* env, jclass clazz, jstring path) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getStatsJni(JNIEnv* env, jclass clazz, jlong store) {
     weaveffi_error err = {0, NULL};
-    const char* path_chars = (*env)->GetStringUTFChars(env, path, NULL);
-    weaveffi_kv_Store* rv = weaveffi_kv_open_store(path_chars, &err);
+    weaveffi_kv_stats_Stats* rv = weaveffi_kv_stats_get_stats((const weaveffi_kv_Store*)(intptr_t)store, &err);
     if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    (*env)->ReleaseStringUTFChars(env, path, path_chars);
-    return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1close_1storeJni(JNIEnv* env, jclass clazz, jlong store) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_kv_close_store((weaveffi_kv_Store*)(intptr_t)store, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        
-    }
-    return;
-}
-
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_kv_1putJni(JNIEnv* env, jclass clazz, jlong store, jstring key, jbyteArray value, jint kind, jobject ttl_seconds) {
-    weaveffi_error err = {0, NULL};
-    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jboolean value_is_copy = 0;
-    jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
-    jsize value_len = (*env)->GetArrayLength(env, value);
-    int64_t ttl_seconds_val = 0;
-    const int64_t* ttl_seconds_ptr = NULL;
-    if (ttl_seconds != NULL) {
-        jclass ttl_seconds_cls = (*env)->FindClass(env, "java/lang/Long");
-        jmethodID ttl_seconds_mid = (*env)->GetMethodID(env, ttl_seconds_cls, "longValue", "()J");
-        ttl_seconds_val = (int64_t)(*env)->CallLongMethod(env, ttl_seconds, ttl_seconds_mid);
-        ttl_seconds_ptr = &ttl_seconds_val;
-    }
-    bool rv = weaveffi_kv_put((weaveffi_kv_Store*)(intptr_t)store, key_chars, (const uint8_t*)value_elems, (size_t)value_len, (int32_t)kind, ttl_seconds_ptr, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return JNI_FALSE;
-    }
-    (*env)->ReleaseStringUTFChars(env, key, key_chars);
-    (*env)->ReleaseByteArrayElements(env, value, value_elems, 0);
-    return rv ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jobject JNICALL Java_com_weaveffi_WeaveFFI_kv_1getJni(JNIEnv* env, jclass clazz, jlong store, jstring key) {
-    weaveffi_error err = {0, NULL};
-    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    const void* rv = weaveffi_kv_get((weaveffi_kv_Store*)(intptr_t)store, key_chars, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return NULL;
-    }
-    (*env)->ReleaseStringUTFChars(env, key, key_chars);
-    if (rv == NULL) { return NULL; }
-    jclass cls = (*env)->FindClass(env, "java/lang/Long");
-    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "valueOf", "(J)Ljava/lang/Long;");
-    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);
-}
-
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_kv_1deleteJni(JNIEnv* env, jclass clazz, jlong store, jstring key) {
-    weaveffi_error err = {0, NULL};
-    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    bool rv = weaveffi_kv_delete((weaveffi_kv_Store*)(intptr_t)store, key_chars, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return JNI_FALSE;
-    }
-    (*env)->ReleaseStringUTFChars(env, key, key_chars);
-    return rv ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_kv_1list_1keysJni(JNIEnv* env, jclass clazz, jlong store, jstring prefix) {
-    weaveffi_error err = {0, NULL};
-    const char* prefix_chars = NULL;
-    if (prefix != NULL) {
-        prefix_chars = (*env)->GetStringUTFChars(env, prefix, NULL);
-    }
-    weaveffi_kv_ListKeysIterator* _iter = weaveffi_kv_list_keys((weaveffi_kv_Store*)(intptr_t)store, prefix_chars, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return NULL;
-    }
-    if (prefix != NULL) { (*env)->ReleaseStringUTFChars(env, prefix, prefix_chars); }
-    jclass _al_cls = (*env)->FindClass(env, "java/util/ArrayList");
-    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, "<init>", "()V"));
-    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, "add", "(Ljava/lang/Object;)Z");
-    const char* _item = (const char*)0;
-    weaveffi_error _iter_err = {0, NULL};
-    while (weaveffi_kv_ListKeysIterator_next(_iter, &_item, &_iter_err) != 0) {
-        jstring _jitem = _item ? (*env)->NewStringUTF(env, _item) : (*env)->NewStringUTF(env, "");
-        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);
-        (*env)->DeleteLocalRef(env, _jitem);
-        weaveffi_free_string(_item);
-    }
-    weaveffi_kv_ListKeysIterator_destroy(_iter);
-    if (_iter_err.code != 0) {
-        throw_weaveffi_error(env, &_iter_err);
-        return NULL;
-    }
-    return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, "iterator", "()Ljava/util/Iterator;"));
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1countJni(JNIEnv* env, jclass clazz, jlong store) {
-    weaveffi_error err = {0, NULL};
-    int64_t rv = weaveffi_kv_count((weaveffi_kv_Store*)(intptr_t)store, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    return (jlong) rv;
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1clearJni(JNIEnv* env, jclass clazz, jlong store) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_kv_clear((weaveffi_kv_Store*)(intptr_t)store, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        
-    }
-    return;
-}
-
-static void weaveffi_kv_compact_async_jni_cb(void* context, weaveffi_error* err, int64_t result) {
-    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
-    JNIEnv* env = NULL;
-    int attached = 0;
-    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
-        attached = 1;
-    }
-    if (err != NULL && err->code != 0) {
-        const char* msg = err->message ? err->message : "WeaveFFI error";
-        jstring jmsg = (*env)->NewStringUTF(env, msg);
-        jclass cls = (*env)->GetObjectClass(env, ctx->callback);
-        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(Ljava/lang/String;)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);
-    } else {
-        jclass boxCls = (*env)->FindClass(env, "java/lang/Long");
-        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, "valueOf", "(J)Ljava/lang/Long;");
-        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);
-        jclass cls = (*env)->GetObjectClass(env, ctx->callback);
-        jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
-    }
-    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
-    (*env)->DeleteGlobalRef(env, ctx->callback);
-    JavaVM* jvm = ctx->jvm;
-    free(ctx);
-    if (attached) (*jvm)->DetachCurrentThread(jvm);
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_kv_1compact_1asyncAsync(JNIEnv* env, jclass clazz, jlong store, jlong cancelToken, jobject callback) {
-    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
-    (*env)->GetJavaVM(env, &ctx->jvm);
-    ctx->callback = (*env)->NewGlobalRef(env, callback);
-    weaveffi_kv_compact_async_async((weaveffi_kv_Store*)(intptr_t)store, (weaveffi_cancel_token*)(intptr_t)cancelToken, weaveffi_kv_compact_async_jni_cb, ctx);
-}
-
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_kv_1legacy_1putJni(JNIEnv* env, jclass clazz, jlong store, jstring key, jbyteArray value) {
-    weaveffi_error err = {0, NULL};
-    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
-    jboolean value_is_copy = 0;
-    jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
-    jsize value_len = (*env)->GetArrayLength(env, value);
-    bool rv = weaveffi_kv_legacy_put((weaveffi_kv_Store*)(intptr_t)store, key_chars, (const uint8_t*)value_elems, (size_t)value_len, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return JNI_FALSE;
-    }
-    (*env)->ReleaseStringUTFChars(env, key, key_chars);
-    (*env)->ReleaseByteArrayElements(env, value, value_elems, 0);
-    return rv ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_kv_1stats_1get_1statsJni(JNIEnv* env, jclass clazz, jlong store) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_kv_stats_Stats* rv = weaveffi_kv_stats_get_stats((weaveffi_kv_Store*)(intptr_t)store, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
+        throw_weaveffi_kv_KvError(env, &err);
         return 0;
     }
     return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeCreate(JNIEnv* env, jclass clazz, jlong id) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_kv_Store* rv = weaveffi_kv_Store_create((int64_t)id, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_Store_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
-    weaveffi_kv_Store_destroy((weaveffi_kv_Store*)(intptr_t)handle);
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeGetId(JNIEnv* env, jclass clazz, jlong handle) {
-    int64_t rv = weaveffi_kv_Store_get_id((const weaveffi_kv_Store*)(intptr_t)handle);
-    return (jlong)rv;
 }
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Entry_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring key, jbyteArray value, jlong created_at, jobject expires_at, jobjectArray tags, jobject metadata) {
@@ -444,6 +252,186 @@ JNIEXPORT jobject JNICALL Java_com_weaveffi_Entry_nativeGetMetadata(JNIEnv* env,
         weaveffi_free_string(out_vals[i]);
     }
     return result;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeOpen(JNIEnv* env, jclass clazz, jstring path) {
+    weaveffi_error err = {0, NULL};
+    const char* path_chars = (*env)->GetStringUTFChars(env, path, NULL);
+    void* rv = weaveffi_kv_Store_open(path_chars, &err);
+    if (err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &err);
+        return 0;
+    }
+    (*env)->ReleaseStringUTFChars(env, path, path_chars);
+    return (jlong)(intptr_t) rv;
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeDefaultCapacity(JNIEnv* env, jclass clazz) {
+    weaveffi_error err = {0, NULL};
+    int64_t rv = weaveffi_kv_Store_default_capacity(&err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jlong) rv;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_Store_nativePut(JNIEnv* env, jclass clazz, jlong selfHandle, jstring key, jbyteArray value, jint kind, jobject ttl_seconds) {
+    weaveffi_error err = {0, NULL};
+    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
+    jboolean value_is_copy = 0;
+    jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
+    jsize value_len = (*env)->GetArrayLength(env, value);
+    int64_t ttl_seconds_val = 0;
+    const int64_t* ttl_seconds_ptr = NULL;
+    if (ttl_seconds != NULL) {
+        jclass ttl_seconds_cls = (*env)->FindClass(env, "java/lang/Long");
+        jmethodID ttl_seconds_mid = (*env)->GetMethodID(env, ttl_seconds_cls, "longValue", "()J");
+        ttl_seconds_val = (int64_t)(*env)->CallLongMethod(env, ttl_seconds, ttl_seconds_mid);
+        ttl_seconds_ptr = &ttl_seconds_val;
+    }
+    bool rv = weaveffi_kv_Store_put((const weaveffi_kv_Store*)(intptr_t)selfHandle, key_chars, (const uint8_t*)value_elems, (size_t)value_len, (int32_t)kind, ttl_seconds_ptr, &err);
+    if (err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &err);
+        return JNI_FALSE;
+    }
+    (*env)->ReleaseStringUTFChars(env, key, key_chars);
+    (*env)->ReleaseByteArrayElements(env, value, value_elems, 0);
+    return rv ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jobject JNICALL Java_com_weaveffi_Store_nativeGet(JNIEnv* env, jclass clazz, jlong selfHandle, jstring key) {
+    weaveffi_error err = {0, NULL};
+    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
+    const void* rv = weaveffi_kv_Store_get((const weaveffi_kv_Store*)(intptr_t)selfHandle, key_chars, &err);
+    if (err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &err);
+        return NULL;
+    }
+    (*env)->ReleaseStringUTFChars(env, key, key_chars);
+    if (rv == NULL) { return NULL; }
+    jclass cls = (*env)->FindClass(env, "java/lang/Long");
+    jmethodID mid = (*env)->GetStaticMethodID(env, cls, "valueOf", "(J)Ljava/lang/Long;");
+    return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_Store_nativeDelete(JNIEnv* env, jclass clazz, jlong selfHandle, jstring key) {
+    weaveffi_error err = {0, NULL};
+    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
+    bool rv = weaveffi_kv_Store_delete((const weaveffi_kv_Store*)(intptr_t)selfHandle, key_chars, &err);
+    if (err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &err);
+        return JNI_FALSE;
+    }
+    (*env)->ReleaseStringUTFChars(env, key, key_chars);
+    return rv ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_Store_nativeListKeys(JNIEnv* env, jclass clazz, jlong selfHandle, jstring prefix) {
+    weaveffi_error err = {0, NULL};
+    const char* prefix_chars = NULL;
+    if (prefix != NULL) {
+        prefix_chars = (*env)->GetStringUTFChars(env, prefix, NULL);
+    }
+    weaveffi_kv_Store_ListKeysIterator* _iter = weaveffi_kv_Store_list_keys((const weaveffi_kv_Store*)(intptr_t)selfHandle, prefix_chars, &err);
+    if (err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &err);
+        return NULL;
+    }
+    if (prefix != NULL) { (*env)->ReleaseStringUTFChars(env, prefix, prefix_chars); }
+    jclass _al_cls = (*env)->FindClass(env, "java/util/ArrayList");
+    jobject _list = (*env)->NewObject(env, _al_cls, (*env)->GetMethodID(env, _al_cls, "<init>", "()V"));
+    jmethodID _al_add = (*env)->GetMethodID(env, _al_cls, "add", "(Ljava/lang/Object;)Z");
+    const char* _item = (const char*)0;
+    weaveffi_error _iter_err = {0, NULL};
+    while (weaveffi_kv_Store_ListKeysIterator_next(_iter, &_item, &_iter_err) != 0) {
+        jstring _jitem = _item ? (*env)->NewStringUTF(env, _item) : (*env)->NewStringUTF(env, "");
+        (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);
+        (*env)->DeleteLocalRef(env, _jitem);
+        weaveffi_free_string(_item);
+    }
+    weaveffi_kv_Store_ListKeysIterator_destroy(_iter);
+    if (_iter_err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &_iter_err);
+        return NULL;
+    }
+    return (*env)->CallObjectMethod(env, _list, (*env)->GetMethodID(env, _al_cls, "iterator", "()Ljava/util/Iterator;"));
+}
+
+JNIEXPORT jlong JNICALL Java_com_weaveffi_Store_nativeCount(JNIEnv* env, jclass clazz, jlong selfHandle) {
+    weaveffi_error err = {0, NULL};
+    int64_t rv = weaveffi_kv_Store_count((const weaveffi_kv_Store*)(intptr_t)selfHandle, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
+    return (jlong) rv;
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_Store_nativeClear(JNIEnv* env, jclass clazz, jlong selfHandle) {
+    weaveffi_error err = {0, NULL};
+    weaveffi_kv_Store_clear((const weaveffi_kv_Store*)(intptr_t)selfHandle, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        
+    }
+    return;
+}
+
+static void weaveffi_kv_Store_compact_jni_cb(void* context, weaveffi_error* err, int64_t result) {
+    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
+    JNIEnv* env = NULL;
+    int attached = 0;
+    if ((*ctx->jvm)->GetEnv(ctx->jvm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
+        attached = 1;
+    }
+    if (err != NULL && err->code != 0) {
+        const char* msg = err->message ? err->message : "WeaveFFI error";
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jclass cls = (*env)->GetObjectClass(env, ctx->callback);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);
+    } else {
+        jclass boxCls = (*env)->FindClass(env, "java/lang/Long");
+        jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, "valueOf", "(J)Ljava/lang/Long;");
+        jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);
+        jclass cls = (*env)->GetObjectClass(env, ctx->callback);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    (*env)->DeleteGlobalRef(env, ctx->callback);
+    JavaVM* jvm = ctx->jvm;
+    free(ctx);
+    if (attached) (*jvm)->DetachCurrentThread(jvm);
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_Store_nativeCompactAsync(JNIEnv* env, jclass clazz, jlong selfHandle, jlong cancelToken, jobject callback) {
+    weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
+    (*env)->GetJavaVM(env, &ctx->jvm);
+    ctx->callback = (*env)->NewGlobalRef(env, callback);
+    weaveffi_kv_Store_compact_async((const weaveffi_kv_Store*)(intptr_t)selfHandle, (weaveffi_cancel_token*)(intptr_t)cancelToken, weaveffi_kv_Store_compact_jni_cb, ctx);
+}
+
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_Store_nativeLegacyPut(JNIEnv* env, jclass clazz, jlong selfHandle, jstring key, jbyteArray value) {
+    weaveffi_error err = {0, NULL};
+    const char* key_chars = (*env)->GetStringUTFChars(env, key, NULL);
+    jboolean value_is_copy = 0;
+    jbyte* value_elems = (*env)->GetByteArrayElements(env, value, &value_is_copy);
+    jsize value_len = (*env)->GetArrayLength(env, value);
+    bool rv = weaveffi_kv_Store_legacy_put((const weaveffi_kv_Store*)(intptr_t)selfHandle, key_chars, (const uint8_t*)value_elems, (size_t)value_len, &err);
+    if (err.code != 0) {
+        throw_weaveffi_kv_KvError(env, &err);
+        return JNI_FALSE;
+    }
+    (*env)->ReleaseStringUTFChars(env, key, key_chars);
+    (*env)->ReleaseByteArrayElements(env, value, value_elems, 0);
+    return rv ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_com_weaveffi_Store_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
+    weaveffi_kv_Store_destroy((weaveffi_kv_Store*)(intptr_t)handle);
 }
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Stats_nativeCreate(JNIEnv* env, jclass clazz, jlong total_entries, jlong total_bytes, jlong expired_entries) {

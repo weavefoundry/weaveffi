@@ -17,8 +17,14 @@
 //! Inside it:
 //!
 //! * `#[weaveffi::export]` on a `fn` exports a function. An `async fn` lowers to
-//!   an asynchronous symbol; a `fn -> Result<T, E>` is fallible (the IDL return
-//!   type is `T`, and errors are reported through the ABI's `out_err`).
+//!   an asynchronous symbol; a `fn -> Result<T, E>` is fallible (`throws` in
+//!   the IDL; the return type is `T` and errors are reported through the ABI's
+//!   `out_err`).
+//! * `#[weaveffi::interface]` on a `struct` declares an interface (opaque
+//!   object type). Its `impl` block's `pub fn`s become the interface's
+//!   members: an associated function returning `Self` is a constructor, a
+//!   `&self` function is a method, and any other associated function is a
+//!   static.
 //! * `#[weaveffi::record]` on a `struct` declares a by-value record.
 //! * `#[weaveffi::enumeration]` on a `#[repr(i32)]` `enum` declares a C-style
 //!   enum.
@@ -27,14 +33,15 @@
 //!
 //! The type mapping mirrors the IDL: `String`/`&str` are strings, `Vec<u8>` and
 //! `&[u8]` are byte buffers, `u64` is an opaque `handle`, `*mut T`/`*const T` is
-//! a typed handle, and other named paths are records or enums resolved later.
+//! a typed handle, and other named paths are records, enums, or interfaces
+//! resolved later.
 
 #![deny(missing_docs)]
 
 use syn::spanned::Spanned;
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
-    StructField, TypeRef, CURRENT_SCHEMA_VERSION,
+    Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
+    ListenerDef, Module, Param, StructDef, StructField, TypeRef, CURRENT_SCHEMA_VERSION,
 };
 
 /// Match a WeaveFFI marker attribute by its final path segment.
@@ -293,9 +300,9 @@ pub fn type_ref_from_syn(ty: &syn::Type) -> syn::Result<TypeRef> {
     }
 }
 
-/// Peel `Result<T, E>` to its `T`, returning any other type unchanged. WeaveFFI
-/// functions are fallible by construction (every symbol carries `out_err`), so
-/// the error type carries no extra IR shape.
+/// Peel `Result<T, E>` to its `T`, returning any other type unchanged. A
+/// `Result` return marks the function `throws` in the IDL; the error type
+/// itself carries no extra IR shape (it reports through the ABI's `out_err`).
 pub fn peel_result(ty: &syn::Type) -> &syn::Type {
     if let syn::Type::Path(p) = ty {
         if let Some(seg) = p.path.segments.last() {
@@ -309,6 +316,16 @@ pub fn peel_result(ty: &syn::Type) -> &syn::Type {
         }
     }
     ty
+}
+
+/// Whether a function's return type is a `Result<_, _>`, which marks the
+/// function as `throws` in the IDL.
+pub fn output_is_result(output: &syn::ReturnType) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    matches!(ty.as_ref(), syn::Type::Path(p)
+        if p.path.segments.last().is_some_and(|s| s.ident == "Result"))
 }
 
 fn is_unit(ty: &syn::Type) -> bool {
@@ -392,11 +409,99 @@ fn extract_function(item: &syn::ItemFn) -> syn::Result<Function> {
         params: extract_params(&item.sig.inputs)?,
         returns: return_type_from_syn(&item.sig.output)?,
         doc: extract_doc(&item.attrs),
+        throws: output_is_result(&item.sig.output),
         r#async: item.sig.asyncness.is_some(),
         cancellable: has_marker(&item.attrs, "cancellable"),
         deprecated,
         since,
     })
+}
+
+/// Whether the (peeled) return type names the interface itself (`Self` or the
+/// interface's own name), which classifies an associated function as a
+/// constructor.
+fn returns_self(output: &syn::ReturnType, iface: &str) -> bool {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    match type_path_ident(peel_result(ty)) {
+        Some(name) => name == "Self" || name == iface,
+        None => false,
+    }
+}
+
+/// Extract one interface member from an `impl` block function.
+///
+/// The receiver decides the member kind at the call site (see
+/// [`members_from_impl`]); this helper maps the signature. A `Self` (or
+/// interface-named) return on a constructor is dropped: the IR leaves a
+/// constructor's `return` empty because the instance is implicit.
+fn extract_member(item: &syn::ImplItemFn, iface: &str, is_ctor: bool) -> syn::Result<Function> {
+    let (since, deprecated) = parse_deprecated(&item.attrs);
+    let returns = if is_ctor {
+        None
+    } else {
+        match return_type_from_syn(&item.sig.output)? {
+            // `fn hand(&self) -> Self` style returns name the interface.
+            Some(TypeRef::Struct(name)) if name == "Self" => {
+                Some(TypeRef::Struct(iface.to_string()))
+            }
+            other => other,
+        }
+    };
+    Ok(Function {
+        name: item.sig.ident.to_string(),
+        params: extract_params(&item.sig.inputs)?,
+        returns,
+        doc: extract_doc(&item.attrs),
+        throws: output_is_result(&item.sig.output),
+        r#async: item.sig.asyncness.is_some(),
+        cancellable: has_marker(&item.attrs, "cancellable"),
+        deprecated,
+        since,
+    })
+}
+
+/// Classify and extract every `pub fn` of an interface's `impl` block into
+/// the interface's constructors, methods, and statics.
+///
+/// * a function with a `&self` receiver is a **method**;
+/// * an associated function returning `Self` (or the interface type,
+///   optionally inside `Result`) is a **constructor**;
+/// * any other associated function is a **static**.
+///
+/// Non-`pub` items are private helpers and stay unexported.
+fn members_from_impl(item_impl: &syn::ItemImpl, iface: &mut InterfaceDef) -> syn::Result<()> {
+    for impl_item in &item_impl.items {
+        let syn::ImplItem::Fn(f) = impl_item else {
+            continue;
+        };
+        if !matches!(f.vis, syn::Visibility::Public(_)) {
+            continue;
+        }
+        match f.sig.receiver() {
+            Some(recv) => {
+                if recv.mutability.is_some() || recv.reference.is_none() {
+                    return Err(syn::Error::new(
+                        recv.span(),
+                        "weaveffi: interface methods must take `&self`; use interior \
+                         mutability (Mutex, RwLock, Cell) for mutable state, because the \
+                         object is shared across the FFI boundary",
+                    ));
+                }
+                iface.methods.push(extract_member(f, &iface.name, false)?);
+            }
+            None if returns_self(&f.sig.output, &iface.name) => {
+                iface
+                    .constructors
+                    .push(extract_member(f, &iface.name, true)?);
+            }
+            None => {
+                iface.statics.push(extract_member(f, &iface.name, false)?);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn extract_callback(item: &syn::ItemFn) -> syn::Result<CallbackDef> {
@@ -547,6 +652,57 @@ fn extract_enum(item: &syn::ItemEnum) -> syn::Result<EnumDef> {
     })
 }
 
+/// Extract a `#[weaveffi::error]` enum into the module's [`ErrorDomain`].
+///
+/// The enum must consist of unit variants with explicit integer
+/// discriminants; each discriminant is the code's stable ABI value. A
+/// variant's doc comment becomes the code's default message (falling back to
+/// the variant name). The enum's name is the domain name, and the macro
+/// generates a matching `ErrorReport` implementation so `Err(KvError::...)`
+/// reports its declared code.
+fn extract_error_domain(item: &syn::ItemEnum) -> syn::Result<ErrorDomain> {
+    let codes = item
+        .variants
+        .iter()
+        .map(|v| {
+            if !matches!(v.fields, syn::Fields::Unit) {
+                return Err(syn::Error::new(
+                    v.span(),
+                    "weaveffi: #[weaveffi::error] variants must be unit variants with \
+                     explicit discriminants (payload-carrying variants cannot cross the \
+                     ABI's (code, message) error slot)",
+                ));
+            }
+            let Some((_, expr)) = v.discriminant.as_ref() else {
+                return Err(syn::Error::new(
+                    v.span(),
+                    format!(
+                        "weaveffi: error variant `{}` must have an explicit discriminant \
+                         (its stable ABI error code)",
+                        v.ident
+                    ),
+                ));
+            };
+            let doc = extract_doc(&v.attrs);
+            let message = doc
+                .as_deref()
+                .and_then(|d| d.lines().next())
+                .unwrap_or(&v.ident.to_string())
+                .to_string();
+            Ok(ErrorCode {
+                name: v.ident.to_string(),
+                code: parse_discriminant(expr)?,
+                message,
+                doc,
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
+    Ok(ErrorDomain {
+        name: item.ident.to_string(),
+        codes,
+    })
+}
+
 /// Extract a single [`Module`] from a `#[weaveffi::module]`-annotated `mod`.
 ///
 /// Only items carrying a WeaveFFI marker are exported; everything else (private
@@ -561,11 +717,13 @@ fn extract_enum(item: &syn::ItemEnum) -> syn::Result<EnumDef> {
 pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
     let name = item_mod.ident.to_string();
     let mut functions = Vec::new();
+    let mut interfaces: Vec<InterfaceDef> = Vec::new();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
     let mut callbacks = Vec::new();
     let mut listeners = Vec::new();
     let mut modules = Vec::new();
+    let mut errors: Option<ErrorDomain> = None;
 
     if let Some((_, items)) = &item_mod.content {
         for item in items {
@@ -579,8 +737,27 @@ pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
                 syn::Item::Fn(f) if has_marker(&f.attrs, "export") => {
                     functions.push(extract_function(f)?);
                 }
+                syn::Item::Struct(s) if has_marker(&s.attrs, "interface") => {
+                    interfaces.push(InterfaceDef {
+                        name: s.ident.to_string(),
+                        doc: extract_doc(&s.attrs),
+                        constructors: vec![],
+                        methods: vec![],
+                        statics: vec![],
+                    });
+                }
                 syn::Item::Struct(s) if has_marker(&s.attrs, "record") => {
                     structs.push(extract_struct(s)?);
+                }
+                syn::Item::Enum(e) if has_marker(&e.attrs, "error") => {
+                    if errors.is_some() {
+                        return Err(syn::Error::new(
+                            e.span(),
+                            "weaveffi: a module may declare at most one #[weaveffi::error] \
+                             domain",
+                        ));
+                    }
+                    errors = Some(extract_error_domain(e)?);
                 }
                 syn::Item::Enum(e) if has_marker(&e.attrs, "enumeration") => {
                     enums.push(extract_enum(e)?);
@@ -591,16 +768,35 @@ pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
                 _ => {}
             }
         }
+
+        // Second pass: attach `impl` block members to their interfaces. The
+        // interface struct may be declared after its impl block, so members
+        // are collected only once every interface name is known.
+        for item in items {
+            let syn::Item::Impl(item_impl) = item else {
+                continue;
+            };
+            if item_impl.trait_.is_some() {
+                continue;
+            }
+            let Some(self_name) = type_path_ident(&item_impl.self_ty) else {
+                continue;
+            };
+            if let Some(iface) = interfaces.iter_mut().find(|i| i.name == self_name) {
+                members_from_impl(item_impl, iface)?;
+            }
+        }
     }
 
     Ok(Module {
         name,
         functions,
+        interfaces,
         structs,
         enums,
         callbacks,
         listeners,
-        errors: None,
+        errors,
         modules,
     })
 }

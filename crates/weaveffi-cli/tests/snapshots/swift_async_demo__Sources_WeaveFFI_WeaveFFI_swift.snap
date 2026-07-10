@@ -33,6 +33,16 @@ func check(_ err: inout weaveffi_error) throws {
 }
 
 @inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
+    }
+}
+
+@inline(__always)
 func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
     guard let value = value else { return try body(nil) }
     return try withUnsafePointer(to: value) { try body($0) }
@@ -44,9 +54,43 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
-private final class ContinuationRef<T> {
-    let value: CheckedContinuation<T, Error>
-    init(_ value: CheckedContinuation<T, Error>) { self.value = value }
+private final class ContinuationRef<T, E: Error> {
+    let value: CheckedContinuation<T, E>
+    init(_ value: CheckedContinuation<T, E>) { self.value = value }
+}
+
+/// Typed errors reported by the `tasks` module.
+public enum TaskError: Error, LocalizedError {
+    case invalidName(message: String)
+    public var errorDescription: String? {
+        switch self {
+        case let .invalidName(message): return message
+        }
+    }
+    /// The numeric ABI code carried by this error.
+    public var errorCode: Int32 {
+        switch self {
+        case .invalidName: return 1
+        }
+    }
+}
+
+@inline(__always)
+func mapTasks(code: Int32, message: String) -> Error {
+    switch code {
+    case 1: return TaskError.invalidName(message: message.isEmpty ? "task name must not be empty" : message)
+    default: return WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func checkTasks(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        throw mapTasks(code: code, message: message)
+    }
 }
 
 public class TaskResult {
@@ -77,16 +121,16 @@ public class TaskResult {
 }
 
 public enum Tasks {
-    public static func tasks_run_task(_ name: String) async throws -> TaskResult {
+    public static func runTask(name: String) async throws -> TaskResult {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<TaskResult, Error>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
             name.withCString { name_ptr in
                 weaveffi_tasks_run_task_async(name_ptr, { context, err, result in
-                    let contRef = Unmanaged<ContinuationRef<TaskResult>>.fromOpaque(context!).takeRetainedValue()
+                    let contRef = Unmanaged<ContinuationRef<TaskResult, Error>>.fromOpaque(context!).takeRetainedValue()
                     if let err = err, err.pointee.code != 0 {
                         let code = err.pointee.code
                         let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                        contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                        contRef.value.resume(throwing: mapTasks(code: code, message: msg))
                     } else {
                         guard let result = result else {
                             contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: "null pointer"))
@@ -98,8 +142,8 @@ public enum Tasks {
             }
         }
     }
-    public static func tasks_run_batch(_ names: [String]) async throws -> [TaskResult] {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[TaskResult], Error>) in
+    public static func runBatch(names: [String]) async -> [TaskResult] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<[TaskResult], Never>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
             let names_cstrs: [UnsafePointer<CChar>?] = names.map { UnsafePointer(strdup($0)) }
             defer { names_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
@@ -107,11 +151,11 @@ public enum Tasks {
                 let names_ptr = names_buf.baseAddress
                 let names_len = names_buf.count
                 weaveffi_tasks_run_batch_async(names_ptr, names_len, { context, err, result, resultLen in
-                    let contRef = Unmanaged<ContinuationRef<[TaskResult]>>.fromOpaque(context!).takeRetainedValue()
+                    let contRef = Unmanaged<ContinuationRef<[TaskResult], Never>>.fromOpaque(context!).takeRetainedValue()
                     if let err = err, err.pointee.code != 0 {
                         let code = err.pointee.code
                         let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                        contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                        fatalError("\(code): \(msg)")
                     } else {
                         guard let result = result else {
                             contRef.value.resume(returning: [])
@@ -124,31 +168,31 @@ public enum Tasks {
             }
         }
     }
-    public static func tasks_cancel_task(_ id: Int64) throws -> Bool {
+    public static func cancelTask(id: Int64) -> Bool {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_tasks_cancel_task(id, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    public static func tasks_run_n_tasks(_ n: Int32) async throws -> Int32 {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+    public static func runNTasks(n: Int32) async -> Int32 {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
             weaveffi_tasks_run_n_tasks_async(n, { context, err, result in
-                let contRef = Unmanaged<ContinuationRef<Int32>>.fromOpaque(context!).takeRetainedValue()
+                let contRef = Unmanaged<ContinuationRef<Int32, Never>>.fromOpaque(context!).takeRetainedValue()
                 if let err = err, err.pointee.code != 0 {
                     let code = err.pointee.code
                     let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                    fatalError("\(code): \(msg)")
                 } else {
                     contRef.value.resume(returning: result)
                 }
             }, ctx)
         }
     }
-    public static func tasks_active_callbacks() throws -> Int64 {
+    public static func activeCallbacks() -> Int64 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_tasks_active_callbacks(&err)
-        try check(&err)
+        trap(&err)
         return rv
     }
 }

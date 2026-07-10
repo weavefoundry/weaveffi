@@ -2,11 +2,12 @@
 //! document becomes.
 //!
 //! Backends read this tree, never the raw IDL text. [`Api`] is the root and
-//! owns a forest of [`Module`]s, each grouping [`Function`]s, [`StructDef`]s,
-//! [`EnumDef`]s, [`CallbackDef`]s, [`ListenerDef`]s, and an optional
-//! [`ErrorDomain`]. Types are referenced throughout by [`TypeRef`], which
-//! (de)serializes as a compact string (`i32`, `[string]`, `{string:i32}`,
-//! `Contact?`, and so on) rather than as a tagged object.
+//! owns a forest of [`Module`]s, each grouping [`Function`]s,
+//! [`InterfaceDef`]s, [`StructDef`]s, [`EnumDef`]s, [`CallbackDef`]s,
+//! [`ListenerDef`]s, and an optional [`ErrorDomain`]. Types are referenced
+//! throughout by [`TypeRef`], which (de)serializes as a compact string (`i32`,
+//! `[string]`, `{string:i32}`, `Contact?`, and so on) rather than as a tagged
+//! object.
 
 use std::collections::BTreeMap;
 
@@ -17,14 +18,14 @@ use serde::{Deserialize, Serialize};
 /// generator expect.
 ///
 /// Pre-1.0 there is exactly one supported schema version: the current one.
-/// Older schema revisions (0.1.0, 0.2.0) are not accepted and have no
+/// Older schema revisions (0.1.0 through 0.5.0) are not accepted and have no
 /// automated migration path: update the `version` field and adjust the
 /// document to the current schema by hand. Post-1.0, schema bumps will ship
 /// with a migration tool and [`SUPPORTED_VERSIONS`] will widen accordingly.
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.4.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.5.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -51,7 +52,7 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.4.0`).
+    /// IR schema version this document targets (for example `0.5.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Package identity used to name, version, and describe every generated
@@ -126,7 +127,12 @@ pub struct Module {
     /// in generated code (for example `contacts`).
     pub name: String,
     /// Free functions this module exports across the FFI boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub functions: Vec<Function>,
+    /// Interface (object) types declared in this module: stateful resources
+    /// with constructors, methods, and static functions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<InterfaceDef>,
     /// Record (struct) types declared in this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structs: Vec<StructDef>,
@@ -153,13 +159,16 @@ pub struct Module {
 /// Each function becomes a C ABI entry point plus an idiomatic wrapper in every
 /// target language. The `async` and `cancellable` flags change how the symbol
 /// is lowered (a completion callback, an extra cancel-token parameter) without
-/// altering the parameter and return shape declared here.
+/// altering the parameter and return shape declared here. The same shape also
+/// describes an interface's constructors, methods, and statics (see
+/// [`InterfaceDef`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Function {
     /// Function name, lowered to a per-language symbol (for example
     /// `create_contact`).
     pub name: String,
     /// Ordered parameter list; order is preserved in every generated signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<Param>,
     /// Return type, or `None` for a function that returns nothing. Serialized
     /// under the IDL key `return`.
@@ -169,6 +178,13 @@ pub struct Function {
     /// comments. `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Whether the function can fail with a domain error. A throwing function
+    /// surfaces as `throws`/`raises` in the idiomatic bindings, reporting the
+    /// owning module's error domain; a non-throwing function has a plain
+    /// signature and treats any error as a producer bug (a trap, not a typed
+    /// error). Defaults to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub throws: bool,
     /// Whether the function is asynchronous, lowering to a completion-callback
     /// form rather than a blocking call. Serialized under the IDL key `async`.
     #[serde(default, rename = "async", skip_serializing_if = "is_false")]
@@ -185,6 +201,43 @@ pub struct Function {
     /// surfaced as a "since" annotation where the target language supports one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
+}
+
+/// An interface: an opaque, stateful object type with constructors, instance
+/// methods, and static functions.
+///
+/// An interface value lives behind the FFI boundary and crosses it as an
+/// opaque pointer; consumers see a class (or the target's closest analogue)
+/// whose methods call back into the producer. This is the primary way to model
+/// resources with identity and behavior (stores, sessions, connections), in
+/// contrast to a [`StructDef`], which models a plain data record with fields.
+///
+/// Every interface also receives an implicit destructor symbol
+/// (`{tag}_destroy`); generated wrappers release the underlying object through
+/// their language's natural disposal hook (`Drop`, `__del__`, `Disposable`,
+/// finalizers, `close()`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(
+    description = "An interface: an opaque object type with constructors, methods, and statics."
+)]
+pub struct InterfaceDef {
+    /// Interface type name (for example `Store`).
+    pub name: String,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// Constructors: static functions returning a new instance. A constructor
+    /// declares no `return` (the instance is implicit) and may not be `async`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constructors: Vec<Function>,
+    /// Instance methods. Each lowers with an implicit leading `self` slot
+    /// (a pointer to the interface object) before the declared parameters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<Function>,
+    /// Static functions namespaced under the interface but taking no `self`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statics: Vec<Function>,
 }
 
 /// A single parameter of a [`Function`] or [`CallbackDef`].
@@ -296,10 +349,20 @@ pub enum TypeRef {
     ///
     /// The resolution pass leaves a rich-enum reference as `Struct` (it only
     /// rewrites *C-style* enum references into [`Enum`](Self::Enum), which lower
-    /// by value); see `weaveffi_core::validate::resolve`.
+    /// by value, and interface references into [`Interface`](Self::Interface));
+    /// see `weaveffi_core::validate::resolve`.
     Struct(String),
     /// A C-style integer enum (no variant payloads). Lowers by value.
     Enum(String),
+    /// A user interface (see [`InterfaceDef`]): an opaque object reference.
+    /// As a parameter the object is borrowed for the call; as a return the
+    /// caller receives a new owned reference it must eventually release.
+    ///
+    /// The IDL spells an interface reference as its bare (or dotted-qualified)
+    /// name, exactly like a struct; the resolution pass rewrites the parsed
+    /// [`Struct`](Self::Struct) into this variant when the name resolves to an
+    /// interface declaration.
+    Interface(String),
     /// Borrowed string slice (`&str`): a non-owning view valid only for the
     /// duration of a call, used to pass input without copying.
     BorrowedStr,
@@ -323,9 +386,10 @@ pub enum TypeRef {
 /// Handles primitive names (`i32`, `string`, `bytes`, `handle`, and so on),
 /// borrowed forms (`&str`, `&[u8]`), typed handles (`handle<Name>`), iterators
 /// (`iter<T>`), lists (`[T]`), maps (`{K:V}`), and the optional suffix (`T?`).
-/// Any other bare identifier is taken to be a user-defined struct or enum name
-/// and returned as [`TypeRef::Struct`]; the struct-versus-enum distinction is
-/// resolved later against the module's declarations.
+/// Any other bare identifier is taken to be a user-defined struct, enum, or
+/// interface name and returned as [`TypeRef::Struct`]; the
+/// struct-versus-enum-versus-interface distinction is resolved later against
+/// the module's declarations.
 ///
 /// # Errors
 ///
@@ -405,7 +469,7 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::BorrowedBytes => "&[u8]".to_string(),
         TypeRef::Handle => "handle".to_string(),
         TypeRef::TypedHandle(name) => format!("handle<{name}>"),
-        TypeRef::Struct(name) | TypeRef::Enum(name) => name.clone(),
+        TypeRef::Struct(name) | TypeRef::Enum(name) | TypeRef::Interface(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
@@ -458,7 +522,7 @@ impl JsonSchema for TypeRef {
              `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), \
              borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), \
              iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), \
-             optionals (`{T}?`), or any user-defined struct/enum name."
+             optionals (`{T}?`), or any user-defined struct/enum/interface name."
                 .to_string(),
         );
         schema.into()
@@ -597,7 +661,7 @@ mod tests {
     #[test]
     fn struct_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: geometry
     functions: []
@@ -628,7 +692,7 @@ modules:
     #[test]
     fn struct_def_round_trip_json() {
         let json = r#"{
-            "version": "0.4.0",
+            "version": "0.5.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -651,7 +715,7 @@ modules:
     #[test]
     fn structs_default_to_empty() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions: []
@@ -663,7 +727,7 @@ modules:
     #[test]
     fn package_block_round_trips_yaml() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: kvstore
   version: 1.2.0
@@ -702,7 +766,7 @@ modules:
     #[test]
     fn package_is_optional() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions: []
@@ -717,7 +781,7 @@ modules:
     #[test]
     fn package_minimal_requires_name_and_version() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: tiny
   version: 0.0.1
@@ -763,7 +827,7 @@ modules: []
     #[test]
     fn enum_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: graphics
     functions: []
@@ -799,7 +863,7 @@ modules:
     #[test]
     fn enum_def_round_trip_json() {
         let json = r#"{
-            "version": "0.4.0",
+            "version": "0.5.0",
             "modules": [{
                 "name": "status",
                 "functions": [],
@@ -823,7 +887,7 @@ modules:
     #[test]
     fn enums_default_to_empty() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions: []
@@ -1058,7 +1122,7 @@ modules:
     #[test]
     fn typeref_optional_yaml_deser() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions:
@@ -1081,7 +1145,7 @@ modules:
     #[test]
     fn typeref_list_yaml_deser() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions:
@@ -1174,7 +1238,7 @@ modules:
     #[test]
     fn typeref_map_yaml_deser() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions:
@@ -1323,7 +1387,7 @@ modules:
     #[test]
     fn typeref_borrowed_yaml_deser() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: io
     functions:
@@ -1352,7 +1416,7 @@ modules:
     #[test]
     fn generators_field_parses_from_yaml() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions: []
@@ -1373,7 +1437,7 @@ generators:
     #[test]
     fn generators_defaults_to_none() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions: []
@@ -1394,7 +1458,7 @@ modules:
     #[test]
     fn callback_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: events
     functions: []
@@ -1419,7 +1483,7 @@ modules:
     #[test]
     fn listener_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: events
     functions: []
@@ -1443,7 +1507,7 @@ modules:
     #[test]
     fn callbacks_and_listeners_default_to_empty() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions: []
@@ -1485,7 +1549,7 @@ modules:
     #[test]
     fn builder_defaults_to_false() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions: []
@@ -1502,7 +1566,7 @@ modules:
     #[test]
     fn builder_true_round_trip() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions: []
@@ -1524,7 +1588,7 @@ modules:
     #[test]
     fn builder_false_explicit() {
         let json = r#"{
-            "version": "0.4.0",
+            "version": "0.5.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -1542,7 +1606,7 @@ modules:
     #[test]
     fn param_mutable_defaults_to_false() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: io
     functions:
@@ -1558,7 +1622,7 @@ modules:
     #[test]
     fn param_mutable_true_round_trip() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: io
     functions:
@@ -1579,7 +1643,7 @@ modules:
     #[test]
     fn param_mutable_false_explicit() {
         let json = r#"{
-            "version": "0.4.0",
+            "version": "0.5.0",
             "modules": [{
                 "name": "io",
                 "functions": [{
@@ -1595,7 +1659,7 @@ modules:
     #[test]
     fn deprecated_and_since_default_to_none() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -1611,7 +1675,7 @@ modules:
     #[test]
     fn deprecated_and_since_round_trip() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -1635,7 +1699,7 @@ modules:
     #[test]
     fn struct_field_default_value_round_trip() {
         let yaml = r#"
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     functions: []
@@ -1663,7 +1727,7 @@ modules:
         // default must serialize without emitting those fields, so the
         // canonical IDL produced by `weaveffi format`/`extract` stays terse.
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "calc".into(),
                 functions: vec![Function {
@@ -1676,11 +1740,13 @@ modules:
                     }],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 }],
+                interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
                 callbacks: vec![],
@@ -1694,6 +1760,7 @@ modules:
         let yaml = serde_yaml::to_string(&api).unwrap();
         for needle in [
             "generators",
+            "interfaces",
             "structs",
             "enums",
             "callbacks",
@@ -1701,6 +1768,7 @@ modules:
             "errors",
             "modules:\n", // nested module list (top-level key is "modules")
             "doc",
+            "throws",
             "async",
             "cancellable",
             "deprecated",
@@ -1749,6 +1817,7 @@ modules:
         assert!(defs.contains_key("Function"));
         assert!(defs.contains_key("Param"));
         assert!(defs.contains_key("TypeRef"));
+        assert!(defs.contains_key("InterfaceDef"));
         assert!(defs.contains_key("StructDef"));
         assert!(defs.contains_key("StructField"));
         assert!(defs.contains_key("EnumDef"));
@@ -1757,6 +1826,103 @@ modules:
         assert!(defs.contains_key("ListenerDef"));
         assert!(defs.contains_key("ErrorDomain"));
         assert!(defs.contains_key("ErrorCode"));
+    }
+
+    #[test]
+    fn interface_round_trip_yaml() {
+        let yaml = r#"
+version: "0.5.0"
+modules:
+  - name: kv
+    interfaces:
+      - name: Store
+        doc: "A key/value store"
+        constructors:
+          - name: open
+            params:
+              - name: path
+                type: string
+            throws: true
+        methods:
+          - name: put
+            params:
+              - name: key
+                type: string
+              - name: value
+                type: bytes
+            return: bool
+            throws: true
+          - name: count
+            return: i64
+        statics:
+          - name: default_path
+            return: string
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        let m = &api.modules[0];
+        assert!(m.functions.is_empty());
+        assert_eq!(m.interfaces.len(), 1);
+        let i = &m.interfaces[0];
+        assert_eq!(i.name, "Store");
+        assert_eq!(i.doc.as_deref(), Some("A key/value store"));
+        assert_eq!(i.constructors.len(), 1);
+        assert!(i.constructors[0].throws);
+        assert_eq!(i.constructors[0].returns, None);
+        assert_eq!(i.methods.len(), 2);
+        assert!(i.methods[0].throws);
+        assert!(!i.methods[1].throws);
+        assert_eq!(i.methods[1].returns, Some(TypeRef::I64));
+        assert_eq!(i.statics.len(), 1);
+        assert_eq!(i.statics[0].returns, Some(TypeRef::StringUtf8));
+
+        // Round trip preserves the interface block.
+        let out = serde_yaml::to_string(&api).unwrap();
+        let back: Api = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(back, api);
+    }
+
+    #[test]
+    fn interfaces_default_to_empty() {
+        let yaml = r#"
+version: "0.5.0"
+modules:
+  - name: math
+    functions: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.modules[0].interfaces.is_empty());
+    }
+
+    #[test]
+    fn throws_defaults_to_false_and_round_trips() {
+        let yaml = r#"
+version: "0.5.0"
+modules:
+  - name: kv
+    functions:
+      - name: open
+        params: []
+        throws: true
+      - name: count
+        params: []
+"#;
+        let api: Api = serde_yaml::from_str(yaml).unwrap();
+        assert!(api.modules[0].functions[0].throws);
+        assert!(!api.modules[0].functions[1].throws);
+        let json = serde_json::to_string(&api).unwrap();
+        let back: Api = serde_json::from_str(&json).unwrap();
+        assert!(back.modules[0].functions[0].throws);
+        assert!(!back.modules[0].functions[1].throws);
+    }
+
+    #[test]
+    fn typeref_interface_serializes_as_name() {
+        let ty = TypeRef::Interface("Store".to_string());
+        let json = serde_json::to_string(&ty).unwrap();
+        assert_eq!(json, r#""Store""#);
+        // Deserialization yields `Struct`; the resolver rewrites it later.
+        let back: TypeRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, TypeRef::Struct("Store".into()));
     }
 
     #[test]

@@ -10,6 +10,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+    napi_value msg;
+    napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
+    napi_value err;
+    napi_create_error(env, NULL, msg, &err);
+    napi_value code_val;
+    napi_create_int32(env, code, &code_val);
+    napi_set_named_property(env, err, "code", code_val);
+    return err;
+}
+
 typedef struct weaveffi_napi_listener_ctx {
     napi_threadsafe_function tsfn;
     uint64_t id;
@@ -97,7 +108,7 @@ static napi_value Napi_weaveffi_events_send_message(napi_env env, napi_callback_
   weaveffi_events_send_message(text, &err);
   free(text);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -112,7 +123,7 @@ static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_
   weaveffi_error err = {0};
   void* result = weaveffi_events_get_messages(&err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -128,15 +139,20 @@ static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_
     napi_set_element(env, ret, iter_idx++, elem);
   }
   weaveffi_events_GetMessagesIterator_destroy(result);
+  if (iter_err.code != 0) {
+    napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));
+    weaveffi_error_clear(&iter_err);
+    return NULL;
+  }
   return ret;
 }
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
-    { "events_register_message_listener", NULL, Napi_weaveffi_events_register_message_listener, NULL, NULL, NULL, napi_default, NULL },
-    { "events_unregister_message_listener", NULL, Napi_weaveffi_events_unregister_message_listener, NULL, NULL, NULL, napi_default, NULL },
-    { "events_send_message", NULL, Napi_weaveffi_events_send_message, NULL, NULL, NULL, napi_default, NULL },
-    { "events_get_messages", NULL, Napi_weaveffi_events_get_messages, NULL, NULL, NULL, napi_default, NULL },
+    { "registerMessageListener", NULL, Napi_weaveffi_events_register_message_listener, NULL, NULL, NULL, napi_default, NULL },
+    { "unregisterMessageListener", NULL, Napi_weaveffi_events_unregister_message_listener, NULL, NULL, NULL, napi_default, NULL },
+    { "sendMessage", NULL, Napi_weaveffi_events_send_message, NULL, NULL, NULL, napi_default, NULL },
+    { "getMessages", NULL, Napi_weaveffi_events_get_messages, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, 4, props);
   return exports;

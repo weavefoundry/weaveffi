@@ -20,23 +20,31 @@ use weaveffi_core::codegen::common::{
 };
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
-    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    IteratorBinding, ListenerBinding, ModuleBinding, RichVariantBinding, StructBinding,
+    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding,
+    FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding,
+    RichVariantBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::platform::Platform;
-use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
+use weaveffi_core::utils::{
+    local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`RubyGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RubyConfig {
     /// Top-level Ruby module name (default `"WeaveFFI"`).
     pub module_name: Option<String>,
     /// Ruby gem name written into `weaveffi.gemspec` (default `"weaveffi"`).
     pub gem_name: Option<String>,
+    /// When `true` (the default), strip the IR module name prefix from
+    /// emitted Ruby method names, so a `contacts` module exports
+    /// `create_contact` rather than `contacts_create_contact`. Set to
+    /// `false` to restore module-prefixed names.
+    pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the FFI bindings call the same
     /// exported symbols the producer emits.
@@ -44,6 +52,18 @@ pub struct RubyConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for RubyConfig {
+    fn default() -> Self {
+        Self {
+            module_name: None,
+            gem_name: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl RubyConfig {
@@ -92,7 +112,7 @@ impl LanguageBackend for RubyGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
@@ -110,9 +130,9 @@ impl LanguageBackend for RubyGenerator {
             OutputFile::new(
                 lib_dir.join(&lib_file),
                 render_ruby_module(
-                    api,
+                    model,
                     config.module_name(),
-                    config.prefix(),
+                    config.strip_module_prefix,
                     &lib_file,
                     input_basename,
                 ),
@@ -131,7 +151,7 @@ impl LanguageBackend for RubyGenerator {
     fn package(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -147,9 +167,9 @@ impl LanguageBackend for RubyGenerator {
 
         // Render the FFI module once with the bundled-first loader.
         let module_src = render_ruby_module(
-            api,
+            model,
             config.module_name(),
-            config.prefix(),
+            config.strip_module_prefix,
             &lib_file,
             input_basename,
         )
@@ -465,11 +485,15 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("{name}_buf"), format!("{name}.bytesize")]
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.handle")],
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            vec![format!("{name}.handle")]
+        }
         TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![format!("{name}_c")],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![name.to_string()],
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}&.handle")],
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                vec![format!("{name}&.handle")]
+            }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 vec![format!("{name}_buf"), format!("{name}_len")]
             }
@@ -498,6 +522,8 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
         }
         TypeRef::TypedHandle(name) => format!("{name}.new({var})"),
         TypeRef::Struct(name) => format!("{}.new({var})", local_type_name(name)),
+        // Owned interface references wrap without re-running initialize.
+        TypeRef::Interface(name) => format!("{}._from_ptr({var})", local_type_name(name)),
         TypeRef::Bool => format!("{var} != 0"),
         _ => var.to_string(),
     }
@@ -511,19 +537,144 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
     common_emit_doc(out, doc, indent, DocCommentStyle::Hash);
 }
 
+// ── Typed errors ──
+
+/// The snake_case stem of a domain's generated helpers: `KvError` becomes
+/// `kv_error`, naming `kv_error_from` and `check_kv_error!`. Domain type
+/// names are globally unique (validated), so the helpers can't collide.
+fn rb_error_stem(eb: &ErrorBinding) -> String {
+    eb.type_name.to_snake_case()
+}
+
+/// `{stem}_from`: builds the domain error matching an ABI code.
+fn rb_error_factory_name(eb: &ErrorBinding) -> String {
+    format!("{}_from", rb_error_stem(eb))
+}
+
+/// `check_{stem}!`: raises the typed domain error for a non-zero out-err slot.
+fn rb_error_checker_name(eb: &ErrorBinding) -> String {
+    format!("check_{}!", rb_error_stem(eb))
+}
+
+/// The error-check call a callable's out-err slot goes through: the module
+/// domain's typed checker when the callable throws, the generic
+/// `check_error!` (plain `Error`; panics and marshalling failures only)
+/// otherwise.
+fn rb_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
+    match error {
+        Some(eb) if f.throws => rb_error_checker_name(eb),
+        _ => "check_error!".to_string(),
+    }
+}
+
+/// Escape a string for embedding in a single-quoted Ruby literal.
+fn rb_str_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Render one module's declared error domain: a domain class subclassing the
+/// generic `Error`, one nested subclass per code carrying its stable `CODE`
+/// constant and default message, the code-to-class table, and the
+/// factory/checker helpers throwing wrappers route their out-err slots
+/// through. Nesting the code classes keeps `KvError::KeyNotFound` spellable
+/// and unambiguous even across domains.
+fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
+    let domain = &eb.type_name;
+    let factory = rb_error_factory_name(eb);
+    let checker = rb_error_checker_name(eb);
+    let table = format!("{}_CODES", eb.type_name.to_shouty_snake_case());
+
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    w.line(format!(
+        "# Base error for the `{}` module's error domain.",
+        module.path
+    ));
+    w.line(format!("class {domain} < Error"));
+    w.scope(|w| {
+        for (idx, c) in eb.codes.iter().enumerate() {
+            if idx > 0 {
+                w.blank();
+            }
+            let class = weaveffi_core::errors::pascal(&c.name);
+            let doc = c.doc.clone().unwrap_or_else(|| c.message.clone());
+            let mut d = String::new();
+            emit_doc(&mut d, &Some(doc), "    ");
+            w.raw(d);
+            w.block(format!("class {class} < {domain}"), "end", |w| {
+                w.line(format!("CODE = {}", c.value));
+                w.blank();
+                w.block(
+                    format!("def initialize(message = '{}')", rb_str_literal(&c.message)),
+                    "end",
+                    |w| {
+                        w.line(format!("super({}, message)", c.value));
+                    },
+                );
+            });
+        }
+    });
+    w.line("end");
+
+    w.blank();
+    w.line(format!(
+        "# Maps each ABI code of the {domain} domain to its error class."
+    ));
+    w.line(format!("{table} = {{"));
+    w.scope(|w| {
+        for c in &eb.codes {
+            w.line(format!(
+                "{} => {domain}::{},",
+                c.value,
+                weaveffi_core::errors::pascal(&c.name)
+            ));
+        }
+    });
+    w.line("}.freeze");
+
+    w.blank();
+    w.line(format!(
+        "# Builds the {domain} subclass matching `code`, or a generic Error"
+    ));
+    w.line("# for codes outside the domain (panics, marshalling).");
+    w.block(format!("def self.{factory}(code, message)"), "end", |w| {
+        w.line(format!("cls = {table}[code]"));
+        w.line("return Error.new(code, message) if cls.nil?");
+        w.line("message.empty? ? cls.new : cls.new(message)");
+    });
+
+    w.blank();
+    w.line(format!(
+        "# Raises the typed {domain} for a non-zero error slot."
+    ));
+    w.block(format!("def self.{checker}(err)"), "end", |w| {
+        w.line("return if err[:code].zero?");
+        w.line("code = err[:code]");
+        w.line("msg_ptr = err[:message]");
+        w.line("msg = msg_ptr.null? ? '' : msg_ptr.read_string");
+        w.line("weaveffi_error_clear(err.to_ptr)");
+        w.line(format!("raise {factory}(code, msg)"));
+    });
+    out.push_str(&w.finish());
+}
+
 fn render_ruby_module(
-    api: &Api,
+    model: &BindingModel,
     module_name: &str,
-    prefix: &str,
+    strip_module_prefix: bool,
     lib_filename: &str,
     input_basename: &str,
 ) -> String {
-    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
     render_preamble(&mut out, module_name, has_listeners);
     for m in &model.modules {
         out.push_str(&format!("\n  # === Module: {} ===\n", m.path));
+        // The typed error surface comes first so the domain class exists
+        // before any wrapper references its checker.
+        if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
+            render_error(&mut out, m, eb);
+        }
         for e in &m.enums {
             // A plain C-style enum is a module of integer constants; a rich
             // (algebraic) enum is an opaque-object wrapper like a struct, so it
@@ -536,6 +687,9 @@ fn render_ruby_module(
         }
         for s in &m.structs {
             render_struct_ffi(&mut out, s);
+        }
+        for i in &m.interfaces {
+            render_interface_ffi(&mut out, i);
         }
         for c in &m.callbacks {
             render_callback_decl(&mut out, c);
@@ -557,11 +711,18 @@ fn render_ruby_module(
                 render_ruby_builder_class(&mut out, s, module_name);
             }
         }
+        for i in &m.interfaces {
+            render_interface_class(&mut out, m, i, module_name);
+        }
         for l in &m.listeners {
-            render_listener_wrapper(&mut out, m, l);
+            render_listener_wrapper(&mut out, m, l, strip_module_prefix);
         }
         for f in &m.functions {
-            render_function_wrapper(&mut out, f);
+            let scope = RbScope::Free {
+                module_path: &m.path,
+                strip_module_prefix,
+            };
+            render_callable(&mut out, m, f, &scope);
         }
     }
     out.push_str("end\n\n");
@@ -736,6 +897,28 @@ fn render_rich_enum_ffi(out: &mut String, e: &EnumBinding) {
         }
     }
     out.push_str(&w.finish());
+}
+
+/// Declare the FFI bindings for one interface: the destroy symbol plus every
+/// constructor, method, and static through the shared attach path. Methods
+/// carry their implicit leading `self` pointer slot in the precomputed ABI
+/// signatures, so no special casing is needed here.
+fn render_interface_ffi(out: &mut String, i: &InterfaceBinding) {
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    w.line(format!(
+        "attach_function :{}, [:pointer], :void",
+        i.destroy_symbol
+    ));
+    out.push_str(&w.finish());
+    for f in i
+        .constructors
+        .iter()
+        .chain(i.methods.iter())
+        .chain(i.statics.iter())
+    {
+        render_attach_function(out, f);
+    }
 }
 
 /// Map lowered ABI slots onto Ruby FFI type tokens. `string_as_pointer`
@@ -942,6 +1125,93 @@ fn render_ruby_builder_class(out: &mut String, s: &StructBinding, rb_module_name
     out.push_str(&w.finish());
 }
 
+/// Render one interface as an opaque-object wrapper class, following the
+/// struct wrapper's ownership pattern: a `{Name}Ptr < FFI::AutoPointer`
+/// subclass releases the handle through the interface's C destroy symbol on
+/// GC, and the wrapper class exposes `attr_reader :handle` plus an explicit
+/// `destroy`. A constructor named `new` becomes `initialize`; every other
+/// constructor becomes a class-method factory; methods pass `@handle` as the
+/// leading C argument; statics are class methods. `_from_ptr` wraps an owned
+/// pointer the producer already handed over (a C return value) without
+/// re-running `initialize`.
+fn render_interface_class(
+    out: &mut String,
+    module: &ModuleBinding,
+    i: &InterfaceBinding,
+    rb_module_name: &str,
+) {
+    let ptr_class = format!("{}Ptr", i.name);
+    let mut w = CodeWriter::two_space().with_depth(1);
+    w.blank();
+    w.block(
+        format!("class {ptr_class} < FFI::AutoPointer"),
+        "end",
+        |w| {
+            w.block("def self.release(ptr)", "end", |w| {
+                w.line(format!("{rb_module_name}.{}(ptr)", i.destroy_symbol));
+            });
+        },
+    );
+    w.blank();
+
+    let mut d = String::new();
+    emit_doc(&mut d, &i.doc, "  ");
+    w.raw(d);
+    w.line(format!("class {}", i.name));
+    w.scope(|w| {
+        w.line("attr_reader :handle");
+        w.blank();
+        w.line("# Wraps an owned pointer the producer handed over, without");
+        w.line("# re-running initialize.");
+        w.block("def self._from_ptr(ptr)", "end", |w| {
+            w.line("obj = allocate");
+            w.line(format!(
+                "obj.instance_variable_set(:@handle, {ptr_class}.new(ptr))"
+            ));
+            w.line("obj");
+        });
+        w.blank();
+        w.block("def destroy", "end", |w| {
+            w.line("return if @handle.nil?");
+            w.line("@handle.free");
+            w.line("@handle = nil");
+        });
+    });
+    out.push_str(&w.finish());
+
+    // Members render at class depth through the shared callable paths, so
+    // sync, async, and iterator members reuse the free-function marshalling.
+    if let Some(c) = i.constructors.iter().find(|c| c.name == "new") {
+        let scope = RbScope::Init {
+            module_name: rb_module_name,
+            ptr_class: &ptr_class,
+        };
+        render_callable(out, module, c, &scope);
+    }
+    for c in i.constructors.iter().filter(|c| c.name != "new") {
+        let scope = RbScope::Factory {
+            module_name: rb_module_name,
+        };
+        render_callable(out, module, c, &scope);
+    }
+    for f in &i.methods {
+        let scope = RbScope::Method {
+            module_name: rb_module_name,
+        };
+        render_callable(out, module, f, &scope);
+    }
+    for f in &i.statics {
+        let scope = RbScope::Static {
+            module_name: rb_module_name,
+        };
+        render_callable(out, module, f, &scope);
+    }
+
+    let mut close = CodeWriter::two_space().with_depth(1);
+    close.line("end");
+    out.push_str(&close.finish());
+}
+
 /// The zero-value default for one Ruby builder slot.
 fn rb_field_default(ty: &TypeRef) -> &'static str {
     match ty {
@@ -1136,23 +1406,138 @@ fn render_rich_variant_factory(out: &mut String, v: &RichVariantBinding, rb_modu
     out.push_str(&w.finish());
 }
 
-fn render_function_wrapper(out: &mut String, f: &FnBinding) {
+/// How a rendered Ruby callable is scoped and spelled in the generated
+/// module: at module scope as a singleton method, or inside an interface
+/// class as a constructor, instance method, or class method.
+enum RbScope<'a> {
+    /// A module-level free function (`def self.name` on the top-level module).
+    Free {
+        /// The owning module's underscore-joined path.
+        module_path: &'a str,
+        /// Whether the emitted name drops the module-path prefix.
+        strip_module_prefix: bool,
+    },
+    /// An instance method on an interface class: `def name`, passing
+    /// `@handle` as the leading C argument.
+    Method {
+        /// The top-level Ruby module name qualifying module singleton calls.
+        module_name: &'a str,
+    },
+    /// A static member of an interface class (`def self.name`).
+    Static {
+        /// The top-level Ruby module name qualifying module singleton calls.
+        module_name: &'a str,
+    },
+    /// A non-`new` constructor: a class method wrapping the returned owned
+    /// pointer via `_from_ptr` (never re-running `initialize`).
+    Factory {
+        /// The top-level Ruby module name qualifying module singleton calls.
+        module_name: &'a str,
+    },
+    /// The canonical `new` constructor, emitted as `initialize`.
+    Init {
+        /// The top-level Ruby module name qualifying module singleton calls.
+        module_name: &'a str,
+        /// The interface's `FFI::AutoPointer` subclass wrapping the handle.
+        ptr_class: &'a str,
+    },
+}
+
+impl<'a> RbScope<'a> {
+    /// The top-level Ruby module name when calls must be explicitly
+    /// qualified (inside a class body); `None` at module scope, where the
+    /// implicit `self` already is the module.
+    fn module_name(&self) -> Option<&'a str> {
+        match self {
+            RbScope::Free { .. } => None,
+            RbScope::Method { module_name }
+            | RbScope::Static { module_name }
+            | RbScope::Factory { module_name }
+            | RbScope::Init { module_name, .. } => Some(module_name),
+        }
+    }
+
+    /// The receiver prefix for module singleton calls (attached C symbols,
+    /// error checkers, `weaveffi_free_*`): `"{ModuleName}."` inside a class
+    /// body, empty at module scope.
+    fn qualifier(&self) -> String {
+        self.module_name()
+            .map(|m| format!("{m}."))
+            .unwrap_or_default()
+    }
+
+    /// Two-space indent depth of the `def` line (1 at module scope, 2 inside
+    /// an interface class).
+    fn depth(&self) -> usize {
+        if self.module_name().is_none() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// The `@handle` argument instance methods pass as the leading C slot.
+    fn self_arg(&self) -> Option<&'static str> {
+        matches!(self, RbScope::Method { .. }).then_some("@handle")
+    }
+
+    /// The `def` opener for `f` with the given formal parameter names.
+    fn def_open(&self, f: &FnBinding, params: &[String]) -> String {
+        let args = params.join(", ");
+        match self {
+            RbScope::Free {
+                module_path,
+                strip_module_prefix,
+            } => format!(
+                "def self.{}({args})",
+                wrapper_name(module_path, &f.name, *strip_module_prefix).to_snake_case()
+            ),
+            RbScope::Method { .. } => format!("def {}({args})", f.name.to_snake_case()),
+            RbScope::Static { .. } | RbScope::Factory { .. } => {
+                format!("def self.{}({args})", f.name.to_snake_case())
+            }
+            RbScope::Init { .. } => format!("def initialize({args})"),
+        }
+    }
+}
+
+/// Render one callable: a free function or an interface member. `module`
+/// supplies the error domain for throwing callables; `scope` picks the def
+/// spelling, receiver, indent, and result handling. Sync, async, and
+/// iterator shapes all route through here so members reuse the free-function
+/// marshalling paths.
+fn render_callable(out: &mut String, module: &ModuleBinding, f: &FnBinding, scope: &RbScope) {
     match &f.shape {
-        CallShape::Sync(_) => render_sync_function_wrapper(out, f),
-        CallShape::Async(a) => render_async_function_wrapper(out, f, a),
-        CallShape::Iterator(it) => render_iterator_function_wrapper(out, f, it),
+        CallShape::Sync(_) => render_sync_function_wrapper(out, module, f, scope),
+        CallShape::Async(a) => render_async_function_wrapper(out, module, f, a, scope),
+        CallShape::Iterator(it) => render_iterator_function_wrapper(out, module, f, it, scope),
     }
 }
 
 /// Idiomatic register/unregister pair for one listener. The user passes a
 /// block; the trampoline converts each C argument and the `FFI::Function` is
 /// pinned in `@listener_refs` until unregistered.
-fn render_listener_wrapper(out: &mut String, module: &ModuleBinding, l: &ListenerBinding) {
+fn render_listener_wrapper(
+    out: &mut String,
+    module: &ModuleBinding,
+    l: &ListenerBinding,
+    strip_module_prefix: bool,
+) {
     let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
         unreachable!("listener '{}' references unknown callback", l.name);
     };
-    let register_name = format!("register_{}", l.name.to_snake_case());
-    let unregister_name = format!("unregister_{}", l.name.to_snake_case());
+    let register_name = wrapper_name(
+        &module.path,
+        &format!("register_{}", l.name),
+        strip_module_prefix,
+    )
+    .to_snake_case();
+    let unregister_name = wrapper_name(
+        &module.path,
+        &format!("unregister_{}", l.name),
+        strip_module_prefix,
+    )
+    .to_snake_case();
 
     let mut w = CodeWriter::two_space().with_depth(1);
     w.blank();
@@ -1240,7 +1625,7 @@ fn rb_cb_arg_expr(n: &str, ty: &TypeRef) -> String {
         TypeRef::Enum(_) => n.into(),
         // Borrowed by contract: the producer owns callback arguments for the
         // duration of the call, so opaque pointers pass through raw.
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n.into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => n.into(),
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -1291,16 +1676,24 @@ fn rb_cb_list_expr(n: &str, ty: &TypeRef) -> String {
     }
 }
 
-fn render_sync_function_wrapper(out: &mut String, f: &FnBinding) {
+fn render_sync_function_wrapper(
+    out: &mut String,
+    module: &ModuleBinding,
+    f: &FnBinding,
+    scope: &RbScope,
+) {
     let c_sym = &f.c_base;
-    let func_name = f.name.to_snake_case();
-    let ind = "    ";
+    let depth = scope.depth();
+    let ind = "  ".repeat(depth + 1);
+    let doc_ind = "  ".repeat(depth);
+    let q = scope.qualifier();
+    let checker = rb_checker_name(f, module.error.as_ref());
 
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
-    let mut w = CodeWriter::two_space().with_depth(1);
+    let mut w = CodeWriter::two_space().with_depth(depth);
     w.blank();
     let mut d = String::new();
-    emit_doc(&mut d, &f.doc, "  ");
+    emit_doc(&mut d, &f.doc, &doc_ind);
     w.raw(d);
     for p in &f.params {
         if let Some(pdoc) = &p.doc {
@@ -1325,73 +1718,86 @@ fn render_sync_function_wrapper(out: &mut String, f: &FnBinding) {
             }
         }
     }
-    w.block(
-        format!("def self.{}({})", func_name, params.join(", ")),
-        "end",
-        |w| {
-            if let Some(msg) = &f.deprecated {
-                let escaped = msg.replace('"', "\\\"");
-                w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+    w.block(scope.def_open(f, &params), "end", |w| {
+        if let Some(msg) = &f.deprecated {
+            let escaped = msg.replace('"', "\\\"");
+            w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+        }
+
+        w.line("err = ErrorStruct.new");
+
+        for p in &f.params {
+            let mut pc = String::new();
+            render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, &ind);
+            w.raw(pc);
+        }
+
+        let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
+        let has_out_len = f
+            .ret
+            .as_ref()
+            .is_some_and(|ty| !rb_return_out_params(ty).is_empty())
+            && !is_map_ret;
+
+        if is_map_ret {
+            w.line("out_keys = FFI::MemoryPointer.new(:pointer)");
+            w.line("out_values = FFI::MemoryPointer.new(:pointer)");
+            w.line("out_len = FFI::MemoryPointer.new(:size_t)");
+        } else if has_out_len {
+            w.line("out_len = FFI::MemoryPointer.new(:size_t)");
+        }
+
+        let mut call_args: Vec<String> = Vec::new();
+        if let Some(recv) = scope.self_arg() {
+            call_args.push(recv.into());
+        }
+        for p in &f.params {
+            call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+        }
+        if is_map_ret {
+            call_args.extend(["out_keys".into(), "out_values".into(), "out_len".into()]);
+        } else if has_out_len {
+            call_args.push("out_len".into());
+        }
+        call_args.push("err".into());
+
+        let call = format!("{q}{c_sym}({})", call_args.join(", "));
+        if f.ret.is_some() && !is_map_ret {
+            w.line(format!("result = {call}"));
+        } else {
+            w.line(call);
+        }
+
+        w.line(format!("{q}{checker}(err)"));
+
+        match scope {
+            // Constructors receive the owned pointer directly rather than
+            // routing through the generic return path.
+            RbScope::Init { ptr_class, .. } => {
+                w.line("raise Error.new(-1, 'null pointer') if result.null?");
+                w.line(format!("@handle = {ptr_class}.new(result)"));
             }
-
-            w.line("err = ErrorStruct.new");
-
-            for p in &f.params {
-                let mut pc = String::new();
-                render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, ind);
-                w.raw(pc);
+            RbScope::Factory { .. } => {
+                w.line("raise Error.new(-1, 'null pointer') if result.null?");
+                w.line("_from_ptr(result)");
             }
-
-            let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
-            let has_out_len = f
-                .ret
-                .as_ref()
-                .is_some_and(|ty| !rb_return_out_params(ty).is_empty())
-                && !is_map_ret;
-
-            if is_map_ret {
-                w.line("out_keys = FFI::MemoryPointer.new(:pointer)");
-                w.line("out_values = FFI::MemoryPointer.new(:pointer)");
-                w.line("out_len = FFI::MemoryPointer.new(:size_t)");
-            } else if has_out_len {
-                w.line("out_len = FFI::MemoryPointer.new(:size_t)");
-            }
-
-            let mut call_args: Vec<String> = Vec::new();
-            for p in &f.params {
-                call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
-            }
-            if is_map_ret {
-                call_args.extend(["out_keys".into(), "out_values".into(), "out_len".into()]);
-            } else if has_out_len {
-                call_args.push("out_len".into());
-            }
-            call_args.push("err".into());
-
-            let call = format!("{c_sym}({})", call_args.join(", "));
-            if f.ret.is_some() && !is_map_ret {
-                w.line(format!("result = {call}"));
-            } else {
-                w.line(call);
-            }
-
-            w.line("check_error!(err)");
-
-            if let Some(ret_ty) = &f.ret {
-                if is_map_ret {
-                    let (k, v) = get_map_kv(ret_ty).unwrap();
-                    let is_optional = matches!(ret_ty, TypeRef::Optional(_));
-                    let mut tmp = String::new();
-                    render_map_return_code(&mut tmp, k, v, ind, is_optional);
-                    w.raw(tmp);
-                } else {
-                    let mut tmp = String::new();
-                    render_return_code(&mut tmp, ret_ty, ind, None);
-                    w.raw(tmp);
+            _ => {
+                if let Some(ret_ty) = &f.ret {
+                    if is_map_ret {
+                        let (k, v) = get_map_kv(ret_ty).unwrap();
+                        let is_optional = matches!(ret_ty, TypeRef::Optional(_));
+                        let mut tmp = String::new();
+                        render_map_return_code(&mut tmp, k, v, &ind, is_optional);
+                        w.raw(tmp);
+                    } else {
+                        let mut tmp = String::new();
+                        render_return_code(&mut tmp, ret_ty, &ind, scope.module_name());
+                        w.raw(tmp);
+                    }
                 }
             }
-        },
-    );
+        }
+    });
     out.push_str(&w.finish());
 }
 
@@ -1400,15 +1806,29 @@ fn render_sync_function_wrapper(out: &mut String, f: &FnBinding) {
 /// releases the GVL, and the ffi gem delivers cross-thread callbacks safely).
 /// Blocking is the idiomatic Ruby surface; callers needing concurrency wrap
 /// the call in their own Thread or Fiber scheduler.
-fn render_async_function_wrapper(out: &mut String, f: &FnBinding, a: &AsyncBinding) {
-    let func_name = f.name.to_snake_case();
-    let ind = "    ";
+fn render_async_function_wrapper(
+    out: &mut String,
+    module: &ModuleBinding,
+    f: &FnBinding,
+    a: &AsyncBinding,
+    scope: &RbScope,
+) {
+    let depth = scope.depth();
+    let ind = "  ".repeat(depth + 1);
+    let doc_ind = "  ".repeat(depth);
+    let q = scope.qualifier();
+    // A completion error raises the typed domain error for throwing
+    // callables; the generic Error otherwise (panics, marshalling).
+    let error_expr = match module.error.as_ref() {
+        Some(eb) if f.throws => format!("{q}{}(code, msg)", rb_error_factory_name(eb)),
+        _ => "Error.new(code, msg)".to_string(),
+    };
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
 
-    let mut w = CodeWriter::two_space().with_depth(1);
+    let mut w = CodeWriter::two_space().with_depth(depth);
     w.blank();
     let mut d = String::new();
-    emit_doc(&mut d, &f.doc, "  ");
+    emit_doc(&mut d, &f.doc, &doc_ind);
     w.raw(d);
     w.line(format!(
         "# Blocks until the async producer completes{}.",
@@ -1418,75 +1838,87 @@ fn render_async_function_wrapper(out: &mut String, f: &FnBinding, a: &AsyncBindi
             ""
         }
     ));
-    w.block(
-        format!("def self.{}({})", func_name, params.join(", ")),
-        "end",
-        |w| {
-            if let Some(msg) = &f.deprecated {
-                let escaped = msg.replace('"', "\\\"");
-                w.line(format!("warn \"[DEPRECATED] {escaped}\""));
-            }
+    w.block(scope.def_open(f, &params), "end", |w| {
+        if let Some(msg) = &f.deprecated {
+            let escaped = msg.replace('"', "\\\"");
+            w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+        }
 
-            w.line("queue = Queue.new");
+        w.line("queue = Queue.new");
 
-            // Completion trampoline: (context, err, <result slots>).
-            let cb_types = rb_abi_types(&a.callback_params, true);
-            let mut cb_formals: Vec<String> = vec!["_context".into(), "err_ptr".into()];
-            cb_formals.extend(a.callback_params.iter().skip(2).map(|p| p.name.clone()));
-            w.block(
-                format!(
-                    "callback = FFI::Function.new(:void, [{}]) do |{}|",
-                    cb_types.join(", "),
-                    cb_formals.join(", ")
-                ),
-                "end",
-                |w| {
-                    // Producers pass err = NULL on success, so guard before dereferencing.
-                    w.line("err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)");
-                    w.line("if err && err[:code] != 0");
-                    w.scope(|w| {
-                        w.line("code = err[:code]");
-                        w.line("msg = err[:message].null? ? '' : err[:message].read_string");
-                        w.line("weaveffi_error_clear(err_ptr)");
-                        w.line("queue << Error.new(code, msg)");
-                    });
-                    w.line("else");
-                    w.scope(|w| {
-                        let mut tmp = String::new();
-                        render_async_result_push(&mut tmp, &f.ret, &format!("{ind}    "));
-                        w.raw(tmp);
-                    });
-                    w.line("end");
-                },
-            );
+        // Completion trampoline: (context, err, <result slots>).
+        let cb_types = rb_abi_types(&a.callback_params, true);
+        let mut cb_formals: Vec<String> = vec!["_context".into(), "err_ptr".into()];
+        cb_formals.extend(a.callback_params.iter().skip(2).map(|p| p.name.clone()));
+        w.block(
+            format!(
+                "callback = FFI::Function.new(:void, [{}]) do |{}|",
+                cb_types.join(", "),
+                cb_formals.join(", ")
+            ),
+            "end",
+            |w| {
+                // Producers pass err = NULL on success, so guard before dereferencing.
+                w.line("err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)");
+                w.line("if err && err[:code] != 0");
+                w.scope(|w| {
+                    w.line("code = err[:code]");
+                    w.line("msg = err[:message].null? ? '' : err[:message].read_string");
+                    w.line(format!("{q}weaveffi_error_clear(err_ptr)"));
+                    w.line(format!("queue << {error_expr}"));
+                });
+                w.line("else");
+                w.scope(|w| {
+                    let mut tmp = String::new();
+                    render_async_result_push(
+                        &mut tmp,
+                        &f.ret,
+                        &format!("{ind}    "),
+                        scope.module_name(),
+                    );
+                    w.raw(tmp);
+                });
+                w.line("end");
+            },
+        );
 
-            for p in &f.params {
-                let mut pc = String::new();
-                render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, ind);
-                w.raw(pc);
-            }
-            let mut call_args: Vec<String> = Vec::new();
-            for p in &f.params {
-                call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
-            }
-            if f.cancellable {
-                call_args.push("FFI::Pointer::NULL".into());
-            }
-            call_args.push("callback".into());
+        for p in &f.params {
+            let mut pc = String::new();
+            render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, &ind);
+            w.raw(pc);
+        }
+        let mut call_args: Vec<String> = Vec::new();
+        if let Some(recv) = scope.self_arg() {
+            call_args.push(recv.into());
+        }
+        for p in &f.params {
+            call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+        }
+        if f.cancellable {
             call_args.push("FFI::Pointer::NULL".into());
-            w.line(format!("{}({})", a.launch.symbol, call_args.join(", ")));
-            w.line("value = queue.pop");
-            w.line("raise value if value.is_a?(Error)");
-            w.line("value");
-        },
-    );
+        }
+        call_args.push("callback".into());
+        call_args.push("FFI::Pointer::NULL".into());
+        w.line(format!("{q}{}({})", a.launch.symbol, call_args.join(", ")));
+        w.line("value = queue.pop");
+        w.line("raise value if value.is_a?(Error)");
+        w.line("value");
+    });
     out.push_str(&w.finish());
 }
 
 /// Push the converted async result onto the queue. Result slots are named by
 /// [`abi::callback_result_params`]: `result` (+ `result_len`, or
-/// `result_keys`/`result_values`/`result_len` for maps).
-fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+/// `result_keys`/`result_values`/`result_len` for maps). `qualifier` is the
+/// top-level Ruby module name when rendering inside a class body, where
+/// module singleton calls (`weaveffi_free_*`) need an explicit receiver.
+fn render_async_result_push(
+    out: &mut String,
+    ret: &Option<TypeRef>,
+    ind: &str,
+    qualifier: Option<&str>,
+) {
+    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     let Some(ty) = ret else {
         w.line("queue << nil");
@@ -1521,7 +1953,7 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
             w.line("else");
             w.scope(|w| {
                 w.line("s = result.read_string");
-                w.line("weaveffi_free_string(result)");
+                w.line(format!("{m}weaveffi_free_string(result)"));
                 w.line("queue << s");
             });
             w.line("end");
@@ -1534,7 +1966,7 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
             w.line("else");
             w.scope(|w| {
                 w.line("data = result.read_string(result_len)");
-                w.line("weaveffi_free_bytes(result, result_len)");
+                w.line(format!("{m}weaveffi_free_bytes(result, result_len)"));
                 w.line("queue << data");
             });
             w.line("end");
@@ -1551,6 +1983,20 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
             });
             w.line("end");
         }
+        // A returned interface transfers ownership of a new object reference;
+        // wrap it without re-running initialize.
+        TypeRef::Interface(name) => {
+            let local = local_type_name(name);
+            w.line("if result.null?");
+            w.scope(|w| {
+                w.line("queue << Error.new(-1, 'null pointer')");
+            });
+            w.line("else");
+            w.scope(|w| {
+                w.line(format!("queue << {local}._from_ptr(result)"));
+            });
+            w.line("end");
+        }
         TypeRef::List(elem) => {
             let reader = rb_array_reader(elem);
             let map_suffix = match elem.as_ref() {
@@ -1560,6 +2006,9 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
                 }
                 TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
                     format!(".map {{ |p| {}.new(p) }}", local_type_name(name))
+                }
+                TypeRef::Interface(name) => {
+                    format!(".map {{ |p| {}._from_ptr(p) }}", local_type_name(name))
                 }
                 _ => String::new(),
             };
@@ -1587,7 +2036,7 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
                 w.line("else");
                 w.scope(|w| {
                     w.line("s = result.read_string");
-                    w.line("weaveffi_free_string(result)");
+                    w.line(format!("{m}weaveffi_free_string(result)"));
                     w.line("queue << s");
                 });
                 w.line("end");
@@ -1596,6 +2045,12 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
                 let local = local_type_name(name);
                 w.line(format!(
                     "queue << (result.null? ? nil : {local}.new(result))"
+                ));
+            }
+            TypeRef::Interface(name) => {
+                let local = local_type_name(name);
+                w.line(format!(
+                    "queue << (result.null? ? nil : {local}._from_ptr(result))"
                 ));
             }
             TypeRef::Bool => {
@@ -1607,7 +2062,7 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
             }
             _ => {
                 let mut tmp = String::new();
-                render_async_result_push(&mut tmp, &Some((**inner).clone()), ind);
+                render_async_result_push(&mut tmp, &Some((**inner).clone()), ind, qualifier);
                 w.raw(tmp);
             }
         },
@@ -1618,79 +2073,90 @@ fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) 
 
 /// Iterator wrapper: launch, drain `next` into an Array, destroy. Errors
 /// during iteration destroy the handle before raising.
-fn render_iterator_function_wrapper(out: &mut String, f: &FnBinding, it: &IteratorBinding) {
-    let func_name = f.name.to_snake_case();
-    let ind = "    ";
+fn render_iterator_function_wrapper(
+    out: &mut String,
+    module: &ModuleBinding,
+    f: &FnBinding,
+    it: &IteratorBinding,
+    scope: &RbScope,
+) {
+    let depth = scope.depth();
+    let ind = "  ".repeat(depth + 1);
+    let doc_ind = "  ".repeat(depth);
+    let q = scope.qualifier();
+    let checker = rb_checker_name(f, module.error.as_ref());
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
 
-    let mut w = CodeWriter::two_space().with_depth(1);
+    let mut w = CodeWriter::two_space().with_depth(depth);
     w.blank();
     let mut d = String::new();
-    emit_doc(&mut d, &f.doc, "  ");
+    emit_doc(&mut d, &f.doc, &doc_ind);
     w.raw(d);
-    w.block(
-        format!("def self.{}({})", func_name, params.join(", ")),
-        "end",
-        |w| {
-            if let Some(msg) = &f.deprecated {
-                let escaped = msg.replace('"', "\\\"");
-                w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+    w.block(scope.def_open(f, &params), "end", |w| {
+        if let Some(msg) = &f.deprecated {
+            let escaped = msg.replace('"', "\\\"");
+            w.line(format!("warn \"[DEPRECATED] {escaped}\""));
+        }
+        w.line("err = ErrorStruct.new");
+        for p in &f.params {
+            let mut pc = String::new();
+            render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, &ind);
+            w.raw(pc);
+        }
+        let mut call_args: Vec<String> = Vec::new();
+        if let Some(recv) = scope.self_arg() {
+            call_args.push(recv.into());
+        }
+        for p in &f.params {
+            call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
+        }
+        call_args.push("err".into());
+        w.line(format!(
+            "iter = {q}{}({})",
+            it.launch.symbol,
+            call_args.join(", ")
+        ));
+        w.line(format!("{q}{checker}(err)"));
+        w.line("items = []");
+        w.line("return items if iter.null?");
+        w.block("loop do", "end", |w| {
+            // `next` params: (iter, out_item, <extra elem out slots>, out_err).
+            let elem = &it.elem;
+            let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
+            let item_mem = rb_mem_type(elem);
+            w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
+            if needs_len {
+                w.line("out_item_len = FFI::MemoryPointer.new(:size_t)");
             }
-            w.line("err = ErrorStruct.new");
-            for p in &f.params {
-                let mut pc = String::new();
-                render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, ind);
-                w.raw(pc);
-            }
-            let mut call_args: Vec<String> = Vec::new();
-            for p in &f.params {
-                call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
-            }
-            call_args.push("err".into());
-            w.line(format!(
-                "iter = {}({})",
-                it.launch.symbol,
-                call_args.join(", ")
-            ));
-            w.line("check_error!(err)");
-            w.line("items = []");
-            w.line("return items if iter.null?");
-            w.block("loop do", "end", |w| {
-                // `next` params: (iter, out_item, <extra elem out slots>, out_err).
-                let elem = &it.elem;
-                let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
-                let item_mem = rb_mem_type(elem);
-                w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
-                if needs_len {
-                    w.line("out_item_len = FFI::MemoryPointer.new(:size_t)");
-                }
-                w.line("item_err = ErrorStruct.new");
-                let next_args = if needs_len {
-                    "iter, out_item, out_item_len, item_err"
-                } else {
-                    "iter, out_item, item_err"
-                };
-                w.line(format!("has_item = {}({next_args})", it.next.symbol));
-                w.line("if item_err[:code] != 0");
-                w.scope(|w| {
-                    w.line(format!("{}(iter)", it.destroy_symbol));
-                    w.line("check_error!(item_err)");
-                });
-                w.line("end");
-                w.line("break if has_item.zero?");
-                let mut tmp = String::new();
-                render_iterator_item_push(&mut tmp, elem, &format!("{ind}  "));
-                w.raw(tmp);
+            w.line("item_err = ErrorStruct.new");
+            let next_args = if needs_len {
+                "iter, out_item, out_item_len, item_err"
+            } else {
+                "iter, out_item, item_err"
+            };
+            w.line(format!("has_item = {q}{}({next_args})", it.next.symbol));
+            w.line("if item_err[:code] != 0");
+            w.scope(|w| {
+                w.line(format!("{q}{}(iter)", it.destroy_symbol));
+                w.line(format!("{q}{checker}(item_err)"));
             });
-            w.line(format!("{}(iter)", it.destroy_symbol));
-            w.line("items");
-        },
-    );
+            w.line("end");
+            w.line("break if has_item.zero?");
+            let mut tmp = String::new();
+            render_iterator_item_push(&mut tmp, elem, &format!("{ind}  "), scope.module_name());
+            w.raw(tmp);
+        });
+        w.line(format!("{q}{}(iter)", it.destroy_symbol));
+        w.line("items");
+    });
     out.push_str(&w.finish());
 }
 
 /// Convert the value written into `out_item` and append it to `items`.
-fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str) {
+/// `qualifier` is the top-level Ruby module name when rendering inside a
+/// class body, where `weaveffi_free_*` calls need an explicit receiver.
+fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str, qualifier: Option<&str>) {
+    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -1702,7 +2168,7 @@ fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str) {
             w.line("else");
             w.scope(|w| {
                 w.line("items << item_ptr.read_string");
-                w.line("weaveffi_free_string(item_ptr)");
+                w.line(format!("{m}weaveffi_free_string(item_ptr)"));
             });
             w.line("end");
         }
@@ -1716,7 +2182,7 @@ fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str) {
             w.line("else");
             w.scope(|w| {
                 w.line("items << item_ptr.read_string(item_len)");
-                w.line("weaveffi_free_bytes(item_ptr, item_len)");
+                w.line(format!("{m}weaveffi_free_bytes(item_ptr, item_len)"));
             });
             w.line("end");
         }
@@ -1725,6 +2191,15 @@ fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str) {
             w.line("item_ptr = out_item.read_pointer");
             w.line(format!(
                 "items << {local}.new(item_ptr) unless item_ptr.null?"
+            ));
+        }
+        // A yielded interface is a new owned reference; wrap it without
+        // re-running initialize.
+        TypeRef::Interface(name) => {
+            let local = local_type_name(name);
+            w.line("item_ptr = out_item.read_pointer");
+            w.line(format!(
+                "items << {local}._from_ptr(item_ptr) unless item_ptr.null?"
             ));
         }
         TypeRef::Bool => {
@@ -1846,7 +2321,7 @@ fn render_element_array_write(
                 "{buf_name}_buf.write_array_of_int32({list_expr}.map {{ |v| v ? 1 : 0 }})"
             ));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             w.line(format!(
                 "{buf_name}_buf.write_array_of_pointer({list_expr}.map(&:handle))"
             ));
@@ -1955,6 +2430,13 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
         TypeRef::Map(_, _) => {
             w.line("result");
         }
+        // A returned interface transfers ownership of a new object reference;
+        // wrap it without re-running initialize.
+        TypeRef::Interface(name) => {
+            let local = local_type_name(name);
+            w.line("raise Error.new(-1, 'null pointer') if result.null?");
+            w.line(format!("{local}._from_ptr(result)"));
+        }
     }
     out.push_str(&w.finish());
 }
@@ -1981,6 +2463,12 @@ fn render_optional_return_code(
         TypeRef::Struct(name) => {
             w.line("return nil if result.null?");
             w.line(format!("{}.new(result)", local_type_name(name)));
+        }
+        // An absent optional interface is a null pointer; a present one is a
+        // new owned reference wrapped without re-running initialize.
+        TypeRef::Interface(name) => {
+            w.line("return nil if result.null?");
+            w.line(format!("{}._from_ptr(result)", local_type_name(name)));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.line("return nil if result.null?");
@@ -2032,6 +2520,14 @@ fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str) {
         TypeRef::Struct(name) => {
             let local = local_type_name(name);
             w.line(format!("result.{reader}(len).map {{ |p| {local}.new(p) }}"));
+        }
+        // Listed interfaces are new owned references; wrap each without
+        // re-running initialize.
+        TypeRef::Interface(name) => {
+            let local = local_type_name(name);
+            w.line(format!(
+                "result.{reader}(len).map {{ |p| {local}._from_ptr(p) }}"
+            ));
         }
         TypeRef::Bool => {
             w.line(format!("result.{reader}(len).map {{ |v| v != 0 }}"));
@@ -2151,6 +2647,7 @@ mod tests {
                 params: vec![],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2207,12 +2704,13 @@ mod tests {
         );
     }
     use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+        Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef, Module, Param,
+        StructDef, StructField, TypeRef,
     };
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".to_string(),
+            version: "0.5.0".to_string(),
             modules,
             generators: None,
             package: None,
@@ -2223,6 +2721,7 @@ mod tests {
         Module {
             name: name.into(),
             functions,
+            interfaces: vec![],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -2232,9 +2731,416 @@ mod tests {
         }
     }
 
+    /// Build the model (test-only; the driver builds it in production) and
+    /// render with the default naming (module-prefix stripping on).
+    fn render(api: &Api, module_name: &str, prefix: &str) -> String {
+        let model = BindingModel::build(api, prefix);
+        render_ruby_module(&model, module_name, true, "weaveffi.rb", "weaveffi.yml")
+    }
+
+    /// A function literal with the boilerplate zeroed; tests override the
+    /// fields they exercise.
+    fn plain_fn(name: &str, params: Vec<Param>, returns: Option<TypeRef>) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            throws: false,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }
+    }
+
+    fn str_param(name: &str) -> Param {
+        Param {
+            name: name.into(),
+            ty: TypeRef::StringUtf8,
+            mutable: false,
+            doc: None,
+        }
+    }
+
+    /// A `kv` module with a declared error domain, an interface with a `new`
+    /// constructor, a factory constructor, methods (sync throwing, sync
+    /// non-throwing, async), a static, plus throwing and non-throwing free
+    /// functions.
+    fn kv_api() -> Api {
+        let mut m = simple_module(
+            "kv",
+            vec![
+                {
+                    let mut f = plain_fn(
+                        "kv_lookup",
+                        vec![str_param("key")],
+                        Some(TypeRef::StringUtf8),
+                    );
+                    f.throws = true;
+                    f
+                },
+                plain_fn("kv_ping", vec![], Some(TypeRef::Bool)),
+            ],
+        );
+        m.errors = Some(ErrorDomain {
+            name: "KvError".into(),
+            codes: vec![
+                ErrorCode {
+                    name: "KeyNotFound".into(),
+                    code: 1001,
+                    message: "key not found".into(),
+                    doc: Some("Raised when the key is absent.".into()),
+                },
+                ErrorCode {
+                    name: "IoError".into(),
+                    code: 1004,
+                    message: "I/O failure".into(),
+                    doc: None,
+                },
+            ],
+        });
+        m.interfaces = vec![InterfaceDef {
+            name: "Store".into(),
+            doc: Some("A key-value store.".into()),
+            constructors: vec![
+                {
+                    let mut f = plain_fn("new", vec![str_param("path")], None);
+                    f.throws = true;
+                    f
+                },
+                {
+                    let mut f = plain_fn("open", vec![str_param("path")], None);
+                    f.throws = true;
+                    f
+                },
+            ],
+            methods: vec![
+                {
+                    let mut f = plain_fn("put", vec![str_param("key"), str_param("value")], None);
+                    f.throws = true;
+                    f
+                },
+                plain_fn("count", vec![], Some(TypeRef::U32)),
+                {
+                    let mut f = plain_fn("compact", vec![], Some(TypeRef::Bool));
+                    f.r#async = true;
+                    f.cancellable = true;
+                    f.throws = true;
+                    f
+                },
+            ],
+            statics: vec![plain_fn("default_capacity", vec![], Some(TypeRef::U32))],
+        }];
+        make_api(vec![m])
+    }
+
     #[test]
     fn name_returns_ruby() {
         assert_eq!(Generator::name(&RubyGenerator), "ruby");
+    }
+
+    #[test]
+    fn interface_ffi_attaches_destroy_and_members() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("attach_function :weaveffi_kv_Store_destroy, [:pointer], :void"),
+            "destroy attach: {code}"
+        );
+        assert!(
+            code.contains("attach_function :weaveffi_kv_Store_new, [:string, :pointer], :pointer"),
+            "ctor attach: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_kv_Store_put, [:pointer, :string, :string, :pointer], :void"
+            ),
+            "method attach includes self slot: {code}"
+        );
+        assert!(
+            code.contains(
+                "attach_function :weaveffi_kv_Store_default_capacity, [:pointer], :uint32"
+            ),
+            "static attach has no self slot: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_class_wraps_pointer_with_auto_pointer() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("class StorePtr < FFI::AutoPointer"),
+            "AutoPointer subclass: {code}"
+        );
+        assert!(
+            code.contains("WeaveFFI.weaveffi_kv_Store_destroy(ptr)"),
+            "release calls destroy symbol: {code}"
+        );
+        assert!(code.contains("def destroy"), "explicit destroy: {code}");
+        assert!(code.contains("@handle.free"), "destroy frees: {code}");
+        assert!(
+            code.contains("def self._from_ptr(ptr)") && code.contains("obj = allocate"),
+            "_from_ptr avoids initialize: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_new_ctor_maps_to_initialize() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(code.contains("def initialize(path)"), "initialize: {code}");
+        assert!(
+            code.contains("result = WeaveFFI.weaveffi_kv_Store_new(path, err)"),
+            "ctor call: {code}"
+        );
+        assert!(
+            code.contains("@handle = StorePtr.new(result)"),
+            "handle assignment: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_named_ctor_is_class_method_factory() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(code.contains("def self.open(path)"), "factory def: {code}");
+        assert!(
+            code.contains("result = WeaveFFI.weaveffi_kv_Store_open(path, err)"),
+            "factory call: {code}"
+        );
+        assert!(
+            code.contains("_from_ptr(result)"),
+            "factory wraps without initialize: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_method_passes_handle_first() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(code.contains("def put(key, value)"), "method def: {code}");
+        assert!(
+            code.contains("WeaveFFI.weaveffi_kv_Store_put(@handle, key, value, err)"),
+            "self slot leads: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_static_is_class_method() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("def self.default_capacity()"),
+            "static def: {code}"
+        );
+        assert!(
+            code.contains("result = WeaveFFI.weaveffi_kv_Store_default_capacity(err)"),
+            "static call has no self slot: {code}"
+        );
+    }
+
+    #[test]
+    fn typed_error_classes_and_helpers() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        assert!(code.contains("class KvError < Error"), "domain: {code}");
+        assert!(
+            code.contains("class KeyNotFound < KvError"),
+            "code subclass: {code}"
+        );
+        assert!(code.contains("CODE = 1001"), "code constant: {code}");
+        assert!(
+            code.contains("def initialize(message = 'key not found')"),
+            "default message: {code}"
+        );
+        assert!(
+            code.contains("1004 => KvError::IoError,"),
+            "code table: {code}"
+        );
+        assert!(
+            code.contains("def self.kv_error_from(code, message)"),
+            "factory helper: {code}"
+        );
+        assert!(
+            code.contains("def self.check_kv_error!(err)"),
+            "checker helper: {code}"
+        );
+        assert!(
+            code.contains("raise kv_error_from(code, msg)"),
+            "checker raises typed: {code}"
+        );
+    }
+
+    #[test]
+    fn throwing_function_uses_typed_checker() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        let lookup = code
+            .split("def self.kv_lookup(key)")
+            .nth(1)
+            .expect("kv_lookup wrapper");
+        assert!(
+            lookup.contains("check_kv_error!(err)"),
+            "typed checker: {code}"
+        );
+    }
+
+    #[test]
+    fn non_throwing_function_uses_generic_checker() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        let ping = code
+            .split("def self.kv_ping()")
+            .nth(1)
+            .expect("kv_ping wrapper");
+        let body = ping.split("\n  end").next().expect("wrapper body");
+        assert!(body.contains("check_error!(err)"), "generic: {code}");
+        assert!(
+            !body.contains("check_kv_error!"),
+            "no typed checker: {code}"
+        );
+    }
+
+    #[test]
+    fn non_throwing_method_uses_generic_checker() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        let count = code.split("def count()").nth(1).expect("count wrapper");
+        let body = count.split("\n    end").next().expect("method body");
+        assert!(
+            body.contains("WeaveFFI.check_error!(err)"),
+            "generic qualified: {code}"
+        );
+        assert!(
+            !body.contains("check_kv_error!"),
+            "no typed checker: {code}"
+        );
+    }
+
+    #[test]
+    fn async_member_routes_typed_error_and_self_slot() {
+        let code = render(&kv_api(), "WeaveFFI", "weaveffi");
+        let compact = code.split("def compact()").nth(1).expect("compact wrapper");
+        assert!(
+            compact.contains("queue << WeaveFFI.kv_error_from(code, msg)"),
+            "typed async error: {code}"
+        );
+        assert!(
+            compact.contains(
+                "WeaveFFI.weaveffi_kv_Store_compact_async(@handle, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)"
+            ),
+            "self slot then cancel token: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_params_borrow_and_returns_wrap() {
+        let mut m = simple_module(
+            "kv",
+            vec![
+                plain_fn(
+                    "clone_store",
+                    vec![Param {
+                        name: "store".into(),
+                        ty: TypeRef::Interface("Store".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    Some(TypeRef::Interface("Store".into())),
+                ),
+                plain_fn(
+                    "find_store",
+                    vec![],
+                    Some(TypeRef::Optional(Box::new(TypeRef::Interface(
+                        "Store".into(),
+                    )))),
+                ),
+            ],
+        );
+        m.interfaces = vec![InterfaceDef {
+            name: "Store".into(),
+            doc: None,
+            constructors: vec![plain_fn("new", vec![], None)],
+            methods: vec![],
+            statics: vec![],
+        }];
+        let code = render(&make_api(vec![m]), "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("weaveffi_kv_clone_store(store.handle, err)"),
+            "param borrows handle: {code}"
+        );
+        assert!(
+            code.contains("Store._from_ptr(result)"),
+            "return wraps owned pointer: {code}"
+        );
+        let find = code
+            .split("def self.find_store()")
+            .nth(1)
+            .expect("find_store wrapper");
+        assert!(
+            find.contains("return nil if result.null?"),
+            "optional interface nil: {code}"
+        );
+    }
+
+    #[test]
+    fn naming_strips_module_prefix_by_default() {
+        let api = make_api(vec![simple_module(
+            "kv",
+            vec![plain_fn("open_store", vec![], None)],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("def self.open_store()"),
+            "stripped name: {code}"
+        );
+        assert!(
+            !code.contains("def self.kv_open_store()"),
+            "no prefixed wrapper: {code}"
+        );
+        // The C symbol stays fully qualified regardless of wrapper naming.
+        assert!(
+            code.contains("weaveffi_kv_open_store(err)"),
+            "C symbol: {code}"
+        );
+    }
+
+    #[test]
+    fn naming_knob_restores_prefixed_wrappers() {
+        let api = make_api(vec![simple_module(
+            "kv",
+            vec![plain_fn("open_store", vec![], None)],
+        )]);
+        let model = BindingModel::build(&api, "weaveffi");
+        let code = render_ruby_module(&model, "WeaveFFI", false, "weaveffi.rb", "weaveffi.yml");
+        assert!(
+            code.contains("def self.kv_open_store()"),
+            "prefixed name: {code}"
+        );
+    }
+
+    #[test]
+    fn throwing_iterator_uses_typed_checker() {
+        let mut m = simple_module("kv", {
+            let mut f = plain_fn(
+                "scan",
+                vec![],
+                Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+            );
+            f.throws = true;
+            vec![f]
+        });
+        m.errors = Some(ErrorDomain {
+            name: "KvError".into(),
+            codes: vec![ErrorCode {
+                name: "IoError".into(),
+                code: 1004,
+                message: "I/O failure".into(),
+                doc: None,
+            }],
+        });
+        let code = render(&make_api(vec![m]), "WeaveFFI", "weaveffi");
+        let scan = code.split("def self.scan()").nth(1).expect("scan wrapper");
+        assert!(
+            scan.contains("check_kv_error!(err)"),
+            "launch checker: {code}"
+        );
+        assert!(
+            scan.contains("check_kv_error!(item_err)"),
+            "next checker: {code}"
+        );
     }
 
     #[test]
@@ -2259,6 +3165,7 @@ mod tests {
                 ],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2339,6 +3246,7 @@ mod tests {
         let api = make_api(vec![Module {
             name: "gfx".into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -2364,7 +3272,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("module Color"), "enum module: {code}");
         assert!(code.contains("RED = 0"), "RED: {code}");
         assert!(code.contains("DARK_BLUE = 1"), "DARK_BLUE: {code}");
@@ -2375,6 +3283,7 @@ mod tests {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -2401,7 +3310,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("class ContactPtr < FFI::AutoPointer"),
             "AutoPointer: {code}"
@@ -2427,6 +3336,7 @@ mod tests {
         let api = make_api(vec![Module {
             name: "geo".into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Point".into(),
                 doc: None,
@@ -2445,7 +3355,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("class PointBuilder"), "builder class: {code}");
         assert!(code.contains("def with_x(value)"), "with_x: {code}");
         // Unset fields default to zero values rather than raising.
@@ -2476,6 +3386,7 @@ mod tests {
         let api = make_api(vec![Module {
             name: "data".into(),
             functions: vec![],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: None,
@@ -2494,7 +3405,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("WeaveFFI.weaveffi_free_string(result)"),
             "free_string in getter: {code}"
@@ -2523,6 +3434,7 @@ mod tests {
                 ],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2530,7 +3442,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("err = ErrorStruct.new"), "err alloc: {code}");
         assert!(code.contains("check_error!(err)"), "check_error: {code}");
     }
@@ -2544,6 +3456,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2551,7 +3464,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("result.read_string"), "read_string: {code}");
         assert!(
             code.contains("weaveffi_free_string(result)"),
@@ -2577,6 +3490,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Bool),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2584,7 +3498,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("value_c = value ? 1 : 0"),
             "bool param: {code}"
@@ -2601,6 +3515,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2608,7 +3523,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("return nil if result.null?"),
             "optional nil: {code}"
@@ -2624,6 +3539,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2631,7 +3547,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("return [] if result.null?"),
             "empty array: {code}"
@@ -2651,6 +3567,7 @@ mod tests {
                     Box::new(TypeRef::I32),
                 )),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2658,7 +3575,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("out_keys"), "out_keys: {code}");
         assert!(code.contains("out_values"), "out_values: {code}");
         assert!(code.contains("each_with_object"), "hash build: {code}");
@@ -2678,11 +3595,13 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Item".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: None,
@@ -2701,7 +3620,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("Item.new(result)"), "struct wrap: {code}");
         assert!(
             code.contains("raise Error.new(-1, 'null pointer') if result.null?"),
@@ -2718,6 +3637,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
+                throws: false,
                 r#async: true,
                 cancellable: false,
                 deprecated: None,
@@ -2725,7 +3645,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         // Completion callback type + launcher attach.
         assert!(
             code.contains(
@@ -2772,13 +3692,14 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
         )]);
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         // Launch returns the opaque iterator; next/destroy attached.
         assert!(
             code.contains("attach_function :weaveffi_events_get_messages, [:pointer], :pointer"),
@@ -2832,7 +3753,7 @@ mod tests {
             }],
             ..simple_module("events", vec![])
         }]);
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("callback :weaveffi_events_OnMessage_fn, [:string, :pointer], :void"),
             "callback decl: {code}"
@@ -2863,13 +3784,7 @@ mod tests {
 
     #[test]
     fn preamble_has_platform_detection() {
-        let code = render_ruby_module(
-            &make_api(vec![]),
-            "WeaveFFI",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let code = render(&make_api(vec![]), "WeaveFFI", "weaveffi");
         assert!(code.contains("FFI::Platform::OS"), "platform: {code}");
         assert!(code.contains("libweaveffi.dylib"), "darwin: {code}");
         assert!(code.contains("weaveffi.dll"), "windows: {code}");
@@ -2878,13 +3793,7 @@ mod tests {
 
     #[test]
     fn error_class_structure() {
-        let code = render_ruby_module(
-            &make_api(vec![]),
-            "WeaveFFI",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let code = render(&make_api(vec![]), "WeaveFFI", "weaveffi");
         assert!(
             code.contains("class Error < StandardError"),
             "Error class: {code}"
@@ -2901,6 +3810,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::Handle),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2908,7 +3818,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains(":uint64"), "handle type: {code}");
     }
 
@@ -2956,6 +3866,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2963,7 +3874,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains(":int32"), "enum type: {code}");
     }
 
@@ -2976,6 +3887,7 @@ mod tests {
                 params: vec![],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2983,7 +3895,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains(":void"), "void return: {code}");
         assert!(
             !code.contains("result = weaveffi_store_clear"),
@@ -3000,11 +3912,13 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: None,
@@ -3023,7 +3937,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(code.contains("Item.new(p)"), "struct list element: {code}");
     }
 
@@ -3041,6 +3955,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct("Item".into())))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3048,7 +3963,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "weaveffi");
         assert!(
             code.contains("return nil if result.null?"),
             "optional struct nil: {code}"
@@ -3063,7 +3978,7 @@ mod tests {
 
     fn contacts_api() -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![
@@ -3097,6 +4012,7 @@ mod tests {
                         ],
                         returns: Some(TypeRef::Handle),
                         doc: None,
+                        throws: false,
                         r#async: false,
                         cancellable: false,
                         deprecated: None,
@@ -3112,6 +4028,7 @@ mod tests {
                         }],
                         returns: Some(TypeRef::Struct("Contact".into())),
                         doc: None,
+                        throws: false,
                         r#async: false,
                         cancellable: false,
                         deprecated: None,
@@ -3122,6 +4039,7 @@ mod tests {
                         params: vec![],
                         returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                         doc: None,
+                        throws: false,
                         r#async: false,
                         cancellable: false,
                         deprecated: None,
@@ -3137,6 +4055,7 @@ mod tests {
                         }],
                         returns: Some(TypeRef::Bool),
                         doc: None,
+                        throws: false,
                         r#async: false,
                         cancellable: false,
                         deprecated: None,
@@ -3147,12 +4066,14 @@ mod tests {
                         params: vec![],
                         returns: Some(TypeRef::I32),
                         doc: None,
+                        throws: false,
                         r#async: false,
                         cancellable: false,
                         deprecated: None,
                         since: None,
                     },
                 ],
+                interfaces: vec![],
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
@@ -3246,6 +4167,7 @@ mod tests {
                 ],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3284,11 +4206,13 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -3351,11 +4275,13 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Enum("ContactType".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![EnumDef {
                 name: "ContactType".into(),
@@ -3417,6 +4343,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3432,6 +4359,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3468,6 +4396,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3483,6 +4412,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3578,6 +4508,7 @@ mod tests {
                 ],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3617,6 +4548,7 @@ mod tests {
     fn ruby_no_double_free_on_error() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
@@ -3641,6 +4573,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3650,7 +4583,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let rb = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let rb = render(&api, "WeaveFFI", "weaveffi");
 
         let fn_start = rb
             .find("def self.find_contact(name)")
@@ -3698,11 +4631,13 @@ mod tests {
                     "Contact".into(),
                 )))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -3711,7 +4646,7 @@ mod tests {
             modules: vec![],
         }]);
 
-        let rb = render_ruby_module(&api, "WeaveFFI", "weaveffi", "weaveffi.rb", "weaveffi.yml");
+        let rb = render(&api, "WeaveFFI", "weaveffi");
 
         let fn_start = rb
             .find("def self.find_contact(id)")
@@ -3745,11 +4680,13 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: Some("Performs a thing.".into()),
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             structs: vec![StructDef {
                 name: "Item".into(),
                 doc: Some("An item we track.".into()),
@@ -3780,62 +4717,32 @@ mod tests {
 
     #[test]
     fn ruby_emits_doc_on_function() {
-        let rb = render_ruby_module(
-            &doc_api(),
-            "Weaveffi",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let rb = render(&doc_api(), "Weaveffi", "weaveffi");
         assert!(rb.contains("# Performs a thing."), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_struct() {
-        let rb = render_ruby_module(
-            &doc_api(),
-            "Weaveffi",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let rb = render(&doc_api(), "Weaveffi", "weaveffi");
         assert!(rb.contains("# An item we track."), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_enum_variant() {
-        let rb = render_ruby_module(
-            &doc_api(),
-            "Weaveffi",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let rb = render(&doc_api(), "Weaveffi", "weaveffi");
         assert!(rb.contains("# Kind of item."), "{rb}");
         assert!(rb.contains("# A small one"), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_field() {
-        let rb = render_ruby_module(
-            &doc_api(),
-            "Weaveffi",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let rb = render(&doc_api(), "Weaveffi", "weaveffi");
         assert!(rb.contains("# Stable id"), "{rb}");
     }
 
     #[test]
     fn ruby_emits_doc_on_param() {
-        let rb = render_ruby_module(
-            &doc_api(),
-            "Weaveffi",
-            "weaveffi",
-            "weaveffi.rb",
-            "weaveffi.yml",
-        );
+        let rb = render(&doc_api(), "Weaveffi", "weaveffi");
         assert!(rb.contains("# @param x [Object] the input value"), "{rb}");
     }
 
@@ -3861,6 +4768,7 @@ mod tests {
                 ],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3868,7 +4776,7 @@ mod tests {
             }],
         )]);
 
-        let code = render_ruby_module(&api, "WeaveFFI", "myffi", "weaveffi.rb", "weaveffi.yml");
+        let code = render(&api, "WeaveFFI", "myffi");
 
         assert!(
             code.contains("attach_function :myffi_math_add"),
@@ -3898,6 +4806,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3921,12 +4830,14 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Struct("Shape".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 },
             ],
+            interfaces: vec![],
             structs: vec![],
             enums: vec![
                 EnumDef {
@@ -4018,13 +4929,7 @@ mod tests {
 
     #[test]
     fn rich_enum_renders_opaque_wrapper_class() {
-        let code = render_ruby_module(
-            &shapes_api(),
-            "Shapes",
-            "weaveffi",
-            "shapes.rb",
-            "shapes.yml",
-        );
+        let code = render(&shapes_api(), "Shapes", "weaveffi");
 
         // A rich enum is an opaque-object class, never a plain constants module.
         assert!(
@@ -4066,13 +4971,7 @@ mod tests {
 
     #[test]
     fn rich_enum_factories_and_getters() {
-        let code = render_ruby_module(
-            &shapes_api(),
-            "Shapes",
-            "weaveffi",
-            "shapes.rb",
-            "shapes.yml",
-        );
+        let code = render(&shapes_api(), "Shapes", "weaveffi");
 
         // FFI bindings for tag, destroy, constructors, and field getters.
         assert!(

@@ -54,9 +54,9 @@ internal static class Program
             Expect(Math.Abs(circle.CircleRadius - 2.5) < 1e-9, "circle radius");
 
             // Free functions: Shape in, string/Shape out.
-            Expect(ShapesDescribe(circle) == "circle(r=2.5)", "describe(circle)");
+            Expect(Describe(circle) == "circle(r=2.5)", "describe(circle)");
 
-            using (var big = ShapesScale(circle, 4.0))
+            using (var big = Scale(circle, 4.0))
             {
                 Expect(big.GetTag() == Shape.Tag.Circle, "scaled tag");
                 Expect(Math.Abs(big.CircleRadius - 10.0) < 1e-9, "scaled radius");
@@ -80,7 +80,7 @@ internal static class Program
         }
 
         // Numerics: list<u8> in, u64 out.
-        ulong total = ShapesSumBytes(new byte[] { 250, 250, 250, 250 });
+        ulong total = SumBytes(new byte[] { 250, 250, 250, 250 });
         Expect(total == 1000UL, $"sum_bytes == 1000 (got {total})");
 
         // Plain C-style enum lowers by value.

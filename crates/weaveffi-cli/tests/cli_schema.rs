@@ -39,6 +39,7 @@ fn schema_emits_valid_json_schema() {
         "StructField",
         "EnumDef",
         "EnumVariant",
+        "InterfaceDef",
         "CallbackDef",
         "ListenerDef",
         "ErrorDomain",

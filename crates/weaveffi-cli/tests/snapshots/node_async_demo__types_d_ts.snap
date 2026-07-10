@@ -6,6 +6,26 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `tasks` module's throwing functions. */
+export class TaskError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class InvalidNameError extends TaskError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
 export interface TaskResult {
   id: number;
   value: string;
@@ -14,23 +34,24 @@ export interface TaskResult {
 // module tasks
 /**
  * Maps to C function: weaveffi_tasks_run_task
+ * @throws {TaskError}
  */
-export function tasks_run_task(name: string): Promise<TaskResult>
+export function runTask(name: string): Promise<TaskResult>
 /**
  * Maps to C function: weaveffi_tasks_run_batch
  */
-export function tasks_run_batch(names: string[]): Promise<TaskResult[]>
+export function runBatch(names: string[]): Promise<TaskResult[]>
 /**
  * Maps to C function: weaveffi_tasks_cancel_task
  */
-export function tasks_cancel_task(id: number): boolean
+export function cancelTask(id: number): boolean
 /**
  * Maps to C function: weaveffi_tasks_run_n_tasks
  */
-export function tasks_run_n_tasks(n: number): Promise<number>
+export function runNTasks(n: number): Promise<number>
 /**
  * Maps to C function: weaveffi_tasks_active_callbacks
  */
-export function tasks_active_callbacks(): number
+export function activeCallbacks(): number
 
 // END types.d.ts

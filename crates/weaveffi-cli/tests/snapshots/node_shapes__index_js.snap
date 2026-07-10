@@ -5,20 +5,55 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
 
-// Re-export every native binding, then layer idiomatic wrappers for
-// rich (algebraic) enums on top.
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
 const wv = {};
 for (const _name of Object.getOwnPropertyNames(addon)) {
   wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
 }
 
 class Shape {
@@ -27,66 +62,73 @@ class Shape {
     Shape._cleanup.register(this, handle, this);
   }
   static empty() {
-    return new Shape(addon.shapes_Shape_empty_new());
+    return new Shape(__invoke(addon.Shape_empty_new, [], __generic));
   }
   static circle(radius) {
-    return new Shape(addon.shapes_Shape_circle_new(radius));
+    return new Shape(__invoke(addon.Shape_circle_new, [radius], __generic));
   }
   static rectangle(width, height) {
-    return new Shape(addon.shapes_Shape_rectangle_new(width, height));
+    return new Shape(__invoke(addon.Shape_rectangle_new, [width, height], __generic));
   }
   static bounded(min, max, weight) {
-    return new Shape(addon.shapes_Shape_bounded_new(min, max, weight));
+    return new Shape(__invoke(addon.Shape_bounded_new, [min, max, weight], __generic));
   }
   static labeled(label, count) {
-    return new Shape(addon.shapes_Shape_labeled_new(label, count));
+    return new Shape(__invoke(addon.Shape_labeled_new, [label, count], __generic));
   }
   tag() {
-    return addon.shapes_Shape_tag(this._handle);
+    return addon.Shape_tag(this._handle);
   }
   get circleRadius() {
-    return addon.shapes_Shape_circle_get_radius(this._handle);
+    return addon.Shape_circle_get_radius(this._handle);
   }
   get rectangleWidth() {
-    return addon.shapes_Shape_rectangle_get_width(this._handle);
+    return addon.Shape_rectangle_get_width(this._handle);
   }
   get rectangleHeight() {
-    return addon.shapes_Shape_rectangle_get_height(this._handle);
+    return addon.Shape_rectangle_get_height(this._handle);
   }
   get boundedMin() {
-    return addon.shapes_Shape_bounded_get_min(this._handle);
+    return addon.Shape_bounded_get_min(this._handle);
   }
   get boundedMax() {
-    return addon.shapes_Shape_bounded_get_max(this._handle);
+    return addon.Shape_bounded_get_max(this._handle);
   }
   get boundedWeight() {
-    return addon.shapes_Shape_bounded_get_weight(this._handle);
+    return addon.Shape_bounded_get_weight(this._handle);
   }
   get labeledLabel() {
-    return addon.shapes_Shape_labeled_get_label(this._handle);
+    return addon.Shape_labeled_get_label(this._handle);
   }
   get labeledCount() {
-    return addon.shapes_Shape_labeled_get_count(this._handle);
+    return addon.Shape_labeled_get_count(this._handle);
   }
   destroy() {
     if (this._handle) {
       Shape._cleanup.unregister(this);
-      addon.shapes_Shape_destroy(this._handle);
+      addon.Shape_destroy(this._handle);
       this._handle = 0;
     }
   }
 }
 Shape._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.shapes_Shape_destroy(handle); }
+  if (handle) { addon.Shape_destroy(handle); }
 });
 Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Bounded: 3, Labeled: 4 });
 wv.Shape = Shape;
 
-wv.shapes_describe = function (shape) {
-  return addon.shapes_describe(shape instanceof Shape ? shape._handle : shape);
+wv.describe = function (shape) {
+  return __invoke(addon.describe, [shape instanceof Shape ? shape._handle : shape], __generic);
 };
-wv.shapes_scale = function (shape, factor) {
-  return new Shape(addon.shapes_scale(shape instanceof Shape ? shape._handle : shape, factor));
+wv.scale = function (shape, factor) {
+  const _r = __invoke(addon.scale, [shape instanceof Shape ? shape._handle : shape, factor], __generic);
+  return new Shape(_r);
+};
+wv.sumBytes = function (values) {
+  return __invoke(addon.sumBytes, [values], __generic);
+};
+wv.makeNumerics = function (a, b, c, d, e, f, g, h, i, j) {
+  return __invoke(addon.makeNumerics, [a, b, c, d, e, f, g, h, i, j], __generic);
 };
 
 module.exports = wv;

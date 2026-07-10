@@ -24,6 +24,30 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the TaskError error domain (module tasks).</summary>
+    public class TaskException : WeaveFFIException
+    {
+        /// <summary>task name must not be empty</summary>
+        public const int InvalidName = 1;
+
+        public TaskException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case InvalidName:
+                    return new TaskException(code, string.IsNullOrEmpty(message) ? "task name must not be empty" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -36,6 +60,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckTask(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw TaskException.FromCode(err.Code, msg);
             }
         }
     }
@@ -138,17 +171,11 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_TaskResult_get_success", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_tasks_TaskResult_get_success(IntPtr ptr);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_task", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_tasks_run_task(IntPtr name, ref WeaveFFIError err);
-
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_task(IntPtr context, IntPtr err, IntPtr result);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_task_async", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_tasks_run_task_async(IntPtr name, AsyncCb_weaveffi_tasks_run_task callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_batch", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_tasks_run_batch(IntPtr names, UIntPtr names_len, out UIntPtr out_len, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_batch(IntPtr context, IntPtr err, IntPtr result, UIntPtr resultLen);
@@ -158,9 +185,6 @@ namespace WeaveFFI
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_cancel_task", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_tasks_cancel_task(long id, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_tasks_run_n_tasks", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_tasks_run_n_tasks(int n, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_n_tasks(IntPtr context, IntPtr err, int result);
@@ -175,7 +199,8 @@ namespace WeaveFFI
 
     public static class Tasks
     {
-        public static async Task<TaskResult> TasksRunTask(string name)
+        /// <exception cref="TaskException">Thrown when the call reports a TaskError code.</exception>
+        public static async Task<TaskResult> RunTask(string name)
         {
             var tcs = new TaskCompletionSource<TaskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_tasks_run_task callback = (context, err, result) =>
@@ -188,7 +213,7 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(new WeaveFFIException(wErr.Code, msg));
+                            tcs.SetException(TaskException.FromCode(wErr.Code, msg));
                             return;
                         }
                     }
@@ -224,7 +249,7 @@ namespace WeaveFFI
             return await tcs.Task;
         }
 
-        public static async Task<TaskResult[]> TasksRunBatch(string[] names)
+        public static async Task<TaskResult[]> RunBatch(string[] names)
         {
             var tcs = new TaskCompletionSource<TaskResult[]>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_tasks_run_batch callback = (context, err, result, resultLen) =>
@@ -276,7 +301,7 @@ namespace WeaveFFI
             return await tcs.Task;
         }
 
-        public static bool TasksCancelTask(long id)
+        public static bool CancelTask(long id)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_tasks_cancel_task(id, ref err);
@@ -284,7 +309,7 @@ namespace WeaveFFI
             return result != 0;
         }
 
-        public static async Task<int> TasksRunNTasks(int n)
+        public static async Task<int> RunNTasks(int n)
         {
             var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_tasks_run_n_tasks callback = (context, err, result) =>
@@ -325,7 +350,7 @@ namespace WeaveFFI
             return await tcs.Task;
         }
 
-        public static long TasksActiveCallbacks()
+        public static long ActiveCallbacks()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_tasks_active_callbacks(ref err);

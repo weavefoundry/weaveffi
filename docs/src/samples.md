@@ -7,9 +7,9 @@ usage of WeaveFFI. Every producer is written as safe Rust and annotated with the
 (`calculator`, `contacts`, and `inventory`) generate bindings straight from
 their annotated source. The advanced samples (`async-demo`, `events`, `kvstore`,
 `shapes`) are macro-annotated too, and they keep a committed YAML IDL as the
-generation source of truth because their interfaces carry metadata the extractor
+generation source of truth because their surfaces carry metadata the extractor
 does not yet recover from source, such as package and per-generator
-configuration, error domains, and `since` tags.
+configuration and standalone `since` tags.
 
 ## Kvstore (kitchen-sink reference)
 
@@ -22,25 +22,25 @@ real-world pattern for a new generator.
 
 **What it demonstrates:**
 
-- Typed handles (`handle<Store>`) for opaque resource lifecycle
+- A first-class interface (`Store`) with a throwing constructor (`open`),
+  instance methods, a static (`default_capacity`), and implicit destroy
 - A struct (`Entry`) with every primitive: `i64`, `string`, `bytes`, optional
   field (`expires_at: i64?`), list field (`tags: [string]`), and map field
   (`metadata: {string:string}`), plus per-field doc strings and `builder: true`
 - A documented enum (`EntryKind` with `Volatile`, `Persistent`, `Encrypted`)
-- A documented error domain (`KvError` with `KEY_NOT_FOUND`, `EXPIRED`,
-  `STORE_FULL`, `IO_ERROR`)
+- A documented error domain (`KvError` with `KeyNotFound`, `Expired`,
+  `StoreFull`, `IoError`) and opt-in `throws: true` on the fallible methods
 - A module-level callback (`OnEvict`) and listener (`eviction_listener`)
 - A streaming iterator return (`list_keys -> iter<string>`) with prefix filter
-- A cancellable async function (`compact_async`, `async: true, cancellable: true`)
+- A cancellable async method (`compact`, `async: true, cancellable: true`)
   that respects a `weaveffi_cancel_token` while reclaiming bytes on a worker
   thread
-- A deprecated function (`legacy_put`) and `since: "0.3.0"` on every other
-  function
+- A deprecated method (`legacy_put`)
 - A nested sub-module (`kv.stats`) with its own struct (`Stats`) and a function
-  that takes a cross-module `handle<Store>`
-- Inline `generators:` overrides for `swift.module_name`, `cpp.namespace`,
-  `dotnet.namespace`, `dart.package_name`, `go.module_path`, and
-  `ruby.module_name`
+  that takes a cross-module `Store` parameter
+- Inline `generators:` overrides for `wasm.allow_unsupported`,
+  `swift.module_name`, `cpp.namespace`, `dotnet.namespace`,
+  `dart.package_name`, `go.module_path`, and `ruby.module_name`
 
 **Build, generate bindings, and run the C ABI tests:**
 
@@ -50,9 +50,9 @@ cargo test -p kvstore
 weaveffi generate samples/kvstore/kvstore.yml -o generated
 ```
 
-Every consumer language under `examples/` ships with a kvstore smoke test
-(`open -> put -> get -> delete -> close`) that runs against the generated
-bindings and the produced `libkvstore` cdylib; see `examples/run_all.sh`.
+The `conformance/` harness ships a kvstore consumer for every language that
+opens a `Store`, round-trips entries, drives the async `compact`, and asserts
+the typed `KvError` surface; see `conformance/run.sh`.
 
 ## Shapes (rich enums + numerics)
 
@@ -101,7 +101,9 @@ understanding the basic C ABI contract and the macro workflow.
 
 - Scalar parameters and return values (`i32`)
 - String parameters and return values (C string ownership)
-- Error propagation via `Result<i32, String>` (e.g. division by zero)
+- The smallest possible typed error surface: a `#[weaveffi::error]` enum
+  (`CalcError`) and one throwing function (`div` returns
+  `Result<i32, CalcError>`)
 - A producer written entirely as safe Rust (no hand-written FFI glue)
 
 **Build and generate bindings (from the annotated source):**
@@ -112,8 +114,9 @@ weaveffi generate samples/calculator/src/lib.rs -o generated
 ```
 
 This produces target-specific output under `generated/` (C headers, Swift
-wrapper, Android skeleton, Node addon loader, Wasm stub). Runnable examples
-that consume the generated output are in `examples/`.
+wrapper, Android skeleton, Node addon sources, Wasm loader). The
+[Calculator tutorial](tutorials/calculator.md) walks through running C,
+Node, and Swift consumers against it.
 
 ## Contacts
 
@@ -128,9 +131,11 @@ calculator while writing no `unsafe` glue.
 - A `#[weaveffi::enumeration]` (`ContactType` with `Personal`, `Work`, `Other`)
 - A `#[weaveffi::record]` (`Contact`) with generated create/destroy/getters
 - Optional fields (`Option<String>` for the email)
-- List return types (`Vec<Contact>` from `list_contacts`)
-- Opaque `u64` handles into an in-memory store
-- Fallible lookups via `Result<Contact, String>` mapped to the ABI's `out_err`
+- A `#[weaveffi::interface]` (`ContactBook`) with a `new` constructor,
+  instance methods, and implicit destroy
+- List return types (`Vec<Contact>` from `ContactBook::list`)
+- A `#[weaveffi::error]` domain (`ContactsError`) surfaced by the throwing
+  methods via `Result<Contact, ContactsError>`
 
 **Build and generate bindings (from the annotated source):**
 
@@ -149,11 +154,14 @@ references and record lists across the macro.
 
 **What it demonstrates:**
 
-- Two annotated modules in one crate, each with its own in-memory store
+- Two annotated modules in one crate, each with its own error domain
+  (`ProductsError`, `OrdersError`)
+- A `#[weaveffi::interface]` (`Catalog`) owning its product list, alongside
+  free functions in the `orders` module
 - A `#[weaveffi::enumeration]` (`Category`) and `#[weaveffi::record]`s
   (`Product`, `Order`, `OrderItem`)
 - Optional and list fields (`Option<String>`, `Vec<String>` tags)
-- A record-list return (`search_products -> Vec<Product>`) and a record-list
+- A record-list return (`Catalog::search -> Vec<Product>`) and a record-list
   parameter (`create_order(items: Vec<OrderItem>)`)
 - A cross-module record parameter (`orders::add_product_to_order` takes a
   `products::Product`)
@@ -206,8 +214,8 @@ Demonstrates callbacks, event listeners, and iterator-based return types.
 - Listener registration and unregistration (`message_listener`)
 - Event-driven patterns (sending a message triggers the registered callback)
 - Iterator return types (`iter<string>` in the YAML)
-- Iterator lifecycle (`get_messages` returns a `MessageIterator`, advanced with
-  `_next`, freed with `_destroy`)
+- Iterator lifecycle (`get_messages` returns a `GetMessagesIterator`, advanced
+  with `_next`, freed with `_destroy`)
 
 **Build and run tests:**
 
@@ -222,7 +230,8 @@ Path: `samples/node-addon`
 
 An N-API addon crate that loads the calculator's C ABI shared library at runtime
 via `libloading` and exposes the functions as JavaScript-friendly `#[napi]`
-exports. Used by the Node.js example in `examples/`.
+exports. It shows the hand-rolled alternative to the generated
+`weaveffi_addon.c`, which the Node generator now emits for you.
 
 **What it demonstrates:**
 
@@ -239,22 +248,21 @@ cargo build -p weaveffi-node-addon
 
 ## End-to-end testing
 
-Every consumer language under `examples/` ships with an executable
-test that loads the calculator and contacts cdylibs at runtime and
-asserts a representative slice of the C ABI (basic add, contact
-create/list/cleanup). The `examples/run_all.sh` orchestrator builds
-and runs each one in turn:
+The `conformance/` directory is the end-to-end regression oracle for
+the code generators. Every consumer under `conformance/<language>/`
+binds through the *generated* wrappers (not the raw C ABI) and asserts
+concrete results against the contacts, events, kvstore, and shapes
+samples. The `conformance/run.sh` harness builds each producer cdylib,
+runs `weaveffi generate` for it, then compiles and runs every
+per-(language, sample) consumer:
 
 ```bash
-cargo build -p calculator -p contacts
-
-WEAVEFFI_LIB=target/debug/libcalculator.dylib \
-  bash examples/run_all.sh
+bash conformance/run.sh
 ```
 
-It prints `[OK] {target}` for each example that succeeds and exits
-non-zero on the first failure. Use `ONLY=python,ruby` to run a
-subset, or `SKIP=android,go` to omit individual targets. CI runs the
-full matrix on Linux, most targets on macOS, and the Python path on
-Windows. See the comment block at the top of `examples/run_all.sh`
-for the full list of env vars and per-target prerequisites.
+It prints `[OK] {target}` for each consumer that succeeds and reports
+a pass/fail summary at the end. Use `ONLY=c-contacts,cpp-contacts` to
+run a subset, or `SKIP=go-contacts` to omit individual targets.
+Missing toolchains cause the affected target to fail; skip those
+explicitly. See the comment block at the top of `conformance/run.sh`
+for the per-target prerequisites.

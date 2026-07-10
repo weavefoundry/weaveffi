@@ -72,13 +72,15 @@ WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
  *   K** out_keys, V** out_values, size_t* out_len
  */
 
+/** Error codes reported by throwing functions in the `calculator` module tree. */
+typedef enum { weaveffi_calculator_CalcError_DivisionByZero = 1 } weaveffi_calculator_CalcError;
 
 // Module: calculator
 /** Add two integers */
 WEAVEFFI_API int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);
 /** Multiply two integers */
 WEAVEFFI_API int32_t weaveffi_calculator_mul(int32_t a, int32_t b, weaveffi_error* out_err);
-/** Divide two integers */
+/** Divide two integers, failing on a zero divisor */
 WEAVEFFI_API int32_t weaveffi_calculator_div(int32_t a, int32_t b, weaveffi_error* out_err);
 /** Echo a string back */
 WEAVEFFI_API const char* weaveffi_calculator_echo(const char* s, weaveffi_error* out_err);

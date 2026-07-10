@@ -46,9 +46,22 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
 
+Wrappers of functions declared `throws` raise the declaring module's typed
+error class (a `WeaveFFIError` subclass with a per-code subclass, such as
+`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
+for producer panics and marshalling failures.
+
 ## API Reference
 
 ### Module: `graphics`
+
+#### Error Domain: `GraphicsError`
+
+Throwing wrappers in this module raise `GraphicsError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+
+| Class | Code | Default Message |
+|-------|------|-----------------|
+| `OutOfBounds` | `1` | coordinate out of bounds |
 
 #### Functions
 

@@ -74,6 +74,8 @@ WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /** A measurement unit shared with nested submodules. */
 typedef enum { weaveffi_graphics_Unit_pixels = 0, weaveffi_graphics_Unit_points = 1 } weaveffi_graphics_Unit;
+/** Error codes reported by throwing functions in the `graphics` module tree. */
+typedef enum { weaveffi_graphics_GraphicsError_OutOfBounds = 1 } weaveffi_graphics_GraphicsError;
 typedef struct weaveffi_graphics_Canvas weaveffi_graphics_Canvas;
 typedef struct weaveffi_graphics_shapes_Shape weaveffi_graphics_shapes_Shape;
 typedef struct weaveffi_graphics_shapes_geometry_Detail weaveffi_graphics_shapes_geometry_Detail;
@@ -110,7 +112,7 @@ WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_
 WEAVEFFI_API void weaveffi_graphics_shapes_geometry_Detail_destroy(weaveffi_graphics_shapes_geometry_Detail* ptr);
 WEAVEFFI_API double weaveffi_graphics_shapes_geometry_Detail_get_area(const weaveffi_graphics_shapes_geometry_Detail* ptr);
 
-/** Deeper function taking an ancestor-module struct. */
+/** Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain. */
 WEAVEFFI_API weaveffi_graphics_shapes_geometry_Detail* weaveffi_graphics_shapes_geometry_compute(const weaveffi_graphics_shapes_Shape* shape, weaveffi_error* out_err);
 
 

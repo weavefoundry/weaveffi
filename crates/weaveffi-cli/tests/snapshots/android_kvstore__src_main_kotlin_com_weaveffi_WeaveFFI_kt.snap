@@ -16,66 +16,13 @@ class WeaveFFI {
         init { System.loadLibrary("weaveffi") }
 
         /** Subscribe to per-key eviction notifications */
-        @JvmStatic external fun kv_register_eviction_listener(callback: (String) -> Unit): Long
-        @JvmStatic external fun kv_unregister_eviction_listener(id: Long)
-        /**
-         * Open (or create) a store backed by the given filesystem path
-         */
-        @JvmStatic private external fun kv_open_storeJni(path: String): Long
-        @JvmStatic fun kv_open_store(path: String): Store = Store(kv_open_storeJni(path))
-        /**
-         * Close the store and release all in-memory resources
-         */
-        @JvmStatic private external fun kv_close_storeJni(store: Long): Unit
-        @JvmStatic fun kv_close_store(store: Store) { kv_close_storeJni(store.handle) }
-        /**
-         * Insert or replace a value, returning true on success
-         */
-        @JvmStatic private external fun kv_putJni(store: Long, key: String, value: ByteArray, kind: Int, ttl_seconds: Long?): Boolean
-        @JvmStatic fun kv_put(store: Store, key: String, value: ByteArray, kind: EntryKind, ttl_seconds: Long?): Boolean = kv_putJni(store.handle, key, value, kind.value, ttl_seconds)
-        /**
-         * Look up an entry by key; returns null if missing or expired
-         */
-        @JvmStatic private external fun kv_getJni(store: Long, key: String): Long?
-        @JvmStatic fun kv_get(store: Store, key: String): Entry? = kv_getJni(store.handle, key)?.let { Entry(it) }
-        /**
-         * Remove the entry for the given key, returning true if it existed
-         */
-        @JvmStatic private external fun kv_deleteJni(store: Long, key: String): Boolean
-        @JvmStatic fun kv_delete(store: Store, key: String): Boolean = kv_deleteJni(store.handle, key)
-        /**
-         * Stream every key, optionally filtered by a prefix
-         */
-        @JvmStatic private external fun kv_list_keysJni(store: Long, prefix: String?): Iterator<String>
-        @JvmStatic fun kv_list_keys(store: Store, prefix: String?): Iterator<String> = kv_list_keysJni(store.handle, prefix)
-        /**
-         * Return the number of live entries in the store
-         */
-        @JvmStatic private external fun kv_countJni(store: Long): Long
-        @JvmStatic fun kv_count(store: Store): Long = kv_countJni(store.handle)
-        /**
-         * Drop every entry from the store
-         */
-        @JvmStatic private external fun kv_clearJni(store: Long): Unit
-        @JvmStatic fun kv_clear(store: Store) { kv_clearJni(store.handle) }
-        /**
-         * Reclaim space asynchronously; returns the number of bytes reclaimed
-         */
-        @JvmStatic private external fun kv_compact_asyncAsync(store: Long, cancelToken: Long, callback: Any)
-        @JvmStatic suspend fun kv_compact_async(store: Store): Long = suspendCancellableCoroutine { cont ->
-            kv_compact_asyncAsync(store.handle, 0L, WeaveContinuation(cont))
-        }
-        /**
-         * Legacy single-shot put kept for compatibility
-         */
-        @Deprecated("use put() with explicit kind")
-        @JvmStatic private external fun kv_legacy_putJni(store: Long, key: String, value: ByteArray): Boolean
-        @JvmStatic fun kv_legacy_put(store: Store, key: String, value: ByteArray): Boolean = kv_legacy_putJni(store.handle, key, value)
+        @JvmStatic external fun registerEvictionListener(callback: (String) -> Unit): Long
+        @JvmStatic external fun unregisterEvictionListener(id: Long)
         /**
          * Snapshot the current store statistics
          */
-        @JvmStatic private external fun kv_stats_get_statsJni(store: Long): Long
-        @JvmStatic fun kv_stats_get_stats(store: Store): Stats = Stats(kv_stats_get_statsJni(store.handle))
+        @JvmStatic private external fun getStatsJni(store: Long): Long
+        @JvmStatic fun getStats(store: Store): Stats = Stats(getStatsJni(store.handle))
     }
 }
 
@@ -90,33 +37,6 @@ enum class EntryKind(val value: Int) {
 
     companion object {
         fun fromValue(value: Int): EntryKind = entries.first { it.value == value }
-    }
-}
-
-/** Opaque key-value store handle target type */
-class Store internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
-
-        @JvmStatic external fun nativeCreate(id: Long): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetId(handle: Long): Long
-
-        fun create(id: Long): Store = Store(nativeCreate(id))
-    }
-
-    /** Internal store identifier */
-    val id: Long get() = nativeGetId(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
     }
 }
 
@@ -222,6 +142,89 @@ class EntryBuilder {
     }
 }
 
+/** An in-memory key-value store owning its entries; destroying the object releases all of its state */
+class Store internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeOpen(path: String): Long
+        @JvmStatic private external fun nativeDefaultCapacity(): Long
+        @JvmStatic private external fun nativePut(selfHandle: Long, key: String, value: ByteArray, kind: Int, ttlSeconds: Long?): Boolean
+        @JvmStatic private external fun nativeGet(selfHandle: Long, key: String): Long?
+        @JvmStatic private external fun nativeDelete(selfHandle: Long, key: String): Boolean
+        @JvmStatic private external fun nativeListKeys(selfHandle: Long, prefix: String?): Iterator<String>
+        @JvmStatic private external fun nativeCount(selfHandle: Long): Long
+        @JvmStatic private external fun nativeClear(selfHandle: Long): Unit
+        @JvmStatic private external fun nativeCompactAsync(selfHandle: Long, cancelToken: Long, callback: Any)
+        @JvmStatic private external fun nativeLegacyPut(selfHandle: Long, key: String, value: ByteArray): Boolean
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+
+        /**
+         * Open (or create) a store backed by the given filesystem path
+         */
+        fun open(path: String): Store = Store(nativeOpen(path))
+
+        /**
+         * The largest number of live entries one store will hold
+         */
+        fun defaultCapacity(): Long = nativeDefaultCapacity()
+    }
+
+    /**
+     * Insert or replace a value, returning true on success
+     */
+    fun put(key: String, value: ByteArray, kind: EntryKind, ttlSeconds: Long?): Boolean = nativePut(handle, key, value, kind.value, ttlSeconds)
+
+    /**
+     * Look up an entry by key; returns null if missing or expired
+     */
+    fun get(key: String): Entry? = nativeGet(handle, key)?.let { Entry(it) }
+
+    /**
+     * Remove the entry for the given key, returning true if it existed
+     */
+    fun delete(key: String): Boolean = nativeDelete(handle, key)
+
+    /**
+     * Stream every key, optionally filtered by a prefix
+     */
+    fun listKeys(prefix: String?): Iterator<String> = nativeListKeys(handle, prefix)
+
+    /**
+     * Return the number of live entries in the store
+     */
+    fun count(): Long = nativeCount(handle)
+
+    /**
+     * Drop every entry from the store
+     */
+    fun clear() { nativeClear(handle) }
+
+    /**
+     * Reclaim space asynchronously; returns the number of bytes reclaimed
+     */
+    suspend fun compact(): Long = suspendCancellableCoroutine { cont ->
+        nativeCompactAsync(handle, 0L, WeaveContinuation(cont) { code, message -> KvException.fromCode(code, message) })
+    }
+
+    /**
+     * Legacy single-shot put kept for compatibility
+     */
+    @Deprecated("use put() with explicit kind")
+    fun legacyPut(key: String, value: ByteArray): Boolean = nativeLegacyPut(handle, key, value)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+}
+
 /** Aggregate store statistics */
 class Stats internal constructor(internal var handle: Long) : java.io.Closeable {
     companion object {
@@ -255,21 +258,39 @@ class Stats internal constructor(internal var handle: Long) : java.io.Closeable 
     }
 }
 
-sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `KvError` declared by module `kv`. */
+sealed class KvException(code: Int, message: String) : WeaveFFIException(code, message) {
     /** No entry exists for the requested key */
-    class KeyNotFound(message: String = "Key not found") : WeaveFFIException(1001, message)
+    class KeyNotFound(message: String = "key not found") : KvException(1001, message)
     /** The entry exists but its TTL has elapsed */
-    class Expired(message: String = "Entry expired") : WeaveFFIException(1002, message)
+    class Expired(message: String = "entry expired") : KvException(1002, message)
     /** The store has reached its capacity limit */
-    class StoreFull(message: String = "Store is full") : WeaveFFIException(1003, message)
+    class StoreFull(message: String = "store has reached capacity") : KvException(1003, message)
     /** Underlying storage reported an I/O failure */
-    class IoError(message: String = "I/O error") : WeaveFFIException(1004, message)
+    class IoError(message: String = "I/O failure") : KvException(1004, message)
+
+    companion object {
+        /** Map a raw `KvError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1001 -> KeyNotFound(message)
+            1002 -> Expired(message)
+            1003 -> StoreFull(message)
+            1004 -> IoError(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
 }
 
-internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+internal class WeaveContinuation<T>(
+    private val cont: kotlinx.coroutines.CancellableContinuation<T>,
+    private val mapError: (Int, String) -> Throwable
+) {
     @Suppress("UNCHECKED_CAST")
     fun onSuccess(result: Any?) { cont.resume(result as T) }
-    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }
 }
 
 // END WeaveFFI.kt

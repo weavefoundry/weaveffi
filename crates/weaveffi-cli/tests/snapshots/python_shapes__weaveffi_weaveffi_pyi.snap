@@ -6,7 +6,12 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 from enum import IntEnum
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Type
+
+class WeaveFFIError(Exception):
+    code: int
+    message: str
+    def __init__(self, code: int, message: str) -> None: ...
 
 # An algebraic shape (sum type with associated data)
 class Shape:
@@ -80,15 +85,15 @@ class Numerics:
     def j(self) -> float: ...
 
 # Render a shape to a string
-def shapes_describe(shape: "Shape") -> str: ...
+def describe(shape: "Shape") -> str: ...
 
 # Scale a shape by a factor, returning a new shape
-def shapes_scale(shape: "Shape", factor: float) -> "Shape": ...
+def scale(shape: "Shape", factor: float) -> "Shape": ...
 
 # Sum a list of bytes into a wide integer (numerics smoke)
-def shapes_sum_bytes(values: List[int]) -> int: ...
+def sum_bytes(values: List[int]) -> int: ...
 
 # Build a Numerics struct from every numeric primitive
-def shapes_make_numerics(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: float, j: float) -> "Numerics": ...
+def make_numerics(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: float, j: float) -> "Numerics": ...
 
 # END weaveffi.pyi

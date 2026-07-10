@@ -10,34 +10,35 @@
 #![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
-use heck::ToUpperCamelCase;
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use weaveffi_core::abi::{self, AbiParam, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::errors;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
-    StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
+    RichVariantBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, Module, TypeRef};
+use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`DotnetGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DotnetConfig {
     /// C# namespace (and on-disk basename used for `.cs`/`.csproj`/`.nuspec`).
     /// Defaults to `"WeaveFFI"`.
     pub namespace: Option<String>,
-    /// When `true`, strip the IR module name prefix from emitted C# method
-    /// names.
+    /// When `true` (the default), strip the IR module name prefix from emitted
+    /// C# method names; the per-module static class already namespaces them.
+    /// Set to `false` to restore module-prefixed names.
     pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the P/Invoke bindings call the same
@@ -46,6 +47,17 @@ pub struct DotnetConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for DotnetConfig {
+    fn default() -> Self {
+        Self {
+            namespace: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl DotnetConfig {
@@ -89,7 +101,7 @@ impl LanguageBackend for DotnetGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
@@ -104,10 +116,9 @@ impl LanguageBackend for DotnetGenerator {
             OutputFile::new(
                 dir.join(&cs_filename),
                 render_csharp(
-                    api,
+                    model,
                     namespace,
                     config.strip_module_prefix,
-                    config.prefix(),
                     input_basename,
                     &cs_filename,
                 ),
@@ -130,7 +141,7 @@ impl LanguageBackend for DotnetGenerator {
     fn package(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -149,10 +160,9 @@ impl LanguageBackend for DotnetGenerator {
         // bundled library's base name so `[DllImport]` resolves the file we
         // ship under `runtimes/<rid>/native/`.
         let cs = render_csharp(
-            api,
+            model,
             namespace,
             config.strip_module_prefix,
-            config.prefix(),
             input_basename,
             &cs_filename,
         )
@@ -310,6 +320,9 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
         TypeRef::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
         TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
+        // Interfaces surface as their opaque-handle wrapper class; a
+        // cross-module reference (`kv.Store`) uses the bare local name.
+        TypeRef::Interface(name) => local_type_name(name).into(),
     }
 }
 
@@ -331,6 +344,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         | TypeRef::Bytes
         | TypeRef::BorrowedBytes
         | TypeRef::Struct(_)
+        | TypeRef::Interface(_)
         | TypeRef::Optional(_)
         | TypeRef::List(_)
         | TypeRef::Iterator(_)
@@ -633,14 +647,12 @@ fn writer_fn_doc(w: &mut CodeWriter, doc: &Option<String>, params: &[ParamBindin
 }
 
 fn render_csharp(
-    api: &Api,
+    model: &BindingModel,
     namespace: &str,
     strip_module_prefix: bool,
-    prefix: &str,
     input_basename: &str,
     filename: &str,
 ) -> String {
-    let model = BindingModel::build(api, prefix);
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     // Opt the file into the nullable annotation context so the `string?`
     // signatures (optional strings) are valid regardless of the consuming
@@ -649,14 +661,31 @@ fn render_csharp(
     out.push_str(
         "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n",
     );
-    if model.functions().any(|(_, f)| f.is_async) {
+    if model
+        .modules
+        .iter()
+        .flat_map(|m| m.callables())
+        .any(|f| f.is_async)
+    {
         out.push_str("using System.Threading.Tasks;\n");
     }
     out.push('\n');
     out.push_str(&format!("namespace {namespace}\n{{\n"));
 
+    // One typed exception per declaring module; inheriting submodules
+    // reference the ancestor's type through `ModuleBinding::error`.
+    let domains: Vec<&ErrorBinding> = model
+        .modules
+        .iter()
+        .filter_map(|m| m.error.as_ref())
+        .filter(|eb| eb.declared_here)
+        .collect();
+
     render_exception_class(&mut out);
-    render_error_struct(&mut out);
+    for eb in &domains {
+        render_domain_exception(&mut out, eb);
+    }
+    render_error_struct(&mut out, &domains);
     render_helpers_class(&mut out);
 
     for m in &model.modules {
@@ -673,28 +702,98 @@ fn render_csharp(
             render_struct_class(&mut out, s);
             render_builder_class(&mut out, s);
         }
+        for i in &m.interfaces {
+            render_interface_class(&mut out, i, m.error.as_ref());
+        }
     }
 
-    render_native_methods(&mut out, &model);
+    render_native_methods(&mut out, model);
 
-    let by_path: HashMap<&str, &ModuleBinding> =
-        model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
-    for m in &api.modules {
-        let class_name = m.name.to_upper_camel_case();
-        render_wrapper_class(
-            &mut out,
-            &by_path,
-            m,
-            &m.name,
-            &class_name,
-            "    ",
-            strip_module_prefix,
-        );
+    for m in &model.modules {
+        render_wrapper_class(&mut out, m, strip_module_prefix);
     }
 
     out.push_str("}\n\n");
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
+}
+
+/// The C# exception class name for one error domain: the domain stem with
+/// exactly one `Exception` suffix, so `KvError` becomes `KvException` rather
+/// than `KvErrorException`.
+fn dotnet_exception_name(eb: &ErrorBinding) -> String {
+    errors::exception_type_name(&eb.type_name)
+}
+
+/// The per-domain error-check helper name on `WeaveFFIError`; `KvException`
+/// is checked by `CheckKv`.
+fn check_method_name(eb: &ErrorBinding) -> String {
+    let exc = dotnet_exception_name(eb);
+    let stem = exc.strip_suffix("Exception").unwrap_or(&exc).to_string();
+    format!("Check{stem}")
+}
+
+/// Escapes a string for embedding in a C# string literal.
+fn cs_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// How a wrapper surfaces a non-zero error slot: `throws` functions with a
+/// domain in scope raise the typed domain exception, everything else raises
+/// the generic brand exception (panics and marshalling errors only).
+#[derive(Clone, Copy)]
+enum ErrCtx<'a> {
+    /// Throw the generic `WeaveFFIException`.
+    Generic,
+    /// Throw the domain's typed exception via its `FromCode` factory.
+    Domain(&'a ErrorBinding),
+}
+
+impl<'a> ErrCtx<'a> {
+    /// The error context for one function: typed when the function throws and
+    /// its module has an error domain in scope, generic otherwise.
+    fn for_fn(f: &FnBinding, error: Option<&'a ErrorBinding>) -> Self {
+        match error {
+            Some(eb) if f.throws => ErrCtx::Domain(eb),
+            _ => ErrCtx::Generic,
+        }
+    }
+
+    /// The check statement placed after a native call writing into `err`.
+    fn check_stmt(&self) -> String {
+        self.check_stmt_for("err")
+    }
+
+    /// The check statement for a named `WeaveFFIError` local.
+    fn check_stmt_for(&self, var: &str) -> String {
+        match self {
+            ErrCtx::Generic => format!("WeaveFFIError.Check({var});"),
+            ErrCtx::Domain(eb) => format!("WeaveFFIError.{}({var});", check_method_name(eb)),
+        }
+    }
+
+    /// The exception expression an async completion callback faults its
+    /// `TaskCompletionSource` with.
+    fn async_exception_expr(&self) -> String {
+        match self {
+            ErrCtx::Generic => "new WeaveFFIException(wErr.Code, msg)".into(),
+            ErrCtx::Domain(eb) => {
+                format!("{}.FromCode(wErr.Code, msg)", dotnet_exception_name(eb))
+            }
+        }
+    }
+
+    /// Emit the `<exception>` XML doc line for a throwing wrapper; generic
+    /// wrappers document nothing extra.
+    fn write_exception_doc(&self, w: &mut CodeWriter) {
+        if let ErrCtx::Domain(eb) = self {
+            w.line(format!(
+                "/// <exception cref=\"{}\">Thrown when the call reports a {} code.</exception>",
+                dotnet_exception_name(eb),
+                eb.type_name
+            ));
+        }
+    }
 }
 
 fn render_exception_class(out: &mut String) {
@@ -712,7 +811,69 @@ fn render_exception_class(out: &mut String) {
     out.push_str(&w.finish());
 }
 
-fn render_error_struct(out: &mut String) {
+/// One typed exception class per declared error domain, extending the generic
+/// brand exception. Each code surfaces as a `public const int` (PascalCase),
+/// and `FromCode` maps a raw error slot to the typed exception, falling back
+/// to the generic `WeaveFFIException` for unknown codes.
+fn render_domain_exception(out: &mut String, eb: &ErrorBinding) {
+    let exc = dotnet_exception_name(eb);
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line(format!(
+        "/// <summary>Typed exception for the {} error domain (module {}).</summary>",
+        eb.type_name,
+        eb.owner_path.replace('_', ".")
+    ));
+    w.line(format!("public class {exc} : WeaveFFIException"));
+    w.block("{", "}", |w| {
+        for c in &eb.codes {
+            if c.doc.is_some() {
+                writer_doc(w, &c.doc);
+            } else {
+                w.line(format!("/// <summary>{}</summary>", xml_escape(&c.message)));
+            }
+            w.line(format!(
+                "public const int {} = {};",
+                errors::pascal(&c.name),
+                c.value
+            ));
+        }
+        w.blank();
+        w.line(format!(
+            "public {exc}(int code, string message) : base(code, message)"
+        ));
+        w.line("{");
+        w.line("}");
+        w.blank();
+        w.line("/// <summary>Wraps a raw error slot in the typed exception, falling");
+        w.line("/// back to <see cref=\"WeaveFFIException\"/> for unknown codes.</summary>");
+        w.line("internal static WeaveFFIException FromCode(int code, string message)");
+        w.block("{", "}", |w| {
+            w.line("switch (code)");
+            w.block("{", "}", |w| {
+                for c in &eb.codes {
+                    w.line(format!("case {}:", errors::pascal(&c.name)));
+                    w.indent();
+                    w.line(format!(
+                        "return new {exc}(code, string.IsNullOrEmpty(message) ? \"{}\" : message);",
+                        cs_str(&c.message)
+                    ));
+                    w.dedent();
+                }
+                w.line("default:");
+                w.indent();
+                w.line("return new WeaveFFIException(code, message);");
+                w.dedent();
+            });
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// The raw error slot plus its check helpers: the generic `Check` (throws
+/// `WeaveFFIException` on any non-zero code) and one `Check{Domain}` variant
+/// per declared domain (throws the typed exception via `FromCode`).
+fn render_error_struct(out: &mut String, domains: &[&ErrorBinding]) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.line("[StructLayout(LayoutKind.Sequential)]");
     w.line("internal struct WeaveFFIError");
@@ -728,6 +889,19 @@ fn render_error_struct(out: &mut String) {
                 w.line("throw new WeaveFFIException(err.Code, msg);");
             });
         });
+        for eb in domains {
+            let exc = dotnet_exception_name(eb);
+            let check = check_method_name(eb);
+            w.blank();
+            w.line(format!("internal static void {check}(WeaveFFIError err)"));
+            w.block("{", "}", |w| {
+                w.line("if (err.Code != 0)");
+                w.block("{", "}", |w| {
+                    w.line("var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";");
+                    w.line(format!("throw {exc}.FromCode(err.Code, msg);"));
+                });
+            });
+        }
     });
     w.blank();
     out.push_str(&w.finish());
@@ -1108,6 +1282,155 @@ fn render_builder_class(out: &mut String, s: &StructBinding) {
     out.push_str(&w.finish());
 }
 
+/// A copy of `f` whose parameter names are lowerCamelCase, the C# parameter
+/// convention for public wrapper signatures. Only the wrapper signature and
+/// its marshalling locals derive from these names; ABI slot names and the
+/// P/Invoke declarations keep the IDL spelling.
+fn camel_fn(f: &FnBinding) -> FnBinding {
+    let mut f = f.clone();
+    for p in &mut f.params {
+        p.name = p.name.to_lower_camel_case();
+    }
+    f
+}
+
+/// Render one interface as an opaque-handle class following the struct-wrapper
+/// pattern: a private `IntPtr` handle with `IDisposable` plus a finalizer
+/// calling the interface's destroy symbol. The `new` constructor maps to a
+/// real C# constructor, other constructors become static factories, instance
+/// methods pass the handle as the leading native argument, and statics are
+/// plain static methods. All member shapes reuse the free-function
+/// marshalling paths.
+fn render_interface_class(out: &mut String, i: &InterfaceBinding, error: Option<&ErrorBinding>) {
+    let name = &i.name;
+    let mut w = CodeWriter::four_space().with_depth(1);
+    writer_doc(&mut w, &i.doc);
+    w.line(format!("public class {name} : IDisposable"));
+    w.line("{");
+    w.indent();
+    w.line("private IntPtr _handle;");
+    w.line("private bool _disposed;");
+    w.blank();
+    w.line(format!("internal {name}(IntPtr handle)"));
+    w.block("{", "}", |w| {
+        w.line("_handle = handle;");
+    });
+    w.blank();
+    w.line("internal IntPtr Handle => _handle;");
+    w.blank();
+
+    for c in &i.constructors {
+        let err = ErrCtx::for_fn(c, error);
+        let mut tmp = String::new();
+        if c.name == "new" && matches!(c.shape, CallShape::Sync(_)) {
+            render_interface_ctor(&mut tmp, i, c, err);
+        } else {
+            render_wrapper_method(&mut tmp, c, &c.name.to_upper_camel_case(), None, err);
+        }
+        w.raw(tmp);
+    }
+    for m in &i.methods {
+        let err = ErrCtx::for_fn(m, error);
+        let mut tmp = String::new();
+        render_wrapper_method(
+            &mut tmp,
+            m,
+            &m.name.to_upper_camel_case(),
+            Some("_handle"),
+            err,
+        );
+        w.raw(tmp);
+    }
+    for s in &i.statics {
+        let err = ErrCtx::for_fn(s, error);
+        let mut tmp = String::new();
+        render_wrapper_method(&mut tmp, s, &s.name.to_upper_camel_case(), None, err);
+        w.raw(tmp);
+    }
+
+    w.line("public void Dispose()");
+    w.block("{", "}", |w| {
+        w.line("if (!_disposed)");
+        w.block("{", "}", |w| {
+            w.line(format!("NativeMethods.{}(_handle);", i.destroy_symbol));
+            w.line("_disposed = true;");
+        });
+        w.line("GC.SuppressFinalize(this);");
+    });
+    w.blank();
+    w.line(format!("~{name}()"));
+    w.block("{", "}", |w| {
+        w.line("Dispose();");
+    });
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Render the `new` constructor as a real C# constructor: the sync call path
+/// with the checked result assigned to `_handle` instead of returned.
+fn render_interface_ctor(out: &mut String, i: &InterfaceBinding, f: &FnBinding, err: ErrCtx) {
+    let f = camel_fn(f);
+    let c_sym = &f.c_base;
+    let params_sig: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
+        .collect();
+
+    let mut w = CodeWriter::four_space().with_depth(2);
+    writer_fn_doc(&mut w, &f.doc, &f.params);
+    err.write_exception_doc(&mut w);
+    if let Some(msg) = &f.deprecated {
+        w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
+    }
+    w.line(format!("public {}({})", i.name, params_sig.join(", ")));
+    w.line("{");
+    w.scope(|w| {
+        w.line("var err = new WeaveFFIError();");
+        let call_args = build_call_args(&f.params);
+        let args_part = if call_args.is_empty() {
+            String::new()
+        } else {
+            format!("{call_args}, ")
+        };
+        let call = format!("var result = NativeMethods.{c_sym}({args_part}ref err);");
+
+        let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
+        if needs_try {
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_setup(&mut tmp, p, "            ");
+                w.raw(tmp);
+            }
+            w.line("try");
+            w.line("{");
+            w.scope(|w| {
+                w.line(call.clone());
+                w.line(err.check_stmt());
+                w.line("_handle = result;");
+            });
+            w.line("}");
+            w.line("finally");
+            w.line("{");
+            for p in &f.params {
+                let mut tmp = String::new();
+                render_marshal_cleanup(&mut tmp, p, "                ");
+                w.raw(tmp);
+            }
+            w.line("}");
+        } else {
+            w.line(call);
+            w.line(err.check_stmt());
+            w.line("_handle = result;");
+        }
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
 fn render_struct_getter(out: &mut String, field: &FieldBinding) {
     let prop_name = field.name.to_upper_camel_case();
     render_field_getter(out, &prop_name, field);
@@ -1294,6 +1617,14 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
             w.line("return dict;");
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
+        // The getter returns an owned reference; the wrapper owns and
+        // disposes it like any interface return.
+        TypeRef::Interface(name) => {
+            let cn = local_type_name(name);
+            w.line(format!(
+                "return new {cn}(NativeMethods.{getter_sym}(_handle));"
+            ));
+        }
     }
 
     w.dedent();
@@ -1366,6 +1697,11 @@ fn render_native_methods(out: &mut String, model: &BindingModel) {
             render_struct_pinvoke(&mut tmp, s);
             w.raw(tmp);
         }
+        for i in &m.interfaces {
+            let mut tmp = String::new();
+            render_interface_pinvoke(&mut tmp, i);
+            w.raw(tmp);
+        }
         for cb in &m.callbacks {
             let mut tmp = String::new();
             render_callback_pinvoke(&mut tmp, cb);
@@ -1378,10 +1714,7 @@ fn render_native_methods(out: &mut String, model: &BindingModel) {
         }
         for f in &m.functions {
             let mut tmp = String::new();
-            render_function_pinvoke(&mut tmp, f);
-            if f.is_async {
-                render_async_function_pinvoke(&mut tmp, f);
-            }
+            render_shaped_pinvoke(&mut tmp, f);
             w.raw(tmp);
         }
     }
@@ -1552,6 +1885,42 @@ fn render_rich_enum_pinvoke(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
+/// Emit the extern declaration set matching one callable's shape exactly:
+/// sync, async (delegate + launcher), or iterator (constructor, `next`,
+/// `destroy`). Shared by free functions and interface members.
+fn render_shaped_pinvoke(out: &mut String, f: &FnBinding) {
+    match &f.shape {
+        CallShape::Sync(_) => render_function_pinvoke(out, f),
+        CallShape::Async(_) => render_async_function_pinvoke(out, f),
+        CallShape::Iterator(it) => render_iterator_pinvoke(out, it),
+    }
+}
+
+/// The `[DllImport]` set backing one interface: the destroy symbol plus one
+/// shape-matched extern set per member. Instance members carry the implicit
+/// leading `self` slot.
+fn render_interface_pinvoke(out: &mut String, i: &InterfaceBinding) {
+    let destroy_sym = &i.destroy_symbol;
+    let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]"
+    ));
+    w.line(format!(
+        "internal static extern void {destroy_sym}(IntPtr self);"
+    ));
+    w.blank();
+    out.push_str(&w.finish());
+
+    for f in i
+        .constructors
+        .iter()
+        .chain(i.methods.iter())
+        .chain(i.statics.iter())
+    {
+        render_shaped_pinvoke(out, f);
+    }
+}
+
 fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
     if let CallShape::Iterator(it) = &f.shape {
         render_iterator_pinvoke(out, it);
@@ -1559,7 +1928,11 @@ fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
     }
     let c_sym = &f.c_base;
 
-    let mut params: Vec<String> = f.params.iter().flat_map(pinvoke_param_list).collect();
+    let mut params: Vec<String> = Vec::new();
+    if f.has_self {
+        params.push("IntPtr self".into());
+    }
+    params.extend(f.params.iter().flat_map(pinvoke_param_list));
 
     let ret_type = if let Some(ret) = &f.ret {
         let (ret_cs, extra) = pinvoke_return_info(ret);
@@ -1677,7 +2050,11 @@ fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
     ));
     w.blank();
 
-    let mut params: Vec<String> = f.params.iter().flat_map(pinvoke_param_list).collect();
+    let mut params: Vec<String> = Vec::new();
+    if f.has_self {
+        params.push("IntPtr self".into());
+    }
+    params.extend(f.params.iter().flat_map(pinvoke_param_list));
     if f.cancellable {
         params.push("IntPtr cancel_token".into());
     }
@@ -1833,6 +2210,11 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             arg
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+        // Borrowed for the duration of the callback, like struct parameters;
+        // the consumer must not Dispose() the wrapper.
+        TypeRef::Interface(name) => {
+            format!("new {}({n0})", local_type_name(name))
+        }
     };
     out.push_str(&w.finish());
     expr
@@ -1942,63 +2324,42 @@ fn render_listener_methods(
     out.push_str(&w.finish());
 }
 
-/// Renders one module's static wrapper class, then its submodules as sibling
-/// classes named by their full path (`KvStats`, not a nested `Kv.Stats`).
-/// Flat classes keep generated type names (`Stats`) unambiguous: a nested
-/// module class with the same name as a struct wrapper would shadow it.
-fn render_wrapper_class(
-    out: &mut String,
-    by_path: &HashMap<&str, &ModuleBinding>,
-    m: &Module,
-    module_path: &str,
-    class_name: &str,
-    indent: &str,
-    strip_module_prefix: bool,
-) {
-    out.push_str(&format!(
-        "{indent}public static class {class_name}\n{indent}{{\n"
-    ));
+/// Renders one module's static wrapper class. Submodules become sibling
+/// classes named by their full path (`KvStats`, not a nested `Kv.Stats`):
+/// flat classes keep generated type names (`Stats`) unambiguous, since a
+/// nested module class with the same name as a struct wrapper would shadow it.
+fn render_wrapper_class(out: &mut String, mb: &ModuleBinding, strip_module_prefix: bool) {
+    let class_name: String = mb
+        .segments
+        .iter()
+        .map(|s| s.to_upper_camel_case())
+        .collect();
+    out.push_str(&format!("    public static class {class_name}\n    {{\n"));
 
-    let mb = by_path[module_path];
     if !mb.listeners.is_empty() {
-        let mut buf = String::new();
-        buf.push_str("        private static readonly object _listenerLock = new object();\n");
-        buf.push_str(
+        out.push_str("        private static readonly object _listenerLock = new object();\n");
+        out.push_str(
             "        // Live listener delegates by subscription id. Holding the delegate\n",
         );
-        buf.push_str(
+        out.push_str(
             "        // here keeps its native thunk alive until unregistered; without this\n",
         );
-        buf.push_str("        // the GC could collect a delegate the producer still calls.\n");
-        buf.push_str(
+        out.push_str("        // the GC could collect a delegate the producer still calls.\n");
+        out.push_str(
             "        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();\n\n",
         );
         for l in &mb.listeners {
-            render_listener_methods(&mut buf, mb, l, strip_module_prefix);
+            render_listener_methods(out, mb, l, strip_module_prefix);
         }
-        reindent(out, &buf, indent.len().saturating_sub(4));
     }
     for f in &mb.functions {
-        let mut buf = String::new();
-        render_wrapper_method(&mut buf, module_path, f, strip_module_prefix);
-        reindent(out, &buf, indent.len().saturating_sub(4));
+        let method_name =
+            wrapper_name(&mb.path, &f.name, strip_module_prefix).to_upper_camel_case();
+        let err = ErrCtx::for_fn(f, mb.error.as_ref());
+        render_wrapper_method(out, f, &method_name, None, err);
     }
 
-    out.push_str(&format!("{indent}}}\n\n"));
-
-    for sub in &m.modules {
-        let sub_path = format!("{module_path}_{}", sub.name);
-        let sub_class = format!("{class_name}{}", sub.name.to_upper_camel_case());
-        render_wrapper_class(
-            out,
-            by_path,
-            sub,
-            &sub_path,
-            &sub_class,
-            indent,
-            strip_module_prefix,
-        );
-    }
+    out.push_str("    }\n\n");
 }
 
 fn param_needs_marshal(ty: &TypeRef) -> bool {
@@ -2031,39 +2392,28 @@ fn param_needs_marshal(ty: &TypeRef) -> bool {
     }
 }
 
-fn reindent(out: &mut String, buf: &str, extra: usize) {
-    if extra == 0 {
-        out.push_str(buf);
-        return;
-    }
-    let pad = " ".repeat(extra);
-    for line in buf.lines() {
-        if line.is_empty() {
-            out.push('\n');
-        } else {
-            out.push_str(&pad);
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-}
-
+/// Render one wrapper method (any shape) named `method_name`. `self_expr` is
+/// the receiver's handle expression for interface instance methods (`None`
+/// for free functions, statics, and factories, which render as `static`);
+/// `err` selects the typed or generic error surface.
 fn render_wrapper_method(
     out: &mut String,
-    module_path: &str,
     f: &FnBinding,
-    strip_module_prefix: bool,
+    method_name: &str,
+    self_expr: Option<&str>,
+    err: ErrCtx,
 ) {
     if f.is_async {
-        render_async_wrapper_method(out, module_path, f, strip_module_prefix);
+        render_async_wrapper_method(out, f, method_name, self_expr, err);
         return;
     }
     if let CallShape::Iterator(it) = &f.shape {
-        render_iterator_wrapper_method(out, module_path, f, it, strip_module_prefix);
+        render_iterator_wrapper_method(out, f, it, method_name, self_expr, err);
         return;
     }
-    let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
+    let f = camel_fn(f);
     let ret_cs = f.ret.as_ref().map(cs_type).unwrap_or_else(|| "void".into());
+    let staticness = if self_expr.is_none() { "static " } else { "" };
 
     let params_sig: Vec<String> = f
         .params
@@ -2073,12 +2423,13 @@ fn render_wrapper_method(
 
     let mut w = CodeWriter::four_space().with_depth(2);
     writer_fn_doc(&mut w, &f.doc, &f.params);
+    err.write_exception_doc(&mut w);
     if let Some(msg) = &f.deprecated {
         w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
     w.line(format!(
-        "public static {ret_cs} {method_name}({})",
+        "public {staticness}{ret_cs} {method_name}({})",
         params_sig.join(", ")
     ));
     w.line("{");
@@ -2096,7 +2447,7 @@ fn render_wrapper_method(
             w.line("try");
             w.line("{");
             let mut tmp = String::new();
-            render_pinvoke_call_and_return(&mut tmp, f, "                ");
+            render_pinvoke_call_and_return(&mut tmp, &f, self_expr, err, "                ");
             w.raw(tmp);
             w.line("}");
             w.line("finally");
@@ -2109,7 +2460,7 @@ fn render_wrapper_method(
             w.line("}");
         } else {
             let mut tmp = String::new();
-            render_pinvoke_call_and_return(&mut tmp, f, "            ");
+            render_pinvoke_call_and_return(&mut tmp, &f, self_expr, err, "            ");
             w.raw(tmp);
         }
     });
@@ -2150,7 +2501,7 @@ fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> S
             "item".into()
         }
         // The consumer owns each yielded wrapper; Dispose() destroys it.
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
             format!("new {}(out_item)", local_type_name(name))
         }
         _ => "default!".into(),
@@ -2165,13 +2516,15 @@ fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> S
 /// enumerator is disposed.
 fn render_iterator_wrapper_method(
     out: &mut String,
-    module_path: &str,
     f: &FnBinding,
     it: &IteratorBinding,
-    strip_module_prefix: bool,
+    method_name: &str,
+    self_expr: Option<&str>,
+    err: ErrCtx,
 ) {
-    let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
+    let f = camel_fn(f);
     let elem_cs = cs_type(&it.elem);
+    let staticness = if self_expr.is_none() { "static " } else { "" };
 
     let params_sig: Vec<String> = f
         .params
@@ -2179,7 +2532,7 @@ fn render_iterator_wrapper_method(
         .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
         .collect();
 
-    let call_args = build_call_args(&f.params);
+    let call_args = full_call_args(&f, self_expr);
     let args_part = if call_args.is_empty() {
         String::new()
     } else {
@@ -2192,12 +2545,13 @@ fn render_iterator_wrapper_method(
 
     let mut w = CodeWriter::four_space().with_depth(2);
     writer_fn_doc(&mut w, &f.doc, &f.params);
+    err.write_exception_doc(&mut w);
     if let Some(msg) = &f.deprecated {
         w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
     w.line(format!(
-        "public static IEnumerable<{elem_cs}> {method_name}({})",
+        "public {staticness}IEnumerable<{elem_cs}> {method_name}({})",
         params_sig.join(", ")
     ));
     w.line("{");
@@ -2215,7 +2569,7 @@ fn render_iterator_wrapper_method(
             w.line("{");
             w.scope(|w| {
                 w.line(launch_call.clone());
-                w.line("WeaveFFIError.Check(err);");
+                w.line(err.check_stmt());
                 w.line(format!("return Enumerate{method_name}(iter);"));
             });
             w.line("}");
@@ -2229,7 +2583,7 @@ fn render_iterator_wrapper_method(
             w.line("}");
         } else {
             w.line(launch_call.clone());
-            w.line("WeaveFFIError.Check(err);");
+            w.line(err.check_stmt());
             w.line(format!("return Enumerate{method_name}(iter);"));
         }
     });
@@ -2265,11 +2619,11 @@ fn render_iterator_wrapper_method(
                 ));
                 w.line("{");
                 w.scope(|w| {
-                    w.line("WeaveFFIError.Check(iterErr);");
+                    w.line(err.check_stmt_for("iterErr"));
                     w.line("yield break;");
                 });
                 w.line("}");
-                w.line("WeaveFFIError.Check(iterErr);");
+                w.line(err.check_stmt_for("iterErr"));
                 let mut conv = String::new();
                 let item_expr =
                     iterator_item_conversion(&mut conv, &it.elem, "                    ");
@@ -2291,15 +2645,21 @@ fn render_iterator_wrapper_method(
     out.push_str(&w.finish());
 }
 
+/// Render an async wrapper returning `Task`/`Task<T>` via a
+/// `TaskCompletionSource` resolved from the native completion callback. A
+/// non-zero error slot faults the task with the typed or generic exception
+/// according to `err`.
 fn render_async_wrapper_method(
     out: &mut String,
-    module_path: &str,
     f: &FnBinding,
-    strip_module_prefix: bool,
+    method_name: &str,
+    self_expr: Option<&str>,
+    err: ErrCtx,
 ) {
-    let method_name = wrapper_name(module_path, &f.name, strip_module_prefix).to_upper_camel_case();
+    let f = camel_fn(f);
     let c_sym = &f.c_base;
     let delegate_name = format!("NativeMethods.AsyncCb_{c_sym}");
+    let staticness = if self_expr.is_none() { "static " } else { "" };
 
     let task_ret = f
         .ret
@@ -2317,12 +2677,13 @@ fn render_async_wrapper_method(
 
     let mut w = CodeWriter::four_space().with_depth(2);
     writer_fn_doc(&mut w, &f.doc, &f.params);
+    err.write_exception_doc(&mut w);
     if let Some(msg) = &f.deprecated {
         w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
     w.line(format!(
-        "public static async {task_ret} {method_name}({})",
+        "public {staticness}async {task_ret} {method_name}({})",
         params_sig.join(", ")
     ));
     w.line("{");
@@ -2346,7 +2707,7 @@ fn render_async_wrapper_method(
                     w.line("{");
                     w.scope(|w| {
                         w.line("var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";");
-                        w.line("tcs.SetException(new WeaveFFIException(wErr.Code, msg));");
+                        w.line(format!("tcs.SetException({});", err.async_exception_expr()));
                         w.line("return;");
                     });
                     w.line("}");
@@ -2375,7 +2736,7 @@ fn render_async_wrapper_method(
         w.line("var ctx = GCHandle.ToIntPtr(gcHandle);");
 
         let needs_try = f.params.iter().any(|p| param_needs_marshal(&p.ty));
-        let call_args = build_call_args(&f.params);
+        let call_args = full_call_args(&f, self_expr);
         let args_part = if call_args.is_empty() {
             String::new()
         } else {
@@ -2469,6 +2830,10 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
             w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
         Some(TypeRef::TypedHandle(name)) => {
+            let cn = local_type_name(name);
+            w.line(format!("tcs.SetResult(new {cn}(result));"));
+        }
+        Some(TypeRef::Interface(name)) => {
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
@@ -2721,12 +3086,29 @@ fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
     out.push_str(&w.finish());
 }
 
-fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str) {
+/// The joined native-call argument list: the implicit self handle (when
+/// `self_expr` is given) followed by every lowered parameter slot.
+fn full_call_args(f: &FnBinding, self_expr: Option<&str>) -> String {
+    let args = build_call_args(&f.params);
+    match self_expr {
+        Some(s) if args.is_empty() => s.to_string(),
+        Some(s) => format!("{s}, {args}"),
+        None => args,
+    }
+}
+
+fn render_pinvoke_call_and_return(
+    out: &mut String,
+    f: &FnBinding,
+    self_expr: Option<&str>,
+    err: ErrCtx,
+    indent: &str,
+) {
     let c_sym = &f.c_base;
-    let call_args = build_call_args(&f.params);
+    let call_args = full_call_args(f, self_expr);
 
     if let Some(TypeRef::Map(k, v)) = &f.ret {
-        render_map_return_call(out, c_sym, &call_args, k, v, indent);
+        render_map_return_call(out, c_sym, &call_args, k, v, err, indent);
         return;
     }
 
@@ -2761,7 +3143,7 @@ fn render_pinvoke_call_and_return(out: &mut String, f: &FnBinding, indent: &str)
         w.line(format!("NativeMethods.{c_sym}({args_part}ref err);"));
     }
 
-    w.line("WeaveFFIError.Check(err);");
+    w.line(err.check_stmt());
     out.push_str(&w.finish());
 
     if let Some(ret_ty) = &f.ret {
@@ -2778,13 +3160,17 @@ fn build_call_args(params: &[ParamBinding]) -> String {
                 TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
                 TypeRef::Enum(_) => vec![format!("(int){name}")],
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}Ptr")],
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}.Handle")],
+                // Interface parameters borrow: pass the handle, ownership
+                // stays with the caller's wrapper.
+                TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                    vec![format!("{name}.Handle")]
+                }
                 TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
                     format!("{name}Pin.AddrOfPinnedObject()"),
                     format!("(UIntPtr){name}.Length"),
                 ],
                 TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
                         vec![format!("{name}?.Handle ?? IntPtr.Zero")]
                     }
                     TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
@@ -2847,6 +3233,12 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
             let cn = local_type_name(name);
             w.line(format!("return new {cn}(result);"));
         }
+        // An interface return transfers ownership: wrap the pointer in a new
+        // instance whose Dispose() releases it.
+        TypeRef::Interface(name) => {
+            let cn = local_type_name(name);
+            w.line(format!("return new {cn}(result);"));
+        }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.line("if (result == IntPtr.Zero) return Array.Empty<byte>();");
             w.line("var arr = new byte[(int)outLen];");
@@ -2882,7 +3274,7 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             w.line("NativeMethods.weaveffi_free_string(result);");
             w.line("return str;");
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::Interface(name) => {
             let cn = local_type_name(name);
             w.line(format!(
                 "return result == IntPtr.Zero ? null : new {cn}(result);"
@@ -2971,6 +3363,7 @@ fn render_map_return_call(
     call_args: &str,
     k: &TypeRef,
     v: &TypeRef,
+    err: ErrCtx,
     indent: &str,
 ) {
     let k_cs = cs_type(k);
@@ -2984,7 +3377,7 @@ fn render_map_return_call(
     w.line(format!(
         "NativeMethods.{c_sym}({args_part}out var outKeys, out var outValues, out var outLen, ref err);"
     ));
-    w.line("WeaveFFIError.Check(err);");
+    w.line(err.check_stmt());
     w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
     let key_read = marshal_read_element(k, "outKeys", "i");
     let val_read = marshal_read_element(v, "outValues", "i");
@@ -3037,7 +3430,7 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
             let cn = local_type_name(name);
             format!("({cn})Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Struct(name) | TypeRef::Interface(name) => {
             let cn = local_type_name(name);
             format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
@@ -3064,6 +3457,26 @@ mod tests {
     use weaveffi_core::codegen::Generator;
     use weaveffi_ir::ir::{EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField};
 
+    /// Test shim matching the pre-0.5.0 signature: builds the [`BindingModel`]
+    /// here so the production `render_csharp` stays model-only.
+    fn render_csharp(
+        api: &Api,
+        namespace: &str,
+        strip_module_prefix: bool,
+        prefix: &str,
+        input_basename: &str,
+        filename: &str,
+    ) -> String {
+        let model = BindingModel::build(api, prefix);
+        super::render_csharp(
+            &model,
+            namespace,
+            strip_module_prefix,
+            input_basename,
+            filename,
+        )
+    }
+
     #[test]
     fn package_emits_runtimes_and_rebinds_libname() {
         use camino::Utf8Path;
@@ -3077,6 +3490,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -3134,7 +3548,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
@@ -3150,6 +3564,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }
     }
@@ -3197,6 +3612,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -3242,6 +3658,7 @@ mod tests {
                 doc: None,
             }],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let dir = tempfile::tempdir().unwrap();
@@ -3263,13 +3680,11 @@ mod tests {
             "register pinvoke missing: {cs}"
         );
         assert!(
-            cs.contains(
-                "public static ulong EventsRegisterMessageListener(Action<string> callback)"
-            ),
+            cs.contains("public static ulong RegisterMessageListener(Action<string> callback)"),
             "register wrapper missing: {cs}"
         );
         assert!(
-            cs.contains("public static void EventsUnregisterMessageListener(ulong id)"),
+            cs.contains("public static void UnregisterMessageListener(ulong id)"),
             "unregister wrapper missing: {cs}"
         );
         assert!(
@@ -3285,7 +3700,7 @@ mod tests {
     #[test]
     fn dotnet_builder_generated() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -3312,6 +3727,7 @@ mod tests {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             }],
             generators: None,
@@ -3482,6 +3898,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -3520,6 +3937,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -3556,6 +3974,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -3594,6 +4013,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -3625,6 +4045,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -3679,6 +4100,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -3748,6 +4170,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -3812,6 +4235,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -3866,6 +4290,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -3915,6 +4340,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -3923,6 +4349,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -3970,6 +4397,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -4018,6 +4446,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -4095,6 +4524,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4103,6 +4533,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4135,6 +4566,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4143,6 +4575,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4176,6 +4609,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4184,6 +4618,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4227,6 +4662,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4276,6 +4712,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4284,6 +4721,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4395,6 +4833,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -4410,6 +4849,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -4420,11 +4860,13 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
             ],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4501,6 +4943,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -4592,6 +5035,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4683,6 +5127,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4720,6 +5165,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4782,6 +5228,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -4820,6 +5267,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -4884,6 +5332,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -4894,6 +5343,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -4904,6 +5354,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -4923,6 +5374,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -5084,6 +5536,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5099,6 +5552,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5114,6 +5568,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5129,6 +5584,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -5139,11 +5595,13 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
             ],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
@@ -5347,6 +5805,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -5409,6 +5868,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5417,13 +5877,13 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
 
-        let config = DotnetConfig {
-            strip_module_prefix: true,
-            ..DotnetConfig::default()
-        };
+        // Stripping is the default: the per-module static class already
+        // namespaces the method.
+        let config = DotnetConfig::default();
 
         let tmp = std::env::temp_dir().join("weaveffi_test_dotnet_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -5446,7 +5906,10 @@ mod tests {
             "C ABI call should still use full name: {cs}"
         );
 
-        let no_strip = DotnetConfig::default();
+        let no_strip = DotnetConfig {
+            strip_module_prefix: false,
+            ..DotnetConfig::default()
+        };
         let tmp2 = std::env::temp_dir().join("weaveffi_test_dotnet_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
@@ -5457,7 +5920,7 @@ mod tests {
         let cs2 = std::fs::read_to_string(tmp2.join("dotnet/WeaveFFI.cs")).unwrap();
         assert!(
             cs2.contains("ContactsCreateContact("),
-            "default should use module-prefixed name: {cs2}"
+            "strip_module_prefix: false should restore module-prefixed names: {cs2}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -5482,6 +5945,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5500,6 +5964,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5535,6 +6000,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5543,6 +6009,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5578,6 +6045,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5619,6 +6087,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5638,7 +6107,7 @@ mod tests {
     #[test]
     fn dotnet_typed_handle_type() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -5653,6 +6122,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 }],
@@ -5671,6 +6141,7 @@ mod tests {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             }],
             generators: None,
@@ -5706,6 +6177,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5724,6 +6196,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5786,6 +6259,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5804,6 +6278,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5836,6 +6311,7 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5844,6 +6320,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5876,6 +6353,7 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5884,6 +6362,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5921,6 +6400,7 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5929,6 +6409,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }]);
         let cs = render_csharp(
@@ -5964,6 +6445,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -5972,6 +6454,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![Module {
                 name: "child".to_string(),
                 functions: vec![Function {
@@ -5981,6 +6464,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 }],
@@ -5989,6 +6473,7 @@ mod tests {
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
+                interfaces: vec![],
                 modules: vec![],
             }],
         }]);
@@ -6040,6 +6525,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: Some("Use AddV2 instead".into()),
             since: Some("0.1.0".into()),
         }])]);
@@ -6072,6 +6558,7 @@ mod tests {
                 doc: Some("Performs a thing.".into()),
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -6099,6 +6586,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }])
     }
@@ -6200,6 +6688,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }])]);
@@ -6324,6 +6813,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -6347,6 +6837,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -6362,6 +6853,7 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 },
@@ -6371,6 +6863,7 @@ mod tests {
             callbacks: vec![],
             listeners: vec![],
             errors: None,
+            interfaces: vec![],
             modules: vec![],
         }])
     }
@@ -6505,6 +6998,572 @@ mod tests {
         assert!(
             cs.contains("public static ulong ShapesSumBytes(byte[] values)"),
             "sum_bytes wrapper: {cs}"
+        );
+    }
+
+    /// A `kv` module exercising the 0.5.0 surface: a declared error domain, a
+    /// `Store` interface (real ctor, named factory, sync/iterator/async
+    /// methods, a static), and free functions with mixed `throws`.
+    fn kv_api() -> Api {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain, InterfaceDef};
+        let f = |name: &str,
+                 params: Vec<Param>,
+                 returns: Option<TypeRef>,
+                 throws: bool,
+                 is_async: bool,
+                 cancellable: bool| Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            throws,
+            r#async: is_async,
+            cancellable,
+            deprecated: None,
+            since: None,
+        };
+        let p = |name: &str, ty: TypeRef| Param {
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        };
+        make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![
+                f(
+                    "lookup_store",
+                    vec![p("store", TypeRef::Interface("Store".into()))],
+                    Some(TypeRef::U64),
+                    true,
+                    false,
+                    false,
+                ),
+                f("ping", vec![], Some(TypeRef::Bool), false, false, false),
+            ],
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: Some("A key-value store.".into()),
+                constructors: vec![
+                    f(
+                        "new",
+                        vec![p("path", TypeRef::StringUtf8)],
+                        None,
+                        true,
+                        false,
+                        false,
+                    ),
+                    f(
+                        "open_readonly",
+                        vec![p("path", TypeRef::StringUtf8)],
+                        None,
+                        false,
+                        false,
+                        false,
+                    ),
+                ],
+                methods: vec![
+                    f(
+                        "get",
+                        vec![p("store_key", TypeRef::StringUtf8)],
+                        Some(TypeRef::StringUtf8),
+                        true,
+                        false,
+                        false,
+                    ),
+                    f("count", vec![], Some(TypeRef::U64), false, false, false),
+                    f(
+                        "list_keys",
+                        vec![],
+                        Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                        true,
+                        false,
+                        false,
+                    ),
+                    f("compact", vec![], None, true, true, true),
+                ],
+                statics: vec![f(
+                    "default_capacity",
+                    vec![],
+                    Some(TypeRef::U32),
+                    false,
+                    false,
+                    false,
+                )],
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KEY_NOT_FOUND".into(),
+                        code: 1001,
+                        message: "Key not found".into(),
+                        doc: None,
+                    },
+                    ErrorCode {
+                        name: "IO_ERROR".into(),
+                        code: 1004,
+                        message: "I/O failure".into(),
+                        doc: Some("Underlying storage failed.".into()),
+                    },
+                ],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn typed_exception_rendering() {
+        let cs = render_csharp(
+            &kv_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        // The domain exception extends the generic brand exception and drops
+        // the doubled suffix (KvException, not KvErrorException).
+        assert!(
+            cs.contains("public class KvException : WeaveFFIException"),
+            "typed exception class missing: {cs}"
+        );
+        assert!(
+            !cs.contains("KvErrorException"),
+            "doubled suffix must not appear: {cs}"
+        );
+        // Codes surface as PascalCase constants with their ABI values.
+        assert!(
+            cs.contains("public const int KeyNotFound = 1001;"),
+            "code constant missing: {cs}"
+        );
+        assert!(
+            cs.contains("public const int IoError = 1004;"),
+            "code constant missing: {cs}"
+        );
+        // FromCode maps known codes to the typed exception and falls back to
+        // the generic exception for unknown codes, with the default message
+        // filling an empty slot message.
+        assert!(
+            cs.contains("internal static WeaveFFIException FromCode(int code, string message)"),
+            "FromCode factory missing: {cs}"
+        );
+        assert!(
+            cs.contains("case KeyNotFound:")
+                && cs.contains(
+                    "return new KvException(code, string.IsNullOrEmpty(message) ? \"Key not found\" : message);"
+                ),
+            "typed mapping missing: {cs}"
+        );
+        assert!(
+            cs.contains("default:") && cs.contains("return new WeaveFFIException(code, message);"),
+            "generic fallback missing: {cs}"
+        );
+        // The error-check helper gains a per-domain variant.
+        assert!(
+            cs.contains("internal static void CheckKv(WeaveFFIError err)")
+                && cs.contains("throw KvException.FromCode(err.Code, msg);"),
+            "per-domain check missing: {cs}"
+        );
+    }
+
+    #[test]
+    fn interface_class_rendering() {
+        let cs = render_csharp(
+            &kv_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        // Opaque-handle wrapper following the struct pattern.
+        assert!(
+            cs.contains("public class Store : IDisposable"),
+            "interface class missing: {cs}"
+        );
+        assert!(
+            cs.contains("internal Store(IntPtr handle)"),
+            "internal handle ctor missing: {cs}"
+        );
+        assert!(
+            cs.contains("internal IntPtr Handle => _handle;"),
+            "Handle accessor missing: {cs}"
+        );
+        // The `new` constructor is a real C# constructor assigning _handle.
+        assert!(
+            cs.contains("public Store(string path)"),
+            "real constructor missing: {cs}"
+        );
+        assert!(
+            cs.contains("_handle = result;"),
+            "constructor must assign the checked handle: {cs}"
+        );
+        // Other constructors become static factories wrapping the pointer.
+        assert!(
+            cs.contains("public static Store OpenReadonly(string path)"),
+            "factory missing: {cs}"
+        );
+        assert!(
+            cs.contains("return new Store(result);"),
+            "factory must wrap the owned pointer: {cs}"
+        );
+        // Instance method: non-static, handle as the leading argument.
+        assert!(
+            cs.contains("public string Get(string storeKey)"),
+            "instance method missing: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_kv_Store_get(_handle, storeKeyPtr, ref err);"),
+            "method must pass _handle first: {cs}"
+        );
+        // Static member is a plain static method.
+        assert!(
+            cs.contains("public static uint DefaultCapacity()"),
+            "interface static missing: {cs}"
+        );
+        // Iterator method surfaces as IEnumerable with the handle prepended.
+        assert!(
+            cs.contains("public IEnumerable<string> ListKeys()"),
+            "iterator method missing: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_kv_Store_list_keys(_handle, ref err);"),
+            "iterator launch must pass _handle: {cs}"
+        );
+        // Async method returns Task and passes the handle to the launcher.
+        assert!(
+            cs.contains("public async Task Compact()"),
+            "async method missing: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "NativeMethods.weaveffi_kv_Store_compact_async(_handle, IntPtr.Zero, callback, ctx);"
+            ),
+            "async launch must pass _handle and the cancel slot: {cs}"
+        );
+        // Disposal: Dispose + finalizer calling the destroy symbol once.
+        assert!(
+            cs.contains("NativeMethods.weaveffi_kv_Store_destroy(_handle);")
+                && cs.contains("~Store()"),
+            "dispose/finalizer missing: {cs}"
+        );
+        // Externs: destroy plus shape-matched member declarations with the
+        // implicit self slot on instance members.
+        for sym in [
+            "internal static extern void weaveffi_kv_Store_destroy(IntPtr self);",
+            "internal static extern IntPtr weaveffi_kv_Store_new(IntPtr path, ref WeaveFFIError err);",
+            "internal static extern IntPtr weaveffi_kv_Store_open_readonly(IntPtr path, ref WeaveFFIError err);",
+            "internal static extern IntPtr weaveffi_kv_Store_get(IntPtr self, IntPtr store_key, ref WeaveFFIError err);",
+            "internal static extern ulong weaveffi_kv_Store_count(IntPtr self, ref WeaveFFIError err);",
+            "internal static extern IntPtr weaveffi_kv_Store_list_keys(IntPtr self, ref WeaveFFIError out_err);",
+            "internal static extern int weaveffi_kv_Store_ListKeysIterator_next(",
+            "internal static extern void weaveffi_kv_Store_ListKeysIterator_destroy(IntPtr iter);",
+            "internal static extern void weaveffi_kv_Store_compact_async(IntPtr self, IntPtr cancel_token, AsyncCb_weaveffi_kv_Store_compact callback, IntPtr context);",
+            "internal static extern uint weaveffi_kv_Store_default_capacity(ref WeaveFFIError err);",
+        ] {
+            assert!(cs.contains(sym), "missing P/Invoke `{sym}`: {cs}");
+        }
+        // No stray sync extern for the async-only member.
+        assert!(
+            !cs.contains("weaveffi_kv_Store_compact(IntPtr self, ref WeaveFFIError err)"),
+            "async member must not declare a sync extern: {cs}"
+        );
+        // Interface parameters borrow the handle.
+        assert!(
+            cs.contains("public static ulong LookupStore(Store store)"),
+            "interface param wrapper missing: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_kv_lookup_store(store.Handle, ref err);"),
+            "interface param must pass obj.Handle: {cs}"
+        );
+    }
+
+    /// Extract the body of the method whose signature contains `sig`, up to
+    /// the next method boundary (a blank line followed by a doc comment or
+    /// declaration at the same depth). Good enough to scope error-check
+    /// assertions to one wrapper.
+    fn method_slice<'a>(cs: &'a str, sig: &str) -> &'a str {
+        let start = cs
+            .find(sig)
+            .unwrap_or_else(|| panic!("signature `{sig}` not found in: {cs}"));
+        let rest = &cs[start..];
+        let end = rest.find("\n\n").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn throws_split_typed_vs_generic() {
+        let cs = render_csharp(
+            &kv_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        // throws == true: sync method reports through the typed check.
+        let get = method_slice(&cs, "public string Get(string storeKey)");
+        assert!(
+            get.contains("WeaveFFIError.CheckKv(err);"),
+            "throwing method must use the typed check: {get}"
+        );
+        // throws == false: generic check only (panics/marshalling).
+        let count = method_slice(&cs, "public ulong Count()");
+        assert!(
+            count.contains("WeaveFFIError.Check(err);") && !count.contains("CheckKv"),
+            "non-throwing method must use the generic check: {count}"
+        );
+        // Free functions follow the same split.
+        let lookup = method_slice(&cs, "public static ulong LookupStore(Store store)");
+        assert!(
+            lookup.contains("WeaveFFIError.CheckKv(err);"),
+            "throwing free function must use the typed check: {lookup}"
+        );
+        let ping = method_slice(&cs, "public static bool Ping()");
+        assert!(
+            ping.contains("WeaveFFIError.Check(err);") && !ping.contains("CheckKv"),
+            "non-throwing free function must use the generic check: {ping}"
+        );
+        // The real constructor throws the typed exception too.
+        let ctor = method_slice(&cs, "public Store(string path)");
+        assert!(
+            ctor.contains("WeaveFFIError.CheckKv(err);"),
+            "throwing constructor must use the typed check: {ctor}"
+        );
+        // Async completion faults the task with the typed exception; the
+        // iterator's next-checks are typed as well.
+        assert!(
+            cs.contains("tcs.SetException(KvException.FromCode(wErr.Code, msg));"),
+            "async throws must fault with the typed exception: {cs}"
+        );
+        let iter = method_slice(&cs, "private static IEnumerable<string> EnumerateListKeys(");
+        assert!(
+            iter.contains("WeaveFFIError.CheckKv(iterErr);"),
+            "iterator next-check must be typed: {iter}"
+        );
+        // Throwing wrappers document the exception type.
+        assert!(
+            cs.contains(
+                "/// <exception cref=\"KvException\">Thrown when the call reports a KvError code.</exception>"
+            ),
+            "exception doc missing: {cs}"
+        );
+    }
+
+    #[test]
+    fn wrapper_params_are_camel_case() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "create_contact".into(),
+                params: vec![
+                    Param {
+                        name: "first_name".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                        doc: Some("Given name.".into()),
+                    },
+                    Param {
+                        name: "contact_type".into(),
+                        ty: TypeRef::I32,
+                        mutable: false,
+                        doc: None,
+                    },
+                ],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }]);
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        assert!(
+            cs.contains("public static int CreateContact(string firstName, int contactType)"),
+            "wrapper params must be camelCase: {cs}"
+        );
+        assert!(
+            cs.contains("Marshal.StringToCoTaskMemUTF8(firstName)")
+                && cs.contains("Marshal.FreeCoTaskMem(firstNamePtr);"),
+            "marshalling locals must follow the camelCase name: {cs}"
+        );
+        assert!(
+            cs.contains("/// <param name=\"firstName\">Given name.</param>"),
+            "param docs must use the camelCase name: {cs}"
+        );
+        // The P/Invoke extern keeps the IDL spelling.
+        assert!(
+            cs.contains("internal static extern int weaveffi_contacts_create_contact(IntPtr first_name, int contact_type, ref WeaveFFIError err);"),
+            "extern must keep IDL parameter names: {cs}"
+        );
+    }
+
+    #[test]
+    fn default_config_strips_module_prefix() {
+        let config = DotnetConfig::default();
+        assert!(
+            config.strip_module_prefix,
+            "strip_module_prefix must default to true"
+        );
+    }
+
+    /// Parse, validate, and render a CLI fixture IDL end to end. Stands in
+    /// for the CLI-driven generation while `weaveffi-cli` is blocked on other
+    /// generators mid-overhaul: same parse, validation, model build, and
+    /// render path the CLI runs, minus the argument plumbing.
+    fn render_fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../weaveffi-cli/tests/fixtures")
+            .join(name);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
+        let mut api = weaveffi_ir::parse::parse_api_str(&text, "yml").expect("fixture must parse");
+        weaveffi_core::validate::validate_api(&mut api, None).expect("fixture must validate");
+        render_csharp(&api, "WeaveFFI", true, "weaveffi", name, "WeaveFFI.cs")
+    }
+
+    #[test]
+    fn fixture_contacts_renders_new_surface() {
+        let cs = render_fixture("02_contacts.yml");
+        // Interface class: real ctor for `new`, PascalCase methods with
+        // camelCase parameters, disposal through the destroy symbol.
+        assert!(
+            cs.contains("public class ContactBook : IDisposable"),
+            "ContactBook class missing: {cs}"
+        );
+        assert!(
+            cs.contains("public ContactBook()"),
+            "real constructor missing: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "public Contact Add(string firstName, string lastName, string? email, \
+                 ContactType contactType)"
+            ),
+            "Add method missing: {cs}"
+        );
+        assert!(
+            cs.contains("public Contact Get(long id)"),
+            "Get method missing: {cs}"
+        );
+        assert!(
+            cs.contains("public Contact[] List()"),
+            "List method missing: {cs}"
+        );
+        assert!(
+            cs.contains("public bool Remove(long id)"),
+            "Remove method missing: {cs}"
+        );
+        assert!(
+            cs.contains("public int Count()"),
+            "Count method missing: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_contacts_ContactBook_destroy(_handle);")
+                && cs.contains("~ContactBook()"),
+            "dispose/finalizer missing: {cs}"
+        );
+        // Typed errors: domain exception with code constants, typed checks in
+        // throwing methods, generic checks elsewhere.
+        assert!(
+            cs.contains("public class ContactsException : WeaveFFIException"),
+            "ContactsException missing: {cs}"
+        );
+        assert!(
+            cs.contains("public const int InvalidName = 1;")
+                && cs.contains("public const int NotFound = 2;"),
+            "code constants missing: {cs}"
+        );
+        let get = method_slice(&cs, "public Contact Get(long id)");
+        assert!(
+            get.contains("WeaveFFIError.CheckContacts(err);"),
+            "throwing method must use the typed check: {get}"
+        );
+        let count = method_slice(&cs, "public int Count()");
+        assert!(
+            count.contains("WeaveFFIError.Check(err);") && !count.contains("CheckContacts"),
+            "non-throwing method must use the generic check: {count}"
+        );
+    }
+
+    #[test]
+    fn fixture_inventory_renders_two_domains() {
+        let cs = render_fixture("03_inventory.yml");
+        // The products module owns the Catalog interface.
+        assert!(
+            cs.contains("public class Catalog : IDisposable"),
+            "Catalog class missing: {cs}"
+        );
+        assert!(
+            cs.contains("public Product AddProduct(string name, double price, Category category)"),
+            "AddProduct method missing: {cs}"
+        );
+        assert!(
+            cs.contains("public Product GetProduct(long id)"),
+            "GetProduct method missing: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_products_Catalog_destroy(_handle);"),
+            "Catalog destroy missing: {cs}"
+        );
+        // Two error domains, each with its own exception and check helper.
+        assert!(
+            cs.contains("public class ProductsException : WeaveFFIException")
+                && cs.contains("public class OrdersException : WeaveFFIException"),
+            "both domain exceptions must render: {cs}"
+        );
+        assert!(
+            cs.contains("public const int InvalidPrice = 1;")
+                && cs.contains("public const int ProductNotFound = 2;")
+                && cs.contains("public const int OrderNotFound = 1;")
+                && cs.contains("public const int EmptyOrder = 2;"),
+            "per-domain code constants missing: {cs}"
+        );
+        let add = method_slice(
+            &cs,
+            "public Product AddProduct(string name, double price, Category category)",
+        );
+        assert!(
+            add.contains("WeaveFFIError.CheckProducts(err);"),
+            "Catalog methods must use the products check: {add}"
+        );
+        // The orders module's free functions use their own domain.
+        let create = method_slice(&cs, "public static long CreateOrder(OrderItem[] items)");
+        assert!(
+            create.contains("WeaveFFIError.CheckOrders(err);"),
+            "orders functions must use the orders check: {create}"
+        );
+        let cancel = method_slice(&cs, "public static bool CancelOrder(long id)");
+        assert!(
+            cancel.contains("WeaveFFIError.Check(err);") && !cancel.contains("CheckOrders"),
+            "non-throwing orders function must use the generic check: {cancel}"
+        );
+        // Per-module static classes with stripped method names.
+        assert!(
+            cs.contains("public static class Orders"),
+            "orders wrapper class missing: {cs}"
         );
     }
 }

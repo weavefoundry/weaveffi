@@ -35,12 +35,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {

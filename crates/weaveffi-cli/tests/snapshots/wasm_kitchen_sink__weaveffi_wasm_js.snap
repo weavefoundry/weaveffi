@@ -16,6 +16,51 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+/** Base error for the `kitchen` module's error domain. */
+export class KitchenErrorsError extends WeaveFFIError {}
+
+// Item not found
+export class NotFound extends KitchenErrorsError {
+  constructor(message = "Item not found") {
+    super(1, message);
+  }
+}
+NotFound.CODE = 1;
+KitchenErrorsError.NotFound = NotFound;
+
+// Invalid input
+export class InvalidInput extends KitchenErrorsError {
+  constructor(message = "Invalid input") {
+    super(2, message);
+  }
+}
+InvalidInput.CODE = 2;
+KitchenErrorsError.InvalidInput = InvalidInput;
+
+const _KITCHEN_ERRORS_ERROR_CODES = Object.freeze({
+  1: NotFound,
+  2: InvalidInput,
+});
+
+// Build the KitchenErrorsError subclass matching `code`, or a generic
+// WeaveFFIError for codes outside the domain (panics, marshalling).
+function _kitchenErrorsErrorFrom(code, message) {
+  const _cls = _KITCHEN_ERRORS_ERROR_CODES[code];
+  if (!_cls) return new WeaveFFIError(code, message);
+  return message ? new _cls(message) : new _cls();
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -83,6 +128,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -91,7 +139,7 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
@@ -100,16 +148,32 @@ function _freeErr(wasm, errPtr) {
   wasm.weaveffi_dealloc(errPtr, 8);
 }
 
+// Throw the `KitchenErrorsError` domain error (and free the slot) if the error slot
+// carries a non-zero code.
+function _checkKitchenErrorsError(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code !== 0) {
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
+    wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
+    throw _kitchenErrorsErrorFrom(code, msg);
+  }
+}
+
 // Throw if a borrowed (producer-owned) error carries a non-zero
 // code. Used by async callbacks: the producer owns and frees the
 // error struct, so the slot is read but never deallocated here.
-function _checkErrRef(wasm, errPtr) {
+// `mkErr` maps domain codes for throwing callables; without it the
+// generic WeaveFFIError is thrown.
+function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code === 0) return;
   const msgPtr = dv.getUint32(errPtr + 4, true);
   const msg = _readCStr(wasm, msgPtr) || '';
-  throw new Error(`WeaveFFI error ${code}: ${msg}`);
+  throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);
 }
 
 function _registerTrampoline(table, paramTypes, handler) {
@@ -465,7 +529,7 @@ export async function loadWeaveffiWasm(url) {
     if (!ctx) return;
     _asyncContexts.delete(ctxId);
     try {
-      if (errPtr !== 0) _checkErrRef(wasm, errPtr);
+      if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);
       ctx.resolve(ctx.unwrap ? ctx.unwrap(wasm, ...results) : results[0]);
     } catch (e) {
       ctx.reject(e);
@@ -473,6 +537,49 @@ export async function loadWeaveffiWasm(url) {
   }
 
   const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], _asyncHandler);
+
+  // A pocket-sized interface exercising the object surface
+  class Gadget {
+    constructor(id) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kitchen_Gadget_new(BigInt(id), _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      this._handle = _r;
+    }
+    static _wrap(handle) {
+      const _o = Object.create(Gadget.prototype);
+      _o._handle = handle;
+      return _o;
+    }
+    free() {
+      if (this._handle !== 0) {
+        wasm.weaveffi_kitchen_Gadget_destroy(this._handle);
+        this._handle = 0;
+      }
+    }
+    describe() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kitchen_Gadget_describe(this._handle, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _takeCStr(wasm, _r);
+    }
+    poke(times) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kitchen_Gadget_poke(this._handle, times, _err);
+      _checkKitchenErrorsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r;
+    }
+    static version() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_kitchen_Gadget_version(_err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _takeCStr(wasm, _r);
+    }
+  }
 
   return {
     _raw: wasm,
@@ -489,42 +596,42 @@ export async function loadWeaveffiWasm(url) {
       },
     },
     kitchen: {
-      bool_id(x) {
+      boolId(x) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_bool_id(x ? 1 : 0, _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r !== 0;
       },
-      i32_id(x) {
+      i32Id(x) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_i32_id(x, _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      u32_id(x) {
+      u32Id(x) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_u32_id(x, _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      i64_id(x) {
+      i64Id(x) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_i64_id(BigInt(x), _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      f64_id(x) {
+      f64Id(x) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_f64_id(x, _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      echo_string(s) {
+      echoString(s) {
         const [a0_p, a0_s] = _cstr(wasm, s);
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_echo_string(a0_p, _err);
@@ -533,7 +640,7 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return _takeCStr(wasm, _r);
       },
-      echo_bytes(b) {
+      echoBytes(b) {
         const [a0_p, a0_l] = _bytes(wasm, b);
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
@@ -546,7 +653,7 @@ export async function loadWeaveffiWasm(url) {
         wasm.weaveffi_dealloc(_lp, 4);
         return _takeBytes(wasm, _r, _len);
       },
-      echo_borrowed_str(s) {
+      echoBorrowedStr(s) {
         const [a0_p, a0_s] = _cstr(wasm, s);
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_echo_borrowed_str(a0_p, _err);
@@ -555,7 +662,7 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return _takeCStr(wasm, _r);
       },
-      echo_borrowed_bytes(b) {
+      echoBorrowedBytes(b) {
         const [a0_p, a0_l] = _bytes(wasm, b);
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
@@ -568,28 +675,28 @@ export async function loadWeaveffiWasm(url) {
         wasm.weaveffi_dealloc(_lp, 4);
         return _takeBytes(wasm, _r, _len);
       },
-      open_handle() {
+      openHandle() {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_open_handle(_err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      open_typed_handle() {
+      openTypedHandle() {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_open_typed_handle(_err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return new Token(wasm, _r);
       },
-      maybe_item(id) {
+      maybeItem(id) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_maybe_item(BigInt(id), _err);
-        _checkErr(wasm, _err);
+        _checkKitchenErrorsError(wasm, _err);
         _freeErr(wasm, _err);
         return _r === 0 ? null : new Item(wasm, _r);
       },
-      list_items() {
+      listItems() {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_list_items(_lp, _err);
@@ -605,7 +712,7 @@ export async function loadWeaveffiWasm(url) {
         }
         return _out;
       },
-      get_attrs() {
+      getAttrs() {
         const _kp = wasm.weaveffi_alloc(4);
         const _vp = wasm.weaveffi_alloc(4);
         const _lp = wasm.weaveffi_alloc(4);
@@ -630,7 +737,7 @@ export async function loadWeaveffiWasm(url) {
         for (let i = 0; i < _len; i++) _out[_out_k[i]] = _out_v[i];
         return _out;
       },
-      stream_items() {
+      streamItems() {
         const _err = _allocErr(wasm);
         const _it = wasm.weaveffi_kitchen_stream_items(_err);
         _checkErr(wasm, _err);
@@ -649,14 +756,14 @@ export async function loadWeaveffiWasm(url) {
         wasm.weaveffi_kitchen_StreamItemsIterator_destroy(_it);
         return _out;
       },
-      cross_module_token() {
+      crossModuleToken() {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_cross_module_token(_err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return new Token(wasm, _r);
       },
-      do_async(input) {
+      doAsync(input) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => _takeCStr(w, p) });
@@ -665,7 +772,7 @@ export async function loadWeaveffiWasm(url) {
           wasm.weaveffi_dealloc(a0_p, a0_s);
         });
       },
-      do_cancellable(input) {
+      doCancellable(input) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => _takeCStr(w, p) });
@@ -675,26 +782,27 @@ export async function loadWeaveffiWasm(url) {
         });
       },
       /** @deprecated Use new_op instead */
-      legacy_op() {
+      legacyOp() {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_legacy_op(_err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      new_op() {
+      newOp() {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_kitchen_new_op(_err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      register_ready_listener() {
+      registerReadyListener() {
         throw new Error("weaveffi: listener 'ready_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
-      unregister_ready_listener() {
+      unregisterReadyListener() {
         throw new Error("weaveffi: listener 'ready_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
       },
+      Gadget: Gadget,
       Item: {
         create: (...args) => Item.create(wasm, ...args),
         builder: () => new ItemBuilder(wasm),

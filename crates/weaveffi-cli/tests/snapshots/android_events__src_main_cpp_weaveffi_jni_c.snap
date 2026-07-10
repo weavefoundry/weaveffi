@@ -15,8 +15,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
@@ -51,7 +56,7 @@ static void weaveffi_events_OnMessage_fn_jni_tramp(const char* message, void* co
     if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_events_1register_1message_1listener(JNIEnv* env, jclass clazz, jobject callback) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_registerMessageListener(JNIEnv* env, jclass clazz, jobject callback) {
     weaveffi_jni_listener_ctx* ctx = (weaveffi_jni_listener_ctx*)calloc(1, sizeof(weaveffi_jni_listener_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -64,7 +69,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_events_1register_1message_1li
     return (jlong)id;
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_1unregister_1message_1listener(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_unregisterMessageListener(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_events_unregister_message_listener((uint64_t)id);
     pthread_mutex_lock(&weaveffi_jni_listener_lock);
     weaveffi_jni_listener_ctx** link = &weaveffi_jni_listeners;
@@ -81,7 +86,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_1unregister_1message_1l
     pthread_mutex_unlock(&weaveffi_jni_listener_lock);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_1send_1message(JNIEnv* env, jclass clazz, jstring text) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_sendMessage(JNIEnv* env, jclass clazz, jstring text) {
     weaveffi_error err = {0, NULL};
     const char* text_chars = (*env)->GetStringUTFChars(env, text, NULL);
     weaveffi_events_send_message(text_chars, &err);
@@ -93,7 +98,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_events_1send_1message(JNIEnv* 
     return;
 }
 
-JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_events_1get_1messages(JNIEnv* env, jclass clazz) {
+JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_WeaveFFI_getMessages(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     weaveffi_events_GetMessagesIterator* _iter = weaveffi_events_get_messages(&err);
     if (err.code != 0) {

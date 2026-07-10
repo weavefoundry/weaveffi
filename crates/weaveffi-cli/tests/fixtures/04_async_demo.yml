@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: tasks
     structs:
@@ -7,12 +7,17 @@ modules:
           - { name: id, type: i64 }
           - { name: value, type: string }
           - { name: success, type: bool }
+    errors:
+      name: TaskError
+      codes:
+        - { name: InvalidName, code: 1, message: "task name must not be empty" }
     functions:
       - name: run_task
         params:
           - { name: name, type: string }
         return: TaskResult
         async: true
+        throws: true
       - name: run_batch
         params:
           - { name: names, type: "[string]" }

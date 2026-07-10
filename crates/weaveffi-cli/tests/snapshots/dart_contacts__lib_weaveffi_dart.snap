@@ -35,12 +35,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -49,6 +50,41 @@ void _checkError(Pointer<_WeaveFFIError> err) {
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
     throw WeaveFFIException(code, msg);
+  }
+}
+
+/// Typed error domain `ContactsError` declared by module `contacts`.
+class ContactsException extends WeaveFFIException {
+  ContactsException(super.code, super.message);
+}
+
+/// name must not be empty
+class InvalidNameException extends ContactsException {
+  InvalidNameException([String message = 'name must not be empty']) : super(1, message);
+}
+
+/// contact not found
+class NotFoundException extends ContactsException {
+  NotFoundException([String message = 'contact not found']) : super(2, message);
+}
+
+WeaveFFIException _mapContactsException(int code, String message) {
+  switch (code) {
+    case 1:
+      return InvalidNameException(message);
+    case 2:
+      return NotFoundException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkContactsException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapContactsException(code, msg);
   }
 }
 
@@ -129,94 +165,128 @@ class Contact {
   }
 }
 
-typedef _NativeWeaveffiContactsCreateContact = Int64 Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsCreateContact = int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int, Pointer<_WeaveFFIError>);
-final _weaveffiContactsCreateContact = _lib.lookupFunction<
-    _NativeWeaveffiContactsCreateContact, _DartWeaveffiContactsCreateContact>('weaveffi_contacts_create_contact');
+typedef _NativeWeaveffiContactsContactBookDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiContactsContactBookDestroy = void Function(Pointer<Void>);
+final _weaveffiContactsContactBookDestroy = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookDestroy, _DartWeaveffiContactsContactBookDestroy>('weaveffi_contacts_ContactBook_destroy');
 
-int createContact(String firstName, String lastName, String? email, ContactType contactType) {
-  final firstNamePtr = firstName.toNativeUtf8();
-  final lastNamePtr = lastName.toNativeUtf8();
-  final emailPtr = email == null ? nullptr : email.toNativeUtf8();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiContactsCreateContact(firstNamePtr, lastNamePtr, emailPtr, contactType.value, err);
-    _checkError(err);
-    return result;
-  } finally {
-    calloc.free(firstNamePtr);
-    calloc.free(lastNamePtr);
-    if (emailPtr != nullptr) calloc.free(emailPtr);
-    calloc.free(err);
+typedef _NativeWeaveffiContactsContactBookNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+final _weaveffiContactsContactBookNew = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookNew, _DartWeaveffiContactsContactBookNew>('weaveffi_contacts_ContactBook_new');
+
+typedef _NativeWeaveffiContactsContactBookAdd = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookAdd = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int, Pointer<_WeaveFFIError>);
+final _weaveffiContactsContactBookAdd = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookAdd, _DartWeaveffiContactsContactBookAdd>('weaveffi_contacts_ContactBook_add');
+
+typedef _NativeWeaveffiContactsContactBookGet = Pointer<Void> Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookGet = Pointer<Void> Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiContactsContactBookGet = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookGet, _DartWeaveffiContactsContactBookGet>('weaveffi_contacts_ContactBook_get');
+
+typedef _NativeWeaveffiContactsContactBookList = Pointer<Void> Function(Pointer<Void>, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookList = Pointer<Void> Function(Pointer<Void>, Pointer<Size>, Pointer<_WeaveFFIError>);
+final _weaveffiContactsContactBookList = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookList, _DartWeaveffiContactsContactBookList>('weaveffi_contacts_ContactBook_list');
+
+typedef _NativeWeaveffiContactsContactBookRemove = Int32 Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookRemove = int Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiContactsContactBookRemove = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookRemove, _DartWeaveffiContactsContactBookRemove>('weaveffi_contacts_ContactBook_remove');
+
+typedef _NativeWeaveffiContactsContactBookCount = Int32 Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookCount = int Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiContactsContactBookCount = _lib.lookupFunction<
+    _NativeWeaveffiContactsContactBookCount, _DartWeaveffiContactsContactBookCount>('weaveffi_contacts_ContactBook_count');
+
+/// An in-memory address book owning its contacts
+class ContactBook {
+  final Pointer<Void> _handle;
+  ContactBook._(this._handle);
+
+  /// Releases the native object reference.
+  void dispose() {
+    _weaveffiContactsContactBookDestroy(_handle);
   }
-}
 
-typedef _NativeWeaveffiContactsGetContact = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsGetContact = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
-final _weaveffiContactsGetContact = _lib.lookupFunction<
-    _NativeWeaveffiContactsGetContact, _DartWeaveffiContactsGetContact>('weaveffi_contacts_get_contact');
-
-Contact getContact(int id) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiContactsGetContact(id, err);
-    _checkError(err);
-    return Contact._(result);
-  } finally {
-    calloc.free(err);
+  factory ContactBook() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiContactsContactBookNew(err);
+      _checkError(err);
+      return ContactBook._(result);
+    } finally {
+      calloc.free(err);
+    }
   }
-}
 
-typedef _NativeWeaveffiContactsListContacts = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsListContacts = Pointer<Void> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
-final _weaveffiContactsListContacts = _lib.lookupFunction<
-    _NativeWeaveffiContactsListContacts, _DartWeaveffiContactsListContacts>('weaveffi_contacts_list_contacts');
-
-List<Contact> listContacts() {
-  final outLen = calloc<Size>();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiContactsListContacts(outLen, err);
-    _checkError(err);
-    final n = outLen.value;
-    if (result == nullptr || n == 0) return <Contact>[];
-    final arr = result.cast<Pointer<Void>>();
-    return List<Contact>.generate(n, (i) => Contact._(arr[i]));
-  } finally {
-    calloc.free(outLen);
-    calloc.free(err);
+  /// Throws [ContactsException] on domain errors.
+  Contact add(String firstName, String lastName, String? email, ContactType contactType) {
+    final firstNamePtr = firstName.toNativeUtf8();
+    final lastNamePtr = lastName.toNativeUtf8();
+    final emailPtr = email == null ? nullptr : email.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiContactsContactBookAdd(_handle, firstNamePtr, lastNamePtr, emailPtr, contactType.value, err);
+      _checkContactsException(err);
+      return Contact._(result);
+    } finally {
+      calloc.free(firstNamePtr);
+      calloc.free(lastNamePtr);
+      if (emailPtr != nullptr) calloc.free(emailPtr);
+      calloc.free(err);
+    }
   }
-}
 
-typedef _NativeWeaveffiContactsDeleteContact = Int32 Function(Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsDeleteContact = int Function(int, Pointer<_WeaveFFIError>);
-final _weaveffiContactsDeleteContact = _lib.lookupFunction<
-    _NativeWeaveffiContactsDeleteContact, _DartWeaveffiContactsDeleteContact>('weaveffi_contacts_delete_contact');
-
-bool deleteContact(int id) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiContactsDeleteContact(id, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(err);
+  /// Throws [ContactsException] on domain errors.
+  Contact get(int id) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiContactsContactBookGet(_handle, id, err);
+      _checkContactsException(err);
+      return Contact._(result);
+    } finally {
+      calloc.free(err);
+    }
   }
-}
 
-typedef _NativeWeaveffiContactsCountContacts = Int32 Function(Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsCountContacts = int Function(Pointer<_WeaveFFIError>);
-final _weaveffiContactsCountContacts = _lib.lookupFunction<
-    _NativeWeaveffiContactsCountContacts, _DartWeaveffiContactsCountContacts>('weaveffi_contacts_count_contacts');
+  List<Contact> list() {
+    final outLen = calloc<Size>();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiContactsContactBookList(_handle, outLen, err);
+      _checkError(err);
+      final n = outLen.value;
+      if (result == nullptr || n == 0) return <Contact>[];
+      final arr = result.cast<Pointer<Void>>();
+      return List<Contact>.generate(n, (i) => Contact._(arr[i]));
+    } finally {
+      calloc.free(outLen);
+      calloc.free(err);
+    }
+  }
 
-int countContacts() {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiContactsCountContacts(err);
-    _checkError(err);
-    return result;
-  } finally {
-    calloc.free(err);
+  bool remove(int id) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiContactsContactBookRemove(_handle, id, err);
+      _checkError(err);
+      return result != 0;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  int count() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiContactsContactBookCount(_handle, err);
+      _checkError(err);
+      return result;
+    } finally {
+      calloc.free(err);
+    }
   }
 }
 

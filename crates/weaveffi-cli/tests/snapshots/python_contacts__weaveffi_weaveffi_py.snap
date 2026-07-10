@@ -87,6 +87,55 @@ def _bytes_to_string(ptr) -> Optional[str]:
 
 # === Module: contacts ===
 
+class ContactsError(WeaveFFIError):
+    """Base exception for the `contacts` module's error domain."""
+
+
+class InvalidName(ContactsError):
+    """name must not be empty"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "name must not be empty") -> None:
+        super().__init__(1, message)
+
+
+class NotFound(ContactsError):
+    """contact not found"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "contact not found") -> None:
+        super().__init__(2, message)
+
+
+ContactsError.InvalidName = InvalidName
+ContactsError.NotFound = NotFound
+
+
+_CONTACTS_ERROR_CODES: Dict[int, type] = {
+    1: InvalidName,
+    2: NotFound,
+}
+
+
+def _contacts_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the ContactsError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _CONTACTS_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_contacts_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _contacts_error_from(code, message)
+
+
 class ContactType(IntEnum):
     Personal = 0
     Work = 1
@@ -151,59 +200,103 @@ class Contact:
 
 
 
-def contacts_create_contact(first_name: str, last_name: str, email: Optional[str], contact_type: "ContactType") -> int:
-    _fn = _lib.weaveffi_contacts_create_contact
-    _fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_uint64
-    _email_c = _string_to_bytes(email)
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(_string_to_bytes(first_name), _string_to_bytes(last_name), _email_c, contact_type.value, ctypes.byref(_err))
-    _check_error(_err)
-    return _result
+class ContactBook:
+    """An in-memory address book owning its contacts"""
+
+    @classmethod
+    def _from_ptr(cls, ptr) -> "ContactBook":
+        _obj = cls.__new__(cls)
+        _obj._ptr = ptr
+        return _obj
+
+    def __init__(self) -> None:
+        self._ptr = None
+        _fn = _lib.weaveffi_contacts_ContactBook_new
+        _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        self._ptr = _result
 
 
-def contacts_get_contact(id: int) -> "Contact":
-    _fn = _lib.weaveffi_contacts_get_contact
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(id, ctypes.byref(_err))
-    _check_error(_err)
-    if _result is None:
-        raise WeaveFFIError(-1, "null pointer")
-    return Contact(_result)
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_contacts_ContactBook_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_contacts_ContactBook_destroy.restype = None
+            _lib.weaveffi_contacts_ContactBook_destroy(self._ptr)
+            self._ptr = None
+
+    def add(self, first_name: str, last_name: str, email: Optional[str], contact_type: "ContactType") -> "Contact":
+        """
+        Raises
+        ------
+        ContactsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_contacts_ContactBook_add
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _email_c = _string_to_bytes(email)
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _string_to_bytes(first_name), _string_to_bytes(last_name), _email_c, contact_type.value, ctypes.byref(_err))
+        _check_contacts_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Contact(_result)
 
 
-def contacts_list_contacts() -> List["Contact"]:
-    _fn = _lib.weaveffi_contacts_list_contacts
-    _fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.POINTER(ctypes.c_void_p)
-    _err = _WeaveFFIErrorStruct()
-    _out_len = ctypes.c_size_t(0)
-    _result = _fn(ctypes.byref(_out_len), ctypes.byref(_err))
-    _check_error(_err)
-    if not _result:
-        return []
-    return [Contact(_result[_i]) for _i in range(_out_len.value)]
+    def get(self, id: int) -> "Contact":
+        """
+        Raises
+        ------
+        ContactsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_contacts_ContactBook_get
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, id, ctypes.byref(_err))
+        _check_contacts_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Contact(_result)
 
 
-def contacts_delete_contact(id: int) -> bool:
-    _fn = _lib.weaveffi_contacts_delete_contact
-    _fn.argtypes = [ctypes.c_uint64, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(id, ctypes.byref(_err))
-    _check_error(_err)
-    return bool(_result)
+    def list(self) -> List["Contact"]:
+        _fn = _lib.weaveffi_contacts_ContactBook_list
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.POINTER(ctypes.c_void_p)
+        _err = _WeaveFFIErrorStruct()
+        _out_len = ctypes.c_size_t(0)
+        _result = _fn(self._ptr, ctypes.byref(_out_len), ctypes.byref(_err))
+        _check_error(_err)
+        if not _result:
+            return []
+        return [Contact(_result[_i]) for _i in range(_out_len.value)]
 
 
-def contacts_count_contacts() -> int:
-    _fn = _lib.weaveffi_contacts_count_contacts
-    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(ctypes.byref(_err))
-    _check_error(_err)
-    return _result
+    def remove(self, id: int) -> bool:
+        _fn = _lib.weaveffi_contacts_ContactBook_remove
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, id, ctypes.byref(_err))
+        _check_error(_err)
+        return bool(_result)
+
+
+    def count(self) -> int:
+        _fn = _lib.weaveffi_contacts_ContactBook_count
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, ctypes.byref(_err))
+        _check_error(_err)
+        return _result
+
 
 # END weaveffi.py

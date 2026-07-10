@@ -31,21 +31,27 @@ function expect(cond, msg) {
   }
 }
 
-api.events.send_message('alpha');
-api.events.send_message('beta');
+// Functions surface in lowerCamelCase (module-prefix-free names under the
+// module object).
+api.events.sendMessage('alpha');
+api.events.sendMessage('beta');
 
-const msgs = api.events.get_messages();
+const msgs = api.events.getMessages();
 expect(
   Array.isArray(msgs) && msgs.length === 2 && msgs[0] === 'alpha' && msgs[1] === 'beta',
   `iterator yields messages in order (got ${JSON.stringify(msgs)})`
 );
 
+// This module declares no error domain, so the generic brand error class is
+// still exported for panic/marshalling failures.
+expect(typeof mod.WeaveFFIError === 'function', 'WeaveFFIError exported');
+
 // The unsupported listener surface throws with a clear message instead of
 // silently not existing.
-expect(typeof api.events.register_message_listener === 'function', 'register stub exists');
+expect(typeof api.events.registerMessageListener === 'function', 'register stub exists');
 let threw = false;
 try {
-  api.events.register_message_listener(() => {});
+  api.events.registerMessageListener(() => {});
 } catch (e) {
   threw = true;
   expect(
@@ -57,7 +63,7 @@ expect(threw, 'register stub throws');
 
 let threwUnregister = false;
 try {
-  api.events.unregister_message_listener(1);
+  api.events.unregisterMessageListener(1);
 } catch (e) {
   threwUnregister = true;
 }

@@ -307,7 +307,7 @@ mod tests {
         use weaveffi_core::platform::{BinarySet, Platform};
 
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![module("calc")],
             generators: None,
             package: None,
@@ -368,6 +368,7 @@ mod tests {
             doc: None,
             r#async: false,
             cancellable: false,
+            throws: false,
             deprecated: None,
             since: None,
         }
@@ -379,6 +380,7 @@ mod tests {
             functions: vec![],
             structs: vec![],
             enums: vec![],
+            interfaces: vec![],
             callbacks: vec![],
             listeners: vec![],
             errors: None,
@@ -388,7 +390,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
@@ -576,6 +578,116 @@ mod tests {
         ));
         assert!(h.contains("uint64_t weaveffi_events_register_messages(weaveffi_events_on_message_fn callback, void* context);"));
         assert!(h.contains("void weaveffi_events_unregister_messages(uint64_t id);"));
+    }
+
+    #[test]
+    fn interface_emits_tag_members_and_destroy() {
+        use weaveffi_ir::ir::InterfaceDef;
+        let m = Module {
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: Some("A key/value store.".into()),
+                constructors: vec![Function {
+                    throws: true,
+                    ..func("open", vec![param("path", TypeRef::StringUtf8)], None)
+                }],
+                methods: vec![
+                    func("count", vec![], Some(TypeRef::I64)),
+                    func(
+                        "label",
+                        vec![param("prefix", TypeRef::StringUtf8)],
+                        Some(TypeRef::StringUtf8),
+                    ),
+                ],
+                statics: vec![func("default_capacity", vec![], Some(TypeRef::I64))],
+            }],
+            ..module("kv")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        // Opaque tag plus constructor returning an owned pointer.
+        assert!(h.contains("typedef struct weaveffi_kv_Store weaveffi_kv_Store;"));
+        assert!(h.contains(
+            "weaveffi_kv_Store* weaveffi_kv_Store_open(const char* path, weaveffi_error* out_err);"
+        ));
+        // Methods carry a leading const self pointer; statics do not.
+        assert!(h.contains(
+            "int64_t weaveffi_kv_Store_count(const weaveffi_kv_Store* self, weaveffi_error* out_err);"
+        ));
+        assert!(h.contains(
+            "const char* weaveffi_kv_Store_label(const weaveffi_kv_Store* self, const char* prefix, weaveffi_error* out_err);"
+        ));
+        assert!(h.contains("int64_t weaveffi_kv_Store_default_capacity(weaveffi_error* out_err);"));
+        // The destructor releases the object reference.
+        assert!(h.contains("void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);"));
+    }
+
+    #[test]
+    fn interface_typed_params_and_returns_are_pointers() {
+        use weaveffi_ir::ir::InterfaceDef;
+        let m = Module {
+            interfaces: vec![InterfaceDef {
+                name: "Counter".into(),
+                doc: None,
+                constructors: vec![func("new", vec![], None)],
+                methods: vec![func(
+                    "snapshot",
+                    vec![],
+                    Some(TypeRef::Interface("Counter".into())),
+                )],
+                statics: vec![],
+            }],
+            functions: vec![func(
+                "read_twice",
+                vec![param("counter", TypeRef::Interface("Counter".into()))],
+                Some(TypeRef::I64),
+            )],
+            ..module("counters")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        // A method returning the interface hands back an owned pointer.
+        assert!(h.contains(
+            "weaveffi_counters_Counter* weaveffi_counters_Counter_snapshot(const weaveffi_counters_Counter* self, weaveffi_error* out_err);"
+        ));
+        // A free function borrows the interface as a const pointer.
+        assert!(h.contains(
+            "int64_t weaveffi_counters_read_twice(const weaveffi_counters_Counter* counter, weaveffi_error* out_err);"
+        ));
+    }
+
+    #[test]
+    fn error_domain_emits_code_enum() {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain};
+        let m = Module {
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KeyNotFound".into(),
+                        code: 1001,
+                        message: "key not found".into(),
+                        doc: None,
+                    },
+                    ErrorCode {
+                        name: "Expired".into(),
+                        code: 1002,
+                        message: "entry expired".into(),
+                        doc: None,
+                    },
+                ],
+            }),
+            functions: vec![Function {
+                throws: true,
+                ..func(
+                    "get",
+                    vec![param("key", TypeRef::StringUtf8)],
+                    Some(TypeRef::I64),
+                )
+            }],
+            ..module("kv")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(h.contains("weaveffi_kv_KvError_KeyNotFound = 1001"));
+        assert!(h.contains("weaveffi_kv_KvError_Expired = 1002"));
     }
 
     #[test]

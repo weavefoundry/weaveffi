@@ -98,8 +98,8 @@ namespace WeaveFFI
         // the GC could collect a delegate the producer still calls.
         private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
 
-        /// <returns>A subscription id for EventsUnregisterMessageListener().</returns>
-        public static ulong EventsRegisterMessageListener(Action<string> callback)
+        /// <returns>A subscription id for UnregisterMessageListener().</returns>
+        public static ulong RegisterMessageListener(Action<string> callback)
         {
             NativeMethods.Cb_weaveffi_events_OnMessage_fn trampoline = (message, context) =>
             {
@@ -114,8 +114,8 @@ namespace WeaveFFI
             return id;
         }
 
-        /// <summary>Unregisters a listener previously registered with EventsRegisterMessageListener().</summary>
-        public static void EventsUnregisterMessageListener(ulong id)
+        /// <summary>Unregisters a listener previously registered with RegisterMessageListener().</summary>
+        public static void UnregisterMessageListener(ulong id)
         {
             NativeMethods.weaveffi_events_unregister_message_listener(id);
             lock (_listenerLock)
@@ -125,7 +125,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Send a message, triggering the OnMessage callback</summary>
-        public static void EventsSendMessage(string text)
+        public static void SendMessage(string text)
         {
             var err = new WeaveFFIError();
             var textPtr = Marshal.StringToCoTaskMemUTF8(text);
@@ -141,15 +141,15 @@ namespace WeaveFFI
         }
 
         /// <summary>Return an iterator over all sent messages</summary>
-        public static IEnumerable<string> EventsGetMessages()
+        public static IEnumerable<string> GetMessages()
         {
             var err = new WeaveFFIError();
             var iter = NativeMethods.weaveffi_events_get_messages(ref err);
             WeaveFFIError.Check(err);
-            return EnumerateEventsGetMessages(iter);
+            return EnumerateGetMessages(iter);
         }
 
-        private static IEnumerable<string> EnumerateEventsGetMessages(IntPtr iter)
+        private static IEnumerable<string> EnumerateGetMessages(IntPtr iter)
         {
             try
             {

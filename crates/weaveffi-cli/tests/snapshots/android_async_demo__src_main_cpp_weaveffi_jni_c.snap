@@ -14,8 +14,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
@@ -36,8 +41,8 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, v
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
-        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(Ljava/lang/String;)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);
     } else {
         jclass boxCls = (*env)->FindClass(env, "java/lang/Long");
         jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, "valueOf", "(J)Ljava/lang/Long;");
@@ -53,7 +58,7 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, v
     if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1taskAsync(JNIEnv* env, jclass clazz, jstring name, jobject callback) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_runTaskAsync(JNIEnv* env, jclass clazz, jstring name, jobject callback) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -74,8 +79,8 @@ static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, 
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
-        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(Ljava/lang/String;)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);
     } else {
         jobject boxed = (jobject)(intptr_t)result;
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
@@ -89,7 +94,7 @@ static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, 
     if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1batchAsync(JNIEnv* env, jclass clazz, jobjectArray names, jobject callback) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_runBatchAsync(JNIEnv* env, jclass clazz, jobjectArray names, jobject callback) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
@@ -108,7 +113,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1batchAsync(JNIEnv*
     free(names_jstrs);
 }
 
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_tasks_1cancel_1task(JNIEnv* env, jclass clazz, jlong id) {
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_cancelTask(JNIEnv* env, jclass clazz, jlong id) {
     weaveffi_error err = {0, NULL};
     bool rv = weaveffi_tasks_cancel_task((int64_t)id, &err);
     if (err.code != 0) {
@@ -130,8 +135,8 @@ static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err
         const char* msg = err->message ? err->message : "WeaveFFI error";
         jstring jmsg = (*env)->NewStringUTF(env, msg);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
-        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(Ljava/lang/String;)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, jmsg);
+        jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;)V");
+        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);
     } else {
         jclass boxCls = (*env)->FindClass(env, "java/lang/Integer");
         jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, "valueOf", "(I)Ljava/lang/Integer;");
@@ -147,14 +152,14 @@ static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err
     if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 
-JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_tasks_1run_1n_1tasksAsync(JNIEnv* env, jclass clazz, jint n, jobject callback) {
+JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_runNTasksAsync(JNIEnv* env, jclass clazz, jint n, jobject callback) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)malloc(sizeof(weaveffi_jni_async_ctx));
     (*env)->GetJavaVM(env, &ctx->jvm);
     ctx->callback = (*env)->NewGlobalRef(env, callback);
     weaveffi_tasks_run_n_tasks_async((int32_t)n, weaveffi_tasks_run_n_tasks_jni_cb, ctx);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_tasks_1active_1callbacks(JNIEnv* env, jclass clazz) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_activeCallbacks(JNIEnv* env, jclass clazz) {
     weaveffi_error err = {0, NULL};
     int64_t rv = weaveffi_tasks_active_callbacks(&err);
     if (err.code != 0) {

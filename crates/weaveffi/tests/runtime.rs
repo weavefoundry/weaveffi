@@ -14,6 +14,14 @@ use weaveffi::abi::{self, c_ptr_to_string, free_string, string_to_c_ptr, weaveff
 
 #[weaveffi::module]
 pub mod demo {
+    /// The demo module's error domain.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum DemoError {
+        /// division by zero
+        DivisionByZero = 100,
+    }
+
     /// A C-style enum that crosses the ABI as its `i32` discriminant.
     #[weaveffi::enumeration]
     #[repr(i32)]
@@ -47,11 +55,11 @@ pub mod demo {
         a + b
     }
 
-    /// Divide, surfacing division by zero as an error.
+    /// Divide, surfacing division by zero as a domain error.
     #[weaveffi::export]
-    pub fn checked_div(a: i32, b: i32) -> Result<i32, String> {
+    pub fn checked_div(a: i32, b: i32) -> Result<i32, DemoError> {
         if b == 0 {
-            return Err("division by zero".to_string());
+            return Err(DemoError::DivisionByZero);
         }
         Ok(a / b)
     }
@@ -247,6 +255,14 @@ pub mod bus {
 
 #[weaveffi::module]
 pub mod tasks {
+    /// The task module's error domain.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum TaskError {
+        /// arithmetic overflow
+        Overflow = 1,
+    }
+
     /// The by-value result an async task completes with.
     #[weaveffi::record]
     #[derive(Clone)]
@@ -268,8 +284,8 @@ pub mod tasks {
 
     /// Add two integers asynchronously, failing on overflow.
     #[weaveffi::export]
-    pub async fn checked_add(a: i32, b: i32) -> Result<i32, String> {
-        a.checked_add(b).ok_or_else(|| "overflow".to_string())
+    pub async fn checked_add(a: i32, b: i32) -> Result<i32, TaskError> {
+        a.checked_add(b).ok_or(TaskError::Overflow)
     }
 }
 
@@ -294,7 +310,10 @@ fn fallible_ok_and_err_paths() {
 
     let r = demo::weaveffi_demo_checked_div(1, 0, &mut err);
     assert_eq!(r, 0, "error path returns the zero sentinel");
-    assert_ne!(err.code, 0);
+    assert_eq!(
+        err.code, 100,
+        "domain code from the #[weaveffi::error] enum"
+    );
     assert_eq!(c_ptr_to_string(err.message).unwrap(), "division by zero");
     abi::error_clear(&mut err);
 }
@@ -769,37 +788,48 @@ fn nested_module_symbols_and_parent_type_reference() {
 pub mod vault {
     use weaveffi::ErrorReport;
 
-    /// The vault's error domain. It deliberately does not implement `Display`,
-    /// so it can carry its own `ErrorReport` codes without colliding with the
-    /// blanket impl.
+    /// The vault's declared error domain: the codes consumers can match on.
+    #[weaveffi::error]
+    #[derive(Debug)]
     pub enum VaultError {
+        /// entry not found
+        NotFound = 2001,
+        /// vault sealed
+        Sealed = 2002,
+    }
+
+    /// The producer's internal failure type. It carries payloads (which the
+    /// declared domain cannot), so it maps itself onto the domain's codes with
+    /// a hand-written `ErrorReport` and dynamic messages. It deliberately does
+    /// not implement `Display`, which would collide with the blanket impl.
+    pub enum VaultFailure {
         /// No entry exists for the key.
         NotFound,
         /// The vault is sealed for the given reason.
         Sealed(String),
     }
 
-    impl ErrorReport for VaultError {
+    impl ErrorReport for VaultFailure {
         fn code(&self) -> i32 {
             match self {
-                VaultError::NotFound => 2001,
-                VaultError::Sealed(_) => 2002,
+                VaultFailure::NotFound => 2001,
+                VaultFailure::Sealed(_) => 2002,
             }
         }
         fn message(&self) -> String {
             match self {
-                VaultError::NotFound => "entry not found".to_string(),
-                VaultError::Sealed(reason) => format!("vault sealed: {reason}"),
+                VaultFailure::NotFound => "entry not found".to_string(),
+                VaultFailure::Sealed(reason) => format!("vault sealed: {reason}"),
             }
         }
     }
 
     /// Fetch a doubled value, failing with a domain code for invalid keys.
     #[weaveffi::export]
-    pub fn fetch(key: i64) -> Result<i64, VaultError> {
+    pub fn fetch(key: i64) -> Result<i64, VaultFailure> {
         match key {
-            0 => Err(VaultError::NotFound),
-            n if n < 0 => Err(VaultError::Sealed("negative key".to_string())),
+            0 => Err(VaultFailure::NotFound),
+            n if n < 0 => Err(VaultFailure::Sealed("negative key".to_string())),
             n => Ok(n * 2),
         }
     }
@@ -847,6 +877,202 @@ pub mod legacy {
     pub fn bump(value: i64) -> i64 {
         value + 1
     }
+}
+
+/// A producer module built around an interface: an opaque object with
+/// constructors, methods, statics, and a destructor.
+#[weaveffi::module]
+pub mod counters {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// The counters error domain.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum CounterError {
+        /// start value out of range
+        OutOfRange = 1,
+    }
+
+    /// A monotonic counter, exported as an interface.
+    #[weaveffi::interface]
+    pub struct Counter {
+        value: AtomicI64,
+        step: i64,
+    }
+
+    impl Counter {
+        /// Create a counter starting at `start`, stepping by 1.
+        pub fn new(start: i64) -> Self {
+            Self {
+                value: AtomicI64::new(start),
+                step: 1,
+            }
+        }
+
+        /// Create a counter with a custom step, rejecting non-positive steps.
+        pub fn with_step(start: i64, step: i64) -> Result<Counter, CounterError> {
+            if step <= 0 {
+                return Err(CounterError::OutOfRange);
+            }
+            Ok(Counter {
+                value: AtomicI64::new(start),
+                step,
+            })
+        }
+
+        /// Advance the counter and return the new value.
+        pub fn increment(&self) -> i64 {
+            self.value.fetch_add(self.step, Ordering::Relaxed) + self.step
+        }
+
+        /// Read the current value without advancing.
+        pub fn value(&self) -> i64 {
+            self.value.load(Ordering::Relaxed)
+        }
+
+        /// Render the value with a prefix (string arg + string return).
+        pub fn label(&self, prefix: &str) -> String {
+            format!("{prefix}{}", self.value())
+        }
+
+        /// Clone the counter at its current value (interface return).
+        pub fn snapshot(&self) -> Counter {
+            Counter {
+                value: AtomicI64::new(self.value()),
+                step: self.step,
+            }
+        }
+
+        /// Panic on purpose, proving panics surface as errors, not aborts.
+        pub fn explode(&self) {
+            panic!("counter exploded");
+        }
+
+        /// The default start value (a static under the interface namespace).
+        pub fn default_start() -> i64 {
+            0
+        }
+
+        // A private helper: not exported.
+        #[allow(dead_code)]
+        fn internal(&self) -> i64 {
+            -1
+        }
+    }
+
+    /// A free function taking the interface by reference.
+    #[weaveffi::export]
+    pub fn read_twice(counter: &Counter) -> i64 {
+        counter.value() * 2
+    }
+}
+
+#[test]
+fn interface_constructor_methods_destroy() {
+    let mut err = ok_err();
+
+    let c = counters::weaveffi_counters_Counter_new(10, &mut err);
+    assert_eq!(err.code, 0);
+    assert!(!c.is_null());
+
+    assert_eq!(
+        counters::weaveffi_counters_Counter_increment(c, &mut err),
+        11
+    );
+    assert_eq!(
+        counters::weaveffi_counters_Counter_increment(c, &mut err),
+        12
+    );
+    assert_eq!(counters::weaveffi_counters_Counter_value(c, &mut err), 12);
+    assert_eq!(err.code, 0);
+
+    let prefix = string_to_c_ptr("n=");
+    let label = counters::weaveffi_counters_Counter_label(c, prefix, &mut err);
+    assert_eq!(c_ptr_to_string(label).unwrap(), "n=12");
+    free_string(label);
+    free_string(prefix);
+
+    counters::weaveffi_counters_Counter_destroy(c);
+}
+
+#[test]
+fn interface_fallible_constructor() {
+    let mut err = ok_err();
+
+    let ok = counters::weaveffi_counters_Counter_with_step(0, 5, &mut err);
+    assert_eq!(err.code, 0);
+    assert!(!ok.is_null());
+    assert_eq!(
+        counters::weaveffi_counters_Counter_increment(ok, &mut err),
+        5
+    );
+    counters::weaveffi_counters_Counter_destroy(ok);
+
+    let bad = counters::weaveffi_counters_Counter_with_step(0, 0, &mut err);
+    assert!(bad.is_null());
+    assert_eq!(err.code, 1, "domain code from the #[weaveffi::error] enum");
+    assert_eq!(
+        c_ptr_to_string(err.message).unwrap(),
+        "start value out of range"
+    );
+    abi::error_clear(&mut err);
+}
+
+#[test]
+fn interface_returning_method_and_static() {
+    let mut err = ok_err();
+    assert_eq!(
+        counters::weaveffi_counters_Counter_default_start(&mut err),
+        0
+    );
+
+    let c = counters::weaveffi_counters_Counter_new(3, &mut err);
+    let snap = counters::weaveffi_counters_Counter_snapshot(c, &mut err);
+    assert!(!snap.is_null());
+    counters::weaveffi_counters_Counter_increment(c, &mut err);
+    assert_eq!(counters::weaveffi_counters_Counter_value(c, &mut err), 4);
+    assert_eq!(
+        counters::weaveffi_counters_Counter_value(snap, &mut err),
+        3,
+        "the snapshot is an independent object"
+    );
+    counters::weaveffi_counters_Counter_destroy(snap);
+    counters::weaveffi_counters_Counter_destroy(c);
+}
+
+#[test]
+fn interface_as_free_function_parameter() {
+    let mut err = ok_err();
+    let c = counters::weaveffi_counters_Counter_new(21, &mut err);
+    assert_eq!(counters::weaveffi_counters_read_twice(c, &mut err), 42);
+    counters::weaveffi_counters_Counter_destroy(c);
+}
+
+#[test]
+fn interface_null_self_reports_error() {
+    let mut err = ok_err();
+    let r = counters::weaveffi_counters_Counter_value(std::ptr::null(), &mut err);
+    assert_eq!(r, 0);
+    assert_ne!(err.code, 0);
+    abi::error_clear(&mut err);
+}
+
+#[test]
+fn producer_panic_reports_panic_code() {
+    let mut err = ok_err();
+    let c = counters::weaveffi_counters_Counter_new(0, &mut err);
+
+    counters::weaveffi_counters_Counter_explode(c, &mut err);
+    assert_eq!(err.code, abi::PANIC_ERROR_CODE);
+    assert!(c_ptr_to_string(err.message)
+        .unwrap()
+        .contains("counter exploded"));
+    abi::error_clear(&mut err);
+
+    // The object is still usable and the error slot resets on the next call.
+    assert_eq!(counters::weaveffi_counters_Counter_value(c, &mut err), 0);
+    assert_eq!(err.code, 0);
+    counters::weaveffi_counters_Counter_destroy(c);
 }
 
 #[test]

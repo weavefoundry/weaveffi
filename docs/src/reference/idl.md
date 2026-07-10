@@ -26,7 +26,7 @@ and objects:
 
 ```text
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: my_app
   version: "1.0.0"
@@ -34,6 +34,7 @@ modules:
   - name: my_module
     structs: [...]
     enums: [...]
+    interfaces: [...]
     functions: [...]
     callbacks: [...]
     listeners: [...]
@@ -49,23 +50,24 @@ A complete, validating example lives at the bottom of this page in the
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version; only the current version (`"0.4.0"`) is accepted |
+| `version`    | string                      | yes      | Schema version; only the current version (`"0.5.0"`) is accepted |
 | `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
 
 ### Module
 
-| Field       | Type              | Required | Description                              |
-|-------------|-------------------|----------|------------------------------------------|
-| `name`      | string            | yes      | Lowercase identifier (e.g. `calculator`) |
-| `functions` | array of Function | yes      | Functions exported by this module        |
-| `structs`   | array of Struct   | no       | Struct type definitions                  |
-| `enums`     | array of Enum     | no       | Enum type definitions                    |
-| `callbacks` | array of Callback | no       | Callback type definitions                |
-| `listeners` | array of Listener | no       | Listener (event subscription) definitions|
-| `errors`    | ErrorDomain       | no       | Optional error domain                    |
-| `modules`   | array of Module   | no       | Nested sub-modules (see [nested modules](#nested-modules)) |
+| Field        | Type               | Required | Description                              |
+|--------------|--------------------|----------|------------------------------------------|
+| `name`       | string             | yes      | Lowercase identifier (e.g. `calculator`) |
+| `functions`  | array of Function  | no       | Free functions exported by this module   |
+| `interfaces` | array of Interface | no       | Interface (object) type definitions (see [Interfaces](#interfaces)) |
+| `structs`    | array of Struct    | no       | Struct type definitions                  |
+| `enums`      | array of Enum      | no       | Enum type definitions                    |
+| `callbacks`  | array of Callback  | no       | Callback type definitions                |
+| `listeners`  | array of Listener  | no       | Listener (event subscription) definitions|
+| `errors`     | ErrorDomain        | no       | Optional error domain (see [Error domain](#error-domain)) |
+| `modules`    | array of Module    | no       | Nested sub-modules (see [nested modules](#nested-modules)) |
 
 ### Function
 
@@ -75,6 +77,7 @@ A complete, validating example lives at the bottom of this page in the
 | `params`      | array of Param   | yes      | Input parameters (may be empty `[]`)      |
 | `return`      | TypeRef          | no       | Return type (omit for void functions)     |
 | `doc`         | string           | no       | Documentation string                      |
+| `throws`      | bool             | no       | Mark as fallible with a typed domain error (default `false`); requires an error domain in scope, on the same module or an ancestor (see [Error domain](#error-domain)) |
 | `async`       | bool             | no       | Mark as asynchronous (default `false`)    |
 | `cancellable` | bool             | no       | Allow cancellation (only meaningful when `async: true`) |
 | `deprecated`  | string           | no       | Deprecation message shown to consumers   |
@@ -141,7 +144,7 @@ spelling.
 ### Package example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: kvstore
   version: "1.0.0"
@@ -193,7 +196,7 @@ parameters and return types.
 ### Primitive examples
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: primitives
     structs:
@@ -273,7 +276,7 @@ knows how to spell the handle's type. At the C ABI level, `handle<T>` is
 still a `uint64_t`.
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: sessions
     structs:
@@ -333,7 +336,7 @@ Each field:
 ### Struct example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: geometry
     structs:
@@ -381,8 +384,9 @@ modules:
         return: Rect
 ```
 
-Struct fields may reference other structs, enums, optionals, or lists: any
-valid `TypeRef`.
+Struct fields may reference other structs, enums, optionals, lists, or maps.
+Interface references, borrowed types, and iterators are not valid field
+types (see [Type compatibility](#type-compatibility)).
 
 ---
 
@@ -411,7 +415,7 @@ Each variant:
 ### Enum example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -445,7 +449,7 @@ Swift `enum` with associated values). A *unit* variant (no `fields`) and a *data
 variant may coexist in the same enum.
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: shapes
     enums:
@@ -489,22 +493,168 @@ variant.
 
 ---
 
+## Interfaces
+
+An interface is a first-class object type: a stateful resource with identity
+and behavior, declared under the `interfaces` key of a module. Where a struct
+models a plain data record with fields, an interface models something you
+*hold and operate on*: a store, a session, a connection. The object lives
+behind the FFI boundary and crosses it as an opaque reference; consumers see
+a real class (or the target's closest analogue) whose constructors, methods,
+and statics call back into the producer.
+
+### Interface schema
+
+| Field          | Type                | Required | Description                                    |
+|----------------|---------------------|----------|------------------------------------------------|
+| `name`         | string              | yes      | Interface type name (e.g. `Store`)             |
+| `doc`          | string              | no       | Documentation string                           |
+| `constructors` | array of Constructor| no       | Static functions returning a new instance      |
+| `methods`      | array of Function   | no       | Instance methods                               |
+| `statics`      | array of Function   | no       | Static functions namespaced under the interface|
+
+An interface must declare at least one member, and constructor, method, and
+static names share one namespace per interface (no duplicates across the
+three lists).
+
+Each constructor:
+
+| Field    | Type           | Required | Description                                     |
+|----------|----------------|----------|-------------------------------------------------|
+| `name`   | string         | yes      | Constructor identifier (e.g. `open`)            |
+| `params` | array of Param | yes      | Input parameters (may be empty `[]`)            |
+| `doc`    | string         | no       | Documentation string                            |
+| `throws` | bool           | no       | Mark as fallible with a typed domain error (default `false`) |
+
+A constructor implicitly returns a new instance of its interface, so it
+declares no `return` field, and it may not be `async` (expose an async
+static factory returning the interface instead). A constructor named `new`
+becomes the canonical constructor where the target language has one (Swift
+`init`, Python `__init__`); every other constructor becomes a static factory
+method.
+
+Methods and statics use the full [Function schema](#function), including
+`throws`, `async`, `cancellable`, `deprecated`, and `since`. A method
+receives the instance implicitly; it does not declare a `self` parameter.
+A static takes no instance at all.
+
+### Lifecycle
+
+Every interface receives an implicit destructor: the C ABI gains a
+`*_destroy` symbol, and each generated wrapper releases the underlying
+object through its language's natural disposal hook (RAII destructors,
+`deinit`, `__del__`, `IDisposable`, finalizers, `close()`). You never
+declare `destroy` in the IDL.
+
+Ownership follows the reference direction: an interface passed as a
+parameter is borrowed for the duration of the call, while an interface
+returned from a call is a new owned reference the caller (or its wrapper)
+must eventually release.
+
+### Where interface types may appear
+
+An interface name is a valid `TypeRef` in function and method parameters,
+in return types, and in optionals of those (`Store`, `Store?`). It is
+**not** valid as a struct field, a collection element (`[Store]`), a map
+key or value, or a callback parameter; the validator rejects those
+positions.
+
+### Interface example
+
+A trimmed version of the `kvstore` sample's `Store` interface:
+
+```yaml
+version: "0.5.0"
+modules:
+  - name: kv
+    errors:
+      name: KvError
+      codes:
+        - { name: KeyNotFound, code: 1001, message: "key not found" }
+        - { name: IoError, code: 1004, message: "I/O failure" }
+    interfaces:
+      - name: Store
+        doc: An embedded key-value store owning its entries
+        constructors:
+          - name: open
+            doc: Open (or create) a store backed by the given filesystem path
+            params:
+              - { name: path, type: string }
+            throws: true
+        methods:
+          - name: get
+            doc: Look up a value by key
+            params:
+              - { name: key, type: string }
+            return: bytes
+            throws: true
+          - name: delete
+            doc: Remove the entry for the given key, returning true if it existed
+            params:
+              - { name: key, type: string }
+            return: bool
+            throws: true
+          - name: count
+            doc: Return the number of live entries in the store
+            params: []
+            return: i64
+        statics:
+          - name: default_capacity
+            doc: The largest number of live entries one store will hold
+            params: []
+            return: i64
+```
+
+### C ABI lowering
+
+An interface lowers to an opaque struct tag plus one C symbol per member.
+Constructors return an owned pointer; methods take a leading
+`const {tag}* self` argument before their declared parameters; statics take
+no `self`; and the implicit destructor releases the object:
+
+```c
+typedef struct weaveffi_kv_Store weaveffi_kv_Store;
+
+/* Constructor: returns a new owned instance. */
+weaveffi_kv_Store* weaveffi_kv_Store_open(const char* path, weaveffi_error* out_err);
+
+/* Methods: an implicit leading self slot. */
+bool weaveffi_kv_Store_delete(const weaveffi_kv_Store* self, const char* key,
+                              weaveffi_error* out_err);
+int64_t weaveffi_kv_Store_count(const weaveffi_kv_Store* self, weaveffi_error* out_err);
+
+/* Statics: no self slot. */
+int64_t weaveffi_kv_Store_default_capacity(weaveffi_error* out_err);
+
+/* Implicit destructor: releases the object. */
+void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);
+```
+
+Async and iterator-returning members follow the same shapes as free
+functions (the async launcher and the iterator handle simply carry the
+`self` slot). Free functions and interface members share the module's C
+symbol namespace, so a free function named `Store_get` would collide with a
+`get` method on an interface `Store`; the validator rejects the collision.
+
+---
+
 ## Optional types
 
 Append `?` to any type to make it optional (nullable). When a value is absent,
 the default is null.
 
-| Syntax       | Meaning                    |
-|--------------|----------------------------|
-| `string?`    | Optional string            |
-| `i32?`       | Optional i32               |
-| `Contact?`   | Optional struct reference  |
-| `Color?`     | Optional enum reference    |
+| Syntax       | Meaning                       |
+|--------------|-------------------------------|
+| `string?`    | Optional string               |
+| `i32?`       | Optional i32                  |
+| `Contact?`   | Optional struct reference     |
+| `Color?`     | Optional enum reference       |
+| `Store?`     | Optional interface reference (params and returns only) |
 
 ### Optional example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     structs:
@@ -546,7 +696,7 @@ Wrap a type in `[T]` brackets to declare a list (variable-length sequence).
 ### List example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: lists
     structs:
@@ -590,7 +740,7 @@ and maps are not valid key types. Values may be any valid `TypeRef`.
 ### Map example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: maps
     structs:
@@ -671,7 +821,7 @@ Optional and list modifiers compose freely:
 ### Nested type example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: nested
     structs:
@@ -718,7 +868,7 @@ one at a time and are suitable for large or streaming result sets.
 ### Iterator example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: streaming
     structs:
@@ -755,7 +905,7 @@ invokes a caller-provided function.
 ### Callback example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: events
     functions: []
@@ -795,7 +945,7 @@ with subscribe/unsubscribe lifecycle management.
 ### Listener example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: events
     functions: []
@@ -823,7 +973,7 @@ modules.
 ### Nested module example
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: app
     functions:
@@ -862,10 +1012,51 @@ C ABI symbols for nested modules use underscores to join the path:
 
 ### Cross-module type references
 
-Type references to structs and enums must resolve within the same module
-(including its parent chain). Cross-module references between sibling
-modules are not currently supported. Define shared types in a common
-parent module or duplicate the definition.
+Struct, enum, interface, and error domain names are unique across the whole
+API (the validator rejects two types sharing a bare name, wherever they are
+declared). A bare type name therefore resolves unambiguously from any
+module: reference the type by name and the toolchain qualifies the
+reference to its owning module internally.
+
+For example, a nested `stats` module can take the parent `kv` module's
+`Store` interface as a parameter:
+
+```yaml
+version: "0.5.0"
+modules:
+  - name: kv
+    errors:
+      name: KvError
+      codes:
+        - { name: IoError, code: 1004, message: "I/O failure" }
+    interfaces:
+      - name: Store
+        constructors:
+          - name: open
+            params:
+              - { name: path, type: string }
+            throws: true
+        methods:
+          - name: count
+            params: []
+            return: i64
+    modules:
+      - name: stats
+        structs:
+          - name: Stats
+            fields:
+              - { name: total_entries, type: i64 }
+        functions:
+          - name: get_stats
+            doc: Snapshot the current store statistics
+            params:
+              - { name: store, type: Store }
+            return: Stats
+            throws: true
+```
+
+The generated bindings spell a cross-module reference with the owning
+module's qualification where the target needs one.
 
 ---
 
@@ -878,15 +1069,20 @@ Functions can be marked as asynchronous. See the
 behaviour.
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: net
+    errors:
+      name: NetError
+      codes:
+        - { name: Unreachable, code: 1, message: "host unreachable" }
     functions:
       - name: fetch_data
         params:
           - { name: url, type: string }
         return: string
         async: true
+        throws: true
 
       - name: upload_file
         params:
@@ -896,15 +1092,23 @@ modules:
         cancellable: true
 ```
 
+`async` composes with `throws`: an async function that also declares
+`throws: true` delivers its failure as the module's typed domain error
+through the target's async idiom (an `async throws` function in Swift, a
+rejected promise carrying the typed error in JavaScript, and so on). An
+async function without `throws` gets a plain async shape, and a failure can
+only be a producer bug.
+
 Async void functions (no return type) emit a validator **warning** since
-they are unusual.
+they are unusual. An async function cannot return an iterator (`iter<T>`);
+return a list instead or make the function synchronous.
 
 ### Deprecated functions
 
 Mark a function as deprecated with a migration message:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: legacy
     functions:
@@ -926,7 +1130,7 @@ Generators propagate the deprecation message to the target language
 Mark a parameter as mutable when the callee may modify it in-place:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: buffers
     functions:
@@ -947,7 +1151,7 @@ directly in the IDL file. This is an alternative to using a separate
 TOML configuration file with `--config`.
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: math
     functions:
@@ -1001,6 +1205,7 @@ All types are valid in both parameter and return positions unless noted.
 | `&[u8]`        | yes    | yes     | yes           | Borrowed, zero-copy    |
 | `StructName`   | yes    | yes     | yes           |                        |
 | `EnumName`     | yes    | yes     | yes           |                        |
+| `InterfaceName`| yes    | yes     | no            | Also `InterfaceName?`; not in collections |
 | `T?`           | yes    | yes     | yes           |                        |
 | `[T]`          | yes    | yes     | yes           |                        |
 | `[T?]`         | yes    | yes     | yes           |                        |
@@ -1013,11 +1218,11 @@ All types are valid in both parameter and return positions unless noted.
 
 ## Complete example
 
-A full IDL combining structs, enums, optionals, lists, and nested
-types:
+A full IDL combining structs, enums, optionals, lists, an interface, and a
+typed error domain (a trimmed version of the `contacts` sample):
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -1037,52 +1242,87 @@ modules:
           - { name: email, type: "string?" }
           - { name: contact_type, type: ContactType }
 
-    functions:
-      - name: create_contact
-        params:
-          - { name: first_name, type: string }
-          - { name: last_name, type: string }
-          - { name: email, type: "string?" }
-          - { name: contact_type, type: ContactType }
-        return: handle
+    errors:
+      name: ContactsError
+      codes:
+        - { name: InvalidName, code: 1, message: "name must not be empty" }
+        - { name: NotFound, code: 2, message: "contact not found" }
 
-      - name: get_contact
-        params:
-          - { name: id, type: handle }
-        return: Contact
+    interfaces:
+      - name: ContactBook
+        doc: "An in-memory address book owning its contacts"
+        constructors:
+          - name: new
+            params: []
+        methods:
+          - name: add
+            doc: "Add a contact, returning the stored record with its assigned id"
+            params:
+              - { name: first_name, type: string }
+              - { name: last_name, type: string }
+              - { name: email, type: "string?" }
+              - { name: contact_type, type: ContactType }
+            return: Contact
+            throws: true
 
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
+          - name: get
+            doc: "Look up a contact by id"
+            params:
+              - { name: id, type: i64 }
+            return: Contact
+            throws: true
 
-      - name: delete_contact
-        params:
-          - { name: id, type: handle }
-        return: bool
+          - name: list
+            params: []
+            return: "[Contact]"
 
-      - name: count_contacts
-        params: []
-        return: i32
+          - name: remove
+            params:
+              - { name: id, type: i64 }
+            return: bool
+
+          - name: count
+            params: []
+            return: i32
 ```
 
 ## Validation rules
 
-- Module, function, parameter, struct, enum, field, and variant names must be
-  valid identifiers (start with a letter or `_`, contain only alphanumeric
-  characters and `_`).
+- Module, function, parameter, struct, enum, interface, field, and variant
+  names must be valid identifiers (start with a letter or `_`, contain only
+  alphanumeric characters and `_`).
 - Names must be unique within their scope (no duplicate module names, no
   duplicate function names within a module, etc.).
+- Struct, enum, interface, and error domain names must be unique across the
+  **whole API**, not just their module: generators emit flat per-language
+  type names, and bare-name references resolve API-wide.
 - Reserved keywords are rejected: `if`, `else`, `for`, `while`, `loop`,
   `match`, `type`, `return`, `async`, `await`, `break`, `continue`, `fn`,
   `struct`, `enum`, `mod`, `use`.
 - Structs must have at least one field. Enums must have at least one variant.
+  Interfaces must have at least one constructor, method, or static.
 - Enum variant values must be unique within their enum.
-- Type references to structs/enums must resolve to a definition in the same
+- Type references to structs, enums, and interfaces must resolve to a
+  definition somewhere in the API (see
+  [Cross-module type references](#cross-module-type-references)).
+- Interface members (constructors, methods, and statics) share one namespace
+  per interface; a constructor may not declare a `return` type and may not
+  be `async`.
+- Interface types are valid only as parameters, return types, and optionals
+  of those; not as struct fields, collection elements, map keys or values,
+  or callback parameters.
+- Free functions and interface members share the module's C symbol
+  namespace; two declarations lowering to the same symbol are rejected.
+- `throws: true` requires an error domain in scope: on the same module or an
+  ancestor module.
+- Error codes must be non-zero (and not `-2`, which is reserved for producer
+  panics) and unique within their domain. Error code **names** must be
+  unique within their domain and across every domain in the API.
+- Error domain names must not collide with function names in the same
   module.
 - Async functions are allowed. Async void functions (no return type) emit a
-  warning.
+  warning. An async function cannot return an iterator.
 - Listener `event_callback` must reference a callback in the same module.
-- Error domain names must not collide with function names.
 
 ## ABI mapping
 
@@ -1097,27 +1337,84 @@ modules:
 
 ## Error domain
 
-You can declare an optional error domain on a module to reserve symbolic names
-and numeric codes:
+A module can declare one error domain: a named set of symbolic error codes
+its fallible functions report. The domain generates a *typed* error
+construct in every target language (an error enum in Swift, an exception
+class hierarchy in Python, sealed exception subclasses in Kotlin, and so
+on), so consumers catch and match on the codes you declared rather than on
+raw integers.
+
+### Error domain schema
+
+| Field   | Type          | Required | Description                                       |
+|---------|---------------|----------|---------------------------------------------------|
+| `name`  | string        | yes      | Domain name, used to name the generated error type (e.g. `KvError`) |
+| `codes` | array of Code | yes      | The named codes belonging to this domain          |
+
+Each code:
+
+| Field     | Type   | Required | Description                                     |
+|-----------|--------|----------|-------------------------------------------------|
+| `name`    | string | yes      | Code name, lowered to a case or subclass on the generated error type (e.g. `KeyNotFound`) |
+| `code`    | i32    | yes      | Stable numeric value carried across the C ABI   |
+| `message` | string | yes      | Default human-readable message                  |
+| `doc`     | string | no       | Documentation string                            |
+
+PascalCase code names (`KeyNotFound`, `StoreFull`) are the convention: each
+generator re-cases them into its own idiom.
+
+### Opting in with `throws`
+
+Declaring a domain reserves the codes; a function, method, or constructor
+joins the typed error path by declaring `throws: true`:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     errors:
-      name: ContactErrors
+      name: ContactsError
       codes:
-        - { name: not_found, code: 1, message: "Contact not found" }
-        - { name: duplicate, code: 2, message: "Contact already exists" }
+        - { name: InvalidName, code: 1, message: "name must not be empty" }
+        - { name: NotFound, code: 2, message: "contact not found" }
     functions:
       - name: get_contact
         params:
-          - { name: id, type: handle }
-        return: handle
+          - { name: id, type: i64 }
+        return: string
+        throws: true
+
+      - name: count_contacts
+        params: []
+        return: i32
 ```
 
-Error codes must be non-zero and unique. Error domain names must not collide
-with function names in the same module.
+A throwing callable surfaces in each target's error idiom (`throws` in
+Swift, `raise` in Python, `(T, error)` in Go, exceptions elsewhere), and the
+error it delivers is the domain type: the numeric code maps to the matching
+declared case. A callable **without** `throws` (like `count_contacts`
+above) has a plain signature at the idiomatic surface; it cannot report a
+domain error, and a failure there can only be a producer bug, which
+surfaces as a generic branded error or a trap rather than a typed error.
+See the [Error Handling guide](../guides/errors.md) for the full model,
+including panic behavior.
+
+The domain is in scope for its module **and every module nested inside
+it**, so a domain declared on a parent module serves the whole subtree.
+Declaring `throws: true` with no domain in scope is a validation error.
+
+### Validation
+
+- Codes must be non-zero (`0` means success) and must not be `-2` (reserved
+  for producer panics).
+- Numeric codes must be unique within a domain.
+- Code names must be unique within a domain **and across every domain in
+  the API**: backends with flat namespaces derive one error class or
+  constant per code, so two domains both declaring `NotFound` would
+  collide. Qualify one of them (e.g. `OrderNotFound`).
+- The domain name must not collide with a function name in the same module,
+  and it shares the API-wide type namespace with struct, enum, and
+  interface names.
 
 ## Documentation comments
 
@@ -1130,6 +1427,9 @@ syntax allows.
 Supported sites:
 
 - `Function.doc`, `Param.doc`
+- `InterfaceDef.doc`, plus each of its constructors, methods, and statics
+  (interface members use the function schema, so they carry `Function.doc`
+  and `Param.doc`)
 - `StructDef.doc`, `StructField.doc`
 - `EnumDef.doc`, `EnumVariant.doc`
 - `CallbackDef.doc`, `ListenerDef.doc`
@@ -1153,7 +1453,7 @@ Per-target syntax:
 Example IDL:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: docs
     structs:

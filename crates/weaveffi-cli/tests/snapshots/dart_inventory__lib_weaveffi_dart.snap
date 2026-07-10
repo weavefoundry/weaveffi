@@ -35,12 +35,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -49,6 +50,41 @@ void _checkError(Pointer<_WeaveFFIError> err) {
     final msg = err.ref.message.toDartString();
     _weaveffiErrorClear(err);
     throw WeaveFFIException(code, msg);
+  }
+}
+
+/// Typed error domain `ProductsError` declared by module `products`.
+class ProductsException extends WeaveFFIException {
+  ProductsException(super.code, super.message);
+}
+
+/// price must be positive
+class InvalidPriceException extends ProductsException {
+  InvalidPriceException([String message = 'price must be positive']) : super(1, message);
+}
+
+/// product not found
+class ProductNotFoundException extends ProductsException {
+  ProductNotFoundException([String message = 'product not found']) : super(2, message);
+}
+
+WeaveFFIException _mapProductsException(int code, String message) {
+  switch (code) {
+    case 1:
+      return InvalidPriceException(message);
+    case 2:
+      return ProductNotFoundException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkProductsException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapProductsException(code, msg);
   }
 }
 
@@ -148,90 +184,160 @@ class Product {
   }
 }
 
-typedef _NativeWeaveffiProductsCreateProduct = Int64 Function(Pointer<Utf8>, Double, Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiProductsCreateProduct = int Function(Pointer<Utf8>, double, int, Pointer<_WeaveFFIError>);
-final _weaveffiProductsCreateProduct = _lib.lookupFunction<
-    _NativeWeaveffiProductsCreateProduct, _DartWeaveffiProductsCreateProduct>('weaveffi_products_create_product');
+typedef _NativeWeaveffiProductsCatalogDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiProductsCatalogDestroy = void Function(Pointer<Void>);
+final _weaveffiProductsCatalogDestroy = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogDestroy, _DartWeaveffiProductsCatalogDestroy>('weaveffi_products_Catalog_destroy');
 
-int createProduct(String name, double price, Category category) {
-  final namePtr = name.toNativeUtf8();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiProductsCreateProduct(namePtr, price, category.value, err);
-    _checkError(err);
-    return result;
-  } finally {
-    calloc.free(namePtr);
-    calloc.free(err);
+typedef _NativeWeaveffiProductsCatalogNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiProductsCatalogNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+final _weaveffiProductsCatalogNew = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogNew, _DartWeaveffiProductsCatalogNew>('weaveffi_products_Catalog_new');
+
+typedef _NativeWeaveffiProductsCatalogAddProduct = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Double, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiProductsCatalogAddProduct = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, double, int, Pointer<_WeaveFFIError>);
+final _weaveffiProductsCatalogAddProduct = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogAddProduct, _DartWeaveffiProductsCatalogAddProduct>('weaveffi_products_Catalog_add_product');
+
+typedef _NativeWeaveffiProductsCatalogGetProduct = Pointer<Void> Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiProductsCatalogGetProduct = Pointer<Void> Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiProductsCatalogGetProduct = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogGetProduct, _DartWeaveffiProductsCatalogGetProduct>('weaveffi_products_Catalog_get_product');
+
+typedef _NativeWeaveffiProductsCatalogSearch = Pointer<Void> Function(Pointer<Void>, Int32, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiProductsCatalogSearch = Pointer<Void> Function(Pointer<Void>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
+final _weaveffiProductsCatalogSearch = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogSearch, _DartWeaveffiProductsCatalogSearch>('weaveffi_products_Catalog_search');
+
+typedef _NativeWeaveffiProductsCatalogUpdatePrice = Int32 Function(Pointer<Void>, Int64, Double, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiProductsCatalogUpdatePrice = int Function(Pointer<Void>, int, double, Pointer<_WeaveFFIError>);
+final _weaveffiProductsCatalogUpdatePrice = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogUpdatePrice, _DartWeaveffiProductsCatalogUpdatePrice>('weaveffi_products_Catalog_update_price');
+
+typedef _NativeWeaveffiProductsCatalogRemove = Int32 Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiProductsCatalogRemove = int Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiProductsCatalogRemove = _lib.lookupFunction<
+    _NativeWeaveffiProductsCatalogRemove, _DartWeaveffiProductsCatalogRemove>('weaveffi_products_Catalog_remove');
+
+/// A product catalog owning its products
+class Catalog {
+  final Pointer<Void> _handle;
+  Catalog._(this._handle);
+
+  /// Releases the native object reference.
+  void dispose() {
+    _weaveffiProductsCatalogDestroy(_handle);
+  }
+
+  factory Catalog() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiProductsCatalogNew(err);
+      _checkError(err);
+      return Catalog._(result);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Throws [ProductsException] on domain errors.
+  Product addProduct(String name, double price, Category category) {
+    final namePtr = name.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiProductsCatalogAddProduct(_handle, namePtr, price, category.value, err);
+      _checkProductsException(err);
+      return Product._(result);
+    } finally {
+      calloc.free(namePtr);
+      calloc.free(err);
+    }
+  }
+
+  /// Throws [ProductsException] on domain errors.
+  Product getProduct(int id) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiProductsCatalogGetProduct(_handle, id, err);
+      _checkProductsException(err);
+      return Product._(result);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  List<Product> search(Category category) {
+    final outLen = calloc<Size>();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiProductsCatalogSearch(_handle, category.value, outLen, err);
+      _checkError(err);
+      final n = outLen.value;
+      if (result == nullptr || n == 0) return <Product>[];
+      final arr = result.cast<Pointer<Void>>();
+      return List<Product>.generate(n, (i) => Product._(arr[i]));
+    } finally {
+      calloc.free(outLen);
+      calloc.free(err);
+    }
+  }
+
+  /// Throws [ProductsException] on domain errors.
+  bool updatePrice(int id, double price) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiProductsCatalogUpdatePrice(_handle, id, price, err);
+      _checkProductsException(err);
+      return result != 0;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  bool remove(int id) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiProductsCatalogRemove(_handle, id, err);
+      _checkError(err);
+      return result != 0;
+    } finally {
+      calloc.free(err);
+    }
   }
 }
 
-typedef _NativeWeaveffiProductsGetProduct = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiProductsGetProduct = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
-final _weaveffiProductsGetProduct = _lib.lookupFunction<
-    _NativeWeaveffiProductsGetProduct, _DartWeaveffiProductsGetProduct>('weaveffi_products_get_product');
+/// Typed error domain `OrdersError` declared by module `orders`.
+class OrdersException extends WeaveFFIException {
+  OrdersException(super.code, super.message);
+}
 
-Product getProduct(int id) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiProductsGetProduct(id, err);
-    _checkError(err);
-    return Product._(result);
-  } finally {
-    calloc.free(err);
+/// order not found
+class OrderNotFoundException extends OrdersException {
+  OrderNotFoundException([String message = 'order not found']) : super(1, message);
+}
+
+/// order must contain at least one item
+class EmptyOrderException extends OrdersException {
+  EmptyOrderException([String message = 'order must contain at least one item']) : super(2, message);
+}
+
+WeaveFFIException _mapOrdersException(int code, String message) {
+  switch (code) {
+    case 1:
+      return OrderNotFoundException(message);
+    case 2:
+      return EmptyOrderException(message);
+    default:
+      return WeaveFFIException(code, message);
   }
 }
 
-typedef _NativeWeaveffiProductsSearchProducts = Pointer<Void> Function(Int32, Pointer<Size>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiProductsSearchProducts = Pointer<Void> Function(int, Pointer<Size>, Pointer<_WeaveFFIError>);
-final _weaveffiProductsSearchProducts = _lib.lookupFunction<
-    _NativeWeaveffiProductsSearchProducts, _DartWeaveffiProductsSearchProducts>('weaveffi_products_search_products');
-
-List<Product> searchProducts(Category category) {
-  final outLen = calloc<Size>();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiProductsSearchProducts(category.value, outLen, err);
-    _checkError(err);
-    final n = outLen.value;
-    if (result == nullptr || n == 0) return <Product>[];
-    final arr = result.cast<Pointer<Void>>();
-    return List<Product>.generate(n, (i) => Product._(arr[i]));
-  } finally {
-    calloc.free(outLen);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiProductsUpdatePrice = Int32 Function(Int64, Double, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiProductsUpdatePrice = int Function(int, double, Pointer<_WeaveFFIError>);
-final _weaveffiProductsUpdatePrice = _lib.lookupFunction<
-    _NativeWeaveffiProductsUpdatePrice, _DartWeaveffiProductsUpdatePrice>('weaveffi_products_update_price');
-
-bool updatePrice(int id, double price) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiProductsUpdatePrice(id, price, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiProductsDeleteProduct = Int32 Function(Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiProductsDeleteProduct = int Function(int, Pointer<_WeaveFFIError>);
-final _weaveffiProductsDeleteProduct = _lib.lookupFunction<
-    _NativeWeaveffiProductsDeleteProduct, _DartWeaveffiProductsDeleteProduct>('weaveffi_products_delete_product');
-
-bool deleteProduct(int id) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiProductsDeleteProduct(id, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(err);
+void _checkOrdersException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapOrdersException(code, msg);
   }
 }
 
@@ -346,6 +452,7 @@ typedef _DartWeaveffiOrdersCreateOrder = int Function(Pointer<Pointer<Void>>, in
 final _weaveffiOrdersCreateOrder = _lib.lookupFunction<
     _NativeWeaveffiOrdersCreateOrder, _DartWeaveffiOrdersCreateOrder>('weaveffi_orders_create_order');
 
+/// Throws [OrdersException] on domain errors.
 int createOrder(List<OrderItem> items) {
   final itemsPtr = items.isEmpty ? nullptr : calloc<Pointer<Void>>(items.length);
   for (var i = 0; i < items.length; i++) {
@@ -354,7 +461,7 @@ int createOrder(List<OrderItem> items) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiOrdersCreateOrder(itemsPtr, items.length, err);
-    _checkError(err);
+    _checkOrdersException(err);
     return result;
   } finally {
     if (itemsPtr != nullptr) calloc.free(itemsPtr);
@@ -367,11 +474,12 @@ typedef _DartWeaveffiOrdersGetOrder = Pointer<Void> Function(int, Pointer<_Weave
 final _weaveffiOrdersGetOrder = _lib.lookupFunction<
     _NativeWeaveffiOrdersGetOrder, _DartWeaveffiOrdersGetOrder>('weaveffi_orders_get_order');
 
+/// Throws [OrdersException] on domain errors.
 Order getOrder(int id) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiOrdersGetOrder(id, err);
-    _checkError(err);
+    _checkOrdersException(err);
     return Order._(result);
   } finally {
     calloc.free(err);

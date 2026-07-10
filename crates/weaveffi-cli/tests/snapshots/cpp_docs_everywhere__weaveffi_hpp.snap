@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 #include <future>
 #include <functional>
 #include <mutex>
@@ -80,8 +81,16 @@ typedef enum {
     /** Document is hidden from listings */
     weaveffi_docs_Status_Archived = 2
 } weaveffi_docs_Status;
+/** Error codes reported by throwing functions in the `docs` module tree. */
+typedef enum {
+    /** Returned when no document matches the requested id */
+    weaveffi_docs_DocsErrors_not_found = 1,
+    /** Raised when attempting to move into a forbidden state */
+    weaveffi_docs_DocsErrors_invalid_status = 2
+} weaveffi_docs_DocsErrors;
 typedef struct weaveffi_docs_Document weaveffi_docs_Document;
 typedef struct weaveffi_docs_DocumentBuilder weaveffi_docs_DocumentBuilder;
+typedef struct weaveffi_docs_Notebook weaveffi_docs_Notebook;
 /** Fires after a document has been persisted successfully */
 typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
 typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
@@ -114,6 +123,23 @@ WEAVEFFI_API void weaveffi_docs_Document_Builder_set_tags(weaveffi_docs_Document
 WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_Document_Builder_build(weaveffi_docs_DocumentBuilder* builder, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_docs_Document_Builder_destroy(weaveffi_docs_DocumentBuilder* builder);
 
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+/** Create an empty notebook */
+WEAVEFFI_API weaveffi_docs_Notebook* weaveffi_docs_Notebook_new(weaveffi_error* out_err);
+/** The largest number of documents one notebook will hold */
+WEAVEFFI_API int32_t weaveffi_docs_Notebook_max_documents(weaveffi_error* out_err);
+/** Add a document, returning its position in the notebook */
+WEAVEFFI_API int32_t weaveffi_docs_Notebook_insert(const weaveffi_docs_Notebook* self, const weaveffi_docs_Document* document, weaveffi_error* out_err);
+/** Look up a document by identifier, failing when none matches */
+WEAVEFFI_API weaveffi_docs_Document* weaveffi_docs_Notebook_find(const weaveffi_docs_Notebook* self, int64_t id, weaveffi_error* out_err);
+/** The number of documents currently held */
+WEAVEFFI_API int32_t weaveffi_docs_Notebook_size(const weaveffi_docs_Notebook* self, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_docs_Notebook_destroy(weaveffi_docs_Notebook* self);
+
 /** Subscribe to document-saved notifications */
 WEAVEFFI_API uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
 /** Subscribe to document-saved notifications */
@@ -134,6 +160,7 @@ WEAVEFFI_API void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_pu
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -142,17 +169,63 @@ public:
     int32_t code() const { return code_; }
 };
 
-/** Returned when no document matches the requested id */
-class NotFoundError : public WeaveFFIError {
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `docs` module's throwing functions. */
+class DocsErrorsError : public WeaveFFIError {
 public:
-    NotFoundError(const std::string& msg) : WeaveFFIError(1, msg) {}
+    DocsErrorsError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** Returned when no document matches the requested id */
+class NotFoundError : public DocsErrorsError {
+public:
+    NotFoundError(const std::string& msg) : DocsErrorsError(1, msg) {}
 };
 
 /** Raised when attempting to move into a forbidden state */
-class InvalidStatusError : public WeaveFFIError {
+class InvalidStatusError : public DocsErrorsError {
 public:
-    InvalidStatusError(const std::string& msg) : WeaveFFIError(2, msg) {}
+    InvalidStatusError(const std::string& msg) : DocsErrorsError(2, msg) {}
 };
+
+namespace detail {
+
+/** Map a `docs` error code to its typed exception (DocsErrorsError for unknown codes). */
+inline std::exception_ptr make_docs_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(NotFoundError(msg));
+    case 2: return std::make_exception_ptr(InvalidStatusError(msg));
+    default: return std::make_exception_ptr(DocsErrorsError(code, msg));
+    }
+}
+
+/** Throw the typed `docs` exception if `err` carries a nonzero code. */
+inline void check_docs(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_docs_error(code, msg));
+}
+
+} // namespace detail
 
 namespace detail {
 
@@ -306,14 +379,91 @@ public:
     Document build() {
         weaveffi_error err{};
         auto* ptr = weaveffi_docs_Document_Builder_build(static_cast<weaveffi_docs_DocumentBuilder*>(handle_), &err);
-        if (err.code != 0) throw std::runtime_error(err.message ? err.message : "build failed");
+        detail::check(err);
         return Document(ptr);
     }
 };
 
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+class Notebook {
+    void* handle_;
+
+public:
+    explicit Notebook(void* h) : handle_(h) {}
+
+    ~Notebook() {
+        if (handle_) weaveffi_docs_Notebook_destroy(static_cast<weaveffi_docs_Notebook*>(handle_));
+    }
+
+    Notebook(const Notebook&) = delete;
+    Notebook& operator=(const Notebook&) = delete;
+
+    Notebook(Notebook&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Notebook& operator=(Notebook&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_docs_Notebook_destroy(static_cast<weaveffi_docs_Notebook*>(handle_));
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    void* handle() const { return handle_; }
+
+    /** Create an empty notebook */
+    Notebook() : handle_(nullptr) {
+        weaveffi_error err{};
+        auto result = weaveffi_docs_Notebook_new(&err);
+        detail::check(err);
+        handle_ = result;
+    }
+
+    /** Add a document, returning its position in the notebook */
+    int32_t insert(const Document& document) const {
+        weaveffi_error err{};
+        auto result = weaveffi_docs_Notebook_insert(static_cast<const weaveffi_docs_Notebook*>(handle_), static_cast<const weaveffi_docs_Document*>(document.handle()), &err);
+        detail::check(err);
+        return result;
+    }
+
+    /** Look up a document by identifier, failing when none matches */
+    Document find(int64_t id) const {
+        weaveffi_error err{};
+        auto result = weaveffi_docs_Notebook_find(static_cast<const weaveffi_docs_Notebook*>(handle_), id, &err);
+        detail::check_docs(err);
+        return Document(result);
+    }
+
+    /** The number of documents currently held */
+    int32_t size() const {
+        weaveffi_error err{};
+        auto result = weaveffi_docs_Notebook_size(static_cast<const weaveffi_docs_Notebook*>(handle_), &err);
+        detail::check(err);
+        return result;
+    }
+
+    /** The largest number of documents one notebook will hold */
+    static int32_t max_documents() {
+        weaveffi_error err{};
+        auto result = weaveffi_docs_Notebook_max_documents(&err);
+        detail::check(err);
+        return result;
+    }
+
+};
+
+namespace docs {
+
 /** Subscribe to document-saved notifications */
-/** @return A subscription id for docs_unregister_saved_listener(). */
-inline uint64_t docs_register_saved_listener(std::function<void(int64_t, int32_t)> callback) {
+/** @return A subscription id for unregister_saved_listener(). */
+inline uint64_t register_saved_listener(std::function<void(int64_t, int32_t)> callback) {
     auto fn = std::make_shared<std::function<void(int64_t, int32_t)>>(std::move(callback));
     uint64_t id = weaveffi_docs_register_saved_listener(
         [](int64_t doc_id, int32_t revision, void* context) {
@@ -326,8 +476,8 @@ inline uint64_t docs_register_saved_listener(std::function<void(int64_t, int32_t
     return id;
 }
 
-/** Unregisters a listener previously registered with docs_register_saved_listener(). */
-inline void docs_unregister_saved_listener(uint64_t id) {
+/** Unregisters a listener previously registered with register_saved_listener(). */
+inline void unregister_saved_listener(uint64_t id) {
     weaveffi_docs_unregister_saved_listener(id);
     std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
     detail::wv_listener_registry().erase(id);
@@ -339,52 +489,34 @@ inline void docs_unregister_saved_listener(uint64_t id) {
  * The document starts in `Draft` status; callers must publish
  * it explicitly to make it visible.
  */
-inline Document docs_create_document(const std::string& title, const std::vector<std::string>& tags) {
+inline Document create_document(const std::string& title, const std::vector<std::string>& tags) {
     std::vector<const char*> tags_cstrs;
     tags_cstrs.reserve(tags.size());
     for (const auto& s : tags) tags_cstrs.push_back(s.c_str());
     weaveffi_error err{};
     auto result = weaveffi_docs_create_document(title.c_str(), tags_cstrs.data(), tags_cstrs.size(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidStatusError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     return Document(result);
 }
 
 /** Look up a document by identifier */
-inline std::optional<Document> docs_get_document(int64_t id) {
+inline std::optional<Document> get_document(int64_t id) {
     weaveffi_error err{};
     auto result = weaveffi_docs_get_document(id, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        switch (code) {
-        case 1: throw NotFoundError(msg);
-        case 2: throw InvalidStatusError(msg);
-        default: throw WeaveFFIError(code, msg);
-        }
-    }
+    detail::check(err);
     if (!result) return std::nullopt;
     return Document(result);
 }
 
 /** Publish a document in the background */
-inline std::future<bool> docs_publish_async(int64_t id) {
+inline std::future<bool> publish_async(int64_t id) {
     auto* promise_ptr = new std::promise<bool>();
     auto future = promise_ptr->get_future();
     weaveffi_docs_publish_async_async(id, [](void* context, weaveffi_error* err, bool result) {
         auto* p = static_cast<std::promise<bool>*>(context);
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+            p->set_exception(detail::make_error(err->code, msg));
         } else {
             p->set_value(result);
         }
@@ -392,6 +524,8 @@ inline std::future<bool> docs_publish_async(int64_t id) {
     }, static_cast<void*>(promise_ptr));
     return future;
 }
+
+} // namespace docs
 
 } // namespace weaveffi
 

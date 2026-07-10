@@ -1854,6 +1854,7 @@ dependencies = [
  "serde",
  "tempfile",
  "weaveffi-core",
+ "weaveffi-gen-c",
  "weaveffi-ir",
 ]
 

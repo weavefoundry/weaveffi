@@ -10,7 +10,7 @@
 #![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
-use heck::ToSnakeCase;
+use heck::{ToShoutySnakeCase, ToSnakeCase};
 use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -20,8 +20,9 @@ use weaveffi_core::codegen::common::{
 };
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
+    InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
+    StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
@@ -31,14 +32,16 @@ use weaveffi_core::utils::{
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`PythonGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PythonConfig {
     /// pip-installable Python package name (default `"weaveffi"`). Also
     /// determines the on-disk package directory inside `python/`.
     pub package_name: Option<String>,
-    /// When `true`, strip the IR module name prefix from emitted Python
-    /// function names.
+    /// When `true` (the default), strip the IR module name prefix from
+    /// emitted Python function names, so a `contacts` module exports
+    /// `create_contact` rather than `contacts_create_contact`. Set to
+    /// `false` to restore module-prefixed names.
     pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the ctypes bindings call the same
@@ -47,6 +50,17 @@ pub struct PythonConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for PythonConfig {
+    fn default() -> Self {
+        Self {
+            package_name: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl PythonConfig {
@@ -88,7 +102,11 @@ impl PythonGenerator {
         };
         let mut out = render_prelude(CommentStyle::Hash, input_basename);
         render_preamble(&mut out);
-        let has_async = model.functions().any(|(_, f)| f.is_async);
+        let has_async = model
+            .modules
+            .iter()
+            .flat_map(|m| m.callables())
+            .any(|f| f.is_async);
         if has_async {
             out.push_str("\nimport asyncio\nimport threading\n");
         }
@@ -129,8 +147,28 @@ impl LanguageBackend for PythonGenerator {
         config.prefix()
     }
 
+    fn render_error(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        e: &ErrorBinding,
+        _config: &Self::Config,
+    ) {
+        render_error(out, module, e);
+    }
+
     fn render_enum(&self, out: &mut String, e: &EnumBinding, _config: &Self::Config) {
         render_enum(out, e);
+    }
+
+    fn render_interface(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        i: &InterfaceBinding,
+        _config: &Self::Config,
+    ) {
+        render_interface(out, module, i);
     }
 
     fn render_struct(
@@ -173,7 +211,15 @@ impl LanguageBackend for PythonGenerator {
         f: &FnBinding,
         config: &Self::Config,
     ) {
-        render_function(out, &module.path, f, config.strip_module_prefix);
+        render_callable(
+            out,
+            f,
+            module.error.as_ref(),
+            &FnScope::Free {
+                module_path: &module.path,
+                strip_module_prefix: config.strip_module_prefix,
+            },
+        );
     }
 
     fn files(
@@ -208,7 +254,7 @@ impl LanguageBackend for PythonGenerator {
             ),
             OutputFile::new(
                 pkg_dir.join("weaveffi.pyi"),
-                render_pyi_module(api, config.strip_module_prefix, input_basename),
+                render_pyi_module(model, config.strip_module_prefix, input_basename),
             ),
             OutputFile::new(
                 dir.join("pyproject.toml"),
@@ -255,7 +301,7 @@ impl LanguageBackend for PythonGenerator {
             render_prelude(hash, input_basename),
             render_trailer(hash, "__init__.py"),
         );
-        let pyi = render_pyi_module(api, config.strip_module_prefix, input_basename);
+        let pyi = render_pyi_module(model, config.strip_module_prefix, input_basename);
         let setup_py = render_packaged_setup_py(&package, &import_name, input_basename);
         let pyproject = render_pyproject_toml(&package, &import_name, input_basename);
 
@@ -431,7 +477,8 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Handle => "ctypes.c_uint64",
         TypeRef::TypedHandle(_) => "ctypes.c_void_p",
         TypeRef::Bytes | TypeRef::BorrowedBytes => "ctypes.c_uint8",
-        TypeRef::Struct(_) => "ctypes.c_void_p",
+        // Structs and interfaces both cross the ABI as opaque object pointers.
+        TypeRef::Struct(_) | TypeRef::Interface(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "ctypes.c_void_p"
@@ -460,7 +507,9 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
         TypeRef::Enum(name) => format!("\"{}\"", local_type_name(name)),
-        TypeRef::Struct(name) => format!("\"{}\"", local_type_name(name)),
+        TypeRef::Struct(name) | TypeRef::Interface(name) => {
+            format!("\"{}\"", local_type_name(name))
+        }
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
@@ -604,6 +653,19 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!("{ind}else:\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
         }
+        // A returned interface transfers ownership of a new object reference;
+        // wrap it without re-running the class's FFI constructor.
+        Some(TypeRef::Interface(name)) => {
+            let name = local_type_name(name);
+            out.push_str(&format!("{ind}if result is None:\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"err\"] = WeaveFFIError(-1, \"null pointer\")\n"
+            ));
+            out.push_str(&format!("{ind}else:\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"val\"] = {name}._from_ptr(result)\n"
+            ));
+        }
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
             out.push_str(&format!("{ind}if not result:\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = b\"\"\n"));
@@ -652,6 +714,15 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
                         out.push_str(&format!("{ind}else:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
+                    }
+                    TypeRef::Interface(name) => {
+                        let name = local_type_name(name);
+                        out.push_str(&format!("{ind}if not result:\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
+                        out.push_str(&format!("{ind}else:\n"));
+                        out.push_str(&format!(
+                            "{ind}    _state[\"val\"] = {name}._from_ptr(result)\n"
+                        ));
                     }
                     TypeRef::Bytes | TypeRef::BorrowedBytes => {
                         out.push_str(&format!("{ind}if not result:\n"));
@@ -717,9 +788,23 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
     }
 }
 
-fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
+/// Render the blocking FFI body of an async callable at the body indent
+/// `ind`. A throwing callable maps the completion error through the module
+/// domain's factory (from `error`); a non-throwing one surfaces the generic
+/// `WeaveFFIError`. When `has_self` is set (an instance method), the launcher
+/// receives `self._ptr` as its leading argument.
+fn render_async_ffi_call_body(
+    out: &mut String,
+    f: &FnBinding,
+    error: Option<&ErrorBinding>,
+    ind: &str,
+    has_self: bool,
+) {
     let c_async = format!("{}_async", f.c_base);
-    let ind = "    ";
+    let err_expr = match error {
+        Some(eb) if f.throws => format!("{}(_code, _msg)", py_error_factory_name(eb)),
+        _ => "WeaveFFIError(_code, _msg)".to_string(),
+    };
 
     out.push_str(&format!("{ind}_fn = _lib.{c_async}\n"));
     out.push_str(&format!("{ind}_ev = threading.Event()\n"));
@@ -742,11 +827,9 @@ fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
     out.push_str(&format!(
         "{ind}            _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
     ));
-    out.push_str(&format!(
-        "{ind}            _state[\"err\"] = WeaveFFIError(_code, _msg)\n"
-    ));
+    out.push_str(&format!("{ind}            _state[\"err\"] = {err_expr}\n"));
     out.push_str(&format!("{ind}        else:\n"));
-    append_async_success_handler(out, &f.ret, "                ");
+    append_async_success_handler(out, &f.ret, &format!("{ind}            "));
     out.push_str(&format!("{ind}    finally:\n"));
     out.push_str(&format!("{ind}        _ev.set()\n"));
 
@@ -762,6 +845,9 @@ fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
     out.push_str(&format!("{ind}_cb = _cb_type(_cb_impl)\n"));
 
     let mut argtypes: Vec<String> = Vec::new();
+    if has_self {
+        argtypes.push("ctypes.c_void_p".into());
+    }
     for p in &f.params {
         argtypes.extend(py_param_argtypes(&p.ty));
     }
@@ -775,15 +861,18 @@ fn render_async_ffi_call_body(out: &mut String, f: &FnBinding) {
     out.push_str(&format!("{ind}_fn.restype = None\n"));
 
     for p in &f.params {
-        for line in py_param_conversion(&p.name, &p.ty, ind) {
+        for line in py_param_conversion(&py_name(&p.name), &p.ty, ind) {
             out.push_str(&line);
             out.push('\n');
         }
     }
 
     let mut call_args: Vec<String> = Vec::new();
+    if has_self {
+        call_args.push("self._ptr".into());
+    }
     for p in &f.params {
-        call_args.extend(py_param_call_args(&p.name, &p.ty));
+        call_args.extend(py_param_call_args(&py_name(&p.name), &p.ty));
     }
     if f.cancellable {
         call_args.push("None".into());
@@ -855,13 +944,15 @@ fn emit_docstring(out: &mut String, doc: &Option<String>, indent: &str) {
 }
 
 /// Emits a NumPy/Google-style docstring with a `Parameters` section listing
-/// each parameter that has a `doc:` value. Skips entirely when there is
-/// nothing to document.
+/// each parameter that has a `doc:` value, and a `Raises` section naming the
+/// domain error type when `raises` is set (throwing callables only). Skips
+/// entirely when there is nothing to document.
 fn emit_fn_docstring(
     out: &mut String,
     doc: &Option<String>,
     params: &[ParamBinding],
     indent: &str,
+    raises: Option<&str>,
 ) {
     let trimmed_doc = doc.as_ref().map(|d| d.trim()).filter(|d| !d.is_empty());
     let documented_params: Vec<&ParamBinding> = params
@@ -873,11 +964,12 @@ fn emit_fn_docstring(
                 .unwrap_or(false)
         })
         .collect();
-    if trimmed_doc.is_none() && documented_params.is_empty() {
+    if trimmed_doc.is_none() && documented_params.is_empty() && raises.is_none() {
         return;
     }
     out.push_str(indent);
     out.push_str("\"\"\"");
+    let mut has_content = false;
     if let Some(d) = trimmed_doc {
         if d.contains('\n') {
             out.push('\n');
@@ -894,11 +986,14 @@ fn emit_fn_docstring(
             out.push_str(d);
             out.push('\n');
         }
+        has_content = true;
     } else {
         out.push('\n');
     }
     if !documented_params.is_empty() {
-        out.push('\n');
+        if has_content {
+            out.push('\n');
+        }
         out.push_str(indent);
         out.push_str("Parameters\n");
         out.push_str(indent);
@@ -908,7 +1003,7 @@ fn emit_fn_docstring(
             let mut lines = pdoc.lines();
             let first = lines.next().unwrap_or("");
             out.push_str(indent);
-            out.push_str(&format!("{} : {}\n", p.name, first));
+            out.push_str(&format!("{} : {}\n", py_name(&p.name), first));
             for line in lines {
                 out.push_str(indent);
                 if line.is_empty() {
@@ -920,6 +1015,21 @@ fn emit_fn_docstring(
                 }
             }
         }
+        has_content = true;
+    }
+    if let Some(domain) = raises {
+        if has_content {
+            out.push('\n');
+        }
+        out.push_str(indent);
+        out.push_str("Raises\n");
+        out.push_str(indent);
+        out.push_str("------\n");
+        out.push_str(indent);
+        out.push_str(domain);
+        out.push('\n');
+        out.push_str(indent);
+        out.push_str("    If the call reports one of the domain's error codes.\n");
     }
     out.push_str(indent);
     out.push_str("\"\"\"\n");
@@ -1007,6 +1117,146 @@ def _bytes_to_string(ptr) -> Optional[str]:
     return ptr.decode("utf-8")
 "#,
     );
+}
+
+// ── Typed errors ──
+
+/// The snake_case stem of a domain's generated helpers: `KvError` becomes
+/// `kv_error`, naming `_kv_error_from` and `_check_kv_error`. Domain type
+/// names are globally unique (validated), so the helpers can't collide.
+fn py_error_stem(eb: &ErrorBinding) -> String {
+    eb.type_name.to_snake_case()
+}
+
+/// `_{stem}_from`: builds the domain exception matching an ABI code.
+fn py_error_factory_name(eb: &ErrorBinding) -> String {
+    format!("_{}_from", py_error_stem(eb))
+}
+
+/// `_check_{stem}`: raises the domain exception for a non-zero out-err slot.
+fn py_error_checker_name(eb: &ErrorBinding) -> String {
+    format!("_check_{}", py_error_stem(eb))
+}
+
+/// The error-check call a callable's out-err slot goes through: the module
+/// domain's typed checker when the callable throws, the generic
+/// `_check_error` (plain `WeaveFFIError`, panics and marshalling failures
+/// only) otherwise.
+fn py_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
+    match error {
+        Some(eb) if f.throws => py_error_checker_name(eb),
+        _ => "_check_error".to_string(),
+    }
+}
+
+/// Escape a string for embedding in a double-quoted Python literal.
+fn py_str_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The Python class name for one error code: plain PascalCase with no forced
+/// suffix (`KeyNotFound`, not `KeyNotFoundError`), matching the new samples'
+/// already-Pascal code names. Each class is also attached to its domain class
+/// (`KvError.KeyNotFound`), which stays unambiguous even if two domains
+/// declare codes with the same name.
+fn py_code_class_name(name: &str) -> String {
+    weaveffi_core::errors::pascal(name)
+}
+
+/// Render one module's declared error domain: a base exception named after
+/// the domain (subclassing the generic `WeaveFFIError`), one exception
+/// subclass per code carrying its stable `CODE` and default message, the
+/// code-to-class table, and the factory/checker helpers throwing wrappers
+/// route their out-err slots through. Each code class is also attached to
+/// the domain class, so consumers can catch `KvError.KeyNotFound`.
+fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
+    let domain = &eb.type_name;
+    let factory = py_error_factory_name(eb);
+    let checker = py_error_checker_name(eb);
+    let table = format!("_{}_CODES", eb.type_name.to_shouty_snake_case());
+
+    let mut w = CodeWriter::four_space();
+    w.blank().blank();
+    w.line(format!("class {domain}(WeaveFFIError):"));
+    w.scope(|w| {
+        w.line(format!(
+            "\"\"\"Base exception for the `{}` module's error domain.\"\"\"",
+            module.path
+        ));
+    });
+
+    for c in &eb.codes {
+        let class = py_code_class_name(&c.name);
+        let message = py_str_literal(&c.message);
+        w.blank().blank();
+        w.line(format!("class {class}({domain}):"));
+        w.indent();
+        let mut doc = String::new();
+        emit_docstring(&mut doc, &c.doc, &w.indent_str());
+        if doc.is_empty() {
+            emit_docstring(&mut doc, &Some(c.message.clone()), &w.indent_str());
+        }
+        w.raw(doc);
+        w.blank();
+        w.line(format!("CODE = {}", c.value));
+        w.blank();
+        w.line(format!(
+            "def __init__(self, message: str = \"{message}\") -> None:"
+        ));
+        w.scope(|w| {
+            w.line(format!("super().__init__({}, message)", c.value));
+        });
+        w.dedent();
+    }
+
+    // Scoped aliases: `except KvError.KeyNotFound` stays unambiguous even if
+    // another domain declares a code with the same name.
+    w.blank().blank();
+    for c in &eb.codes {
+        let class = py_code_class_name(&c.name);
+        w.line(format!("{domain}.{class} = {class}"));
+    }
+
+    w.blank().blank();
+    w.line(format!("{table}: Dict[int, type] = {{"));
+    w.scope(|w| {
+        for c in &eb.codes {
+            let class = py_code_class_name(&c.name);
+            w.line(format!("{}: {class},", c.value));
+        }
+    });
+    w.line("}");
+
+    w.blank().blank();
+    w.line(format!(
+        "def {factory}(code: int, message: str) -> WeaveFFIError:"
+    ));
+    w.scope(|w| {
+        w.line(format!(
+            "\"\"\"Build the {domain} subclass matching `code`, or a generic"
+        ));
+        w.line("WeaveFFIError for codes outside the domain (panics, marshalling).\"\"\"");
+        w.line(format!("_cls = {table}.get(code)"));
+        w.line("if _cls is None:");
+        w.scope(|w| {
+            w.line("return WeaveFFIError(code, message)");
+        });
+        w.line("return _cls(message) if message else _cls()");
+    });
+
+    w.blank().blank();
+    w.line(format!("def {checker}(err: _WeaveFFIErrorStruct) -> None:"));
+    w.scope(|w| {
+        w.line("if err.code != 0:");
+        w.scope(|w| {
+            w.line("code = err.code");
+            w.line("message = err.message.decode(\"utf-8\") if err.message else \"\"");
+            w.line("_lib.weaveffi_error_clear(ctypes.byref(err))");
+            w.line(format!("raise {factory}(code, message)"));
+        });
+    });
+
+    out.push_str(&w.finish());
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
@@ -1272,6 +1522,80 @@ fn render_builder(out: &mut String, s: &StructBinding) {
     out.push('\n');
 }
 
+// ── Interfaces ──
+
+/// Render one interface as an opaque-object wrapper class, following the
+/// struct wrapper's ownership pattern: the class owns the raw C pointer and
+/// releases it exactly once, calling the interface's destroy symbol from
+/// `__del__`. A constructor named `new` becomes `__init__`; every other
+/// constructor becomes a `@classmethod` factory; methods pass `self._ptr` as
+/// the leading C argument; statics are `@staticmethod`s. `_from_ptr` wraps a
+/// pointer the producer already handed over (a C return value) without
+/// re-running the FFI constructor.
+fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding) {
+    let error = module.error.as_ref();
+
+    // `_...Iterator` helpers are module-level classes; emit them ahead of the
+    // wrapper so nothing nests inside the class body. The interface name
+    // qualifies the helper so two interfaces can share a method name.
+    for m in i.methods.iter().chain(i.statics.iter()) {
+        if let (Some(TypeRef::Iterator(inner)), CallShape::Iterator(it)) = (&m.ret, &m.shape) {
+            let checker = py_checker_name(m, error);
+            render_iterator_class(
+                out,
+                &it.iter_tag,
+                &format!("{}_{}", i.name, m.name),
+                inner,
+                &checker,
+            );
+        }
+    }
+
+    out.push_str(&format!("\n\nclass {}:\n", i.name));
+    emit_docstring(out, &i.doc, "    ");
+
+    out.push_str(&format!(
+        "\n    @classmethod\n    def _from_ptr(cls, ptr) -> \"{}\":",
+        i.name
+    ));
+    out.push_str("\n        _obj = cls.__new__(cls)");
+    out.push_str("\n        _obj._ptr = ptr");
+    out.push_str("\n        return _obj");
+
+    let new_ctor = i.constructors.iter().find(|c| c.name == "new");
+    if let Some(c) = new_ctor {
+        render_callable(out, c, error, &FnScope::Init);
+    } else {
+        // No canonical constructor: expose the same raw-pointer `__init__`
+        // the struct wrappers use, so factories stay the only public path.
+        out.push_str("\n\n    def __init__(self, _ptr: int) -> None:");
+        out.push_str("\n        self._ptr = _ptr\n");
+    }
+
+    let destroy = &i.destroy_symbol;
+    out.push_str("\n\n    def __del__(self) -> None:");
+    out.push_str("\n        if self._ptr is not None:");
+    out.push_str(&format!(
+        "\n            _lib.{destroy}.argtypes = [ctypes.c_void_p]"
+    ));
+    out.push_str(&format!("\n            _lib.{destroy}.restype = None"));
+    out.push_str(&format!("\n            _lib.{destroy}(self._ptr)"));
+    out.push_str("\n            self._ptr = None");
+
+    for c in &i.constructors {
+        if c.name != "new" {
+            render_callable(out, c, error, &FnScope::Factory);
+        }
+    }
+    for m in &i.methods {
+        render_callable(out, m, error, &FnScope::Method);
+    }
+    for s in &i.statics {
+        render_callable(out, s, error, &FnScope::Static { class: &i.name });
+    }
+    out.push('\n');
+}
+
 /// The zero-value default (and matching type hint) for one builder slot.
 fn py_field_default(ty: &TypeRef) -> (String, String) {
     let hint = py_type_hint(ty);
@@ -1352,15 +1676,16 @@ fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
         }
         TypeRef::Enum(name) => format!("{}({n})", local_type_name(name)),
         // Borrowed by contract: the producer owns callback arguments for the
-        // duration of the call, so opaque pointers pass through raw rather
-        // than being wrapped in an owning class whose __del__ would free them.
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+        // duration of the call, so opaque pointers (including interface
+        // references) pass through raw rather than being wrapped in an owning
+        // class whose __del__ would free them.
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n.into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else None")
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n.into(),
             TypeRef::List(elem) => {
                 let read = py_read_element(&format!("{n}[_i]"), elem);
                 format!("[{read} for _i in range({n}_len)] if {n} else None")
@@ -1405,12 +1730,14 @@ fn render_listener(
         &module.path,
         &format!("register_{}", l.name),
         strip_module_prefix,
-    );
+    )
+    .to_snake_case();
     let unregister_name = wrapper_name(
         &module.path,
         &format!("unregister_{}", l.name),
         strip_module_prefix,
-    );
+    )
+    .to_snake_case();
     let cfunc = format!("_CFUNC_{}", cb.c_fn_type);
     let ind = "    ";
 
@@ -1526,18 +1853,103 @@ fn render_getter(out: &mut String, field: &FieldBinding) {
     render_return_value(out, &field.ty, ind);
 }
 
-fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_module_prefix: bool) {
-    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
-    let params_sig: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| format!("{}: {}", p.name, py_type_hint(&p.ty)))
-        .collect();
-    let ret_hint = f
-        .ret
-        .as_ref()
-        .map(py_type_hint)
-        .unwrap_or_else(|| "None".to_string());
+/// How a rendered callable is scoped and spelled in the generated Python.
+#[derive(Clone, Copy)]
+enum FnScope<'a> {
+    /// A module-level free function.
+    Free {
+        /// The owning module's underscore-joined path.
+        module_path: &'a str,
+        /// Whether the emitted name drops the module-path prefix.
+        strip_module_prefix: bool,
+    },
+    /// An instance method on an interface wrapper: leading `self` parameter,
+    /// `self._ptr` passed as the leading C argument.
+    Method,
+    /// A `@staticmethod` member; carries the wrapper class name so an async
+    /// static's executor call can reference the private sync helper.
+    Static {
+        /// The wrapper class name.
+        class: &'a str,
+    },
+    /// A `@classmethod` constructor factory returning a new wrapper instance.
+    Factory,
+    /// The canonical `new` constructor, emitted as `__init__`.
+    Init,
+}
+
+impl FnScope<'_> {
+    /// True for every scope rendered inside a class body (depth 1).
+    fn is_member(&self) -> bool {
+        !matches!(self, FnScope::Free { .. })
+    }
+
+    /// True when the C call receives `self._ptr` as its leading argument.
+    fn has_self_slot(&self) -> bool {
+        matches!(self, FnScope::Method)
+    }
+
+    /// Indentation depth of the `def` line (0 at module scope, 1 in a class).
+    fn depth(&self) -> usize {
+        usize::from(self.is_member())
+    }
+}
+
+/// The Python spelling of an IDL value identifier (parameter name):
+/// snake_case via heck. IDL names are usually already snake, so this is a
+/// safety net for camelCase inputs.
+fn py_name(name: &str) -> String {
+    name.to_snake_case()
+}
+
+/// The emitted Python name for a callable in `scope`: `__init__` for the
+/// canonical constructor, otherwise the snake_case member name, with the
+/// module-path prefix applied to free functions when configured.
+fn py_fn_name(f: &FnBinding, scope: &FnScope) -> String {
+    match scope {
+        FnScope::Free {
+            module_path,
+            strip_module_prefix,
+        } => wrapper_name(module_path, &f.name, *strip_module_prefix).to_snake_case(),
+        FnScope::Init => "__init__".to_string(),
+        _ => f.name.to_snake_case(),
+    }
+}
+
+/// Render one callable: a free function or an interface member. `error` is
+/// the module's error domain (used when the callable throws); `scope` picks
+/// the def spelling, receiver, indent, and result handling. Sync, async, and
+/// iterator shapes all route through here so members reuse the free-function
+/// marshalling paths.
+fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>, scope: &FnScope) {
+    let func_name = py_fn_name(f, scope);
+    let depth = scope.depth();
+    let ind = "    ".repeat(depth + 1);
+    let checker = py_checker_name(f, error);
+    let raises = error.filter(|_| f.throws).map(|eb| eb.type_name.as_str());
+
+    let receiver = match scope {
+        FnScope::Method | FnScope::Init => Some("self"),
+        FnScope::Factory => Some("cls"),
+        _ => None,
+    };
+    let mut params_sig: Vec<String> = Vec::new();
+    if let Some(r) = receiver {
+        params_sig.push(r.to_string());
+    }
+    params_sig.extend(
+        f.params
+            .iter()
+            .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty))),
+    );
+    let ret_hint = match scope {
+        FnScope::Init => "None".to_string(),
+        _ => f
+            .ret
+            .as_ref()
+            .map(py_type_hint)
+            .unwrap_or_else(|| "None".to_string()),
+    };
 
     let def_name = if f.is_async {
         format!("_{func_name}_sync")
@@ -1545,14 +1957,25 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         func_name.clone()
     };
 
+    // The `_...Iterator` helper class is module-level; a member's helper is
+    // emitted by `render_interface` ahead of the wrapper class instead.
     if let (Some(TypeRef::Iterator(inner)), CallShape::Iterator(it)) = (&f.ret, &f.shape) {
-        render_iterator_class(out, &it.iter_tag, &f.name, inner);
+        if !scope.is_member() {
+            render_iterator_class(out, &it.iter_tag, &f.name, inner, &checker);
+        }
     }
 
-    let ind = "    ";
+    let decorator = match scope {
+        FnScope::Static { .. } => Some("@staticmethod"),
+        FnScope::Factory => Some("@classmethod"),
+        _ => None,
+    };
 
-    let mut w = CodeWriter::four_space();
+    let mut w = CodeWriter::four_space().with_depth(depth);
     w.blank().blank();
+    if let Some(d) = decorator {
+        w.line(d);
+    }
     w.line(format!(
         "def {}({}) -> {}:",
         def_name,
@@ -1562,8 +1985,14 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
     w.indent();
 
     let mut fdoc = String::new();
-    emit_fn_docstring(&mut fdoc, &f.doc, &f.params, ind);
+    emit_fn_docstring(&mut fdoc, &f.doc, &f.params, &ind, raises);
     w.raw(fdoc);
+
+    // Set before any fallible statement so `__del__` never sees a
+    // half-constructed instance when the constructor raises.
+    if matches!(scope, FnScope::Init) {
+        w.line("self._ptr = None");
+    }
 
     if let Some(msg) = &f.deprecated {
         w.line("import warnings");
@@ -1577,13 +2006,21 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         // The async FFI call body is rendered at the function-body indent and
         // spliced in verbatim.
         let mut body = String::new();
-        render_async_ffi_call_body(&mut body, f);
+        render_async_ffi_call_body(&mut body, f, error, &ind, scope.has_self_slot());
         w.raw(body);
         out.push_str(&w.finish());
     } else {
-        w.line(format!("_fn = _lib.{}", f.c_base));
+        let sym = match &f.shape {
+            CallShape::Sync(abi) => abi.symbol.as_str(),
+            CallShape::Iterator(it) => it.launch.symbol.as_str(),
+            CallShape::Async(_) => unreachable!("async handled above"),
+        };
+        w.line(format!("_fn = _lib.{sym}"));
 
         let mut argtypes: Vec<String> = Vec::new();
+        if scope.has_self_slot() {
+            argtypes.push("ctypes.c_void_p".into());
+        }
         for p in &f.params {
             argtypes.extend(py_param_argtypes(&p.ty));
         }
@@ -1603,7 +2040,7 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         w.line(format!("_fn.restype = {restype}"));
 
         for p in &f.params {
-            for line in py_param_conversion(&p.name, &p.ty, ind) {
+            for line in py_param_conversion(&py_name(&p.name), &p.ty, &ind) {
                 w.raw(&line).raw("\n");
             }
         }
@@ -1628,8 +2065,11 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
         }
 
         let mut call_args: Vec<String> = Vec::new();
+        if scope.has_self_slot() {
+            call_args.push("self._ptr".into());
+        }
         for p in &f.params {
-            call_args.extend(py_param_call_args(&p.name, &p.ty));
+            call_args.extend(py_param_call_args(&py_name(&p.name), &p.ty));
         }
         if is_map_ret {
             call_args.push("ctypes.byref(_out_keys)".into());
@@ -1647,36 +2087,69 @@ fn render_function(out: &mut String, module_name: &str, f: &FnBinding, strip_mod
             w.line(call_expr);
         }
 
-        w.line("_check_error(_err)");
-        out.push_str(&w.finish());
+        w.line(format!("{checker}(_err)"));
 
-        if let Some(ret_ty) = &f.ret {
-            if let (TypeRef::Iterator(inner), CallShape::Iterator(it)) = (ret_ty, &f.shape) {
-                render_iterator_return(out, &it.iter_tag, inner, ind);
-            } else {
-                render_return_value(out, ret_ty, ind);
+        match scope {
+            // Constructors receive the owned pointer directly rather than
+            // routing through the generic return path.
+            FnScope::Init => {
+                w.line("if _result is None:");
+                w.scope(|w| {
+                    w.line("raise WeaveFFIError(-1, \"null pointer\")");
+                });
+                w.line("self._ptr = _result");
+                out.push_str(&w.finish());
+            }
+            FnScope::Factory => {
+                w.line("if _result is None:");
+                w.scope(|w| {
+                    w.line("raise WeaveFFIError(-1, \"null pointer\")");
+                });
+                w.line("return cls._from_ptr(_result)");
+                out.push_str(&w.finish());
+            }
+            _ => {
+                out.push_str(&w.finish());
+                if let Some(ret_ty) = &f.ret {
+                    if let (TypeRef::Iterator(inner), CallShape::Iterator(it)) = (ret_ty, &f.shape)
+                    {
+                        render_iterator_return(out, &it.iter_tag, inner, &ind, &checker);
+                    } else {
+                        render_return_value(out, ret_ty, &ind);
+                    }
+                }
             }
         }
     }
 
     if f.is_async {
         let params_joined = params_sig.join(", ");
-        let mut w = CodeWriter::four_space();
+        let mut w = CodeWriter::four_space().with_depth(depth);
         w.blank().blank();
+        if let Some(d) = decorator {
+            w.line(d);
+        }
         w.line(format!(
             "async def {}({}) -> {}:",
             func_name, params_joined, ret_hint
         ));
         w.indent();
         let mut adoc = String::new();
-        emit_fn_docstring(&mut adoc, &f.doc, &f.params, ind);
+        emit_fn_docstring(&mut adoc, &f.doc, &f.params, &ind, raises);
         w.raw(adoc);
         w.line("_loop = asyncio.get_event_loop()");
-        let arg_names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        // The sync helper is resolved per scope: bound (`self.`), via the
+        // class name for statics, or the bare module-level name.
+        let target = match scope {
+            FnScope::Method => format!("self.{def_name}"),
+            FnScope::Static { class } => format!("{class}.{def_name}"),
+            _ => def_name.clone(),
+        };
+        let arg_names: Vec<String> = f.params.iter().map(|p| py_name(&p.name)).collect();
         let executor_args = if arg_names.is_empty() {
-            def_name
+            target
         } else {
-            format!("{def_name}, {}", arg_names.join(", "))
+            format!("{target}, {}", arg_names.join(", "))
         };
         if f.ret.is_some() {
             w.line(format!(
@@ -1698,7 +2171,9 @@ fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             format!("*[_string_to_bytes(v) for v in {name}]")
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => format!("*[v._ptr for v in {name}]"),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            format!("*[v._ptr for v in {name}]")
+        }
         TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
         TypeRef::Bool => format!("*[1 if v else 0 for v in {name}]"),
         _ => format!("*{name}"),
@@ -1711,7 +2186,7 @@ fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
             format!("*[_string_to_bytes({var}) for {var} in {list_name}]")
         }
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             format!("*[{var}._ptr for {var} in {list_name}]")
         }
         TypeRef::Bool => format!("*[1 if {var} else 0 for {var} in {list_name}]"),
@@ -1821,11 +2296,15 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("_{name}_arr"), format!("len({name})")]
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![format!("{name}._ptr")],
+        // An interface parameter is borrowed: pass the wrapper's raw pointer;
+        // the callee never takes ownership.
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            vec![format!("{name}._ptr")]
+        }
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_{name}_c")],
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
                 vec![format!("{name}._ptr if {name} is not None else None")]
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
@@ -1857,6 +2336,11 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
         TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Enum(name) => {
             let name = local_type_name(name);
             format!("{name}({expr})")
+        }
+        // Owned interface references wrap without re-running the class's FFI
+        // constructor.
+        TypeRef::Interface(name) => {
+            format!("{}._from_ptr({expr})", local_type_name(name))
         }
         TypeRef::Bool => format!("bool({expr})"),
         _ => expr.to_string(),
@@ -1900,6 +2384,16 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             });
             w.line(format!("return {name}(_result)"));
         }
+        // A returned interface is a new owned reference: wrap it without
+        // re-running the class's FFI constructor.
+        TypeRef::Interface(name) => {
+            let name = local_type_name(name);
+            w.line("if _result is None:");
+            w.scope(|w| {
+                w.line("raise WeaveFFIError(-1, \"null pointer\")");
+            });
+            w.line(format!("return {name}._from_ptr(_result)"));
+        }
         TypeRef::Enum(name) => {
             let name = local_type_name(name);
             w.line(format!("return {name}(_result)"));
@@ -1938,6 +2432,14 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
                 w.line("return None");
             });
             w.line(format!("return {name}(_result)"));
+        }
+        TypeRef::Interface(name) => {
+            let name = local_type_name(name);
+            w.line("if _result is None:");
+            w.scope(|w| {
+                w.line("return None");
+            });
+            w.line(format!("return {name}._from_ptr(_result)"));
         }
         TypeRef::Enum(name) => {
             let name = local_type_name(name);
@@ -1993,12 +2495,25 @@ fn py_read_iter_item(inner: &TypeRef) -> String {
             let name = local_type_name(name);
             format!("{name}(_out_item.value)")
         }
+        TypeRef::Interface(name) => {
+            format!("{}._from_ptr(_out_item.value)", local_type_name(name))
+        }
         TypeRef::Bool => "bool(_out_item.value)".into(),
         _ => "_out_item.value".into(),
     }
 }
 
-fn render_iterator_class(out: &mut String, iter_tag: &str, func_name: &str, inner: &TypeRef) {
+/// Render the module-level `_...Iterator` helper class for one
+/// iterator-returning callable. `checker` is the error-check helper the
+/// `next` calls route their out-err slot through (typed for a throwing
+/// callable, generic otherwise).
+fn render_iterator_class(
+    out: &mut String,
+    iter_tag: &str,
+    func_name: &str,
+    inner: &TypeRef,
+    checker: &str,
+) {
     let pascal = pascal_case(func_name);
     let class_name = format!("_{pascal}Iterator");
     let item_scalar = py_ctypes_scalar(inner);
@@ -2025,7 +2540,7 @@ fn render_iterator_class(out: &mut String, iter_tag: &str, func_name: &str, inne
     out.push_str(
         "\n        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))",
     );
-    out.push_str("\n        _check_error(_err)");
+    out.push_str(&format!("\n        {checker}(_err)"));
     out.push_str("\n        if not _has:");
     out.push_str("\n            self._done = True");
     out.push_str("\n            self._destroy()");
@@ -2047,7 +2562,15 @@ fn render_iterator_class(out: &mut String, iter_tag: &str, func_name: &str, inne
     out.push('\n');
 }
 
-fn render_iterator_return(out: &mut String, iter_tag: &str, inner: &TypeRef, ind: &str) {
+/// Render the eager-drain body of an iterator-returning wrapper. `checker`
+/// is the error-check helper each `next` call routes its out-err through.
+fn render_iterator_return(
+    out: &mut String,
+    iter_tag: &str,
+    inner: &TypeRef,
+    ind: &str,
+    checker: &str,
+) {
     let item_scalar = py_ctypes_scalar(inner);
     let read_expr = py_read_iter_item(inner);
 
@@ -2068,7 +2591,7 @@ fn render_iterator_return(out: &mut String, iter_tag: &str, inner: &TypeRef, ind
     out.push_str(&format!(
         "{ind}    _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))\n"
     ));
-    out.push_str(&format!("{ind}    _check_error(_item_err)\n"));
+    out.push_str(&format!("{ind}    {checker}(_item_err)\n"));
     out.push_str(&format!("{ind}    if not _has:\n"));
     out.push_str(&format!("{ind}        break\n"));
     out.push_str(&format!("{ind}    _items.append({read_expr})\n"));
@@ -2182,15 +2705,23 @@ from {import_name} import *
 
 // ── Type stub (.pyi) rendering ──
 
-fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str) -> String {
-    // Type stubs contain no C symbols, so the ABI prefix is irrelevant here; the
-    // model is used purely for its flattened, path-carrying module traversal.
-    let model = BindingModel::build(api, "weaveffi");
+fn render_pyi_module(
+    model: &BindingModel,
+    strip_module_prefix: bool,
+    input_basename: &str,
+) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     out.push_str(
-        "from enum import IntEnum\nfrom typing import Callable, Dict, Iterator, List, Optional\n",
+        "from enum import IntEnum\nfrom typing import Callable, Dict, Iterator, List, Optional, Type\n",
     );
+    out.push_str("\nclass WeaveFFIError(Exception):\n");
+    out.push_str("    code: int\n");
+    out.push_str("    message: str\n");
+    out.push_str("    def __init__(self, code: int, message: str) -> None: ...\n");
     for m in &model.modules {
+        if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
+            render_pyi_error(&mut out, eb);
+        }
         for e in &m.enums {
             if e.is_rich() {
                 render_pyi_rich_enum(&mut out, e);
@@ -2200,6 +2731,9 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str)
         }
         for s in &m.structs {
             render_pyi_struct(&mut out, s);
+        }
+        for i in &m.interfaces {
+            render_pyi_interface(&mut out, i);
         }
         for l in &m.listeners {
             render_pyi_listener(&mut out, m, l, strip_module_prefix);
@@ -2211,6 +2745,92 @@ fn render_pyi_module(api: &Api, strip_module_prefix: bool, input_basename: &str)
     out.push('\n');
     out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.pyi"));
     out
+}
+
+/// `.pyi` stub for one module's error domain: the domain base class (with
+/// its scoped per-code aliases) plus a per-code subclass carrying its stable
+/// `CODE`, mirroring [`render_error`].
+fn render_pyi_error(out: &mut String, eb: &ErrorBinding) {
+    let domain = &eb.type_name;
+    out.push('\n');
+    out.push_str(&format!("class {domain}(WeaveFFIError):\n"));
+    for c in &eb.codes {
+        let class = py_code_class_name(&c.name);
+        out.push_str(&format!("    {class}: Type[\"{class}\"]\n"));
+    }
+    out.push_str("    def __init__(self, code: int, message: str) -> None: ...\n");
+    for c in &eb.codes {
+        let class = py_code_class_name(&c.name);
+        out.push('\n');
+        emit_doc(out, &c.doc, "");
+        out.push_str(&format!("class {class}({domain}):\n"));
+        out.push_str("    CODE: int\n");
+        out.push_str("    def __init__(self, message: str = ...) -> None: ...\n");
+    }
+}
+
+/// `.pyi` stub for one interface wrapper class: `__init__` for the canonical
+/// `new` constructor, a classmethod per remaining constructor, then methods
+/// and statics, mirroring [`render_interface`].
+fn render_pyi_interface(out: &mut String, i: &InterfaceBinding) {
+    out.push('\n');
+    emit_doc(out, &i.doc, "");
+    out.push_str(&format!("class {}:\n", i.name));
+    let member_sig = |f: &FnBinding, receiver: Option<&str>| -> String {
+        let mut params: Vec<String> = receiver.iter().map(|r| r.to_string()).collect();
+        params.extend(
+            f.params
+                .iter()
+                .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty))),
+        );
+        params.join(", ")
+    };
+    let async_kw = |f: &FnBinding| if f.is_async { "async " } else { "" };
+    if let Some(c) = i.constructors.iter().find(|c| c.name == "new") {
+        out.push_str(&format!(
+            "    def __init__({}) -> None: ...\n",
+            member_sig(c, Some("self"))
+        ));
+    }
+    for c in i.constructors.iter().filter(|c| c.name != "new") {
+        out.push_str(&format!(
+            "    @classmethod\n    def {}({}) -> \"{}\": ...\n",
+            c.name.to_snake_case(),
+            member_sig(c, Some("cls")),
+            i.name
+        ));
+    }
+    for m in &i.methods {
+        let ret = m
+            .ret
+            .as_ref()
+            .map(py_type_hint)
+            .unwrap_or_else(|| "None".into());
+        out.push_str(&format!(
+            "    {}def {}({}) -> {}: ...\n",
+            async_kw(m),
+            m.name.to_snake_case(),
+            member_sig(m, Some("self")),
+            ret
+        ));
+    }
+    for s in &i.statics {
+        let ret = s
+            .ret
+            .as_ref()
+            .map(py_type_hint)
+            .unwrap_or_else(|| "None".into());
+        out.push_str(&format!(
+            "    @staticmethod\n    {}def {}({}) -> {}: ...\n",
+            async_kw(s),
+            s.name.to_snake_case(),
+            member_sig(s, None),
+            ret
+        ));
+    }
+    if i.constructors.is_empty() && i.methods.is_empty() && i.statics.is_empty() {
+        out.push_str("    ...\n");
+    }
 }
 
 fn render_pyi_enum(out: &mut String, e: &EnumBinding) {
@@ -2295,12 +2915,14 @@ fn render_pyi_listener(
         &module.path,
         &format!("register_{}", l.name),
         strip_module_prefix,
-    );
+    )
+    .to_snake_case();
     let unregister_name = wrapper_name(
         &module.path,
         &format!("unregister_{}", l.name),
         strip_module_prefix,
-    );
+    )
+    .to_snake_case();
     out.push('\n');
     emit_doc(out, &l.doc, "");
     out.push_str(&format!(
@@ -2318,11 +2940,11 @@ fn render_pyi_function(
     f: &FnBinding,
     strip_module_prefix: bool,
 ) {
-    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix);
+    let func_name = wrapper_name(module_name, &f.name, strip_module_prefix).to_snake_case();
     let params: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", p.name, py_type_hint(&p.ty)))
+        .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty)))
         .collect();
     let ret = f
         .ret
@@ -2351,7 +2973,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
@@ -2366,6 +2988,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }
@@ -2382,6 +3005,7 @@ mod tests {
             params: vec![],
             returns: None,
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2469,6 +3093,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2572,6 +3197,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2616,6 +3242,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2625,6 +3252,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2652,6 +3280,7 @@ mod tests {
             params: vec![],
             returns: None,
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2705,6 +3334,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2737,6 +3367,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2746,6 +3377,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2790,6 +3422,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2834,7 +3467,7 @@ mod tests {
     #[test]
     fn python_builder_generated() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -2860,6 +3493,7 @@ mod tests {
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
+                interfaces: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -2914,6 +3548,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2923,6 +3558,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2954,6 +3590,7 @@ mod tests {
             }],
             returns: Some(TypeRef::Bool),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2984,6 +3621,7 @@ mod tests {
             params: vec![],
             returns: Some(TypeRef::Handle),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -3011,6 +3649,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Bytes),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3020,6 +3659,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3049,6 +3689,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3058,6 +3699,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3095,6 +3737,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3104,6 +3747,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3134,6 +3778,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3144,6 +3789,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3154,6 +3800,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3190,6 +3837,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3203,6 +3851,7 @@ mod tests {
                         Box::new(TypeRef::I32),
                     )),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3213,6 +3862,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3253,6 +3903,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3287,6 +3938,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3382,6 +4034,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Handle),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3397,6 +4050,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3407,6 +4061,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3417,12 +4072,14 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 },
             ],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3538,6 +4195,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3547,6 +4205,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3581,6 +4240,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3680,6 +4340,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Handle),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3695,6 +4356,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3710,12 +4372,14 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 },
             ],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3818,6 +4482,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -3899,6 +4564,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3943,6 +4609,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Enum("ContactType".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3975,6 +4642,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4018,6 +4686,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::I32))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4033,6 +4702,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4045,6 +4715,7 @@ mod tests {
                         "Contact".into(),
                     )))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4055,6 +4726,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::Optional(Box::new(TypeRef::Bool))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4065,6 +4737,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4135,6 +4808,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4145,6 +4819,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4155,6 +4830,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4165,6 +4841,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4216,6 +4893,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4229,6 +4907,7 @@ mod tests {
                         Box::new(TypeRef::I32),
                     )),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4239,6 +4918,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4378,6 +5058,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Handle),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4393,6 +5074,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4403,6 +5085,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4418,17 +5101,19 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 },
             ],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
 
-        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
 
         assert!(pyi.contains("from enum import IntEnum"));
         assert!(pyi.contains("from typing import Callable, Dict, Iterator, List, Optional"));
@@ -4549,6 +5234,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Handle),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4564,6 +5250,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4574,6 +5261,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4589,6 +5277,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Bool),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -4599,12 +5288,14 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 },
             ],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4706,6 +5397,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -4816,6 +5508,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -4876,6 +5569,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -4885,6 +5579,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -4921,7 +5616,13 @@ mod tests {
             "pyi stripped name should be create_contact: {pyi}"
         );
 
-        let no_strip = PythonConfig::default();
+        // Stripping is the default; module-prefixed names are opt-in.
+        assert!(PythonConfig::default().strip_module_prefix);
+
+        let no_strip = PythonConfig {
+            strip_module_prefix: false,
+            ..PythonConfig::default()
+        };
         let tmp2 = std::env::temp_dir().join("weaveffi_test_python_no_strip_prefix");
         let _ = std::fs::remove_dir_all(&tmp2);
         std::fs::create_dir_all(&tmp2).unwrap();
@@ -4932,13 +5633,13 @@ mod tests {
         let py2 = std::fs::read_to_string(tmp2.join("python/weaveffi/weaveffi.py")).unwrap();
         assert!(
             py2.contains("def contacts_create_contact("),
-            "default should use module-prefixed name: {py2}"
+            "opting out should use module-prefixed name: {py2}"
         );
 
         let pyi2 = std::fs::read_to_string(tmp2.join("python/weaveffi/weaveffi.pyi")).unwrap();
         assert!(
             pyi2.contains("def contacts_create_contact("),
-            "pyi default should use module-prefixed name: {pyi2}"
+            "pyi opt-out should use module-prefixed name: {pyi2}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4961,6 +5662,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -4980,10 +5682,11 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
-        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
         assert!(
             pyi.contains("Optional[List[Optional["),
             "should contain deeply nested optional type: {pyi}"
@@ -5007,6 +5710,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5016,10 +5720,11 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
-        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
         assert!(
             pyi.contains("Dict[str, List[int]]"),
             "should contain map of lists type: {pyi}"
@@ -5043,6 +5748,7 @@ mod tests {
                 }],
                 returns: None,
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5085,10 +5791,11 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
-        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
         assert!(
             pyi.contains("Dict[\"Color\", \"Contact\"]"),
             "should contain enum-keyed map type: {pyi}"
@@ -5098,7 +5805,7 @@ mod tests {
     #[test]
     fn python_typed_handle_type() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -5111,6 +5818,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -5130,6 +5838,7 @@ mod tests {
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
+                interfaces: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -5165,6 +5874,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5184,6 +5894,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5261,6 +5972,7 @@ mod tests {
                     "Contact".into(),
                 )))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5280,6 +5992,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5314,6 +6027,7 @@ mod tests {
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
+            throws: false,
             r#async: true,
             cancellable: false,
             deprecated: None,
@@ -5472,6 +6186,7 @@ mod tests {
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
+            throws: false,
             r#async: true,
             cancellable: false,
             deprecated: None,
@@ -5507,12 +6222,13 @@ mod tests {
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
+            throws: false,
             r#async: true,
             cancellable: false,
             deprecated: None,
             since: None,
         }])]);
-        let stubs = render_pyi_module(&api, true, "weaveffi.yml");
+        let stubs = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
         assert!(
             stubs.contains("async def fetch_data(id: int) -> str: ..."),
             "pyi should declare async def: {stubs}"
@@ -5539,6 +6255,7 @@ mod tests {
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
+                interfaces: vec![],
                 errors: None,
                 modules: vec![],
             },
@@ -5554,6 +6271,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Struct("types.Name".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -5563,13 +6281,14 @@ mod tests {
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
+                interfaces: vec![],
                 errors: None,
                 modules: vec![],
             },
         ]);
 
         let code = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
-        let stubs = render_pyi_module(&api, true, "weaveffi.yml");
+        let stubs = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
 
         assert!(
             code.contains("Name(_result)"),
@@ -5598,6 +6317,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::I32),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5607,6 +6327,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![Module {
                 name: "child".to_string(),
@@ -5615,6 +6336,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -5624,6 +6346,7 @@ mod tests {
                 enums: vec![],
                 callbacks: vec![],
                 listeners: vec![],
+                interfaces: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -5645,7 +6368,7 @@ mod tests {
             py.contains("weaveffi_parent_child_inner_fn"),
             "nested child C function missing: {py}"
         );
-        let pyi = render_pyi_module(&api, true, "weaveffi.yml");
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
         assert!(
             pyi.contains("def inner_fn"),
             "nested child function missing from pyi: {pyi}"
@@ -5675,6 +6398,7 @@ mod tests {
                 params: vec![],
                 returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5684,6 +6408,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -5722,6 +6447,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: Some("Use add_v2 instead".into()),
@@ -5747,6 +6473,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: Some("Performs a thing.".into()),
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -5775,6 +6502,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }])
@@ -5832,6 +6560,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -5858,6 +6587,541 @@ mod tests {
         assert!(
             !py.contains("myffi_error_clear"),
             "runtime ABI helper must not be prefixed: {py}"
+        );
+    }
+
+    /// A `kv` module declaring a `KvError` domain, a throwing and a
+    /// non-throwing free function, and a `Store` interface exercising the
+    /// canonical `new` constructor, a factory constructor, an instance method
+    /// with a string parameter and return, and a static.
+    fn kv_api() -> Api {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain, InterfaceDef};
+
+        let fn_lit =
+            |name: &str, params: Vec<Param>, returns: Option<TypeRef>, throws: bool| Function {
+                name: name.into(),
+                params,
+                returns,
+                doc: None,
+                throws,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            };
+        let str_param = |name: &str| Param {
+            name: name.into(),
+            ty: TypeRef::StringUtf8,
+            mutable: false,
+            doc: None,
+        };
+
+        make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![
+                fn_lit(
+                    "lookup",
+                    vec![str_param("key")],
+                    Some(TypeRef::StringUtf8),
+                    true,
+                ),
+                fn_lit("reset", vec![], None, false),
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: Some("A key-value store handle.".into()),
+                constructors: vec![
+                    fn_lit("new", vec![str_param("path")], None, true),
+                    fn_lit("open_readonly", vec![str_param("path")], None, true),
+                ],
+                methods: vec![fn_lit(
+                    "get",
+                    vec![str_param("key")],
+                    Some(TypeRef::StringUtf8),
+                    true,
+                )],
+                statics: vec![fn_lit("version", vec![], Some(TypeRef::StringUtf8), false)],
+            }],
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KEY_NOT_FOUND".into(),
+                        code: 1,
+                        message: "key not found".into(),
+                        doc: Some("Raised when the key is absent.".into()),
+                    },
+                    ErrorCode {
+                        name: "IO_FAILURE".into(),
+                        code: 2,
+                        message: "io failure".into(),
+                        doc: None,
+                    },
+                ],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn python_interface_async_and_iterator_members() {
+        use weaveffi_ir::ir::InterfaceDef;
+        let mut api = kv_api();
+        api.modules[0].interfaces = vec![InterfaceDef {
+            name: "Store".into(),
+            doc: None,
+            constructors: vec![Function {
+                name: "new".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                throws: true,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            methods: vec![
+                Function {
+                    name: "fetch".into(),
+                    params: vec![Param {
+                        name: "key".into(),
+                        ty: TypeRef::StringUtf8,
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::StringUtf8),
+                    doc: None,
+                    throws: true,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "list_keys".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    throws: true,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            statics: vec![Function {
+                name: "default_path".into(),
+                params: vec![],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                throws: false,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        }];
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        // Async method: private sync helper takes self, passes self._ptr to
+        // the launcher, and the async def dispatches through the bound helper.
+        assert!(
+            py.contains("import asyncio"),
+            "missing asyncio import: {py}"
+        );
+        assert!(
+            py.contains("def _fetch_sync(self, key: str) -> str:"),
+            "missing async method sync helper: {py}"
+        );
+        assert!(
+            py.contains("_fn(self._ptr, _string_to_bytes(key), _cb, None)"),
+            "async launcher should receive self._ptr first: {py}"
+        );
+        assert!(
+            py.contains("async def fetch(self, key: str) -> str:"),
+            "missing async def method: {py}"
+        );
+        assert!(
+            py.contains("run_in_executor(None, self._fetch_sync, key)"),
+            "async method should dispatch through the bound helper: {py}"
+        );
+        // A throwing async member maps errors through the domain factory.
+        assert!(
+            py.contains("_state[\"err\"] = _kv_error_from(_code, _msg)"),
+            "throwing async member should build domain errors: {py}"
+        );
+
+        // Iterator method: the helper class is emitted at module scope,
+        // qualified by the interface name, and checks the domain error.
+        assert!(
+            py.contains("class _StoreListKeysIterator:"),
+            "missing interface-qualified iterator helper: {py}"
+        );
+        assert!(
+            py.contains("def list_keys(self) -> Iterator[str]:"),
+            "missing iterator method: {py}"
+        );
+
+        // Async static: the executor resolves the helper via the class name,
+        // and a non-throwing member falls back to the generic error.
+        assert!(
+            py.contains("run_in_executor(None, Store._default_path_sync)"),
+            "async static should dispatch via the class: {py}"
+        );
+        assert!(
+            py.contains("_state[\"err\"] = WeaveFFIError(_code, _msg)"),
+            "non-throwing async member keeps the generic error: {py}"
+        );
+    }
+
+    #[test]
+    fn python_typed_error_domain_classes() {
+        let py = render_python_module(&kv_api(), true, "weaveffi", "weaveffi.yml");
+        assert!(
+            py.contains("class KvError(WeaveFFIError):"),
+            "missing domain base class: {py}"
+        );
+        assert!(
+            py.contains("class KeyNotFound(KvError):"),
+            "missing per-code subclass: {py}"
+        );
+        assert!(py.contains("CODE = 1"), "missing CODE attr: {py}");
+        assert!(
+            py.contains("class IoFailure(KvError):"),
+            "missing second per-code subclass: {py}"
+        );
+        assert!(
+            py.contains("\"\"\"Raised when the key is absent.\"\"\""),
+            "per-code class should carry its doc: {py}"
+        );
+        assert!(
+            py.contains("\"\"\"io failure\"\"\""),
+            "per-code class should fall back to its message: {py}"
+        );
+        assert!(
+            py.contains("def __init__(self, message: str = \"key not found\") -> None:"),
+            "per-code class should default its message: {py}"
+        );
+        assert!(
+            py.contains("KvError.KeyNotFound = KeyNotFound"),
+            "code classes should attach to the domain for scoped catches: {py}"
+        );
+        assert!(
+            py.contains("1: KeyNotFound,"),
+            "missing code table entry: {py}"
+        );
+        assert!(
+            py.contains("def _kv_error_from(code: int, message: str) -> WeaveFFIError:"),
+            "missing factory: {py}"
+        );
+        assert!(
+            py.contains("def _check_kv_error(err: _WeaveFFIErrorStruct) -> None:"),
+            "missing domain checker: {py}"
+        );
+        assert!(
+            py.contains("raise _kv_error_from(code, message)"),
+            "checker should raise through the factory: {py}"
+        );
+    }
+
+    #[test]
+    fn python_throwing_fn_uses_domain_checker() {
+        let py = render_python_module(&kv_api(), true, "weaveffi", "weaveffi.yml");
+        let lookup = py
+            .split("def lookup(")
+            .nth(1)
+            .expect("lookup wrapper present");
+        let lookup_body = lookup.split("\n\n").next().unwrap();
+        assert!(
+            lookup_body.contains("_check_kv_error(_err)"),
+            "throwing fn should route through the domain checker: {py}"
+        );
+    }
+
+    #[test]
+    fn python_non_throwing_fn_uses_generic_checker() {
+        let py = render_python_module(&kv_api(), true, "weaveffi", "weaveffi.yml");
+        let reset = py
+            .split("def reset(")
+            .nth(1)
+            .expect("reset wrapper present");
+        let reset_body = reset.split("\n\n").next().unwrap();
+        assert!(
+            reset_body.contains("def reset() -> None:")
+                || reset.starts_with(") -> None:")
+                || py.contains("def reset() -> None:"),
+            "non-throwing fn keeps a plain signature: {py}"
+        );
+        assert!(
+            reset_body.contains("_check_error(_err)"),
+            "non-throwing fn should use the generic checker: {py}"
+        );
+        assert!(
+            !reset_body.contains("_check_kv_error"),
+            "non-throwing fn must not use the domain checker: {py}"
+        );
+    }
+
+    #[test]
+    fn python_interface_class_generated() {
+        let py = render_python_module(&kv_api(), true, "weaveffi", "weaveffi.yml");
+
+        assert!(py.contains("class Store:"), "missing wrapper class: {py}");
+        assert!(
+            py.contains("\"\"\"A key-value store handle.\"\"\""),
+            "missing interface docstring: {py}"
+        );
+        assert!(
+            py.contains("def _from_ptr(cls, ptr) -> \"Store\":"),
+            "missing _from_ptr wrapper hook: {py}"
+        );
+
+        // `new` becomes `__init__`, calling the constructor symbol and
+        // stashing the owned pointer.
+        assert!(
+            py.contains("def __init__(self, path: str) -> None:"),
+            "missing __init__ from ctor `new`: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_kv_Store_new"),
+            "missing ctor symbol: {py}"
+        );
+        assert!(
+            py.contains("self._ptr = _result"),
+            "__init__ should own the returned pointer: {py}"
+        );
+
+        // The second constructor is a classmethod factory.
+        assert!(
+            py.contains("@classmethod\n    def open_readonly(cls, path: str) -> \"Store\":"),
+            "missing classmethod factory: {py}"
+        );
+        assert!(
+            py.contains("return cls._from_ptr(_result)"),
+            "factory should wrap via _from_ptr: {py}"
+        );
+
+        // Instance method: string param and return, `self._ptr` leading arg.
+        assert!(
+            py.contains("def get(self, key: str) -> str:"),
+            "missing method signature: {py}"
+        );
+        assert!(
+            py.contains("_fn(self._ptr, _string_to_bytes(key), ctypes.byref(_err))"),
+            "method should pass self._ptr as the leading C argument: {py}"
+        );
+        let get_body = py.split("def get(").nth(1).unwrap();
+        let get_body = get_body.split("\n\n").next().unwrap();
+        assert!(
+            get_body.contains("_check_kv_error(_err)"),
+            "throwing method should use the domain checker: {py}"
+        );
+
+        // Static member.
+        assert!(
+            py.contains("@staticmethod\n    def version() -> str:"),
+            "missing staticmethod: {py}"
+        );
+        assert!(
+            py.contains("_lib.weaveffi_kv_Store_version"),
+            "missing static symbol: {py}"
+        );
+
+        // Destroy wiring in __del__.
+        assert!(
+            py.contains("_lib.weaveffi_kv_Store_destroy(self._ptr)"),
+            "missing destroy call in __del__: {py}"
+        );
+    }
+
+    #[test]
+    fn python_interface_param_and_return_marshalling() {
+        use weaveffi_ir::ir::InterfaceDef;
+        let api = make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![
+                Function {
+                    name: "clone_store".into(),
+                    params: vec![Param {
+                        name: "store".into(),
+                        ty: TypeRef::Interface("Store".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::Interface("Store".into())),
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "find_store".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Interface(
+                        "Store".into(),
+                    )))),
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: None,
+                constructors: vec![],
+                methods: vec![],
+                statics: vec![],
+            }],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        // An interface parameter is borrowed: the wrapper passes its pointer.
+        assert!(
+            py.contains("def clone_store(store: \"Store\") -> \"Store\":"),
+            "missing interface hints: {py}"
+        );
+        assert!(
+            py.contains("_fn(store._ptr, ctypes.byref(_err))"),
+            "interface param should pass ._ptr: {py}"
+        );
+        // A returned interface wraps the owned pointer via _from_ptr.
+        assert!(
+            py.contains("return Store._from_ptr(_result)"),
+            "interface return should wrap via _from_ptr: {py}"
+        );
+        // An optional interface return maps null to None.
+        let find = py.split("def find_store(").nth(1).unwrap();
+        assert!(
+            find.contains("return None") && find.contains("Store._from_ptr(_result)"),
+            "optional interface return should null-check: {py}"
+        );
+    }
+
+    #[test]
+    fn python_naming_default_stripped_snake_case() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "createContact".into(),
+                params: vec![Param {
+                    name: "firstName".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::I32),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let config = PythonConfig::default();
+        assert!(config.strip_module_prefix, "stripping must be the default");
+        let py = render_python_module(&api, config.strip_module_prefix, "weaveffi", "weaveffi.yml");
+        assert!(
+            py.contains("def create_contact(first_name: str) -> int:"),
+            "default naming should be bare snake_case incl. params: {py}"
+        );
+        assert!(
+            py.contains("_fn(_string_to_bytes(first_name), ctypes.byref(_err))"),
+            "body references should use the snake_case param name: {py}"
+        );
+        assert!(
+            !py.contains("def contacts_create_contact("),
+            "default should not module-prefix: {py}"
+        );
+    }
+
+    #[test]
+    fn python_throws_docstring_has_raises_section() {
+        let py = render_python_module(&kv_api(), true, "weaveffi", "weaveffi.yml");
+        let lookup = py
+            .split("def lookup(")
+            .nth(1)
+            .expect("lookup wrapper present");
+        assert!(
+            lookup.contains("Raises\n    ------\n    KvError\n"),
+            "throwing fn should document Raises: {py}"
+        );
+        let reset = py
+            .split("def reset(")
+            .nth(1)
+            .expect("reset wrapper present");
+        let reset_body = reset.split("\n\n").next().unwrap();
+        assert!(
+            !reset_body.contains("Raises"),
+            "non-throwing fn must not document domain raises: {py}"
+        );
+    }
+
+    #[test]
+    fn python_pyi_errors_and_interfaces() {
+        let pyi = render_pyi_module(
+            &BindingModel::build(&kv_api(), "weaveffi"),
+            true,
+            "weaveffi.yml",
+        );
+        assert!(
+            pyi.contains("class WeaveFFIError(Exception):"),
+            "stub should declare the generic error: {pyi}"
+        );
+        assert!(
+            pyi.contains("class KvError(WeaveFFIError):"),
+            "stub should declare the domain base: {pyi}"
+        );
+        assert!(
+            pyi.contains("class KeyNotFound(KvError):"),
+            "stub should declare per-code classes: {pyi}"
+        );
+        assert!(
+            pyi.contains("    KeyNotFound: Type[\"KeyNotFound\"]"),
+            "stub should declare the scoped alias on the domain: {pyi}"
+        );
+        assert!(
+            pyi.contains("class Store:"),
+            "stub should declare the interface class: {pyi}"
+        );
+        assert!(
+            pyi.contains("def __init__(self, path: str) -> None: ..."),
+            "stub should declare __init__ for ctor `new`: {pyi}"
+        );
+        assert!(
+            pyi.contains("def open_readonly(cls, path: str) -> \"Store\": ..."),
+            "stub should declare factory classmethods: {pyi}"
+        );
+        assert!(
+            pyi.contains("def get(self, key: str) -> str: ..."),
+            "stub should declare methods: {pyi}"
+        );
+        assert!(
+            pyi.contains("def version() -> str: ..."),
+            "stub should declare statics: {pyi}"
         );
     }
 }

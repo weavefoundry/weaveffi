@@ -36,12 +36,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -57,6 +58,55 @@ void _checkError(Pointer<_WeaveFFIError> err) {
 // NativeCallable here keeps its native thunk alive until unregistered.
 final Map<int, NativeCallable> _listenerCallables = {};
 
+/// Typed error domain `KvError` declared by module `kv`.
+class KvException extends WeaveFFIException {
+  KvException(super.code, super.message);
+}
+
+/// No entry exists for the requested key
+class KeyNotFoundException extends KvException {
+  KeyNotFoundException([String message = 'key not found']) : super(1001, message);
+}
+
+/// The entry exists but its TTL has elapsed
+class ExpiredException extends KvException {
+  ExpiredException([String message = 'entry expired']) : super(1002, message);
+}
+
+/// The store has reached its capacity limit
+class StoreFullException extends KvException {
+  StoreFullException([String message = 'store has reached capacity']) : super(1003, message);
+}
+
+/// Underlying storage reported an I/O failure
+class IoException extends KvException {
+  IoException([String message = 'I/O failure']) : super(1004, message);
+}
+
+WeaveFFIException _mapKvException(int code, String message) {
+  switch (code) {
+    case 1001:
+      return KeyNotFoundException(message);
+    case 1002:
+      return ExpiredException(message);
+    case 1003:
+      return StoreFullException(message);
+    case 1004:
+      return IoException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkKvException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapKvException(code, msg);
+  }
+}
+
 /// Persistence semantics applied to a stored entry
 enum EntryKind {
   /// In-memory only; lost on close
@@ -71,32 +121,6 @@ enum EntryKind {
 
   static EntryKind fromValue(int value) =>
       EntryKind.values.firstWhere((e) => e.value == value);
-}
-
-typedef _NativeWeaveffiKvStoreDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiKvStoreDestroy = void Function(Pointer<Void>);
-final _weaveffiKvStoreDestroy = _lib.lookupFunction<
-    _NativeWeaveffiKvStoreDestroy, _DartWeaveffiKvStoreDestroy>('weaveffi_kv_Store_destroy');
-
-typedef _NativeWeaveffiKvStoreGetId = Int64 Function(Pointer<Void>);
-typedef _DartWeaveffiKvStoreGetId = int Function(Pointer<Void>);
-final _weaveffiKvStoreGetId = _lib.lookupFunction<
-    _NativeWeaveffiKvStoreGetId, _DartWeaveffiKvStoreGetId>('weaveffi_kv_Store_get_id');
-
-/// Opaque key-value store handle target type
-class Store {
-  final Pointer<Void> _handle;
-  Store._(this._handle);
-
-  void dispose() {
-    _weaveffiKvStoreDestroy(_handle);
-  }
-
-  /// Internal store identifier
-  int get id {
-    final result = _weaveffiKvStoreGetId(_handle);
-    return result;
-  }
 }
 
 typedef _NativeWeaveffiKvEntryDestroy = Void Function(Pointer<Void>);
@@ -342,6 +366,269 @@ class EntryBuilder {
   }
 }
 
+typedef _NativeWeaveffiKvStoreDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiKvStoreDestroy = void Function(Pointer<Void>);
+final _weaveffiKvStoreDestroy = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreDestroy, _DartWeaveffiKvStoreDestroy>('weaveffi_kv_Store_destroy');
+
+typedef _NativeWeaveffiKvStoreOpen = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreOpen = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreOpen = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreOpen, _DartWeaveffiKvStoreOpen>('weaveffi_kv_Store_open');
+
+typedef _NativeWeaveffiKvStorePut = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Size, Int32, Pointer<Int64>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStorePut = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int, int, Pointer<Int64>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStorePut = _lib.lookupFunction<
+    _NativeWeaveffiKvStorePut, _DartWeaveffiKvStorePut>('weaveffi_kv_Store_put');
+
+typedef _NativeWeaveffiKvStoreGet = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreGet = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreGet = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreGet, _DartWeaveffiKvStoreGet>('weaveffi_kv_Store_get');
+
+typedef _NativeWeaveffiKvStoreDelete = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreDelete = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreDelete = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreDelete, _DartWeaveffiKvStoreDelete>('weaveffi_kv_Store_delete');
+
+typedef _NativeWeaveffiKvStoreListKeys = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreListKeys = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreListKeys = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreListKeys, _DartWeaveffiKvStoreListKeys>('weaveffi_kv_Store_list_keys');
+
+typedef _NativeWeaveffiKvStoreListKeysIteratorNext = Int32 Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreListKeysIteratorNext = int Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreListKeysIteratorNext = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreListKeysIteratorNext, _DartWeaveffiKvStoreListKeysIteratorNext>('weaveffi_kv_Store_ListKeysIterator_next');
+
+typedef _NativeWeaveffiKvStoreListKeysIteratorDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiKvStoreListKeysIteratorDestroy = void Function(Pointer<Void>);
+final _weaveffiKvStoreListKeysIteratorDestroy = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreListKeysIteratorDestroy, _DartWeaveffiKvStoreListKeysIteratorDestroy>('weaveffi_kv_Store_ListKeysIterator_destroy');
+
+typedef _NativeWeaveffiKvStoreCount = Int64 Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreCount = int Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreCount = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreCount, _DartWeaveffiKvStoreCount>('weaveffi_kv_Store_count');
+
+typedef _NativeWeaveffiKvStoreClear = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreClear = void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreClear = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreClear, _DartWeaveffiKvStoreClear>('weaveffi_kv_Store_clear');
+
+typedef _NativeAsyncCb_weaveffi_kv_Store_compact = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Int64);
+
+typedef _NativeWeaveffiKvStoreCompactAsync = Void Function(Pointer<Void>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kv_Store_compact>>, Pointer<Void>);
+typedef _DartWeaveffiKvStoreCompactAsync = void Function(Pointer<Void>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kv_Store_compact>>, Pointer<Void>);
+final _weaveffiKvStoreCompactAsync = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreCompactAsync, _DartWeaveffiKvStoreCompactAsync>('weaveffi_kv_Store_compact_async');
+
+typedef _NativeWeaveffiKvStoreLegacyPut = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Size, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreLegacyPut = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int, Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreLegacyPut = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreLegacyPut, _DartWeaveffiKvStoreLegacyPut>('weaveffi_kv_Store_legacy_put');
+
+typedef _NativeWeaveffiKvStoreDefaultCapacity = Int64 Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKvStoreDefaultCapacity = int Function(Pointer<_WeaveFFIError>);
+final _weaveffiKvStoreDefaultCapacity = _lib.lookupFunction<
+    _NativeWeaveffiKvStoreDefaultCapacity, _DartWeaveffiKvStoreDefaultCapacity>('weaveffi_kv_Store_default_capacity');
+
+/// An in-memory key-value store owning its entries; destroying the object releases all of its state
+class Store {
+  final Pointer<Void> _handle;
+  Store._(this._handle);
+
+  /// Releases the native object reference.
+  void dispose() {
+    _weaveffiKvStoreDestroy(_handle);
+  }
+
+  /// Open (or create) a store backed by the given filesystem path
+  ///
+  /// Throws [KvException] on domain errors.
+  factory Store.open(String path) {
+    final pathPtr = path.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreOpen(pathPtr, err);
+      _checkKvException(err);
+      return Store._(result);
+    } finally {
+      calloc.free(pathPtr);
+      calloc.free(err);
+    }
+  }
+
+  /// Insert or replace a value, returning true on success
+  ///
+  /// Throws [KvException] on domain errors.
+  bool put(String key, List<int> value, EntryKind kind, int? ttlSeconds) {
+    final keyPtr = key.toNativeUtf8();
+    final valuePtr = value.isEmpty ? nullptr : calloc<Uint8>(value.length);
+    for (var i = 0; i < value.length; i++) { valuePtr[i] = value[i]; }
+    Pointer<Int64> ttlSecondsPtr = nullptr;
+    if (ttlSeconds != null) {
+      ttlSecondsPtr = calloc<Int64>();
+      ttlSecondsPtr.value = ttlSeconds;
+    }
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStorePut(_handle, keyPtr, valuePtr, value.length, kind.value, ttlSecondsPtr, err);
+      _checkKvException(err);
+      return result != 0;
+    } finally {
+      calloc.free(keyPtr);
+      if (valuePtr != nullptr) calloc.free(valuePtr);
+      if (ttlSecondsPtr != nullptr) calloc.free(ttlSecondsPtr);
+      calloc.free(err);
+    }
+  }
+
+  /// Look up an entry by key; returns null if missing or expired
+  ///
+  /// Throws [KvException] on domain errors.
+  Entry? get(String key) {
+    final keyPtr = key.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreGet(_handle, keyPtr, err);
+      _checkKvException(err);
+      if (result == nullptr) return null;
+      return Entry._(result);
+    } finally {
+      calloc.free(keyPtr);
+      calloc.free(err);
+    }
+  }
+
+  /// Remove the entry for the given key, returning true if it existed
+  ///
+  /// Throws [KvException] on domain errors.
+  bool delete(String key) {
+    final keyPtr = key.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreDelete(_handle, keyPtr, err);
+      _checkKvException(err);
+      return result != 0;
+    } finally {
+      calloc.free(keyPtr);
+      calloc.free(err);
+    }
+  }
+
+  /// Stream every key, optionally filtered by a prefix
+  ///
+  /// Throws [KvException] on domain errors.
+  Iterable<String> listKeys(String? prefix) {
+    final prefixPtr = prefix == null ? nullptr : prefix.toNativeUtf8();
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final iter = _weaveffiKvStoreListKeys(_handle, prefixPtr, err);
+      _checkKvException(err);
+      final items = <String>[];
+      final outItem = calloc<Pointer<Utf8>>();
+      while (_weaveffiKvStoreListKeysIteratorNext(iter, outItem, err) != 0) {
+        _checkKvException(err);
+        items.add(outItem.value.toDartString());
+      }
+      _checkKvException(err);
+      calloc.free(outItem);
+      _weaveffiKvStoreListKeysIteratorDestroy(iter);
+      return items;
+    } finally {
+      if (prefixPtr != nullptr) calloc.free(prefixPtr);
+      calloc.free(err);
+    }
+  }
+
+  /// Return the number of live entries in the store
+  int count() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreCount(_handle, err);
+      _checkError(err);
+      return result;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Drop every entry from the store
+  void clear() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      _weaveffiKvStoreClear(_handle, err);
+      _checkError(err);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Reclaim space asynchronously; returns the number of bytes reclaimed
+  ///
+  /// Throws [KvException] on domain errors.
+  Future<int> compact() {
+    final completer = Completer<int>();
+    late NativeCallable<_NativeAsyncCb_weaveffi_kv_Store_compact> callable;
+    callable = NativeCallable<_NativeAsyncCb_weaveffi_kv_Store_compact>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, int result) {
+      try {
+        if (err.address != 0 && err.ref.code != 0) {
+          final code = err.ref.code;
+          final msg = err.ref.message.toDartString();
+          _weaveffiErrorClear(err);
+          completer.completeError(_mapKvException(code, msg));
+          return;
+        }
+        completer.complete(result);
+      } catch (e) {
+        completer.completeError(e);
+      } finally {
+        callable.close();
+      }
+    });
+    try {
+      _weaveffiKvStoreCompactAsync(_handle, nullptr, callable.nativeFunction, nullptr);
+    } catch (e) {
+      callable.close();
+      rethrow;
+    }
+    return completer.future;
+  }
+
+  /// Legacy single-shot put kept for compatibility
+  ///
+  /// Throws [KvException] on domain errors.
+  @Deprecated('use put() with explicit kind')
+  bool legacyPut(String key, List<int> value) {
+    final keyPtr = key.toNativeUtf8();
+    final valuePtr = value.isEmpty ? nullptr : calloc<Uint8>(value.length);
+    for (var i = 0; i < value.length; i++) { valuePtr[i] = value[i]; }
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreLegacyPut(_handle, keyPtr, valuePtr, value.length, err);
+      _checkKvException(err);
+      return result != 0;
+    } finally {
+      calloc.free(keyPtr);
+      if (valuePtr != nullptr) calloc.free(valuePtr);
+      calloc.free(err);
+    }
+  }
+
+  /// The largest number of live entries one store will hold
+  static int defaultCapacity() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiKvStoreDefaultCapacity(err);
+      _checkError(err);
+      return result;
+    } finally {
+      calloc.free(err);
+    }
+  }
+}
+
 typedef _NativeCb_weaveffi_kv_OnEvict_fn = Void Function(Pointer<Utf8>, Pointer<Void>);
 
 typedef _NativeWeaveffiKvRegisterEvictionListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_kv_OnEvict_fn>>, Pointer<Void>);
@@ -369,238 +656,6 @@ int registerEvictionListener(void Function(String key) callback) {
 void unregisterEvictionListener(int id) {
   _weaveffiKvUnregisterEvictionListener(id);
   _listenerCallables.remove(id)?.close();
-}
-
-typedef _NativeWeaveffiKvOpenStore = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvOpenStore = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
-final _weaveffiKvOpenStore = _lib.lookupFunction<
-    _NativeWeaveffiKvOpenStore, _DartWeaveffiKvOpenStore>('weaveffi_kv_open_store');
-
-/// Open (or create) a store backed by the given filesystem path
-Store openStore(String path) {
-  final pathPtr = path.toNativeUtf8();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKvOpenStore(pathPtr, err);
-    _checkError(err);
-    return Store._(result);
-  } finally {
-    calloc.free(pathPtr);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvCloseStore = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvCloseStore = void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-final _weaveffiKvCloseStore = _lib.lookupFunction<
-    _NativeWeaveffiKvCloseStore, _DartWeaveffiKvCloseStore>('weaveffi_kv_close_store');
-
-/// Close the store and release all in-memory resources
-void closeStore(Store store) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    _weaveffiKvCloseStore(store._handle, err);
-    _checkError(err);
-  } finally {
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvPut = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Size, Int32, Pointer<Int64>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvPut = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int, int, Pointer<Int64>, Pointer<_WeaveFFIError>);
-final _weaveffiKvPut = _lib.lookupFunction<
-    _NativeWeaveffiKvPut, _DartWeaveffiKvPut>('weaveffi_kv_put');
-
-/// Insert or replace a value, returning true on success
-bool put(Store store, String key, List<int> value, EntryKind kind, int? ttlSeconds) {
-  final keyPtr = key.toNativeUtf8();
-  final valuePtr = value.isEmpty ? nullptr : calloc<Uint8>(value.length);
-  for (var i = 0; i < value.length; i++) { valuePtr[i] = value[i]; }
-  Pointer<Int64> ttlSecondsPtr = nullptr;
-  if (ttlSeconds != null) {
-    ttlSecondsPtr = calloc<Int64>();
-    ttlSecondsPtr.value = ttlSeconds;
-  }
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKvPut(store._handle, keyPtr, valuePtr, value.length, kind.value, ttlSecondsPtr, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(keyPtr);
-    if (valuePtr != nullptr) calloc.free(valuePtr);
-    if (ttlSecondsPtr != nullptr) calloc.free(ttlSecondsPtr);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvGet = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvGet = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
-final _weaveffiKvGet = _lib.lookupFunction<
-    _NativeWeaveffiKvGet, _DartWeaveffiKvGet>('weaveffi_kv_get');
-
-/// Look up an entry by key; returns null if missing or expired
-Entry? get(Store store, String key) {
-  final keyPtr = key.toNativeUtf8();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKvGet(store._handle, keyPtr, err);
-    _checkError(err);
-    if (result == nullptr) return null;
-    return Entry._(result);
-  } finally {
-    calloc.free(keyPtr);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvDelete = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvDelete = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
-final _weaveffiKvDelete = _lib.lookupFunction<
-    _NativeWeaveffiKvDelete, _DartWeaveffiKvDelete>('weaveffi_kv_delete');
-
-/// Remove the entry for the given key, returning true if it existed
-bool delete(Store store, String key) {
-  final keyPtr = key.toNativeUtf8();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKvDelete(store._handle, keyPtr, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(keyPtr);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvListKeys = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvListKeys = Pointer<Void> Function(Pointer<Void>, Pointer<Utf8>, Pointer<_WeaveFFIError>);
-final _weaveffiKvListKeys = _lib.lookupFunction<
-    _NativeWeaveffiKvListKeys, _DartWeaveffiKvListKeys>('weaveffi_kv_list_keys');
-
-typedef _NativeWeaveffiKvListKeysIteratorNext = Int32 Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvListKeysIteratorNext = int Function(Pointer<Void>, Pointer<Pointer<Utf8>>, Pointer<_WeaveFFIError>);
-final _weaveffiKvListKeysIteratorNext = _lib.lookupFunction<
-    _NativeWeaveffiKvListKeysIteratorNext, _DartWeaveffiKvListKeysIteratorNext>('weaveffi_kv_ListKeysIterator_next');
-
-typedef _NativeWeaveffiKvListKeysIteratorDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiKvListKeysIteratorDestroy = void Function(Pointer<Void>);
-final _weaveffiKvListKeysIteratorDestroy = _lib.lookupFunction<
-    _NativeWeaveffiKvListKeysIteratorDestroy, _DartWeaveffiKvListKeysIteratorDestroy>('weaveffi_kv_ListKeysIterator_destroy');
-
-/// Stream every key, optionally filtered by a prefix
-Iterable<String> listKeys(Store store, String? prefix) {
-  final prefixPtr = prefix == null ? nullptr : prefix.toNativeUtf8();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final iter = _weaveffiKvListKeys(store._handle, prefixPtr, err);
-    _checkError(err);
-    final items = <String>[];
-    final outItem = calloc<Pointer<Utf8>>();
-    while (_weaveffiKvListKeysIteratorNext(iter, outItem, err) != 0) {
-      _checkError(err);
-      items.add(outItem.value.toDartString());
-    }
-    _checkError(err);
-    calloc.free(outItem);
-    _weaveffiKvListKeysIteratorDestroy(iter);
-    return items;
-  } finally {
-    if (prefixPtr != nullptr) calloc.free(prefixPtr);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvCount = Int64 Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvCount = int Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-final _weaveffiKvCount = _lib.lookupFunction<
-    _NativeWeaveffiKvCount, _DartWeaveffiKvCount>('weaveffi_kv_count');
-
-/// Return the number of live entries in the store
-int count(Store store) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKvCount(store._handle, err);
-    _checkError(err);
-    return result;
-  } finally {
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKvClear = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvClear = void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-final _weaveffiKvClear = _lib.lookupFunction<
-    _NativeWeaveffiKvClear, _DartWeaveffiKvClear>('weaveffi_kv_clear');
-
-/// Drop every entry from the store
-void clear(Store store) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    _weaveffiKvClear(store._handle, err);
-    _checkError(err);
-  } finally {
-    calloc.free(err);
-  }
-}
-
-typedef _NativeAsyncCb_weaveffi_kv_compact_async = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Int64);
-
-typedef _NativeWeaveffiKvCompactAsyncAsync = Void Function(Pointer<Void>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kv_compact_async>>, Pointer<Void>);
-typedef _DartWeaveffiKvCompactAsyncAsync = void Function(Pointer<Void>, Pointer<Void>, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_kv_compact_async>>, Pointer<Void>);
-final _weaveffiKvCompactAsyncAsync = _lib.lookupFunction<
-    _NativeWeaveffiKvCompactAsyncAsync, _DartWeaveffiKvCompactAsyncAsync>('weaveffi_kv_compact_async_async');
-
-/// Reclaim space asynchronously; returns the number of bytes reclaimed
-Future<int> compactAsync(Store store) {
-  final completer = Completer<int>();
-  late NativeCallable<_NativeAsyncCb_weaveffi_kv_compact_async> callable;
-  callable = NativeCallable<_NativeAsyncCb_weaveffi_kv_compact_async>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, int result) {
-    try {
-      if (err.address != 0 && err.ref.code != 0) {
-        final code = err.ref.code;
-        final msg = err.ref.message.toDartString();
-        _weaveffiErrorClear(err);
-        completer.completeError(WeaveFFIException(code, msg));
-        return;
-      }
-      completer.complete(result);
-    } catch (e) {
-      completer.completeError(e);
-    } finally {
-      callable.close();
-    }
-  });
-  try {
-    _weaveffiKvCompactAsyncAsync(store._handle, nullptr, callable.nativeFunction, nullptr);
-  } catch (e) {
-    callable.close();
-    rethrow;
-  }
-  return completer.future;
-}
-
-typedef _NativeWeaveffiKvLegacyPut = Int32 Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, Size, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKvLegacyPut = int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Uint8>, int, Pointer<_WeaveFFIError>);
-final _weaveffiKvLegacyPut = _lib.lookupFunction<
-    _NativeWeaveffiKvLegacyPut, _DartWeaveffiKvLegacyPut>('weaveffi_kv_legacy_put');
-
-/// Legacy single-shot put kept for compatibility
-@Deprecated('use put() with explicit kind')
-bool legacyPut(Store store, String key, List<int> value) {
-  final keyPtr = key.toNativeUtf8();
-  final valuePtr = value.isEmpty ? nullptr : calloc<Uint8>(value.length);
-  for (var i = 0; i < value.length; i++) { valuePtr[i] = value[i]; }
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKvLegacyPut(store._handle, keyPtr, valuePtr, value.length, err);
-    _checkError(err);
-    return result != 0;
-  } finally {
-    calloc.free(keyPtr);
-    if (valuePtr != nullptr) calloc.free(valuePtr);
-    calloc.free(err);
-  }
 }
 
 typedef _NativeWeaveffiKvStatsStatsDestroy = Void Function(Pointer<Void>);
@@ -657,11 +712,13 @@ final _weaveffiKvStatsGetStats = _lib.lookupFunction<
     _NativeWeaveffiKvStatsGetStats, _DartWeaveffiKvStatsGetStats>('weaveffi_kv_stats_get_stats');
 
 /// Snapshot the current store statistics
+///
+/// Throws [KvException] on domain errors.
 Stats getStats(Store store) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiKvStatsGetStats(store._handle, err);
-    _checkError(err);
+    _checkKvException(err);
     return Stats._(result);
   } finally {
     calloc.free(err);

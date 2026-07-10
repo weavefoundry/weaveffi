@@ -16,8 +16,8 @@ class WeaveFFI {
         init { System.loadLibrary("weaveffi") }
 
         /** Subscribe to document-saved notifications */
-        @JvmStatic external fun docs_register_saved_listener(callback: (Long, Int) -> Unit): Long
-        @JvmStatic external fun docs_unregister_saved_listener(id: Long)
+        @JvmStatic external fun registerSavedListener(callback: (Long, Int) -> Unit): Long
+        @JvmStatic external fun unregisterSavedListener(id: Long)
         /**
          * Create a brand new document.
          *
@@ -26,21 +26,21 @@ class WeaveFFI {
          * @param title Human-readable title for the new document
          * @param tags Initial set of tags (may be empty)
          */
-        @JvmStatic private external fun docs_create_documentJni(title: String, tags: Array<String>): Long
-        @JvmStatic fun docs_create_document(title: String, tags: Array<String>): Document = Document(docs_create_documentJni(title, tags))
+        @JvmStatic private external fun createDocumentJni(title: String, tags: Array<String>): Long
+        @JvmStatic fun createDocument(title: String, tags: Array<String>): Document = Document(createDocumentJni(title, tags))
         /**
          * Look up a document by identifier
          * @param id Identifier returned from create_document
          */
-        @JvmStatic private external fun docs_get_documentJni(id: Long): Long?
-        @JvmStatic fun docs_get_document(id: Long): Document? = docs_get_documentJni(id)?.let { Document(it) }
+        @JvmStatic private external fun getDocumentJni(id: Long): Long?
+        @JvmStatic fun getDocument(id: Long): Document? = getDocumentJni(id)?.let { Document(it) }
         /**
          * Publish a document in the background
          * @param id Identifier of the document to publish
          */
-        @JvmStatic private external fun docs_publish_asyncAsync(id: Long, callback: Any)
-        @JvmStatic suspend fun docs_publish_async(id: Long): Boolean = suspendCancellableCoroutine { cont ->
-            docs_publish_asyncAsync(id, WeaveContinuation(cont))
+        @JvmStatic private external fun publishAsyncAsync(id: Long, callback: Any)
+        @JvmStatic suspend fun publishAsync(id: Long): Boolean = suspendCancellableCoroutine { cont ->
+            publishAsyncAsync(id, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
         }
     }
 }
@@ -143,17 +143,89 @@ class DocumentBuilder {
     }
 }
 
-sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
-    /** Returned when no document matches the requested id */
-    class NotFound(message: String = "Document not found") : WeaveFFIException(1, message)
-    /** Raised when attempting to move into a forbidden state */
-    class InvalidStatus(message: String = "Invalid status transition") : WeaveFFIException(2, message)
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+class Notebook internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNew(): Long
+        @JvmStatic private external fun nativeMaxDocuments(): Int
+        @JvmStatic private external fun nativeInsert(selfHandle: Long, document: Long): Int
+        @JvmStatic private external fun nativeFind(selfHandle: Long, id: Long): Long
+        @JvmStatic private external fun nativeSize(selfHandle: Long): Int
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+
+        /**
+         * Create an empty notebook
+         */
+        operator fun invoke(): Notebook = Notebook(nativeNew())
+
+        /**
+         * The largest number of documents one notebook will hold
+         */
+        fun maxDocuments(): Int = nativeMaxDocuments()
+    }
+
+    /**
+     * Add a document, returning its position in the notebook
+     * @param document The document to add
+     */
+    fun insert(document: Document): Int = nativeInsert(handle, document.handle)
+
+    /**
+     * Look up a document by identifier, failing when none matches
+     * @param id Identifier of the document to find
+     */
+    fun find(id: Long): Document = Document(nativeFind(handle, id))
+
+    /**
+     * The number of documents currently held
+     */
+    fun size(): Int = nativeSize(handle)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
 }
 
-internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `DocsErrors` declared by module `docs`. */
+sealed class DocsErrorsException(code: Int, message: String) : WeaveFFIException(code, message) {
+    /** Returned when no document matches the requested id */
+    class NotFound(message: String = "Document not found") : DocsErrorsException(1, message)
+    /** Raised when attempting to move into a forbidden state */
+    class InvalidStatus(message: String = "Invalid status transition") : DocsErrorsException(2, message)
+
+    companion object {
+        /** Map a raw `DocsErrors` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> NotFound(message)
+            2 -> InvalidStatus(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
+
+internal class WeaveContinuation<T>(
+    private val cont: kotlinx.coroutines.CancellableContinuation<T>,
+    private val mapError: (Int, String) -> Throwable
+) {
     @Suppress("UNCHECKED_CAST")
     fun onSuccess(result: Any?) { cont.resume(result as T) }
-    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }
 }
 
 // END WeaveFFI.kt

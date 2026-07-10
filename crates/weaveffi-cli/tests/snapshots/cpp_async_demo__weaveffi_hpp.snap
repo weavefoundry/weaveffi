@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 #include <future>
 
 #ifndef WEAVEFFI_API
@@ -65,6 +66,8 @@ WEAVEFFI_API void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+/** Error codes reported by throwing functions in the `tasks` module tree. */
+typedef enum { weaveffi_tasks_TaskError_InvalidName = 1 } weaveffi_tasks_TaskError;
 typedef struct weaveffi_tasks_TaskResult weaveffi_tasks_TaskResult;
 typedef void (*weaveffi_tasks_run_task_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result);
 typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);
@@ -86,6 +89,7 @@ WEAVEFFI_API int64_t weaveffi_tasks_active_callbacks(weaveffi_error* out_err);
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -93,6 +97,57 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `tasks` module's throwing functions. */
+class TaskError : public WeaveFFIError {
+public:
+    TaskError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** task name must not be empty */
+class InvalidNameError : public TaskError {
+public:
+    InvalidNameError(const std::string& msg) : TaskError(1, msg) {}
+};
+
+namespace detail {
+
+/** Map a `tasks` error code to its typed exception (TaskError for unknown codes). */
+inline std::exception_ptr make_tasks_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(InvalidNameError(msg));
+    default: return std::make_exception_ptr(TaskError(code, msg));
+    }
+}
+
+/** Throw the typed `tasks` exception if `err` carries a nonzero code. */
+inline void check_tasks(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_tasks_error(code, msg));
+}
+
+} // namespace detail
 
 class TaskResult {
     void* handle_;
@@ -139,14 +194,16 @@ public:
 
 };
 
-inline std::future<TaskResult> tasks_run_task(const std::string& name) {
+namespace tasks {
+
+inline std::future<TaskResult> run_task(const std::string& name) {
     auto* promise_ptr = new std::promise<TaskResult>();
     auto future = promise_ptr->get_future();
     weaveffi_tasks_run_task_async(name.c_str(), [](void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result) {
         auto* p = static_cast<std::promise<TaskResult>*>(context);
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+            p->set_exception(detail::make_tasks_error(err->code, msg));
         } else {
             p->set_value(TaskResult(result));
         }
@@ -155,7 +212,7 @@ inline std::future<TaskResult> tasks_run_task(const std::string& name) {
     return future;
 }
 
-inline std::future<std::vector<TaskResult>> tasks_run_batch(const std::vector<std::string>& names) {
+inline std::future<std::vector<TaskResult>> run_batch(const std::vector<std::string>& names) {
     auto* promise_ptr = new std::promise<std::vector<TaskResult>>();
     auto future = promise_ptr->get_future();
     std::vector<const char*> names_cstrs;
@@ -165,7 +222,7 @@ inline std::future<std::vector<TaskResult>> tasks_run_batch(const std::vector<st
         auto* p = static_cast<std::promise<std::vector<TaskResult>>*>(context);
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+            p->set_exception(detail::make_error(err->code, msg));
         } else {
             std::vector<TaskResult> ret;
             ret.reserve(result_len);
@@ -177,26 +234,21 @@ inline std::future<std::vector<TaskResult>> tasks_run_batch(const std::vector<st
     return future;
 }
 
-inline bool tasks_cancel_task(int64_t id) {
+inline bool cancel_task(int64_t id) {
     weaveffi_error err{};
     auto result = weaveffi_tasks_cancel_task(id, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return result;
 }
 
-inline std::future<int32_t> tasks_run_n_tasks(int32_t n) {
+inline std::future<int32_t> run_n_tasks(int32_t n) {
     auto* promise_ptr = new std::promise<int32_t>();
     auto future = promise_ptr->get_future();
     weaveffi_tasks_run_n_tasks_async(n, [](void* context, weaveffi_error* err, int32_t result) {
         auto* p = static_cast<std::promise<int32_t>*>(context);
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(std::make_exception_ptr(WeaveFFIError(err->code, msg)));
+            p->set_exception(detail::make_error(err->code, msg));
         } else {
             p->set_value(result);
         }
@@ -205,17 +257,14 @@ inline std::future<int32_t> tasks_run_n_tasks(int32_t n) {
     return future;
 }
 
-inline int64_t tasks_active_callbacks() {
+inline int64_t active_callbacks() {
     weaveffi_error err{};
     auto result = weaveffi_tasks_active_callbacks(&err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return result;
 }
+
+} // namespace tasks
 
 } // namespace weaveffi
 

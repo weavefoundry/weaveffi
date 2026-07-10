@@ -10,6 +10,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+    napi_value msg;
+    napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
+    napi_value err;
+    napi_create_error(env, NULL, msg, &err);
+    napi_value code_val;
+    napi_create_int32(env, code, &code_val);
+    napi_set_named_property(env, err, "code", code_val);
+    return err;
+}
+
 typedef struct {
     napi_deferred deferred;
     napi_threadsafe_function tsfn;
@@ -35,13 +46,7 @@ static void weaveffi_tasks_run_task_napi_settle(napi_env env, napi_value js_cb, 
     weaveffi_tasks_run_task_napi_actx* ctx = (weaveffi_tasks_run_task_napi_actx*)data;
     if (env != NULL) {
     if (ctx->err_code != 0) {
-        napi_value err_msg;
-        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
-        napi_value err_obj;
-        napi_create_error(env, NULL, err_msg, &err_obj);
-        napi_value err_code;
-        napi_create_int32(env, ctx->err_code, &err_code);
-        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_value err_obj = weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg);
         napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
@@ -117,13 +122,7 @@ static void weaveffi_tasks_run_batch_napi_settle(napi_env env, napi_value js_cb,
     weaveffi_tasks_run_batch_napi_actx* ctx = (weaveffi_tasks_run_batch_napi_actx*)data;
     if (env != NULL) {
     if (ctx->err_code != 0) {
-        napi_value err_msg;
-        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
-        napi_value err_obj;
-        napi_create_error(env, NULL, err_msg, &err_obj);
-        napi_value err_code;
-        napi_create_int32(env, ctx->err_code, &err_code);
-        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_value err_obj = weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg);
         napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
@@ -179,7 +178,7 @@ static napi_value Napi_weaveffi_tasks_cancel_task(napi_env env, napi_callback_in
   weaveffi_error err = {0};
   bool result = weaveffi_tasks_cancel_task(id, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -213,13 +212,7 @@ static void weaveffi_tasks_run_n_tasks_napi_settle(napi_env env, napi_value js_c
     weaveffi_tasks_run_n_tasks_napi_actx* ctx = (weaveffi_tasks_run_n_tasks_napi_actx*)data;
     if (env != NULL) {
     if (ctx->err_code != 0) {
-        napi_value err_msg;
-        napi_create_string_utf8(env, ctx->err_msg ? ctx->err_msg : "", NAPI_AUTO_LENGTH, &err_msg);
-        napi_value err_obj;
-        napi_create_error(env, NULL, err_msg, &err_obj);
-        napi_value err_code;
-        napi_create_int32(env, ctx->err_code, &err_code);
-        napi_set_named_property(env, err_obj, "code", err_code);
+        napi_value err_obj = weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg);
         napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
@@ -254,7 +247,7 @@ static napi_value Napi_weaveffi_tasks_active_callbacks(napi_env env, napi_callba
   weaveffi_error err = {0};
   int64_t result = weaveffi_tasks_active_callbacks(&err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -265,11 +258,11 @@ static napi_value Napi_weaveffi_tasks_active_callbacks(napi_env env, napi_callba
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
-    { "tasks_run_task", NULL, Napi_weaveffi_tasks_run_task, NULL, NULL, NULL, napi_default, NULL },
-    { "tasks_run_batch", NULL, Napi_weaveffi_tasks_run_batch, NULL, NULL, NULL, napi_default, NULL },
-    { "tasks_cancel_task", NULL, Napi_weaveffi_tasks_cancel_task, NULL, NULL, NULL, napi_default, NULL },
-    { "tasks_run_n_tasks", NULL, Napi_weaveffi_tasks_run_n_tasks, NULL, NULL, NULL, napi_default, NULL },
-    { "tasks_active_callbacks", NULL, Napi_weaveffi_tasks_active_callbacks, NULL, NULL, NULL, napi_default, NULL },
+    { "runTask", NULL, Napi_weaveffi_tasks_run_task, NULL, NULL, NULL, napi_default, NULL },
+    { "runBatch", NULL, Napi_weaveffi_tasks_run_batch, NULL, NULL, NULL, napi_default, NULL },
+    { "cancelTask", NULL, Napi_weaveffi_tasks_cancel_task, NULL, NULL, NULL, napi_default, NULL },
+    { "runNTasks", NULL, Napi_weaveffi_tasks_run_n_tasks, NULL, NULL, NULL, napi_default, NULL },
+    { "activeCallbacks", NULL, Napi_weaveffi_tasks_active_callbacks, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, 5, props);
   return exports;

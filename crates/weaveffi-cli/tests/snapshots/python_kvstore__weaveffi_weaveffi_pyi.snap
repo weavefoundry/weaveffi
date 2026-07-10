@@ -6,7 +6,39 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 from enum import IntEnum
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Type
+
+class WeaveFFIError(Exception):
+    code: int
+    message: str
+    def __init__(self, code: int, message: str) -> None: ...
+
+class KvError(WeaveFFIError):
+    KeyNotFound: Type["KeyNotFound"]
+    Expired: Type["Expired"]
+    StoreFull: Type["StoreFull"]
+    IoError: Type["IoError"]
+    def __init__(self, code: int, message: str) -> None: ...
+
+# No entry exists for the requested key
+class KeyNotFound(KvError):
+    CODE: int
+    def __init__(self, message: str = ...) -> None: ...
+
+# The entry exists but its TTL has elapsed
+class Expired(KvError):
+    CODE: int
+    def __init__(self, message: str = ...) -> None: ...
+
+# The store has reached its capacity limit
+class StoreFull(KvError):
+    CODE: int
+    def __init__(self, message: str = ...) -> None: ...
+
+# Underlying storage reported an I/O failure
+class IoError(KvError):
+    CODE: int
+    def __init__(self, message: str = ...) -> None: ...
 
 # Persistence semantics applied to a stored entry
 class EntryKind(IntEnum):
@@ -16,12 +48,6 @@ class EntryKind(IntEnum):
     Persistent: int
     # Persistent and encrypted at rest
     Encrypted: int
-
-# Opaque key-value store handle target type
-class Store:
-    # Internal store identifier
-    @property
-    def id(self) -> int: ...
 
 # A single key-value entry persisted in the store
 class Entry:
@@ -47,39 +73,24 @@ class Entry:
     @property
     def metadata(self) -> Dict[str, str]: ...
 
+# An in-memory key-value store owning its entries; destroying the object releases all of its state
+class Store:
+    @classmethod
+    def open(cls, path: str) -> "Store": ...
+    def put(self, key: str, value: bytes, kind: "EntryKind", ttl_seconds: Optional[int]) -> bool: ...
+    def get(self, key: str) -> Optional["Entry"]: ...
+    def delete(self, key: str) -> bool: ...
+    def list_keys(self, prefix: Optional[str]) -> Iterator[str]: ...
+    def count(self) -> int: ...
+    def clear(self) -> None: ...
+    async def compact(self) -> int: ...
+    def legacy_put(self, key: str, value: bytes) -> bool: ...
+    @staticmethod
+    def default_capacity() -> int: ...
+
 # Subscribe to per-key eviction notifications
-def kv_register_eviction_listener(callback: Callable[[str], None]) -> int: ...
-def kv_unregister_eviction_listener(listener_id: int) -> None: ...
-
-# Open (or create) a store backed by the given filesystem path
-def kv_open_store(path: str) -> "Store": ...
-
-# Close the store and release all in-memory resources
-def kv_close_store(store: "Store") -> None: ...
-
-# Insert or replace a value, returning true on success
-def kv_put(store: "Store", key: str, value: bytes, kind: "EntryKind", ttl_seconds: Optional[int]) -> bool: ...
-
-# Look up an entry by key; returns null if missing or expired
-def kv_get(store: "Store", key: str) -> Optional["Entry"]: ...
-
-# Remove the entry for the given key, returning true if it existed
-def kv_delete(store: "Store", key: str) -> bool: ...
-
-# Stream every key, optionally filtered by a prefix
-def kv_list_keys(store: "Store", prefix: Optional[str]) -> Iterator[str]: ...
-
-# Return the number of live entries in the store
-def kv_count(store: "Store") -> int: ...
-
-# Drop every entry from the store
-def kv_clear(store: "Store") -> None: ...
-
-# Reclaim space asynchronously; returns the number of bytes reclaimed
-async def kv_compact_async(store: "Store") -> int: ...
-
-# Legacy single-shot put kept for compatibility
-def kv_legacy_put(store: "Store", key: str, value: bytes) -> bool: ...
+def register_eviction_listener(callback: Callable[[str], None]) -> int: ...
+def unregister_eviction_listener(listener_id: int) -> None: ...
 
 # Aggregate store statistics
 class Stats:
@@ -94,6 +105,6 @@ class Stats:
     def expired_entries(self) -> int: ...
 
 # Snapshot the current store statistics
-def kv_stats_get_stats(store: "Store") -> "Stats": ...
+def get_stats(store: "Store") -> "Stats": ...
 
 # END weaveffi.pyi

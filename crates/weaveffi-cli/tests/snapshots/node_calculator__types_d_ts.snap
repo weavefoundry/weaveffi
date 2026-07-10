@@ -6,26 +6,47 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
+/** Typed errors reported by the `calculator` module's throwing functions. */
+export class CalcError extends WeaveFFIError {
+  constructor(code: number, message: string);
+}
+export class DivisionByZeroError extends CalcError {
+  static readonly CODE: 1;
+  constructor(message?: string);
+}
 // module calculator
 /**
  * Add two integers
  * Maps to C function: weaveffi_calculator_add
  */
-export function calculator_add(a: number, b: number): number
+export function add(a: number, b: number): number
 /**
  * Multiply two integers
  * Maps to C function: weaveffi_calculator_mul
  */
-export function calculator_mul(a: number, b: number): number
+export function mul(a: number, b: number): number
 /**
- * Divide two integers
+ * Divide two integers, failing on a zero divisor
  * Maps to C function: weaveffi_calculator_div
+ * @throws {CalcError}
  */
-export function calculator_div(a: number, b: number): number
+export function div(a: number, b: number): number
 /**
  * Echo a string back
  * Maps to C function: weaveffi_calculator_echo
  */
-export function calculator_echo(s: string): string
+export function echo(s: string): string
 
 // END types.d.ts

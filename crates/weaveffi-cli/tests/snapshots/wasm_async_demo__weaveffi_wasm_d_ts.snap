@@ -7,8 +7,27 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `tasks` module's error domain. */
+export declare class TaskError extends WeaveFFIError {
+  static readonly InvalidName: typeof InvalidName;
+}
+
+/** task name must not be empty */
+export declare class InvalidName extends TaskError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
 export interface TaskResult {
-  readonly id: number;
+  readonly id: bigint;
   readonly value: string;
   readonly success: boolean;
 }
@@ -17,25 +36,25 @@ export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   tasks: {
     /**
-     * @throws {Error} if the native call fails
+     * @throws {TaskError} on a domain error code
      */
-    run_task(name: string): Promise<TaskResult>;
+    runTask(name: string): Promise<TaskResult>;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    run_batch(names: string[]): Promise<TaskResult[]>;
+    runBatch(names: string[]): Promise<TaskResult[]>;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    cancel_task(id: number): boolean;
+    cancelTask(id: bigint): boolean;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    run_n_tasks(n: number): Promise<number>;
+    runNTasks(n: number): Promise<number>;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    active_callbacks(): number;
+    activeCallbacks(): bigint;
   };
 }
 

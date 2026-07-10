@@ -2,6 +2,10 @@
 //! [`validate_api`] entry point; the work is split across submodules:
 //! `rules` (per-module checks), `resolve` (type-reference qualification),
 //! `diagnostic` (miette span attachment), and `warnings` (advisory lints).
+//!
+//! Validation collects *every* rule violation before failing, so a document
+//! with several problems reports them all in one run rather than one per
+//! invocation.
 
 use miette::Diagnostic;
 use std::collections::BTreeSet;
@@ -20,8 +24,8 @@ pub use warnings::{collect_warnings, ValidationWarning};
 
 /// Every way an [`Api`] can fail validation.
 ///
-/// `validate_api` returns the first variant it encounters. Each variant
-/// carries the names needed to render an actionable diagnostic, and the
+/// `validate_api` collects every variant it encounters. Each variant carries
+/// the names needed to render an actionable diagnostic, and the
 /// `#[error]`/`#[diagnostic]` attributes supply the message and help text
 /// shown to the user.
 #[derive(Debug, thiserror::Error, Diagnostic)]
@@ -94,9 +98,12 @@ pub enum ValidationError {
         /// Conflicting numeric error code.
         code: i32,
     },
-    /// An error code uses the reserved value `0` (which means success).
-    #[error("invalid error code in module '{module}' for '{name}': must be non-zero")]
-    #[diagnostic(help("error codes must be non-zero; use a positive or negative integer"))]
+    /// An error code uses a reserved value: `0` means success and `-2` is the
+    /// panic code the runtime reports when a producer panics.
+    #[error("invalid error code in module '{module}' for '{name}': must not be 0 or -2")]
+    #[diagnostic(help(
+        "0 means success and -2 is reserved for producer panics; use another integer"
+    ))]
     InvalidErrorCode {
         /// Module that contains the error domain.
         module: String,
@@ -113,6 +120,74 @@ pub enum ValidationError {
         module: String,
         /// Name shared by the function and the error domain.
         name: String,
+    },
+    /// Two callables in one module lower to the same C symbol.
+    ///
+    /// Free functions claim `{prefix}_{module}_{name}`; interface members
+    /// claim `{prefix}_{module}_{Interface}_{member}` plus an implicit
+    /// `_destroy`. A free function named `Store_get` and a `get` method on an
+    /// interface `Store` would collide.
+    #[error("C symbol collision in module '{module}': two declarations lower to '..._{symbol}'")]
+    #[diagnostic(help(
+        "free functions and interface members share the module's C symbol namespace \
+         (interface members are prefixed with the interface name); rename one of the \
+         colliding declarations"
+    ))]
+    AbiSymbolCollision {
+        /// Module whose symbol namespace has the collision.
+        module: String,
+        /// The colliding symbol suffix (without the `{prefix}_{module}_` part).
+        symbol: String,
+    },
+    /// A function declares `throws: true` but no error domain is in scope.
+    #[error("function '{module}::{function}' declares throws but no error domain is in scope")]
+    #[diagnostic(help(
+        "a throwing function reports codes from its module's error domain; declare an \
+         `errors:` block on this module (or an ancestor module), or remove `throws: true`"
+    ))]
+    ThrowsWithoutErrorDomain {
+        /// Module that contains the function.
+        module: String,
+        /// Function marked `throws` with no domain in scope.
+        function: String,
+    },
+    /// Two types (structs, enums, or interfaces) share a bare name.
+    ///
+    /// Type names must be unique across the whole API: generators emit flat
+    /// per-language type names, and unqualified cross-module references
+    /// resolve by bare name, so two types called `Config` would collide in
+    /// generated code and make references ambiguous.
+    #[error("duplicate type name '{name}' (declared in '{first}' and '{second}')")]
+    #[diagnostic(help(
+        "struct, enum, interface, and error domain names must be unique across the whole \
+         API; rename one of the declarations"
+    ))]
+    DuplicateTypeName {
+        /// The colliding bare type name.
+        name: String,
+        /// Module path of the first declaration.
+        first: String,
+        /// Module path of the second declaration.
+        second: String,
+    },
+    /// Two error domains declare a code with the same name.
+    ///
+    /// Code names must be unique across every domain in the API: backends
+    /// with flat namespaces (Python, Node, Go) derive one error class or
+    /// constant per code, so `NotFound` in two domains would collide in
+    /// generated code.
+    #[error("duplicate error code name '{name}' (declared in '{first}' and '{second}')")]
+    #[diagnostic(help(
+        "error code names must be unique across the whole API; qualify one of them \
+         (e.g. 'OrderNotFound')"
+    ))]
+    DuplicateErrorCodeName {
+        /// The colliding code name.
+        name: String,
+        /// Domain of the first declaration, as `module.Domain`.
+        first: String,
+        /// Domain of the second declaration, as `module.Domain`.
+        second: String,
     },
     /// Two structs in the same module share a name.
     #[error("duplicate struct name in module '{module}': {name}")]
@@ -192,11 +267,80 @@ pub enum ValidationError {
         /// Conflicting numeric discriminant.
         value: i32,
     },
-    /// A type reference names a struct or enum that doesn't exist.
-    #[error("unknown type reference: {name}")]
+    /// Two interfaces in the same module share a name.
+    #[error("duplicate interface name in module '{module}': {name}")]
+    #[diagnostic(help("interface names must be unique within a module; rename the duplicate"))]
+    DuplicateInterfaceName {
+        /// Module that contains the interfaces.
+        module: String,
+        /// Duplicated interface name.
+        name: String,
+    },
+    /// Two members (constructors, methods, or statics) of one interface share
+    /// a name.
+    #[error("duplicate member name in interface '{interface}': {name}")]
     #[diagnostic(help(
-        "define a struct or enum with this name in the same module, or check for typos"
+        "constructor, method, and static names share one namespace per interface; \
+         rename the duplicate"
     ))]
+    DuplicateInterfaceMember {
+        /// Interface that contains the colliding members.
+        interface: String,
+        /// Duplicated member name.
+        name: String,
+    },
+    /// An interface declares no members at all.
+    #[error("empty interface in module '{module}': {name}")]
+    #[diagnostic(help(
+        "interfaces must declare at least one constructor, method, or static; \
+         add a member or remove the interface"
+    ))]
+    EmptyInterface {
+        /// Module that contains the interface.
+        module: String,
+        /// Name of the empty interface.
+        name: String,
+    },
+    /// An interface constructor declares an explicit return type.
+    #[error("constructor '{constructor}' of interface '{interface}' declares a return type")]
+    #[diagnostic(help(
+        "a constructor implicitly returns a new instance of its interface; remove the \
+         `return` field"
+    ))]
+    ConstructorHasReturn {
+        /// Interface that declares the constructor.
+        interface: String,
+        /// The offending constructor.
+        constructor: String,
+    },
+    /// An interface constructor is marked `async`.
+    #[error("constructor '{constructor}' of interface '{interface}' cannot be async")]
+    #[diagnostic(help(
+        "constructors are synchronous; expose an async static factory returning the \
+         interface instead"
+    ))]
+    AsyncConstructor {
+        /// Interface that declares the constructor.
+        interface: String,
+        /// The offending constructor.
+        constructor: String,
+    },
+    /// An interface reference appears in a position the ABI cannot support.
+    #[error("interface type '{name}' is not valid in {location}")]
+    #[diagnostic(help(
+        "interface objects may appear as function parameters, return types, and \
+         optionals of those; they cannot be struct fields, collection elements, \
+         map keys/values, or callback parameters"
+    ))]
+    InterfaceInInvalidPosition {
+        /// The referenced interface name.
+        name: String,
+        /// Position where the interface reference appeared.
+        location: String,
+    },
+    /// A type reference names a struct, enum, or interface that doesn't exist.
+    #[error("unknown type reference: {name}")]
+    #[diagnostic(help("define a struct, enum, or interface with this name, or check for typos"))]
     UnknownTypeRef {
         /// Unresolved type name.
         name: String,
@@ -320,7 +464,7 @@ pub enum ValidationError {
     #[error("unsupported schema version '{version}'; supported versions: {supported}")]
     #[diagnostic(help(
         "set the version field to the current schema version and update the \
-         document to match the current schema (see docs/src/idl.md)"
+         document to match the current schema (see docs/src/reference/idl.md)"
     ))]
     UnsupportedSchemaVersion {
         /// Version requested by the document.
@@ -330,43 +474,117 @@ pub enum ValidationError {
     },
 }
 
-/// Validate an [`Api`]. The optional `source` is `(filename, contents)` of the
-/// IDL file and is used at the call site to attach a span to a returned error
-/// via [`ValidationDiagnostic::new`]. Pass `None` when the API is constructed
+/// Every validation failure found in one pass, each wrapped as a
+/// [`ValidationDiagnostic`] carrying an optional source span.
+///
+/// `Display` renders every message on its own line; miette renderers reach the
+/// individual diagnostics through [`Diagnostic::related`].
+#[derive(Debug)]
+pub struct ValidationDiagnostics {
+    /// The individual failures, in the order they were found. Never empty.
+    pub diagnostics: Vec<ValidationDiagnostic>,
+}
+
+impl ValidationDiagnostics {
+    /// The first failure, which every report is guaranteed to contain.
+    pub fn first(&self) -> &ValidationDiagnostic {
+        &self.diagnostics[0]
+    }
+}
+
+impl std::fmt::Display for ValidationDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, d) in self.diagnostics.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{d}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ValidationDiagnostics {}
+
+impl Diagnostic for ValidationDiagnostics {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.first().code()
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.first().help()
+    }
+
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.first().source_code()
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        self.first().labels()
+    }
+
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
+        if self.diagnostics.len() <= 1 {
+            return None;
+        }
+        Some(Box::new(
+            self.diagnostics[1..].iter().map(|d| d as &dyn Diagnostic),
+        ))
+    }
+}
+
+/// Validate an [`Api`], reporting **every** rule violation found. The optional
+/// `source` is `(filename, contents)` of the IDL file and is used to attach
+/// spans to the returned diagnostics. Pass `None` when the API is constructed
 /// in memory (tests, programmatic builds) and there is no on-disk source.
 ///
 /// On success, type references in `api` are resolved in place (see
-/// [`resolve_type_refs`]).
+/// [`resolve_type_refs`]): enum and interface references are distinguished
+/// from struct references, and cross-module references are qualified.
 ///
 /// # Errors
 ///
-/// Returns a [`ValidationDiagnostic`] wrapping the first [`ValidationError`]
-/// found: an unsupported schema version, a duplicate or invalid name, an
-/// unknown or misplaced type, an empty struct or enum, or any other rule
-/// violation in the catalog above. The diagnostic carries a source span when
-/// `source` is provided.
-#[allow(clippy::result_large_err)]
+/// Returns [`ValidationDiagnostics`] carrying one [`ValidationDiagnostic`]
+/// per violation: an unsupported schema version, a duplicate or invalid name,
+/// an unknown or misplaced type, an empty struct or enum, a `throws` without
+/// an error domain, or any other rule violation in the catalog above.
 pub fn validate_api(
     api: &mut Api,
     source: Option<(&str, &str)>,
-) -> Result<(), ValidationDiagnostic> {
-    validate_api_inner(api).map_err(|e| ValidationDiagnostic::new(e, source))
+) -> Result<(), ValidationDiagnostics> {
+    let errors = validate_api_inner(api);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    Err(ValidationDiagnostics {
+        diagnostics: errors
+            .into_iter()
+            .map(|e| ValidationDiagnostic::new(e, source))
+            .collect(),
+    })
 }
 
-fn validate_api_inner(api: &mut Api) -> Result<(), ValidationError> {
+fn validate_api_inner(api: &mut Api) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
     if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
-        return Err(ValidationError::UnsupportedSchemaVersion {
+        // A wrong-schema document is checked no further: the rules below
+        // assume the current schema's shape.
+        return vec![ValidationError::UnsupportedSchemaVersion {
             version: api.version.clone(),
             supported: SUPPORTED_VERSIONS.join(", "),
-        });
+        }];
     }
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {
-            return Err(ValidationError::DuplicateModuleName(m.name.clone()));
+            errors.push(ValidationError::DuplicateModuleName(m.name.clone()));
         }
-        rules::validate_module(m, &api.modules)?;
+        rules::validate_module(m, &api.modules, false, &mut errors);
     }
-    resolve_type_refs(api);
-    Ok(())
+    rules::check_global_type_names(&api.modules, &mut errors);
+    rules::check_global_error_code_names(&api.modules, &mut errors);
+    if errors.is_empty() {
+        resolve_type_refs(api);
+    }
+    errors
 }

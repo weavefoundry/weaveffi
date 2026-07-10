@@ -23,6 +23,30 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the GraphicsError error domain (module graphics).</summary>
+    public class GraphicsException : WeaveFFIException
+    {
+        /// <summary>coordinate out of bounds</summary>
+        public const int OutOfBounds = 1;
+
+        public GraphicsException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case OutOfBounds:
+                    return new GraphicsException(code, string.IsNullOrEmpty(message) ? "coordinate out of bounds" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -35,6 +59,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckGraphics(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw GraphicsException.FromCode(err.Code, msg);
             }
         }
     }
@@ -265,7 +298,7 @@ namespace WeaveFFI
     public static class Graphics
     {
         /// <summary>Construct a Canvas.</summary>
-        public static Canvas GraphicsNewCanvas(int width)
+        public static Canvas NewCanvas(int width)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_graphics_new_canvas(width, ref err);
@@ -278,7 +311,7 @@ namespace WeaveFFI
     public static class GraphicsShapes
     {
         /// <summary>Construct a Shape.</summary>
-        public static Shape GraphicsShapesMakeShape(int sides)
+        public static Shape MakeShape(int sides)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_graphics_shapes_make_shape(sides, ref err);
@@ -287,7 +320,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Nested function returning a struct owned by an ancestor module.</summary>
-        public static Canvas GraphicsShapesDescribe()
+        public static Canvas Describe()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_graphics_shapes_describe(ref err);
@@ -299,12 +332,13 @@ namespace WeaveFFI
 
     public static class GraphicsShapesGeometry
     {
-        /// <summary>Deeper function taking an ancestor-module struct.</summary>
-        public static Detail GraphicsShapesGeometryCompute(Shape shape)
+        /// <summary>Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.</summary>
+        /// <exception cref="GraphicsException">Thrown when the call reports a GraphicsError code.</exception>
+        public static Detail Compute(Shape shape)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_graphics_shapes_geometry_compute(shape.Handle, ref err);
-            WeaveFFIError.Check(err);
+            WeaveFFIError.CheckGraphics(err);
             return new Detail(result);
         }
 

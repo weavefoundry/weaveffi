@@ -7,24 +7,58 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
-/** Opaque key-value store handle target type */
-export interface Store {
-  /** Internal store identifier */
-  readonly id: number;
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `kv` module's error domain. */
+export declare class KvError extends WeaveFFIError {
+  static readonly KeyNotFound: typeof KeyNotFound;
+  static readonly Expired: typeof Expired;
+  static readonly StoreFull: typeof StoreFull;
+  static readonly IoError: typeof IoError;
+}
+
+/** No entry exists for the requested key */
+export declare class KeyNotFound extends KvError {
+  constructor(message?: string);
+  static readonly CODE: 1001;
+}
+
+/** The entry exists but its TTL has elapsed */
+export declare class Expired extends KvError {
+  constructor(message?: string);
+  static readonly CODE: 1002;
+}
+
+/** The store has reached its capacity limit */
+export declare class StoreFull extends KvError {
+  constructor(message?: string);
+  static readonly CODE: 1003;
+}
+
+/** Underlying storage reported an I/O failure */
+export declare class IoError extends KvError {
+  constructor(message?: string);
+  static readonly CODE: 1004;
 }
 
 /** A single key-value entry persisted in the store */
 export interface Entry {
   /** Stable monotonic identifier assigned on insert */
-  readonly id: number;
+  readonly id: bigint;
   /** UTF-8 lookup key */
   readonly key: string;
   /** Opaque binary payload */
   readonly value: Uint8Array;
   /** Unix-timestamp seconds when the entry was created */
-  readonly created_at: number;
+  readonly created_at: bigint;
   /** Optional unix-timestamp seconds at which the entry expires */
-  readonly expires_at: number | null;
+  readonly expires_at: bigint | null;
   /** Free-form labels attached to the entry */
   readonly tags: string[];
   /** Arbitrary string-valued metadata pairs */
@@ -41,76 +75,83 @@ export declare const EntryKind: Readonly<{
   Encrypted: 2;
 }>;
 
+/** An in-memory key-value store owning its entries; destroying the object releases all of its state */
+export declare class Store {
+  /**
+   * Open (or create) a store backed by the given filesystem path
+   * @throws {KvError} on a domain error code
+   */
+  static open(path: string): Store;
+  /**
+   * Insert or replace a value, returning true on success
+   * @throws {KvError} on a domain error code
+   */
+  put(key: string, value: Uint8Array, kind: EntryKind, ttlSeconds: bigint | null): boolean;
+  /**
+   * Look up an entry by key; returns null if missing or expired
+   * @throws {KvError} on a domain error code
+   */
+  get(key: string): Entry | null;
+  /**
+   * Remove the entry for the given key, returning true if it existed
+   * @throws {KvError} on a domain error code
+   */
+  delete(key: string): boolean;
+  /**
+   * Stream every key, optionally filtered by a prefix
+   * @throws {KvError} on a domain error code
+   */
+  listKeys(prefix: string | null): string[];
+  /**
+   * Return the number of live entries in the store
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  count(): bigint;
+  /**
+   * Drop every entry from the store
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  clear(): void;
+  /**
+   * Reclaim space asynchronously; returns the number of bytes reclaimed
+   * @throws {KvError} on a domain error code
+   */
+  compact(): Promise<bigint>;
+  /**
+   * Legacy single-shot put kept for compatibility
+   * @deprecated use put() with explicit kind
+   * @throws {KvError} on a domain error code
+   */
+  legacyPut(key: string, value: Uint8Array): boolean;
+  /**
+   * The largest number of live entries one store will hold
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  static defaultCapacity(): bigint;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
+}
+
 /** Aggregate store statistics */
 export interface Stats {
   /** Number of live entries */
-  readonly total_entries: number;
+  readonly total_entries: bigint;
   /** Sum of all value byte lengths */
-  readonly total_bytes: number;
+  readonly total_bytes: bigint;
   /** Number of entries past their TTL but not yet evicted */
-  readonly expired_entries: number;
+  readonly expired_entries: bigint;
 }
 
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   kv: {
-    /**
-     * Open (or create) a store backed by the given filesystem path
-     * @throws {Error} if the native call fails
-     */
-    open_store(path: string): Store;
-    /**
-     * Close the store and release all in-memory resources
-     * @throws {Error} if the native call fails
-     */
-    close_store(store: Store): void;
-    /**
-     * Insert or replace a value, returning true on success
-     * @throws {Error} if the native call fails
-     */
-    put(store: Store, key: string, value: Uint8Array, kind: EntryKind, ttl_seconds: number | null): boolean;
-    /**
-     * Look up an entry by key; returns null if missing or expired
-     * @throws {Error} if the native call fails
-     */
-    get(store: Store, key: string): Entry | null;
-    /**
-     * Remove the entry for the given key, returning true if it existed
-     * @throws {Error} if the native call fails
-     */
-    delete(store: Store, key: string): boolean;
-    /**
-     * Stream every key, optionally filtered by a prefix
-     * @throws {Error} if the native call fails
-     */
-    list_keys(store: Store, prefix: string | null): string[];
-    /**
-     * Return the number of live entries in the store
-     * @throws {Error} if the native call fails
-     */
-    count(store: Store): number;
-    /**
-     * Drop every entry from the store
-     * @throws {Error} if the native call fails
-     */
-    clear(store: Store): void;
-    /**
-     * Reclaim space asynchronously; returns the number of bytes reclaimed
-     * @throws {Error} if the native call fails
-     */
-    compact_async(store: Store): Promise<number>;
-    /**
-     * Legacy single-shot put kept for compatibility
-     * @deprecated use put() with explicit kind
-     * @throws {Error} if the native call fails
-     */
-    legacy_put(store: Store, key: string, value: Uint8Array): boolean;
+    Store: typeof Store;
     stats: {
       /**
        * Snapshot the current store statistics
-       * @throws {Error} if the native call fails
+       * @throws {KvError} on a domain error code
        */
-      get_stats(store: Store): Stats;
+      getStats(store: Store): Stats;
     };
   };
 }

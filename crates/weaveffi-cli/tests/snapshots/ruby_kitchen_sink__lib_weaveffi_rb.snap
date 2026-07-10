@@ -120,6 +120,51 @@ module WeaveFFI
 
   # === Module: kitchen ===
 
+  # Base error for the `kitchen` module's error domain.
+  class KitchenErrorsError < Error
+    # Item not found
+    class NotFound < KitchenErrorsError
+      CODE = 1
+
+      def initialize(message = 'Item not found')
+        super(1, message)
+      end
+    end
+
+    # Invalid input
+    class InvalidInput < KitchenErrorsError
+      CODE = 2
+
+      def initialize(message = 'Invalid input')
+        super(2, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the KitchenErrorsError domain to its error class.
+  KITCHEN_ERRORS_ERROR_CODES = {
+    1 => KitchenErrorsError::NotFound,
+    2 => KitchenErrorsError::InvalidInput,
+  }.freeze
+
+  # Builds the KitchenErrorsError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.kitchen_errors_error_from(code, message)
+    cls = KITCHEN_ERRORS_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed KitchenErrorsError for a non-zero error slot.
+  def self.check_kitchen_errors_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise kitchen_errors_error_from(code, msg)
+  end
+
   # Task priority levels
   module Priority
     # Low priority
@@ -150,6 +195,16 @@ module WeaveFFI
   # Cross-module struct reference
   attach_function :weaveffi_kitchen_Item_get_token, [:pointer], :pointer
   attach_function :weaveffi_kitchen_Item_get_priority, [:pointer], :int32
+
+  attach_function :weaveffi_kitchen_Gadget_destroy, [:pointer], :void
+  # Create a gadget with the given id
+  attach_function :weaveffi_kitchen_Gadget_new, [:int64, :pointer], :pointer
+  # Render the gadget as a human-readable string
+  attach_function :weaveffi_kitchen_Gadget_describe, [:pointer, :pointer], :pointer
+  # Poke the gadget a number of times, failing on a negative count
+  attach_function :weaveffi_kitchen_Gadget_poke, [:pointer, :int32, :pointer], :int32
+  # The gadget subsystem version string
+  attach_function :weaveffi_kitchen_Gadget_version, [:pointer], :pointer
   # Fires when an item is ready
   callback :weaveffi_kitchen_OnReady_fn, [:int32, :string, :pointer], :void
   attach_function :weaveffi_kitchen_register_ready_listener, [:weaveffi_kitchen_OnReady_fn, :pointer], :uint64
@@ -422,6 +477,70 @@ module WeaveFFI
     end
   end
 
+  class GadgetPtr < FFI::AutoPointer
+    def self.release(ptr)
+      WeaveFFI.weaveffi_kitchen_Gadget_destroy(ptr)
+    end
+  end
+
+  # A pocket-sized interface exercising the object surface
+  class Gadget
+    attr_reader :handle
+
+    # Wraps an owned pointer the producer handed over, without
+    # re-running initialize.
+    def self._from_ptr(ptr)
+      obj = allocate
+      obj.instance_variable_set(:@handle, GadgetPtr.new(ptr))
+      obj
+    end
+
+    def destroy
+      return if @handle.nil?
+      @handle.free
+      @handle = nil
+    end
+
+    # Create a gadget with the given id
+    def initialize(id)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kitchen_Gadget_new(id, err)
+      WeaveFFI.check_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      @handle = GadgetPtr.new(result)
+    end
+
+    # Render the gadget as a human-readable string
+    def describe()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kitchen_Gadget_describe(@handle, err)
+      WeaveFFI.check_error!(err)
+      return '' if result.null?
+      str = result.read_string
+      WeaveFFI.weaveffi_free_string(result)
+      str
+    end
+
+    # Poke the gadget a number of times, failing on a negative count
+    def poke(times)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kitchen_Gadget_poke(@handle, times, err)
+      WeaveFFI.check_kitchen_errors_error!(err)
+      result
+    end
+
+    # The gadget subsystem version string
+    def self.version()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_kitchen_Gadget_version(err)
+      WeaveFFI.check_error!(err)
+      return '' if result.null?
+      str = result.read_string
+      WeaveFFI.weaveffi_free_string(result)
+      str
+    end
+  end
+
   # Subscribe to OnReady events
   # Registers a OnReady listener block. Returns a subscription id for
   # unregister_ready_listener.
@@ -549,7 +668,7 @@ module WeaveFFI
   def self.maybe_item(id)
     err = ErrorStruct.new
     result = weaveffi_kitchen_maybe_item(id, err)
-    check_error!(err)
+    check_kitchen_errors_error!(err)
     return nil if result.null?
     Item.new(result)
   end

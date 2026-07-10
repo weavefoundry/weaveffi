@@ -1,8 +1,8 @@
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: contacts
   version: "1.0.0"
-  description: A small contacts book API demonstrating structs, enums, and optionals.
+  description: A small contacts book API demonstrating interfaces, enums, and typed errors.
   license: MIT
   authors:
     - WeaveFoundry <hello@weavefoundry.dev>
@@ -32,31 +32,49 @@ modules:
             type: "string?"
           - name: contact_type
             type: ContactType
-    functions:
-      - name: create_contact
-        params:
-          - name: first_name
-            type: string
-          - name: last_name
-            type: string
-          - name: email
-            type: "string?"
-          - name: contact_type
-            type: ContactType
-        return: handle
-      - name: get_contact
-        params:
-          - name: id
-            type: handle
-        return: Contact
-      - name: list_contacts
-        params: []
-        return: "[Contact]"
-      - name: delete_contact
-        params:
-          - name: id
-            type: handle
-        return: bool
-      - name: count_contacts
-        params: []
-        return: i32
+    errors:
+      name: ContactsError
+      codes:
+        - { name: InvalidName, code: 1, message: "name must not be empty" }
+        - { name: NotFound, code: 2, message: "contact not found" }
+    interfaces:
+      - name: ContactBook
+        doc: An in-memory address book owning its contacts
+        constructors:
+          - name: new
+            params: []
+        methods:
+          - name: add
+            doc: Add a contact, returning the stored record with its assigned id
+            params:
+              - name: first_name
+                type: string
+              - name: last_name
+                type: string
+              - name: email
+                type: "string?"
+              - name: contact_type
+                type: ContactType
+            return: Contact
+            throws: true
+          - name: get
+            doc: Look up a contact by id
+            params:
+              - name: id
+                type: i64
+            return: Contact
+            throws: true
+          - name: list
+            doc: List every stored contact
+            params: []
+            return: "[Contact]"
+          - name: remove
+            doc: Remove a contact by id, returning whether it existed
+            params:
+              - name: id
+                type: i64
+            return: bool
+          - name: count
+            doc: Count the stored contacts
+            params: []
+            return: i32

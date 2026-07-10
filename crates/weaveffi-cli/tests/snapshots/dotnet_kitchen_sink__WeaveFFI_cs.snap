@@ -24,6 +24,34 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the KitchenErrorsError error domain (module kitchen).</summary>
+    public class KitchenErrorsException : WeaveFFIException
+    {
+        /// <summary>Item not found</summary>
+        public const int NotFound = 1;
+        /// <summary>Invalid input</summary>
+        public const int InvalidInput = 2;
+
+        public KitchenErrorsException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case NotFound:
+                    return new KitchenErrorsException(code, string.IsNullOrEmpty(message) ? "Item not found" : message);
+                case InvalidInput:
+                    return new KitchenErrorsException(code, string.IsNullOrEmpty(message) ? "Invalid input" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -36,6 +64,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckKitchenErrors(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw KitchenErrorsException.FromCode(err.Code, msg);
             }
         }
     }
@@ -423,6 +460,76 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>A pocket-sized interface exercising the object surface</summary>
+    public class Gadget : IDisposable
+    {
+        private IntPtr _handle;
+        private bool _disposed;
+
+        internal Gadget(IntPtr handle)
+        {
+            _handle = handle;
+        }
+
+        internal IntPtr Handle => _handle;
+
+        /// <summary>Create a gadget with the given id</summary>
+        public Gadget(long id)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kitchen_Gadget_new(id, ref err);
+            WeaveFFIError.Check(err);
+            _handle = result;
+        }
+
+        /// <summary>Render the gadget as a human-readable string</summary>
+        public string Describe()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kitchen_Gadget_describe(_handle, ref err);
+            WeaveFFIError.Check(err);
+            var str = Marshal.PtrToStringUTF8(result);
+            NativeMethods.weaveffi_free_string(result);
+            return str;
+        }
+
+        /// <summary>Poke the gadget a number of times, failing on a negative count</summary>
+        /// <exception cref="KitchenErrorsException">Thrown when the call reports a KitchenErrorsError code.</exception>
+        public int Poke(int times)
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kitchen_Gadget_poke(_handle, times, ref err);
+            WeaveFFIError.CheckKitchenErrors(err);
+            return result;
+        }
+
+        /// <summary>The gadget subsystem version string</summary>
+        public static string Version()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kitchen_Gadget_version(ref err);
+            WeaveFFIError.Check(err);
+            var str = Marshal.PtrToStringUTF8(result);
+            NativeMethods.weaveffi_free_string(result);
+            return str;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                NativeMethods.weaveffi_kitchen_Gadget_destroy(_handle);
+                _disposed = true;
+            }
+            GC.SuppressFinalize(this);
+        }
+
+        ~Gadget()
+        {
+            Dispose();
+        }
+    }
+
     internal static class NativeMethods
     {
         private const string LibName = "weaveffi";
@@ -490,6 +597,21 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_get_priority", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_kitchen_Item_get_priority(IntPtr ptr);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kitchen_Gadget_destroy(IntPtr self);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_new", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_Gadget_new(long id, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_describe", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_Gadget_describe(IntPtr self, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_poke", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kitchen_Gadget_poke(IntPtr self, int times, ref WeaveFFIError err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_version", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_Gadget_version(ref WeaveFFIError err);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void Cb_weaveffi_kitchen_OnReady_fn(int code, IntPtr msg, IntPtr context);
 
@@ -553,17 +675,11 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_cross_module_token", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kitchen_cross_module_token(ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_do_async", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_do_async(IntPtr input, ref WeaveFFIError err);
-
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_kitchen_do_async(IntPtr context, IntPtr err, IntPtr result);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_do_async_async", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kitchen_do_async_async(IntPtr input, AsyncCb_weaveffi_kitchen_do_async callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_do_cancellable", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_do_cancellable(IntPtr input, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_kitchen_do_cancellable(IntPtr context, IntPtr err, IntPtr result);
@@ -585,7 +701,7 @@ namespace WeaveFFI
     public static class Shared
     {
         /// <summary>Trivial cross-module helper</summary>
-        public static string SharedPing()
+        public static string Ping()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_shared_ping(ref err);
@@ -606,8 +722,8 @@ namespace WeaveFFI
         private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
 
         /// <summary>Subscribe to OnReady events</summary>
-        /// <returns>A subscription id for KitchenUnregisterReadyListener().</returns>
-        public static ulong KitchenRegisterReadyListener(Action<int, string> callback)
+        /// <returns>A subscription id for UnregisterReadyListener().</returns>
+        public static ulong RegisterReadyListener(Action<int, string> callback)
         {
             NativeMethods.Cb_weaveffi_kitchen_OnReady_fn trampoline = (code, msg, context) =>
             {
@@ -622,8 +738,8 @@ namespace WeaveFFI
             return id;
         }
 
-        /// <summary>Unregisters a listener previously registered with KitchenRegisterReadyListener().</summary>
-        public static void KitchenUnregisterReadyListener(ulong id)
+        /// <summary>Unregisters a listener previously registered with RegisterReadyListener().</summary>
+        public static void UnregisterReadyListener(ulong id)
         {
             NativeMethods.weaveffi_kitchen_unregister_ready_listener(id);
             lock (_listenerLock)
@@ -633,7 +749,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Identity for bool</summary>
-        public static bool KitchenBoolId(bool x)
+        public static bool BoolId(bool x)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_bool_id(x ? 1 : 0, ref err);
@@ -641,7 +757,7 @@ namespace WeaveFFI
             return result != 0;
         }
 
-        public static int KitchenI32Id(int x)
+        public static int I32Id(int x)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_i32_id(x, ref err);
@@ -649,7 +765,7 @@ namespace WeaveFFI
             return result;
         }
 
-        public static uint KitchenU32Id(uint x)
+        public static uint U32Id(uint x)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_u32_id(x, ref err);
@@ -657,7 +773,7 @@ namespace WeaveFFI
             return result;
         }
 
-        public static long KitchenI64Id(long x)
+        public static long I64Id(long x)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_i64_id(x, ref err);
@@ -665,7 +781,7 @@ namespace WeaveFFI
             return result;
         }
 
-        public static double KitchenF64Id(double x)
+        public static double F64Id(double x)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_f64_id(x, ref err);
@@ -673,7 +789,7 @@ namespace WeaveFFI
             return result;
         }
 
-        public static string KitchenEchoString(string s)
+        public static string EchoString(string s)
         {
             var err = new WeaveFFIError();
             var sPtr = Marshal.StringToCoTaskMemUTF8(s);
@@ -691,7 +807,7 @@ namespace WeaveFFI
             }
         }
 
-        public static byte[] KitchenEchoBytes(byte[] b)
+        public static byte[] EchoBytes(byte[] b)
         {
             var err = new WeaveFFIError();
             var bPin = GCHandle.Alloc(b, GCHandleType.Pinned);
@@ -712,7 +828,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Borrowed string parameter</summary>
-        public static string KitchenEchoBorrowedStr(string s)
+        public static string EchoBorrowedStr(string s)
         {
             var err = new WeaveFFIError();
             var sPtr = Marshal.StringToCoTaskMemUTF8(s);
@@ -731,7 +847,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Borrowed bytes parameter</summary>
-        public static byte[] KitchenEchoBorrowedBytes(byte[] b)
+        public static byte[] EchoBorrowedBytes(byte[] b)
         {
             var err = new WeaveFFIError();
             var bPin = GCHandle.Alloc(b, GCHandleType.Pinned);
@@ -752,7 +868,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Returns an opaque handle</summary>
-        public static ulong KitchenOpenHandle()
+        public static ulong OpenHandle()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_open_handle(ref err);
@@ -761,7 +877,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Returns a typed handle</summary>
-        public static Token KitchenOpenTypedHandle()
+        public static Token OpenTypedHandle()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_open_typed_handle(ref err);
@@ -770,16 +886,17 @@ namespace WeaveFFI
         }
 
         /// <summary>Optional struct return</summary>
-        public static Item? KitchenMaybeItem(long id)
+        /// <exception cref="KitchenErrorsException">Thrown when the call reports a KitchenErrorsError code.</exception>
+        public static Item? MaybeItem(long id)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_maybe_item(id, ref err);
-            WeaveFFIError.Check(err);
+            WeaveFFIError.CheckKitchenErrors(err);
             return result == IntPtr.Zero ? null : new Item(result);
         }
 
         /// <summary>List of structs</summary>
-        public static Item[] KitchenListItems()
+        public static Item[] ListItems()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_list_items(out var outLen, ref err);
@@ -794,7 +911,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Map return type</summary>
-        public static Dictionary<string, int> KitchenGetAttrs()
+        public static Dictionary<string, int> GetAttrs()
         {
             var err = new WeaveFFIError();
             NativeMethods.weaveffi_kitchen_get_attrs(out var outKeys, out var outValues, out var outLen, ref err);
@@ -808,15 +925,15 @@ namespace WeaveFFI
         }
 
         /// <summary>Iterator return type</summary>
-        public static IEnumerable<Item> KitchenStreamItems()
+        public static IEnumerable<Item> StreamItems()
         {
             var err = new WeaveFFIError();
             var iter = NativeMethods.weaveffi_kitchen_stream_items(ref err);
             WeaveFFIError.Check(err);
-            return EnumerateKitchenStreamItems(iter);
+            return EnumerateStreamItems(iter);
         }
 
-        private static IEnumerable<Item> EnumerateKitchenStreamItems(IntPtr iter)
+        private static IEnumerable<Item> EnumerateStreamItems(IntPtr iter)
         {
             try
             {
@@ -839,7 +956,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Returns the shared Token type from another module</summary>
-        public static Token KitchenCrossModuleToken()
+        public static Token CrossModuleToken()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_cross_module_token(ref err);
@@ -848,7 +965,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Async operation</summary>
-        public static async Task<string> KitchenDoAsync(string input)
+        public static async Task<string> DoAsync(string input)
         {
             var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_kitchen_do_async callback = (context, err, result) =>
@@ -900,7 +1017,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Cancellable async operation</summary>
-        public static async Task<string> KitchenDoCancellable(string input)
+        public static async Task<string> DoCancellable(string input)
         {
             var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
             NativeMethods.AsyncCb_weaveffi_kitchen_do_cancellable callback = (context, err, result) =>
@@ -953,7 +1070,7 @@ namespace WeaveFFI
 
         /// <summary>Legacy operation kept for compatibility</summary>
         [Obsolete("Use new_op instead")]
-        public static int KitchenLegacyOp()
+        public static int LegacyOp()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_legacy_op(ref err);
@@ -962,7 +1079,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Replacement for legacy_op</summary>
-        public static int KitchenNewOp()
+        public static int NewOp()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_new_op(ref err);
@@ -975,7 +1092,7 @@ namespace WeaveFFI
     public static class KitchenNested
     {
         /// <summary>Trivial nested-module function</summary>
-        public static string KitchenNestedHello()
+        public static string Hello()
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_kitchen_nested_hello(ref err);

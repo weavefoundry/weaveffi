@@ -3,11 +3,11 @@
 ## Overview
 
 The C++ target emits a header-only library `weaveffi.hpp` that wraps the
-C ABI in idiomatic C++17. Structs become RAII classes with deleted copies
-and movable handles, errors map to exceptions, async functions return
-`std::future`, and listeners accept `std::function` callbacks. A
-`CMakeLists.txt` is included so the generated directory can be dropped
-into any CMake build.
+C ABI in idiomatic C++17. Structs and interfaces become RAII classes with
+deleted copies and movable handles, error domains map to typed exception
+hierarchies, async functions return `std::future`, and listeners accept
+`std::function` callbacks. A `CMakeLists.txt` is included so the generated
+directory can be dropped into any CMake build.
 
 ## What gets generated
 
@@ -36,6 +36,7 @@ into any CMake build.
 | `bytes`      | `std::vector<uint8_t>`               | `const std::vector<uint8_t>&` |
 | `handle`     | `void*`                              | `void*`                     |
 | `StructName` | `StructName`                         | `const StructName&`         |
+| `InterfaceName` | `InterfaceName` (RAII class)      | `const InterfaceName&`      |
 | `EnumName` (plain) | `EnumName` (`enum class`)      | `EnumName`                  |
 | `EnumName` (rich)  | `EnumName` (RAII class)        | `const EnumName&`           |
 | `T?`         | `std::optional<T>`                   | `const std::optional<T>&`   |
@@ -46,7 +47,7 @@ into any CMake build.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -127,11 +128,15 @@ public:
 };
 ```
 
-Free functions live in the `weaveffi` namespace and throw on failure:
+Free functions live in a nested namespace per module inside the outer
+`weaveffi` namespace (configurable via `namespace`), keeping their
+snake_case IDL names with no module prefix, and throw on failure:
 
 ```cpp
 namespace weaveffi {
-inline Contact contacts_create_contact(
+namespace contacts {
+
+inline Contact create_contact(
     const std::string& name,
     const std::optional<std::string>& email,
     int32_t age)
@@ -141,40 +146,110 @@ inline Contact contacts_create_contact(
         name.c_str(),
         email.has_value() ? email.value().c_str() : nullptr,
         age, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return Contact(result);
 }
+
+} // namespace contacts
 } // namespace weaveffi
 ```
 
-`WeaveFFIError` extends `std::runtime_error`. When the IDL declares
-custom error codes the generator also emits typed subclasses, each named in
-PascalCase with an `Error` suffix (`not_found` → `NotFoundError`,
-`KEY_NOT_FOUND` → `KeyNotFoundError`):
+The module namespace replaces the old flat `contacts_create_contact`
+spelling; call it as `weaveffi::contacts::create_contact(...)`. Nested IDL
+modules nest namespaces the same way (`weaveffi::kv::stats::get_stats`).
+
+## Typed errors
+
+`WeaveFFIError` extends `std::runtime_error` and carries the raw `code()`.
+A module's error domain generates a typed hierarchy: one class named after
+the domain, plus one subclass per declared code, each named in PascalCase
+with exactly one `Error` suffix. From the `contacts` sample's
+`ContactsError` domain:
 
 ```cpp
 namespace weaveffi {
-class NotFoundError : public WeaveFFIError { /* ... */ };
+
+class ContactsError : public WeaveFFIError {
+public:
+    ContactsError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** name must not be empty */
+class InvalidNameError : public ContactsError { /* ... */ };
+
+/** contact not found */
+class NotFoundError : public ContactsError { /* ... */ };
+
 } // namespace weaveffi
 ```
 
-The exception dispatcher throws the most specific subclass, so you can catch
-a single code or fall back to the base `WeaveFFIError`:
+A callable declared with `throws: true` routes its failure through a
+per-domain checker (`detail::check_contacts`) that throws the most specific
+subclass, so you can catch a single code, the domain, or the generic base:
 
 ```cpp
 try {
-    auto contact = weaveffi::contacts_find_contact(42);
+    auto contact = book.get(42);
 } catch (const weaveffi::NotFoundError& e) {
     std::cerr << "Not found: " << e.what() << '\n';
-} catch (const weaveffi::WeaveFFIError& e) {
-    std::cerr << "Error " << e.code() << ": " << e.what() << '\n';
+} catch (const weaveffi::ContactsError& e) {
+    std::cerr << "Contacts error " << e.code() << ": " << e.what() << '\n';
 }
 ```
+
+A callable without `throws` has the same C++ signature (C++ has no checked
+exceptions), but its failures can only be producer bugs (a panic or a
+marshalling failure), which arrive as the generic `weaveffi::WeaveFFIError`
+rather than a domain type. An unknown code on the typed path falls back to
+the domain class itself (`ContactsError`).
+
+## Interfaces
+
+An `interfaces:` entry becomes a move-only RAII class following the same
+ownership model as struct wrappers. Constructors become static factories,
+methods are instance members, statics are static members, and the
+destructor calls the implicit C `_destroy` symbol. From the `kvstore`
+sample's `Store` (trimmed):
+
+```cpp
+/** An embedded key-value store owning its entries */
+class Store {
+    void* handle_;
+
+public:
+    ~Store() {
+        if (handle_) weaveffi_kv_Store_destroy(static_cast<weaveffi_kv_Store*>(handle_));
+    }
+    Store(const Store&) = delete;
+    Store(Store&& other) noexcept;
+
+    /** Open (or create) a store backed by the given filesystem path */
+    static Store open(const std::string& path) {
+        weaveffi_error err{};
+        auto result = weaveffi_kv_Store_open(path.c_str(), &err);
+        detail::check_kv(err);       // throws: true -> typed KvError path
+        return Store(result);
+    }
+
+    /** Remove the entry for the given key, returning true if it existed */
+    bool delete_(const std::string& key) const;
+
+    /** Return the number of live entries in the store */
+    int64_t count() const;           // no throws: generic check only
+
+    /** Reclaim space asynchronously; returns the number of bytes reclaimed */
+    std::future<int64_t> compact(weaveffi_cancel_token* cancel_token = nullptr) const;
+
+    /** The largest number of live entries one store will hold */
+    static int64_t default_capacity();
+};
+```
+
+Method names keep their snake_case IDL spelling; a name that collides with
+a C++ keyword gains a trailing underscore (`delete` → `delete_`).
+Deprecated members carry `[[deprecated("...")]]`. An interface parameter is
+passed as `const Store&` (borrowed); an interface return wraps the owned
+pointer in a new instance.
 
 ## Rich (algebraic) enums
 
@@ -258,9 +333,9 @@ Then `#include "weaveffi.hpp"` and link against the Rust shared library
 
 ## Memory and ownership
 
-- Struct wrappers own a single `void*` handle. The destructor calls the
-  C `_destroy` function. Copies are deleted; moves transfer ownership
-  by nulling the source handle.
+- Struct and interface wrappers own a single `void*` handle. The
+  destructor calls the C `_destroy` function. Copies are deleted; moves
+  transfer ownership by nulling the source handle.
 - Strings returned from getters are copied into `std::string` and the
   raw pointer is freed via `weaveffi_free_string` before returning.
 - Optional fields use `std::optional<T>`; a `nullptr` from the C layer
@@ -270,11 +345,11 @@ Then `#include "weaveffi.hpp"` and link against the Rust shared library
 
 ## Callbacks and listeners
 
-Listeners surface as free functions taking `std::function`. The
-register wrapper boxes the callable in a `std::shared_ptr`, hands the
-C ABI a capture-less trampoline plus the raw pointer as `context`, and
-pins the box in a global registry so it stays alive until unregister.
-From the `events` sample (trimmed):
+Listeners surface as free functions in the module's namespace taking
+`std::function`. The register wrapper boxes the callable in a
+`std::shared_ptr`, hands the C ABI a capture-less trampoline plus the raw
+pointer as `context`, and pins the box in a global registry so it stays
+alive until unregister. From the `events` sample (trimmed):
 
 ```cpp
 namespace detail {
@@ -291,7 +366,9 @@ inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry
 
 } // namespace detail
 
-inline uint64_t events_register_message_listener(std::function<void(std::string)> callback) {
+namespace events {
+
+inline uint64_t register_message_listener(std::function<void(std::string)> callback) {
     auto fn = std::make_shared<std::function<void(std::string)>>(std::move(callback));
     uint64_t id = weaveffi_events_register_message_listener(
         [](const char* message, void* context) {
@@ -304,11 +381,13 @@ inline uint64_t events_register_message_listener(std::function<void(std::string)
     return id;
 }
 
-inline void events_unregister_message_listener(uint64_t id) {
+inline void unregister_message_listener(uint64_t id) {
     weaveffi_events_unregister_message_listener(id);
     std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
     detail::wv_listener_registry().erase(id);
 }
+
+} // namespace events
 ```
 
 - `register_*` returns the `uint64_t` subscription id from the C
@@ -324,10 +403,10 @@ inline void events_unregister_message_listener(uint64_t id) {
   registered it; capture and synchronize accordingly.
 
 ```cpp
-uint64_t id = weaveffi::events_register_message_listener(
+uint64_t id = weaveffi::events::register_message_listener(
     [](std::string message) { std::cout << message << '\n'; });
-weaveffi::events_send_message("hello");
-weaveffi::events_unregister_message_listener(id);
+weaveffi::events::send_message("hello");
+weaveffi::events::unregister_message_listener(id);
 ```
 
 ## Async support
@@ -337,7 +416,7 @@ heap-owned `std::promise`, hands the C ABI a callback that resolves
 (or rejects) the promise, and returns the corresponding future:
 
 ```cpp
-inline std::future<Contact> contacts_fetch_contact(int32_t id) {
+inline std::future<Contact> fetch_contact(int32_t id) {
     auto* promise_ptr = new std::promise<Contact>();
     auto future = promise_ptr->get_future();
     weaveffi_contacts_fetch_contact_async(id,
@@ -346,8 +425,7 @@ inline std::future<Contact> contacts_fetch_contact(int32_t id) {
             auto* p = static_cast<std::promise<Contact>*>(context);
             if (err && err->code != 0) {
                 std::string msg(err->message ? err->message : "unknown error");
-                p->set_exception(std::make_exception_ptr(
-                    WeaveFFIError(err->code, msg)));
+                p->set_exception(detail::make_error(err->code, msg));
             } else {
                 p->set_value(Contact(result));
             }
@@ -358,23 +436,26 @@ inline std::future<Contact> contacts_fetch_contact(int32_t id) {
 ```
 
 Use it with `.get()` (blocking) or compose with your event loop. The
-promise is completed (or rejected with a `WeaveFFIError` exception)
-exactly once in the completion lambda, which then deletes it.
+promise is completed (or rejected) exactly once in the completion lambda,
+which then deletes it. An async callable with `throws: true` rejects with
+the module's typed domain exception (`detail::make_kv_error` and friends);
+one without `throws` rejects with the generic `WeaveFFIError` only when the
+producer has a bug.
 
-When the IDL marks the function `cancellable: true`, the wrapper gains
-a trailing `weaveffi_cancel_token*` parameter defaulting to `nullptr`
-(from the `kvstore` sample):
+When the IDL marks the callable `cancellable: true`, the wrapper gains
+a trailing `weaveffi_cancel_token*` parameter defaulting to `nullptr`.
+From the `kvstore` sample's async method `Store.compact`:
 
 ```cpp
-inline std::future<int64_t> kv_compact_async(Store& store,
-    weaveffi_cancel_token* cancel_token = nullptr) { /* ... */ }
+/** Reclaim space asynchronously; returns the number of bytes reclaimed */
+std::future<int64_t> compact(weaveffi_cancel_token* cancel_token = nullptr) const;
 ```
 
 ```cpp
 weaveffi_cancel_token* token = weaveffi_cancel_token_create();
-auto fut = weaveffi::kv_compact_async(store, token);
+auto fut = store.compact(token);
 weaveffi_cancel_token_cancel(token);   // from any thread
-// fut.get() throws WeaveFFIError if the operation was cancelled
+// fut.get() throws (typed KvError) if the operation was cancelled
 weaveffi_cancel_token_destroy(token);
 ```
 
@@ -389,10 +470,10 @@ destroys the iterator handle, and returns the collected values. From the `events
 sample (`get_messages` returns `iter<string>`, trimmed):
 
 ```cpp
-inline std::vector<std::string> events_get_messages() {
+inline std::vector<std::string> get_messages() {
     weaveffi_error err{};
     weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
-    // ... throw WeaveFFIError on error ...
+    detail::check(err);
     std::vector<std::string> ret;
     while (true) {
         const char* item{};

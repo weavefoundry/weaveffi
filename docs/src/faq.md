@@ -88,29 +88,42 @@ by WeaveFFI; the implementation chooses how to spawn work.
 
 ## 5. How are errors propagated?
 
-Every generated function takes a trailing `weaveffi_error* out_err`
-parameter. On success the runtime sets `code = 0` and
+At the C ABI, generated functions take a trailing `weaveffi_error*
+out_err` parameter. On success the runtime sets `code = 0` and
 `message = NULL`. On failure it sets a non-zero code and a
 heap-allocated UTF-8 message that the caller frees via
 `weaveffi_error_clear`.
 
-Each target language maps this to its native error story:
+Above the ABI, error surfacing is opt-in per function: a module
+declares an error domain (`errors:` in the IDL) with named, stable
+codes, and functions marked `throws: true` surface those codes as the
+domain's typed error in each language. Taking a `KvError` domain as
+the example:
 
-- **C**: direct `weaveffi_error` struct.
-- **C++**: exceptions (`WeaveFFIError` + per-code subclasses).
-- **Swift**: `throws` + `WeaveFFIError`.
-- **Kotlin**: checked exceptions (`WeaveFFIException`).
-- **Node.js / TypeScript**: thrown `Error` objects (or
-  `Promise.reject` for `async`).
-- **Wasm/JS**: thrown `Error`.
-- **Python**: raised `WeaveFFIError`.
-- **.NET**: thrown `WeaveFFIException`.
-- **Dart**: thrown `WeaveFFIException`.
-- **Go**: second `error` return value.
-- **Ruby**: raised `WeaveFFIError`.
+- **C**: direct `weaveffi_error` struct, plus an enum constant per
+  code (`weaveffi_kv_KvError_KeyNotFound`).
+- **C++**: per-domain exception types (`KvError` + per-code
+  subclasses).
+- **Swift**: `throws` with a domain enum conforming to `Error`
+  (`catch KvError.keyNotFound`).
+- **Kotlin**: domain exceptions (`KvException` extends
+  `WeaveFFIException`, one nested class per code).
+- **Node.js / TypeScript**: domain error classes (`KvError` extends
+  `WeaveFFIError`); async functions reject the promise with them.
+- **Wasm/JS**: the same domain error classes.
+- **Python**: a domain exception hierarchy (`KvError` extends
+  `WeaveFFIError`, `KeyNotFound` extends `KvError`).
+- **.NET**: thrown `KvException` (extends `WeaveFFIException`).
+- **Dart**: thrown `KvException` (extends `WeaveFFIException`).
+- **Go**: a second `error` return carrying a typed error struct
+  matched via `errors.As` and code constants
+  (`KvErrorKeyNotFound`).
+- **Ruby**: domain exception classes (`KvError` with nested
+  per-code classes).
 
-You can also declare named error domains in the IDL (per module) to
-assign stable numeric codes to expected failures. See the
+Non-throwing functions (the default) return plain values; a non-zero
+code on one of them only ever reports a producer bug, so the wrapper
+panics or traps instead of surfacing an error type. See the
 [Error Handling guide](guides/errors.md).
 
 ## 6. Can I customize the generated code?
@@ -119,9 +132,9 @@ Yes, via two escape hatches in increasing order of power:
 
 1. **Generator config** (`--config cfg.toml` or inline `generators:`
    table in the IDL). Controls Swift module names, Android package,
-   C prefix, C++ namespace, Dart/Go/Ruby package names, and other
-   per-target knobs. See the
-   [Generator Configuration guide](guides/config.md).
+   C prefix, C++ namespace, Dart/Go/Ruby package names, module-prefix
+   stripping (`strip_module_prefix`), and other per-target knobs. See
+   the [Generator Configuration guide](guides/config.md).
 2. **Hook commands** (`pre_generate` / `post_generate` in the
    config). Run arbitrary shell commands before and after generation,
    useful for `prettier`, `swiftformat`, `gofmt`, etc.
@@ -163,10 +176,11 @@ Windows correctly:
 - **Dart**: looks up `weaveffi.dll` via `Platform.isWindows`.
 - **Go / Ruby**: load the appropriate Windows shared library.
 
-CI runs the Python end-to-end consumer test on Windows on every PR
-to keep the platform honest. The other targets are exercised on macOS
-and Linux only. If you hit a Windows-specific issue, please open an
-issue.
+CI builds and tests the workspace on Windows on every PR, and a
+dedicated Windows job generates every target's bindings and verifies
+the output. The full conformance harness (running the generated
+bindings in all eleven languages) is exercised on Linux. If you hit a
+Windows-specific issue, please open an issue.
 
 ## 9. How do I distribute the cdylib?
 

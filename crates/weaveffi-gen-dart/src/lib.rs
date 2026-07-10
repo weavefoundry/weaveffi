@@ -16,23 +16,31 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::errors;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, FieldBinding, FnBinding,
-    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
-    StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
+    RichVariantBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
-use weaveffi_core::utils::{local_type_name, render_prelude, render_trailer, CommentStyle};
+use weaveffi_core::utils::{
+    local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
+};
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Per-target configuration for [`DartGenerator`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DartConfig {
     /// Dart package name (recorded in `pubspec.yaml`). Defaults to
     /// `"weaveffi"`.
     pub package_name: Option<String>,
+    /// When `true` (the default), strip the IR module path from emitted
+    /// function and listener names, so a `contacts` module exports
+    /// `createContact` rather than `contactsCreateContact`. Set to `false`
+    /// to restore module-prefixed names.
+    pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the `dart:ffi` bindings call the
     /// same exported symbols the producer emits.
@@ -40,6 +48,17 @@ pub struct DartConfig {
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
     pub input_basename: Option<String>,
+}
+
+impl Default for DartConfig {
+    fn default() -> Self {
+        Self {
+            package_name: None,
+            strip_module_prefix: true,
+            prefix: None,
+            input_basename: None,
+        }
+    }
 }
 
 impl DartConfig {
@@ -83,7 +102,7 @@ impl LanguageBackend for DartGenerator {
     fn files(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
     ) -> Vec<OutputFile> {
@@ -93,7 +112,7 @@ impl LanguageBackend for DartGenerator {
         vec![
             OutputFile::new(
                 lib_dir.join("weaveffi.dart"),
-                render_dart_module(api, config.prefix(), input_basename),
+                render_dart_module(api, model, config),
             ),
             OutputFile::new(
                 dart_dir.join("pubspec.yaml"),
@@ -123,7 +142,7 @@ impl LanguageBackend for DartGenerator {
     fn package(
         &self,
         api: &Api,
-        _model: &BindingModel,
+        model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -140,7 +159,7 @@ impl LanguageBackend for DartGenerator {
         let lib_base = pkg::resolve(api, None, Some(input_basename)).ident_name();
         let lib = &ctx.binaries.lib_name;
 
-        let module_src = render_dart_module(api, config.prefix(), input_basename)
+        let module_src = render_dart_module(api, model, config)
             .replace(&dart_loader_original(&lib_base), &dart_loader_packaged(lib));
 
         let dart_dir = out_dir.join("dart");
@@ -278,10 +297,11 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "List<int>".into(),
-        // Structs, enums, and typed handles all surface as bare local Dart
-        // classes. A cross-module typed handle (resolved to e.g. `kv.Store`) must
-        // still name the local `Store` class, not the qualified IR name.
-        TypeRef::TypedHandle(n) | TypeRef::Enum(n) | TypeRef::Struct(n) => {
+        // Structs, enums, typed handles, and interfaces all surface as bare
+        // local Dart classes. A cross-module reference (resolved to e.g.
+        // `kv.Store`) must still name the local `Store` class, not the
+        // qualified IR name.
+        TypeRef::TypedHandle(n) | TypeRef::Enum(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
             local_type_name(n).to_upper_camel_case()
         }
         TypeRef::Optional(inner) => format!("{}?", dart_type(inner)),
@@ -315,7 +335,9 @@ fn native_ffi_type(ty: &TypeRef) -> String {
         TypeRef::Bool | TypeRef::Enum(_) => "Int32".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            "Pointer<Void>".into()
+        }
         TypeRef::Optional(inner) => native_ffi_type(inner),
         TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
@@ -337,7 +359,9 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
         TypeRef::F32 | TypeRef::F64 => "double".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => "Pointer<Void>".into(),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            "Pointer<Void>".into()
+        }
         TypeRef::Optional(inner) => dart_ffi_type(inner),
         TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
@@ -367,7 +391,9 @@ fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
 fn input_array_ffi(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Utf8>>".into(),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => "Pointer<Pointer<Void>>".into(),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            "Pointer<Pointer<Void>>".into()
+        }
         _ => format!("Pointer<{}>", scalar_ffi(elem).0),
     }
 }
@@ -392,11 +418,15 @@ fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
         ],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![ptr("Pointer<Void>")],
+            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                vec![ptr("Pointer<Void>")]
+            }
             other => vec![ptr(&format!("Pointer<{}>", scalar_ffi(other).0))],
         },
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => vec![ptr("Pointer<Void>")],
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            vec![ptr("Pointer<Void>")]
+        }
         _ => {
             let (n, d) = scalar_ffi(ty);
             vec![(n.into(), d.into())]
@@ -411,7 +441,9 @@ fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String
     match ty {
         TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => vec![format!("{name}._handle")],
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            vec![format!("{name}._handle")]
+        }
         TypeRef::I8
         | TypeRef::I16
         | TypeRef::I32
@@ -469,7 +501,7 @@ fn emit_optional_input(
             frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
             vec![p]
         }
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
             vec![format!("{name}?._handle ?? nullptr")]
         }
         other => {
@@ -589,7 +621,9 @@ fn emit_map_input(
 fn elem_to_native(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{expr}.toNativeUtf8()"),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) => format!("{expr}._handle"),
+        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            format!("{expr}._handle")
+        }
         TypeRef::Bool => format!("{expr} ? 1 : 0"),
         TypeRef::Enum(_) => format!("{expr}.value"),
         _ => expr.to_string(),
@@ -610,7 +644,11 @@ fn return_has_out_params(ty: &TypeRef) -> bool {
 fn optional_inner_is_pointer(inner: &TypeRef) -> bool {
     matches!(
         inner,
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Struct(_) | TypeRef::TypedHandle(_)
+        TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Struct(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_)
     )
 }
 
@@ -633,7 +671,9 @@ fn return_ffi(ty: &TypeRef) -> (String, String) {
 fn map_out_ffi(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Pointer<Utf8>>>".into(),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => "Pointer<Pointer<Pointer<Void>>>".into(),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            "Pointer<Pointer<Pointer<Void>>>".into()
+        }
         _ => format!("Pointer<Pointer<{}>>", scalar_ffi(elem).0),
     }
 }
@@ -647,7 +687,7 @@ fn map_elem_read(arr: &str, idx: &str, ty: &TypeRef) -> String {
             local_type_name(n).to_upper_camel_case()
         ),
         TypeRef::Bool => format!("{arr}[{idx}] != 0"),
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
             format!(
                 "{}._({arr}[{idx}])",
                 local_type_name(n).to_upper_camel_case()
@@ -760,7 +800,7 @@ fn read_value(expr: &str, ty: &TypeRef) -> String {
             local_type_name(n).to_upper_camel_case()
         ),
         TypeRef::Bool => format!("{expr} != 0"),
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) => {
+        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
             format!("{}._({expr})", local_type_name(n).to_upper_camel_case())
         }
         _ => expr.to_string(),
@@ -772,7 +812,9 @@ fn read_value(expr: &str, ty: &TypeRef) -> String {
 fn iter_item_pointee(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => "Pointer<Void>".into(),
+        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            "Pointer<Void>".into()
+        }
         _ => scalar_ffi(elem).0.to_string(),
     }
 }
@@ -858,10 +900,13 @@ fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
     common_emit_doc(out, doc, indent, DocCommentStyle::TripleSlash);
 }
 
-fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
-    let model = BindingModel::build(api, prefix);
+fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> String {
+    let input_basename = config.input_basename();
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    let has_async = model.functions().any(|(_, f)| f.is_async);
+    let has_async = model
+        .modules
+        .iter()
+        .any(|m| m.callables().any(|f| f.is_async));
     // The default shared-library basename follows the package identity
     // (`lib<name>`), matching the producer cdylib. WEAVEFFI_LIBRARY still wins.
     let resolved = pkg::resolve(api, None, Some(input_basename));
@@ -912,12 +957,15 @@ fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
         "void",
     );
 
-    out.push_str("\nclass WeaveFFIException implements Exception {\n");
+    out.push_str(
+        "\n/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.\n",
+    );
+    out.push_str("class WeaveFFIException implements Exception {\n");
     out.push_str("  final int code;\n");
     out.push_str("  final String message;\n");
     out.push_str("  WeaveFFIException(this.code, this.message);\n");
     out.push_str("  @override\n");
-    out.push_str("  String toString() => 'WeaveFFIException($code): $message';\n");
+    out.push_str("  String toString() => '$runtimeType($code): $message';\n");
     out.push_str("}\n\n");
 
     out.push_str("void _checkError(Pointer<_WeaveFFIError> err) {\n");
@@ -937,7 +985,12 @@ fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
         out.push_str("final Map<int, NativeCallable> _listenerCallables = {};\n");
     }
 
+    // Canonical member order per module: error domain, enums, structs,
+    // interfaces, callbacks, listeners, functions.
     for module in &model.modules {
+        if let Some(eb) = module.error.as_ref().filter(|e| e.declared_here) {
+            render_error(&mut out, module, eb);
+        }
         for e in &module.enums {
             render_enum(&mut out, e);
         }
@@ -947,20 +1000,238 @@ fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
                 render_dart_builder(&mut out, s);
             }
         }
+        for i in &module.interfaces {
+            render_interface(&mut out, module, i);
+        }
         for cb in &module.callbacks {
             render_callback_typedef(&mut out, cb);
         }
         for l in &module.listeners {
-            render_listener(&mut out, module, l);
+            render_listener(&mut out, module, l, config.strip_module_prefix);
         }
         for f in &module.functions {
-            render_function(&mut out, f);
+            render_function(&mut out, module, f, config.strip_module_prefix);
         }
     }
 
     out.push('\n');
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, "weaveffi.dart"));
     out
+}
+
+/// The Dart exception class named by an error domain or one of its codes: the
+/// PascalCase name with a trailing `Error` swapped for `Exception`, so
+/// `KvError` becomes `KvException` and a code `IoError` becomes `IoException`.
+fn dart_exception_name(raw: &str) -> String {
+    errors::exception_type_name(raw)
+}
+
+/// Escape a string for embedding in a single-quoted Dart literal.
+fn dart_str_literal(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('$', "\\$")
+}
+
+/// Error-reporting context for one wrapper: which check helper guards its
+/// out-err slot and which exception its async completion path constructs.
+#[derive(Clone, Copy)]
+struct ErrCtx<'a> {
+    /// `true` when the wrapper surfaces typed domain errors (`throws: true`).
+    throws: bool,
+    /// The domain exception class in effect (`KvException` names `_checkKvException`
+    /// and `_mapKvException`); `None` when no error domain is in scope.
+    exception: Option<&'a str>,
+}
+
+impl<'a> ErrCtx<'a> {
+    /// The domain exception this wrapper throws, or `None` for a non-throwing
+    /// wrapper (which reports every failure as the generic brand exception).
+    fn thrown_exception(&self) -> Option<&'a str> {
+        self.exception.filter(|_| self.throws)
+    }
+
+    /// The statement checking the wrapper's `err` slot after a call.
+    fn check_stmt(&self) -> String {
+        match self.thrown_exception() {
+            Some(exc) => format!("_check{exc}(err);"),
+            None => "_checkError(err);".to_string(),
+        }
+    }
+
+    /// The expression building the exception for an async completion's
+    /// already-captured `code`/`msg` locals.
+    fn map_expr(&self) -> String {
+        match self.thrown_exception() {
+            Some(exc) => format!("_map{exc}(code, msg)"),
+            None => "WeaveFFIException(code, msg)".to_string(),
+        }
+    }
+}
+
+/// Render one module's declared error domain: the domain exception extending
+/// the generic [`errors::EXCEPTION_BRAND`], one exception subclass per code
+/// carrying its stable code and default message, and the `_map`/`_check`
+/// helpers that throwing wrappers route their out-err slots through. Unknown
+/// codes (panics, marshalling failures) fall back to the generic exception.
+fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
+    let exc = dart_exception_name(&eb.type_name);
+    let brand = errors::EXCEPTION_BRAND;
+
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    w.line(format!(
+        "/// Typed error domain `{}` declared by module `{}`.",
+        eb.name, module.path
+    ));
+    w.block(format!("class {exc} extends {brand} {{"), "}", |w| {
+        w.line(format!("{exc}(super.code, super.message);"));
+    });
+
+    for c in &eb.codes {
+        let class = dart_exception_name(&c.name);
+        let message = dart_str_literal(&c.message);
+        w.blank();
+        let doc = c.doc.clone().or_else(|| Some(c.message.clone()));
+        {
+            let mut d = String::new();
+            emit_doc(&mut d, &doc, "");
+            w.raw(d);
+        }
+        w.block(format!("class {class} extends {exc} {{"), "}", |w| {
+            w.line(format!(
+                "{class}([String message = '{message}']) : super({}, message);",
+                c.value
+            ));
+        });
+    }
+
+    w.blank();
+    w.line(format!("{brand} _map{exc}(int code, String message) {{"));
+    w.scope(|w| {
+        w.block("switch (code) {", "}", |w| {
+            for c in &eb.codes {
+                w.line(format!("case {}:", c.value));
+                w.scope(|w| {
+                    w.line(format!("return {}(message);", dart_exception_name(&c.name)));
+                });
+            }
+            w.line("default:");
+            w.scope(|w| {
+                w.line(format!("return {brand}(code, message);"));
+            });
+        });
+    });
+    w.line("}");
+
+    w.blank();
+    w.block(
+        format!("void _check{exc}(Pointer<_WeaveFFIError> err) {{"),
+        "}",
+        |w| {
+            w.block("if (err.ref.code != 0) {", "}", |w| {
+                w.line("final code = err.ref.code;");
+                w.line("final msg = err.ref.message.toDartString();");
+                w.line("_weaveffiErrorClear(err);");
+                w.line(format!("throw _map{exc}(code, msg);"));
+            });
+        },
+    );
+    out.push_str(&w.finish());
+}
+
+/// The [`ErrCtx`] for one callable of `module`: its own `throws` flag paired
+/// with the exception class of the domain in effect (own or inherited).
+fn err_ctx<'a>(f: &FnBinding, exception: Option<&'a str>) -> ErrCtx<'a> {
+    ErrCtx {
+        throws: f.throws,
+        exception,
+    }
+}
+
+/// Render one interface as an opaque-object wrapper class, mirroring the Dart
+/// struct wrapper: it owns the C handle behind a private `_handle`, frees it
+/// once in `dispose()` via the interface's destroy symbol, and exposes the
+/// canonical `new` constructor as an unnamed factory (`Store(...)`), every
+/// other constructor as a named factory (`Store.open(...)`), instance methods
+/// that pass `_handle` as the implicit leading FFI argument, and statics as
+/// `static` methods. Member FFI typedefs and lookups stay at file scope.
+fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding) {
+    let class_name = i.name.to_upper_camel_case();
+    emit_typedef_and_lookup(
+        out,
+        &i.destroy_symbol,
+        "Pointer<Void>",
+        "Pointer<Void>",
+        "Void",
+        "void",
+    );
+
+    let exc = module
+        .error
+        .as_ref()
+        .map(|e| dart_exception_name(&e.type_name));
+
+    // Members render exactly like free functions (depth 0), with the lookups
+    // going to file scope and the declarations collected for the class body.
+    let mut members = String::new();
+    for c in &i.constructors {
+        let kind = DartDecl::Factory {
+            class_name: &class_name,
+            named: c.name != "new",
+        };
+        render_callable(
+            out,
+            &mut members,
+            c,
+            &kind,
+            &c.name.to_lower_camel_case(),
+            err_ctx(c, exc.as_deref()),
+        );
+    }
+    for m in &i.methods {
+        render_callable(
+            out,
+            &mut members,
+            m,
+            &DartDecl::Method,
+            &m.name.to_lower_camel_case(),
+            err_ctx(m, exc.as_deref()),
+        );
+    }
+    for s in &i.statics {
+        render_callable(
+            out,
+            &mut members,
+            s,
+            &DartDecl::Static,
+            &s.name.to_lower_camel_case(),
+            err_ctx(s, exc.as_deref()),
+        );
+    }
+
+    let mut w = CodeWriter::two_space();
+    w.blank();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &i.doc, "");
+        w.raw(d);
+    }
+    w.block(format!("class {class_name} {{"), "}", |w| {
+        w.line("final Pointer<Void> _handle;");
+        w.line(format!("{class_name}._(this._handle);"));
+        w.blank();
+        w.line("/// Releases the native object reference.");
+        w.block("void dispose() {", "}", |w| {
+            w.line(format!(
+                "_{}(_handle);",
+                i.destroy_symbol.to_lower_camel_case()
+            ));
+        });
+        // Reindent the depth-0 member declarations into the class body.
+        w.block_raw(&members);
+    });
+    out.push_str(&w.finish());
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
@@ -1482,12 +1753,74 @@ fn emit_rich_variant_factory(out: &mut String, class_name: &str, v: &RichVariant
     out.push_str(&w.finish());
 }
 
-fn render_function(out: &mut String, f: &FnBinding) {
+/// How one rendered wrapper is declared in Dart source: a top-level function,
+/// or a member (method, static, or factory constructor) of an interface class.
+enum DartDecl<'a> {
+    /// A top-level free function.
+    TopLevel,
+    /// An instance method of an interface class: the FFI call passes the
+    /// wrapper's `_handle` as the implicit leading argument.
+    Method,
+    /// A `static` method of an interface class.
+    Static,
+    /// A `factory` constructor of the interface class. `named` is `false` for
+    /// the canonical `new` constructor (`factory Store(...)`) and `true` for
+    /// every other constructor (`factory Store.open(...)`).
+    Factory { class_name: &'a str, named: bool },
+}
+
+impl DartDecl<'_> {
+    /// The declaration's opening line (through the `{`). `ret` is the public
+    /// return type, already wrapped in `Future<...>` for an async member.
+    fn open_line(&self, ret: &str, name: &str, params: &str) -> String {
+        match self {
+            DartDecl::TopLevel | DartDecl::Method => format!("{ret} {name}({params}) {{"),
+            DartDecl::Static => format!("static {ret} {name}({params}) {{"),
+            DartDecl::Factory {
+                class_name,
+                named: false,
+            } => format!("factory {class_name}({params}) {{"),
+            DartDecl::Factory {
+                class_name,
+                named: true,
+            } => format!("factory {class_name}.{name}({params}) {{"),
+        }
+    }
+}
+
+fn render_function(out: &mut String, module: &ModuleBinding, f: &FnBinding, strip: bool) {
+    let name = wrapper_name(&module.path, &f.name, strip).to_lower_camel_case();
+    let exc = module
+        .error
+        .as_ref()
+        .map(|e| dart_exception_name(&e.type_name));
+    let mut decl = String::new();
+    render_callable(
+        out,
+        &mut decl,
+        f,
+        &DartDecl::TopLevel,
+        &name,
+        err_ctx(f, exc.as_deref()),
+    );
+    out.push_str(&decl);
+}
+
+/// Render one callable: its FFI typedefs and lookups into `lookups` (always
+/// top-level) and its Dart wrapper declaration into `decl` (top-level for a
+/// free function, spliced into the class body for an interface member).
+fn render_callable(
+    lookups: &mut String,
+    decl: &mut String,
+    f: &FnBinding,
+    kind: &DartDecl,
+    name: &str,
+    err: ErrCtx,
+) {
     // `c_base` is the prefixed `{prefix}_{module}_{name}` symbol the shared
     // BindingModel already computed; the async/iterator suffixing matches the C
     // ABI by construction.
     let c_sym = f.c_base.as_str();
-    let wrapper_name = f.name.to_lower_camel_case();
     let pub_ret = f.ret.as_ref().map_or("void".into(), dart_type);
     let wrapper_params: Vec<String> = f
         .params
@@ -1496,15 +1829,30 @@ fn render_function(out: &mut String, f: &FnBinding) {
         .collect();
 
     if f.is_async {
-        render_async_function(out, c_sym, f, &wrapper_name, &pub_ret, &wrapper_params);
+        render_async_function(
+            lookups,
+            decl,
+            c_sym,
+            f,
+            kind,
+            name,
+            &pub_ret,
+            &wrapper_params,
+            err,
+        );
         return;
     }
 
     // Each input parameter expands to its ABI slots (bytes/list/map fan out to
     // `(ptr, len)` / `(keys, vals, len)`); a complex return adds its callee-
-    // allocated out-params; the trailing error slot closes the signature.
+    // allocated out-params; the trailing error slot closes the signature. An
+    // instance method's `AbiFn` carries an implicit leading `self` pointer.
     let mut native_params: Vec<String> = Vec::new();
     let mut dart_params: Vec<String> = Vec::new();
+    if f.has_self {
+        native_params.push("Pointer<Void>".into());
+        dart_params.push("Pointer<Void>".into());
+    }
     for p in &f.params {
         for (n, d) in input_slots(&p.ty) {
             native_params.push(n);
@@ -1526,7 +1874,7 @@ fn render_function(out: &mut String, f: &FnBinding) {
     };
 
     emit_typedef_and_lookup(
-        out,
+        lookups,
         c_sym,
         &native_params.join(", "),
         &dart_params.join(", "),
@@ -1536,31 +1884,40 @@ fn render_function(out: &mut String, f: &FnBinding) {
 
     // Iterator-returning functions also bind the element `next`/`destroy` symbols.
     if let CallShape::Iterator(ib) = &f.shape {
-        emit_iter_lookups(out, ib);
+        emit_iter_lookups(lookups, ib);
     }
 
     let mut w = CodeWriter::two_space();
     w.blank();
+    emit_wrapper_doc(&mut w, f, err);
+    w.line(kind.open_line(&pub_ret, name, &wrapper_params.join(", ")));
+    {
+        let mut body = String::new();
+        emit_function_body(&mut body, f, c_sym, err);
+        w.raw(body);
+    }
+    w.line("}");
+    decl.push_str(&w.finish());
+}
+
+/// Emit a wrapper's doc comment, the typed-exception note for a throwing
+/// callable, and its `@Deprecated` annotation when present.
+fn emit_wrapper_doc(w: &mut CodeWriter, f: &FnBinding, err: ErrCtx) {
     {
         let mut d = String::new();
         emit_doc(&mut d, &f.doc, "");
         w.raw(d);
     }
+    if let Some(exc) = err.thrown_exception() {
+        if f.doc.is_some() {
+            w.line("///");
+        }
+        w.line(format!("/// Throws [{exc}] on domain errors."));
+    }
     if let Some(msg) = &f.deprecated {
         let escaped = msg.replace('\'', "\\'");
         w.line(format!("@Deprecated('{escaped}')"));
     }
-    w.line(format!(
-        "{pub_ret} {wrapper_name}({}) {{",
-        wrapper_params.join(", ")
-    ));
-    {
-        let mut body = String::new();
-        emit_function_body(&mut body, f, c_sym);
-        w.raw(body);
-    }
-    w.line("}");
-    out.push_str(&w.finish());
 }
 
 /// The native FFI typedef for a module-level callback declaration, shared by
@@ -1610,7 +1967,7 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
             format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({len}).toList()")
         }
         // Borrowed for the duration of the callback: do not dispose().
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
             format!("{}._({n0})", local_type_name(name).to_upper_camel_case())
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -1621,10 +1978,12 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
                 let len = p.abi[1].name.to_lower_camel_case();
                 format!("{n0} == nullptr ? null : {n0}.asTypedList({len}).toList()")
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => format!(
-                "{n0} == nullptr ? null : {}._({n0})",
-                local_type_name(name).to_upper_camel_case()
-            ),
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+                format!(
+                    "{n0} == nullptr ? null : {}._({n0})",
+                    local_type_name(name).to_upper_camel_case()
+                )
+            }
             TypeRef::Bool => format!("{n0} == nullptr ? null : {n0}.value != 0"),
             TypeRef::Enum(name) => format!(
                 "{n0} == nullptr ? null : {}.fromValue({n0}.value)",
@@ -1657,13 +2016,15 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
 /// `isolateLocal` NativeCallable: WeaveFFI listeners fire synchronously on the
 /// thread calling the producer API, so arguments are converted inside the
 /// borrow window (a `.listener` callable would read freed pointers later).
-fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding) {
+fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding, strip: bool) {
     let Some(cb) = m.callback(&l.event_callback) else {
         unreachable!("validation guarantees the listener's callback exists");
     };
     let cb_typedef = format!("_NativeCb_{}", cb.c_fn_type);
-    let register_name = format!("register_{}", l.name).to_lower_camel_case();
-    let unregister_name = format!("unregister_{}", l.name).to_lower_camel_case();
+    let register_name =
+        wrapper_name(&m.path, &format!("register_{}", l.name), strip).to_lower_camel_case();
+    let unregister_name =
+        wrapper_name(&m.path, &format!("unregister_{}", l.name), strip).to_lower_camel_case();
 
     emit_typedef_and_lookup(
         out,
@@ -1762,7 +2123,7 @@ fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static s
                 TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => "Int64",
                 TypeRef::F64 => "Double",
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
-                TypeRef::Struct(_) => "Pointer<Void>",
+                TypeRef::Struct(_) | TypeRef::Interface(_) => "Pointer<Void>",
                 _ => "Pointer<Void>",
             };
             let d: &'static str = match t {
@@ -1775,7 +2136,7 @@ fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static s
                 | TypeRef::TypedHandle(_) => "int",
                 TypeRef::F64 => "double",
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
-                TypeRef::Struct(_) => "Pointer<Void>",
+                TypeRef::Struct(_) | TypeRef::Interface(_) => "Pointer<Void>",
                 _ => "Pointer<Void>",
             };
             (n, d)
@@ -1783,13 +2144,20 @@ fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static s
     }
 }
 
+/// Render one async callable: its callback typedef and launcher lookup into
+/// `lookups`, and its `Future`-returning wrapper into `decl`. A method's
+/// launcher carries the implicit leading `self` pointer.
+#[allow(clippy::too_many_arguments)]
 fn render_async_function(
-    out: &mut String,
+    lookups: &mut String,
+    decl: &mut String,
     c_sym: &str,
     f: &FnBinding,
-    wrapper_name: &str,
+    kind: &DartDecl,
+    name: &str,
     pub_ret: &str,
     wrapper_params: &[String],
+    err: ErrCtx,
 ) {
     let cb_extras = async_cb_extra_params(f.ret.as_ref());
     let cb_native_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
@@ -1798,19 +2166,26 @@ fn render_async_function(
         .collect();
 
     let cb_typedef = format!("_NativeAsyncCb_{c_sym}");
-    out.push_str(&format!(
+    lookups.push_str(&format!(
         "\ntypedef {cb_typedef} = Void Function({});\n",
         cb_native_params.join(", ")
     ));
 
     let async_sym = format!("{c_sym}_async");
-    let mut native_params: Vec<String> = f.params.iter().map(|p| native_ffi_type(&p.ty)).collect();
+    let self_slot = if f.has_self {
+        vec!["Pointer<Void>".to_string()]
+    } else {
+        vec![]
+    };
+    let mut native_params: Vec<String> = self_slot.clone();
+    native_params.extend(f.params.iter().map(|p| native_ffi_type(&p.ty)));
     if f.cancellable {
         native_params.push("Pointer<Void>".into());
     }
     native_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
     native_params.push("Pointer<Void>".into());
-    let mut dart_params: Vec<String> = f.params.iter().map(|p| dart_ffi_type(&p.ty)).collect();
+    let mut dart_params: Vec<String> = self_slot;
+    dart_params.extend(f.params.iter().map(|p| dart_ffi_type(&p.ty)));
     if f.cancellable {
         dart_params.push("Pointer<Void>".into());
     }
@@ -1818,7 +2193,7 @@ fn render_async_function(
     dart_params.push("Pointer<Void>".into());
 
     emit_typedef_and_lookup(
-        out,
+        lookups,
         &async_sym,
         &native_params.join(", "),
         &dart_params.join(", "),
@@ -1866,13 +2241,18 @@ fn render_async_function(
         .collect();
 
     let mut call_args: Vec<String> = Vec::new();
+    if f.has_self {
+        call_args.push("_handle".into());
+    }
     for p in &f.params {
         let pname = p.name.to_lower_camel_case();
         call_args.push(match &p.ty {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{pname}Ptr"),
             TypeRef::Bool => format!("{pname} ? 1 : 0"),
             TypeRef::Enum(_) => format!("{pname}.value"),
-            TypeRef::TypedHandle(_) | TypeRef::Struct(_) => format!("{pname}._handle"),
+            TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+                format!("{pname}._handle")
+            }
             _ => pname,
         });
     }
@@ -1889,19 +2269,12 @@ fn render_async_function(
 
     let mut w = CodeWriter::two_space();
     w.blank();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &f.doc, "");
-        w.raw(d);
-    }
-    if let Some(msg) = &f.deprecated {
-        let escaped = msg.replace('\'', "\\'");
-        w.line(format!("@Deprecated('{escaped}')"));
-    }
+    emit_wrapper_doc(&mut w, f, err);
     w.block(
-        format!(
-            "Future<{pub_ret}> {wrapper_name}({}) {{",
-            wrapper_params.join(", ")
+        kind.open_line(
+            &format!("Future<{pub_ret}>"),
+            name,
+            &wrapper_params.join(", "),
         ),
         "}",
         |w| {
@@ -1922,7 +2295,7 @@ fn render_async_function(
                         w.line("final code = err.ref.code;");
                         w.line("final msg = err.ref.message.toDartString();");
                         w.line("_weaveffiErrorClear(err);");
-                        w.line("completer.completeError(WeaveFFIException(code, msg));");
+                        w.line(format!("completer.completeError({});", err.map_expr()));
                         w.line("return;");
                     });
                     w.line("}");
@@ -1965,7 +2338,7 @@ fn render_async_function(
             }
         },
     );
-    out.push_str(&w.finish());
+    decl.push_str(&w.finish());
 }
 
 fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
@@ -1981,11 +2354,7 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("completer.complete({n}.fromValue(result));"));
         }
-        Some(TypeRef::Struct(name)) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line(format!("completer.complete({n}._(result));"));
-        }
-        Some(TypeRef::TypedHandle(name)) => {
+        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name)) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("completer.complete({n}._(result));"));
         }
@@ -2004,19 +2373,7 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
                 });
                 w.line("}");
             }
-            TypeRef::Struct(name) => {
-                let n = local_type_name(name).to_upper_camel_case();
-                w.line("if (result == nullptr) {");
-                w.scope(|w| {
-                    w.line("completer.complete(null);");
-                });
-                w.line("} else {");
-                w.scope(|w| {
-                    w.line(format!("completer.complete({n}._(result));"));
-                });
-                w.line("}");
-            }
-            TypeRef::TypedHandle(name) => {
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
                 w.line("if (result == nullptr) {");
                 w.scope(|w| {
@@ -2039,14 +2396,17 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
     out.push_str(&w.finish());
 }
 
-fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str) {
+fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx) {
     if let CallShape::Iterator(ib) = &f.shape {
-        emit_iterator_body(out, f, c_sym, ib);
+        emit_iterator_body(out, f, c_sym, ib, err);
         return;
     }
 
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
+    if f.has_self {
+        call_args.push("_handle".into());
+    }
     let mut staging = String::new();
     for p in &f.params {
         let args = emit_input(
@@ -2082,7 +2442,7 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str) {
         } else {
             w.line(format!("final result = _{var}({args});"));
         }
-        w.line("_checkError(err);");
+        w.line(err.check_stmt());
         w.raw(&dec);
     });
     w.line("} finally {");
@@ -2117,9 +2477,18 @@ fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
 }
 
 /// Launch the iterator, then drain it via `next`/`destroy` into a `List<T>`.
-fn emit_iterator_body(out: &mut String, f: &FnBinding, c_sym: &str, ib: &IteratorBinding) {
+fn emit_iterator_body(
+    out: &mut String,
+    f: &FnBinding,
+    c_sym: &str,
+    ib: &IteratorBinding,
+    err: ErrCtx,
+) {
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
+    if f.has_self {
+        call_args.push("_handle".into());
+    }
     let mut staging = String::new();
     for p in &f.params {
         let args = emit_input(
@@ -2143,7 +2512,7 @@ fn emit_iterator_body(out: &mut String, f: &FnBinding, c_sym: &str, ib: &Iterato
     w.line("try {");
     w.scope(|w| {
         w.line(format!("final iter = _{var}({});", call_args.join(", ")));
-        w.line("_checkError(err);");
+        w.line(err.check_stmt());
         w.line(format!("final items = <{dt}>[];"));
         w.line(format!(
             "final outItem = calloc<{}>();",
@@ -2154,11 +2523,11 @@ fn emit_iterator_body(out: &mut String, f: &FnBinding, c_sym: &str, ib: &Iterato
             ib.next.symbol.to_lower_camel_case()
         ));
         w.scope(|w| {
-            w.line("_checkError(err);");
+            w.line(err.check_stmt());
             w.line(format!("items.add({});", read_value("outItem.value", elem)));
         });
         w.line("}");
-        w.line("_checkError(err);");
+        w.line(err.check_stmt());
         w.line("calloc.free(outItem);");
         w.line(format!(
             "_{}(iter);",
@@ -2185,14 +2554,7 @@ fn emit_list_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
     let dt = dart_type(inner);
     w.line(format!("if (result == nullptr || n == 0) return <{dt}>[];"));
     match inner {
-        TypeRef::Struct(name) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line("final arr = result.cast<Pointer<Void>>();");
-            w.line(format!(
-                "return List<{n}>.generate(n, (i) => {n}._(arr[i]));"
-            ));
-        }
-        TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line("final arr = result.cast<Pointer<Void>>();");
             w.line(format!(
@@ -2244,11 +2606,7 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("return {n}.fromValue(result);"));
         }
-        TypeRef::Struct(name) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line(format!("return {n}._(result);"));
-        }
-        TypeRef::TypedHandle(name) => {
+        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("return {n}._(result);"));
         }
@@ -2257,7 +2615,7 @@ fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
                 w.line("if (result == nullptr) return null;");
                 w.line("return result.toDartString();");
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
                 w.line("if (result == nullptr) return null;");
                 w.line(format!("return {n}._(result);"));
@@ -2300,6 +2658,7 @@ mod tests {
             params: vec![],
             returns: None,
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2347,7 +2706,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules,
             generators: None,
             package: None,
@@ -2362,9 +2721,23 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }
+    }
+
+    /// Build the binding model and render the module exactly as the driver
+    /// does in production before calling [`LanguageBackend::files`]. Shadows
+    /// the production three-argument renderer for the test suite.
+    fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
+        let model = BindingModel::build(api, prefix);
+        let config = DartConfig {
+            prefix: Some(prefix.to_string()),
+            input_basename: Some(input_basename.to_string()),
+            ..DartConfig::default()
+        };
+        super::render_dart_module(api, &model, &config)
     }
 
     #[test]
@@ -2459,6 +2832,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2589,6 +2963,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2655,6 +3030,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2689,6 +3065,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Enum("Color".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2721,6 +3098,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2764,6 +3142,7 @@ mod tests {
             params: vec![],
             returns: None,
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2795,6 +3174,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2804,6 +3184,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2839,6 +3220,7 @@ mod tests {
             }],
             returns: Some(TypeRef::Bool),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -2866,6 +3248,7 @@ mod tests {
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
+            throws: false,
             r#async: true,
             cancellable: false,
             deprecated: None,
@@ -2907,6 +3290,7 @@ mod tests {
             }],
             returns: Some(TypeRef::StringUtf8),
             doc: None,
+            throws: false,
             r#async: true,
             cancellable: false,
             deprecated: None,
@@ -2940,6 +3324,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -2949,6 +3334,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -2971,6 +3357,7 @@ mod tests {
             params: vec![],
             returns: Some(TypeRef::Handle),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -3041,6 +3428,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3050,6 +3438,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3083,6 +3472,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3092,6 +3482,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3119,6 +3510,7 @@ mod tests {
                     Box::new(TypeRef::I32),
                 )),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3128,6 +3520,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3154,6 +3547,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::TypedHandle("Session".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3169,6 +3563,7 @@ mod tests {
                     }],
                     returns: None,
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3179,6 +3574,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3237,6 +3633,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Handle),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3252,6 +3649,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Struct("Contact".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3262,6 +3660,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3277,6 +3676,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::Bool),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3287,6 +3687,7 @@ mod tests {
                     params: vec![],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3356,6 +3757,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3476,11 +3878,13 @@ mod tests {
                 }],
                 returns: Some(TypeRef::Struct("Contact".into())),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
                 since: None,
             }],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3530,6 +3934,7 @@ mod tests {
                     "Contact".into(),
                 )))),
                 doc: None,
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3539,6 +3944,7 @@ mod tests {
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }]);
@@ -3575,6 +3981,7 @@ mod tests {
                 }],
                 returns: Some(TypeRef::I32),
                 doc: Some("Performs a thing.".into()),
+                throws: false,
                 r#async: false,
                 cancellable: false,
                 deprecated: None,
@@ -3603,6 +4010,7 @@ mod tests {
             }],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }])
@@ -3650,6 +4058,7 @@ mod tests {
                     }],
                     returns: Some(TypeRef::StringUtf8),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3673,6 +4082,7 @@ mod tests {
                     ],
                     returns: Some(TypeRef::Struct("Shape".into())),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
@@ -3763,6 +4173,7 @@ mod tests {
             ],
             callbacks: vec![],
             listeners: vec![],
+            interfaces: vec![],
             errors: None,
             modules: vec![],
         }])
@@ -3924,6 +4335,496 @@ mod tests {
         assert!(
             dart.contains("return Shape._(result);"),
             "a rich-enum return must wrap the opaque handle: {dart}"
+        );
+    }
+
+    /// A `kv` module with a declared error domain and a `Store` interface
+    /// exercising every member kind: a plain constructor named `new`, a
+    /// throwing named constructor, throwing and non-throwing methods, an
+    /// async throwing method, an iterator method, and a static.
+    fn store_api() -> Api {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain, InterfaceDef};
+        fn f(
+            name: &str,
+            params: Vec<Param>,
+            returns: Option<TypeRef>,
+            throws: bool,
+            is_async: bool,
+        ) -> Function {
+            Function {
+                name: name.into(),
+                params,
+                returns,
+                doc: None,
+                throws,
+                r#async: is_async,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }
+        }
+        fn p(name: &str, ty: TypeRef) -> Param {
+            Param {
+                name: name.into(),
+                ty,
+                mutable: false,
+                doc: None,
+            }
+        }
+        make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![f(
+                "inspect",
+                vec![p("store", TypeRef::Interface("Store".into()))],
+                Some(TypeRef::I64),
+                false,
+                false,
+            )],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: Some("A key-value store.".into()),
+                constructors: vec![
+                    f("new", vec![p("capacity", TypeRef::I64)], None, false, false),
+                    f(
+                        "open",
+                        vec![p("path", TypeRef::StringUtf8)],
+                        None,
+                        true,
+                        false,
+                    ),
+                ],
+                methods: vec![
+                    f(
+                        "put",
+                        vec![
+                            p("key", TypeRef::StringUtf8),
+                            p("value", TypeRef::StringUtf8),
+                        ],
+                        None,
+                        true,
+                        false,
+                    ),
+                    f("count", vec![], Some(TypeRef::I64), false, false),
+                    f("compact", vec![], Some(TypeRef::I64), true, true),
+                    f(
+                        "list_keys",
+                        vec![],
+                        Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                        true,
+                        false,
+                    ),
+                ],
+                statics: vec![f(
+                    "default_capacity",
+                    vec![],
+                    Some(TypeRef::I64),
+                    false,
+                    false,
+                )],
+            }],
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KeyNotFound".into(),
+                        code: 1001,
+                        message: "key not found".into(),
+                        doc: None,
+                    },
+                    ErrorCode {
+                        name: "IoError".into(),
+                        code: 1004,
+                        message: "I/O failure".into(),
+                        doc: None,
+                    },
+                ],
+            }),
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn typed_exception_rendering() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        // The domain exception extends the generic brand exception.
+        assert!(
+            dart.contains("class KvException extends WeaveFFIException {"),
+            "missing domain exception: {dart}"
+        );
+        assert!(
+            dart.contains("KvException(super.code, super.message);"),
+            "domain exception must forward code and message: {dart}"
+        );
+        // One subclass per code, preloaded with its stable code and message.
+        assert!(
+            dart.contains("class KeyNotFoundException extends KvException {"),
+            "missing per-code subclass: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "KeyNotFoundException([String message = 'key not found']) : super(1001, message);"
+            ),
+            "per-code subclass must carry its code and default message: {dart}"
+        );
+        // A code already named `*Error` swaps the suffix rather than stacking.
+        assert!(
+            dart.contains("class IoException extends KvException {")
+                && !dart.contains("IoErrorException"),
+            "code exception must swap the Error suffix: {dart}"
+        );
+        // The mapper covers each code and falls back to the generic exception.
+        assert!(
+            dart.contains("WeaveFFIException _mapKvException(int code, String message) {"),
+            "missing domain mapper: {dart}"
+        );
+        assert!(
+            dart.contains("case 1001:") && dart.contains("return KeyNotFoundException(message);"),
+            "mapper must build the per-code subclass: {dart}"
+        );
+        assert!(
+            dart.contains("default:") && dart.contains("return WeaveFFIException(code, message);"),
+            "mapper must fall back to the generic exception: {dart}"
+        );
+        // The per-domain check helper throws through the mapper.
+        assert!(
+            dart.contains("void _checkKvException(Pointer<_WeaveFFIError> err) {")
+                && dart.contains("throw _mapKvException(code, msg);"),
+            "missing domain check helper: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_emits_wrapper_class_with_dispose() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("/// A key-value store.\nclass Store {"),
+            "missing documented interface class: {dart}"
+        );
+        assert!(
+            dart.contains("final Pointer<Void> _handle;")
+                && dart.contains("Store._(this._handle);"),
+            "missing opaque handle plumbing: {dart}"
+        );
+        let dispose = dart
+            .find("class Store {")
+            .map(|i| &dart[i..])
+            .expect("class body");
+        assert!(
+            dispose.contains("void dispose() {\n    _weaveffiKvStoreDestroy(_handle);"),
+            "dispose must call the interface destroy symbol: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_kv_Store_destroy'"),
+            "destroy lookup must bind the C symbol: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_ctor_new_is_unnamed_factory() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("factory Store(int capacity) {"),
+            "missing unnamed factory for ctor `new`: {dart}"
+        );
+        let body = &dart[dart.find("factory Store(int capacity)").expect("ctor body")..];
+        assert!(
+            body.contains("_weaveffiKvStoreNew(capacity, err)"),
+            "ctor must call its member symbol: {dart}"
+        );
+        // Non-throwing ctor still traps through the generic check.
+        assert!(
+            body.contains("_checkError(err);"),
+            "plain ctor must use the generic check: {dart}"
+        );
+        assert!(
+            body.contains("return Store._(result);"),
+            "ctor must adopt the owned handle: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_secondary_ctor_is_named_factory() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("factory Store.open(String path) {"),
+            "missing named factory: {dart}"
+        );
+        let body = &dart[dart.find("factory Store.open(").expect("open body")..];
+        assert!(
+            body.contains("_weaveffiKvStoreOpen(pathPtr, err)"),
+            "named factory must call its member symbol: {dart}"
+        );
+        assert!(
+            body.contains("_checkKvException(err);"),
+            "throwing factory must use the domain check: {dart}"
+        );
+        assert!(
+            body.contains("return Store._(result);"),
+            "named factory must adopt the owned handle: {dart}"
+        );
+        // The throwing ctor documents the thrown domain exception.
+        assert!(
+            dart.contains("/// Throws [KvException] on domain errors.\n  factory Store.open("),
+            "throwing ctor must note the thrown type: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_methods_pass_self_handle() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        // Throwing instance method: `_handle` leads the C argument list.
+        assert!(
+            dart.contains("void put(String key, String value) {"),
+            "missing instance method: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiKvStorePut(_handle, keyPtr, valuePtr, err);"),
+            "method must pass _handle as the leading argument: {dart}"
+        );
+        let put_body = &dart[dart.find("void put(").expect("put body")..];
+        assert!(
+            put_body.contains("_checkKvException(err);"),
+            "throwing method must use the domain check: {dart}"
+        );
+        // Non-throwing method uses the generic check.
+        let count_body = &dart[dart.find("int count()").expect("count body")..];
+        assert!(
+            count_body.contains("_weaveffiKvStoreCount(_handle, err)")
+                && count_body.contains("_checkError(err);"),
+            "plain method must call with _handle and check generically: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_async_method_maps_typed_error() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("Future<int> compact() {"),
+            "missing async method: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "_weaveffiKvStoreCompactAsync(_handle, callable.nativeFunction, nullptr);"
+            ),
+            "async launcher must lead with _handle: {dart}"
+        );
+        assert!(
+            dart.contains("completer.completeError(_mapKvException(code, msg));"),
+            "async throwing method must complete with the typed exception: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_iterator_method_checks_domain() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("Iterable<String> listKeys() {"),
+            "missing iterator method: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiKvStoreListKeys(_handle, err)"),
+            "iterator launch must lead with _handle: {dart}"
+        );
+        let body = &dart[dart
+            .find("Iterable<String> listKeys()")
+            .expect("listKeys body")..];
+        assert!(
+            body.contains("_checkKvException(err);"),
+            "throwing iterator must drain through the domain check: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_static_is_static_method() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("static int defaultCapacity() {"),
+            "missing static method: {dart}"
+        );
+        let body = &dart[dart
+            .find("static int defaultCapacity()")
+            .expect("static body")..];
+        assert!(
+            body.contains("_weaveffiKvStoreDefaultCapacity(err)"),
+            "static must call its member symbol without a self slot: {dart}"
+        );
+    }
+
+    #[test]
+    fn interface_param_passes_borrowed_handle() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        // Free function taking the interface: the class is the Dart type and
+        // the call borrows its handle without wrapping or disposing.
+        assert!(
+            dart.contains("int inspect(Store store) {"),
+            "missing interface-typed param signature: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiKvInspect(store._handle, err)"),
+            "interface param must pass ._handle: {dart}"
+        );
+    }
+
+    #[test]
+    fn throws_split_on_free_functions() {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain};
+        let api = make_api(vec![Module {
+            name: "calc".into(),
+            functions: vec![
+                Function {
+                    name: "div".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    throws: true,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "add".into(),
+                    params: vec![
+                        Param {
+                            name: "a".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "b".into(),
+                            ty: TypeRef::I32,
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::I32),
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: Some(ErrorDomain {
+                name: "CalcError".into(),
+                codes: vec![ErrorCode {
+                    name: "DivisionByZero".into(),
+                    code: 1,
+                    message: "Division by zero".into(),
+                    doc: None,
+                }],
+            }),
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api, "weaveffi", "calc.yml");
+        // throws: true routes the slot through the domain check and says so.
+        let div_body = &dart[dart.find("int div(int a, int b)").expect("div body")..];
+        assert!(
+            div_body.contains("_checkCalcException(err);"),
+            "throwing fn must use the domain check: {dart}"
+        );
+        assert!(
+            dart.contains("/// Throws [CalcException] on domain errors.\nint div(int a, int b) {"),
+            "throwing fn must note the thrown type: {dart}"
+        );
+        // throws: false keeps the generic check for panics and marshalling.
+        let add_body = &dart[dart.find("int add(int a, int b)").expect("add body")..];
+        assert!(
+            add_body.contains("_checkError(err);"),
+            "plain fn must check generically: {dart}"
+        );
+        assert!(
+            !add_body[..add_body.find('}').unwrap_or(add_body.len())]
+                .contains("_checkCalcException"),
+            "plain fn must not use the domain check: {dart}"
+        );
+    }
+
+    #[test]
+    fn strip_module_prefix_defaults_to_true() {
+        assert!(
+            DartConfig::default().strip_module_prefix,
+            "stripping must be the default"
+        );
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("int inspect(Store store) {") && !dart.contains("int kvInspect("),
+            "default naming must strip the module prefix: {dart}"
+        );
+    }
+
+    /// Mirrors the `cli_dart.rs` expectations for `samples/contacts` by
+    /// rendering the sample directly; kept here because the CLI binary cannot
+    /// build while other generator crates are mid-overhaul.
+    #[test]
+    fn contacts_sample_renders_interface_and_domain() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest_dir).join("../../samples/contacts/contacts.yml");
+        let src = std::fs::read_to_string(path).expect("contacts sample readable");
+        let api = weaveffi_ir::parse::parse_api_str(&src, "yaml").expect("contacts sample parses");
+        let dart = render_dart_module(&api, "weaveffi", "contacts.yml");
+        assert!(
+            dart.contains("enum ContactType {"),
+            "missing ContactType enum: {dart}"
+        );
+        assert!(dart.contains("class Contact {"), "missing Contact: {dart}");
+        assert!(
+            dart.contains("class ContactBook {") && dart.contains("factory ContactBook() {"),
+            "missing ContactBook interface: {dart}"
+        );
+        assert!(
+            dart.contains("class ContactsException extends WeaveFFIException {"),
+            "missing ContactsException: {dart}"
+        );
+        assert!(
+            dart.contains("weaveffi_contacts_ContactBook_add"),
+            "missing ContactBook add member symbol: {dart}"
+        );
+    }
+
+    #[test]
+    fn strip_module_prefix_can_be_disabled() {
+        let api = store_api();
+        let model = BindingModel::build(&api, "weaveffi");
+        let config = DartConfig {
+            prefix: Some("weaveffi".into()),
+            input_basename: Some("kv.yml".into()),
+            strip_module_prefix: false,
+            ..DartConfig::default()
+        };
+        let dart = super::render_dart_module(&api, &model, &config);
+        assert!(
+            dart.contains("int kvInspect(Store store) {"),
+            "disabled stripping must keep the module prefix: {dart}"
+        );
+        // Interface members are namespaced by their class, never prefixed.
+        assert!(
+            dart.contains("factory Store.open(String path) {"),
+            "interface members must not gain a module prefix: {dart}"
         );
     }
 }

@@ -96,6 +96,77 @@ _listener_refs: Dict[int, object] = {}
 
 # === Module: kv ===
 
+class KvError(WeaveFFIError):
+    """Base exception for the `kv` module's error domain."""
+
+
+class KeyNotFound(KvError):
+    """No entry exists for the requested key"""
+
+    CODE = 1001
+
+    def __init__(self, message: str = "key not found") -> None:
+        super().__init__(1001, message)
+
+
+class Expired(KvError):
+    """The entry exists but its TTL has elapsed"""
+
+    CODE = 1002
+
+    def __init__(self, message: str = "entry expired") -> None:
+        super().__init__(1002, message)
+
+
+class StoreFull(KvError):
+    """The store has reached its capacity limit"""
+
+    CODE = 1003
+
+    def __init__(self, message: str = "store has reached capacity") -> None:
+        super().__init__(1003, message)
+
+
+class IoError(KvError):
+    """Underlying storage reported an I/O failure"""
+
+    CODE = 1004
+
+    def __init__(self, message: str = "I/O failure") -> None:
+        super().__init__(1004, message)
+
+
+KvError.KeyNotFound = KeyNotFound
+KvError.Expired = Expired
+KvError.StoreFull = StoreFull
+KvError.IoError = IoError
+
+
+_KV_ERROR_CODES: Dict[int, type] = {
+    1001: KeyNotFound,
+    1002: Expired,
+    1003: StoreFull,
+    1004: IoError,
+}
+
+
+def _kv_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the KvError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _KV_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_kv_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _kv_error_from(code, message)
+
+
 class EntryKind(IntEnum):
     """Persistence semantics applied to a stored entry"""
     # In-memory only; lost on close
@@ -104,30 +175,6 @@ class EntryKind(IntEnum):
     Persistent = 1
     # Persistent and encrypted at rest
     Encrypted = 2
-
-
-class Store:
-    """Opaque key-value store handle target type"""
-
-    def __init__(self, _ptr: int) -> None:
-        self._ptr = _ptr
-
-    def __del__(self) -> None:
-        if self._ptr is not None:
-            _lib.weaveffi_kv_Store_destroy.argtypes = [ctypes.c_void_p]
-            _lib.weaveffi_kv_Store_destroy.restype = None
-            _lib.weaveffi_kv_Store_destroy(self._ptr)
-            self._ptr = None
-
-    @property
-    def id(self) -> int:
-        """Internal store identifier"""
-        _fn = _lib.weaveffi_kv_Store_get_id
-        _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_int64
-        _result = _fn(self._ptr)
-        return _result
-
 
 
 class Entry:
@@ -299,16 +346,283 @@ class EntryBuilder:
         return Entry(_result)
 
 
+class _StoreListKeysIterator:
+    def __init__(self, ptr):
+        self._ptr = ptr
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        _next_fn = _lib.weaveffi_kv_Store_ListKeysIterator_next
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _next_fn.restype = ctypes.c_int32
+        _out_item = ctypes.c_char_p()
+        _err = _WeaveFFIErrorStruct()
+        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
+        _check_kv_error(_err)
+        if not _has:
+            self._done = True
+            self._destroy()
+            raise StopIteration
+        return _bytes_to_string(_out_item.value)
+
+    def _destroy(self):
+        if self._ptr is not None:
+            _destroy_fn = _lib.weaveffi_kv_Store_ListKeysIterator_destroy
+            _destroy_fn.argtypes = [ctypes.c_void_p]
+            _destroy_fn.restype = None
+            _destroy_fn(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        self._destroy()
+
+
+class Store:
+    """An in-memory key-value store owning its entries; destroying the object releases all of its state"""
+
+    @classmethod
+    def _from_ptr(cls, ptr) -> "Store":
+        _obj = cls.__new__(cls)
+        _obj._ptr = ptr
+        return _obj
+
+    def __init__(self, _ptr: int) -> None:
+        self._ptr = _ptr
+
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_kv_Store_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_kv_Store_destroy.restype = None
+            _lib.weaveffi_kv_Store_destroy(self._ptr)
+            self._ptr = None
+
+    @classmethod
+    def open(cls, path: str) -> "Store":
+        """Open (or create) a store backed by the given filesystem path
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_open
+        _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(_string_to_bytes(path), ctypes.byref(_err))
+        _check_kv_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return cls._from_ptr(_result)
+
+
+    def put(self, key: str, value: bytes, kind: "EntryKind", ttl_seconds: Optional[int]) -> bool:
+        """Insert or replace a value, returning true on success
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_put
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _value_arr = (ctypes.c_uint8 * len(value))(*value)
+        _ttl_seconds_c = ctypes.byref(ctypes.c_int64(ttl_seconds)) if ttl_seconds is not None else None
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _string_to_bytes(key), _value_arr, len(value), kind.value, _ttl_seconds_c, ctypes.byref(_err))
+        _check_kv_error(_err)
+        return bool(_result)
+
+
+    def get(self, key: str) -> Optional["Entry"]:
+        """Look up an entry by key; returns null if missing or expired
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_get
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _string_to_bytes(key), ctypes.byref(_err))
+        _check_kv_error(_err)
+        if _result is None:
+            return None
+        return Entry(_result)
+
+
+    def delete(self, key: str) -> bool:
+        """Remove the entry for the given key, returning true if it existed
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_delete
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _string_to_bytes(key), ctypes.byref(_err))
+        _check_kv_error(_err)
+        return bool(_result)
+
+
+    def list_keys(self, prefix: Optional[str]) -> Iterator[str]:
+        """Stream every key, optionally filtered by a prefix
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_list_keys
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _prefix_c = _string_to_bytes(prefix)
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _prefix_c, ctypes.byref(_err))
+        _check_kv_error(_err)
+        _next_fn = _lib.weaveffi_kv_Store_ListKeysIterator_next
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _next_fn.restype = ctypes.c_int32
+        _destroy_fn = _lib.weaveffi_kv_Store_ListKeysIterator_destroy
+        _destroy_fn.argtypes = [ctypes.c_void_p]
+        _destroy_fn.restype = None
+        _items = []
+        while True:
+            _out_item = ctypes.c_char_p()
+            _item_err = _WeaveFFIErrorStruct()
+            _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
+            _check_kv_error(_item_err)
+            if not _has:
+                break
+            _items.append(_bytes_to_string(_out_item.value))
+        _destroy_fn(_result)
+        return _items
+
+
+    def count(self) -> int:
+        """Return the number of live entries in the store
+        """
+        _fn = _lib.weaveffi_kv_Store_count
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int64
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, ctypes.byref(_err))
+        _check_error(_err)
+        return _result
+
+
+    def clear(self) -> None:
+        """Drop every entry from the store
+        """
+        _fn = _lib.weaveffi_kv_Store_clear
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = None
+        _err = _WeaveFFIErrorStruct()
+        _fn(self._ptr, ctypes.byref(_err))
+        _check_error(_err)
+
+
+    def _compact_sync(self) -> int:
+        """Reclaim space asynchronously; returns the number of bytes reclaimed
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_kv_Store_compact_async
+        _ev = threading.Event()
+        _state = {"err": None, "val": None}
+        def _cb_impl(context, err, result):
+            try:
+                if err and err.contents.code != 0:
+                    _code = err.contents.code
+                    _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
+                    _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+                    _state["err"] = _kv_error_from(_code, _msg)
+                else:
+                    _state["val"] = result
+            finally:
+                _ev.set()
+        _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_int64)
+        _cb = _cb_type(_cb_impl)
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
+        _fn.restype = None
+        _fn(self._ptr, None, _cb, None)
+        _ev.wait()
+        if _state["err"] is not None:
+            raise _state["err"]
+        return _state["val"]
+
+
+    async def compact(self) -> int:
+        """Reclaim space asynchronously; returns the number of bytes reclaimed
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        _loop = asyncio.get_event_loop()
+        return await _loop.run_in_executor(None, self._compact_sync)
+
+
+    def legacy_put(self, key: str, value: bytes) -> bool:
+        """Legacy single-shot put kept for compatibility
+
+        Raises
+        ------
+        KvError
+            If the call reports one of the domain's error codes.
+        """
+        import warnings
+        warnings.warn("use put() with explicit kind", DeprecationWarning, stacklevel=2)
+        _fn = _lib.weaveffi_kv_Store_legacy_put
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _value_arr = (ctypes.c_uint8 * len(value))(*value)
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, _string_to_bytes(key), _value_arr, len(value), ctypes.byref(_err))
+        _check_kv_error(_err)
+        return bool(_result)
+
+
+    @staticmethod
+    def default_capacity() -> int:
+        """The largest number of live entries one store will hold
+        """
+        _fn = _lib.weaveffi_kv_Store_default_capacity
+        _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int64
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(ctypes.byref(_err))
+        _check_error(_err)
+        return _result
+
+
+
 # Fires when an entry is evicted from the store
 # Callback type OnEvict: Callable[[str], None]
 _CFUNC_weaveffi_kv_OnEvict_fn = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
 
-def kv_register_eviction_listener(callback: Callable[[str], None]) -> int:
+def register_eviction_listener(callback: Callable[[str], None]) -> int:
     """
     Subscribe to per-key eviction notifications
 
-    Returns a subscription id for kv_unregister_eviction_listener().
+    Returns a subscription id for unregister_eviction_listener().
     """
     def _trampoline(key, _context):
         callback(_bytes_to_string(key))
@@ -321,216 +635,13 @@ def kv_register_eviction_listener(callback: Callable[[str], None]) -> int:
     return _listener_id
 
 
-def kv_unregister_eviction_listener(listener_id: int) -> None:
-    """Unregister a listener previously registered with kv_register_eviction_listener()."""
+def unregister_eviction_listener(listener_id: int) -> None:
+    """Unregister a listener previously registered with register_eviction_listener()."""
     _fn = _lib.weaveffi_kv_unregister_eviction_listener
     _fn.argtypes = [ctypes.c_uint64]
     _fn.restype = None
     _fn(ctypes.c_uint64(listener_id))
     _listener_refs.pop(listener_id, None)
-
-
-def kv_open_store(path: str) -> "Store":
-    """Open (or create) a store backed by the given filesystem path
-    """
-    _fn = _lib.weaveffi_kv_open_store
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(_string_to_bytes(path), ctypes.byref(_err))
-    _check_error(_err)
-    if _result is None:
-        raise WeaveFFIError(-1, "null pointer")
-    return Store(_result)
-
-
-def kv_close_store(store: "Store") -> None:
-    """Close the store and release all in-memory resources
-    """
-    _fn = _lib.weaveffi_kv_close_store
-    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = None
-    _err = _WeaveFFIErrorStruct()
-    _fn(store._ptr, ctypes.byref(_err))
-    _check_error(_err)
-
-
-def kv_put(store: "Store", key: str, value: bytes, kind: "EntryKind", ttl_seconds: Optional[int]) -> bool:
-    """Insert or replace a value, returning true on success
-    """
-    _fn = _lib.weaveffi_kv_put
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_int32, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _value_arr = (ctypes.c_uint8 * len(value))(*value)
-    _ttl_seconds_c = ctypes.byref(ctypes.c_int64(ttl_seconds)) if ttl_seconds is not None else None
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(store._ptr, _string_to_bytes(key), _value_arr, len(value), kind.value, _ttl_seconds_c, ctypes.byref(_err))
-    _check_error(_err)
-    return bool(_result)
-
-
-def kv_get(store: "Store", key: str) -> Optional["Entry"]:
-    """Look up an entry by key; returns null if missing or expired
-    """
-    _fn = _lib.weaveffi_kv_get
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(store._ptr, _string_to_bytes(key), ctypes.byref(_err))
-    _check_error(_err)
-    if _result is None:
-        return None
-    return Entry(_result)
-
-
-def kv_delete(store: "Store", key: str) -> bool:
-    """Remove the entry for the given key, returning true if it existed
-    """
-    _fn = _lib.weaveffi_kv_delete
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(store._ptr, _string_to_bytes(key), ctypes.byref(_err))
-    _check_error(_err)
-    return bool(_result)
-
-
-class _ListKeysIterator:
-    def __init__(self, ptr):
-        self._ptr = ptr
-        self._done = False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._done:
-            raise StopIteration
-        _next_fn = _lib.weaveffi_kv_ListKeysIterator_next
-        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
-        _next_fn.restype = ctypes.c_int32
-        _out_item = ctypes.c_char_p()
-        _err = _WeaveFFIErrorStruct()
-        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
-        _check_error(_err)
-        if not _has:
-            self._done = True
-            self._destroy()
-            raise StopIteration
-        return _bytes_to_string(_out_item.value)
-
-    def _destroy(self):
-        if self._ptr is not None:
-            _destroy_fn = _lib.weaveffi_kv_ListKeysIterator_destroy
-            _destroy_fn.argtypes = [ctypes.c_void_p]
-            _destroy_fn.restype = None
-            _destroy_fn(self._ptr)
-            self._ptr = None
-
-    def __del__(self):
-        self._destroy()
-
-
-def kv_list_keys(store: "Store", prefix: Optional[str]) -> Iterator[str]:
-    """Stream every key, optionally filtered by a prefix
-    """
-    _fn = _lib.weaveffi_kv_list_keys
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
-    _prefix_c = _string_to_bytes(prefix)
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(store._ptr, _prefix_c, ctypes.byref(_err))
-    _check_error(_err)
-    _next_fn = _lib.weaveffi_kv_ListKeysIterator_next
-    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _next_fn.restype = ctypes.c_int32
-    _destroy_fn = _lib.weaveffi_kv_ListKeysIterator_destroy
-    _destroy_fn.argtypes = [ctypes.c_void_p]
-    _destroy_fn.restype = None
-    _items = []
-    while True:
-        _out_item = ctypes.c_char_p()
-        _item_err = _WeaveFFIErrorStruct()
-        _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
-        _check_error(_item_err)
-        if not _has:
-            break
-        _items.append(_bytes_to_string(_out_item.value))
-    _destroy_fn(_result)
-    return _items
-
-
-def kv_count(store: "Store") -> int:
-    """Return the number of live entries in the store
-    """
-    _fn = _lib.weaveffi_kv_count
-    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int64
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(store._ptr, ctypes.byref(_err))
-    _check_error(_err)
-    return _result
-
-
-def kv_clear(store: "Store") -> None:
-    """Drop every entry from the store
-    """
-    _fn = _lib.weaveffi_kv_clear
-    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = None
-    _err = _WeaveFFIErrorStruct()
-    _fn(store._ptr, ctypes.byref(_err))
-    _check_error(_err)
-
-
-def _kv_compact_async_sync(store: "Store") -> int:
-    """Reclaim space asynchronously; returns the number of bytes reclaimed
-    """
-    _fn = _lib.weaveffi_kv_compact_async_async
-    _ev = threading.Event()
-    _state = {"err": None, "val": None}
-    def _cb_impl(context, err, result):
-        try:
-            if err and err.contents.code != 0:
-                _code = err.contents.code
-                _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
-                _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveFFIError(_code, _msg)
-            else:
-                _state["val"] = result
-        finally:
-            _ev.set()
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_int64)
-    _cb = _cb_type(_cb_impl)
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
-    _fn.restype = None
-    _fn(store._ptr, None, _cb, None)
-    _ev.wait()
-    if _state["err"] is not None:
-        raise _state["err"]
-    return _state["val"]
-
-
-async def kv_compact_async(store: "Store") -> int:
-    """Reclaim space asynchronously; returns the number of bytes reclaimed
-    """
-    _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _kv_compact_async_sync, store)
-
-
-def kv_legacy_put(store: "Store", key: str, value: bytes) -> bool:
-    """Legacy single-shot put kept for compatibility
-    """
-    import warnings
-    warnings.warn("use put() with explicit kind", DeprecationWarning, stacklevel=2)
-    _fn = _lib.weaveffi_kv_legacy_put
-    _fn.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_int32
-    _value_arr = (ctypes.c_uint8 * len(value))(*value)
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(store._ptr, _string_to_bytes(key), _value_arr, len(value), ctypes.byref(_err))
-    _check_error(_err)
-    return bool(_result)
 
 
 # === Module: kv_stats ===
@@ -579,15 +690,20 @@ class Stats:
 
 
 
-def kv_stats_get_stats(store: "Store") -> "Stats":
+def get_stats(store: "Store") -> "Stats":
     """Snapshot the current store statistics
+
+    Raises
+    ------
+    KvError
+        If the call reports one of the domain's error codes.
     """
     _fn = _lib.weaveffi_kv_stats_get_stats
     _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(store._ptr, ctypes.byref(_err))
-    _check_error(_err)
+    _check_kv_error(_err)
     if _result is None:
         raise WeaveFFIError(-1, "null pointer")
     return Stats(_result)

@@ -58,6 +58,51 @@ module WeaveFFI
 
   # === Module: contacts ===
 
+  # Base error for the `contacts` module's error domain.
+  class ContactsError < Error
+    # name must not be empty
+    class InvalidName < ContactsError
+      CODE = 1
+
+      def initialize(message = 'name must not be empty')
+        super(1, message)
+      end
+    end
+
+    # contact not found
+    class NotFound < ContactsError
+      CODE = 2
+
+      def initialize(message = 'contact not found')
+        super(2, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the ContactsError domain to its error class.
+  CONTACTS_ERROR_CODES = {
+    1 => ContactsError::InvalidName,
+    2 => ContactsError::NotFound,
+  }.freeze
+
+  # Builds the ContactsError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.contacts_error_from(code, message)
+    cls = CONTACTS_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed ContactsError for a non-zero error slot.
+  def self.check_contacts_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise contacts_error_from(code, msg)
+  end
+
   module ContactType
     PERSONAL = 0
     WORK = 1
@@ -70,11 +115,14 @@ module WeaveFFI
   attach_function :weaveffi_contacts_Contact_get_last_name, [:pointer], :pointer
   attach_function :weaveffi_contacts_Contact_get_email, [:pointer], :pointer
   attach_function :weaveffi_contacts_Contact_get_contact_type, [:pointer], :int32
-  attach_function :weaveffi_contacts_create_contact, [:string, :string, :string, :int32, :pointer], :uint64
-  attach_function :weaveffi_contacts_get_contact, [:uint64, :pointer], :pointer
-  attach_function :weaveffi_contacts_list_contacts, [:pointer, :pointer], :pointer
-  attach_function :weaveffi_contacts_delete_contact, [:uint64, :pointer], :int32
-  attach_function :weaveffi_contacts_count_contacts, [:pointer], :int32
+
+  attach_function :weaveffi_contacts_ContactBook_destroy, [:pointer], :void
+  attach_function :weaveffi_contacts_ContactBook_new, [:pointer], :pointer
+  attach_function :weaveffi_contacts_ContactBook_add, [:pointer, :string, :string, :string, :int32, :pointer], :pointer
+  attach_function :weaveffi_contacts_ContactBook_get, [:pointer, :int64, :pointer], :pointer
+  attach_function :weaveffi_contacts_ContactBook_list, [:pointer, :pointer, :pointer], :pointer
+  attach_function :weaveffi_contacts_ContactBook_remove, [:pointer, :int64, :pointer], :int32
+  attach_function :weaveffi_contacts_ContactBook_count, [:pointer, :pointer], :int32
 
   class ContactPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -134,43 +182,77 @@ module WeaveFFI
     end
   end
 
-  def self.create_contact(first_name, last_name, email, contact_type)
-    err = ErrorStruct.new
-    result = weaveffi_contacts_create_contact(first_name, last_name, email, contact_type, err)
-    check_error!(err)
-    result
+  class ContactBookPtr < FFI::AutoPointer
+    def self.release(ptr)
+      WeaveFFI.weaveffi_contacts_ContactBook_destroy(ptr)
+    end
   end
 
-  def self.get_contact(id)
-    err = ErrorStruct.new
-    result = weaveffi_contacts_get_contact(id, err)
-    check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Contact.new(result)
-  end
+  # An in-memory address book owning its contacts
+  class ContactBook
+    attr_reader :handle
 
-  def self.list_contacts()
-    err = ErrorStruct.new
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_contacts_list_contacts(out_len, err)
-    check_error!(err)
-    return [] if result.null?
-    len = out_len.read(:size_t)
-    result.read_array_of_pointer(len).map { |p| Contact.new(p) }
-  end
+    # Wraps an owned pointer the producer handed over, without
+    # re-running initialize.
+    def self._from_ptr(ptr)
+      obj = allocate
+      obj.instance_variable_set(:@handle, ContactBookPtr.new(ptr))
+      obj
+    end
 
-  def self.delete_contact(id)
-    err = ErrorStruct.new
-    result = weaveffi_contacts_delete_contact(id, err)
-    check_error!(err)
-    result != 0
-  end
+    def destroy
+      return if @handle.nil?
+      @handle.free
+      @handle = nil
+    end
 
-  def self.count_contacts()
-    err = ErrorStruct.new
-    result = weaveffi_contacts_count_contacts(err)
-    check_error!(err)
-    result
+    def initialize()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_contacts_ContactBook_new(err)
+      WeaveFFI.check_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      @handle = ContactBookPtr.new(result)
+    end
+
+    def add(first_name, last_name, email, contact_type)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_contacts_ContactBook_add(@handle, first_name, last_name, email, contact_type, err)
+      WeaveFFI.check_contacts_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      Contact.new(result)
+    end
+
+    def get(id)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_contacts_ContactBook_get(@handle, id, err)
+      WeaveFFI.check_contacts_error!(err)
+      raise Error.new(-1, 'null pointer') if result.null?
+      Contact.new(result)
+    end
+
+    def list()
+      err = ErrorStruct.new
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_contacts_ContactBook_list(@handle, out_len, err)
+      WeaveFFI.check_error!(err)
+      return [] if result.null?
+      len = out_len.read(:size_t)
+      result.read_array_of_pointer(len).map { |p| Contact.new(p) }
+    end
+
+    def remove(id)
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_contacts_ContactBook_remove(@handle, id, err)
+      WeaveFFI.check_error!(err)
+      result != 0
+    end
+
+    def count()
+      err = ErrorStruct.new
+      result = WeaveFFI.weaveffi_contacts_ContactBook_count(@handle, err)
+      WeaveFFI.check_error!(err)
+      result
+    end
   end
 end
 

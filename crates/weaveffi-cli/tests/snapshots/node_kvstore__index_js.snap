@@ -5,14 +5,157 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
-module.exports = addon;
+
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
+const wv = {};
+for (const _name of Object.getOwnPropertyNames(addon)) {
+  wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
+}
+
+class KvError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'KvError';
+  }
+}
+wv.KvError = KvError;
+class KeyNotFoundError extends KvError {
+  constructor(message) {
+    super(1001, message || 'key not found');
+    this.name = 'KeyNotFoundError';
+  }
+}
+KeyNotFoundError.CODE = 1001;
+wv.KeyNotFoundError = KeyNotFoundError;
+class ExpiredError extends KvError {
+  constructor(message) {
+    super(1002, message || 'entry expired');
+    this.name = 'ExpiredError';
+  }
+}
+ExpiredError.CODE = 1002;
+wv.ExpiredError = ExpiredError;
+class StoreFullError extends KvError {
+  constructor(message) {
+    super(1003, message || 'store has reached capacity');
+    this.name = 'StoreFullError';
+  }
+}
+StoreFullError.CODE = 1003;
+wv.StoreFullError = StoreFullError;
+class IoError extends KvError {
+  constructor(message) {
+    super(1004, message || 'I/O failure');
+    this.name = 'IoError';
+  }
+}
+IoError.CODE = 1004;
+wv.IoError = IoError;
+const __kvErrorCodes = Object.freeze({ 1001: KeyNotFoundError, 1002: ExpiredError, 1003: StoreFullError, 1004: IoError });
+function __kvErrorFrom(code, message) {
+  const _cls = __kvErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+class Store {
+  static open(path) {
+    const _r = __invoke(addon.Store_open, [path], __kvErrorFrom);
+    return Store._fromHandle(_r);
+  }
+  put(key, value, kind, ttlSeconds) {
+    return __invoke(addon.Store_put, [this._handle, key, value, kind, ttlSeconds], __kvErrorFrom);
+  }
+  get(key) {
+    return __invoke(addon.Store_get, [this._handle, key], __kvErrorFrom);
+  }
+  delete(key) {
+    return __invoke(addon.Store_delete, [this._handle, key], __kvErrorFrom);
+  }
+  listKeys(prefix) {
+    return __invoke(addon.Store_list_keys, [this._handle, prefix], __kvErrorFrom);
+  }
+  count() {
+    return __invoke(addon.Store_count, [this._handle], __generic);
+  }
+  clear() {
+    return __invoke(addon.Store_clear, [this._handle], __generic);
+  }
+  compact() {
+    return __invokeAsync(addon.Store_compact, [this._handle], __kvErrorFrom);
+  }
+  legacyPut(key, value) {
+    return __invoke(addon.Store_legacy_put, [this._handle, key, value], __kvErrorFrom);
+  }
+  static defaultCapacity() {
+    return __invoke(addon.Store_default_capacity, [], __generic);
+  }
+  destroy() {
+    if (this._handle) {
+      Store._cleanup.unregister(this);
+      addon.Store_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Store._fromHandle = function (handle) {
+  const _o = Object.create(Store.prototype);
+  _o._handle = handle;
+  Store._cleanup.register(_o, handle, _o);
+  return _o;
+};
+Store._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.Store_destroy(handle); }
+});
+wv.Store = Store;
+
+wv.getStats = function (store) {
+  return __invoke(addon.getStats, [store instanceof Store ? store._handle : store], __kvErrorFrom);
+};
+
+module.exports = wv;
 
 // END index.js

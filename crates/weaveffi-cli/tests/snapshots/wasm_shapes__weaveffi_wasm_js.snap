@@ -16,6 +16,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -55,6 +66,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -63,7 +77,7 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
@@ -296,7 +310,7 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return new Shape(wasm, _r);
       },
-      sum_bytes(values) {
+      sumBytes(values) {
         const a0_arr = values || [];
         const a0_n = a0_arr.length;
         const a0_base = wasm.weaveffi_alloc(a0_n ? a0_n * 1 : 1);
@@ -313,7 +327,7 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return _r;
       },
-      make_numerics(a, b, c, d, e, f, g, h, i, j) {
+      makeNumerics(a, b, c, d, e, f, g, h, i, j) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_shapes_make_numerics(a, b, c, BigInt(d), e, f, g, BigInt(h), i, j, _err);
         _checkErr(wasm, _err);

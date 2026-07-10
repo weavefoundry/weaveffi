@@ -10,6 +10,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+    napi_value msg;
+    napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
+    napi_value err;
+    napi_create_error(env, NULL, msg, &err);
+    napi_value code_val;
+    napi_create_int32(env, code, &code_val);
+    napi_set_named_property(env, err, "code", code_val);
+    return err;
+}
+
 static napi_value Napi_weaveffi_calculator_add(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value args[2];
@@ -21,7 +32,7 @@ static napi_value Napi_weaveffi_calculator_add(napi_env env, napi_callback_info 
   weaveffi_error err = {0};
   int32_t result = weaveffi_calculator_add(a, b, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -41,7 +52,7 @@ static napi_value Napi_weaveffi_calculator_mul(napi_env env, napi_callback_info 
   weaveffi_error err = {0};
   int32_t result = weaveffi_calculator_mul(a, b, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -61,7 +72,7 @@ static napi_value Napi_weaveffi_calculator_div(napi_env env, napi_callback_info 
   weaveffi_error err = {0};
   int32_t result = weaveffi_calculator_div(a, b, &err);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -82,7 +93,7 @@ static napi_value Napi_weaveffi_calculator_echo(napi_env env, napi_callback_info
   const char* result = weaveffi_calculator_echo(s, &err);
   free(s);
   if (err.code != 0) {
-    napi_throw_error(env, NULL, err.message);
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -94,10 +105,10 @@ static napi_value Napi_weaveffi_calculator_echo(napi_env env, napi_callback_info
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
-    { "calculator_add", NULL, Napi_weaveffi_calculator_add, NULL, NULL, NULL, napi_default, NULL },
-    { "calculator_mul", NULL, Napi_weaveffi_calculator_mul, NULL, NULL, NULL, napi_default, NULL },
-    { "calculator_div", NULL, Napi_weaveffi_calculator_div, NULL, NULL, NULL, napi_default, NULL },
-    { "calculator_echo", NULL, Napi_weaveffi_calculator_echo, NULL, NULL, NULL, napi_default, NULL },
+    { "add", NULL, Napi_weaveffi_calculator_add, NULL, NULL, NULL, napi_default, NULL },
+    { "mul", NULL, Napi_weaveffi_calculator_mul, NULL, NULL, NULL, napi_default, NULL },
+    { "div", NULL, Napi_weaveffi_calculator_div, NULL, NULL, NULL, napi_default, NULL },
+    { "echo", NULL, Napi_weaveffi_calculator_echo, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, 4, props);
   return exports;

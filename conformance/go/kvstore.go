@@ -1,15 +1,20 @@
 // Conformance consumer: kvstore sample, Go target.
 //
-// Exercises the complex-return marshaling the Go backend previously stubbed:
-// the `[]string` list getter (`Entry.Tags`), the `map[string]string` getter
-// over the triple-pointer ABI (`Entry.Metadata`), and the fluent builder's
-// list/map *input* marshaling (`Build` -> the C `create` symbol). Also covers
-// the `[]byte` getter, the iterator-backed `KvListKeys`, and the `kv.stats`
-// submodule. Exits 0 on success; aborts (non-zero) on any mismatch.
+// Exercises the Store interface end to end: the throwing factory constructor
+// (OpenStore), methods on the wrapper across every shape (sync put/get/delete,
+// the iterator-backed ListKeys, plain count/clear, the async cancellable
+// Compact, the deprecated LegacyPut), the package-level static
+// (StoreDefaultCapacity), and the explicit Close. Asserts the typed KvError
+// domain via errors.As (IoError on an empty open path, KeyNotFound on a
+// missing get). Also covers the Entry builder's list/map input marshaling,
+// the []byte / []string / map[string]string getters, the eviction listener
+// trampoline, and the nested kv.stats submodule borrowing the Store across
+// the module boundary. Exits 0 on success; aborts (non-zero) on any mismatch.
 
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -25,23 +30,58 @@ func expect(cond bool, msg string) {
 }
 
 func main() {
-	store, err := wv.KvOpenStore("/tmp/conformance-kvstore-go")
+	store, err := wv.OpenStore("/tmp/conformance-kvstore-go")
 	expect(err == nil, "open store")
 
+	// Typed error: an empty path reports KvError IoError.
+	_, err = wv.OpenStore("")
+	var kerr *wv.KvError
+	expect(errors.As(err, &kerr), "empty path yields a *KvError")
+	expect(kerr.Code == wv.KvErrorIoError,
+		fmt.Sprintf("empty path code == 1004 (got %d)", kerr.Code))
+	expect(kerr.Message == "I/O failure", "io error default message")
+
+	// Static: package-level func namespaced by the type, plain return.
+	expect(wv.StoreDefaultCapacity() == 1_000_000, "default capacity")
+
 	payload := []byte{1, 2, 3}
-	ok, err := wv.KvPut(store, "alpha", payload, wv.EntryKindPersistent, nil)
+	ok, err := store.Put("alpha", payload, wv.EntryKindPersistent, nil)
 	expect(err == nil && ok, "put alpha")
-	ok, err = wv.KvPut(store, "beta", payload, wv.EntryKindVolatile, nil)
+	ok, err = store.Put("beta", payload, wv.EntryKindVolatile, nil)
 	expect(err == nil && ok, "put beta")
 
-	n, err := wv.KvCount(store)
-	expect(err == nil && n == 2, "count == 2")
+	// Non-throwing method: plain return.
+	expect(store.Count() == 2, "count == 2")
 
-	// Iterator-backed list-of-string function return.
-	keys, err := wv.KvListKeys(store, nil)
+	// Optional struct return through a throwing method.
+	e, err := store.Get("alpha")
+	expect(err == nil && e != nil, "get alpha")
+	expect(e.Key() == "alpha", "entry key")
+	expect(len(e.Value()) == 3 && e.Value()[0] == 1, "entry value bytes")
+	e.Close()
+
+	// Typed error: a missing key reports KvError KeyNotFound.
+	_, err = store.Get("missing")
+	kerr = nil
+	expect(errors.As(err, &kerr), "missing key yields a *KvError")
+	expect(kerr.Code == wv.KvErrorKeyNotFound,
+		fmt.Sprintf("missing key code == 1001 (got %d)", kerr.Code))
+
+	// Iterator-backed list-of-string method, with and without the prefix.
+	keys, err := store.ListKeys(nil)
 	expect(err == nil && len(keys) == 2, "list_keys len == 2")
 	sort.Strings(keys)
 	expect(keys[0] == "alpha" && keys[1] == "beta", "list_keys values")
+
+	prefix := "al"
+	keys, err = store.ListKeys(&prefix)
+	expect(err == nil && len(keys) == 1 && keys[0] == "alpha", "list_keys prefix filter")
+
+	// Deprecated member keeps working.
+	ok, err = store.LegacyPut("legacy", payload)
+	expect(err == nil && ok, "legacy put")
+	ok, err = store.Delete("legacy")
+	expect(err == nil && ok, "delete legacy")
 
 	// Builder input marshaling: scalars, bytes, optional, list, and map.
 	entry, err := wv.NewEntryBuilder().
@@ -70,20 +110,20 @@ func main() {
 	entry.Close()
 
 	// Empty map round-trips as a zero-length map.
-	empty, err := wv.NewEntryBuilder().
+	emptyEntry, err := wv.NewEntryBuilder().
 		WithId(8).
 		WithKey("k").
 		WithValue(payload).
 		WithCreatedAt(1000).
 		WithExpiresAt(nil).
 		Build()
-	expect(err == nil && empty != nil, "build empty entry")
-	expect(len(empty.Metadata()) == 0, "empty metadata len 0")
-	expect(len(empty.Tags()) == 0, "empty tags len 0")
-	empty.Close()
+	expect(err == nil && emptyEntry != nil, "build empty entry")
+	expect(len(emptyEntry.Metadata()) == 0, "empty metadata len 0")
+	expect(len(emptyEntry.Tags()) == 0, "empty tags len 0")
+	emptyEntry.Close()
 
-	// kv.stats submodule.
-	st, err := wv.KvStatsGetStats(store)
+	// kv.stats submodule borrows the Store across the module boundary.
+	st, err := wv.GetStats(store)
 	expect(err == nil && st != nil, "get stats")
 	expect(st.TotalEntries() == 2, "stats total entries == 2")
 	st.Close()
@@ -91,31 +131,32 @@ func main() {
 	// Eviction listener: delete fires the //export trampoline synchronously
 	// on the deleting goroutine's thread.
 	var evicted []string
-	sub := wv.KvRegisterEvictionListener(func(key string) {
+	sub := wv.RegisterEvictionListener(func(key string) {
 		evicted = append(evicted, key)
 	})
 	expect(sub > 0, "listener id positive")
-	ok, err = wv.KvDelete(store, "beta")
+	ok, err = store.Delete("beta")
 	expect(err == nil && ok, "delete beta")
 	expect(len(evicted) == 1 && evicted[0] == "beta",
 		fmt.Sprintf("eviction fired for beta (got %v)", evicted))
 
 	// Unregister stops delivery.
-	wv.KvUnregisterEvictionListener(sub)
-	ok, err = wv.KvDelete(store, "alpha")
+	wv.UnregisterEvictionListener(sub)
+	ok, err = store.Delete("alpha")
 	expect(err == nil && ok, "delete alpha")
 	expect(len(evicted) == 1, fmt.Sprintf("no eviction after unregister (got %v)", evicted))
 
 	// Async: an immediately-expired entry gives compact 3 bytes to reclaim;
 	// the cgo trampoline bridges the producer's worker thread to a channel.
-	ok, err = wv.KvPut(store, "doomed", payload, wv.EntryKindVolatile, ptrInt64(0))
+	ok, err = store.Put("doomed", payload, wv.EntryKindVolatile, ptrInt64(0))
 	expect(err == nil && ok, "put doomed")
-	reclaimed, err := wv.KvCompactAsync(store)
+	reclaimed, err := store.Compact()
 	expect(err == nil, "compact async")
 	expect(reclaimed == 3, fmt.Sprintf("compact reclaimed 3 bytes (got %d)", reclaimed))
-	n, err = wv.KvCount(store)
-	expect(err == nil && n == 0, "store empty after deletes + compact")
+	expect(store.Count() == 0, "store empty after deletes + compact")
 
+	// Plain void method, then release the object.
+	store.Clear()
 	store.Close()
 	fmt.Println("go/kvstore: OK")
 }

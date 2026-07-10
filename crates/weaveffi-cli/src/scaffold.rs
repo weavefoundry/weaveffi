@@ -9,9 +9,12 @@ use weaveffi_ir::ir::Api;
 /// The body every generated stub carries until the producer fills it in.
 const TODO_BODY: &str = "    todo!()\n";
 
-/// Render `name: <rust-ffi-type>` for one lowered ABI slot.
+/// Render `name: <rust-ffi-type>` for one lowered ABI slot. The interface
+/// receiver slot is named `self` in the C header; that is a keyword in Rust,
+/// so the stub renames it `self_`.
 fn slot_decl(p: &AbiParam, prefix: &str) -> String {
-    format!("{}: {}", p.name, p.ty.render_rust(prefix))
+    let name = if p.name == "self" { "self_" } else { &p.name };
+    format!("{}: {}", name, p.ty.render_rust(prefix))
 }
 
 /// Join lowered ABI slots into a Rust parameter list.
@@ -118,42 +121,84 @@ fn render_module(out: &mut String, m: &ModuleBinding, prefix: &str) {
         );
         emit_stub(out, &l.unregister_symbol, "id: u64", "", TODO_BODY);
     }
+    for i in &m.interfaces {
+        render_interface_scaffold(out, i, prefix);
+    }
     for f in &m.functions {
-        match &f.shape {
-            CallShape::Sync(abi) => emit_abi_fn(out, abi, prefix, TODO_BODY),
-            CallShape::Async(a) => {
-                // The completion callback typedef, then the launcher (its
-                // params already carry the callback + context slots).
-                let _ = writeln!(
-                    out,
-                    "pub type {} = extern \"C\" fn({});\n",
-                    a.callback_type,
-                    slots_decl(&a.callback_params, prefix)
-                );
-                emit_abi_fn(
-                    out,
-                    &a.launch,
-                    prefix,
-                    "    todo!(\"spawn async work and call callback with result\")\n",
-                );
-            }
-            CallShape::Iterator(it) => {
-                let tag = &it.iter_tag;
-                let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
-                out.push_str("    // TODO: hold the iterator's streaming state\n");
-                out.push_str("}\n\n");
-                emit_abi_fn(out, &it.launch, prefix, TODO_BODY);
-                emit_abi_fn(out, &it.next, prefix, TODO_BODY);
-                emit_stub(
-                    out,
-                    &it.destroy_symbol,
-                    &format!("iter: *mut {tag}"),
-                    "",
-                    TODO_BODY,
-                );
-            }
+        emit_callable(out, &f.shape, prefix);
+    }
+}
+
+/// Emit the producer stubs for one lowered call shape: a plain symbol, an
+/// async callback typedef plus launcher, or an iterator's opaque state type
+/// with its `launch`/`next`/`destroy` triple.
+fn emit_callable(out: &mut String, shape: &CallShape, prefix: &str) {
+    match shape {
+        CallShape::Sync(abi) => emit_abi_fn(out, abi, prefix, TODO_BODY),
+        CallShape::Async(a) => {
+            // The completion callback typedef, then the launcher (its
+            // params already carry the callback + context slots).
+            let _ = writeln!(
+                out,
+                "pub type {} = extern \"C\" fn({});\n",
+                a.callback_type,
+                slots_decl(&a.callback_params, prefix)
+            );
+            emit_abi_fn(
+                out,
+                &a.launch,
+                prefix,
+                "    todo!(\"spawn async work and call callback with result\")\n",
+            );
+        }
+        CallShape::Iterator(it) => {
+            let tag = &it.iter_tag;
+            let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
+            out.push_str("    // TODO: hold the iterator's streaming state\n");
+            out.push_str("}\n\n");
+            emit_abi_fn(out, &it.launch, prefix, TODO_BODY);
+            emit_abi_fn(out, &it.next, prefix, TODO_BODY);
+            emit_stub(
+                out,
+                &it.destroy_symbol,
+                &format!("iter: *mut {tag}"),
+                "",
+                TODO_BODY,
+            );
         }
     }
+}
+
+/// Emit the producer surface for an interface: the opaque object type, every
+/// constructor (returning an owned `*mut {tag}`), every method (leading
+/// `self_: *const {tag}` receiver slot), every static, and the
+/// `{tag}_destroy` release hook. Symbols and signatures come straight from
+/// the [`InterfaceBinding`], mirroring the generated C header exactly.
+fn render_interface_scaffold(
+    out: &mut String,
+    i: &weaveffi_core::model::InterfaceBinding,
+    prefix: &str,
+) {
+    let tag = &i.c_tag;
+    let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
+    out.push_str("    // TODO: hold the object's state\n");
+    out.push_str("}\n\n");
+    for c in &i.constructors {
+        emit_callable(out, &c.shape, prefix);
+    }
+    for m in &i.methods {
+        emit_callable(out, &m.shape, prefix);
+    }
+    for s in &i.statics {
+        emit_callable(out, &s.shape, prefix);
+    }
+    emit_stub(
+        out,
+        &i.destroy_symbol,
+        &format!("self_: *mut {tag}"),
+        "",
+        TODO_BODY,
+    );
 }
 
 fn render_struct_scaffold(out: &mut String, s: &StructBinding, prefix: &str) {
@@ -249,12 +294,13 @@ mod tests {
 
     fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
         Api {
-            version: "0.4.0".to_string(),
+            version: "0.5.0".to_string(),
             modules: vec![Module {
                 name: "calc".to_string(),
                 functions,
                 structs,
                 enums: vec![],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
@@ -263,6 +309,54 @@ mod tests {
             generators: None,
             package: None,
         }
+    }
+
+    #[test]
+    fn scaffold_interface_emits_type_members_and_destroy() {
+        use weaveffi_ir::ir::InterfaceDef;
+        let mut api = minimal_api(vec![], vec![]);
+        api.modules[0].interfaces.push(InterfaceDef {
+            name: "Store".into(),
+            doc: None,
+            constructors: vec![Function {
+                name: "open".into(),
+                params: vec![Param {
+                    name: "path".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: None,
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                throws: true,
+                deprecated: None,
+                since: None,
+            }],
+            methods: vec![Function {
+                name: "count".into(),
+                params: vec![],
+                returns: Some(TypeRef::I64),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                throws: false,
+                deprecated: None,
+                since: None,
+            }],
+            statics: vec![],
+        });
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(out.contains("pub struct weaveffi_calc_Store {"));
+        assert!(out.contains("fn weaveffi_calc_Store_open("));
+        // The method's receiver slot is renamed self_ for Rust (self is a
+        // keyword), while the C header keeps `self`.
+        assert!(
+            out.contains("fn weaveffi_calc_Store_count(self_: *const weaveffi_calc_Store"),
+            "method stub should carry a renamed receiver slot: {out}"
+        );
+        assert!(out.contains("fn weaveffi_calc_Store_destroy(self_: *mut weaveffi_calc_Store)"));
     }
 
     #[test]
@@ -316,6 +410,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -381,6 +476,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -411,6 +507,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -435,6 +532,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -463,6 +561,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -527,7 +626,7 @@ mod tests {
     fn scaffold_rich_enum_emits_variant_surface() {
         use weaveffi_ir::ir::{EnumDef, EnumVariant};
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "shapes".into(),
                 functions: vec![],
@@ -555,6 +654,7 @@ mod tests {
                         },
                     ],
                 }],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
@@ -594,7 +694,7 @@ mod tests {
     fn scaffold_c_style_enum_emits_no_producer_surface() {
         use weaveffi_ir::ir::{EnumDef, EnumVariant};
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "shapes".into(),
                 functions: vec![],
@@ -617,6 +717,7 @@ mod tests {
                         },
                     ],
                 }],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
@@ -670,6 +771,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -697,6 +799,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -724,6 +827,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -747,6 +851,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -771,6 +876,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -798,6 +904,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -851,6 +958,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -884,6 +992,7 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -926,6 +1035,7 @@ mod tests {
                 doc: None,
                 r#async: true,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -953,12 +1063,13 @@ mod tests {
         // symbols must use the underscore-joined module path so they line up
         // with the generated bindings.
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "graphics".into(),
                 functions: vec![],
                 structs: vec![],
                 enums: vec![],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
@@ -971,6 +1082,7 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        throws: false,
                         deprecated: None,
                         since: None,
                     }],
@@ -986,6 +1098,7 @@ mod tests {
                         builder: false,
                     }],
                     enums: vec![],
+                    interfaces: vec![],
                     callbacks: vec![],
                     listeners: vec![],
                     errors: None,
@@ -1016,7 +1129,7 @@ mod tests {
         // (e.g. `shared.Token`). The scaffold must flatten it to the owning
         // module's C symbol, never embed the dot or the referrer's module.
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "kitchen".into(),
                 functions: vec![Function {
@@ -1026,11 +1139,13 @@ mod tests {
                     doc: None,
                     r#async: false,
                     cancellable: false,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
@@ -1057,7 +1172,7 @@ mod tests {
     #[test]
     fn scaffold_multiple_modules() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![
                 Module {
                     name: "math".into(),
@@ -1068,11 +1183,13 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        throws: false,
                         deprecated: None,
                         since: None,
                     }],
                     structs: vec![],
                     enums: vec![],
+                    interfaces: vec![],
                     callbacks: vec![],
                     listeners: vec![],
                     errors: None,
@@ -1087,11 +1204,13 @@ mod tests {
                         doc: None,
                         r#async: false,
                         cancellable: false,
+                        throws: false,
                         deprecated: None,
                         since: None,
                     }],
                     structs: vec![],
                     enums: vec![],
+                    interfaces: vec![],
                     callbacks: vec![],
                     listeners: vec![],
                     errors: None,
@@ -1112,12 +1231,13 @@ mod tests {
         listeners: Vec<weaveffi_ir::ir::ListenerDef>,
     ) -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "events".into(),
                 functions,
                 structs: vec![],
                 enums: vec![],
+                interfaces: vec![],
                 callbacks,
                 listeners,
                 errors: None,
@@ -1138,6 +1258,7 @@ mod tests {
                 doc: None,
                 r#async: false,
                 cancellable: false,
+                throws: false,
                 deprecated: None,
                 since: None,
             }],
@@ -1205,7 +1326,7 @@ mod tests {
     #[test]
     fn scaffold_struct_builder_emits_full_surface() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -1221,6 +1342,7 @@ mod tests {
                     builder: true,
                 }],
                 enums: vec![],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,
@@ -1255,7 +1377,7 @@ mod tests {
     #[test]
     fn scaffold_cancellable_async_threads_cancel_token() {
         let api = Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "net".into(),
                 functions: vec![Function {
@@ -1270,11 +1392,13 @@ mod tests {
                     doc: None,
                     r#async: true,
                     cancellable: true,
+                    throws: false,
                     deprecated: None,
                     since: None,
                 }],
                 structs: vec![],
                 enums: vec![],
+                interfaces: vec![],
                 callbacks: vec![],
                 listeners: vec![],
                 errors: None,

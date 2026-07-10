@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -64,12 +65,14 @@ WEAVEFFI_API void weaveffi_cancel_token_cancel(weaveffi_cancel_token* token);
 WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
+/** Error codes reported by throwing functions in the `calculator` module tree. */
+typedef enum { weaveffi_calculator_CalcError_DivisionByZero = 1 } weaveffi_calculator_CalcError;
 
 /** Add two integers */
 WEAVEFFI_API int32_t weaveffi_calculator_add(int32_t a, int32_t b, weaveffi_error* out_err);
 /** Multiply two integers */
 WEAVEFFI_API int32_t weaveffi_calculator_mul(int32_t a, int32_t b, weaveffi_error* out_err);
-/** Divide two integers */
+/** Divide two integers, failing on a zero divisor */
 WEAVEFFI_API int32_t weaveffi_calculator_div(int32_t a, int32_t b, weaveffi_error* out_err);
 /** Echo a string back */
 WEAVEFFI_API const char* weaveffi_calculator_echo(const char* s, weaveffi_error* out_err);
@@ -78,6 +81,7 @@ WEAVEFFI_API const char* weaveffi_calculator_echo(const char* s, weaveffi_error*
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -86,59 +90,94 @@ public:
     int32_t code() const { return code_; }
 };
 
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
+
+/** Typed errors reported by the `calculator` module's throwing functions. */
+class CalcError : public WeaveFFIError {
+public:
+    CalcError(int32_t code, const std::string& msg) : WeaveFFIError(code, msg) {}
+};
+
+/** division by zero */
+class DivisionByZeroError : public CalcError {
+public:
+    DivisionByZeroError(const std::string& msg) : CalcError(1, msg) {}
+};
+
+namespace detail {
+
+/** Map a `calculator` error code to its typed exception (CalcError for unknown codes). */
+inline std::exception_ptr make_calculator_error(int32_t code, const std::string& msg) {
+    switch (code) {
+    case 1: return std::make_exception_ptr(DivisionByZeroError(msg));
+    default: return std::make_exception_ptr(CalcError(code, msg));
+    }
+}
+
+/** Throw the typed `calculator` exception if `err` carries a nonzero code. */
+inline void check_calculator(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    std::rethrow_exception(make_calculator_error(code, msg));
+}
+
+} // namespace detail
+
+namespace calculator {
+
 /** Add two integers */
-inline int32_t calculator_add(int32_t a, int32_t b) {
+inline int32_t add(int32_t a, int32_t b) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_add(a, b, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return result;
 }
 
 /** Multiply two integers */
-inline int32_t calculator_mul(int32_t a, int32_t b) {
+inline int32_t mul(int32_t a, int32_t b) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_mul(a, b, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return result;
 }
 
-/** Divide two integers */
-inline int32_t calculator_div(int32_t a, int32_t b) {
+/** Divide two integers, failing on a zero divisor */
+inline int32_t div(int32_t a, int32_t b) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_div(a, b, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check_calculator(err);
     return result;
 }
 
 /** Echo a string back */
-inline std::string calculator_echo(const std::string& s) {
+inline std::string echo(const std::string& s) {
     weaveffi_error err{};
     auto result = weaveffi_calculator_echo(s.c_str(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
 }
+
+} // namespace calculator
 
 } // namespace weaveffi
 

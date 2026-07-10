@@ -1,11 +1,12 @@
 // Conformance consumer: contacts sample, Swift target.
 //
-// Binds through the generated `WeaveFFI` module and asserts the full contacts
-// surface: enum marshalling, opaque-handle classes with property getters,
-// NUL-terminated string params (`withCString`), optional strings
-// (`withOptionalCString`, null email), list-of-struct returns (the `out_len` +
-// `T**` lowering), boolean returns, and the thrown-error path. Exercises the
-// exact marshalling the Swift backend was previously generating incorrectly.
+// Binds through the generated `Contacts` module and asserts the 0.5.0
+// interface surface: `ContactBook` as a final class whose `new` constructor is
+// a plain `init()`, throwing methods (`add`, `get`) that raise the typed
+// `ContactsError` domain enum, non-throwing methods (`list`, `remove`,
+// `count`) called without `try`, real argument labels, enum marshalling,
+// optional strings (nil email), and list-of-struct returns. The typed-error
+// asserts pin both the case and the numeric code carried by `errorCode`.
 
 import Foundation
 import Contacts
@@ -20,37 +21,54 @@ func expect(_ cond: Bool, _ msg: String) {
 }
 
 do {
-    let alice = try Contacts.contacts_create_contact("Alice", "Smith", "alice@example.com", .work)
-    expect(alice > 0, "alice handle positive")
+    let book = ContactBook()
 
-    let c = try Contacts.contacts_get_contact(alice)
+    let alice = try book.add(
+        firstName: "Alice", lastName: "Smith",
+        email: "alice@example.com", contactType: .work)
+    expect(alice.id > 0, "alice id positive")
+
+    let c = try book.get(id: alice.id)
     expect(c.first_name == "Alice", "first_name")
     expect(c.last_name == "Smith", "last_name")
     expect(c.email == "alice@example.com", "email")
     expect(c.contact_type == .work, "contact_type")
 
     // Optional string: a missing email round-trips as nil.
-    let bob = try Contacts.contacts_create_contact("Bob", "Jones", nil, .personal)
-    let cb = try Contacts.contacts_get_contact(bob)
+    let bob = try book.add(firstName: "Bob", lastName: "Jones", email: nil, contactType: .personal)
+    let cb = try book.get(id: bob.id)
     expect(cb.email == nil, "bob email nil")
     expect(cb.contact_type == .personal, "bob contact_type")
 
-    expect(try Contacts.contacts_count_contacts() == 2, "count == 2")
-    let everyone = try Contacts.contacts_list_contacts()
+    // Non-throwing methods need no `try`.
+    expect(book.count() == 2, "count == 2")
+    let everyone = book.list()
     expect(everyone.count == 2, "list count == 2")
     let names = everyone.map { $0.first_name }.sorted()
     expect(names == ["Alice", "Bob"], "list names")
 
-    expect(try Contacts.contacts_delete_contact(alice) == true, "delete returns true")
-    expect(try Contacts.contacts_count_contacts() == 1, "count == 1 after delete")
+    expect(book.remove(id: alice.id) == true, "remove returns true")
+    expect(book.count() == 1, "count == 1 after remove")
 
-    // Error path throws a typed error with a non-zero code.
+    // A missing id raises the typed domain error's notFound case (code 2).
     do {
-        _ = try Contacts.contacts_get_contact(9999)
-        fail("expected WeaveFFIError for missing contact")
-    } catch let WeaveFFIError.error(code, _) {
-        expect(code != 0, "error code non-zero")
+        _ = try book.get(id: 999)
+        fail("expected ContactsError.notFound for missing contact")
+    } catch let e as ContactsError {
+        guard case let .notFound(message) = e else { fail("expected .notFound, got \(e)") }
+        expect(e.errorCode == 2, "notFound code == 2 (got \(e.errorCode))")
+        expect(!message.isEmpty, "notFound message non-empty")
     }
+
+    // An empty name raises the invalidName case (code 1).
+    do {
+        _ = try book.add(firstName: "", lastName: "Smith", email: nil, contactType: .personal)
+        fail("expected ContactsError.invalidName for empty first name")
+    } catch let e as ContactsError {
+        guard case .invalidName = e else { fail("expected .invalidName, got \(e)") }
+        expect(e.errorCode == 1, "invalidName code == 1 (got \(e.errorCode))")
+    }
+    expect(book.count() == 1, "rejected add stores nothing")
 
     print("swift/contacts: OK")
 } catch {

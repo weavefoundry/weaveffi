@@ -4,8 +4,11 @@
 // move-only RAII `Shape` class, its nested `Tag` enum + `tag()` reader, the
 // per-variant static factories (`Shape::Circle(...)`) and field accessors
 // (`circle_radius()`), plus the free functions that take and return `Shape` by
-// value. Also covers the expanded numerics (f32 fields, u8 field, u64 return).
-// Aborts (non-zero) on any failed assertion.
+// value. The 0.5.0 surface puts those functions at bare snake_case names in
+// the per-module namespace, so with the configured root namespace `shapes`
+// they live at `shapes::shapes::describe`. Also covers the expanded numerics
+// (f32 fields, u8 field, u64 return). Aborts (non-zero) on any failed
+// assertion.
 
 #include <cassert>
 #include <cmath>
@@ -15,7 +18,8 @@
 
 #include "weaveffi.hpp"
 
-using namespace shapes;
+using shapes::Shape;
+using namespace shapes::shapes;
 
 int main() {
     // Unit variant.
@@ -40,15 +44,15 @@ int main() {
     assert(labeled.labeled_count() == 6);
 
     // Free functions: Shape in, string/Shape out.
-    assert(shapes_describe(circle) == "circle(r=2.5)");
+    assert(describe(circle) == "circle(r=2.5)");
 
-    Shape big = shapes_scale(circle, 4.0);
+    Shape big = scale(circle, 4.0);
     assert(big.tag() == Shape::Tag::Circle);
     assert(std::fabs(big.circle_radius() - 10.0) < 1e-9);
 
     // Numerics: list<u8> in, u64 out.
     std::vector<uint8_t> bytes{250, 250, 250, 250};
-    assert(shapes_sum_bytes(bytes) == 1000);
+    assert(sum_bytes(bytes) == 1000);
 
     std::printf("cpp/shapes: OK\n");
     return 0;

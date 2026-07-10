@@ -6,6 +6,18 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
 // Generated types for WeaveFFI functions
+/**
+ * Base class of every error thrown by these bindings. Non-throwing
+ * functions reject or throw it directly for panics and marshalling
+ * failures; throwing functions surface a module domain subclass.
+ */
+export class WeaveFFIError extends Error {
+  /** The numeric ABI error code. */
+  code: number;
+  /** The raw producer message, without the code prefix. */
+  errorMessage: string;
+  constructor(code: number, message: string);
+}
 /** One field per supported numeric primitive */
 export interface Numerics {
   a: number;
@@ -65,21 +77,21 @@ export enum Channel {
  * Render a shape to a string
  * Maps to C function: weaveffi_shapes_describe
  */
-export function shapes_describe(shape: Shape): string
+export function describe(shape: Shape): string
 /**
  * Scale a shape by a factor, returning a new shape
  * Maps to C function: weaveffi_shapes_scale
  */
-export function shapes_scale(shape: Shape, factor: number): Shape
+export function scale(shape: Shape, factor: number): Shape
 /**
  * Sum a list of bytes into a wide integer (numerics smoke)
  * Maps to C function: weaveffi_shapes_sum_bytes
  */
-export function shapes_sum_bytes(values: number[]): number
+export function sumBytes(values: number[]): number
 /**
  * Build a Numerics struct from every numeric primitive
  * Maps to C function: weaveffi_shapes_make_numerics
  */
-export function shapes_make_numerics(a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number): Numerics
+export function makeNumerics(a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number): Numerics
 
 // END types.d.ts

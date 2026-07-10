@@ -86,8 +86,11 @@ macro_rules! cli_targets {
 
             /// Fan `global.strip_module_prefix` out to every target whose
             /// config honors it (those tagged `strip` in `cli_targets!`).
-            fn fan_strip_module_prefix(&mut self) {
-                $( $( cli_targets!(@strip self, $field, $strip); )? )*
+            /// Stripping is the default, so the useful direction is `false`:
+            /// one `[global]` line restores module-prefixed wrapper names
+            /// across every supporting target.
+            fn fan_strip_module_prefix(&mut self, value: bool) {
+                $( $( cli_targets!(@strip self, $field, value, $strip); )? )*
             }
 
             /// Fan the resolved global C ABI `prefix` out to every per-target
@@ -105,8 +108,8 @@ macro_rules! cli_targets {
             }
         }
     };
-    (@strip $self:ident, $field:ident, strip) => {
-        $self.$field.strip_module_prefix = true;
+    (@strip $self:ident, $field:ident, $value:ident, strip) => {
+        $self.$field.strip_module_prefix = $value;
     };
 }
 
@@ -119,19 +122,21 @@ cli_targets! {
     "wasm"    => wasm:    WasmConfig    via WasmGenerator,
     "python"  => python:  PythonConfig  via PythonGenerator,  strip,
     "dotnet"  => dotnet:  DotnetConfig  via DotnetGenerator,  strip,
-    "dart"    => dart:    DartConfig    via DartGenerator,
-    "go"      => go:      GoConfig      via GoGenerator,
-    "ruby"    => ruby:    RubyConfig    via RubyGenerator,
+    "dart"    => dart:    DartConfig    via DartGenerator,    strip,
+    "go"      => go:      GoConfig      via GoGenerator,      strip,
+    "ruby"    => ruby:    RubyConfig    via RubyGenerator,    strip,
 }
 
 /// Knobs that affect multiple generators or the orchestrator itself.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct GlobalConfig {
-    /// Shorthand: when `true`, set `strip_module_prefix` on every per-target
-    /// config that supports it. Per-target sections may still set the flag
-    /// directly.
-    pub(crate) strip_module_prefix: bool,
+    /// Shorthand: sets `strip_module_prefix` on every per-target config that
+    /// supports it. Stripping is the default, so `strip_module_prefix =
+    /// false` here restores module-prefixed wrapper names everywhere at
+    /// once. When set, this overrides per-target sections; omit it to
+    /// control targets individually.
+    pub(crate) strip_module_prefix: Option<bool>,
     /// Global C ABI symbol prefix (default `"weaveffi"`). Applies to every
     /// target so generated consumers across all languages call the identical
     /// exported symbols. A per-target `prefix` overrides this for that target.
@@ -164,8 +169,8 @@ impl CliConfig {
     /// so per-target overrides can disable a flag or override the propagated
     /// prefix.
     pub(crate) fn finalize(&mut self, input_basename: Option<String>) {
-        if self.global.strip_module_prefix {
-            self.fan_strip_module_prefix();
+        if let Some(v) = self.global.strip_module_prefix {
+            self.fan_strip_module_prefix(v);
         }
         // The C ABI prefix is global: every backend must call the exact same
         // `extern "C"` symbols. Resolve it once (`[global] c_prefix` wins, then
@@ -259,14 +264,14 @@ mod tests {
         let cfg = CliConfig::load(Some(cfg_path.to_str().unwrap())).unwrap();
         assert_eq!(cfg.swift.module_name(), "MyApp");
         assert_eq!(cfg.android.package(), "com.example.myapp");
-        assert!(cfg.global.strip_module_prefix);
+        assert_eq!(cfg.global.strip_module_prefix, Some(true));
         assert_eq!(cfg.c.prefix(), "weaveffi");
     }
 
     #[test]
     fn inline_generator_config() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",
@@ -290,7 +295,7 @@ mod tests {
     #[test]
     fn inline_dart_package_name_merges() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -307,7 +312,7 @@ mod tests {
     #[test]
     fn inline_go_module_path_merges() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -324,7 +329,7 @@ mod tests {
     #[test]
     fn inline_ruby_module_name_merges() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -341,7 +346,7 @@ mod tests {
     #[test]
     fn inline_ruby_gem_name_merges() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -358,7 +363,7 @@ mod tests {
     #[test]
     fn inline_global_strip_module_prefix_merges() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -368,10 +373,10 @@ mod tests {
         );
         let api: weaveffi_ir::ir::Api = serde_yaml::from_str(yaml).unwrap();
         let mut config = CliConfig::default();
-        assert!(!config.global.strip_module_prefix);
+        assert_eq!(config.global.strip_module_prefix, None);
         merge_inline_generators(&mut config, api.generators.as_ref().unwrap());
         config.finalize(None);
-        assert!(config.global.strip_module_prefix);
+        assert_eq!(config.global.strip_module_prefix, Some(true));
         assert!(
             config.python.strip_module_prefix,
             "finalize should fan strip_module_prefix out to python"
@@ -385,7 +390,7 @@ mod tests {
     #[test]
     fn inline_global_pre_generate_merges() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -402,7 +407,7 @@ mod tests {
     #[test]
     fn inline_unknown_target_silently_ignored() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -421,7 +426,7 @@ mod tests {
     #[test]
     fn inline_unknown_key_silently_ignored() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -439,7 +444,7 @@ mod tests {
     #[test]
     fn inline_generator_config_overrides_file() {
         let yaml = concat!(
-            "version: \"0.4.0\"\n",
+            "version: \"0.5.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",
@@ -477,7 +482,7 @@ mod tests {
         let cfg = CliConfig::load(None).unwrap();
         assert_eq!(cfg.swift.module_name(), "WeaveFFI");
         assert_eq!(cfg.android.package(), "com.weaveffi");
-        assert!(!cfg.global.strip_module_prefix);
+        assert_eq!(cfg.global.strip_module_prefix, None);
     }
 
     /// Every registered target's *declared* [`TargetCapabilities`] must match

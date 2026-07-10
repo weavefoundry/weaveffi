@@ -10,20 +10,14 @@ import Foundation
 
 public enum WeaveFFIError: Error, LocalizedError {
     case error(code: Int32, message: String)
-    case notFound
-    case invalidInput
     public var errorDescription: String? {
         switch self {
         case let .error(_, message): return message
-        case .notFound: return "Item not found"
-        case .invalidInput: return "Invalid input"
         }
     }
     public var errorCode: Int32 {
         switch self {
         case let .error(code, _): return code
-        case .notFound: return 1
-        case .invalidInput: return 2
         }
     }
 }
@@ -34,11 +28,17 @@ func check(_ err: inout weaveffi_error) throws {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
         weaveffi_error_clear(&err)
-        switch code {
-        case 1: throw WeaveFFIError.notFound
-        case 2: throw WeaveFFIError.invalidInput
-        default: throw WeaveFFIError.error(code: code, message: message)
-        }
+        throw WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
     }
 }
 
@@ -54,9 +54,9 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
-private final class ContinuationRef<T> {
-    let value: CheckedContinuation<T, Error>
-    init(_ value: CheckedContinuation<T, Error>) { self.value = value }
+private final class ContinuationRef<T, E: Error> {
+    let value: CheckedContinuation<T, E>
+    init(_ value: CheckedContinuation<T, E>) { self.value = value }
 }
 
 final class WvCallbackBox<T> {
@@ -93,13 +93,51 @@ public class Token {
 
 public enum Shared {
     /// Trivial cross-module helper
-    public static func shared_ping() throws -> String {
+    public static func ping() -> String {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_shared_ping(&err)
-        try check(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null string") }
         defer { weaveffi_free_string(rv) }
         return String(cString: rv)
+    }
+}
+
+/// Typed errors reported by the `kitchen` module.
+public enum KitchenErrorsError: Error, LocalizedError {
+    case notFound(message: String)
+    case invalidInput(message: String)
+    public var errorDescription: String? {
+        switch self {
+        case let .notFound(message): return message
+        case let .invalidInput(message): return message
+        }
+    }
+    /// The numeric ABI code carried by this error.
+    public var errorCode: Int32 {
+        switch self {
+        case .notFound: return 1
+        case .invalidInput: return 2
+        }
+    }
+}
+
+@inline(__always)
+func mapKitchen(code: Int32, message: String) -> Error {
+    switch code {
+    case 1: return KitchenErrorsError.notFound(message: message.isEmpty ? "Item not found" : message)
+    case 2: return KitchenErrorsError.invalidInput(message: message.isEmpty ? "Invalid input" : message)
+    default: return WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func checkKitchen(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        throw mapKitchen(code: code, message: message)
     }
 }
 
@@ -344,10 +382,56 @@ public class ItemBuilder {
     }
 }
 
+/// A pocket-sized interface exercising the object surface
+public final class Gadget {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_kitchen_Gadget_destroy(ptr)
+    }
+    /// Create a gadget with the given id
+    public init(id: Int64) {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kitchen_Gadget_new(id, &err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null pointer") }
+        self.ptr = rv
+    }
+    /// Render the gadget as a human-readable string
+    public func describe() -> String {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kitchen_Gadget_describe(ptr, &err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null string") }
+        defer { weaveffi_free_string(rv) }
+        return String(cString: rv)
+    }
+    /// Poke the gadget a number of times, failing on a negative count
+    public func poke(times: Int32) throws -> Int32 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kitchen_Gadget_poke(ptr, times, &err)
+        try checkKitchen(&err)
+        return rv
+    }
+    /// The gadget subsystem version string
+    public static func version() -> String {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kitchen_Gadget_version(&err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null string") }
+        defer { weaveffi_free_string(rv) }
+        return String(cString: rv)
+    }
+}
+
 public enum Kitchen {
     /// Subscribe to OnReady events
-    /// - Returns: A subscription id for ``kitchen_unregister_ready_listener(_:)``.
-    public static func kitchen_register_ready_listener(_ callback: @escaping (Int32, String) -> Void) -> UInt64 {
+    /// - Returns: A subscription id for ``unregisterReadyListener(_:)``.
+    public static func registerReadyListener(_ callback: @escaping (Int32, String) -> Void) -> UInt64 {
         let box = WvCallbackBox(callback)
         let ctx = Unmanaged.passRetained(box).toOpaque()
         let id = weaveffi_kitchen_register_ready_listener({ code, msg, context in
@@ -359,8 +443,8 @@ public enum Kitchen {
         wvListenerLock.unlock()
         return id
     }
-    /// Unregisters a listener previously registered with ``kitchen_register_ready_listener(_:)``.
-    public static func kitchen_unregister_ready_listener(_ id: UInt64) {
+    /// Unregisters a listener previously registered with ``registerReadyListener(_:)``.
+    public static func unregisterReadyListener(_ id: UInt64) {
         weaveffi_kitchen_unregister_ready_listener(id)
         wvListenerLock.lock()
         let ctx = wvListenerContexts.removeValue(forKey: id)
@@ -370,48 +454,48 @@ public enum Kitchen {
         }
     }
     /// Identity for bool
-    public static func kitchen_bool_id(_ x: Bool) throws -> Bool {
+    public static func boolId(x: Bool) -> Bool {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_bool_id(x, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    public static func kitchen_i32_id(_ x: Int32) throws -> Int32 {
+    public static func i32Id(x: Int32) -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_i32_id(x, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    public static func kitchen_u32_id(_ x: UInt32) throws -> UInt32 {
+    public static func u32Id(x: UInt32) -> UInt32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_u32_id(x, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    public static func kitchen_i64_id(_ x: Int64) throws -> Int64 {
+    public static func i64Id(x: Int64) -> Int64 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_i64_id(x, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    public static func kitchen_f64_id(_ x: Double) throws -> Double {
+    public static func f64Id(x: Double) -> Double {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_f64_id(x, &err)
-        try check(&err)
+        trap(&err)
         return rv
     }
-    public static func kitchen_echo_string(_ s: String) throws -> String {
+    public static func echoString(s: String) -> String {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: String = try s.withCString { s_ptr in
+        let result: String = s.withCString { s_ptr in
                 let rv = weaveffi_kitchen_echo_string(s_ptr, &err)
-                try check(&err)
-                guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
+                trap(&err)
+                guard let rv = rv else { fatalError("-1: null string") }
                 defer { weaveffi_free_string(rv) }
                 return String(cString: rv)
         }
         return result
     }
-    public static func kitchen_echo_bytes(_ b: Data) throws -> Data {
+    public static func echoBytes(b: Data) -> Data {
         var err = weaveffi_error(code: 0, message: nil)
         let b_bytes = Array(b)
         let result: Data = b_bytes.withUnsafeBufferPointer { b_buf in
@@ -419,23 +503,23 @@ public enum Kitchen {
             let b_len = b_buf.count
                 return weaveffi_kitchen_echo_bytes(b_ptr, b_len, &err)
         }
-        try check(&err)
+        trap(&err)
         return result
     }
     /// Borrowed string parameter
-    public static func kitchen_echo_borrowed_str(_ s: String) throws -> String {
+    public static func echoBorrowedStr(s: String) -> String {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: String = try s.withCString { s_ptr in
+        let result: String = s.withCString { s_ptr in
                 let rv = weaveffi_kitchen_echo_borrowed_str(s_ptr, &err)
-                try check(&err)
-                guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
+                trap(&err)
+                guard let rv = rv else { fatalError("-1: null string") }
                 defer { weaveffi_free_string(rv) }
                 return String(cString: rv)
         }
         return result
     }
     /// Borrowed bytes parameter
-    public static func kitchen_echo_borrowed_bytes(_ b: Data) throws -> Data {
+    public static func echoBorrowedBytes(b: Data) -> Data {
         var err = weaveffi_error(code: 0, message: nil)
         let b_bytes = Array(b)
         let result: Data = b_bytes.withUnsafeBufferPointer { b_buf in
@@ -443,48 +527,48 @@ public enum Kitchen {
             let b_len = b_buf.count
                 return weaveffi_kitchen_echo_borrowed_bytes(b_ptr, b_len, &err)
         }
-        try check(&err)
+        trap(&err)
         return result
     }
     /// Returns an opaque handle
-    public static func kitchen_open_handle() throws -> UInt64 {
+    public static func openHandle() -> UInt64 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_open_handle(&err)
-        try check(&err)
+        trap(&err)
         return rv
     }
     /// Returns a typed handle
-    public static func kitchen_open_typed_handle() throws -> Token {
+    public static func openTypedHandle() -> Token {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_open_typed_handle(&err)
-        try check(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null pointer") }
         return Token(ptr: rv)
     }
     /// Optional struct return
-    public static func kitchen_maybe_item(_ id: Int64) throws -> Item? {
+    public static func maybeItem(id: Int64) throws -> Item? {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_maybe_item(id, &err)
-        try check(&err)
+        try checkKitchen(&err)
         return rv.map { Item(ptr: $0) }
     }
     /// List of structs
-    public static func kitchen_list_items() throws -> [Item] {
+    public static func listItems() -> [Item] {
         var err = weaveffi_error(code: 0, message: nil)
         var outLen: Int = 0
         let rv = weaveffi_kitchen_list_items(&outLen, &err)
-        try check(&err)
+        trap(&err)
         guard let rv = rv else { return [] }
         return (0..<outLen).map { Item(ptr: rv[$0]!) }
     }
     /// Map return type
-    public static func kitchen_get_attrs() throws -> [String: Int32] {
+    public static func getAttrs() -> [String: Int32] {
         var err = weaveffi_error(code: 0, message: nil)
         var outKeysPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
         var outValuesPtr: UnsafeMutablePointer<Int32>? = nil
         var outLen: Int = 0
         weaveffi_kitchen_get_attrs(&outKeysPtr, &outValuesPtr, &outLen, &err)
-        try check(&err)
+        trap(&err)
         guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
         var result: [String: Int32] = [:]
         for i in 0..<outLen {
@@ -493,10 +577,10 @@ public enum Kitchen {
         return result
     }
     /// Iterator return type
-    public static func kitchen_stream_items() throws -> [Item] {
+    public static func streamItems() -> [Item] {
         var err = weaveffi_error(code: 0, message: nil)
         let iter = weaveffi_kitchen_stream_items(&err)
-        try check(&err)
+        trap(&err)
         guard let iter = iter else { return [] }
         var items: [Item] = []
         var iterItem: OpaquePointer? = nil
@@ -505,32 +589,31 @@ public enum Kitchen {
             items.append(Item(ptr: iterItem!))
         }
         weaveffi_kitchen_StreamItemsIterator_destroy(iter)
-        try check(&iterErr)
+        trap(&iterErr)
         return items
     }
     /// Returns the shared Token type from another module
-    public static func kitchen_cross_module_token() throws -> Token {
+    public static func crossModuleToken() -> Token {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_cross_module_token(&err)
-        try check(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null pointer") }
         return Token(ptr: rv)
     }
     /// Async operation
-    public static func kitchen_do_async(_ input: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+    public static func doAsync(input: String) async -> String {
+        await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
             input.withCString { input_ptr in
                 weaveffi_kitchen_do_async_async(input_ptr, { context, err, result in
-                    let contRef = Unmanaged<ContinuationRef<String>>.fromOpaque(context!).takeRetainedValue()
+                    let contRef = Unmanaged<ContinuationRef<String, Never>>.fromOpaque(context!).takeRetainedValue()
                     if let err = err, err.pointee.code != 0 {
                         let code = err.pointee.code
                         let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                        contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                        fatalError("\(code): \(msg)")
                     } else {
                         guard let result = result else {
-                            contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: "null string"))
-                            return
+                            fatalError("-1: null string")
                         }
                         let str = String(cString: result)
                         weaveffi_free_string(UnsafeMutablePointer(mutating: result))
@@ -541,20 +624,19 @@ public enum Kitchen {
         }
     }
     /// Cancellable async operation
-    public static func kitchen_do_cancellable(_ input: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+    public static func doCancellable(input: String) async -> String {
+        await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
             input.withCString { input_ptr in
                 weaveffi_kitchen_do_cancellable_async(input_ptr, nil, { context, err, result in
-                    let contRef = Unmanaged<ContinuationRef<String>>.fromOpaque(context!).takeRetainedValue()
+                    let contRef = Unmanaged<ContinuationRef<String, Never>>.fromOpaque(context!).takeRetainedValue()
                     if let err = err, err.pointee.code != 0 {
                         let code = err.pointee.code
                         let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                        contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                        fatalError("\(code): \(msg)")
                     } else {
                         guard let result = result else {
-                            contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: "null string"))
-                            return
+                            fatalError("-1: null string")
                         }
                         let str = String(cString: result)
                         weaveffi_free_string(UnsafeMutablePointer(mutating: result))
@@ -566,26 +648,26 @@ public enum Kitchen {
     }
     /// Legacy operation kept for compatibility
     @available(*, deprecated, message: "Use new_op instead")
-    public static func kitchen_legacy_op() throws -> Int32 {
+    public static func legacyOp() -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_legacy_op(&err)
-        try check(&err)
+        trap(&err)
         return rv
     }
     /// Replacement for legacy_op
-    public static func kitchen_new_op() throws -> Int32 {
+    public static func newOp() -> Int32 {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_kitchen_new_op(&err)
-        try check(&err)
+        trap(&err)
         return rv
     }
     public enum Nested {
         /// Trivial nested-module function
-        public static func kitchen_nested_hello() throws -> String {
+        public static func hello() -> String {
             var err = weaveffi_error(code: 0, message: nil)
             let rv = weaveffi_kitchen_nested_hello(&err)
-            try check(&err)
-            guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null string") }
+            trap(&err)
+            guard let rv = rv else { fatalError("-1: null string") }
             defer { weaveffi_free_string(rv) }
             return String(cString: rv)
         }

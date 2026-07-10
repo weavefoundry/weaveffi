@@ -14,6 +14,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <unordered_map>
 #include <memory>
 #include <stdexcept>
+#include <exception>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -132,6 +133,7 @@ WEAVEFFI_API weaveffi_shapes_Numerics* weaveffi_shapes_make_numerics(int8_t a, i
 
 namespace weaveffi {
 
+/** Base exception for every error reported through the C ABI. */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -139,6 +141,24 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+namespace detail {
+
+/** Throw the generic WeaveFFIError if `err` carries a nonzero code. */
+inline void check(weaveffi_error& err) {
+    if (err.code == 0) return;
+    std::string msg(err.message ? err.message : "unknown error");
+    int32_t code = err.code;
+    weaveffi_error_clear(&err);
+    throw WeaveFFIError(code, msg);
+}
+
+/** Wrap an async-callback error as the generic WeaveFFIError. */
+inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
+    return std::make_exception_ptr(WeaveFFIError(code, msg));
+}
+
+} // namespace detail
 
 /** A plain C-style enum (no payloads) */
 enum class Channel : int32_t {
@@ -263,12 +283,7 @@ public:
     static Shape Empty() {
         weaveffi_error err{};
         auto* result = weaveffi_shapes_Shape_Empty_new(&err);
-        if (err.code != 0) {
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            throw WeaveFFIError(code, msg);
-        }
+        detail::check(err);
         return Shape(result);
     }
 
@@ -276,12 +291,7 @@ public:
     static Shape Circle(double radius) {
         weaveffi_error err{};
         auto* result = weaveffi_shapes_Shape_Circle_new(radius, &err);
-        if (err.code != 0) {
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            throw WeaveFFIError(code, msg);
-        }
+        detail::check(err);
         return Shape(result);
     }
 
@@ -289,12 +299,7 @@ public:
     static Shape Rectangle(float width, float height) {
         weaveffi_error err{};
         auto* result = weaveffi_shapes_Shape_Rectangle_new(width, height, &err);
-        if (err.code != 0) {
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            throw WeaveFFIError(code, msg);
-        }
+        detail::check(err);
         return Shape(result);
     }
 
@@ -302,12 +307,7 @@ public:
     static Shape Bounded(int16_t min, int16_t max, uint64_t weight) {
         weaveffi_error err{};
         auto* result = weaveffi_shapes_Shape_Bounded_new(min, max, weight, &err);
-        if (err.code != 0) {
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            throw WeaveFFIError(code, msg);
-        }
+        detail::check(err);
         return Shape(result);
     }
 
@@ -315,12 +315,7 @@ public:
     static Shape Labeled(const std::string& label, uint8_t count) {
         weaveffi_error err{};
         auto* result = weaveffi_shapes_Shape_Labeled_new(label.c_str(), count, &err);
-        if (err.code != 0) {
-            std::string msg(err.message ? err.message : "unknown error");
-            int32_t code = err.code;
-            weaveffi_error_clear(&err);
-            throw WeaveFFIError(code, msg);
-        }
+        detail::check(err);
         return Shape(result);
     }
 
@@ -362,59 +357,43 @@ public:
 
 };
 
+namespace shapes {
+
 /** Render a shape to a string */
-inline std::string shapes_describe(const Shape& shape) {
+inline std::string describe(const Shape& shape) {
     weaveffi_error err{};
     auto result = weaveffi_shapes_describe(static_cast<const weaveffi_shapes_Shape*>(shape.handle()), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
 }
 
 /** Scale a shape by a factor, returning a new shape */
-inline Shape shapes_scale(const Shape& shape, double factor) {
+inline Shape scale(const Shape& shape, double factor) {
     weaveffi_error err{};
     auto result = weaveffi_shapes_scale(static_cast<const weaveffi_shapes_Shape*>(shape.handle()), factor, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return Shape(result);
 }
 
 /** Sum a list of bytes into a wide integer (numerics smoke) */
-inline uint64_t shapes_sum_bytes(const std::vector<uint8_t>& values) {
+inline uint64_t sum_bytes(const std::vector<uint8_t>& values) {
     weaveffi_error err{};
     auto result = weaveffi_shapes_sum_bytes(values.data(), values.size(), &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return result;
 }
 
 /** Build a Numerics struct from every numeric primitive */
-inline Numerics shapes_make_numerics(int8_t a, int16_t b, int32_t c, int64_t d, uint8_t e, uint16_t f, uint32_t g, uint64_t h, float i, double j) {
+inline Numerics make_numerics(int8_t a, int16_t b, int32_t c, int64_t d, uint8_t e, uint16_t f, uint32_t g, uint64_t h, float i, double j) {
     weaveffi_error err{};
     auto result = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, &err);
-    if (err.code != 0) {
-        std::string msg(err.message ? err.message : "unknown error");
-        int32_t code = err.code;
-        weaveffi_error_clear(&err);
-        throw WeaveFFIError(code, msg);
-    }
+    detail::check(err);
     return Numerics(result);
 }
+
+} // namespace shapes
 
 } // namespace weaveffi
 

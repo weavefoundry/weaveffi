@@ -21,6 +21,46 @@ import (
 	"unsafe"
 )
 
+// WeaveFFIError reports a failure crossing the C boundary that no typed
+// error domain claims: an unknown code, a marshalling failure, or a
+// producer panic.
+type WeaveFFIError struct {
+	// Code is the numeric ABI error code.
+	Code int32
+	// Message is the human-readable error message.
+	Message string
+}
+
+func (e *WeaveFFIError) Error() string {
+	return fmt.Sprintf("weaveffi: %s (code %d)", e.Message, e.Code)
+}
+
+// wvTakeError reads and clears a non-zero C error slot, returning its
+// code and message.
+func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+	code := int32(cErr.code)
+	msg := ""
+	if cErr.message != nil {
+		msg = C.GoString(cErr.message)
+	}
+	C.weaveffi_error_clear(cErr)
+	return code, msg
+}
+
+func wvBrandError(code int32, message string) error {
+	return &WeaveFFIError{Code: code, Message: message}
+}
+
+// wvTrap panics when the C error slot reports a failure. Non-throwing
+// wrappers check their slot with it: a non-zero code there can only be
+// a producer panic or a marshalling failure.
+func wvTrap(cErr *C.weaveffi_error) {
+	if cErr.code != 0 {
+		code, msg := wvTakeError(cErr)
+		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
+	}
+}
+
 var (
 	wvCallbackMu  sync.Mutex
 	wvCallbackSeq uint64
@@ -71,8 +111,8 @@ func goWv_weaveffi_events_OnMessage_fn(message *C.char, context unsafe.Pointer) 
 	cb(arg0)
 }
 
-// Returns a subscription id for EventsUnregisterMessageListener.
-func EventsRegisterMessageListener(callback func(message string)) uint64 {
+// Returns a subscription id for UnregisterMessageListener.
+func RegisterMessageListener(callback func(message string)) uint64 {
 	ctxID := wvCallbackStore(callback)
 	id := uint64(C.weaveffi_events_register_message_listener(C.weaveffi_events_OnMessage_fn(unsafe.Pointer(C.goWv_weaveffi_events_OnMessage_fn)), unsafe.Pointer(uintptr(ctxID))))
 	wvCallbackMu.Lock()
@@ -81,8 +121,8 @@ func EventsRegisterMessageListener(callback func(message string)) uint64 {
 	return id
 }
 
-// EventsUnregisterMessageListener unregisters a listener previously registered with EventsRegisterMessageListener.
-func EventsUnregisterMessageListener(id uint64) {
+// UnregisterMessageListener unregisters a listener previously registered with RegisterMessageListener.
+func UnregisterMessageListener(id uint64) {
 	C.weaveffi_events_unregister_message_listener(C.uint64_t(id))
 	wvCallbackMu.Lock()
 	ctxID, ok := wvListenerCtx[id]
@@ -93,29 +133,20 @@ func EventsUnregisterMessageListener(id uint64) {
 	}
 }
 
-// EventsSendMessage: Send a message, triggering the OnMessage callback
-func EventsSendMessage(text string) error {
+// SendMessage: Send a message, triggering the OnMessage callback
+func SendMessage(text string) {
 	cText := C.CString(text)
 	defer C.free(unsafe.Pointer(cText))
 	var cErr C.weaveffi_error
 	C.weaveffi_events_send_message(cText, &cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return goErr
-	}
-	return nil
+	wvTrap(&cErr)
 }
 
-// EventsGetMessages: Return an iterator over all sent messages
-func EventsGetMessages() ([]string, error) {
+// GetMessages: Return an iterator over all sent messages
+func GetMessages() []string {
 	var cErr C.weaveffi_error
 	it := C.weaveffi_events_get_messages(&cErr)
-	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
-	}
+	wvTrap(&cErr)
 	defer C.weaveffi_events_GetMessagesIterator_destroy(it)
 	goResult := []string{}
 	for {
@@ -124,15 +155,11 @@ func EventsGetMessages() ([]string, error) {
 		if C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) == 0 {
 			break
 		}
-		if iterErr.code != 0 {
-			goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(iterErr.message), int(iterErr.code))
-			C.weaveffi_error_clear(&iterErr)
-			return nil, goErr
-		}
+		wvTrap(&iterErr)
 		goResult = append(goResult, C.GoString(outItem))
 		C.weaveffi_free_string(outItem)
 	}
-	return goResult, nil
+	return goResult
 }
 
 

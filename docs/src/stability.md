@@ -16,8 +16,8 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
   minor bump; removing or renaming one is a breaking change.
 - **IDL schema.** The set of accepted top-level keys, type-reference syntax
   (`handle<T>`, `iter<T>`, `[T]`, `{K:V}`, `T?`, `&str`, `&[u8]`, primitives,
-  user-defined struct/enum names), `version` semantics, and the JSON Schema
-  exported by `weaveffi schema --format json-schema`.
+  user-defined struct/enum/interface names), `version` semantics, and the
+  JSON Schema exported by `weaveffi schema --format json-schema`.
 - **Generated code shape.** The exported symbol names, function signatures,
   type names, package layouts, and ABI conventions of every generator's
   output. A patch release will not change the bytes of the generated output;
@@ -40,6 +40,10 @@ minor release, with a schema-version bump), but the contract is "no
 contract." Things that have already changed during 0.x:
 
 - IR type-reference syntax (`callback` was removed in `0.3.0`).
+- Schema `0.5.0` introduced first-class interfaces (`interfaces:`, objects
+  with constructors, methods, and statics) and per-function typed errors
+  (`throws:`), and made bare type names unique across the whole API. The
+  samples' handle-based resource surfaces were rewritten as interfaces.
 - The `Generator` trait gained `generate_with_config` in `0.3.0`, then
   was reworked in `0.5.0` into an associated `Config` type (with an
   object-safe `DynGenerator` view) that replaced the
@@ -81,14 +85,17 @@ The IR schema version is independent of the workspace version, but it is
 tied to `weaveffi-ir`'s minor version: each `weaveffi-ir` minor bump
 corresponds to at most one schema version bump.
 [`CURRENT_SCHEMA_VERSION`](https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs)
-in `crates/weaveffi-ir/src/ir.rs` is the source of truth.
+in `crates/weaveffi-ir/src/ir.rs` is the source of truth; the current
+schema version is `0.5.0`.
 
 Pre-1.0, **only the current schema version is accepted**
-(`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`). When a
-schema bump lands, update the `version` field in your IDL and adjust the
-document to the new schema; the changes are documented in `CHANGELOG.md`
-with a "Migration" section. Post-1.0, schema bumps will ship with an
-automated migration tool and a widened `SUPPORTED_VERSIONS` window.
+(`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`), so a
+document declaring any earlier revision is rejected with an actionable
+error. When a schema bump lands, update the `version` field in your IDL and
+adjust the document to the new schema by hand; the changes are documented
+in `CHANGELOG.md` with a "Migration" section. Post-1.0, schema bumps will
+ship with an automated migration tool and a widened `SUPPORTED_VERSIONS`
+window.
 
 ## Generated-code stability (determinism)
 

@@ -10,30 +10,14 @@ import Foundation
 
 public enum WeaveFFIError: Error, LocalizedError {
     case error(code: Int32, message: String)
-    /// No entry exists for the requested key
-    case keyNotFound
-    /// The entry exists but its TTL has elapsed
-    case expired
-    /// The store has reached its capacity limit
-    case storeFull
-    /// Underlying storage reported an I/O failure
-    case ioError
     public var errorDescription: String? {
         switch self {
         case let .error(_, message): return message
-        case .keyNotFound: return "Key not found"
-        case .expired: return "Entry expired"
-        case .storeFull: return "Store is full"
-        case .ioError: return "I/O error"
         }
     }
     public var errorCode: Int32 {
         switch self {
         case let .error(code, _): return code
-        case .keyNotFound: return 1001
-        case .expired: return 1002
-        case .storeFull: return 1003
-        case .ioError: return 1004
         }
     }
 }
@@ -44,13 +28,17 @@ func check(_ err: inout weaveffi_error) throws {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
         weaveffi_error_clear(&err)
-        switch code {
-        case 1001: throw WeaveFFIError.keyNotFound
-        case 1002: throw WeaveFFIError.expired
-        case 1003: throw WeaveFFIError.storeFull
-        case 1004: throw WeaveFFIError.ioError
-        default: throw WeaveFFIError.error(code: code, message: message)
-        }
+        throw WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
     }
 }
 
@@ -66,9 +54,9 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
-private final class ContinuationRef<T> {
-    let value: CheckedContinuation<T, Error>
-    init(_ value: CheckedContinuation<T, Error>) { self.value = value }
+private final class ContinuationRef<T, E: Error> {
+    let value: CheckedContinuation<T, E>
+    init(_ value: CheckedContinuation<T, E>) { self.value = value }
 }
 
 final class WvCallbackBox<T> {
@@ -79,6 +67,56 @@ final class WvCallbackBox<T> {
 var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
 let wvListenerLock = NSLock()
 
+/// Typed errors reported by the `kv` module.
+public enum KvError: Error, LocalizedError {
+    /// No entry exists for the requested key
+    case keyNotFound(message: String)
+    /// The entry exists but its TTL has elapsed
+    case expired(message: String)
+    /// The store has reached its capacity limit
+    case storeFull(message: String)
+    /// Underlying storage reported an I/O failure
+    case ioError(message: String)
+    public var errorDescription: String? {
+        switch self {
+        case let .keyNotFound(message): return message
+        case let .expired(message): return message
+        case let .storeFull(message): return message
+        case let .ioError(message): return message
+        }
+    }
+    /// The numeric ABI code carried by this error.
+    public var errorCode: Int32 {
+        switch self {
+        case .keyNotFound: return 1001
+        case .expired: return 1002
+        case .storeFull: return 1003
+        case .ioError: return 1004
+        }
+    }
+}
+
+@inline(__always)
+func mapKv(code: Int32, message: String) -> Error {
+    switch code {
+    case 1001: return KvError.keyNotFound(message: message.isEmpty ? "key not found" : message)
+    case 1002: return KvError.expired(message: message.isEmpty ? "entry expired" : message)
+    case 1003: return KvError.storeFull(message: message.isEmpty ? "store has reached capacity" : message)
+    case 1004: return KvError.ioError(message: message.isEmpty ? "I/O failure" : message)
+    default: return WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func checkKv(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        throw mapKv(code: code, message: message)
+    }
+}
+
 /// Persistence semantics applied to a stored entry
 public enum EntryKind: UInt32 {
     /// In-memory only; lost on close
@@ -87,24 +125,6 @@ public enum EntryKind: UInt32 {
     case persistent = 1
     /// Persistent and encrypted at rest
     case encrypted = 2
-}
-
-/// Opaque key-value store handle target type
-public class Store {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_kv_Store_destroy(ptr)
-    }
-
-    /// Internal store identifier
-    public var id: Int64 {
-        return weaveffi_kv_Store_get_id(ptr)
-    }
 }
 
 /// A single key-value entry persisted in the store
@@ -280,6 +300,135 @@ public class EntryBuilder {
     }
 }
 
+/// An in-memory key-value store owning its entries; destroying the object releases all of its state
+public final class Store {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_kv_Store_destroy(ptr)
+    }
+    /// Open (or create) a store backed by the given filesystem path
+    public static func open(path: String) throws -> Store {
+        var err = weaveffi_error(code: 0, message: nil)
+        let result: OpaquePointer? = path.withCString { path_ptr in
+                return weaveffi_kv_Store_open(path_ptr, &err)
+        }
+        try checkKv(&err)
+        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        return Store(ptr: result)
+    }
+    /// Insert or replace a value, returning true on success
+    public func put(key: String, value: Data, kind: EntryKind, ttlSeconds: Int64?) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let value_bytes = Array(value)
+        let result: Bool = key.withCString { key_ptr in
+            return value_bytes.withUnsafeBufferPointer { value_buf in
+                let value_ptr = value_buf.baseAddress!
+                let value_len = value_buf.count
+                return withOptionalPointer(to: ttlSeconds) { ttlSeconds_ptr in
+                        return weaveffi_kv_Store_put(ptr, key_ptr, value_ptr, value_len, weaveffi_kv_EntryKind(kind.rawValue), ttlSeconds_ptr, &err)
+                }
+            }
+        }
+        try checkKv(&err)
+        return result
+    }
+    /// Look up an entry by key; returns null if missing or expired
+    public func get(key: String) throws -> Entry? {
+        var err = weaveffi_error(code: 0, message: nil)
+        let result: Entry? = try key.withCString { key_ptr in
+                let rv = weaveffi_kv_Store_get(ptr, key_ptr, &err)
+                try checkKv(&err)
+                return rv.map { Entry(ptr: $0) }
+        }
+        return result
+    }
+    /// Remove the entry for the given key, returning true if it existed
+    public func delete(key: String) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let result: Bool = key.withCString { key_ptr in
+                return weaveffi_kv_Store_delete(ptr, key_ptr, &err)
+        }
+        try checkKv(&err)
+        return result
+    }
+    /// Stream every key, optionally filtered by a prefix
+    public func listKeys(prefix: String?) throws -> [String] {
+        var err = weaveffi_error(code: 0, message: nil)
+        let result: [String] = try withOptionalCString(prefix) { prefix_ptr in
+                let iter = weaveffi_kv_Store_list_keys(ptr, prefix_ptr, &err)
+                try checkKv(&err)
+                guard let iter = iter else { return [] }
+                var items: [String] = []
+                var iterItem: UnsafePointer<CChar>? = nil
+                var iterErr = weaveffi_error(code: 0, message: nil)
+                while weaveffi_kv_Store_ListKeysIterator_next(iter, &iterItem, &iterErr) != 0 {
+                    items.append(String(cString: iterItem!))
+                    weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
+                }
+                weaveffi_kv_Store_ListKeysIterator_destroy(iter)
+                try checkKv(&iterErr)
+                return items
+        }
+        return result
+    }
+    /// Return the number of live entries in the store
+    public func count() -> Int64 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kv_Store_count(ptr, &err)
+        trap(&err)
+        return rv
+    }
+    /// Drop every entry from the store
+    public func clear() -> Void {
+        var err = weaveffi_error(code: 0, message: nil)
+        weaveffi_kv_Store_clear(ptr, &err)
+        trap(&err)
+    }
+    /// Reclaim space asynchronously; returns the number of bytes reclaimed
+    public func compact() async throws -> Int64 {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int64, Error>) in
+            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
+            weaveffi_kv_Store_compact_async(ptr, nil, { context, err, result in
+                let contRef = Unmanaged<ContinuationRef<Int64, Error>>.fromOpaque(context!).takeRetainedValue()
+                if let err = err, err.pointee.code != 0 {
+                    let code = err.pointee.code
+                    let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    contRef.value.resume(throwing: mapKv(code: code, message: msg))
+                } else {
+                    contRef.value.resume(returning: result)
+                }
+            }, ctx)
+        }
+    }
+    /// Legacy single-shot put kept for compatibility
+    @available(*, deprecated, message: "use put() with explicit kind")
+    public func legacyPut(key: String, value: Data) throws -> Bool {
+        var err = weaveffi_error(code: 0, message: nil)
+        let value_bytes = Array(value)
+        let result: Bool = key.withCString { key_ptr in
+            return value_bytes.withUnsafeBufferPointer { value_buf in
+                let value_ptr = value_buf.baseAddress!
+                let value_len = value_buf.count
+                    return weaveffi_kv_Store_legacy_put(ptr, key_ptr, value_ptr, value_len, &err)
+            }
+        }
+        try checkKv(&err)
+        return result
+    }
+    /// The largest number of live entries one store will hold
+    public static func defaultCapacity() -> Int64 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_kv_Store_default_capacity(&err)
+        trap(&err)
+        return rv
+    }
+}
+
 /// Aggregate store statistics
 public class Stats {
     let ptr: OpaquePointer
@@ -310,8 +459,8 @@ public class Stats {
 
 public enum Kv {
     /// Subscribe to per-key eviction notifications
-    /// - Returns: A subscription id for ``kv_unregister_eviction_listener(_:)``.
-    public static func kv_register_eviction_listener(_ callback: @escaping (String) -> Void) -> UInt64 {
+    /// - Returns: A subscription id for ``unregisterEvictionListener(_:)``.
+    public static func registerEvictionListener(_ callback: @escaping (String) -> Void) -> UInt64 {
         let box = WvCallbackBox(callback)
         let ctx = Unmanaged.passRetained(box).toOpaque()
         let id = weaveffi_kv_register_eviction_listener({ key, context in
@@ -323,8 +472,8 @@ public enum Kv {
         wvListenerLock.unlock()
         return id
     }
-    /// Unregisters a listener previously registered with ``kv_register_eviction_listener(_:)``.
-    public static func kv_unregister_eviction_listener(_ id: UInt64) {
+    /// Unregisters a listener previously registered with ``registerEvictionListener(_:)``.
+    public static func unregisterEvictionListener(_ id: UInt64) {
         weaveffi_kv_unregister_eviction_listener(id)
         wvListenerLock.lock()
         let ctx = wvListenerContexts.removeValue(forKey: id)
@@ -333,127 +482,12 @@ public enum Kv {
             Unmanaged<WvCallbackBox<(String) -> Void>>.fromOpaque(ctx).release()
         }
     }
-    /// Open (or create) a store backed by the given filesystem path
-    public static func kv_open_store(_ path: String) throws -> Store {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: OpaquePointer? = path.withCString { path_ptr in
-                return weaveffi_kv_open_store(path_ptr, &err)
-        }
-        try check(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Store(ptr: result)
-    }
-    /// Close the store and release all in-memory resources
-    public static func kv_close_store(_ store: Store) throws -> Void {
-        var err = weaveffi_error(code: 0, message: nil)
-        weaveffi_kv_close_store(store.ptr, &err)
-        try check(&err)
-    }
-    /// Insert or replace a value, returning true on success
-    public static func kv_put(_ store: Store, _ key: String, _ value: Data, _ kind: EntryKind, _ ttl_seconds: Int64?) throws -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
-        let value_bytes = Array(value)
-        let result: Bool = key.withCString { key_ptr in
-            return value_bytes.withUnsafeBufferPointer { value_buf in
-                let value_ptr = value_buf.baseAddress!
-                let value_len = value_buf.count
-                return withOptionalPointer(to: ttl_seconds) { ttl_seconds_ptr in
-                        return weaveffi_kv_put(store.ptr, key_ptr, value_ptr, value_len, weaveffi_kv_EntryKind(kind.rawValue), ttl_seconds_ptr, &err)
-                }
-            }
-        }
-        try check(&err)
-        return result
-    }
-    /// Look up an entry by key; returns null if missing or expired
-    public static func kv_get(_ store: Store, _ key: String) throws -> Entry? {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: Entry? = try key.withCString { key_ptr in
-                let rv = weaveffi_kv_get(store.ptr, key_ptr, &err)
-                try check(&err)
-                return rv.map { Entry(ptr: $0) }
-        }
-        return result
-    }
-    /// Remove the entry for the given key, returning true if it existed
-    public static func kv_delete(_ store: Store, _ key: String) throws -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: Bool = key.withCString { key_ptr in
-                return weaveffi_kv_delete(store.ptr, key_ptr, &err)
-        }
-        try check(&err)
-        return result
-    }
-    /// Stream every key, optionally filtered by a prefix
-    public static func kv_list_keys(_ store: Store, _ prefix: String?) throws -> [String] {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: [String] = try withOptionalCString(prefix) { prefix_ptr in
-                let iter = weaveffi_kv_list_keys(store.ptr, prefix_ptr, &err)
-                try check(&err)
-                guard let iter = iter else { return [] }
-                var items: [String] = []
-                var iterItem: UnsafePointer<CChar>? = nil
-                var iterErr = weaveffi_error(code: 0, message: nil)
-                while weaveffi_kv_ListKeysIterator_next(iter, &iterItem, &iterErr) != 0 {
-                    items.append(String(cString: iterItem!))
-                    weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
-                }
-                weaveffi_kv_ListKeysIterator_destroy(iter)
-                try check(&iterErr)
-                return items
-        }
-        return result
-    }
-    /// Return the number of live entries in the store
-    public static func kv_count(_ store: Store) throws -> Int64 {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_kv_count(store.ptr, &err)
-        try check(&err)
-        return rv
-    }
-    /// Drop every entry from the store
-    public static func kv_clear(_ store: Store) throws -> Void {
-        var err = weaveffi_error(code: 0, message: nil)
-        weaveffi_kv_clear(store.ptr, &err)
-        try check(&err)
-    }
-    /// Reclaim space asynchronously; returns the number of bytes reclaimed
-    public static func kv_compact_async(_ store: Store) async throws -> Int64 {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int64, Error>) in
-            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
-            weaveffi_kv_compact_async_async(store.ptr, nil, { context, err, result in
-                let contRef = Unmanaged<ContinuationRef<Int64>>.fromOpaque(context!).takeRetainedValue()
-                if let err = err, err.pointee.code != 0 {
-                    let code = err.pointee.code
-                    let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
-                } else {
-                    contRef.value.resume(returning: result)
-                }
-            }, ctx)
-        }
-    }
-    /// Legacy single-shot put kept for compatibility
-    @available(*, deprecated, message: "use put() with explicit kind")
-    public static func kv_legacy_put(_ store: Store, _ key: String, _ value: Data) throws -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
-        let value_bytes = Array(value)
-        let result: Bool = key.withCString { key_ptr in
-            return value_bytes.withUnsafeBufferPointer { value_buf in
-                let value_ptr = value_buf.baseAddress!
-                let value_len = value_buf.count
-                    return weaveffi_kv_legacy_put(store.ptr, key_ptr, value_ptr, value_len, &err)
-            }
-        }
-        try check(&err)
-        return result
-    }
     public enum Stats {
         /// Snapshot the current store statistics
-        public static func kv_stats_get_stats(_ store: Store) throws -> WeaveFFI.Stats {
+        public static func getStats(store: Store) throws -> WeaveFFI.Stats {
             var err = weaveffi_error(code: 0, message: nil)
             let rv = weaveffi_kv_stats_get_stats(store.ptr, &err)
-            try check(&err)
+            try checkKv(&err)
             guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
             return WeaveFFI.Stats(ptr: rv)
         }

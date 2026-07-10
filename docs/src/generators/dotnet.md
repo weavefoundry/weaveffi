@@ -4,8 +4,9 @@
 
 The .NET target emits a C# class library that wraps the C ABI through
 [P/Invoke](https://learn.microsoft.com/en-us/dotnet/standard/native-interop/pinvoke).
-Structs are exposed as `IDisposable` classes with property getters,
-errors become managed exceptions, and the project targets `net8.0`.
+Structs and interfaces are exposed as `IDisposable` classes with
+PascalCase members, error domains become managed exception types, and
+the project targets `net8.0`.
 
 ## What gets generated
 
@@ -15,6 +16,10 @@ errors become managed exceptions, and the project targets `net8.0`.
 | `generated/dotnet/WeaveFFI.csproj` | SDK-style project (`net8.0`, `AllowUnsafeBlocks`) |
 | `generated/dotnet/WeaveFFI.nuspec` | NuGet package metadata |
 | `generated/dotnet/README.md` | Build and pack instructions |
+
+File names and the C# namespace follow the IDL `package.name` (a
+package named `kvstore` produces `Kvstore.cs` inside
+`namespace Kvstore`); `WeaveFFI` is the default.
 
 ## Type mapping
 
@@ -35,6 +40,7 @@ errors become managed exceptions, and the project targets `net8.0`.
 | `handle`     | `ulong`                    | `ulong`       |
 | `bytes`      | `byte[]`                   | `IntPtr`      |
 | `StructName` | `StructName`               | `IntPtr`      |
+| `InterfaceName` | `InterfaceName`         | `IntPtr`      |
 | `EnumName` (plain) | `EnumName`           | `int`         |
 | `EnumName` (rich)  | `EnumName`           | `IntPtr`      |
 | `T?`         | `T?` (nullable)            | `IntPtr`      |
@@ -45,7 +51,7 @@ errors become managed exceptions, and the project targets `net8.0`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: contacts
     enums:
@@ -140,15 +146,17 @@ public class Contact : IDisposable
 ```
 
 Functions live as static methods on a class named after the module.
-Method names carry the module prefix (`ContactsCreateContact`), and
-nested IDL modules flatten into a single class with a concatenated
-name (a `stats` module nested under `kv` becomes `KvStats` with
-`KvStatsGetStats`). All wrappers throw `WeaveFFIException` on failure:
+Method names are PascalCase with the module prefix stripped
+(`Contacts.CreateContact`, not `ContactsCreateContact`); set
+`strip_module_prefix: false` in the .NET generator config (or under
+`[global]`) to keep prefixed names. Nested IDL modules flatten into a
+single class with a concatenated name (a `stats` module nested under
+`kv` becomes `KvStats` with `KvStats.GetStats`):
 
 ```csharp
 public static class Contacts
 {
-    public static ulong ContactsCreateContact(string name, string? email, int age)
+    public static ulong CreateContact(string name, string? email, int age)
     {
         var err = new WeaveFFIError();
         var namePtr = Marshal.StringToCoTaskMemUTF8(name);
@@ -181,6 +189,151 @@ internal static class NativeMethods
     [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact", CallingConvention = CallingConvention.Cdecl)]
     internal static extern ulong weaveffi_contacts_create_contact(IntPtr name, IntPtr email, int age, ref WeaveFFIError err);
 }
+```
+
+## Typed errors
+
+The library defines `WeaveFFIException` with a `Code` property. A
+module's error domain adds a derived exception named by replacing the
+trailing `Error` stem with `Exception` (`KvError` becomes
+`KvException`), carrying one `const int` per code and a `FromCode`
+factory. From the `kvstore` sample:
+
+```csharp
+/// <summary>Typed exception for the KvError error domain (module kv).</summary>
+public class KvException : WeaveFFIException
+{
+    /// <summary>key not found</summary>
+    public const int KeyNotFound = 1001;
+    /// <summary>entry expired</summary>
+    public const int Expired = 1002;
+    /// <summary>store has reached capacity</summary>
+    public const int StoreFull = 1003;
+    /// <summary>I/O failure</summary>
+    public const int IoError = 1004;
+
+    public KvException(int code, string message) : base(code, message)
+    {
+    }
+
+    /// <summary>Wraps a raw error slot in the typed exception, falling
+    /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+    internal static WeaveFFIException FromCode(int code, string message)
+    {
+        switch (code)
+        {
+            case KeyNotFound:
+                return new KvException(code, string.IsNullOrEmpty(message) ? "key not found" : message);
+            // ... Expired, StoreFull, IoError ...
+            default:
+                return new WeaveFFIException(code, message);
+        }
+    }
+}
+```
+
+Only callables marked `throws: true` in the IDL surface the typed
+exception: their wrappers check the error slot with
+`WeaveFFIError.CheckKv`, which throws `KvException` for domain codes
+and plain `WeaveFFIException` for anything else (producer panics,
+marshalling failures), and their doc comments carry an
+`<exception cref="KvException">` tag. A callable without `throws` uses
+the generic `WeaveFFIError.Check`, which only throws
+`WeaveFFIException` if the producer misbehaves.
+
+```csharp
+try
+{
+    store.Delete("missing");
+}
+catch (KvException e) when (e.Code == KvException.KeyNotFound)
+{
+    // specific code
+}
+```
+
+## Interfaces
+
+An `interfaces:` entry becomes a class implementing `IDisposable`.
+Constructors are static factories (a constructor named `new` becomes a
+public C# constructor), methods are PascalCase instance methods,
+statics are static methods, and `Dispose()` calls the C destructor with
+a finalizer as a safety net. From the `kvstore` sample (trimmed):
+
+```csharp
+public class Store : IDisposable
+{
+    private IntPtr _handle;
+    private bool _disposed;
+
+    internal Store(IntPtr handle)
+    {
+        _handle = handle;
+    }
+
+    /// <summary>Open (or create) a store backed by the given filesystem path</summary>
+    /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+    public static Store Open(string path)
+    {
+        var err = new WeaveFFIError();
+        var pathPtr = Marshal.StringToCoTaskMemUTF8(path);
+        try
+        {
+            var result = NativeMethods.weaveffi_kv_Store_open(pathPtr, ref err);
+            WeaveFFIError.CheckKv(err);
+            return new Store(result);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pathPtr);
+        }
+    }
+
+    public bool Put(string key, byte[] value, EntryKind kind, long? ttlSeconds) { /* throws KvException */ }
+    public Entry? Get(string key) { /* throws KvException */ }
+    public long Count() { /* generic check only (no throws) */ }
+
+    /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
+    public async Task<long> Compact() { /* see Async support */ }
+
+    [Obsolete("use put() with explicit kind")]
+    public bool LegacyPut(string key, byte[] value) { /* ... */ }
+
+    /// <summary>The largest number of live entries one store will hold</summary>
+    public static long DefaultCapacity()
+    {
+        var err = new WeaveFFIError();
+        var result = NativeMethods.weaveffi_kv_Store_default_capacity(ref err);
+        WeaveFFIError.Check(err);
+        return result;
+    }
+
+    public void Dispose()
+    {
+        if (!_disposed)
+        {
+            NativeMethods.weaveffi_kv_Store_destroy(_handle);
+            _disposed = true;
+        }
+        GC.SuppressFinalize(this);
+    }
+
+    ~Store()
+    {
+        Dispose();
+    }
+}
+```
+
+Functions elsewhere in the IDL pass the wrapper's handle across the
+boundary (`KvStats.GetStats(store)` reads `store.Handle` and returns a
+new `Stats`). Deprecated members carry `[Obsolete]`:
+
+```csharp
+using var store = Store.Open("/tmp/cache.kv");
+store.Put("alpha", new byte[] { 1 }, EntryKind.Persistent, null);
+Console.WriteLine($"{store.Count()} / {Store.DefaultCapacity()}");
+long reclaimed = await store.Compact();
 ```
 
 ## Rich (algebraic) enums
@@ -305,18 +458,18 @@ internal static extern void weaveffi_shapes_Shape_destroy(IntPtr ptr);
 
 Free functions that take or return the enum live on the module class
 `Shapes` and pass the wrapper's handle across the boundary
-(`Shapes.ShapesDescribe(Shape)`, `Shapes.ShapesScale(Shape, double)`):
+(`Shapes.Describe(Shape)`, `Shapes.Scale(Shape, double)`):
 
 ```csharp
 using var c = Shape.Circle(2.0);
-Console.WriteLine(c.GetTag());                  // Tag.Circle
-Console.WriteLine(c.CircleRadius);              // 2
-using var bigger = Shapes.ShapesScale(c, 3.0);  // returns a new Shape
-Console.WriteLine(Shapes.ShapesDescribe(bigger));
+Console.WriteLine(c.GetTag());                // Tag.Circle
+Console.WriteLine(c.CircleRadius);            // 2
+using var bigger = Shapes.Scale(c, 3.0);      // returns a new Shape
+Console.WriteLine(Shapes.Describe(bigger));
 ```
 
 **Ownership:** a `Shape` owns its native handle, so dispose every `Shape`
-you create or receive, including the one returned by `ShapesScale`, with
+you create or receive, including the one returned by `Shapes.Scale`, with
 `using` or an explicit `Dispose()`. The finalizer is a safety net that
 runs on a non-deterministic schedule.
 
@@ -351,9 +504,9 @@ runs on a non-deterministic schedule.
 
 ## Memory and ownership
 
-- Each struct class implements `IDisposable`; use `using` for
-  deterministic cleanup. The finalizer is a safety net only and runs
-  on a non-deterministic schedule.
+- Each struct and interface class implements `IDisposable`; use
+  `using` for deterministic cleanup. The finalizer is a safety net
+  only and runs on a non-deterministic schedule.
 - Strings returned from getters are copied into managed memory and the
   raw pointer is freed via `weaveffi_free_string` immediately, so
   string properties do not require any disposal.
@@ -375,14 +528,15 @@ and keeps the callback delegate alive with a `GCHandle` while the call
 is in flight:
 
 ```csharp
-public static async Task<TaskResult> TasksRunTask(string name)
+/// <exception cref="TaskException">Thrown when the call reports a TaskError code.</exception>
+public static async Task<TaskResult> RunTask(string name)
 {
     var tcs = new TaskCompletionSource<TaskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
     NativeMethods.AsyncCb_weaveffi_tasks_run_task callback = (context, err, result) =>
     {
         try
         {
-            // ... tcs.SetException(new WeaveFFIException(...)) on error ...
+            // ... tcs.SetException(TaskException.FromCode(...)) on error ...
             tcs.SetResult(new TaskResult(result));
         }
         finally
@@ -408,12 +562,18 @@ public static async Task<TaskResult> TasksRunTask(string name)
 - The completion callback runs on the producer's native thread;
   `RunContinuationsAsynchronously` keeps awaiting code from running
   inline on that thread.
-- Errors fault the task with a `WeaveFFIException` carrying the C
-  error code and message.
+- For a callable marked `throws: true`, an error faults the task with
+  the domain exception via its `FromCode` factory
+  (`KvException.FromCode` on `Store.Compact()`); otherwise a failure
+  can only be a producer bug and faults the task with
+  `WeaveFFIException`.
+
+Async interface methods follow the same pattern as instance methods:
+`await store.Compact()` returns `Task<long>`.
 
 For functions marked `cancellable: true` the wrapper passes
 `IntPtr.Zero` for the C ABI's cancel-token slot; no
-`CancellationToken` parameter is exposed. Only the C, C++, and Kotlin
+`CancellationToken` parameter is exposed. Only the C and C++
 targets expose cancellation tokens.
 
 ## Callbacks and listeners
@@ -423,8 +583,8 @@ class. Registration takes an `Action<...>` and returns a `ulong`
 subscription id; unregistration takes that id back:
 
 ```csharp
-public static ulong EventsRegisterMessageListener(Action<string> callback)
-public static void EventsUnregisterMessageListener(ulong id)
+public static ulong RegisterMessageListener(Action<string> callback)
+public static void UnregisterMessageListener(ulong id)
 ```
 
 The id is the `uint64` returned by the C ABI's
@@ -437,7 +597,7 @@ collect it while the native side may still call it:
 private static readonly object _listenerLock = new object();
 private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
 
-public static ulong EventsRegisterMessageListener(Action<string> callback)
+public static ulong RegisterMessageListener(Action<string> callback)
 {
     NativeMethods.Cb_weaveffi_events_OnMessage_fn trampoline = (message, context) =>
     {
@@ -455,7 +615,7 @@ public static ulong EventsRegisterMessageListener(Action<string> callback)
 
 The trampoline's delegate type is declared with
 `[UnmanagedFunctionPointer(CallingConvention.Cdecl)]`.
-`EventsUnregisterMessageListener(id)` calls the C ABI unregister first
+`Events.UnregisterMessageListener(id)` calls the C ABI unregister first
 and then drops the registry entry, releasing the delegate for
 collection.
 

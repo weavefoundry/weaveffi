@@ -96,6 +96,55 @@ _listener_refs: Dict[int, object] = {}
 
 # === Module: docs ===
 
+class DocsErrorsError(WeaveFFIError):
+    """Base exception for the `docs` module's error domain."""
+
+
+class NotFound(DocsErrorsError):
+    """Returned when no document matches the requested id"""
+
+    CODE = 1
+
+    def __init__(self, message: str = "Document not found") -> None:
+        super().__init__(1, message)
+
+
+class InvalidStatus(DocsErrorsError):
+    """Raised when attempting to move into a forbidden state"""
+
+    CODE = 2
+
+    def __init__(self, message: str = "Invalid status transition") -> None:
+        super().__init__(2, message)
+
+
+DocsErrorsError.NotFound = NotFound
+DocsErrorsError.InvalidStatus = InvalidStatus
+
+
+_DOCS_ERRORS_ERROR_CODES: Dict[int, type] = {
+    1: NotFound,
+    2: InvalidStatus,
+}
+
+
+def _docs_errors_error_from(code: int, message: str) -> WeaveFFIError:
+    """Build the DocsErrorsError subclass matching `code`, or a generic
+    WeaveFFIError for codes outside the domain (panics, marshalling)."""
+    _cls = _DOCS_ERRORS_ERROR_CODES.get(code)
+    if _cls is None:
+        return WeaveFFIError(code, message)
+    return _cls(message) if message else _cls()
+
+
+def _check_docs_errors_error(err: _WeaveFFIErrorStruct) -> None:
+    if err.code != 0:
+        code = err.code
+        message = err.message.decode("utf-8") if err.message else ""
+        _lib.weaveffi_error_clear(ctypes.byref(err))
+        raise _docs_errors_error_from(code, message)
+
+
 class Status(IntEnum):
     """
     Lifecycle status of a document.
@@ -220,16 +269,116 @@ class DocumentBuilder:
         return Document(_result)
 
 
+class Notebook:
+    """
+    An ordered collection of documents.
+
+    Notebooks own their documents and release them when destroyed.
+    """
+
+    @classmethod
+    def _from_ptr(cls, ptr) -> "Notebook":
+        _obj = cls.__new__(cls)
+        _obj._ptr = ptr
+        return _obj
+
+    def __init__(self) -> None:
+        """Create an empty notebook
+        """
+        self._ptr = None
+        _fn = _lib.weaveffi_docs_Notebook_new
+        _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(ctypes.byref(_err))
+        _check_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        self._ptr = _result
+
+
+    def __del__(self) -> None:
+        if self._ptr is not None:
+            _lib.weaveffi_docs_Notebook_destroy.argtypes = [ctypes.c_void_p]
+            _lib.weaveffi_docs_Notebook_destroy.restype = None
+            _lib.weaveffi_docs_Notebook_destroy(self._ptr)
+            self._ptr = None
+
+    def insert(self, document: "Document") -> int:
+        """Add a document, returning its position in the notebook
+
+        Parameters
+        ----------
+        document : The document to add
+        """
+        _fn = _lib.weaveffi_docs_Notebook_insert
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, document._ptr, ctypes.byref(_err))
+        _check_error(_err)
+        return _result
+
+
+    def find(self, id: int) -> "Document":
+        """Look up a document by identifier, failing when none matches
+
+        Parameters
+        ----------
+        id : Identifier of the document to find
+
+        Raises
+        ------
+        DocsErrorsError
+            If the call reports one of the domain's error codes.
+        """
+        _fn = _lib.weaveffi_docs_Notebook_find
+        _fn.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_void_p
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, id, ctypes.byref(_err))
+        _check_docs_errors_error(_err)
+        if _result is None:
+            raise WeaveFFIError(-1, "null pointer")
+        return Document(_result)
+
+
+    def size(self) -> int:
+        """The number of documents currently held
+        """
+        _fn = _lib.weaveffi_docs_Notebook_size
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(self._ptr, ctypes.byref(_err))
+        _check_error(_err)
+        return _result
+
+
+    @staticmethod
+    def max_documents() -> int:
+        """The largest number of documents one notebook will hold
+        """
+        _fn = _lib.weaveffi_docs_Notebook_max_documents
+        _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _fn.restype = ctypes.c_int32
+        _err = _WeaveFFIErrorStruct()
+        _result = _fn(ctypes.byref(_err))
+        _check_error(_err)
+        return _result
+
+
+
 # Fires after a document has been persisted successfully
 # Callback type OnSaved: Callable[[int, int], None]
 _CFUNC_weaveffi_docs_OnSaved_fn = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p)
 
 
-def docs_register_saved_listener(callback: Callable[[int, int], None]) -> int:
+def register_saved_listener(callback: Callable[[int, int], None]) -> int:
     """
     Subscribe to document-saved notifications
 
-    Returns a subscription id for docs_unregister_saved_listener().
+    Returns a subscription id for unregister_saved_listener().
     """
     def _trampoline(doc_id, revision, _context):
         callback(doc_id, revision)
@@ -242,8 +391,8 @@ def docs_register_saved_listener(callback: Callable[[int, int], None]) -> int:
     return _listener_id
 
 
-def docs_unregister_saved_listener(listener_id: int) -> None:
-    """Unregister a listener previously registered with docs_register_saved_listener()."""
+def unregister_saved_listener(listener_id: int) -> None:
+    """Unregister a listener previously registered with register_saved_listener()."""
     _fn = _lib.weaveffi_docs_unregister_saved_listener
     _fn.argtypes = [ctypes.c_uint64]
     _fn.restype = None
@@ -251,7 +400,7 @@ def docs_unregister_saved_listener(listener_id: int) -> None:
     _listener_refs.pop(listener_id, None)
 
 
-def docs_create_document(title: str, tags: List[str]) -> "Document":
+def create_document(title: str, tags: List[str]) -> "Document":
     """
     Create a brand new document.
 
@@ -275,7 +424,7 @@ def docs_create_document(title: str, tags: List[str]) -> "Document":
     return Document(_result)
 
 
-def docs_get_document(id: int) -> Optional["Document"]:
+def get_document(id: int) -> Optional["Document"]:
     """Look up a document by identifier
 
     Parameters
@@ -293,7 +442,7 @@ def docs_get_document(id: int) -> Optional["Document"]:
     return Document(_result)
 
 
-def _docs_publish_async_sync(id: int) -> bool:
+def _publish_async_sync(id: int) -> bool:
     """Publish a document in the background
 
     Parameters
@@ -325,7 +474,7 @@ def _docs_publish_async_sync(id: int) -> bool:
     return _state["val"]
 
 
-async def docs_publish_async(id: int) -> bool:
+async def publish_async(id: int) -> bool:
     """Publish a document in the background
 
     Parameters
@@ -333,6 +482,6 @@ async def docs_publish_async(id: int) -> bool:
     id : Identifier of the document to publish
     """
     _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _docs_publish_async_sync, id)
+    return await _loop.run_in_executor(None, _publish_async_sync, id)
 
 # END weaveffi.py

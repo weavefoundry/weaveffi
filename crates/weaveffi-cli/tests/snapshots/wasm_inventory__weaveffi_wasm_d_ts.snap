@@ -7,8 +7,52 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `products` module's error domain. */
+export declare class ProductsError extends WeaveFFIError {
+  static readonly InvalidPrice: typeof InvalidPrice;
+  static readonly ProductNotFound: typeof ProductNotFound;
+}
+
+/** price must be positive */
+export declare class InvalidPrice extends ProductsError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
+/** product not found */
+export declare class ProductNotFound extends ProductsError {
+  constructor(message?: string);
+  static readonly CODE: 2;
+}
+
+/** Base error for the `orders` module's error domain. */
+export declare class OrdersError extends WeaveFFIError {
+  static readonly OrderNotFound: typeof OrderNotFound;
+  static readonly EmptyOrder: typeof EmptyOrder;
+}
+
+/** order not found */
+export declare class OrderNotFound extends OrdersError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
+/** order must contain at least one item */
+export declare class EmptyOrder extends OrdersError {
+  constructor(message?: string);
+  static readonly CODE: 2;
+}
+
 export interface Product {
-  readonly id: number;
+  readonly id: bigint;
   readonly name: string;
   readonly description: string | null;
   readonly price: number;
@@ -23,14 +67,44 @@ export declare const Category: Readonly<{
   Books: 3;
 }>;
 
+/** A product catalog owning its products */
+export declare class Catalog {
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  constructor();
+  /**
+   * @throws {ProductsError} on a domain error code
+   */
+  addProduct(name: string, price: number, category: Category): Product;
+  /**
+   * @throws {ProductsError} on a domain error code
+   */
+  getProduct(id: bigint): Product;
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  search(category: Category): Product[];
+  /**
+   * @throws {ProductsError} on a domain error code
+   */
+  updatePrice(id: bigint, price: number): boolean;
+  /**
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  remove(id: bigint): boolean;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
+}
+
 export interface OrderItem {
-  readonly product_id: number;
+  readonly product_id: bigint;
   readonly quantity: number;
   readonly unit_price: number;
 }
 
 export interface Order {
-  readonly id: number;
+  readonly id: bigint;
   readonly items: OrderItem[];
   readonly total: number;
   readonly status: string;
@@ -39,44 +113,25 @@ export interface Order {
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   products: {
-    /**
-     * @throws {Error} if the native call fails
-     */
-    create_product(name: string, price: number, category: Category): bigint;
-    /**
-     * @throws {Error} if the native call fails
-     */
-    get_product(id: bigint): Product;
-    /**
-     * @throws {Error} if the native call fails
-     */
-    search_products(category: Category): Product[];
-    /**
-     * @throws {Error} if the native call fails
-     */
-    update_price(id: bigint, price: number): boolean;
-    /**
-     * @throws {Error} if the native call fails
-     */
-    delete_product(id: bigint): boolean;
+    Catalog: typeof Catalog;
   };
   orders: {
     /**
-     * @throws {Error} if the native call fails
+     * @throws {OrdersError} on a domain error code
      */
-    create_order(items: OrderItem[]): bigint;
+    createOrder(items: OrderItem[]): bigint;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {OrdersError} on a domain error code
      */
-    get_order(id: bigint): Order;
+    getOrder(id: bigint): Order;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    cancel_order(id: bigint): boolean;
+    cancelOrder(id: bigint): boolean;
     /**
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    add_product_to_order(order_id: bigint, product: Product): boolean;
+    addProductToOrder(orderId: bigint, product: Product): boolean;
   };
 }
 

@@ -36,12 +36,13 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
   @override
-  String toString() => 'WeaveFFIException($code): $message';
+  String toString() => '$runtimeType($code): $message';
 }
 
 void _checkError(Pointer<_WeaveFFIError> err) {
@@ -56,6 +57,41 @@ void _checkError(Pointer<_WeaveFFIError> err) {
 // Live listener trampolines by subscription id. Holding the
 // NativeCallable here keeps its native thunk alive until unregistered.
 final Map<int, NativeCallable> _listenerCallables = {};
+
+/// Typed error domain `DocsErrors` declared by module `docs`.
+class DocsErrorsException extends WeaveFFIException {
+  DocsErrorsException(super.code, super.message);
+}
+
+/// Returned when no document matches the requested id
+class NotFoundException extends DocsErrorsException {
+  NotFoundException([String message = 'Document not found']) : super(1, message);
+}
+
+/// Raised when attempting to move into a forbidden state
+class InvalidStatusException extends DocsErrorsException {
+  InvalidStatusException([String message = 'Invalid status transition']) : super(2, message);
+}
+
+WeaveFFIException _mapDocsErrorsException(int code, String message) {
+  switch (code) {
+    case 1:
+      return NotFoundException(message);
+    case 2:
+      return InvalidStatusException(message);
+    default:
+      return WeaveFFIException(code, message);
+  }
+}
+
+void _checkDocsErrorsException(Pointer<_WeaveFFIError> err) {
+  if (err.ref.code != 0) {
+    final code = err.ref.code;
+    final msg = err.ref.message.toDartString();
+    _weaveffiErrorClear(err);
+    throw _mapDocsErrorsException(code, msg);
+  }
+}
 
 /// Lifecycle status of a document.
 ///
@@ -212,6 +248,111 @@ class DocumentBuilder {
     } finally {
       calloc.free(titlePtr);
       if (tagsPtr != nullptr) { for (var i = 0; i < tags.length; i++) { calloc.free(tagsPtr[i]); } calloc.free(tagsPtr); }
+      calloc.free(err);
+    }
+  }
+}
+
+typedef _NativeWeaveffiDocsNotebookDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiDocsNotebookDestroy = void Function(Pointer<Void>);
+final _weaveffiDocsNotebookDestroy = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookDestroy, _DartWeaveffiDocsNotebookDestroy>('weaveffi_docs_Notebook_destroy');
+
+typedef _NativeWeaveffiDocsNotebookNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+final _weaveffiDocsNotebookNew = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookNew, _DartWeaveffiDocsNotebookNew>('weaveffi_docs_Notebook_new');
+
+typedef _NativeWeaveffiDocsNotebookInsert = Int32 Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookInsert = int Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiDocsNotebookInsert = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookInsert, _DartWeaveffiDocsNotebookInsert>('weaveffi_docs_Notebook_insert');
+
+typedef _NativeWeaveffiDocsNotebookFind = Pointer<Void> Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookFind = Pointer<Void> Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+final _weaveffiDocsNotebookFind = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookFind, _DartWeaveffiDocsNotebookFind>('weaveffi_docs_Notebook_find');
+
+typedef _NativeWeaveffiDocsNotebookSize = Int32 Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookSize = int Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiDocsNotebookSize = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookSize, _DartWeaveffiDocsNotebookSize>('weaveffi_docs_Notebook_size');
+
+typedef _NativeWeaveffiDocsNotebookMaxDocuments = Int32 Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookMaxDocuments = int Function(Pointer<_WeaveFFIError>);
+final _weaveffiDocsNotebookMaxDocuments = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookMaxDocuments, _DartWeaveffiDocsNotebookMaxDocuments>('weaveffi_docs_Notebook_max_documents');
+
+/// An ordered collection of documents.
+///
+/// Notebooks own their documents and release them when destroyed.
+class Notebook {
+  final Pointer<Void> _handle;
+  Notebook._(this._handle);
+
+  /// Releases the native object reference.
+  void dispose() {
+    _weaveffiDocsNotebookDestroy(_handle);
+  }
+
+  /// Create an empty notebook
+  factory Notebook() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiDocsNotebookNew(err);
+      _checkError(err);
+      return Notebook._(result);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Add a document, returning its position in the notebook
+  int insert(Document document) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiDocsNotebookInsert(_handle, document._handle, err);
+      _checkError(err);
+      return result;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// Look up a document by identifier, failing when none matches
+  ///
+  /// Throws [DocsErrorsException] on domain errors.
+  Document find(int id) {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiDocsNotebookFind(_handle, id, err);
+      _checkDocsErrorsException(err);
+      return Document._(result);
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// The number of documents currently held
+  int size() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiDocsNotebookSize(_handle, err);
+      _checkError(err);
+      return result;
+    } finally {
+      calloc.free(err);
+    }
+  }
+
+  /// The largest number of documents one notebook will hold
+  static int maxDocuments() {
+    final err = calloc<_WeaveFFIError>();
+    try {
+      final result = _weaveffiDocsNotebookMaxDocuments(err);
+      _checkError(err);
+      return result;
+    } finally {
       calloc.free(err);
     }
   }

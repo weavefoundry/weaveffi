@@ -451,7 +451,7 @@ namespace WeaveFFI
     public static class Shapes
     {
         /// <summary>Render a shape to a string</summary>
-        public static string ShapesDescribe(Shape shape)
+        public static string Describe(Shape shape)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_shapes_describe(shape.Handle, ref err);
@@ -462,7 +462,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Scale a shape by a factor, returning a new shape</summary>
-        public static Shape ShapesScale(Shape shape, double factor)
+        public static Shape Scale(Shape shape, double factor)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_shapes_scale(shape.Handle, factor, ref err);
@@ -471,7 +471,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Sum a list of bytes into a wide integer (numerics smoke)</summary>
-        public static ulong ShapesSumBytes(byte[] values)
+        public static ulong SumBytes(byte[] values)
         {
             var err = new WeaveFFIError();
             var valuesArr = new byte[values.Length];
@@ -490,7 +490,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Build a Numerics struct from every numeric primitive</summary>
-        public static Numerics ShapesMakeNumerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j)
+        public static Numerics MakeNumerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, ref err);

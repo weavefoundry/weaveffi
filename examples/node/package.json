@@ -1,8 +1,0 @@
-{
-  "name": "weaveffi-examples-node",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "start": "node main.mjs"
-  }
-}

@@ -1,11 +1,13 @@
 // Conformance consumer: contacts sample, .NET target.
 //
-// Drives the generated P/Invoke surface (WeaveFFI.cs): enum marshalling,
-// IDisposable opaque-handle classes with property getters, UTF-8 string params,
-// optional strings (null email), list-of-struct returns (out_len + T**), the
-// bool return, and the thrown-exception error path. The producer cdylib is
-// resolved by absolute path via a DllImportResolver reading WEAVEFFI_LIBRARY,
-// mirroring the override the Python/Ruby/Dart backends use.
+// Drives the generated P/Invoke surface (WeaveFFI.cs): the ContactBook
+// interface class (real `new` constructor, instance methods, Dispose lowering
+// to the destroy symbol), enum marshalling, IDisposable struct wrappers with
+// property getters, UTF-8 string params, optional strings (null email),
+// list-of-struct returns, the bool return, and the typed ContactsException
+// error path (InvalidName=1, NotFound=2). The producer cdylib is resolved by
+// absolute path via a DllImportResolver reading WEAVEFFI_LIBRARY, mirroring
+// the override the Python/Ruby/Dart backends use.
 
 using System;
 using System.Linq;
@@ -33,44 +35,63 @@ internal static class Program
             return IntPtr.Zero;
         });
 
-        var alice = Contacts.ContactsCreateContact("Alice", "Smith", "alice@example.com", ContactType.Work);
-        Expect(alice > 0, "alice handle positive");
-
-        using (var c = Contacts.ContactsGetContact(alice))
+        using (var book = new ContactBook())
         {
-            Expect(c.FirstName == "Alice", "first name");
-            Expect(c.LastName == "Smith", "last name");
-            Expect(c.Email == "alice@example.com", "email");
-            Expect(c.ContactType == ContactType.Work, "contact type");
-        }
+            long aliceId;
+            using (var alice = book.Add("Alice", "Smith", "alice@example.com", ContactType.Work))
+            {
+                aliceId = alice.Id;
+                Expect(aliceId > 0, "alice id positive");
+                Expect(alice.FirstName == "Alice", "first name");
+                Expect(alice.LastName == "Smith", "last name");
+                Expect(alice.Email == "alice@example.com", "email");
+                Expect(alice.ContactType == ContactType.Work, "contact type");
+            }
 
-        // Optional string: a missing email round-trips as null.
-        var bob = Contacts.ContactsCreateContact("Bob", "Jones", null, ContactType.Personal);
-        using (var cb = Contacts.ContactsGetContact(bob))
-        {
-            Expect(cb.Email == null, "bob email null");
-            Expect(cb.ContactType == ContactType.Personal, "bob contact type");
-        }
+            // Optional string: a missing email round-trips as null.
+            using (var bob = book.Add("Bob", "Jones", null, ContactType.Personal))
+            {
+                Expect(bob.Email == null, "bob email null");
+                Expect(bob.ContactType == ContactType.Personal, "bob contact type");
+            }
 
-        Expect(Contacts.ContactsCountContacts() == 2, "count == 2");
+            using (var fetched = book.Get(aliceId))
+            {
+                Expect(fetched.FirstName == "Alice", "get returns alice");
+            }
 
-        var everyone = Contacts.ContactsListContacts();
-        Expect(everyone.Length == 2, "list length == 2");
-        var names = everyone.Select(p => p.FirstName).OrderBy(s => s).ToArray();
-        Expect(names[0] == "Alice" && names[1] == "Bob", "list names");
-        foreach (var p in everyone) p.Dispose();
+            Expect(book.Count() == 2, "count == 2");
 
-        Expect(Contacts.ContactsDeleteContact(alice) == true, "delete returns true");
-        Expect(Contacts.ContactsCountContacts() == 1, "count == 1 after delete");
+            var everyone = book.List();
+            Expect(everyone.Length == 2, "list length == 2");
+            var names = everyone.Select(p => p.FirstName).OrderBy(s => s).ToArray();
+            Expect(names[0] == "Alice" && names[1] == "Bob", "list names");
+            foreach (var p in everyone) p.Dispose();
 
-        try
-        {
-            Contacts.ContactsGetContact(9999);
-            Expect(false, "expected WeaveFFIException for missing contact");
-        }
-        catch (WeaveFFIException e)
-        {
-            Expect(e.Code != 0, "error code non-zero");
+            Expect(book.Remove(aliceId) == true, "remove returns true");
+            Expect(book.Count() == 1, "count == 1 after remove");
+
+            // Typed errors: the domain exception carries the declared code.
+            try
+            {
+                book.Add("", "Smith", null, ContactType.Personal);
+                Expect(false, "expected ContactsException for empty name");
+            }
+            catch (ContactsException e)
+            {
+                Expect(e.Code == ContactsException.InvalidName, "InvalidName code == 1");
+            }
+
+            try
+            {
+                book.Get(9999);
+                Expect(false, "expected ContactsException for missing contact");
+            }
+            catch (ContactsException e)
+            {
+                Expect(e.Code == ContactsException.NotFound, "NotFound code == 2");
+                Expect(e is WeaveFFIException, "typed exception extends the brand exception");
+            }
         }
 
         Console.WriteLine("dotnet/contacts: OK");

@@ -23,6 +23,30 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Typed exception for the CalcError error domain (module calculator).</summary>
+    public class CalcException : WeaveFFIException
+    {
+        /// <summary>division by zero</summary>
+        public const int DivisionByZero = 1;
+
+        public CalcException(int code, string message) : base(code, message)
+        {
+        }
+
+        /// <summary>Wraps a raw error slot in the typed exception, falling
+        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
+        internal static WeaveFFIException FromCode(int code, string message)
+        {
+            switch (code)
+            {
+                case DivisionByZero:
+                    return new CalcException(code, string.IsNullOrEmpty(message) ? "division by zero" : message);
+                default:
+                    return new WeaveFFIException(code, message);
+            }
+        }
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WeaveFFIError
     {
@@ -35,6 +59,15 @@ namespace WeaveFFI
             {
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
                 throw new WeaveFFIException(err.Code, msg);
+            }
+        }
+
+        internal static void CheckCalc(WeaveFFIError err)
+        {
+            if (err.Code != 0)
+            {
+                var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
+                throw CalcException.FromCode(err.Code, msg);
             }
         }
     }
@@ -84,7 +117,7 @@ namespace WeaveFFI
     public static class Calculator
     {
         /// <summary>Add two integers</summary>
-        public static int CalculatorAdd(int a, int b)
+        public static int Add(int a, int b)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_calculator_add(a, b, ref err);
@@ -93,7 +126,7 @@ namespace WeaveFFI
         }
 
         /// <summary>Multiply two integers</summary>
-        public static int CalculatorMul(int a, int b)
+        public static int Mul(int a, int b)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_calculator_mul(a, b, ref err);
@@ -101,17 +134,18 @@ namespace WeaveFFI
             return result;
         }
 
-        /// <summary>Divide two integers</summary>
-        public static int CalculatorDiv(int a, int b)
+        /// <summary>Divide two integers, failing on a zero divisor</summary>
+        /// <exception cref="CalcException">Thrown when the call reports a CalcError code.</exception>
+        public static int Div(int a, int b)
         {
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_calculator_div(a, b, ref err);
-            WeaveFFIError.Check(err);
+            WeaveFFIError.CheckCalc(err);
             return result;
         }
 
         /// <summary>Echo a string back</summary>
-        public static string CalculatorEcho(string s)
+        public static string Echo(string s)
         {
             var err = new WeaveFFIError();
             var sPtr = Marshal.StringToCoTaskMemUTF8(s);

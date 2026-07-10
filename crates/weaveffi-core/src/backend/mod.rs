@@ -26,8 +26,8 @@ use weaveffi_ir::ir::Api;
 
 use crate::capabilities::TargetCapabilities;
 use crate::model::{
-    BindingModel, CallbackBinding, EnumBinding, FnBinding, ListenerBinding, ModuleBinding,
-    StructBinding,
+    BindingModel, CallbackBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    ListenerBinding, ModuleBinding, StructBinding,
 };
 use crate::package::{PackageContext, PackagedFile};
 
@@ -128,6 +128,35 @@ pub trait LanguageBackend: Send + Sync {
         let _ = (out, module, s, config);
     }
 
+    /// Render the typed error surface for a module that *declares* an error
+    /// domain: the target's error enum/class hierarchy mapping each
+    /// [`ErrorBinding`] code to a case the consumer can match on. Override when
+    /// using [`emit_members`](Self::emit_members); inheriting modules reference
+    /// the ancestor's type, so this hook only fires where
+    /// [`ModuleBinding::declares_error`] is true.
+    fn render_error(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        e: &ErrorBinding,
+        config: &Self::Config,
+    ) {
+        let _ = (out, module, e, config);
+    }
+
+    /// Render one interface: the wrapper class with its constructors, methods,
+    /// statics, and destructor wiring. Override when using
+    /// [`emit_members`](Self::emit_members).
+    fn render_interface(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        i: &InterfaceBinding,
+        config: &Self::Config,
+    ) {
+        let _ = (out, module, i, config);
+    }
+
     /// Render a module-scope callback typedef. Default: no output (most idiomatic
     /// backends express callbacks inline at the async/listener call site).
     fn render_callback(
@@ -164,16 +193,23 @@ pub trait LanguageBackend: Send + Sync {
         let _ = (out, module, f, config);
     }
 
-    /// Emit every member of `module` in canonical order (enums → structs →
-    /// callbacks → listeners → functions). Backends call this from within their
-    /// own module scoping; overriding the per-entity hooks is what guarantees a
-    /// single-pass backend cannot silently skip an entity kind.
+    /// Emit every member of `module` in canonical order (error domain → enums
+    /// → structs → interfaces → callbacks → listeners → functions). Backends
+    /// call this from within their own module scoping; overriding the
+    /// per-entity hooks is what guarantees a single-pass backend cannot
+    /// silently skip an entity kind.
     fn emit_members(&self, out: &mut String, module: &ModuleBinding, config: &Self::Config) {
+        if let Some(e) = module.error.as_ref().filter(|e| e.declared_here) {
+            self.render_error(out, module, e, config);
+        }
         for e in &module.enums {
             self.render_enum(out, e, config);
         }
         for s in &module.structs {
             self.render_struct(out, module, s, config);
+        }
+        for i in &module.interfaces {
+            self.render_interface(out, module, i, config);
         }
         for c in &module.callbacks {
             self.render_callback(out, module, c, config);
@@ -454,6 +490,7 @@ mod tests {
             }],
             returns,
             doc: None,
+            throws: false,
             r#async: is_async,
             cancellable: false,
             deprecated: None,
@@ -463,13 +500,14 @@ mod tests {
 
     fn api() -> Api {
         Api {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             modules: vec![Module {
                 name: "math".into(),
                 functions: vec![
                     func("add", Some(TypeRef::I32), false),
                     func("fetch", Some(TypeRef::StringUtf8), true),
                 ],
+                interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
                 callbacks: vec![],

@@ -9,7 +9,7 @@ script.
 ## Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (stable channel).
-- Python 3.7 or later (`python3 --version`).
+- Python 3.8 or later (`python3 --version`).
 - WeaveFFI CLI (`cargo install weaveffi-cli`).
 - `pip` (ships with Python).
 
@@ -20,9 +20,13 @@ script.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.4.0"
+version: "0.5.0"
 modules:
   - name: greeter
+    errors:
+      name: GreeterError
+      codes:
+        - { name: UnknownLang, code: 1, message: "unknown language" }
     structs:
       - name: Greeting
         fields:
@@ -34,11 +38,16 @@ modules:
           - { name: name, type: string }
         return: string
       - name: greeting
+        throws: true
         params:
           - { name: name, type: string }
           - { name: lang, type: string }
         return: Greeting
 ```
+
+`hello` can't fail, so it stays non-throwing. `greeting` declares
+`throws: true` and reports codes from the module's `GreeterError`
+domain when the language is unknown.
 
 ### 2. Generate bindings
 
@@ -56,15 +65,16 @@ generated/
 │   ├── pyproject.toml
 │   ├── setup.py
 │   ├── README.md
-│   └── weaveffi/
+│   └── greeter/
 │       ├── __init__.py
 │       ├── weaveffi.py
 │       └── weaveffi.pyi
 └── scaffold.rs
 ```
 
-The Python target uses ctypes: no native extension to compile on the
-Python side.
+The package directory and distribution name follow the IDL package name
+(here `greeter`). The Python target uses ctypes: no native extension to
+compile on the Python side.
 
 ### 3. Implement the Rust library
 
@@ -84,7 +94,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.1" }
+weaveffi-abi = { version = "0.14" }
 ```
 
 `mygreeter/src/lib.rs`:
@@ -99,12 +109,11 @@ use weaveffi_abi::{self as abi, weaveffi_error};
 
 #[no_mangle]
 pub extern "C" fn weaveffi_greeter_hello(
-    name_ptr: *const c_char,
-    _name_len: usize,
+    name: *const c_char,
     out_err: *mut weaveffi_error,
 ) -> *const c_char {
     abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name_ptr) }.to_str().unwrap_or("world");
+    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
     let msg = format!("Hello, {name}!");
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
@@ -114,7 +123,8 @@ pub extern "C" fn weaveffi_greeter_hello(
 abi::export_runtime!();
 ```
 
-Use `scaffold.rs` for the rest of the API.
+Use `scaffold.rs` for the rest of the API; it lists every symbol the
+bindings expect, with exact signatures.
 
 ### 4. Build the cdylib
 
@@ -141,9 +151,18 @@ Use `pip install -e .` for an editable install during development.
 
 ### 6. Make the cdylib findable
 
-The generated loader looks for `libweaveffi.dylib` (macOS),
-`libweaveffi.so` (Linux), or `weaveffi.dll` (Windows). Symlink or copy
-your cdylib to the expected name and set the loader path.
+The simplest option on any platform is the `WEAVEFFI_LIBRARY`
+environment variable, which the generated loader checks first and
+treats as an explicit path:
+
+```bash
+WEAVEFFI_LIBRARY=target/release/libmygreeter.dylib python demo.py
+```
+
+Without the override, the loader looks for `libweaveffi.dylib` (macOS),
+`libweaveffi.so` (Linux), or `weaveffi.dll` (Windows) on the system
+loader path. Symlink or copy your cdylib to the expected name and set
+the loader path.
 
 macOS:
 
@@ -160,22 +179,24 @@ LD_LIBRARY_PATH=target/release python demo.py
 ```
 
 Windows: place `weaveffi.dll` next to your script or add its
-directory to `PATH`. For production, copy the cdylib into the package
-directory and update `weaveffi.py`'s loader path.
+directory to `PATH`.
 
 ### 7. Use the bindings
 
-Save as `demo.py`:
+Save as `demo.py`. Function names are snake_case with the module
+prefix stripped, and the throwing `greeting` raises the typed
+exception hierarchy (`GreeterError` extends `WeaveFFIError`, with an
+`UnknownLang` subclass per code):
 
 ```python
-from weaveffi import hello, greeting, WeaveFFIError
+from greeter import hello, greeting, GreeterError
 
 print(hello("Python"))
 
 try:
     g = greeting("Python", "en")
     print(f"{g.message} ({g.lang})")
-except WeaveFFIError as e:
+except GreeterError as e:
     print(f"Error {e.code}: {e.message}")
 ```
 
@@ -184,7 +205,7 @@ deterministic cleanup, `del g` after you are done with the object.
 
 ## Verification
 
-- `pip show weaveffi` lists the package.
+- `pip show greeter` lists the package.
 - Running `demo.py` prints `Hello, Python!` and `Hi (en)` (or whatever
   `Greeting` you constructed).
 - `mypy demo.py` reports no errors thanks to the generated
@@ -193,15 +214,15 @@ deterministic cleanup, `del g` after you are done with the object.
 
   | Symptom                                                   | Likely cause                                                                  |
   |-----------------------------------------------------------|-------------------------------------------------------------------------------|
-  | `OSError: dlopen ... not found`                           | Cdylib not on the loader path; set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`.    |
-  | `WeaveFFIError: ...` at runtime                            | Rust returned a non-zero error code; inspect `e.code` and `e.message`.        |
-  | `ModuleNotFoundError: No module named 'weaveffi'`          | Package not installed; rerun `pip install .` from `generated/python/`.        |
-  | mypy complains about `weaveffi`                           | Make sure `weaveffi.pyi` ships next to `weaveffi.py` in the package.          |
+  | `OSError: dlopen ... not found`                           | Cdylib not on the loader path; set `WEAVEFFI_LIBRARY` or the loader path.      |
+  | `GreeterError: ...` at runtime                             | Rust reported a domain error code; inspect `e.code` and `e.message`.          |
+  | `ModuleNotFoundError: No module named 'greeter'`           | Package not installed; rerun `pip install .` from `generated/python/`.        |
+  | mypy complains about `greeter`                            | Make sure `weaveffi.pyi` ships next to `weaveffi.py` in the package.          |
 
 ## Cleanup
 
 ```bash
-pip uninstall weaveffi
+pip uninstall greeter
 rm -rf generated/
 cargo clean -p mygreeter
 ```

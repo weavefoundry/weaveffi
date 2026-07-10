@@ -8,13 +8,14 @@
 //! syntactic markers here match the same names the proc-macro re-emits.
 //!
 //! Round-trip gaps documented in `docs/src/guides/extract.md`:
-//!   * `iter<T>` returns: no equivalent Rust syntax, so the original
-//!     `stream_items` IDL function is omitted from this fixture.
-//!   * Error domains: not derivable from Rust, so `KitchenErrors` is
-//!     omitted.
+//!   * The original `stream_items` IDL function (an `iter<T>` return) is
+//!     omitted from this fixture.
 //!   * Struct field `default:` values: dropped.
 //!   * Standalone `since:` without `#[deprecated]`: dropped, so `new_op`
 //!     loses its `since: "0.3.0"`.
+//!   * An error code's yml `doc:` cannot be expressed separately from its
+//!     `message:` in Rust (the message is the first doc line), so the
+//!     round-trip test compares codes by name/code/message only.
 
 #![allow(dead_code)]
 #![allow(unused_attributes)]
@@ -82,6 +83,45 @@ mod kitchen {
     #[weaveffi::listener(event = "OnReady")]
     fn ready_listener() {}
 
+    #[weaveffi::error]
+    enum KitchenErrors {
+        /// Item not found
+        NotFound = 1,
+        /// Invalid input
+        InvalidInput = 2,
+    }
+
+    /// A pocket-sized interface exercising the object surface
+    #[weaveffi::interface]
+    struct Gadget {
+        id: i64,
+    }
+
+    impl Gadget {
+        /// Create a gadget with the given id
+        pub fn new(id: i64) -> Self {
+            Gadget { id }
+        }
+
+        /// Render the gadget as a human-readable string
+        pub fn describe(&self) -> String {
+            format!("gadget {}", self.id)
+        }
+
+        /// Poke the gadget a number of times, failing on a negative count
+        pub fn poke(&self, times: i32) -> Result<i32, KitchenErrors> {
+            if times < 0 {
+                return Err(KitchenErrors::InvalidInput);
+            }
+            Ok(times)
+        }
+
+        /// The gadget subsystem version string
+        pub fn version() -> String {
+            String::new()
+        }
+    }
+
     /// Identity for bool
     #[weaveffi::export]
     fn bool_id(x: bool) -> bool {
@@ -144,8 +184,8 @@ mod kitchen {
 
     /// Optional struct return
     #[weaveffi::export]
-    fn maybe_item(id: i64) -> Option<Item> {
-        None
+    fn maybe_item(id: i64) -> Result<Option<Item>, KitchenErrors> {
+        Ok(None)
     }
 
     /// List of structs

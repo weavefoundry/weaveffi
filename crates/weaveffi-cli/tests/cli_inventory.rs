@@ -52,15 +52,19 @@ fn generate_inventory_all_targets() {
         );
     }
 
-    // Python weaveffi.py contains functions from both modules
+    // Python weaveffi.py contains classes from both modules
     let weaveffi_py = std::fs::read_to_string(out_path.join("python/inventory/weaveffi.py"))
         .expect("missing python/inventory/weaveffi.py");
     assert!(
-        weaveffi_py.contains("def products_create_product"),
-        "weaveffi.py should contain products module function"
+        weaveffi_py.contains("class Catalog:"),
+        "weaveffi.py should contain the products module's Catalog interface"
     );
     assert!(
-        weaveffi_py.contains("def orders_create_order"),
-        "weaveffi.py should contain orders module function"
+        weaveffi_py.contains("class Order:"),
+        "weaveffi.py should contain the orders module's Order type"
+    );
+    assert!(
+        weaveffi_py.contains("class ProductNotFound(ProductsError):"),
+        "weaveffi.py should contain typed products error classes"
     );
 }

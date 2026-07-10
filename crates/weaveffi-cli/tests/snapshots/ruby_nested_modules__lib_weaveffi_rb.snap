@@ -58,6 +58,41 @@ module WeaveFFI
 
   # === Module: graphics ===
 
+  # Base error for the `graphics` module's error domain.
+  class GraphicsError < Error
+    # coordinate out of bounds
+    class OutOfBounds < GraphicsError
+      CODE = 1
+
+      def initialize(message = 'coordinate out of bounds')
+        super(1, message)
+      end
+    end
+  end
+
+  # Maps each ABI code of the GraphicsError domain to its error class.
+  GRAPHICS_ERROR_CODES = {
+    1 => GraphicsError::OutOfBounds,
+  }.freeze
+
+  # Builds the GraphicsError subclass matching `code`, or a generic Error
+  # for codes outside the domain (panics, marshalling).
+  def self.graphics_error_from(code, message)
+    cls = GRAPHICS_ERROR_CODES[code]
+    return Error.new(code, message) if cls.nil?
+    message.empty? ? cls.new : cls.new(message)
+  end
+
+  # Raises the typed GraphicsError for a non-zero error slot.
+  def self.check_graphics_error!(err)
+    return if err[:code].zero?
+    code = err[:code]
+    msg_ptr = err[:message]
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    weaveffi_error_clear(err.to_ptr)
+    raise graphics_error_from(code, msg)
+  end
+
   # A measurement unit shared with nested submodules.
   module Unit
     PIXELS = 0
@@ -195,7 +230,7 @@ module WeaveFFI
 
   attach_function :weaveffi_graphics_shapes_geometry_Detail_destroy, [:pointer], :void
   attach_function :weaveffi_graphics_shapes_geometry_Detail_get_area, [:pointer], :double
-  # Deeper function taking an ancestor-module struct.
+  # Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
   attach_function :weaveffi_graphics_shapes_geometry_compute, [:pointer, :pointer], :pointer
 
   class DetailPtr < FFI::AutoPointer
@@ -228,11 +263,11 @@ module WeaveFFI
     end
   end
 
-  # Deeper function taking an ancestor-module struct.
+  # Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
   def self.compute(shape)
     err = ErrorStruct.new
     result = weaveffi_graphics_shapes_geometry_compute(shape.handle, err)
-    check_error!(err)
+    check_graphics_error!(err)
     raise Error.new(-1, 'null pointer') if result.null?
     Detail.new(result)
   end

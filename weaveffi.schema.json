@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.4.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.5.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "package": {
@@ -97,7 +97,6 @@
       "description": "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors.",
       "type": "object",
       "required": [
-        "functions",
         "name"
       ],
       "properties": {
@@ -110,6 +109,13 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/Function"
+          }
+        },
+        "interfaces": {
+          "description": "Interface (object) types declared in this module: stateful resources with constructors, methods, and static functions.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InterfaceDef"
           }
         },
         "structs": {
@@ -161,11 +167,10 @@
       }
     },
     "Function": {
-      "description": "A function exported across the FFI boundary.\n\nEach function becomes a C ABI entry point plus an idiomatic wrapper in every target language. The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without altering the parameter and return shape declared here.",
+      "description": "A function exported across the FFI boundary.\n\nEach function becomes a C ABI entry point plus an idiomatic wrapper in every target language. The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without altering the parameter and return shape declared here. The same shape also describes an interface's constructors, methods, and statics (see [`InterfaceDef`]).",
       "type": "object",
       "required": [
-        "name",
-        "params"
+        "name"
       ],
       "properties": {
         "name": {
@@ -196,6 +201,10 @@
             "string",
             "null"
           ]
+        },
+        "throws": {
+          "description": "Whether the function can fail with a domain error. A throwing function surfaces as `throws`/`raises` in the idiomatic bindings, reporting the owning module's error domain; a non-throwing function has a plain signature and treats any error as a producer bug (a trap, not a typed error). Defaults to `false`.",
+          "type": "boolean"
         },
         "async": {
           "description": "Whether the function is asynchronous, lowering to a completion-callback form rather than a blocking call. Serialized under the IDL key `async`.",
@@ -256,8 +265,49 @@
     },
     "TypeRef": {
       "title": "TypeRef",
-      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct/enum name.",
+      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct/enum/interface name.",
       "type": "string"
+    },
+    "InterfaceDef": {
+      "description": "An interface: an opaque object type with constructors, methods, and statics.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Interface type name (for example `Store`).",
+          "type": "string"
+        },
+        "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "constructors": {
+          "description": "Constructors: static functions returning a new instance. A constructor declares no `return` (the instance is implicit) and may not be `async`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        },
+        "methods": {
+          "description": "Instance methods. Each lowers with an implicit leading `self` slot (a pointer to the interface object) before the declared parameters.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        },
+        "statics": {
+          "description": "Static functions namespaced under the interface but taking no `self`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        }
+      }
     },
     "StructDef": {
       "description": "A struct (record) type with named fields.",

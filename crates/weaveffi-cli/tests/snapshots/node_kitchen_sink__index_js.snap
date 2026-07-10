@@ -5,14 +5,186 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
-module.exports = addon;
+
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
+const wv = {};
+for (const _name of Object.getOwnPropertyNames(addon)) {
+  wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
+}
+
+class KitchenErrorsError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'KitchenErrorsError';
+  }
+}
+wv.KitchenErrorsError = KitchenErrorsError;
+class NotFoundError extends KitchenErrorsError {
+  constructor(message) {
+    super(1, message || 'Item not found');
+    this.name = 'NotFoundError';
+  }
+}
+NotFoundError.CODE = 1;
+wv.NotFoundError = NotFoundError;
+class InvalidInputError extends KitchenErrorsError {
+  constructor(message) {
+    super(2, message || 'Invalid input');
+    this.name = 'InvalidInputError';
+  }
+}
+InvalidInputError.CODE = 2;
+wv.InvalidInputError = InvalidInputError;
+const __kitchenErrorCodes = Object.freeze({ 1: NotFoundError, 2: InvalidInputError });
+function __kitchenErrorFrom(code, message) {
+  const _cls = __kitchenErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+class Gadget {
+  constructor(id) {
+    this._handle = __invoke(addon.Gadget_new, [id], __generic);
+    Gadget._cleanup.register(this, this._handle, this);
+  }
+  describe() {
+    return __invoke(addon.Gadget_describe, [this._handle], __generic);
+  }
+  poke(times) {
+    return __invoke(addon.Gadget_poke, [this._handle, times], __kitchenErrorFrom);
+  }
+  static version() {
+    return __invoke(addon.Gadget_version, [], __generic);
+  }
+  destroy() {
+    if (this._handle) {
+      Gadget._cleanup.unregister(this);
+      addon.Gadget_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+Gadget._fromHandle = function (handle) {
+  const _o = Object.create(Gadget.prototype);
+  _o._handle = handle;
+  Gadget._cleanup.register(_o, handle, _o);
+  return _o;
+};
+Gadget._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.Gadget_destroy(handle); }
+});
+wv.Gadget = Gadget;
+
+wv.ping = function () {
+  return __invoke(addon.ping, [], __generic);
+};
+wv.boolId = function (x) {
+  return __invoke(addon.boolId, [x], __generic);
+};
+wv.i32Id = function (x) {
+  return __invoke(addon.i32Id, [x], __generic);
+};
+wv.u32Id = function (x) {
+  return __invoke(addon.u32Id, [x], __generic);
+};
+wv.i64Id = function (x) {
+  return __invoke(addon.i64Id, [x], __generic);
+};
+wv.f64Id = function (x) {
+  return __invoke(addon.f64Id, [x], __generic);
+};
+wv.echoString = function (s) {
+  return __invoke(addon.echoString, [s], __generic);
+};
+wv.echoBytes = function (b) {
+  return __invoke(addon.echoBytes, [b], __generic);
+};
+wv.echoBorrowedStr = function (s) {
+  return __invoke(addon.echoBorrowedStr, [s], __generic);
+};
+wv.echoBorrowedBytes = function (b) {
+  return __invoke(addon.echoBorrowedBytes, [b], __generic);
+};
+wv.openHandle = function () {
+  return __invoke(addon.openHandle, [], __generic);
+};
+wv.openTypedHandle = function () {
+  return __invoke(addon.openTypedHandle, [], __generic);
+};
+wv.maybeItem = function (id) {
+  return __invoke(addon.maybeItem, [id], __kitchenErrorFrom);
+};
+wv.listItems = function () {
+  return __invoke(addon.listItems, [], __generic);
+};
+wv.getAttrs = function () {
+  return __invoke(addon.getAttrs, [], __generic);
+};
+wv.streamItems = function () {
+  return __invoke(addon.streamItems, [], __generic);
+};
+wv.crossModuleToken = function () {
+  return __invoke(addon.crossModuleToken, [], __generic);
+};
+wv.doAsync = function (input) {
+  return __invokeAsync(addon.doAsync, [input], __generic);
+};
+wv.doCancellable = function (input) {
+  return __invokeAsync(addon.doCancellable, [input], __generic);
+};
+wv.legacyOp = function () {
+  return __invoke(addon.legacyOp, [], __generic);
+};
+wv.newOp = function () {
+  return __invoke(addon.newOp, [], __generic);
+};
+wv.hello = function () {
+  return __invoke(addon.hello, [], __generic);
+};
+
+module.exports = wv;
 
 // END index.js

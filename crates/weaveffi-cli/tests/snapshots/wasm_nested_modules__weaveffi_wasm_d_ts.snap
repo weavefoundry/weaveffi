@@ -7,6 +7,25 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `graphics` module's error domain. */
+export declare class GraphicsError extends WeaveFFIError {
+  static readonly OutOfBounds: typeof OutOfBounds;
+}
+
+/** coordinate out of bounds */
+export declare class OutOfBounds extends GraphicsError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
 /** Top-level struct that references a struct defined one level deeper. */
 export interface Canvas {
   readonly width: number;
@@ -39,24 +58,24 @@ export interface WeaveffiWasmModule {
   graphics: {
     /**
      * Construct a Canvas.
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    new_canvas(width: number): Canvas;
+    newCanvas(width: number): Canvas;
     shapes: {
       /**
        * Construct a Shape.
-       * @throws {Error} if the native call fails
+       * @throws {WeaveFFIError} if the native call fails
        */
-      make_shape(sides: number): Shape;
+      makeShape(sides: number): Shape;
       /**
        * Nested function returning a struct owned by an ancestor module.
-       * @throws {Error} if the native call fails
+       * @throws {WeaveFFIError} if the native call fails
        */
       describe(): Canvas;
       geometry: {
         /**
-         * Deeper function taking an ancestor-module struct.
-         * @throws {Error} if the native call fails
+         * Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
+         * @throws {GraphicsError} on a domain error code
          */
         compute(shape: Shape): Detail;
       };

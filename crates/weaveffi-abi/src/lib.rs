@@ -163,6 +163,37 @@ pub fn result_to_out_err<T, E: ErrorReport>(
     }
 }
 
+/// The reserved error code reporting a producer **panic**.
+///
+/// Generated thunks wrap the producer call in `catch_unwind`; a panic is
+/// reported through `out_err` with this code so the consumer can distinguish
+/// "the producer has a bug" from any declared domain error. Validation rejects
+/// error domains that try to claim this value (or `0`, which means success).
+pub const PANIC_ERROR_CODE: i32 = -2;
+
+/// Best-effort extraction of a panic payload's message (`&str` and `String`
+/// payloads; anything else yields a fixed placeholder).
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "producer panicked".to_string()
+    }
+}
+
+/// Report a caught panic through `out_err` with [`PANIC_ERROR_CODE`] and the
+/// payload's message. Generated thunks call this from their `catch_unwind`
+/// error arm.
+pub fn error_set_panic(out_err: *mut weaveffi_error, payload: &(dyn std::any::Any + Send)) {
+    error_set(
+        out_err,
+        PANIC_ERROR_CODE,
+        &format!("producer panicked: {}", panic_message(payload)),
+    );
+}
+
 /// Allocate a new C string from a Rust string, returning an owned pointer.
 /// Caller must later free with `weaveffi_free_string` or `weaveffi_error_clear`.
 // `CString::new` is infallible here because interior NUL bytes are stripped

@@ -3,7 +3,8 @@
 // Exercises the JNI listener trampoline (register pins the Kotlin lambda with
 // a GlobalRef, the producer fires it synchronously on send via FunctionN.invoke,
 // unregister releases it and stops delivery) and the iterator-backed
-// events_get_messages drained through Kotlin's Iterator.
+// getMessages drained through Kotlin's Iterator. Function names are the 0.5.0
+// defaults: lowerCamelCase with the module prefix stripped.
 @file:JvmName("Main")
 
 import com.weaveffi.WeaveFFI
@@ -18,24 +19,24 @@ fun expect(cond: Boolean, msg: String) {
 
 fun main() {
     val received = mutableListOf<String>()
-    val sub = WeaveFFI.events_register_message_listener { message -> received.add(message) }
+    val sub = WeaveFFI.registerMessageListener { message -> received.add(message) }
     expect(sub > 0L, "listener id positive")
 
-    WeaveFFI.events_send_message("alpha")
-    WeaveFFI.events_send_message("beta")
+    WeaveFFI.sendMessage("alpha")
+    WeaveFFI.sendMessage("beta")
     expect(received == listOf("alpha", "beta"), "listener received sends (got $received)")
 
     val msgs = mutableListOf<String>()
-    val it = WeaveFFI.events_get_messages()
+    val it = WeaveFFI.getMessages()
     while (it.hasNext()) msgs.add(it.next())
     expect(msgs == listOf("alpha", "beta"), "iterator yields messages in order (got $msgs)")
 
     // Unregister stops delivery; the producer still records the message.
-    WeaveFFI.events_unregister_message_listener(sub)
-    WeaveFFI.events_send_message("gamma")
+    WeaveFFI.unregisterMessageListener(sub)
+    WeaveFFI.sendMessage("gamma")
     expect(received == listOf("alpha", "beta"), "no delivery after unregister (got $received)")
     val after = mutableListOf<String>()
-    val it2 = WeaveFFI.events_get_messages()
+    val it2 = WeaveFFI.getMessages()
     while (it2.hasNext()) after.add(it2.next())
     expect(after.size == 3, "producer kept recording (got $after)")
 

@@ -29,6 +29,10 @@
 //! * [`macro@module`] marks an exported namespace (the driver attribute).
 //! * [`macro@export`] exports a function; [`macro@record`] a by-value struct;
 //!   [`macro@enumeration`] a `#[repr(i32)]` C-style enum.
+//! * [`macro@interface`] declares an opaque object type whose `impl` block's
+//!   `pub fn`s become constructors, methods, and statics.
+//! * [`macro@error`] declares the module's error domain from a unit-variant
+//!   enum with explicit discriminants.
 //! * [`macro@callback`] / [`macro@listener`] declare a callback and an event
 //!   listener; [`macro@cancellable`] marks an async function as cancellable.
 //!
@@ -74,6 +78,17 @@ marker_attr! {
 marker_attr! {
     /// Declare a by-value record (struct) with generated create/getters.
     record
+}
+marker_attr! {
+    /// Declare an interface: an opaque object type with constructors, methods,
+    /// and statics read from its `impl` block. Methods must take `&self`.
+    interface
+}
+marker_attr! {
+    /// Declare the module's error domain from a unit-variant enum with
+    /// explicit discriminants. The module macro generates the matching
+    /// `ErrorReport` implementation.
+    error
 }
 marker_attr! {
     /// Declare a C-style `#[repr(i32)]` enum exported by value.

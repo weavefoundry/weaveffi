@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.5.0"
 # Exercises multi-level nested modules and type references that cross nesting
 # boundaries in every direction:
 #   * parent  -> nested child   (graphics.Canvas.root : shapes.Shape)
@@ -9,8 +9,14 @@ version: "0.4.0"
 # All bare names below are auto-qualified by the resolver to their full
 # dot-joined module path, which the C ABI then flattens to underscores
 # (e.g. graphics.shapes.geometry.Detail -> weaveffi_graphics_shapes_geometry_Detail).
+# The root module also declares an error domain that geometry.compute (two
+# levels down) relies on through domain inheritance for its `throws: true`.
 modules:
   - name: graphics
+    errors:
+      name: GraphicsError
+      codes:
+        - { name: OutOfBounds, code: 1, message: "coordinate out of bounds" }
     enums:
       - name: Unit
         doc: A measurement unit shared with nested submodules.
@@ -57,7 +63,9 @@ modules:
                   - { name: area, type: f64 }
             functions:
               - name: compute
-                doc: Deeper function taking an ancestor-module struct.
+                doc: Deeper function taking an ancestor-module struct. Throws
+                  through the root module's inherited GraphicsError domain.
                 params:
                   - { name: shape, type: Shape }
                 return: Detail
+                throws: true

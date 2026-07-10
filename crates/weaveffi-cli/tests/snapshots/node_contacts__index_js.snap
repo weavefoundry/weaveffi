@@ -5,14 +5,126 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// Prefer the default node-gyp output path; fall back to a
-// prebuilt index.node placed next to this file.
+// The WEAVEFFI_ADDON environment variable overrides the addon location
+// (an absolute path to the built .node file); otherwise prefer the
+// default node-gyp output path and fall back to a prebuilt index.node
+// placed next to this file.
 let addon;
-try {
-  addon = require('./build/Release/weaveffi.node');
-} catch (e) {
-  addon = require('./index.node');
+if (process.env.WEAVEFFI_ADDON) {
+  addon = require(process.env.WEAVEFFI_ADDON);
+} else {
+  try {
+    addon = require('./build/Release/weaveffi.node');
+  } catch (e) {
+    addon = require('./index.node');
+  }
 }
-module.exports = addon;
+
+// Re-export every native binding, then layer the idiomatic wrappers
+// (error classes, interface and rich-enum classes, function wrappers)
+// on top.
+const wv = {};
+for (const _name of Object.getOwnPropertyNames(addon)) {
+  wv[_name] = addon[_name];
+}
+
+class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super('(' + code + ') ' + (message || ''));
+    this.name = 'WeaveFFIError';
+    this.code = code;
+    this.errorMessage = message || '';
+  }
+}
+wv.WeaveFFIError = WeaveFFIError;
+function __generic(code, message) {
+  return new WeaveFFIError(code, message);
+}
+function __rebrand(e, map) {
+  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+}
+function __invoke(fn, args, map) {
+  try {
+    return fn.apply(null, args);
+  } catch (e) {
+    throw __rebrand(e, map);
+  }
+}
+function __invokeAsync(fn, args, map) {
+  return fn.apply(null, args).catch((e) => {
+    throw __rebrand(e, map);
+  });
+}
+
+class ContactsError extends WeaveFFIError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'ContactsError';
+  }
+}
+wv.ContactsError = ContactsError;
+class InvalidNameError extends ContactsError {
+  constructor(message) {
+    super(1, message || 'name must not be empty');
+    this.name = 'InvalidNameError';
+  }
+}
+InvalidNameError.CODE = 1;
+wv.InvalidNameError = InvalidNameError;
+class NotFoundError extends ContactsError {
+  constructor(message) {
+    super(2, message || 'contact not found');
+    this.name = 'NotFoundError';
+  }
+}
+NotFoundError.CODE = 2;
+wv.NotFoundError = NotFoundError;
+const __contactsErrorCodes = Object.freeze({ 1: InvalidNameError, 2: NotFoundError });
+function __contactsErrorFrom(code, message) {
+  const _cls = __contactsErrorCodes[code];
+  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+}
+
+class ContactBook {
+  constructor() {
+    this._handle = __invoke(addon.ContactBook_new, [], __generic);
+    ContactBook._cleanup.register(this, this._handle, this);
+  }
+  add(firstName, lastName, email, contactType) {
+    return __invoke(addon.ContactBook_add, [this._handle, firstName, lastName, email, contactType], __contactsErrorFrom);
+  }
+  get(id) {
+    return __invoke(addon.ContactBook_get, [this._handle, id], __contactsErrorFrom);
+  }
+  list() {
+    return __invoke(addon.ContactBook_list, [this._handle], __generic);
+  }
+  remove(id) {
+    return __invoke(addon.ContactBook_remove, [this._handle, id], __generic);
+  }
+  count() {
+    return __invoke(addon.ContactBook_count, [this._handle], __generic);
+  }
+  destroy() {
+    if (this._handle) {
+      ContactBook._cleanup.unregister(this);
+      addon.ContactBook_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
+}
+ContactBook._fromHandle = function (handle) {
+  const _o = Object.create(ContactBook.prototype);
+  _o._handle = handle;
+  ContactBook._cleanup.register(_o, handle, _o);
+  return _o;
+};
+ContactBook._cleanup = new FinalizationRegistry((handle) => {
+  if (handle) { addon.ContactBook_destroy(handle); }
+});
+wv.ContactBook = ContactBook;
+
+
+module.exports = wv;
 
 // END index.js

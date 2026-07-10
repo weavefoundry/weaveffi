@@ -11,5 +11,5 @@ fn schema_version_command_prints_0_4_0() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout.trim(), "0.4.0");
+    assert_eq!(stdout.trim(), "0.5.0");
 }

@@ -61,67 +61,8 @@ jobs:
           [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
           "$BIN" generate samples/calculator/calculator.yml -o generated
 
-      - name: Build calculator cdylib (debug)
-        run: cargo build -p calculator
-
-      - name: Build contacts cdylib (debug)
-        run: cargo build -p contacts
-
-      - name: Compile C example
-        shell: bash
-        run: |
-          case "${{ runner.os }}" in
-            Windows)
-              # Use clang to link directly against the MSVC import library that
-              # cargo emits next to the cdylib (calculator.dll.lib).
-              clang -I generated/c examples/c/main.c \
-                target/debug/calculator.dll.lib \
-                -o c_example.exe
-              ;;
-            *)
-              cc -I generated/c examples/c/main.c -L target/debug -lcalculator -o c_example
-              ;;
-          esac
-
-      - name: Run C example
-        shell: bash
-        run: |
-          case "${{ runner.os }}" in
-            macOS)   DYLD_LIBRARY_PATH=target/debug ./c_example ;;
-            Windows) PATH="$PWD/target/debug:$PATH" ./c_example.exe ;;
-            *)       LD_LIBRARY_PATH=target/debug ./c_example ;;
-          esac
-
-      - name: Build Node addon (debug)
-        run: cargo build -p weaveffi-node-addon
-
-      - name: Place Node addon next to generated loader
-        shell: bash
-        run: |
-          case "${{ runner.os }}" in
-            macOS)   cp target/debug/libindex.dylib generated/node/index.node ;;
-            Windows) cp target/debug/index.dll      generated/node/index.node ;;
-            *)       cp target/debug/libindex.so    generated/node/index.node ;;
-          esac
-
-      - name: Smoke run Node example
-        shell: bash
-        run: |
-          case "${{ runner.os }}" in
-            macOS)
-              export DYLD_LIBRARY_PATH="$PWD/target/debug"
-              export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.dylib"
-              ;;
-            Windows)
-              export PATH="$PWD/target/debug:$PATH"
-              export WEAVEFFI_LIB="$PWD/target/debug/calculator.dll"
-              ;;
-            *)
-              export LD_LIBRARY_PATH="$PWD/target/debug"
-              export WEAVEFFI_LIB="$PWD/target/debug/libcalculator.so"
-              ;;
-          esac
-          node examples/node/main.mjs
+      - name: Build sample producer cdylibs (debug)
+        run: cargo build -p calculator -p contacts -p kvstore
 
       - name: Add wasm target
         if: runner.os != 'Windows'
@@ -130,56 +71,6 @@ jobs:
       - name: Build calculator wasm (release)
         if: runner.os != 'Windows'
         run: cargo build -p calculator --target wasm32-unknown-unknown --release
-
-      - name: Install consumer toolchains (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            g++ cmake python3 golang-go ruby-ffi unzip
-          sudo apt-get install -y dotnet-sdk-8.0 || true
-          curl -sLO https://github.com/JetBrains/kotlin/releases/download/v1.9.22/kotlin-compiler-1.9.22.zip
-          unzip -q kotlin-compiler-1.9.22.zip -d "$HOME/.kotlin"
-          echo "$HOME/.kotlin/kotlinc/bin" >> "$GITHUB_PATH"
-
-      - name: Install consumer toolchains (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install cmake go kotlin
-          gem install --no-document --user-install ffi
-          echo "$(ruby -e 'puts Gem.user_dir')/bin" >> "$GITHUB_PATH"
-
-      - name: Set up Dart
-        if: runner.os != 'Windows'
-        uses: dart-lang/setup-dart@v1
-
-      - name: Set up Swift (Linux)
-        if: runner.os == 'Linux'
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "5.10"
-
-      - name: Run end-to-end consumer tests (Linux)
-        if: runner.os == 'Linux'
-        env:
-          WEAVEFFI_LIB: ${{ github.workspace }}/target/debug/libcalculator.so
-        run: bash examples/run_all.sh
-
-      - name: Run end-to-end consumer tests (macOS)
-        if: runner.os == 'macOS'
-        env:
-          WEAVEFFI_LIB: ${{ github.workspace }}/target/debug/libcalculator.dylib
-        run: bash examples/run_all.sh
-
-      - name: Run end-to-end consumer tests (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        env:
-          ONLY: python
-        run: |
-          export WEAVEFFI_LIB="$GITHUB_WORKSPACE/target/debug/calculator.dll"
-          export CONTACTS_LIB="$GITHUB_WORKSPACE/target/debug/contacts.dll"
-          bash examples/run_all.sh
 
       - name: Verify weaveffi.schema.json is up to date
         if: runner.os == 'Linux'
@@ -208,12 +99,13 @@ jobs:
   conformance:
     # Correctness gate: every consumer binds through the *generated* wrappers and
     # asserts concrete results, so a backend that lowers a type wrong, drifts a
-    # symbol, or skips a feature fails here (unlike the examples/ smoke programs
-    # in build-test, which mostly check exit status). Covers contacts + events +
-    # kvstore across C, C++, Python, Ruby, Dart, Go, Swift, .NET, Node, Kotlin,
-    # and Wasm: the events lanes exercise listeners/callbacks + iterators, and
-    # the kvstore lanes exercise handles, struct getters (bytes/optional/list/
-    # map), builders, eviction listeners, and async; see conformance/run.sh.
+    # symbol, or skips a feature fails here. Covers contacts + events + kvstore
+    # across C, C++, Python, Ruby, Dart, Go, Swift, .NET, Node, Kotlin, and
+    # Wasm: the events lanes exercise listeners/callbacks + iterators, and the
+    # kvstore lanes exercise interfaces (constructors, methods, async methods,
+    # iterator methods, destroy), typed error domains, struct getters
+    # (bytes/optional/list/map), builders, and eviction listeners; see
+    # conformance/run.sh.
     name: Conformance harness
     runs-on: ubuntu-latest
     steps:
@@ -311,62 +203,6 @@ jobs:
           }
           Write-Host "All expected generated files present"
 
-  windows-e2e-extended:
-    name: Windows E2E (Python + .NET)
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      - name: Build CLI (release)
-        run: cargo build -p weaveffi-cli --release
-
-      - name: Build calculator and contacts cdylibs (debug)
-        run: cargo build -p calculator -p contacts
-
-      - name: Generate bindings (calculator + contacts)
-        shell: bash
-        run: |
-          target/release/weaveffi.exe generate samples/calculator/calculator.yml -o generated
-          target/release/weaveffi.exe generate samples/contacts/contacts.yml   -o generated
-
-      - name: Run Python consumer
-        shell: bash
-        env:
-          WEAVEFFI_LIB: ${{ github.workspace }}\target\debug\calculator.dll
-          CONTACTS_LIB: ${{ github.workspace }}\target\debug\contacts.dll
-        run: |
-          export PATH="$GITHUB_WORKSPACE/target/debug:$PATH"
-          python examples/python/test.py
-
-      - name: Run .NET consumer
-        shell: bash
-        env:
-          WEAVEFFI_LIB: ${{ github.workspace }}\target\debug\calculator.dll
-          CONTACTS_LIB: ${{ github.workspace }}\target\debug\contacts.dll
-        run: |
-          export PATH="$GITHUB_WORKSPACE/target/debug:$PATH"
-          dotnet run --project examples/dotnet/Contacts --configuration Release \
-            --verbosity quiet --nologo
-
   android-ndk:
     name: Android NDK JNI
     runs-on: ubuntu-latest
@@ -444,40 +280,3 @@ jobs:
             fi
           done
           echo "All expected JNI symbols are exported."
-
-  swift-spm:
-    name: Swift SPM consumer
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
-
-      - name: Build CLI (release)
-        run: cargo build -p weaveffi-cli --release
-
-      - name: Build calculator and contacts cdylibs (debug)
-        run: cargo build -p calculator -p contacts
-
-      - name: Generate Swift bindings for contacts
-        run: target/release/weaveffi generate samples/contacts/contacts.yml -o generated --target swift
-
-      - name: Build Swift consumer (SPM)
-        run: swift build --package-path examples/swift
-
-      - name: Run Swift consumer against calculator dylib
-        env:
-          WEAVEFFI_LIB: ${{ github.workspace }}/target/debug/libcalculator.dylib
-          CONTACTS_LIB: ${{ github.workspace }}/target/debug/libcontacts.dylib
-        run: |
-          export DYLD_LIBRARY_PATH="$GITHUB_WORKSPACE/target/debug"
-          out=$(examples/swift/.build/debug/App)
-          echo "$out"
-          echo "$out" | grep -q "^OK$"

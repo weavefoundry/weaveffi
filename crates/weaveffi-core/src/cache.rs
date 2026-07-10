@@ -173,7 +173,7 @@ mod tests {
 
     fn minimal_api() -> Api {
         Api {
-            version: "0.4.0".to_string(),
+            version: "0.5.0".to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -194,11 +194,13 @@ mod tests {
                     ],
                     returns: Some(TypeRef::I32),
                     doc: None,
+                    throws: false,
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
                     since: None,
                 }],
+                interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
                 callbacks: vec![],
@@ -309,6 +311,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
@@ -454,6 +457,7 @@ mod tests {
             ],
             returns: Some(TypeRef::I32),
             doc: None,
+            throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,

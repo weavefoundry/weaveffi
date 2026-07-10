@@ -16,6 +16,85 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Optionals -> null handle / null pointer (0); scalars boxed by pointer
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export class WeaveFFIError extends Error {
+  constructor(code, message) {
+    super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
+    this.name = new.target.name;
+    this.code = code;
+  }
+}
+
+/** Base error for the `products` module's error domain. */
+export class ProductsError extends WeaveFFIError {}
+
+// price must be positive
+export class InvalidPrice extends ProductsError {
+  constructor(message = "price must be positive") {
+    super(1, message);
+  }
+}
+InvalidPrice.CODE = 1;
+ProductsError.InvalidPrice = InvalidPrice;
+
+// product not found
+export class ProductNotFound extends ProductsError {
+  constructor(message = "product not found") {
+    super(2, message);
+  }
+}
+ProductNotFound.CODE = 2;
+ProductsError.ProductNotFound = ProductNotFound;
+
+const _PRODUCTS_ERROR_CODES = Object.freeze({
+  1: InvalidPrice,
+  2: ProductNotFound,
+});
+
+// Build the ProductsError subclass matching `code`, or a generic
+// WeaveFFIError for codes outside the domain (panics, marshalling).
+function _productsErrorFrom(code, message) {
+  const _cls = _PRODUCTS_ERROR_CODES[code];
+  if (!_cls) return new WeaveFFIError(code, message);
+  return message ? new _cls(message) : new _cls();
+}
+
+/** Base error for the `orders` module's error domain. */
+export class OrdersError extends WeaveFFIError {}
+
+// order not found
+export class OrderNotFound extends OrdersError {
+  constructor(message = "order not found") {
+    super(1, message);
+  }
+}
+OrderNotFound.CODE = 1;
+OrdersError.OrderNotFound = OrderNotFound;
+
+// order must contain at least one item
+export class EmptyOrder extends OrdersError {
+  constructor(message = "order must contain at least one item") {
+    super(2, message);
+  }
+}
+EmptyOrder.CODE = 2;
+OrdersError.EmptyOrder = EmptyOrder;
+
+const _ORDERS_ERROR_CODES = Object.freeze({
+  1: OrderNotFound,
+  2: EmptyOrder,
+});
+
+// Build the OrdersError subclass matching `code`, or a generic
+// WeaveFFIError for codes outside the domain (panics, marshalling).
+function _ordersErrorFrom(code, message) {
+  const _cls = _ORDERS_ERROR_CODES[code];
+  if (!_cls) return new WeaveFFIError(code, message);
+  return message ? new _cls(message) : new _cls();
+}
+
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
 
@@ -67,6 +146,9 @@ function _allocErr(wasm) {
 }
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
+// Non-throwing wrappers route here: a non-zero code can only be a
+// producer panic or a marshalling failure, surfaced as the generic
+// WeaveFFIError.
 function _checkErr(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
@@ -75,13 +157,41 @@ function _checkErr(wasm, errPtr) {
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
     wasm.weaveffi_dealloc(errPtr, 8);
-    throw new Error(`WeaveFFI error ${code}: ${msg}`);
+    throw new WeaveFFIError(code, msg);
   }
 }
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
   wasm.weaveffi_dealloc(errPtr, 8);
+}
+
+// Throw the `ProductsError` domain error (and free the slot) if the error slot
+// carries a non-zero code.
+function _checkProductsError(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code !== 0) {
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
+    wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
+    throw _productsErrorFrom(code, msg);
+  }
+}
+
+// Throw the `OrdersError` domain error (and free the slot) if the error slot
+// carries a non-zero code.
+function _checkOrdersError(wasm, errPtr) {
+  const dv = new DataView(wasm.memory.buffer);
+  const code = dv.getInt32(errPtr, true);
+  if (code !== 0) {
+    const msgPtr = dv.getUint32(errPtr + 4, true);
+    const msg = _readCStr(wasm, msgPtr) || '';
+    wasm.weaveffi_error_clear(errPtr);
+    wasm.weaveffi_dealloc(errPtr, 8);
+    throw _ordersErrorFrom(code, msg);
+  }
 }
 
 export const Category = Object.freeze({
@@ -273,61 +383,84 @@ export async function loadWeaveffiWasm(url) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const wasm = instance.exports;
 
+  // A product catalog owning its products
+  class Catalog {
+    constructor() {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_products_Catalog_new(_err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      this._handle = _r;
+    }
+    static _wrap(handle) {
+      const _o = Object.create(Catalog.prototype);
+      _o._handle = handle;
+      return _o;
+    }
+    free() {
+      if (this._handle !== 0) {
+        wasm.weaveffi_products_Catalog_destroy(this._handle);
+        this._handle = 0;
+      }
+    }
+    addProduct(name, price, category) {
+      const [a0_p, a0_s] = _cstr(wasm, name);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_products_Catalog_add_product(this._handle, a0_p, price, category, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_s);
+      _checkProductsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return new Product(wasm, _r);
+    }
+    getProduct(id) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_products_Catalog_get_product(this._handle, BigInt(id), _err);
+      _checkProductsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return new Product(wasm, _r);
+    }
+    search(category) {
+      const _lp = wasm.weaveffi_alloc(4);
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_products_Catalog_search(this._handle, category, _lp, _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      const _dv = new DataView(wasm.memory.buffer);
+      const _len = _dv.getUint32(_lp, true);
+      wasm.weaveffi_dealloc(_lp, 4);
+      const _out = [];
+      {
+        const dv = new DataView(wasm.memory.buffer);
+        for (let i = 0; i < _len; i++) _out.push(new Product(wasm, dv.getInt32(_r + i * 4, true)));
+      }
+      return _out;
+    }
+    updatePrice(id, price) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_products_Catalog_update_price(this._handle, BigInt(id), price, _err);
+      _checkProductsError(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r !== 0;
+    }
+    remove(id) {
+      const _err = _allocErr(wasm);
+      const _r = wasm.weaveffi_products_Catalog_remove(this._handle, BigInt(id), _err);
+      _checkErr(wasm, _err);
+      _freeErr(wasm, _err);
+      return _r !== 0;
+    }
+  }
+
   return {
     _raw: wasm,
     products: {
-      create_product(name, price, category) {
-        const [a0_p, a0_s] = _cstr(wasm, name);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_products_create_product(a0_p, price, category, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_s);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r;
-      },
-      get_product(id) {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_products_get_product(BigInt(id), _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return new Product(wasm, _r);
-      },
-      search_products(category) {
-        const _lp = wasm.weaveffi_alloc(4);
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_products_search_products(category, _lp, _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        const _dv = new DataView(wasm.memory.buffer);
-        const _len = _dv.getUint32(_lp, true);
-        wasm.weaveffi_dealloc(_lp, 4);
-        const _out = [];
-        {
-          const dv = new DataView(wasm.memory.buffer);
-          for (let i = 0; i < _len; i++) _out.push(new Product(wasm, dv.getInt32(_r + i * 4, true)));
-        }
-        return _out;
-      },
-      update_price(id, price) {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_products_update_price(BigInt(id), price, _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r !== 0;
-      },
-      delete_product(id) {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_products_delete_product(BigInt(id), _err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r !== 0;
-      },
+      Catalog: Catalog,
       Product: {
         create: (...args) => Product.create(wasm, ...args),
       },
     },
     orders: {
-      create_order(items) {
+      createOrder(items) {
         const a0_arr = items || [];
         const a0_n = a0_arr.length;
         const a0_base = wasm.weaveffi_alloc(a0_n ? a0_n * 4 : 1);
@@ -338,27 +471,27 @@ export async function loadWeaveffiWasm(url) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_orders_create_order(a0_base, a0_n, _err);
         wasm.weaveffi_dealloc(a0_base, a0_n ? a0_n * 4 : 1);
-        _checkErr(wasm, _err);
+        _checkOrdersError(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
-      get_order(id) {
+      getOrder(id) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_orders_get_order(BigInt(id), _err);
-        _checkErr(wasm, _err);
+        _checkOrdersError(wasm, _err);
         _freeErr(wasm, _err);
         return new Order(wasm, _r);
       },
-      cancel_order(id) {
+      cancelOrder(id) {
         const _err = _allocErr(wasm);
         const _r = wasm.weaveffi_orders_cancel_order(BigInt(id), _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r !== 0;
       },
-      add_product_to_order(order_id, product) {
+      addProductToOrder(orderId, product) {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_orders_add_product_to_order(BigInt(order_id), product._handle, _err);
+        const _r = wasm.weaveffi_orders_add_product_to_order(BigInt(orderId), product._handle, _err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r !== 0;

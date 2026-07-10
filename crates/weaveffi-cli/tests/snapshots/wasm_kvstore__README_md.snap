@@ -46,6 +46,11 @@ export the following functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
 
+Wrappers of functions declared `throws` raise the declaring module's typed
+error class (a `WeaveFFIError` subclass with a per-code subclass, such as
+`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
+for producer panics and marshalling failures.
+
 ## Unsupported Features
 
 This IDL uses features the wasm target does not support (generated because
@@ -63,138 +68,141 @@ you need them.
 
 ### Module: `kv`
 
-#### Functions
+#### Error Domain: `KvError`
 
-##### `weaveffi_kv_open_store`
+Throwing wrappers in this module raise `KvError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+
+| Class | Code | Default Message |
+|-------|------|-----------------|
+| `KeyNotFound` | `1001` | key not found |
+| `Expired` | `1002` | entry expired |
+| `StoreFull` | `1003` | store has reached capacity |
+| `IoError` | `1004` | I/O failure |
+
+#### Interfaces
+
+##### `Store`
+
+An in-memory key-value store owning its entries; destroying the object releases all of its state
+
+Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+
+##### `weaveffi_kv_Store_open`
 
 Open (or create) a store backed by the given filesystem path
 
-`weaveffi_kv_open_store(path: i32, i32) -> i64`
+`weaveffi_kv_Store_open(path: i32, i32) -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `path` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `handle` | `i64` | opaque pointer |
+| _returns_ | `Store` | `i64` | opaque handle in linear memory |
 
-##### `weaveffi_kv_close_store`
-
-Close the store and release all in-memory resources
-
-`weaveffi_kv_close_store(store: i64) -> void`
-
-| Param | API Type | Wasm | Notes |
-|-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
-
-##### `weaveffi_kv_put`
+##### `weaveffi_kv_Store_put`
 
 Insert or replace a value, returning true on success
 
-`weaveffi_kv_put(store: i64, key: i32, i32, value: i32, i32, kind: i32, ttl_seconds: i32, i32) -> i32`
+`weaveffi_kv_Store_put(key: i32, i32, value: i32, i32, kind: i32, ttl_seconds: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | `key` | `string` | `i32, i32` | ptr + len in linear memory |
 | `value` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | `kind` | `EntryKind` | `i32` | variant discriminant |
 | `ttl_seconds` | `i64?` | `i32, i32` | is_present flag + value |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
-##### `weaveffi_kv_get`
+##### `weaveffi_kv_Store_get`
 
 Look up an entry by key; returns null if missing or expired
 
-`weaveffi_kv_get(store: i64, key: i32, i32) -> i64`
+`weaveffi_kv_Store_get(key: i32, i32) -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | `key` | `string` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `Entry?` | `i64` | opaque handle, 0 = absent |
 
-##### `weaveffi_kv_delete`
+##### `weaveffi_kv_Store_delete`
 
 Remove the entry for the given key, returning true if it existed
 
-`weaveffi_kv_delete(store: i64, key: i32, i32) -> i32`
+`weaveffi_kv_Store_delete(key: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | `key` | `string` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
-##### `weaveffi_kv_list_keys`
+##### `weaveffi_kv_Store_list_keys`
 
 Stream every key, optionally filtered by a prefix
 
-`weaveffi_kv_list_keys(store: i64, prefix: i32, i32) -> i64`
+`weaveffi_kv_Store_list_keys(prefix: i32, i32) -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | `prefix` | `string?` | `i32, i32` | is_present flag + value |
 | _returns_ | `iter<string>` | `i64` | opaque iterator handle |
 
-##### `weaveffi_kv_count`
+##### `weaveffi_kv_Store_count`
 
 Return the number of live entries in the store
 
-`weaveffi_kv_count(store: i64) -> i64`
+`weaveffi_kv_Store_count() -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | _returns_ | `i64` | `i64` | native Wasm i64 |
 
-##### `weaveffi_kv_clear`
+##### `weaveffi_kv_Store_clear`
 
 Drop every entry from the store
 
-`weaveffi_kv_clear(store: i64) -> void`
+`weaveffi_kv_Store_clear() -> void`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 
-##### `weaveffi_kv_compact_async`
+##### `weaveffi_kv_Store_compact`
 
 Reclaim space asynchronously; returns the number of bytes reclaimed
 
-`weaveffi_kv_compact_async(store: i64) -> i64`
+`weaveffi_kv_Store_compact() -> i64`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | _returns_ | `i64` | `i64` | native Wasm i64 |
 
-##### `weaveffi_kv_legacy_put`
+##### `weaveffi_kv_Store_legacy_put`
 
 Legacy single-shot put kept for compatibility
 
 **Deprecated:** use put() with explicit kind
 
-`weaveffi_kv_legacy_put(store: i64, key: i32, i32, value: i32, i32) -> i32`
+`weaveffi_kv_Store_legacy_put(key: i32, i32, value: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `store` | `handle` | `i64` | opaque pointer |
 | `key` | `string` | `i32, i32` | ptr + len in linear memory |
 | `value` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
+##### `weaveffi_kv_Store_default_capacity`
+
+The largest number of live entries one store will hold
+
+`weaveffi_kv_Store_default_capacity() -> i64`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `i64` | `i64` | native Wasm i64 |
+
+##### `weaveffi_kv_Store_destroy`
+
+Releases the object reference. Called by the wrapper's `free()`.
+
 #### Structs
-
-##### `Store`
-
-Opaque key-value store handle target type
-
-Passed as opaque handle (`i64`).
-
-| Accessor | Wasm Return |
-|----------|-------------|
-| `weaveffi_kv_Store_get_id` | `i64` |
 
 ##### `Entry`
 

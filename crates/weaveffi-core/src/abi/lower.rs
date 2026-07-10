@@ -77,6 +77,13 @@ fn typed_handle_ctype(name: &str, current_module: &str) -> CType {
     CType::ptr(CType::StructTag { module, name })
 }
 
+/// Resolve an interface reference (possibly `module.Name`) to a pointer to its
+/// opaque C tag. Interfaces and structs share the tag spelling
+/// (`{prefix}_{module}_{Name}`); only the ownership convention differs.
+fn interface_ptr_ctype(name: &str, current_module: &str) -> CType {
+    CType::ptr(struct_tag(name, current_module))
+}
+
 /// The C "element" type used in pointer/array contexts. Composite shapes
 /// collapse to their innermost element; maps collapse to `void*`.
 pub fn element_ctype(ty: &TypeRef, module: &str) -> CType {
@@ -97,8 +104,10 @@ pub fn element_ctype(ty: &TypeRef, module: &str) -> CType {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => CType::const_ptr(CType::Char),
         TypeRef::Bytes | TypeRef::BorrowedBytes => CType::const_ptr(CType::Uint8),
         // A struct or rich (algebraic) enum crosses the ABI as an opaque object
-        // pointer; both are spelled `TypeRef::Struct` after resolution.
+        // pointer; both are spelled `TypeRef::Struct` after resolution. An
+        // interface object uses the same pointer spelling.
         TypeRef::Struct(s) => CType::ptr(struct_tag(s, module)),
+        TypeRef::Interface(i) => interface_ptr_ctype(i, module),
         TypeRef::Enum(e) => enum_ctype(e, module),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             element_ctype(inner, module)
@@ -151,6 +160,15 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
             CType::Ptr {
                 konst: west_if_immut,
                 pointee: Box::new(struct_tag(s, module)),
+            },
+        )],
+        // An interface parameter borrows the object for the call: the callee
+        // reads through the const pointer and never takes ownership.
+        TypeRef::Interface(i) => vec![AbiParam::new(
+            name,
+            CType::Ptr {
+                konst: ConstPos::West,
+                pointee: Box::new(struct_tag(i, module)),
             },
         )],
         TypeRef::Enum(e) => vec![AbiParam::new(name, enum_ctype(e, module))],
@@ -253,6 +271,8 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
         TypeRef::TypedHandle(n) => no_out(typed_handle_ctype(n, module)),
         // A struct or rich enum is returned as an owning pointer to its tag.
         TypeRef::Struct(s) => no_out(CType::ptr(struct_tag(s, module))),
+        // A returned interface transfers ownership of a new object reference.
+        TypeRef::Interface(i) => no_out(interface_ptr_ctype(i, module)),
         TypeRef::Enum(e) => no_out(enum_ctype(e, module)),
         TypeRef::Optional(inner) => {
             if is_c_pointer_type(inner) {

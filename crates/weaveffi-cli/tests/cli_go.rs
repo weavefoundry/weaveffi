@@ -38,9 +38,50 @@ fn generate_go_contacts() {
         go.contains("type Contact struct {"),
         "weaveffi.go should contain Contact struct"
     );
+
+    // The ContactBook interface surfaces as a wrapper struct with a factory
+    // constructor, methods on the wrapper, and an explicit Close.
     assert!(
-        go.contains("weaveffi_contacts_create_contact"),
-        "weaveffi.go should contain create_contact C symbol"
+        go.contains("type ContactBook struct {"),
+        "weaveffi.go should contain the ContactBook wrapper"
+    );
+    assert!(
+        go.contains("func NewContactBook() *ContactBook {"),
+        "ctor named `new` should surface as NewContactBook"
+    );
+    assert!(
+        go.contains("func (s *ContactBook) Add(firstName string, lastName string, email *string, contactType ContactType) (*Contact, error) {"),
+        "throwing method should keep the (T, error) shape"
+    );
+    assert!(
+        go.contains("func (s *ContactBook) Count() int32 {"),
+        "plain method should have a bare return"
+    );
+    assert!(
+        go.contains("C.weaveffi_contacts_ContactBook_add(s.ptr, "),
+        "methods should pass s.ptr as the leading C argument"
+    );
+    assert!(
+        go.contains("C.weaveffi_contacts_ContactBook_destroy(s.ptr)"),
+        "Close should call the interface destroy symbol"
+    );
+
+    // The typed error domain: one Go error type plus exported code constants.
+    assert!(
+        go.contains("type ContactsError struct {"),
+        "weaveffi.go should contain the typed ContactsError"
+    );
+    assert!(
+        go.contains("ContactsErrorInvalidName int32 = 1"),
+        "missing InvalidName code constant"
+    );
+    assert!(
+        go.contains("ContactsErrorNotFound int32 = 2"),
+        "missing NotFound code constant"
+    );
+    assert!(
+        go.contains("return nil, wvMapContacts(wvTakeError(&cErr))"),
+        "throwing methods should map through the domain helper"
     );
 
     assert!(out_path.join("go/go.mod").exists(), "missing go/go.mod");

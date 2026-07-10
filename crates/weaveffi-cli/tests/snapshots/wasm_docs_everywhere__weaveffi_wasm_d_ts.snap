@@ -7,6 +7,32 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
+/** Base error for WeaveFFI failures: domain errors extend it, and it is
+ * thrown directly for unknown codes, marshalling failures, and producer
+ * panics. Carries the stable ABI `code`. */
+export declare class WeaveFFIError extends Error {
+  constructor(code: number, message?: string);
+  code: number;
+}
+
+/** Base error for the `docs` module's error domain. */
+export declare class DocsErrorsError extends WeaveFFIError {
+  static readonly NotFound: typeof NotFound;
+  static readonly InvalidStatus: typeof InvalidStatus;
+}
+
+/** Returned when no document matches the requested id */
+export declare class NotFound extends DocsErrorsError {
+  constructor(message?: string);
+  static readonly CODE: 1;
+}
+
+/** Raised when attempting to move into a forbidden state */
+export declare class InvalidStatus extends DocsErrorsError {
+  constructor(message?: string);
+  static readonly CODE: 2;
+}
+
 /**
  * Represents a single document tracked by the system.
  *
@@ -14,7 +40,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
  */
 export interface Document {
   /** Stable opaque identifier */
-  readonly id: number;
+  readonly id: bigint;
   /** Human-readable title shown in lists */
   readonly title: string;
   /** Current lifecycle status */
@@ -37,6 +63,43 @@ export declare const Status: Readonly<{
   Archived: 2;
 }>;
 
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+export declare class Notebook {
+  /**
+   * Create an empty notebook
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  constructor();
+  /**
+   * Add a document, returning its position in the notebook
+   * @param document The document to add
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  insert(document: Document): number;
+  /**
+   * Look up a document by identifier, failing when none matches
+   * @param id Identifier of the document to find
+   * @throws {DocsErrorsError} on a domain error code
+   */
+  find(id: bigint): Document;
+  /**
+   * The number of documents currently held
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  size(): number;
+  /**
+   * The largest number of documents one notebook will hold
+   * @throws {WeaveFFIError} if the native call fails
+   */
+  static maxDocuments(): number;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
+}
+
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   docs: {
@@ -47,21 +110,22 @@ export interface WeaveffiWasmModule {
      * it explicitly to make it visible.
      * @param title Human-readable title for the new document
      * @param tags Initial set of tags (may be empty)
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    create_document(title: string, tags: string[]): Document;
+    createDocument(title: string, tags: string[]): Document;
     /**
      * Look up a document by identifier
      * @param id Identifier returned from create_document
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    get_document(id: number): Document | null;
+    getDocument(id: bigint): Document | null;
     /**
      * Publish a document in the background
      * @param id Identifier of the document to publish
-     * @throws {Error} if the native call fails
+     * @throws {WeaveFFIError} if the native call fails
      */
-    publish_async(id: number): Promise<boolean>;
+    publishAsync(id: bigint): Promise<boolean>;
+    Notebook: typeof Notebook;
   };
 }
 

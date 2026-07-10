@@ -14,12 +14,17 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     const char* msg = err->message ? err->message : "WeaveFFI error";
-    jclass exClass = (*env)->FindClass(env, "java/lang/RuntimeException");
-    (*env)->ThrowNew(env, exClass, msg);
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/WeaveFFIException");
+    if (exClass != NULL) {
+        jmethodID ctor = (*env)->GetMethodID(env, exClass, "<init>", "(ILjava/lang/String;)V");
+        jstring jmsg = (*env)->NewStringUTF(env, msg);
+        jthrowable ex = (jthrowable)(*env)->NewObject(env, exClass, ctor, (jint)err->code, jmsg);
+        if (ex != NULL) { (*env)->Throw(env, ex); }
+    }
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_shapes_1describeJni(JNIEnv* env, jclass clazz, jlong shape) {
+JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_describeJni(JNIEnv* env, jclass clazz, jlong shape) {
     weaveffi_error err = {0, NULL};
     const char* rv = weaveffi_shapes_describe((const weaveffi_shapes_Shape*)(intptr_t)shape, &err);
     if (err.code != 0) {
@@ -31,7 +36,7 @@ JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_shapes_1describeJni(JNIEnv*
     return out;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_shapes_1scaleJni(JNIEnv* env, jclass clazz, jlong shape, jdouble factor) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_scaleJni(JNIEnv* env, jclass clazz, jlong shape, jdouble factor) {
     weaveffi_error err = {0, NULL};
     weaveffi_shapes_Shape* rv = weaveffi_shapes_scale((const weaveffi_shapes_Shape*)(intptr_t)shape, (double)factor, &err);
     if (err.code != 0) {
@@ -41,7 +46,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_shapes_1scaleJni(JNIEnv* env,
     return (jlong)(intptr_t)rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_shapes_1sum_1bytes(JNIEnv* env, jclass clazz, jbyteArray values) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_sumBytes(JNIEnv* env, jclass clazz, jbyteArray values) {
     weaveffi_error err = {0, NULL};
     jbyte* values_elems = (*env)->GetByteArrayElements(env, values, NULL);
     jsize values_len = (*env)->GetArrayLength(env, values);
@@ -54,7 +59,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_shapes_1sum_1bytes(JNIEnv* en
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_shapes_1make_1numericsJni(JNIEnv* env, jclass clazz, jbyte a, jshort b, jint c, jlong d, jbyte e, jshort f, jlong g, jlong h, jfloat i, jdouble j) {
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_makeNumericsJni(JNIEnv* env, jclass clazz, jbyte a, jshort b, jint c, jlong d, jbyte e, jshort f, jlong g, jlong h, jfloat i, jdouble j) {
     weaveffi_error err = {0, NULL};
     weaveffi_shapes_Numerics* rv = weaveffi_shapes_make_numerics((int8_t)a, (int16_t)b, (int32_t)c, (int64_t)d, (uint8_t)e, (uint16_t)f, (uint32_t)g, (uint64_t)h, (float)i, (double)j, &err);
     if (err.code != 0) {

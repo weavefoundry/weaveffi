@@ -18,86 +18,86 @@ class WeaveFFI {
         /**
          * Trivial cross-module helper
          */
-        @JvmStatic external fun shared_ping(): String
+        @JvmStatic external fun ping(): String
         /** Subscribe to OnReady events */
-        @JvmStatic external fun kitchen_register_ready_listener(callback: (Int, String) -> Unit): Long
-        @JvmStatic external fun kitchen_unregister_ready_listener(id: Long)
+        @JvmStatic external fun registerReadyListener(callback: (Int, String) -> Unit): Long
+        @JvmStatic external fun unregisterReadyListener(id: Long)
         /**
          * Identity for bool
          */
-        @JvmStatic external fun kitchen_bool_id(x: Boolean): Boolean
-        @JvmStatic external fun kitchen_i32_id(x: Int): Int
-        @JvmStatic external fun kitchen_u32_id(x: Long): Long
-        @JvmStatic external fun kitchen_i64_id(x: Long): Long
-        @JvmStatic external fun kitchen_f64_id(x: Double): Double
-        @JvmStatic external fun kitchen_echo_string(s: String): String
-        @JvmStatic external fun kitchen_echo_bytes(b: ByteArray): ByteArray
+        @JvmStatic external fun boolId(x: Boolean): Boolean
+        @JvmStatic external fun i32Id(x: Int): Int
+        @JvmStatic external fun u32Id(x: Long): Long
+        @JvmStatic external fun i64Id(x: Long): Long
+        @JvmStatic external fun f64Id(x: Double): Double
+        @JvmStatic external fun echoString(s: String): String
+        @JvmStatic external fun echoBytes(b: ByteArray): ByteArray
         /**
          * Borrowed string parameter
          */
-        @JvmStatic external fun kitchen_echo_borrowed_str(s: String): String
+        @JvmStatic external fun echoBorrowedStr(s: String): String
         /**
          * Borrowed bytes parameter
          */
-        @JvmStatic external fun kitchen_echo_borrowed_bytes(b: ByteArray): ByteArray
+        @JvmStatic external fun echoBorrowedBytes(b: ByteArray): ByteArray
         /**
          * Returns an opaque handle
          */
-        @JvmStatic external fun kitchen_open_handle(): Long
+        @JvmStatic external fun openHandle(): Long
         /**
          * Returns a typed handle
          */
-        @JvmStatic private external fun kitchen_open_typed_handleJni(): Long
-        @JvmStatic fun kitchen_open_typed_handle(): Token = Token(kitchen_open_typed_handleJni())
+        @JvmStatic private external fun openTypedHandleJni(): Long
+        @JvmStatic fun openTypedHandle(): Token = Token(openTypedHandleJni())
         /**
          * Optional struct return
          */
-        @JvmStatic private external fun kitchen_maybe_itemJni(id: Long): Long?
-        @JvmStatic fun kitchen_maybe_item(id: Long): Item? = kitchen_maybe_itemJni(id)?.let { Item(it) }
+        @JvmStatic private external fun maybeItemJni(id: Long): Long?
+        @JvmStatic fun maybeItem(id: Long): Item? = maybeItemJni(id)?.let { Item(it) }
         /**
          * List of structs
          */
-        @JvmStatic external fun kitchen_list_items(): LongArray
+        @JvmStatic external fun listItems(): LongArray
         /**
          * Map return type
          */
-        @JvmStatic external fun kitchen_get_attrs(): Map<String, Int>
+        @JvmStatic external fun getAttrs(): Map<String, Int>
         /**
          * Iterator return type
          */
-        @JvmStatic external fun kitchen_stream_items(): Iterator<Long>
+        @JvmStatic external fun streamItems(): Iterator<Long>
         /**
          * Returns the shared Token type from another module
          */
-        @JvmStatic private external fun kitchen_cross_module_tokenJni(): Long
-        @JvmStatic fun kitchen_cross_module_token(): Token = Token(kitchen_cross_module_tokenJni())
+        @JvmStatic private external fun crossModuleTokenJni(): Long
+        @JvmStatic fun crossModuleToken(): Token = Token(crossModuleTokenJni())
         /**
          * Async operation
          */
-        @JvmStatic private external fun kitchen_do_asyncAsync(input: String, callback: Any)
-        @JvmStatic suspend fun kitchen_do_async(input: String): String = suspendCancellableCoroutine { cont ->
-            kitchen_do_asyncAsync(input, WeaveContinuation(cont))
+        @JvmStatic private external fun doAsyncAsync(input: String, callback: Any)
+        @JvmStatic suspend fun doAsync(input: String): String = suspendCancellableCoroutine { cont ->
+            doAsyncAsync(input, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
         }
         /**
          * Cancellable async operation
          */
-        @JvmStatic private external fun kitchen_do_cancellableAsync(input: String, cancelToken: Long, callback: Any)
-        @JvmStatic suspend fun kitchen_do_cancellable(input: String): String = suspendCancellableCoroutine { cont ->
-            kitchen_do_cancellableAsync(input, 0L, WeaveContinuation(cont))
+        @JvmStatic private external fun doCancellableAsync(input: String, cancelToken: Long, callback: Any)
+        @JvmStatic suspend fun doCancellable(input: String): String = suspendCancellableCoroutine { cont ->
+            doCancellableAsync(input, 0L, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
         }
         /**
          * Legacy operation kept for compatibility
          */
         @Deprecated("Use new_op instead")
-        @JvmStatic external fun kitchen_legacy_op(): Int
+        @JvmStatic external fun legacyOp(): Int
         /**
          * Replacement for legacy_op
          */
-        @JvmStatic external fun kitchen_new_op(): Int
+        @JvmStatic external fun newOp(): Int
         /**
          * Trivial nested-module function
          */
-        @JvmStatic external fun kitchen_nested_hello(): String
+        @JvmStatic external fun hello(): String
     }
 }
 
@@ -283,15 +283,75 @@ class ItemBuilder {
     }
 }
 
-sealed class WeaveFFIException(val code: Int, message: String) : Exception(message) {
-    class NotFound(message: String = "Item not found") : WeaveFFIException(1, message)
-    class InvalidInput(message: String = "Invalid input") : WeaveFFIException(2, message)
+/** A pocket-sized interface exercising the object surface */
+class Gadget internal constructor(internal var handle: Long) : java.io.Closeable {
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNew(id: Long): Long
+        @JvmStatic private external fun nativeVersion(): String
+        @JvmStatic private external fun nativeDescribe(selfHandle: Long): String
+        @JvmStatic private external fun nativePoke(selfHandle: Long, times: Int): Int
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+
+        /**
+         * Create a gadget with the given id
+         */
+        operator fun invoke(id: Long): Gadget = Gadget(nativeNew(id))
+
+        /**
+         * The gadget subsystem version string
+         */
+        fun version(): String = nativeVersion()
+    }
+
+    /**
+     * Render the gadget as a human-readable string
+     */
+    fun describe(): String = nativeDescribe(handle)
+
+    /**
+     * Poke the gadget a number of times, failing on a negative count
+     */
+    fun poke(times: Int): Int = nativePoke(handle, times)
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
 }
 
-internal class WeaveContinuation<T>(private val cont: kotlinx.coroutines.CancellableContinuation<T>) {
+/** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
+open class WeaveFFIException(val code: Int, message: String) : Exception(message)
+
+/** Typed error domain `KitchenErrors` declared by module `kitchen`. */
+sealed class KitchenErrorsException(code: Int, message: String) : WeaveFFIException(code, message) {
+    class NotFound(message: String = "Item not found") : KitchenErrorsException(1, message)
+    class InvalidInput(message: String = "Invalid input") : KitchenErrorsException(2, message)
+
+    companion object {
+        /** Map a raw `KitchenErrors` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+            1 -> NotFound(message)
+            2 -> InvalidInput(message)
+            else -> WeaveFFIException(code, message)
+        }
+    }
+}
+
+internal class WeaveContinuation<T>(
+    private val cont: kotlinx.coroutines.CancellableContinuation<T>,
+    private val mapError: (Int, String) -> Throwable
+) {
     @Suppress("UNCHECKED_CAST")
     fun onSuccess(result: Any?) { cont.resume(result as T) }
-    fun onError(message: String) { cont.resumeWithException(RuntimeException(message)) }
+    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }
 }
 
 // END WeaveFFI.kt

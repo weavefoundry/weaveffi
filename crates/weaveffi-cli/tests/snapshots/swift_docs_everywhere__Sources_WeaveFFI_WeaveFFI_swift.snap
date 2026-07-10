@@ -10,22 +10,14 @@ import Foundation
 
 public enum WeaveFFIError: Error, LocalizedError {
     case error(code: Int32, message: String)
-    /// Returned when no document matches the requested id
-    case notFound
-    /// Raised when attempting to move into a forbidden state
-    case invalidStatus
     public var errorDescription: String? {
         switch self {
         case let .error(_, message): return message
-        case .notFound: return "Document not found"
-        case .invalidStatus: return "Invalid status transition"
         }
     }
     public var errorCode: Int32 {
         switch self {
         case let .error(code, _): return code
-        case .notFound: return 1
-        case .invalidStatus: return 2
         }
     }
 }
@@ -36,11 +28,17 @@ func check(_ err: inout weaveffi_error) throws {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
         weaveffi_error_clear(&err)
-        switch code {
-        case 1: throw WeaveFFIError.notFound
-        case 2: throw WeaveFFIError.invalidStatus
-        default: throw WeaveFFIError.error(code: code, message: message)
-        }
+        throw WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func trap(_ err: inout weaveffi_error) {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        fatalError("\(code): \(message)")
     }
 }
 
@@ -56,9 +54,9 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
-private final class ContinuationRef<T> {
-    let value: CheckedContinuation<T, Error>
-    init(_ value: CheckedContinuation<T, Error>) { self.value = value }
+private final class ContinuationRef<T, E: Error> {
+    let value: CheckedContinuation<T, E>
+    init(_ value: CheckedContinuation<T, E>) { self.value = value }
 }
 
 final class WvCallbackBox<T> {
@@ -68,6 +66,46 @@ final class WvCallbackBox<T> {
 
 var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
 let wvListenerLock = NSLock()
+
+/// Typed errors reported by the `docs` module.
+public enum DocsErrorsError: Error, LocalizedError {
+    /// Returned when no document matches the requested id
+    case notFound(message: String)
+    /// Raised when attempting to move into a forbidden state
+    case invalidStatus(message: String)
+    public var errorDescription: String? {
+        switch self {
+        case let .notFound(message): return message
+        case let .invalidStatus(message): return message
+        }
+    }
+    /// The numeric ABI code carried by this error.
+    public var errorCode: Int32 {
+        switch self {
+        case .notFound: return 1
+        case .invalidStatus: return 2
+        }
+    }
+}
+
+@inline(__always)
+func mapDocs(code: Int32, message: String) -> Error {
+    switch code {
+    case 1: return DocsErrorsError.notFound(message: message.isEmpty ? "Document not found" : message)
+    case 2: return DocsErrorsError.invalidStatus(message: message.isEmpty ? "Invalid status transition" : message)
+    default: return WeaveFFIError.error(code: code, message: message)
+    }
+}
+
+@inline(__always)
+func checkDocs(_ err: inout weaveffi_error) throws {
+    if err.code != 0 {
+        let code = err.code
+        let message = err.message.flatMap { String(cString: $0) } ?? ""
+        weaveffi_error_clear(&err)
+        throw mapDocs(code: code, message: message)
+    }
+}
 
 /// Lifecycle status of a document.
 ///
@@ -182,10 +220,64 @@ public class DocumentBuilder {
     }
 }
 
+/// An ordered collection of documents.
+///
+/// Notebooks own their documents and release them when destroyed.
+public final class Notebook {
+    let ptr: OpaquePointer
+
+    init(ptr: OpaquePointer) {
+        self.ptr = ptr
+    }
+
+    deinit {
+        weaveffi_docs_Notebook_destroy(ptr)
+    }
+    /// Create an empty notebook
+    public init() {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_docs_Notebook_new(&err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null pointer") }
+        self.ptr = rv
+    }
+    /// Add a document, returning its position in the notebook
+    /// - Parameter document: The document to add
+    public func insert(document: Document) -> Int32 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_docs_Notebook_insert(ptr, document.ptr, &err)
+        trap(&err)
+        return rv
+    }
+    /// Look up a document by identifier, failing when none matches
+    /// - Parameter id: Identifier of the document to find
+    public func find(id: Int64) throws -> Document {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_docs_Notebook_find(ptr, id, &err)
+        try checkDocs(&err)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        return Document(ptr: rv)
+    }
+    /// The number of documents currently held
+    public func size() -> Int32 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_docs_Notebook_size(ptr, &err)
+        trap(&err)
+        return rv
+    }
+    /// The largest number of documents one notebook will hold
+    public static func maxDocuments() -> Int32 {
+        var err = weaveffi_error(code: 0, message: nil)
+        let rv = weaveffi_docs_Notebook_max_documents(&err)
+        trap(&err)
+        return rv
+    }
+}
+
 public enum Docs {
     /// Subscribe to document-saved notifications
-    /// - Returns: A subscription id for ``docs_unregister_saved_listener(_:)``.
-    public static func docs_register_saved_listener(_ callback: @escaping (Int64, Int32) -> Void) -> UInt64 {
+    /// - Returns: A subscription id for ``unregisterSavedListener(_:)``.
+    public static func registerSavedListener(_ callback: @escaping (Int64, Int32) -> Void) -> UInt64 {
         let box = WvCallbackBox(callback)
         let ctx = Unmanaged.passRetained(box).toOpaque()
         let id = weaveffi_docs_register_saved_listener({ doc_id, revision, context in
@@ -197,8 +289,8 @@ public enum Docs {
         wvListenerLock.unlock()
         return id
     }
-    /// Unregisters a listener previously registered with ``docs_register_saved_listener(_:)``.
-    public static func docs_unregister_saved_listener(_ id: UInt64) {
+    /// Unregisters a listener previously registered with ``registerSavedListener(_:)``.
+    public static func unregisterSavedListener(_ id: UInt64) {
         weaveffi_docs_unregister_saved_listener(id)
         wvListenerLock.lock()
         let ctx = wvListenerContexts.removeValue(forKey: id)
@@ -213,7 +305,7 @@ public enum Docs {
     /// it explicitly to make it visible.
     /// - Parameter title: Human-readable title for the new document
     /// - Parameter tags: Initial set of tags (may be empty)
-    public static func docs_create_document(_ title: String, _ tags: [String]) throws -> Document {
+    public static func createDocument(title: String, tags: [String]) -> Document {
         var err = weaveffi_error(code: 0, message: nil)
         let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
         defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
@@ -224,29 +316,29 @@ public enum Docs {
                     return weaveffi_docs_create_document(title_ptr, tags_ptr, tags_len, &err)
             }
         }
-        try check(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
+        trap(&err)
+        guard let result = result else { fatalError("-1: null pointer") }
         return Document(ptr: result)
     }
     /// Look up a document by identifier
     /// - Parameter id: Identifier returned from create_document
-    public static func docs_get_document(_ id: Int64) throws -> Document? {
+    public static func getDocument(id: Int64) -> Document? {
         var err = weaveffi_error(code: 0, message: nil)
         let rv = weaveffi_docs_get_document(id, &err)
-        try check(&err)
+        trap(&err)
         return rv.map { Document(ptr: $0) }
     }
     /// Publish a document in the background
     /// - Parameter id: Identifier of the document to publish
-    public static func docs_publish_async(_ id: Int64) async throws -> Bool {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
+    public static func publishAsync(id: Int64) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
             weaveffi_docs_publish_async_async(id, { context, err, result in
-                let contRef = Unmanaged<ContinuationRef<Bool>>.fromOpaque(context!).takeRetainedValue()
+                let contRef = Unmanaged<ContinuationRef<Bool, Never>>.fromOpaque(context!).takeRetainedValue()
                 if let err = err, err.pointee.code != 0 {
                     let code = err.pointee.code
                     let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
-                    contRef.value.resume(throwing: WeaveFFIError.error(code: code, message: msg))
+                    fatalError("\(code): \(msg)")
                 } else {
                     contRef.value.resume(returning: result)
                 }

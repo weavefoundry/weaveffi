@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.5.0"
 package:
   name: inventory
   version: "1.0.0"
@@ -36,38 +36,57 @@ modules:
             type: Category
           - name: tags
             type: "[string]"
-    functions:
-      - name: create_product
-        params:
-          - name: name
-            type: string
-          - name: price
-            type: f64
-          - name: category
-            type: Category
-        return: handle
-      - name: get_product
-        params:
-          - name: id
-            type: handle
-        return: Product
-      - name: search_products
-        params:
-          - name: category
-            type: Category
-        return: "[Product]"
-      - name: update_price
-        params:
-          - name: id
-            type: handle
-          - name: price
-            type: f64
-        return: bool
-      - name: delete_product
-        params:
-          - name: id
-            type: handle
-        return: bool
+    errors:
+      name: ProductsError
+      codes:
+        - { name: InvalidPrice, code: 1, message: "price must be positive" }
+        - { name: ProductNotFound, code: 2, message: "product not found" }
+    interfaces:
+      - name: Catalog
+        doc: A product catalog owning its products
+        constructors:
+          - name: new
+            params: []
+        methods:
+          - name: add_product
+            doc: Add a product, returning the stored record with its assigned id
+            params:
+              - name: name
+                type: string
+              - name: price
+                type: f64
+              - name: category
+                type: Category
+            return: Product
+            throws: true
+          - name: get_product
+            doc: Look up a product by id
+            params:
+              - name: id
+                type: i64
+            return: Product
+            throws: true
+          - name: search
+            doc: Return every product in the given category
+            params:
+              - name: category
+                type: Category
+            return: "[Product]"
+          - name: update_price
+            doc: Update a product's price, returning whether the product existed
+            params:
+              - name: id
+                type: i64
+              - name: price
+                type: f64
+            return: bool
+            throws: true
+          - name: remove
+            doc: Remove a product by id, returning whether it existed
+            params:
+              - name: id
+                type: i64
+            return: bool
   - name: orders
     structs:
       - name: OrderItem
@@ -88,26 +107,33 @@ modules:
             type: f64
           - name: status
             type: string
+    errors:
+      name: OrdersError
+      codes:
+        - { name: OrderNotFound, code: 1, message: "order not found" }
+        - { name: EmptyOrder, code: 2, message: "order must contain at least one item" }
     functions:
       - name: create_order
         params:
           - name: items
             type: "[OrderItem]"
-        return: handle
+        return: i64
+        throws: true
       - name: get_order
         params:
           - name: id
-            type: handle
+            type: i64
         return: Order
+        throws: true
       - name: cancel_order
         params:
           - name: id
-            type: handle
+            type: i64
         return: bool
       - name: add_product_to_order
         params:
           - name: order_id
-            type: handle
+            type: i64
           - name: product
             type: Product
         return: bool
