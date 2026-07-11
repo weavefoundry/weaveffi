@@ -23,9 +23,11 @@ use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, ErrorBinding, FieldBinding, FnBinding, InterfaceBinding,
-    ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding, StructBinding,
+    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
+    StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::plan::{ElemFree, ErrorStrategy};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -399,11 +401,16 @@ fn swift_type_for(t: &TypeRef) -> String {
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Data".to_string(),
         TypeRef::Handle => "UInt64".to_string(),
         TypeRef::TypedHandle(name) | TypeRef::Enum(name) => local_type_name(name).to_string(),
-        TypeRef::Struct(name) | TypeRef::Interface(name) => local_type_name(name).to_string(),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::Interface(name) => {
+            local_type_name(name).to_string()
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
         TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
-        TypeRef::Iterator(inner) => format!("[{}]", swift_type_for(inner)),
+        // An iterator return renders as its per-function sequence class (see
+        // `render_swift_iterator_class`), never through this generic mapping.
+        TypeRef::Iterator(_) => unreachable!("iterator type is only valid as a function return"),
     }
 }
 
@@ -452,7 +459,17 @@ struct ErrCtx<'a> {
     domain: Option<&'a str>,
 }
 
-impl ErrCtx<'_> {
+impl<'a> ErrCtx<'a> {
+    /// Build the error context for `f` from its [`ErrorStrategy`]:
+    /// [`ErrorStrategy::Throws`] surfaces typed errors, [`ErrorStrategy::Trap`]
+    /// traps on the (panic-only) error path.
+    fn for_fn(f: &FnBinding, domain: Option<&'a str>) -> Self {
+        Self {
+            throws: f.error_strategy() == ErrorStrategy::Throws,
+            domain,
+        }
+    }
+
     /// The statement checking the error slot named `slot`.
     fn check_stmt(&self, slot: &str) -> String {
         if !self.throws {
@@ -538,13 +555,13 @@ fn domain_stem(module: &ModuleBinding) -> Option<String> {
 fn swift_type_ctx(t: &TypeRef, ctx: SwiftCtx) -> String {
     match t {
         TypeRef::TypedHandle(name)
-        | TypeRef::Struct(name)
+        | TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
         | TypeRef::Enum(name)
         | TypeRef::Interface(name) => ctx.ty_name(local_type_name(name)),
         TypeRef::Optional(inner) => format!("{}?", swift_type_ctx(inner, ctx)),
         TypeRef::List(inner) => format!("[{}]", swift_type_ctx(inner, ctx)),
         TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_ctx(k, ctx), swift_type_ctx(v, ctx)),
-        TypeRef::Iterator(inner) => format!("[{}]", swift_type_ctx(inner, ctx)),
         _ => swift_type_for(t),
     }
 }
@@ -633,9 +650,9 @@ fn render_swift_enum(out: &mut String, e: &EnumBinding) {
 /// discriminant plus a `tag` reader, a throwing static factory per variant
 /// (`Shape.circle(2.0)`), and per-variant field getters namespaced by variant
 /// (`circleRadius`) so identically-named fields on different variants never
-/// collide. Functions that take or return the enum see it lowered to
-/// [`TypeRef::Struct`], so the existing `x.ptr` / `T(ptr:)` marshalling binds
-/// them with no special-casing.
+/// collide. Functions that take or return the enum reference it as
+/// [`TypeRef::RichEnum`], which shares the record marshalling (`x.ptr` /
+/// `T(ptr:)`), so no special-casing is needed at call sites.
 fn render_swift_rich_enum(
     out: &mut String,
     c_prefix: &str,
@@ -869,6 +886,18 @@ fn render_swift_wrapper(
     out.push_str("    return try value.withCString { try body($0) }\n");
     out.push_str("}\n\n");
 
+    // Ownership helpers: release a producer-allocated array buffer (after its
+    // elements have been copied or adopted) and a boxed optional scalar.
+    out.push_str(
+        "@inline(__always)\nfunc wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {\n",
+    );
+    out.push_str("    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)\n");
+    out.push_str("}\n\n");
+
+    out.push_str("@inline(__always)\nfunc wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {\n");
+    out.push_str("    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)\n");
+    out.push_str("}\n\n");
+
     // Interface members can be async too, so consult every callable.
     let has_async = model
         .modules
@@ -946,6 +975,14 @@ fn render_swift_module_types(
     }
     for i in &mb.interfaces {
         render_swift_interface(out, c_prefix, mb, i, ctx);
+    }
+    // One lazy sequence class per `iter<T>` callable (free functions and
+    // interface members alike), emitted at file scope next to the module's
+    // other wrapper types.
+    for f in mb.callables() {
+        if let CallShape::Iterator(it) = &f.shape {
+            render_swift_iterator_class(out, mb, f, it, ctx);
+        }
     }
     for sub in &m.modules {
         let sub_path = format!("{module_path}_{}", sub.name);
@@ -1110,10 +1147,7 @@ fn render_swift_interface(
     let mut members = String::new();
     for c in &iface.constructors {
         let f = camel_params(c);
-        let err = ErrCtx {
-            throws: f.throws,
-            domain: stem.as_deref(),
-        };
+        let err = ErrCtx::for_fn(&f, stem.as_deref());
         if f.name == "new" {
             render_swift_ctor_init(&mut members, c_prefix, &module.path, &f, err, ctx);
         } else {
@@ -1132,10 +1166,7 @@ fn render_swift_interface(
     }
     for m in &iface.methods {
         let f = camel_params(m);
-        let err = ErrCtx {
-            throws: f.throws,
-            domain: stem.as_deref(),
-        };
+        let err = ErrCtx::for_fn(&f, stem.as_deref());
         let swift_name = f.name.to_lower_camel_case();
         if matches!(f.shape, CallShape::Async(_)) {
             render_swift_async_function(
@@ -1163,10 +1194,7 @@ fn render_swift_interface(
     }
     for s in &iface.statics {
         let f = camel_params(s);
-        let err = ErrCtx {
-            throws: f.throws,
-            domain: stem.as_deref(),
-        };
+        let err = ErrCtx::for_fn(&f, stem.as_deref());
         let swift_name = f.name.to_lower_camel_case();
         if matches!(f.shape, CallShape::Async(_)) {
             render_swift_async_function(
@@ -1281,10 +1309,7 @@ fn render_swift_module_body(
         let f = camel_params(f);
         let swift_name =
             wrapper_name(module_path, &f.name, strip_module_prefix).to_lower_camel_case();
-        let err = ErrCtx {
-            throws: f.throws,
-            domain: stem.as_deref(),
-        };
+        let err = ErrCtx::for_fn(&f, stem.as_deref());
         if matches!(f.shape, CallShape::Async(_)) {
             render_swift_async_function(
                 &mut buf,
@@ -1427,9 +1452,12 @@ fn render_swift_builder(out: &mut String, c_prefix: &str, module_name: &str, s: 
     let params = struct_fields_as_params(&s.fields);
     w.line(format!("public func build() throws -> {} {{", class_name));
     w.indent();
+    // `build()` throws, so a missing field surfaces through the normal error
+    // channel rather than trapping (it's a recoverable consumer mistake, not
+    // a producer bug).
     for field in &s.fields {
         w.line(format!(
-            "guard let {} = _{} else {{ fatalError(\"missing field: {}\") }}",
+            "guard let {} = _{} else {{ throw {ERROR_BRAND}.error(code: -1, message: \"missing field: {}\") }}",
             field.name, field.name, field.name
         ));
     }
@@ -1494,7 +1522,7 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
             w.line("defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }");
             w.line("return Data(bytes: raw, count: outLen)");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
             w.line(format!("return {}(ptr: {}(ptr)!)", name, getter));
         }
@@ -1512,7 +1540,7 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
                 w.line("defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: p), outLen) }");
                 w.line("return Data(bytes: p, count: outLen)");
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                 let name = local_type_name(name);
                 w.line(format!("let p = {}(ptr)", getter));
                 w.line(format!("return p.map {{ {}(ptr: $0) }}", name));
@@ -1520,14 +1548,15 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
             TypeRef::Enum(name) => {
                 let name = local_type_name(name);
                 w.line(format!("let p = {}(ptr)", getter));
-                w.line(format!(
-                    "return p.map {{ {}(rawValue: $0.pointee.rawValue)! }}",
-                    name
-                ));
+                w.line("guard let p = p else { return nil }");
+                w.line("defer { wvFreeBox(p) }");
+                w.line(format!("return {}(rawValue: p.pointee.rawValue)!", name));
             }
             _ if is_c_value_type(inner) => {
                 w.line(format!("let p = {}(ptr)", getter));
-                w.line("return p?.pointee");
+                w.line("guard let p = p else { return nil }");
+                w.line("defer { wvFreeBox(p) }");
+                w.line("return p.pointee");
             }
             _ => {
                 w.line(format!("return {}(ptr)", getter));
@@ -1537,6 +1566,7 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
             w.line("var outLen: Int = 0");
             w.line(format!("let rv = {}(ptr, &outLen)", getter));
             w.line("guard let rv = rv else { return [] }");
+            w.line("defer { wvFreeArray(rv, outLen) }");
             match inner.as_ref() {
                 TypeRef::Enum(name) => {
                     let name = local_type_name(name);
@@ -1545,7 +1575,7 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
                         name
                     ));
                 }
-                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                     let name = local_type_name(name);
                     w.line(format!(
                         "return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}",
@@ -1553,7 +1583,15 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
                     ));
                 }
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line("return (0..<outLen).map { String(cString: rv[$0]!) }");
+                    w.line("var items: [String] = []");
+                    w.line("items.reserveCapacity(outLen)");
+                    w.line("for i in 0..<outLen {");
+                    w.scope(|w| {
+                        w.line("items.append(String(cString: rv[i]!))");
+                        w.line("weaveffi_free_string(rv[i])");
+                    });
+                    w.line("}");
+                    w.line("return items");
                 }
                 _ => {
                     w.line("return Array(UnsafeBufferPointer(start: rv, count: outLen))");
@@ -1581,12 +1619,18 @@ fn render_swift_getter(out: &mut String, field: &FieldBinding, ctx: SwiftCtx) {
             w.line(
                 "guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }",
             );
+            w.line("defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }");
             w.line(format!("var result: [{}: {}] = [:]", key_swift, val_swift));
             w.line("for i in 0..<outLen {");
             w.scope(|w| {
                 let key_expr = map_element_read(k, "outKeys[i]", ctx);
                 let val_expr = map_element_read(v, "outValues[i]", ctx);
                 w.line(format!("result[{}] = {}", key_expr, val_expr));
+                for (ty, base) in [(k, "outKeys[i]"), (v, "outValues[i]")] {
+                    if is_string_elem(ty) {
+                        w.line(format!("weaveffi_free_string({base})"));
+                    }
+                }
             });
             w.line("}");
             w.line("return result");
@@ -1638,17 +1682,30 @@ fn render_swift_function(
         emit_fn_doc(&mut tmp, &f.doc, &f.params, "    ");
         w.raw(tmp);
     }
+    if let CallShape::Iterator(_) = &f.shape {
+        w.line("/// - Returns: A lazy sequence that pulls one element per step from the");
+        w.line("///   producer; the underlying iterator is destroyed when the sequence is");
+        w.line("///   exhausted or deinitialized.");
+        if err.throws {
+            w.line("/// - Throws: The module's typed error if the launch fails. Mid-stream");
+            w.line("///   errors end iteration and are stored in the sequence's `error`");
+            w.line("///   property instead of being thrown.");
+        }
+    }
     if let Some(msg) = &f.deprecated {
         w.line(format!(
             "@available(*, deprecated, message: \"{}\")",
             msg.replace('"', "\\\"")
         ));
     }
-    let ret_swift = f
-        .ret
-        .as_ref()
-        .map(|t| swift_type_ctx(t, ctx))
-        .unwrap_or_else(|| "Void".to_string());
+    let ret_swift = match &f.shape {
+        CallShape::Iterator(it) => ctx.ty_name(&iterator_class_name(it, c_prefix)),
+        _ => f
+            .ret
+            .as_ref()
+            .map(|t| swift_type_ctx(t, ctx))
+            .unwrap_or_else(|| "Void".to_string()),
+    };
     let mut sig = String::new();
     write_swift_params_sig(&mut sig, &f.params, ctx);
     let static_kw = if self_arg.is_some() { "" } else { "static " };
@@ -1710,13 +1767,17 @@ fn write_swift_params_sig(out: &mut String, params: &[ParamBinding], ctx: SwiftC
 /// the owning Swift class would `*_destroy` a borrowed handle on ARC release.
 fn swift_cb_param_type(ty: &TypeRef, ctx: SwiftCtx) -> String {
     match ty {
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-            "OpaquePointer?".into()
-        }
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => "OpaquePointer?".into(),
         TypeRef::Optional(inner)
             if matches!(
                 inner.as_ref(),
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+                TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_)
             ) =>
         {
             "OpaquePointer?".into()
@@ -1755,7 +1816,10 @@ fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
                 "{n0} != nil ? [UInt8](UnsafeBufferPointer(start: {n0}, count: Int({n1}))) : []"
             )
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n0,
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => n0,
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 format!("{n0}.map {{ String(cString: $0) }}")
@@ -1769,7 +1833,10 @@ fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
                 format!("{n0}.map {{ {local}(rawValue: $0.pointee.rawValue)! }}")
             }
             TypeRef::Bool => format!("{n0}.map {{ $0.pointee != 0 }}"),
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n0,
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => n0,
             _ => format!("{n0}.map {{ $0.pointee }}"),
         },
         TypeRef::List(inner) => {
@@ -1806,6 +1873,7 @@ fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
             )
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -2004,7 +2072,10 @@ fn render_swift_async_function(
                         e = enum_name
                     ));
                 }
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => {
                     out.push_str(&format!(
                         "{}let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
                         base,
@@ -2034,7 +2105,10 @@ fn render_swift_async_function(
                     ));
                 } else if matches!(
                     k.as_ref(),
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+                    TypeRef::Record(_)
+                        | TypeRef::RichEnum(_)
+                        | TypeRef::TypedHandle(_)
+                        | TypeRef::Interface(_)
                 ) {
                     out.push_str(&format!(
                         "{}let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
@@ -2052,7 +2126,10 @@ fn render_swift_async_function(
                     ));
                 } else if matches!(
                     v.as_ref(),
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+                    TypeRef::Record(_)
+                        | TypeRef::RichEnum(_)
+                        | TypeRef::TypedHandle(_)
+                        | TypeRef::Interface(_)
                 ) {
                     out.push_str(&format!(
                         "{}let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
@@ -2213,16 +2290,7 @@ fn render_swift_async_function(
     out.push_str(&format!("{}}} else {{\n", cb_indent));
 
     let success_indent = format!("{}    ", cb_indent);
-    render_async_resume_result(
-        out,
-        c_prefix,
-        &f.ret,
-        &success_indent,
-        module_name,
-        &f.name,
-        err,
-        ctx,
-    );
+    render_async_resume_result(out, &f.ret, &success_indent, err, ctx);
 
     out.push_str(&format!("{}}}\n", cb_indent));
     out.push_str(&format!("{}}}, ctx)\n", inner_indent));
@@ -2247,14 +2315,17 @@ fn async_callback_param_names(returns: &Option<TypeRef>) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Render the success branch of an async completion callback: convert the
+/// callback's result slots and resume the continuation exactly once.
+///
+/// Result buffers (strings, bytes, arrays, map buffers) are borrowed for the
+/// callback's duration: they're deep-copied before the callback returns and
+/// never freed here. Owned-object results are the exception; the callback
+/// receives ownership and the pointer is adopted by its wrapper class.
 fn render_async_resume_result(
     out: &mut String,
-    c_prefix: &str,
     returns: &Option<TypeRef>,
     indent: &str,
-    module_name: &str,
-    func_name: &str,
     err: ErrCtx,
     ctx: SwiftCtx,
 ) {
@@ -2275,14 +2346,15 @@ fn render_async_resume_result(
                 out.push_str(&format!("{}    return\n", indent));
             }
             out.push_str(&format!("{}}}\n", indent));
-            out.push_str(&format!("{}let str = String(cString: result)\n", indent));
+            // The string is borrowed for the callback's duration: copy it,
+            // don't free it (the producer releases its own buffer).
             out.push_str(&format!(
-                "{}weaveffi_free_string(UnsafeMutablePointer(mutating: result))\n",
+                "{}contRef.value.resume(returning: String(cString: result))\n",
                 indent
             ));
-            out.push_str(&format!("{}contRef.value.resume(returning: str)\n", indent));
         }
-        Some(TypeRef::Struct(name))
+        Some(TypeRef::Record(name))
+        | Some(TypeRef::RichEnum(name))
         | Some(TypeRef::TypedHandle(name))
         | Some(TypeRef::Interface(name)) => {
             let name = ctx.ty_name(local_type_name(name));
@@ -2310,27 +2382,16 @@ fn render_async_resume_result(
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
             TypeRef::StringUtf8 => {
-                out.push_str(&format!("{}if let result = result {{\n", indent));
+                // Borrowed for the callback's duration: copy, never free.
                 out.push_str(&format!(
-                    "{}    let str = String(cString: result)\n",
+                    "{}contRef.value.resume(returning: result.map {{ String(cString: $0) }})\n",
                     indent
                 ));
-                out.push_str(&format!(
-                    "{}    weaveffi_free_string(UnsafeMutablePointer(mutating: result))\n",
-                    indent
-                ));
-                out.push_str(&format!(
-                    "{}    contRef.value.resume(returning: str)\n",
-                    indent
-                ));
-                out.push_str(&format!("{}}} else {{\n", indent));
-                out.push_str(&format!(
-                    "{}    contRef.value.resume(returning: nil)\n",
-                    indent
-                ));
-                out.push_str(&format!("{}}}\n", indent));
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name) => {
                 let name = ctx.ty_name(local_type_name(name));
                 out.push_str(&format!(
                     "{}contRef.value.resume(returning: result.map {{ {}(ptr: $0) }})\n",
@@ -2387,7 +2448,10 @@ fn render_async_resume_result(
                         indent, name
                     ));
                 }
-                TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+                TypeRef::Record(name)
+                | TypeRef::RichEnum(name)
+                | TypeRef::TypedHandle(name)
+                | TypeRef::Interface(name) => {
                     let name = ctx.ty_name(local_type_name(name));
                     out.push_str(&format!(
                         "{}contRef.value.resume(returning: (0..<len).map {{ {}(ptr: result[$0]!) }})\n",
@@ -2433,43 +2497,10 @@ fn render_async_resume_result(
                 indent
             ));
         }
-        Some(TypeRef::Iterator(inner)) => {
-            let pascal_func = func_name.to_upper_camel_case();
-            let iter_prefix = format!("{c_prefix}_{module_name}_{pascal_func}Iterator");
-            let next_fn = format!("{iter_prefix}_next");
-            let destroy_fn = format!("{iter_prefix}_destroy");
-            let inner_swift = swift_type_ctx(inner, ctx);
-
-            out.push_str(&format!("{}guard let result = result else {{\n", indent));
-            out.push_str(&format!(
-                "{}    contRef.value.resume(returning: [])\n",
-                indent
-            ));
-            out.push_str(&format!("{}    return\n", indent));
-            out.push_str(&format!("{}}}\n", indent));
-            out.push_str(&format!("{}var items: [{}] = []\n", indent, inner_swift));
-            let elem_c_type = match inner.as_ref() {
-                TypeRef::Enum(name) => {
-                    format!("{}_{}_{}", c_prefix, module_name, local_type_name(name))
-                }
-                _ => String::new(),
-            };
-            render_iter_pull(out, indent, &next_fn, "result", inner, &elem_c_type, ctx);
-            out.push_str(&format!("{}{}(result)\n", indent, destroy_fn));
-            out.push_str(&format!("{}if iterErr.code != 0 {{\n", indent));
-            out.push_str(&format!("{}    let code = iterErr.code\n", indent));
-            out.push_str(&format!(
-                "{}    let msg = iterErr.message.flatMap {{ String(cString: $0) }} ?? \"\"\n",
-                indent
-            ));
-            out.push_str(&format!("{}    weaveffi_error_clear(&iterErr)\n", indent));
-            out.push_str(&format!("{}    {}\n", indent, err.async_err_stmt()));
-            out.push_str(&format!("{}    return\n", indent));
-            out.push_str(&format!("{}}}\n", indent));
-            out.push_str(&format!(
-                "{}contRef.value.resume(returning: items)\n",
-                indent
-            ));
+        // Validation rejects `async` functions returning `iter<T>` (the
+        // callback-completed ABI has no streaming protocol).
+        Some(TypeRef::Iterator(_)) => {
+            unreachable!("async functions cannot return iterators")
         }
         Some(_) => {
             out.push_str(&format!(
@@ -2494,17 +2525,19 @@ fn build_c_call_args(params: &[ParamBinding], c_prefix: &str, module_name: &str)
             // An interface param borrows the wrapper's handle for the call,
             // exactly like the struct wrappers do; the receiver stays alive
             // for the duration of the call frame that owns it.
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-                args.push(format!("{}.ptr", p.name))
-            }
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => args.push(format!("{}.ptr", p.name)),
             TypeRef::Enum(enum_name) => args.push(format!(
                 "{c_prefix}_{}_{}({}.rawValue)",
                 module_name, enum_name, p.name
             )),
             TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-                    args.push(format!("{}?.ptr", p.name))
-                }
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => args.push(format!("{}?.ptr", p.name)),
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => args.push(format!("{}_ptr", p.name)),
                 TypeRef::Bytes | TypeRef::BorrowedBytes => {
                     args.push(format!("{}_ptr", p.name));
@@ -2559,7 +2592,8 @@ fn render_direct_call(
             w.line("defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }");
             w.line("return Data(bytes: rv, count: outLen)");
         }
-        Some(TypeRef::Struct(name))
+        Some(TypeRef::Record(name))
+        | Some(TypeRef::RichEnum(name))
         | Some(TypeRef::TypedHandle(name))
         | Some(TypeRef::Interface(name)) => {
             let name = ctx.ty_name(local_type_name(name));
@@ -2646,7 +2680,10 @@ fn render_optional_return_inner(
             w.line("defer { weaveffi_free_string(rv) }");
             w.line("return String(cString: rv)");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             let name = ctx.ty_name(local_type_name(name));
             w.line(format!("let rv = {}", call));
             w.line(check);
@@ -2656,15 +2693,16 @@ fn render_optional_return_inner(
             let name = ctx.ty_name(local_type_name(name));
             w.line(format!("let rv = {}", call));
             w.line(check);
-            w.line(format!(
-                "return rv.map {{ {}(rawValue: $0.pointee.rawValue)! }}",
-                name
-            ));
+            w.line("guard let rv = rv else { return nil }");
+            w.line("defer { wvFreeBox(rv) }");
+            w.line(format!("return {}(rawValue: rv.pointee.rawValue)!", name));
         }
         _ if is_c_value_type(inner) => {
             w.line(format!("let rv = {}", call));
             w.line(check);
-            w.line("return rv?.pointee");
+            w.line("guard let rv = rv else { return nil }");
+            w.line("defer { wvFreeBox(rv) }");
+            w.line("return rv.pointee");
         }
         _ => {
             w.line(format!("let rv = {}", call));
@@ -2701,6 +2739,7 @@ fn render_list_return_inner_body(
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4 + 1);
     w.line(err.check_stmt("err"));
     w.line("guard let rv = rv else { return [] }");
+    w.line("defer { wvFreeArray(rv, outLen) }");
     match inner {
         TypeRef::Enum(name) => {
             let name = ctx.ty_name(local_type_name(name));
@@ -2709,7 +2748,10 @@ fn render_list_return_inner_body(
                 name
             ));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             let name = ctx.ty_name(local_type_name(name));
             w.line(format!(
                 "return (0..<outLen).map {{ {}(ptr: rv[$0]!) }}",
@@ -2717,7 +2759,15 @@ fn render_list_return_inner_body(
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("return (0..<outLen).map { String(cString: rv[$0]!) }");
+            w.line("var items: [String] = []");
+            w.line("items.reserveCapacity(outLen)");
+            w.line("for i in 0..<outLen {");
+            w.scope(|w| {
+                w.line("items.append(String(cString: rv[i]!))");
+                w.line("weaveffi_free_string(rv[i])");
+            });
+            w.line("}");
+            w.line("return items");
         }
         _ => {
             w.line("return Array(UnsafeBufferPointer(start: rv, count: outLen))");
@@ -2743,12 +2793,14 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "UnsafePointer<CChar>?".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "UInt8".to_string(),
         TypeRef::Enum(_) => "Int32".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
-            "OpaquePointer?".to_string()
-        }
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => "OpaquePointer?".to_string(),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "OpaquePointer?".to_string()
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -2762,7 +2814,10 @@ fn map_element_read(ty: &TypeRef, expr: &str, ctx: SwiftCtx) -> String {
                 expr
             )
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             format!("{}(ptr: {}!)", ctx.ty_name(local_type_name(name)), expr)
         }
         _ => expr.to_string(),
@@ -2797,12 +2852,18 @@ fn render_map_return(
     w.line(modified_call);
     w.line(err.check_stmt("err"));
     w.line("guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }");
+    w.line("defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }");
     w.line(format!("var result: [{}: {}] = [:]", key_swift, val_swift));
     w.line("for i in 0..<outLen {");
     w.scope(|w| {
         let key_expr = map_element_read(k, "outKeys[i]", ctx);
         let val_expr = map_element_read(v, "outValues[i]", ctx);
         w.line(format!("result[{}] = {}", key_expr, val_expr));
+        for (ty, base) in [(k, "outKeys[i]"), (v, "outValues[i]")] {
+            if is_string_elem(ty) {
+                w.line(format!("weaveffi_free_string({base})"));
+            }
+        }
     });
     w.line("}");
     w.line("return result");
@@ -2825,12 +2886,18 @@ fn render_map_return_inner(
     w.line(call);
     w.line(err.check_stmt("err"));
     w.line("guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }");
+    w.line("defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }");
     w.line(format!("var result: [{}: {}] = [:]", key_swift, val_swift));
     w.line("for i in 0..<outLen {");
     w.scope(|w| {
         let key_expr = map_element_read(k, "outKeys[i]", ctx);
         let val_expr = map_element_read(v, "outValues[i]", ctx);
         w.line(format!("result[{}] = {}", key_expr, val_expr));
+        for (ty, base) in [(k, "outKeys[i]"), (v, "outValues[i]")] {
+            if is_string_elem(ty) {
+                w.line(format!("weaveffi_free_string({base})"));
+            }
+        }
     });
     w.line("}");
     w.line("return result");
@@ -2847,83 +2914,48 @@ fn swift_scalar_default(ty: &TypeRef) -> String {
     }
 }
 
-/// Emit the materialization loop for an `iter<T>` `next` symbol. The C ABI is
-/// `int32_t next(iter*, T* out_item, …, error* out_err)`, returning 1 when an
-/// element was written to `out_item` and 0 at end-of-stream (or on error, with
-/// `out_err` set). `iter_ptr` is the already-bound, non-nil handle; elements are
-/// appended into a pre-declared `items` array. Declares `iterErr` in the caller's
-/// scope so the caller can `check(&iterErr)` after `destroy`. `elem_c_type` is
-/// the element's C type and is only consulted for enum elements.
-fn render_iter_pull(
-    out: &mut String,
-    indent: &str,
-    next_fn: &str,
-    iter_ptr: &str,
-    inner: &TypeRef,
-    elem_c_type: &str,
-    ctx: SwiftCtx,
-) {
-    let (c_var, default, convert, free): (String, String, String, Option<String>) = match inner {
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => (
-            "OpaquePointer?".to_string(),
-            "nil".to_string(),
-            format!("{}(ptr: iterItem!)", ctx.ty_name(local_type_name(name))),
-            None,
-        ),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
-            "UnsafePointer<CChar>?".to_string(),
-            "nil".to_string(),
-            "String(cString: iterItem!)".to_string(),
-            Some("weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))".to_string()),
-        ),
-        TypeRef::Enum(name) => (
-            elem_c_type.to_string(),
-            format!("{elem_c_type}(0)"),
-            format!(
-                "{}(rawValue: iterItem.rawValue)!",
-                ctx.ty_name(local_type_name(name))
-            ),
-            None,
-        ),
-        _ => (
-            swift_c_ptr_element(inner),
-            swift_scalar_default(inner),
-            "iterItem".to_string(),
-            None,
-        ),
-    };
-    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    w.line(format!("var iterItem: {c_var} = {default}"));
-    w.line("var iterErr = weaveffi_error(code: 0, message: nil)");
-    w.line(format!(
-        "while {next_fn}({iter_ptr}, &iterItem, &iterErr) != 0 {{"
-    ));
-    w.indent();
-    w.line(format!("items.append({convert})"));
-    if let Some(free) = free {
-        w.line(free);
-    }
-    w.dedent();
-    w.line("}");
-    out.push_str(&w.finish());
+/// The Swift name of the lazy sequence class emitted for one `iter<T>`
+/// function: the iterator tag minus the C prefix, PascalCased
+/// (`weaveffi_kv_ScanIterator` becomes `KvScanIterator`).
+fn iterator_class_name(it: &IteratorBinding, c_prefix: &str) -> String {
+    it.iter_tag
+        .strip_prefix(&format!("{c_prefix}_"))
+        .unwrap_or(&it.iter_tag)
+        .to_upper_camel_case()
 }
 
-fn render_iterator_return(
+/// Emit the lazy sequence class backing one `iter<T>` function.
+///
+/// The class conforms to `Sequence & IteratorProtocol` and owns the C
+/// iterator handle. Each `next()` issues exactly one producer `next` call;
+/// the handle is destroyed eagerly on exhaustion (or on a mid-stream error)
+/// and again, guarded against double-destroy by the nulled handle, from
+/// `deinit` when iteration is abandoned early. Elements are converted and
+/// released per the [`weaveffi_core::plan::elem_free`] contract: strings are
+/// copied then freed, record and rich-enum pointers are adopted by their
+/// owning wrapper classes, and by-value elements need no release.
+///
+/// Errors follow the owning function's [`ErrorStrategy`]. `next()` cannot
+/// throw under `IteratorProtocol`, so for a throwing function a mid-stream
+/// domain error ends iteration and is stored in the sequence's public
+/// `error` property for the caller to inspect; for a non-throwing function
+/// a reported error can only be a producer bug and traps via `fatalError`.
+fn render_swift_iterator_class(
     out: &mut String,
+    mb: &ModuleBinding,
     f: &FnBinding,
-    call_with_err: &str,
-    indent: &str,
-    err: ErrCtx,
+    it: &IteratorBinding,
     ctx: SwiftCtx,
 ) {
-    let it = match &f.shape {
-        CallShape::Iterator(it) => it,
-        _ => unreachable!("render_iterator_return on non-iterator function"),
-    };
+    let protocol = it.protocol(f, &mb.path, ctx.c_prefix);
+    let class_name = iterator_class_name(it, ctx.c_prefix);
     let next_fn = &it.next.symbol;
     let destroy_fn = &it.destroy_symbol;
     let inner = &it.elem;
-    let inner_swift = swift_type_ctx(inner, ctx);
+    let elem_swift = swift_type_ctx(inner, ctx);
+    let stem = domain_stem(mb);
+    let throws = protocol.error == ErrorStrategy::Throws;
+
     // `out_item` is the slot after the iterator handle; render its pointee as
     // the element C type so enum slots get the imported C enum
     // (`{prefix}_{module}_{Name}`).
@@ -2939,19 +2971,160 @@ fn render_iterator_return(
         })
         .unwrap_or_default();
 
+    // The slot declaration, the conversion of a filled slot, and the release
+    // owed after conversion (per the element's `ElemFree` plan).
+    let (c_var, default, convert): (String, String, String) = match inner {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => (
+            "OpaquePointer?".to_string(),
+            "nil".to_string(),
+            format!("{}(ptr: item!)", ctx.ty_name(local_type_name(name))),
+        ),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
+            "UnsafePointer<CChar>?".to_string(),
+            "nil".to_string(),
+            "String(cString: item!)".to_string(),
+        ),
+        TypeRef::Enum(name) => (
+            elem_c_type.clone(),
+            format!("{elem_c_type}(0)"),
+            format!(
+                "{}(rawValue: item.rawValue)!",
+                ctx.ty_name(local_type_name(name))
+            ),
+        ),
+        _ => (
+            swift_c_ptr_element(inner),
+            swift_scalar_default(inner),
+            "item".to_string(),
+        ),
+    };
+    let elem_release = match &protocol.elem_free {
+        ElemFree::String => Some("weaveffi_free_string(item)".to_string()),
+        // Object elements are adopted by the wrapper class built in `convert`;
+        // its `deinit` owes the `_destroy`, so nothing is released here.
+        ElemFree::Object { .. } | ElemFree::None => None,
+    };
+
+    let mut w = CodeWriter::four_space();
+    w.line(format!(
+        "/// A lazy sequence over the `{elem_swift}` elements streamed by `{}`.",
+        it.launch.symbol
+    ));
+    w.line("///");
+    w.line("/// Each `next()` call pulls exactly one element from the producer. The");
+    w.line("/// underlying C iterator is destroyed eagerly on exhaustion and from");
+    w.line("/// `deinit` when iteration is abandoned early.");
+    if throws {
+        w.line("///");
+        w.line("/// If the producer reports an error mid-stream, iteration ends and the");
+        w.line("/// error is stored in ``error`` for the caller to inspect after the loop.");
+    }
+    w.line(format!(
+        "public final class {class_name}: Sequence, IteratorProtocol {{"
+    ));
+    w.indent();
+    w.line("private var handle: OpaquePointer?");
+    if throws {
+        w.line("/// The error that ended iteration early, if any.");
+        w.line("public private(set) var error: Error?");
+    }
+    w.blank();
+    w.line("init(handle: OpaquePointer) {");
+    w.scope(|w| {
+        w.line("self.handle = handle");
+    });
+    w.line("}");
+    w.blank();
+    w.line("deinit {");
+    w.scope(|w| {
+        w.line("destroyHandle()");
+    });
+    w.line("}");
+    w.blank();
+    w.line("private func destroyHandle() {");
+    w.scope(|w| {
+        w.line("guard let handle = handle else { return }");
+        w.line(format!("{destroy_fn}(handle)"));
+        w.line("self.handle = nil");
+    });
+    w.line("}");
+    w.blank();
+    w.line("/// Pulls the next element from the producer, or returns `nil` once the");
+    w.line("/// stream is exhausted (destroying the underlying iterator).");
+    w.line(format!("public func next() -> {elem_swift}? {{"));
+    w.indent();
+    w.line("guard let handle = handle else { return nil }");
+    w.line(format!("var item: {c_var} = {default}"));
+    w.line("var err = weaveffi_error(code: 0, message: nil)");
+    w.line(format!("if {next_fn}(handle, &item, &err) == 0 {{"));
+    w.indent();
+    w.line("if err.code != 0 {");
+    w.indent();
+    w.line("let code = err.code");
+    w.line("let message = err.message.flatMap { String(cString: $0) } ?? \"\"");
+    w.line("weaveffi_error_clear(&err)");
+    if throws {
+        match &stem {
+            Some(stem) => {
+                w.line(format!(
+                    "self.error = map{stem}(code: code, message: message)"
+                ));
+            }
+            None => {
+                w.line(format!(
+                    "self.error = {ERROR_BRAND}.error(code: code, message: message)"
+                ));
+            }
+        }
+    } else {
+        w.line("fatalError(\"\\(code): \\(message)\")");
+    }
+    w.dedent();
+    w.line("}");
+    w.line("destroyHandle()");
+    w.line("return nil");
+    w.dedent();
+    w.line("}");
+    w.line(format!("let element = {convert}"));
+    if let Some(release) = elem_release {
+        w.line(release);
+    }
+    w.line("return element");
+    w.dedent();
+    w.line("}");
+    w.dedent();
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Render the tail of an `iter<T>` wrapper body: launch the producer, check
+/// launch errors per the function's [`ErrorStrategy`], and hand the returned
+/// handle to the function's lazy sequence class (see
+/// [`render_swift_iterator_class`]). No element is pulled here; the sequence
+/// pulls lazily, one producer `next` per consumer step.
+fn render_iterator_return(
+    out: &mut String,
+    f: &FnBinding,
+    call_with_err: &str,
+    indent: &str,
+    err: ErrCtx,
+    ctx: SwiftCtx,
+) {
+    let it = match &f.shape {
+        CallShape::Iterator(it) => it,
+        _ => unreachable!("render_iterator_return on non-iterator function"),
+    };
+    let class_name = ctx.ty_name(&iterator_class_name(it, ctx.c_prefix));
+
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     w.line(format!("let iter = {call_with_err}"));
     w.line(err.check_stmt("err"));
-    w.line("guard let iter = iter else { return [] }");
-    w.line(format!("var items: [{inner_swift}] = []"));
-    {
-        let mut tmp = String::new();
-        render_iter_pull(&mut tmp, indent, next_fn, "iter", inner, &elem_c_type, ctx);
-        w.raw(tmp);
-    }
-    w.line(format!("{destroy_fn}(iter)"));
-    w.line(err.check_stmt("iterErr"));
-    w.line("return items");
+    w.line(err.guard_stmt("iter", -1, "null iterator"));
+    w.line(format!("return {class_name}(handle: iter)"));
     out.push_str(&w.finish());
 }
 
@@ -2966,7 +3139,10 @@ fn is_string_elem(ty: &TypeRef) -> bool {
 fn list_array_source(inner: &TypeRef, name: &str) -> String {
     match inner {
         TypeRef::Enum(_) => format!("{name}_raw"),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             format!("{name}_ptrs")
         }
         _ if is_string_elem(inner) => format!("{name}_cstrs"),
@@ -2977,7 +3153,10 @@ fn list_array_source(inner: &TypeRef, name: &str) -> String {
 fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
     match ty {
         TypeRef::Enum(_) => format!("{name}_{suffix}Raw"),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             format!("{name}_{suffix}Ptrs")
         }
         _ if is_string_elem(ty) => format!("{name}_{suffix}Cstrs"),
@@ -3067,7 +3246,10 @@ fn render_buffered_call(
                         e = enum_name
                     ));
                 }
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => {
                     out.push_str(&format!(
                         "        let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
                         n = p.name
@@ -3091,7 +3273,10 @@ fn render_buffered_call(
                             n = p.name, m = module_name, e = e
                         ));
                     }
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                    TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_) => {
                         out.push_str(&format!(
                             "        let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
                             n = p.name
@@ -3106,7 +3291,10 @@ fn render_buffered_call(
                             n = p.name, m = module_name, e = e
                         ));
                     }
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                    TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_) => {
                         out.push_str(&format!(
                             "        let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
                             n = p.name
@@ -3154,12 +3342,20 @@ fn render_buffered_call(
     // when it can actually throw; a trapping wrapper's closures never do.
     let needs_try = handles_return_inside && err.throws;
 
-    let ret_type = match &f.ret {
-        Some(TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)) => {
-            "OpaquePointer?".to_string()
-        }
-        Some(ty) => swift_type_for(ty),
-        None => "Void".to_string(),
+    let ret_type = match (&f.shape, &f.ret) {
+        // The staged closures return the function's lazy sequence class.
+        (CallShape::Iterator(it), _) => ctx.ty_name(&iterator_class_name(it, c_prefix)),
+        (
+            _,
+            Some(
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_),
+            ),
+        ) => "OpaquePointer?".to_string(),
+        (_, Some(ty)) => swift_type_for(ty),
+        (_, None) => "Void".to_string(),
     };
     let needs_return = f.ret.is_some();
 
@@ -3341,7 +3537,8 @@ fn render_buffered_call(
 
     if f.ret.is_none() {
         out.push_str(&format!("        {}\n", err.check_stmt("err")));
-    } else if let Some(TypeRef::Struct(name))
+    } else if let Some(TypeRef::Record(name))
+    | Some(TypeRef::RichEnum(name))
     | Some(TypeRef::TypedHandle(name))
     | Some(TypeRef::Interface(name)) = &f.ret
     {
@@ -3395,7 +3592,7 @@ fn render_buffered_struct_create(
                         e = enum_name
                     ));
                 }
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                     out.push_str(&format!(
                         "        let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
                         n = p.name
@@ -3421,7 +3618,7 @@ fn render_buffered_struct_create(
                             e = e
                         ));
                     }
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                         out.push_str(&format!(
                             "        let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
                             n = p.name
@@ -3438,7 +3635,7 @@ fn render_buffered_struct_create(
                             e = e
                         ));
                     }
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                         out.push_str(&format!(
                             "        let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
                             n = p.name
@@ -3742,7 +3939,7 @@ mod tests {
     #[test]
     fn swift_type_for_struct_returns_name() {
         assert_eq!(
-            swift_type_for(&TypeRef::Struct("Contact".into())),
+            swift_type_for(&TypeRef::Record("Contact".into())),
             "Contact"
         );
     }
@@ -3759,7 +3956,7 @@ mod tests {
             "Int32?"
         );
         assert_eq!(
-            swift_type_for(&TypeRef::Optional(Box::new(TypeRef::Struct(
+            swift_type_for(&TypeRef::Optional(Box::new(TypeRef::Record(
                 "Contact".into()
             )))),
             "Contact?"
@@ -3964,7 +4161,7 @@ mod tests {
                 name: "update".to_string(),
                 params: vec![Param {
                     name: "person".to_string(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into()))),
+                    ty: TypeRef::Optional(Box::new(TypeRef::Record("Contact".into()))),
                     mutable: false,
                     doc: None,
                 }],
@@ -4031,8 +4228,12 @@ mod tests {
             "missing optional return type: {out}"
         );
         assert!(
-            out.contains("rv?.pointee"),
+            out.contains("return rv.pointee"),
             "missing pointer dereference: {out}"
+        );
+        assert!(
+            out.contains("defer { wvFreeBox(rv) }"),
+            "boxed optional scalar must be freed after copying: {out}"
         );
     }
 
@@ -4169,7 +4370,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -4484,7 +4685,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4520,7 +4721,7 @@ mod tests {
                 name: "save".to_string(),
                 params: vec![Param {
                     name: "contact".to_string(),
-                    ty: TypeRef::Struct("Contact".into()),
+                    ty: TypeRef::Record("Contact".into()),
                     mutable: false,
                     doc: None,
                 }],
@@ -4597,7 +4798,7 @@ mod tests {
                 doc: None,
                 fields: vec![StructField {
                     name: "start".to_string(),
-                    ty: TypeRef::Struct("Point".into()),
+                    ty: TypeRef::Record("Point".into()),
                     doc: None,
                     default: None,
                 }],
@@ -4634,7 +4835,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4674,7 +4875,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4991,8 +5192,12 @@ mod tests {
             "missing optional i32 getter: {out}"
         );
         assert!(
-            out.contains("return p?.pointee"),
+            out.contains("return p.pointee"),
             "missing pointee for optional value: {out}"
+        );
+        assert!(
+            out.contains("defer { wvFreeBox(p) }"),
+            "boxed optional field must be freed after copying: {out}"
         );
 
         assert!(
@@ -5000,7 +5205,7 @@ mod tests {
             "missing optional enum getter: {out}"
         );
         assert!(
-            out.contains("Role(rawValue: $0.pointee.rawValue)!"),
+            out.contains("Role(rawValue: p.pointee.rawValue)!"),
             "missing optional enum conversion: {out}"
         );
     }
@@ -5370,7 +5575,7 @@ mod tests {
                 params: vec![Param {
                     name: "data".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ))))),
                     mutable: false,
                     doc: None,
@@ -5456,7 +5661,7 @@ mod tests {
                     name: "contacts".into(),
                     ty: TypeRef::Map(
                         Box::new(TypeRef::Enum("Color".into())),
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ),
                     mutable: false,
                     doc: None,
@@ -5682,7 +5887,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -5735,7 +5940,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -5951,7 +6156,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("types.Name".to_string())),
+                    returns: Some(TypeRef::Record("types.Name".to_string())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -6047,28 +6252,172 @@ mod tests {
         );
     }
 
-    #[test]
-    fn swift_type_for_iterator() {
-        assert_eq!(
-            swift_type_for(&TypeRef::Iterator(Box::new(TypeRef::I32))),
-            "[Int32]"
-        );
-        assert_eq!(
-            swift_type_for(&TypeRef::Iterator(Box::new(TypeRef::Struct(
-                "Contact".into()
-            )))),
-            "[Contact]"
-        );
-    }
-
-    #[test]
-    fn swift_iterator_return_generates_consumption_code() {
-        let api = make_api(vec![Module {
+    /// A module with a non-throwing `iter<i32>` function.
+    fn iter_api(throws: bool) -> Api {
+        make_api(vec![Module {
             name: "data".to_string(),
             functions: vec![Function {
                 name: "list_items".to_string(),
                 params: vec![],
                 returns: Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                doc: None,
+                throws,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: if throws {
+                Some(ErrorDomain {
+                    name: "DataError".to_string(),
+                    codes: vec![ErrorCode {
+                        name: "Broken".to_string(),
+                        code: 7,
+                        message: "Broken".to_string(),
+                        doc: None,
+                    }],
+                })
+            } else {
+                None
+            },
+            modules: vec![],
+        }])
+    }
+
+    #[test]
+    fn swift_iterator_emits_lazy_sequence_class() {
+        let out = render(
+            &iter_api(false),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
+        // A final class conforming to Sequence & IteratorProtocol owns the
+        // handle; the wrapper returns it instead of a drained array.
+        assert!(
+            out.contains("public final class DataListItemsIterator: Sequence, IteratorProtocol {"),
+            "missing lazy sequence class: {out}"
+        );
+        assert!(
+            out.contains("public static func listItems() -> DataListItemsIterator {"),
+            "wrapper must return the sequence type, not an array: {out}"
+        );
+        assert!(
+            out.contains("return DataListItemsIterator(handle: iter)"),
+            "wrapper must hand the launched handle to the sequence: {out}"
+        );
+        // No hidden drain: the wrapper body never loops over `_next`.
+        assert!(
+            !out.contains("while weaveffi_data_ListItemsIterator_next"),
+            "wrapper must not drain the iterator eagerly: {out}"
+        );
+        assert!(
+            !out.contains("-> [Int32]"),
+            "iterator wrapper must not return an array: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_iterator_next_pulls_one_element_and_destroys() {
+        let out = render(
+            &iter_api(false),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
+        // Exactly one producer `next` call, inside `next()`.
+        assert_eq!(
+            out.matches("weaveffi_data_ListItemsIterator_next(").count(),
+            1,
+            "expected exactly one next call (inside next()): {out}"
+        );
+        assert!(
+            out.contains("public func next() -> Int32? {"),
+            "missing IteratorProtocol next(): {out}"
+        );
+        // Destroy happens eagerly on exhaustion and from deinit, guarded
+        // against double-destroy by nulling the handle.
+        assert!(
+            out.contains("private func destroyHandle() {"),
+            "missing destroy helper: {out}"
+        );
+        assert!(
+            out.contains("guard let handle = handle else { return }")
+                && out.contains("weaveffi_data_ListItemsIterator_destroy(handle)")
+                && out.contains("self.handle = nil"),
+            "destroy must null the handle to prevent double-destroy: {out}"
+        );
+        let deinit_pos = out.find("deinit {").expect("deinit present");
+        assert!(
+            out[deinit_pos..].contains("destroyHandle()"),
+            "deinit must destroy an abandoned iterator: {out}"
+        );
+        // Non-throwing: a mid-stream error is a producer bug and traps.
+        assert!(
+            out.contains("fatalError(\"\\(code): \\(message)\")"),
+            "non-throwing iterator must trap on per-next errors: {out}"
+        );
+        assert!(
+            !out.contains("public private(set) var error"),
+            "non-throwing iterator has no error property: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_throwing_iterator_stores_per_next_error() {
+        let out = render(
+            &iter_api(true),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
+        // Launch errors throw through the domain checker in the wrapper.
+        assert!(
+            out.contains("public static func listItems() throws -> DataListItemsIterator {"),
+            "throwing wrapper must keep its throws signature: {out}"
+        );
+        let wrapper_pos = out
+            .find("public static func listItems()")
+            .expect("wrapper present");
+        assert!(
+            out[wrapper_pos..].contains("try checkData(&err)"),
+            "launch errors must throw through the domain checker: {out}"
+        );
+        // Per-next domain errors end iteration and are stored on the sequence.
+        assert!(
+            out.contains("public private(set) var error: Error?"),
+            "throwing iterator must expose the stored error: {out}"
+        );
+        assert!(
+            out.contains("self.error = mapData(code: code, message: message)"),
+            "per-next errors must map through the domain: {out}"
+        );
+        let class_pos = out
+            .find("public final class DataListItemsIterator")
+            .expect("class present");
+        let class_body = &out[class_pos..];
+        assert!(
+            !class_body.contains("fatalError"),
+            "throwing iterator must not trap on domain errors: {class_body}"
+        );
+    }
+
+    #[test]
+    fn swift_string_iterator_frees_each_element() {
+        let api = make_api(vec![Module {
+            name: "data".to_string(),
+            functions: vec![Function {
+                name: "list_names".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -6086,16 +6435,182 @@ mod tests {
         }]);
         let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
         assert!(
-            out.contains("ListItemsIterator"),
-            "should reference iterator type: {out}"
+            out.contains("let element = String(cString: item!)"),
+            "string element must be copied: {out}"
         );
         assert!(
-            out.contains("_next"),
-            "should call _next to consume iterator: {out}"
+            out.contains("weaveffi_free_string(item)"),
+            "string element must be freed after copying: {out}"
+        );
+    }
+
+    #[test]
+    fn swift_record_iterator_adopts_elements() {
+        let api = make_api(vec![Module {
+            name: "kv".to_string(),
+            functions: vec![Function {
+                name: "scan".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Entry".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "key".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        assert!(
+            out.contains("public func next() -> Entry? {"),
+            "record iterator must yield the wrapper class: {out}"
+        );
+        // The record pointer is adopted by the owning wrapper (whose deinit
+        // destroys it); no explicit per-element free appears in next().
+        assert!(
+            out.contains("let element = Entry(ptr: item!)"),
+            "record element must be adopted by the wrapper: {out}"
+        );
+    }
+
+    #[test]
+    fn list_return_frees_buffer_and_string_elements() {
+        let api = make_api(vec![Module {
+            name: "data".to_string(),
+            functions: vec![
+                Function {
+                    name: "get_ids".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::I32))),
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "get_names".to_string(),
+                    params: vec![],
+                    returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        // The producer-allocated array buffer is released after copying.
+        assert!(
+            out.contains("defer { wvFreeArray(rv, outLen) }"),
+            "list return must free the array buffer: {out}"
+        );
+        // Each string element is freed after being copied into a Swift String.
+        assert!(
+            out.contains("items.append(String(cString: rv[i]!))")
+                && out.contains("weaveffi_free_string(rv[i])"),
+            "string list elements must be copied then freed: {out}"
+        );
+    }
+
+    #[test]
+    fn map_return_frees_parallel_buffers_and_string_keys() {
+        let api = make_api(vec![Module {
+            name: "store".to_string(),
+            functions: vec![Function {
+                name: "get_scores".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        assert!(
+            out.contains("defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }"),
+            "map return must free both parallel buffers: {out}"
         );
         assert!(
-            out.contains("_destroy"),
-            "should call _destroy to clean up iterator: {out}"
+            out.contains("weaveffi_free_string(outKeys[i])"),
+            "string map keys must be freed after copying: {out}"
+        );
+    }
+
+    #[test]
+    fn async_string_result_is_copied_not_freed() {
+        let api = make_api(vec![Module {
+            name: "tasks".to_string(),
+            functions: vec![Function {
+                name: "fetch".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                throws: true,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        // The callback's string is borrowed for the callback's duration: it
+        // is copied into the resumed value and never freed by the wrapper.
+        assert!(
+            out.contains("contRef.value.resume(returning: String(cString: result))"),
+            "async string result must be copied before resuming: {out}"
+        );
+        let cb_pos = out.find("fetch_async").expect("async launcher present");
+        assert!(
+            !out[cb_pos..].contains("weaveffi_free_string"),
+            "async wrapper must not free the borrowed result buffer: {out}"
         );
     }
 
@@ -6266,7 +6781,7 @@ mod tests {
     /// The `shapes` sample: a rich (algebraic) enum `Shape` (a unit variant, an
     /// f64 payload, two f32 payloads, and a string+u8 payload), a plain C-style
     /// enum `Channel`, and the free functions that take/return `Shape` (lowered
-    /// to `TypeRef::Struct`) plus the numerics smoke `sum_bytes`.
+    /// to `TypeRef::RichEnum`) plus the numerics smoke `sum_bytes`.
     fn shapes_api() -> Api {
         use weaveffi_ir::ir::StructField;
         fn field(name: &str, ty: TypeRef) -> StructField {
@@ -6284,7 +6799,7 @@ mod tests {
                     name: "describe".into(),
                     params: vec![Param {
                         name: "shape".into(),
-                        ty: TypeRef::Struct("Shape".into()),
+                        ty: TypeRef::RichEnum("Shape".into()),
                         mutable: false,
                         doc: None,
                     }],
@@ -6301,7 +6816,7 @@ mod tests {
                     params: vec![
                         Param {
                             name: "shape".into(),
-                            ty: TypeRef::Struct("Shape".into()),
+                            ty: TypeRef::RichEnum("Shape".into()),
                             mutable: false,
                             doc: None,
                         },
@@ -6312,7 +6827,7 @@ mod tests {
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Struct("Shape".into())),
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
                     doc: None,
                     throws: false,
                     r#async: false,

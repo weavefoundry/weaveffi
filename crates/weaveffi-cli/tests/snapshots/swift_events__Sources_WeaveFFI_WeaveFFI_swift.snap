@@ -54,6 +54,16 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+@inline(__always)
+func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
+}
+
+@inline(__always)
+func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+}
+
 final class WvCallbackBox<T> {
     let value: T
     init(_ value: T) { self.value = value }
@@ -61,6 +71,50 @@ final class WvCallbackBox<T> {
 
 var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
 let wvListenerLock = NSLock()
+
+/// A lazy sequence over the `String` elements streamed by `weaveffi_events_get_messages`.
+///
+/// Each `next()` call pulls exactly one element from the producer. The
+/// underlying C iterator is destroyed eagerly on exhaustion and from
+/// `deinit` when iteration is abandoned early.
+public final class EventsGetMessagesIterator: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+
+    init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        destroyHandle()
+    }
+
+    private func destroyHandle() {
+        guard let handle = handle else { return }
+        weaveffi_events_GetMessagesIterator_destroy(handle)
+        self.handle = nil
+    }
+
+    /// Pulls the next element from the producer, or returns `nil` once the
+    /// stream is exhausted (destroying the underlying iterator).
+    public func next() -> String? {
+        guard let handle = handle else { return nil }
+        var item: UnsafePointer<CChar>? = nil
+        var err = weaveffi_error(code: 0, message: nil)
+        if weaveffi_events_GetMessagesIterator_next(handle, &item, &err) == 0 {
+            if err.code != 0 {
+                let code = err.code
+                let message = err.message.flatMap { String(cString: $0) } ?? ""
+                weaveffi_error_clear(&err)
+                fatalError("\(code): \(message)")
+            }
+            destroyHandle()
+            return nil
+        }
+        let element = String(cString: item!)
+        weaveffi_free_string(item)
+        return element
+    }
+}
 
 public enum Events {
     /// - Returns: A subscription id for ``unregisterMessageListener(_:)``.
@@ -95,21 +149,15 @@ public enum Events {
         trap(&err)
     }
     /// Return an iterator over all sent messages
-    public static func getMessages() -> [String] {
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   producer; the underlying iterator is destroyed when the sequence is
+    ///   exhausted or deinitialized.
+    public static func getMessages() -> EventsGetMessagesIterator {
         var err = weaveffi_error(code: 0, message: nil)
         let iter = weaveffi_events_get_messages(&err)
         trap(&err)
-        guard let iter = iter else { return [] }
-        var items: [String] = []
-        var iterItem: UnsafePointer<CChar>? = nil
-        var iterErr = weaveffi_error(code: 0, message: nil)
-        while weaveffi_events_GetMessagesIterator_next(iter, &iterItem, &iterErr) != 0 {
-            items.append(String(cString: iterItem!))
-            weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
-        }
-        weaveffi_events_GetMessagesIterator_destroy(iter)
-        trap(&iterErr)
-        return items
+        guard let iter = iter else { fatalError("-1: null iterator") }
+        return EventsGetMessagesIterator(handle: iter)
     }
 }
 

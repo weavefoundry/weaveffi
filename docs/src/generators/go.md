@@ -7,7 +7,10 @@ ABI. The generator emits one Go source file (`weaveffi.go`) plus a
 `go.mod` so the result can be imported by any Go module. Functions
 marked `throws: true` return `(value, error)` to match Go conventions;
 all other wrappers return plain values. Struct and interface wrappers
-expose methods plus an explicit `Close()`.
+expose methods plus an explicit `Close()`. Functions returning
+`iter<T>` produce standard-library `iter.Seq`/`iter.Seq2` sequences,
+so the generated module requires Go 1.23 or later (the emitted
+`go.mod` declares `go 1.23`).
 
 ## What gets generated
 
@@ -42,7 +45,7 @@ expose methods plus an explicit `Close()`.
 | `T?`         | `*T`          | pointer to scalar; nil-able pointer for strings/structs |
 | `[T]`        | `[]T`         | pointer + `C.size_t`       |
 | `{K: V}`     | `map[K]V`     | key/value arrays + `C.size_t` |
-| `iter<T>`    | `[]T` (drained eagerly) | opaque iterator pointer + `_next`/`_destroy` |
+| `iter<T>`    | `iter.Seq[T]`, or `iter.Seq2[T, error]` when the function throws | opaque iterator pointer + `_next`/`_destroy` |
 
 Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 
@@ -127,13 +130,17 @@ type Contact struct {
 }
 
 func (s *Contact) FirstName() string {
-	return C.GoString(C.weaveffi_contacts_Contact_get_first_name(s.ptr))
+	cStr := C.weaveffi_contacts_Contact_get_first_name(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Contact) Email() *string {
 	cStr := C.weaveffi_contacts_Contact_get_email(s.ptr)
 	if cStr == nil { return nil }
 	v := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
 	return &v
 }
 
@@ -173,7 +180,9 @@ func CreateContact(firstName string, email *string, contactType ContactType) int
 A function marked `throws: true` returns `(value, error)` instead; see
 [Typed errors](#typed-errors).
 
-Lists round-trip through `unsafe.Slice`:
+Lists round-trip through `unsafe.Slice`; after the copy, the wrapper
+releases the producer's buffer with `weaveffi_free_bytes` (and frees
+string elements individually with `weaveffi_free_string` first):
 
 ```go
 var cOutLen C.size_t
@@ -183,6 +192,7 @@ if count == 0 || result == nil { return nil, nil }
 goResult := make([]int32, count)
 cSlice := unsafe.Slice((*C.int32_t)(unsafe.Pointer(result)), count)
 for i, v := range cSlice { goResult[i] = int32(v) }
+C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 ```
 
 The Go module path defaults to `weaveffi`; override it via the
@@ -292,8 +302,11 @@ func (s *Store) Count() int64 {
 }
 
 // Compact: Reclaim space asynchronously; returns the number of bytes reclaimed
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func (s *Store) Compact() (int64, error) { /* see Async support */ }
+
+// ListKeys: Stream every key, optionally filtered by a prefix
+func (s *Store) ListKeys(prefix *string) iter.Seq2[string, error] { /* see Iterators */ }
 
 // LegacyPut: Legacy single-shot put kept for compatibility
 // Deprecated: use put() with explicit kind
@@ -367,9 +380,7 @@ func NewShapeCircle(radius float64) (*Shape, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_shapes_Shape_Circle_new(C.double(radius), &cErr)
 	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
+		return nil, wvBrandError(wvTakeError(&cErr))
 	}
 	return &Shape{ptr: result}, nil
 }
@@ -381,9 +392,7 @@ func NewShapeLabeled(label string, count uint8) (*Shape, error) {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_shapes_Shape_Labeled_new(cLabel, C.uint8_t(count), &cErr)
 	if cErr.code != 0 {
-		goErr := fmt.Errorf("weaveffi: %s (code %d)", C.GoString(cErr.message), int(cErr.code))
-		C.weaveffi_error_clear(&cErr)
-		return nil, goErr
+		return nil, wvBrandError(wvTakeError(&cErr))
 	}
 	return &Shape{ptr: result}, nil
 }
@@ -475,11 +484,16 @@ use a MinGW-w64 toolchain or the MSVC build provided by `go env`.
 - **Bytes:** input slices are passed by pointer for the duration of
   the call (no copy); returned bytes are copied with `C.GoBytes` and
   then `weaveffi_free_bytes` is called.
+- **Lists and maps out:** each element is copied (string elements are
+  freed individually with `weaveffi_free_string`), then the array
+  buffer, or both parallel key/value buffers for a map, is released
+  with `weaveffi_free_bytes`.
 - **Structs and interfaces:** wrappers hold a typed C pointer. Always
   pair with `defer s.Close()` because Go has no deterministic
   destructors.
 - **Optionals:** scalar optionals are `*T`; struct/string optionals
-  rely on a nil pointer to indicate absence.
+  rely on a nil pointer to indicate absence. A returned boxed scalar
+  is dereferenced and its box freed with `weaveffi_free_bytes`.
 
 ## Callbacks and listeners
 
@@ -566,38 +580,59 @@ inside `SendMessage`). Don't block in it; forward to a channel
 ## Async support
 
 Functions marked `async: true` are exposed through `_async`-suffixed C
-launchers that take a completion callback plus `void* context`. The
-generated Go wrapper turns that into a plain blocking call: it makes a
-buffered channel, stores it in the same callback registry the listener
-bindings use, launches the C call with an exported trampoline and the
-integer context id, then receives from the channel:
+launchers that take a completion callback plus `void* context`. Go has
+no ambient async runtime, so the generated wrapper turns that into a
+blocking call built on a channel: it makes a buffered channel, stores
+it in the same callback registry the listener bindings use, launches
+the C call with an exported trampoline and the integer context id,
+then receives from the channel. The generated doc comment states that
+the call blocks. From the `kvstore` sample:
 
 ```go
-// Blocks until the async producer completes.
-func RunTask(name string) (*TaskResult, error) {
-	ch := make(chan wvOutcomeTasksRunTask, 1)
+// Compact: Reclaim space asynchronously; returns the number of bytes reclaimed
+// Blocks the calling goroutine until the async producer completes.
+func (s *Store) Compact() (int64, error) {
+	ch := make(chan wvOutcomeKvStoreCompact, 1)
 	ctxID := wvCallbackStore(ch)
-	cName := C.CString(name)
-	defer C.free(unsafe.Pointer(cName))
-	C.weaveffi_tasks_run_task_async(cName,
-		C.weaveffi_tasks_run_task_callback(unsafe.Pointer(C.goWv_weaveffi_tasks_run_task_callback)),
-		unsafe.Pointer(uintptr(ctxID)))
+	C.weaveffi_kv_Store_compact_async(s.ptr, nil, C.weaveffi_kv_Store_compact_callback(unsafe.Pointer(C.goWv_weaveffi_kv_Store_compact_callback)), unsafe.Pointer(uintptr(ctxID)))
 	outcome := <-ch
 	if outcome.err != nil {
-		return nil, outcome.err
+		return 0, outcome.err
 	}
 	return outcome.val, nil
 }
 ```
 
-The completion trampoline removes the channel from the registry with
-`wvCallbackTake` (one-shot), converts the C error or result, and sends
-a single `wvOutcome…` value. For a callable marked `throws: true`, the
-trampoline maps the error through the domain mapper, so the returned
-`error` is the typed one (`*KvError` from `store.Compact()`). The
-native producer already runs on its own thread, so the wrapper simply
-blocks the calling goroutine; callers that want concurrency run the
-call from a goroutine of their own.
+The completion callback fires exactly once, on a producer thread. The
+trampoline removes the channel from the registry with `wvCallbackTake`
+(one-shot), converts the C error or result inside the callback (result
+buffers such as strings and arrays are borrowed from the producer for
+the callback's duration, so the trampoline copies them into Go memory
+and never frees them; owned-object results are adopted into a wrapper
+instead), and sends a single `wvOutcome…` value:
+
+```go
+//export goWv_weaveffi_kv_Store_compact_callback
+func goWv_weaveffi_kv_Store_compact_callback(context unsafe.Pointer, err *C.weaveffi_error, result C.int64_t) {
+	v := wvCallbackTake(uint64(uintptr(context)))
+	if v == nil {
+		return
+	}
+	ch := v.(chan wvOutcomeKvStoreCompact)
+	if err != nil && err.code != 0 {
+		ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeError(err))}
+		return
+	}
+	ch <- wvOutcomeKvStoreCompact{val: int64(result)}
+}
+```
+
+For a callable marked `throws: true`, the trampoline maps the error
+through the domain mapper, so the returned `error` is the typed one
+(`*KvError` from `store.Compact()`). The native producer already runs
+on its own thread, so the wrapper simply blocks the calling goroutine;
+callers that want concurrency run the call from a goroutine of their
+own.
 
 For functions marked `cancellable: true` the C launcher gains a
 `weaveffi_cancel_token*` parameter. The Go wrapper passes `nil` for it
@@ -606,35 +641,81 @@ surface cancellation tokens.
 
 ## Iterators
 
-`iter<T>` returns map to plain `[]T` (plus an `error` when the
-function throws, as with `Store.ListKeys`). The wrapper obtains the
-opaque iterator pointer, drains it eagerly through the generated
-`_next` symbol, and destroys it before returning:
+`iter<T>` returns map to the standard library's range-over-function
+sequences (Go 1.23+): a non-throwing function returns `iter.Seq[T]`
+and a throwing one returns `iter.Seq2[T, error]`. Nothing is drained:
+the producer iterator is launched when the consumer starts ranging,
+and each consumer step issues exactly one producer `next` call. From
+the `events` sample:
 
 ```go
-func GetMessages() []string {
-	var cErr C.weaveffi_error
-	it := C.weaveffi_events_get_messages(&cErr)
-	wvTrap(&cErr)
-	defer C.weaveffi_events_GetMessagesIterator_destroy(it)
-	goResult := []string{}
-	for {
-		var outItem *C.char
-		var iterErr C.weaveffi_error
-		if C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) == 0 {
-			break
+// GetMessages: Return an iterator over all sent messages
+// Returns a lazy sequence: the producer iterator is launched on first
+// iteration and one producer next call runs per element. The iterator is
+// destroyed exactly once, whether the sequence is exhausted or abandoned
+// early; each range over the sequence launches a fresh producer iterator.
+// A reported error can only be a producer bug and panics with the
+// weaveffi message.
+func GetMessages() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		var cErr C.weaveffi_error
+		it := C.weaveffi_events_get_messages(&cErr)
+		wvTrap(&cErr)
+		defer C.weaveffi_events_GetMessagesIterator_destroy(it)
+		for {
+			var outItem *C.char
+			var iterErr C.weaveffi_error
+			ok := C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) != 0
+			wvTrap(&iterErr)
+			if !ok {
+				return
+			}
+			item := C.GoString(outItem)
+			C.weaveffi_free_string(outItem)
+			if !yield(item) {
+				return
+			}
 		}
-		wvTrap(&iterErr)
-		goResult = append(goResult, C.GoString(outItem))
-		C.weaveffi_free_string(outItem)
 	}
-	return goResult
 }
 ```
 
 Each yielded element is copied into Go memory and its Rust allocation
-released (strings via `weaveffi_free_string`); the iterator handle is
-destroyed by the deferred `_destroy` call.
+released per element (strings via `weaveffi_free_string`; record
+elements are adopted by owning wrappers). The deferred `_destroy` call
+runs exactly once, whether the consumer exhausts the sequence or
+breaks out of the `for range` loop early. Ranging over the same
+returned sequence again launches a fresh producer iterator.
+
+A throwing function yields errors in-band as the second value of the
+`iter.Seq2` pair: a launch or per-element failure is mapped through
+the domain mapper, yielded as the final `(zero value, error)` pair,
+and iteration stops. From the `kvstore` sample:
+
+```go
+// ListKeys: Stream every key, optionally filtered by a prefix
+// ...
+// A launch or per-element error is yielded as the final (zero value,
+// error) pair, and iteration stops.
+func (s *Store) ListKeys(prefix *string) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		// ... launch weaveffi_kv_Store_list_keys ...
+		if cErr.code != 0 {
+			yield("", wvMapKv(wvTakeError(&cErr)))
+			return
+		}
+		defer C.weaveffi_kv_Store_ListKeysIterator_destroy(it)
+		for {
+			// ... one _next call per step; errors yield ("", err) and stop ...
+		}
+	}
+}
+```
+
+Consume it with `for key, err := range store.ListKeys(nil)`, checking
+`err` on each step. In a non-throwing sequence such as `GetMessages`,
+a reported error can only be a producer bug, so `wvTrap` panics
+instead of yielding it.
 
 ## Troubleshooting
 

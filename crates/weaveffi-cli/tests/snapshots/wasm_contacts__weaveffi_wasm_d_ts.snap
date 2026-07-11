@@ -39,6 +39,8 @@ export interface Contact {
   readonly last_name: string;
   readonly email: string | null;
   readonly contact_type: ContactType;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export declare const ContactType: Readonly<{

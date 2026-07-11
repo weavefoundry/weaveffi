@@ -126,8 +126,9 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Decode a producer-owned array of `len` C strings at `base` (each
-// freed); the array container itself is owned by the producer.
+// Decode an array of `len` C strings at `base`, freeing each string
+// after copying (the consumer owns the elements); the caller releases
+// the array container separately.
 function _takeStrArray(wasm, base, len) {
   const out = [];
   if (base === 0) return out;
@@ -239,6 +240,7 @@ class Product {
     const _len = _dv.getUint32(_lp, true);
     wasm.weaveffi_dealloc(_lp, 4);
     const _out = _takeStrArray(wasm, _r, _len);
+    if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
     return _out;
   }
   static create(wasm, id, name, description, price, category, tags) {
@@ -263,6 +265,12 @@ class Product {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Product(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_products_Product_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 
@@ -293,6 +301,12 @@ class OrderItem {
     _freeErr(wasm, _err);
     return new OrderItem(wasm, _r);
   }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_orders_OrderItem_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
 }
 
 class Order {
@@ -317,6 +331,7 @@ class Order {
       const dv = new DataView(wasm.memory.buffer);
       for (let i = 0; i < _len; i++) _out.push(new OrderItem(wasm, dv.getInt32(_r + i * 4, true)));
     }
+    if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
     return _out;
   }
   get total() {
@@ -345,6 +360,12 @@ class Order {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Order(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_orders_Order_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 
@@ -433,6 +454,7 @@ export async function loadWeaveffiWasm(url) {
         const dv = new DataView(wasm.memory.buffer);
         for (let i = 0; i < _len; i++) _out.push(new Product(wasm, dv.getInt32(_r + i * 4, true)));
       }
+      if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
       return _out;
     }
     updatePrice(id, price) {

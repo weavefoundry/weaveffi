@@ -16,17 +16,22 @@ use weaveffi_ir::ir::{Api, Function, InterfaceDef, Module, StructDef, TypeRef};
 use weaveffi_ir::parse::parse_api_str;
 
 /// The validator that runs inside `weaveffi extract` rewrites cross-module
-/// struct refs (e.g. `Token` → `shared.Token`) and demotes/promotes Struct
-/// vs Enum based on the module's enums. Neither rewrite survives the YAML
-/// round-trip because a string like `"Priority"` always re-parses as
-/// `Struct("Priority")` regardless of which kind it was. Compare types
-/// modulo those two transforms so a fresh parse matches a validated one.
+/// struct refs (e.g. `Token` → `shared.Token`) and resolves each bare name
+/// to its kind (`Record`, `RichEnum`, `Enum`, `Interface`). Neither rewrite
+/// survives the YAML round-trip because a string like `"Priority"` always
+/// re-parses as `Named("Priority")` regardless of which kind it was. Compare
+/// types modulo those two transforms so a fresh parse matches a validated
+/// one.
 fn normalize(ty: &TypeRef) -> TypeRef {
     fn last_segment(name: &str) -> String {
         name.rsplit('.').next().unwrap_or(name).to_string()
     }
     match ty {
-        TypeRef::Struct(name) | TypeRef::Enum(name) => TypeRef::Struct(last_segment(name)),
+        TypeRef::Named(name)
+        | TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::Enum(name)
+        | TypeRef::Interface(name) => TypeRef::Named(last_segment(name)),
         TypeRef::TypedHandle(name) => TypeRef::TypedHandle(last_segment(name)),
         TypeRef::Optional(inner) => TypeRef::Optional(Box::new(normalize(inner))),
         TypeRef::List(inner) => TypeRef::List(Box::new(normalize(inner))),

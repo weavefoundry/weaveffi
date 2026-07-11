@@ -47,9 +47,11 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
-_lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
+# The free helpers take raw addresses (`c_void_p`) so wrappers can release
+# owned producer allocations they hold as plain integers or typed pointers.
+_lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
 _lib.weaveffi_free_string.restype = None
-_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.weaveffi_free_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _lib.weaveffi_free_bytes.restype = None
 
 
@@ -83,6 +85,15 @@ def _bytes_to_string(ptr) -> Optional[str]:
     if ptr is None:
         return None
     return ptr.decode("utf-8")
+
+
+def _take_string(ptr) -> Optional[str]:
+    """Copy an owned C string (a raw address) and free the producer buffer."""
+    if not ptr:
+        return None
+    _s = ctypes.string_at(ptr).decode("utf-8")
+    _lib.weaveffi_free_string(ptr)
+    return _s
 
 
 # === Module: calculator ===
@@ -171,10 +182,10 @@ def echo(s: str) -> str:
     """
     _fn = _lib.weaveffi_calculator_echo
     _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_char_p
+    _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
     _check_error(_err)
-    return _bytes_to_string(_result) or ""
+    return _take_string(_result) or ""
 
 # END weaveffi.py

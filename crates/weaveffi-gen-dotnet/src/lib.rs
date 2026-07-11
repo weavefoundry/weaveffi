@@ -24,6 +24,7 @@ use weaveffi_core::model::{
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -296,7 +297,8 @@ fn cs_type(ty: &TypeRef) -> String {
         // bare local class; the qualified IR name is not a C# type here.
         TypeRef::TypedHandle(name) => local_type_name(name).into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "byte[]".into(),
-        TypeRef::Struct(name) => local_type_name(name).into(),
+        // Records and rich enums share the opaque-object wrapper class.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).into(),
         TypeRef::Enum(name) => local_type_name(name).into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::I8 => "sbyte?".into(),
@@ -314,7 +316,9 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::TypedHandle(name) => format!("{}?", local_type_name(name)),
             TypeRef::Enum(name) => format!("{}?", local_type_name(name)),
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string?".into(),
-            TypeRef::Struct(name) => format!("{}?", local_type_name(name)),
+            TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+                format!("{}?", local_type_name(name))
+            }
             _ => format!("{}?", cs_type(inner)),
         },
         TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
@@ -323,6 +327,7 @@ fn cs_type(ty: &TypeRef) -> String {
         // Interfaces surface as their opaque-handle wrapper class; a
         // cross-module reference (`kv.Store`) uses the bare local name.
         TypeRef::Interface(name) => local_type_name(name).into(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -338,12 +343,15 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::U64 => "ulong".into(),
         TypeRef::F32 => "float".into(),
         TypeRef::F64 => "double".into(),
-        TypeRef::Bool => "int".into(),
+        // C `bool` is one byte; marshalling it as `int` would read past the
+        // slot in arrays and leave garbage in the upper bits of returns.
+        TypeRef::Bool => "byte".into(),
         TypeRef::StringUtf8
         | TypeRef::BorrowedStr
         | TypeRef::Bytes
         | TypeRef::BorrowedBytes
-        | TypeRef::Struct(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
         | TypeRef::Interface(_)
         | TypeRef::Optional(_)
         | TypeRef::List(_)
@@ -352,6 +360,7 @@ fn pinvoke_type(ty: &TypeRef) -> String {
         TypeRef::Handle => "ulong".into(),
         TypeRef::TypedHandle(_) => "IntPtr".into(),
         TypeRef::Enum(_) => "int".into(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -360,7 +369,9 @@ fn pinvoke_type(ty: &TypeRef) -> String {
 /// exist, in what order) comes from [`weaveffi_core::abi`].
 fn cs_pinvoke_ctype(ty: &CType) -> String {
     match ty {
-        CType::Int32 | CType::Bool | CType::Enum { .. } => "int".into(),
+        CType::Int32 | CType::Enum { .. } => "int".into(),
+        // C `bool` is one byte on every supported ABI.
+        CType::Bool => "byte".into(),
         CType::Uint32 => "uint".into(),
         CType::Int64 => "long".into(),
         CType::Uint64 | CType::Handle => "ulong".into(),
@@ -687,6 +698,14 @@ fn render_csharp(
     }
     render_error_struct(&mut out, &domains);
     render_helpers_class(&mut out);
+    if model
+        .modules
+        .iter()
+        .flat_map(|m| m.callables())
+        .any(|f| matches!(f.shape, CallShape::Iterator(_)))
+    {
+        render_once_enumerable_class(&mut out);
+    }
 
     for m in &model.modules {
         for e in &m.enums {
@@ -738,9 +757,11 @@ fn cs_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// How a wrapper surfaces a non-zero error slot: `throws` functions with a
-/// domain in scope raise the typed domain exception, everything else raises
-/// the generic brand exception (panics and marshalling errors only).
+/// How a wrapper surfaces a non-zero error slot, rendering
+/// [`ErrorStrategy`]: [`ErrorStrategy::Throws`] with a domain in scope raises
+/// the typed domain exception; everything else (a producer trap, or a
+/// throwing function without a declared domain) raises the plain
+/// `WeaveFFIException`, which no domain exception check can catch by type.
 #[derive(Clone, Copy)]
 enum ErrCtx<'a> {
     /// Throw the generic `WeaveFFIException`.
@@ -750,11 +771,13 @@ enum ErrCtx<'a> {
 }
 
 impl<'a> ErrCtx<'a> {
-    /// The error context for one function: typed when the function throws and
-    /// its module has an error domain in scope, generic otherwise.
+    /// The error context for one function: typed when the function's
+    /// [`ErrorStrategy`] is `Throws` and its module has an error domain in
+    /// scope, generic otherwise (including every `Trap` function, whose only
+    /// failures are producer bugs and must not wear the domain type).
     fn for_fn(f: &FnBinding, error: Option<&'a ErrorBinding>) -> Self {
-        match error {
-            Some(eb) if f.throws => ErrCtx::Domain(eb),
+        match (f.error_strategy(), error) {
+            (ErrorStrategy::Throws, Some(eb)) => ErrCtx::Domain(eb),
             _ => ErrCtx::Generic,
         }
     }
@@ -930,6 +953,47 @@ fn render_helpers_class(out: &mut String) {
     out.push_str(&w.finish());
 }
 
+/// The single-use `IEnumerable<T>` wrapping every iterator return. The
+/// native iterator is consumed (and destroyed) by its one enumerator, so a
+/// second `GetEnumerator()` cannot yield anything; surfacing it as an
+/// `InvalidOperationException` beats silently returning an empty or
+/// double-destroyed sequence.
+fn render_once_enumerable_class(out: &mut String) {
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("/// <summary>A lazily streamed sequence backed by a native iterator.");
+    w.line("/// It can be enumerated exactly once; enumerate it promptly (or call");
+    w.line("/// a materializing operator such as ToList) and let the enumerator be");
+    w.line("/// disposed to release the native iterator.</summary>");
+    w.line("internal sealed class WeaveFFIOnceEnumerable<T> : IEnumerable<T>");
+    w.block("{", "}", |w| {
+        w.line("private IEnumerator<T>? _enumerator;");
+        w.blank();
+        w.line("internal WeaveFFIOnceEnumerable(IEnumerator<T> enumerator)");
+        w.block("{", "}", |w| {
+            w.line("_enumerator = enumerator;");
+        });
+        w.blank();
+        w.line("public IEnumerator<T> GetEnumerator()");
+        w.block("{", "}", |w| {
+            w.line("var e = System.Threading.Interlocked.Exchange(ref _enumerator, null);");
+            w.line("if (e == null)");
+            w.block("{", "}", |w| {
+                w.line(
+                    "throw new InvalidOperationException(\"this sequence can be enumerated only once\");",
+                );
+            });
+            w.line("return e;");
+        });
+        w.blank();
+        w.line("System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator()");
+        w.block("{", "}", |w| {
+            w.line("return GetEnumerator();");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
 fn render_enum(out: &mut String, e: &EnumBinding) {
     // A rich (algebraic) enum is not a plain C# `enum`; it surfaces as an
     // opaque-object class via `render_rich_enum_class`. Guard here so this
@@ -999,9 +1063,9 @@ fn render_struct_class(out: &mut String, s: &StructBinding) {
 /// a nested `enum Tag` + `GetTag()` reader, one static factory per variant
 /// (`Shape.Circle(2.5)`) using the struct/builder error-handling convention,
 /// and per-variant field accessors namespaced as `{Variant}{Field}` properties
-/// that reuse the struct-getter marshalling. Because resolution leaves a
-/// rich-enum reference as `TypeRef::Struct`, functions taking/returning the
-/// enum flow through the existing struct param/return path unchanged.
+/// that reuse the struct-getter marshalling. A `TypeRef::RichEnum` reference
+/// shares the opaque-pointer handling of `TypeRef::Record`, so functions
+/// taking/returning the enum flow through the record param/return path.
 fn render_rich_enum_class(out: &mut String, e: &EnumBinding) {
     let Some(rich) = e.rich.as_ref() else {
         return;
@@ -1500,7 +1564,9 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
             let cn = local_type_name(name);
             w.line(format!("return ({cn})NativeMethods.{getter_sym}(_handle);"));
         }
-        TypeRef::Struct(name) => {
+        // The getter returns an owned object reference; the wrapper adopts it
+        // and its Dispose() calls the type's destroy symbol.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
             let cn = local_type_name(name);
             w.line(format!(
                 "return new {cn}(NativeMethods.{getter_sym}(_handle));"
@@ -1527,69 +1593,23 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
                     w.line("NativeMethods.weaveffi_free_string(ptr);");
                     w.line("return str;");
                 }
-                TypeRef::Struct(name) => {
+                // Owned object pointer, adopted by its wrapper.
+                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                     let cn = local_type_name(name);
                     w.line(format!("return ptr == IntPtr.Zero ? null : new {cn}(ptr);"));
                 }
-                TypeRef::I32 => {
+                other => {
+                    // A producer-boxed scalar: dereference, then release the
+                    // box (the `ReturnFree::BoxedScalar` contract).
+                    let Some((read, size)) = boxed_scalar_read(other, "ptr") else {
+                        unreachable!("unsupported optional field type");
+                    };
                     w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return Marshal.ReadInt32(ptr);");
-                }
-                TypeRef::U32 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return (uint)Marshal.ReadInt32(ptr);");
-                }
-                TypeRef::I64 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return Marshal.ReadInt64(ptr);");
-                }
-                TypeRef::F64 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr));");
-                }
-                TypeRef::I8 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return (sbyte)Marshal.ReadByte(ptr);");
-                }
-                TypeRef::U8 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return (byte)Marshal.ReadByte(ptr);");
-                }
-                TypeRef::I16 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return Marshal.ReadInt16(ptr);");
-                }
-                TypeRef::U16 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return (ushort)Marshal.ReadInt16(ptr);");
-                }
-                TypeRef::U64 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return (ulong)Marshal.ReadInt64(ptr);");
-                }
-                TypeRef::F32 => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(ptr));");
-                }
-                TypeRef::Bool => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return Marshal.ReadInt32(ptr) != 0;");
-                }
-                TypeRef::Handle => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("return (ulong)Marshal.ReadInt64(ptr);");
-                }
-                TypeRef::TypedHandle(name) => {
-                    let cn = local_type_name(name);
-                    w.line(format!("return ptr == IntPtr.Zero ? null : new {cn}(ptr);"));
-                }
-                TypeRef::Enum(name) => {
-                    let cn = local_type_name(name);
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line(format!("return ({cn})Marshal.ReadInt32(ptr);"));
-                }
-                _ => {
-                    w.line("return ptr;");
+                    w.line(format!("var value = {read};"));
+                    w.line(format!(
+                        "NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr){size});"
+                    ));
+                    w.line("return value;");
                 }
             }
         }
@@ -1605,16 +1625,17 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
             w.line(format!(
                 "NativeMethods.{getter_sym}(_handle, out var outKeys, out var outValues, out var outLen);"
             ));
-            let k_cs = cs_type(k);
-            let v_cs = cs_type(v);
-            w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
-            let key_read = marshal_read_element(k, "outKeys", "i");
-            let val_read = marshal_read_element(v, "outValues", "i");
-            w.line("for (int i = 0; i < (int)outLen; i++)");
-            w.block("{", "}", |w| {
-                w.line(format!("dict[{key_read}] = {val_read};"));
-            });
-            w.line("return dict;");
+            let mut tmp = String::new();
+            render_map_decode(
+                &mut tmp,
+                k,
+                v,
+                "outKeys",
+                "outValues",
+                "outLen",
+                "                ",
+            );
+            w.raw(tmp);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
         // The getter returns an owned reference; the wrapper owns and
@@ -1625,6 +1646,7 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
                 "return new {cn}(NativeMethods.{getter_sym}(_handle));"
             ));
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 
     w.dedent();
@@ -1639,31 +1661,154 @@ fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
     render_list_decode(out, inner, "ptr", "len", indent);
 }
 
-/// Decodes a C parallel array (`base` + `len`) into a managed `T[]` and
-/// returns it. Blittable scalars bulk-copy; everything else element-reads via
-/// [`marshal_read_element`].
+/// The C# expression dereferencing one producer-boxed optional scalar of type
+/// `inner` through `ptr`, paired with the box's size in bytes (the argument
+/// to the `weaveffi_free_bytes` release the `ReturnFree::BoxedScalar` plan
+/// requires). Returns `None` for non-scalar inners, which are pointer
+/// optionals and reuse the inner type's return plan.
+fn boxed_scalar_read(inner: &TypeRef, ptr: &str) -> Option<(String, &'static str)> {
+    Some(match inner {
+        TypeRef::I8 => (format!("(sbyte)Marshal.ReadByte({ptr})"), "1"),
+        TypeRef::U8 => (format!("Marshal.ReadByte({ptr})"), "1"),
+        TypeRef::I16 => (format!("Marshal.ReadInt16({ptr})"), "2"),
+        TypeRef::U16 => (format!("(ushort)Marshal.ReadInt16({ptr})"), "2"),
+        TypeRef::I32 => (format!("Marshal.ReadInt32({ptr})"), "4"),
+        TypeRef::U32 => (format!("(uint)Marshal.ReadInt32({ptr})"), "4"),
+        TypeRef::I64 => (format!("Marshal.ReadInt64({ptr})"), "8"),
+        TypeRef::U64 | TypeRef::Handle => (format!("(ulong)Marshal.ReadInt64({ptr})"), "8"),
+        TypeRef::F32 => (
+            format!("BitConverter.Int32BitsToSingle(Marshal.ReadInt32({ptr}))"),
+            "4",
+        ),
+        TypeRef::F64 => (
+            format!("BitConverter.Int64BitsToDouble(Marshal.ReadInt64({ptr}))"),
+            "8",
+        ),
+        // C `bool` is one byte.
+        TypeRef::Bool => (format!("Marshal.ReadByte({ptr}) != 0"), "1"),
+        TypeRef::Enum(name) => (
+            format!("({})Marshal.ReadInt32({ptr})", local_type_name(name)),
+            "4",
+        ),
+        _ => return None,
+    })
+}
+
+/// The size in bytes of one C array slot holding an element of type `ty`, as
+/// a C# expression. Used to release producer-allocated array and map buffers
+/// with `weaveffi_free_bytes(ptr, len * slot_size)`, the `ReturnFree::Array`
+/// and `ReturnFree::MapBuffers` contract.
+fn cs_elem_size(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::I8 | TypeRef::U8 | TypeRef::Bool => "1",
+        TypeRef::I16 | TypeRef::U16 => "2",
+        TypeRef::I32 | TypeRef::U32 | TypeRef::F32 | TypeRef::Enum(_) => "4",
+        TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => "8",
+        // Optional pointer elements occupy one pointer slot (null = none).
+        TypeRef::Optional(inner) => cs_elem_size(inner),
+        // Strings, records, rich enums, interfaces, and typed handles are all
+        // pointer slots.
+        _ => "IntPtr.Size",
+    }
+}
+
+/// Emit the statements reading element `idx` of the producer-owned buffer
+/// `arr` into a local named `var`, honoring the per-element release contract
+/// (`ElemFree`): string elements are copied and then freed with
+/// `weaveffi_free_string`; record/rich-enum/interface elements are adopted by
+/// their wrapper (whose `Dispose` calls the destroy symbol); by-value
+/// elements copy with nothing to free.
+fn render_owned_element_read(w: &mut CodeWriter, ty: &TypeRef, arr: &str, idx: &str, var: &str) {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!(
+                "var {var}Ptr = Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size);"
+            ));
+            w.line(format!(
+                "var {var} = Marshal.PtrToStringUTF8({var}Ptr) ?? \"\";"
+            ));
+            w.line(format!("NativeMethods.weaveffi_free_string({var}Ptr);"));
+        }
+        _ => {
+            w.line(format!(
+                "var {var} = {};",
+                marshal_read_element(ty, arr, idx)
+            ));
+        }
+    }
+}
+
+/// Emit the `weaveffi_free_bytes` release of a producer-allocated array
+/// buffer of `len` elements of type `elem` based at `base`, after every
+/// element has been copied out (and string elements individually freed).
+fn write_buffer_free(w: &mut CodeWriter, base: &str, len: &str, elem: &TypeRef) {
+    w.line(format!(
+        "NativeMethods.weaveffi_free_bytes({base}, (UIntPtr)((int){len} * {}));",
+        cs_elem_size(elem)
+    ));
+}
+
+/// Decodes a producer-owned C array (`base` + `len`) into a managed `T[]`,
+/// releases the producer's allocations (each string element via
+/// `weaveffi_free_string`, then the array buffer via `weaveffi_free_bytes`),
+/// and returns the copy. Object elements are adopted by their wrappers rather
+/// than freed. Blittable scalars bulk-copy before the buffer release.
 fn render_list_decode(out: &mut String, inner: &TypeRef, base: &str, len: &str, indent: &str) {
     let elem = cs_type(inner);
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     w.line(format!(
         "if ({base} == IntPtr.Zero) return Array.Empty<{elem}>();"
     ));
+    w.line(format!("var arr = new {elem}[(int){len}];"));
     match inner {
         TypeRef::I32 | TypeRef::I64 | TypeRef::F64 => {
-            w.line(format!("var arr = new {elem}[(int){len}];"));
             w.line(format!("Marshal.Copy({base}, arr, 0, (int){len});"));
-            w.line("return arr;");
         }
         _ => {
-            let read = marshal_read_element(inner, base, "i");
-            w.line(format!("var arr = new {elem}[(int){len}];"));
             w.line(format!("for (int i = 0; i < (int){len}; i++)"));
             w.block("{", "}", |w| {
-                w.line(format!("arr[i] = {read};"));
+                render_owned_element_read(w, inner, base, "i", "item");
+                w.line("arr[i] = item;");
             });
-            w.line("return arr;");
         }
     }
+    write_buffer_free(&mut w, base, len, inner);
+    w.line("return arr;");
+    out.push_str(&w.finish());
+}
+
+/// Decodes a producer-owned map return (parallel `keys`/`values` buffers of
+/// `len` entries) into a `Dictionary`, freeing each string key/value after
+/// copying and then releasing both parallel buffers with
+/// `weaveffi_free_bytes` (the `ReturnFree::MapBuffers` contract), and
+/// returns the copy.
+fn render_map_decode(
+    out: &mut String,
+    k: &TypeRef,
+    v: &TypeRef,
+    keys: &str,
+    values: &str,
+    len: &str,
+    indent: &str,
+) {
+    let k_cs = cs_type(k);
+    let v_cs = cs_type(v);
+    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
+    w.line(format!(
+        "if ({keys} != IntPtr.Zero && {values} != IntPtr.Zero)"
+    ));
+    w.block("{", "}", |w| {
+        w.line(format!("for (int i = 0; i < (int){len}; i++)"));
+        w.block("{", "}", |w| {
+            render_owned_element_read(w, k, keys, "i", "key");
+            render_owned_element_read(w, v, values, "i", "value");
+            w.line("dict[key] = value;");
+        });
+        write_buffer_free(w, keys, len, k);
+        write_buffer_free(w, values, len, v);
+    });
+    w.line("return dict;");
     out.push_str(&w.finish());
 }
 
@@ -2106,7 +2251,7 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
         }
         // Borrowed for the duration of the callback; the consumer must not
         // Dispose() the wrapper.
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             format!("new {}({n0})", local_type_name(name))
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -2126,7 +2271,7 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
                 });
                 arg
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                 let cn = local_type_name(name);
                 format!("{n0} == IntPtr.Zero ? null : new {cn}({n0})")
             }
@@ -2162,7 +2307,7 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
                 "{n0} == IntPtr.Zero ? (float?)null : BitConverter.Int32BitsToSingle(Marshal.ReadInt32({n0}))"
             ),
             TypeRef::Bool => {
-                format!("{n0} == IntPtr.Zero ? (bool?)null : Marshal.ReadInt32({n0}) != 0")
+                format!("{n0} == IntPtr.Zero ? (bool?)null : Marshal.ReadByte({n0}) != 0")
             }
             TypeRef::Enum(name) => {
                 let cn = local_type_name(name);
@@ -2210,11 +2355,12 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             arg
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
-        // Borrowed for the duration of the callback, like struct parameters;
+        // Borrowed for the duration of the callback, like record parameters;
         // the consumer must not Dispose() the wrapper.
         TypeRef::Interface(name) => {
             format!("new {}({n0})", local_type_name(name))
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     };
     out.push_str(&w.finish());
     expr
@@ -2500,20 +2646,46 @@ fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> S
             w.line("NativeMethods.weaveffi_free_bytes(out_item, out_len);");
             "item".into()
         }
-        // The consumer owns each yielded wrapper; Dispose() destroys it.
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        // The consumer owns each yielded wrapper; Dispose() destroys it
+        // (`ElemFree::Object`, adopted rather than freed eagerly).
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             format!("new {}(out_item)", local_type_name(name))
         }
-        _ => "default!".into(),
+        // A null slot is "none"; a non-null slot is an owned object pointer
+        // adopted exactly like the non-optional case.
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+            ) =>
+        {
+            let cn = match inner.as_ref() {
+                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
+                    local_type_name(name)
+                }
+                _ => unreachable!(),
+            };
+            format!("out_item == IntPtr.Zero ? null : new {cn}(out_item)")
+        }
+        other => unreachable!("unsupported iterator element type {other:?}"),
     };
     out.push_str(&w.finish());
     expr
 }
 
-/// An `iter<T>` function surfaces as `IEnumerable<T>`: an eager constructor
-/// call (so launch errors throw immediately), then a lazy enumerator that
-/// drives `_next` and destroys the handle when enumeration ends or the
-/// enumerator is disposed.
+/// An `iter<T>` function surfaces as `IEnumerable<T>`, rendering the
+/// `IteratorProtocol` pull contract: an eager launcher call (so launch errors
+/// throw immediately, per the function's `ErrorStrategy`), then a lazy
+/// `yield return` enumerator issuing exactly one C `next` call per
+/// `MoveNext`. Each yielded element is released per its `ElemFree` plan after
+/// conversion, and the compiler-generated `finally` destroys the native
+/// iterator exactly once, whether enumeration runs to exhaustion or is
+/// abandoned early (C# `foreach` disposes the enumerator). Wrapping the
+/// single enumerator in `WeaveFFIOnceEnumerable` makes a second enumeration
+/// throw instead of double-destroying the consumed handle.
 fn render_iterator_wrapper_method(
     out: &mut String,
     f: &FnBinding,
@@ -2545,11 +2717,18 @@ fn render_iterator_wrapper_method(
 
     let mut w = CodeWriter::four_space().with_depth(2);
     writer_fn_doc(&mut w, &f.doc, &f.params);
+    w.line("/// <remarks>Streams lazily: each element is pulled from the native");
+    w.line("/// iterator on demand, and the iterator is destroyed when enumeration");
+    w.line("/// completes or the enumerator is disposed (a <c>foreach</c> disposes it");
+    w.line("/// automatically, including on early exit). The returned sequence can be");
+    w.line("/// enumerated only once.</remarks>");
     err.write_exception_doc(&mut w);
     if let Some(msg) = &f.deprecated {
         w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
+    let wrap_return =
+        format!("return new WeaveFFIOnceEnumerable<{elem_cs}>(Enumerate{method_name}(iter));");
     w.line(format!(
         "public {staticness}IEnumerable<{elem_cs}> {method_name}({})",
         params_sig.join(", ")
@@ -2570,7 +2749,7 @@ fn render_iterator_wrapper_method(
             w.scope(|w| {
                 w.line(launch_call.clone());
                 w.line(err.check_stmt());
-                w.line(format!("return Enumerate{method_name}(iter);"));
+                w.line(wrap_return.clone());
             });
             w.line("}");
             w.line("finally");
@@ -2584,7 +2763,7 @@ fn render_iterator_wrapper_method(
         } else {
             w.line(launch_call.clone());
             w.line(err.check_stmt());
-            w.line(format!("return Enumerate{method_name}(iter);"));
+            w.line(wrap_return.clone());
         }
     });
     w.line("}");
@@ -2600,8 +2779,11 @@ fn render_iterator_wrapper_method(
         .map(|slot| format!("out var {}", slot.name))
         .collect();
 
+    // A `yield return` iterator method: the compiler emits the `finally`
+    // into Dispose(), so the destroy below runs exactly once, on exhaustion
+    // or when the consumer abandons enumeration early.
     w.line(format!(
-        "private static IEnumerable<{elem_cs}> Enumerate{method_name}(IntPtr iter)"
+        "private static IEnumerator<{elem_cs}> Enumerate{method_name}(IntPtr iter)"
     ));
     w.line("{");
     w.scope(|w| {
@@ -2807,6 +2989,15 @@ fn render_async_wrapper_method(
     out.push_str(&w.finish());
 }
 
+/// Emit the statements resolving the `TaskCompletionSource` from the
+/// completion callback's result slots, honoring the `AsyncProtocol` borrowed
+/// results clause: string, bytes, array, and map buffers (and producer-boxed
+/// optional scalars) are owned by the producer and valid only for the
+/// callback's duration, so they are deep-copied here and never freed.
+/// Owned-object results (records, rich enums, interfaces, typed handles) are
+/// the exception: the callback receives ownership and the wrapper adopts the
+/// pointer, as do object pointers inside a list result (its `ElemFree`
+/// plan).
 fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match ret {
@@ -2817,27 +3008,89 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
             w.line("tcs.SetResult(result != 0);");
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            w.line("var str = Marshal.PtrToStringUTF8(result);");
-            w.line("NativeMethods.weaveffi_free_string(result);");
-            w.line("tcs.SetResult(str);");
+            w.line("tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? \"\");");
         }
         Some(TypeRef::Enum(name)) => {
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(({cn})result);"));
         }
-        Some(TypeRef::Struct(name)) => {
+        Some(
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name),
+        ) => {
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
-        Some(TypeRef::TypedHandle(name)) => {
-            let cn = local_type_name(name);
-            w.line(format!("tcs.SetResult(new {cn}(result));"));
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            w.line("var arr = new byte[(int)resultLen];");
+            w.line(
+                "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, arr, 0, (int)resultLen);",
+            );
+            w.line("tcs.SetResult(arr);");
         }
-        Some(TypeRef::Interface(name)) => {
-            let cn = local_type_name(name);
-            w.line(format!("tcs.SetResult(new {cn}(result));"));
+        Some(TypeRef::List(inner)) => {
+            let elem = cs_type(inner);
+            w.line(format!("var arr = new {elem}[(int)resultLen];"));
+            w.line("if (result != IntPtr.Zero)");
+            w.block("{", "}", |w| {
+                w.line("for (int i = 0; i < (int)resultLen; i++)");
+                w.block("{", "}", |w| {
+                    w.line(format!(
+                        "arr[i] = {};",
+                        marshal_read_element(inner, "result", "i")
+                    ));
+                });
+            });
+            w.line("tcs.SetResult(arr);");
         }
-        _ => {
+        Some(TypeRef::Map(k, v)) => {
+            let k_cs = cs_type(k);
+            let v_cs = cs_type(v);
+            w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
+            w.line("if (resultKeys != IntPtr.Zero && resultValues != IntPtr.Zero)");
+            w.block("{", "}", |w| {
+                w.line("for (int i = 0; i < (int)resultLen; i++)");
+                w.block("{", "}", |w| {
+                    w.line(format!(
+                        "dict[{}] = {};",
+                        marshal_read_element(k, "resultKeys", "i"),
+                        marshal_read_element(v, "resultValues", "i")
+                    ));
+                });
+            });
+            w.line("tcs.SetResult(dict);");
+        }
+        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                w.line(
+                    "tcs.SetResult(result == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(result));",
+                );
+            }
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name) => {
+                let cn = local_type_name(name);
+                w.line(format!(
+                    "tcs.SetResult(result == IntPtr.Zero ? null : new {cn}(result));"
+                ));
+            }
+            other => {
+                // A producer-boxed scalar, borrowed like every other result
+                // buffer: dereference the copy, leave the box alone.
+                let Some((read, _)) = boxed_scalar_read(other, "result") else {
+                    unreachable!("unsupported optional async result type");
+                };
+                let cs = cs_type(ret.as_ref().unwrap());
+                w.line(format!(
+                    "tcs.SetResult(result == IntPtr.Zero ? ({cs})null : {read});"
+                ));
+            }
+        },
+        // Remaining scalars pass by value in the result slot.
+        Some(_) => {
             w.line("tcs.SetResult(result);");
         }
     }
@@ -2864,13 +3117,24 @@ fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
                     "var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;"
                 ));
             }
-            TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) | TypeRef::U32 => {
+            // A boxed C `bool` is one byte, matching the pointee the
+            // producer dereferences.
+            TypeRef::Bool => {
+                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
+                w.line(format!("if ({name}.HasValue)"));
+                w.block("{", "}", |w| {
+                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(byte));"));
+                    w.line(format!(
+                        "Marshal.WriteByte({name}Ptr, (byte)({name}.Value ? 1 : 0));"
+                    ));
+                });
+            }
+            TypeRef::I32 | TypeRef::Enum(_) | TypeRef::U32 => {
                 w.line(format!("var {name}Ptr = IntPtr.Zero;"));
                 w.line(format!("if ({name}.HasValue)"));
                 w.block("{", "}", |w| {
                     w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(int));"));
                     let val = match inner.as_ref() {
-                        TypeRef::Bool => format!("{name}.Value ? 1 : 0"),
                         TypeRef::Enum(_) => format!("(int){name}.Value"),
                         TypeRef::U32 => format!("(int){name}.Value"),
                         _ => format!("{name}.Value"),
@@ -2998,7 +3262,8 @@ fn cs_elem_array_slot(elem: &TypeRef, expr: &str) -> (String, String) {
             format!("Marshal.StringToCoTaskMemUTF8({expr})"),
         ),
         TypeRef::Enum(_) => ("int".into(), format!("(int){expr}")),
-        TypeRef::Bool => ("int".into(), format!("{expr} ? 1 : 0")),
+        // C `bool` array slots are one byte each.
+        TypeRef::Bool => ("byte".into(), format!("(byte)({expr} ? 1 : 0)")),
         TypeRef::I8 => ("sbyte".into(), expr.into()),
         TypeRef::I16 => ("short".into(), expr.into()),
         TypeRef::I32 => ("int".into(), expr.into()),
@@ -3157,12 +3422,15 @@ fn build_call_args(params: &[ParamBinding]) -> String {
         .flat_map(|p| {
             let name = safe_cs_name(&p.name);
             match &p.ty {
-                TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
+                TypeRef::Bool => vec![format!("(byte)({name} ? 1 : 0)")],
                 TypeRef::Enum(_) => vec![format!("(int){name}")],
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}Ptr")],
-                // Interface parameters borrow: pass the handle, ownership
+                // Object parameters borrow: pass the handle, ownership
                 // stays with the caller's wrapper.
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => {
                     vec![format!("{name}.Handle")]
                 }
                 TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
@@ -3170,7 +3438,10 @@ fn build_call_args(params: &[ParamBinding]) -> String {
                     format!("(UIntPtr){name}.Length"),
                 ],
                 TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                    TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_) => {
                         vec![format!("{name}?.Handle ?? IntPtr.Zero")]
                     }
                     TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
@@ -3225,7 +3496,9 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
             let cn = local_type_name(name);
             w.line(format!("return ({cn})result;"));
         }
-        TypeRef::Struct(name) => {
+        // An owned object return (`ReturnFree::OwnedObject`): the wrapper
+        // adopts the pointer and its Dispose() calls the destroy symbol.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
             let cn = local_type_name(name);
             w.line(format!("return new {cn}(result);"));
         }
@@ -3265,6 +3538,11 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
     out.push_str(&w.finish());
 }
 
+/// Renders an `T?` return: null pointer means none; pointer optionals reuse
+/// the inner type's plan (owned strings and buffers freed after copying,
+/// object pointers adopted); scalar optionals are producer-boxed
+/// (`ReturnFree::BoxedScalar`), so the box is dereferenced and then released
+/// with `weaveffi_free_bytes`.
 fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match inner {
@@ -3274,7 +3552,10 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             w.line("NativeMethods.weaveffi_free_string(result);");
             w.line("return str;");
         }
-        TypeRef::Struct(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::Interface(name)
+        | TypeRef::TypedHandle(name) => {
             let cn = local_type_name(name);
             w.line(format!(
                 "return result == IntPtr.Zero ? null : new {cn}(result);"
@@ -3287,67 +3568,16 @@ fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: 
             w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
             w.line("return arr;");
         }
-        TypeRef::I32 => {
+        other => {
+            let Some((read, size)) = boxed_scalar_read(other, "result") else {
+                unreachable!("unsupported optional return type");
+            };
             w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return Marshal.ReadInt32(result);");
-        }
-        TypeRef::U32 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return (uint)Marshal.ReadInt32(result);");
-        }
-        TypeRef::I64 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return Marshal.ReadInt64(result);");
-        }
-        TypeRef::F64 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return BitConverter.Int64BitsToDouble(Marshal.ReadInt64(result));");
-        }
-        TypeRef::I8 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return (sbyte)Marshal.ReadByte(result);");
-        }
-        TypeRef::U8 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return (byte)Marshal.ReadByte(result);");
-        }
-        TypeRef::I16 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return Marshal.ReadInt16(result);");
-        }
-        TypeRef::U16 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return (ushort)Marshal.ReadInt16(result);");
-        }
-        TypeRef::U64 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return (ulong)Marshal.ReadInt64(result);");
-        }
-        TypeRef::F32 => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return BitConverter.Int32BitsToSingle(Marshal.ReadInt32(result));");
-        }
-        TypeRef::Bool => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return Marshal.ReadInt32(result) != 0;");
-        }
-        TypeRef::Handle => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("return (ulong)Marshal.ReadInt64(result);");
-        }
-        TypeRef::TypedHandle(name) => {
-            let cn = local_type_name(name);
+            w.line(format!("var value = {read};"));
             w.line(format!(
-                "return result == IntPtr.Zero ? null : new {cn}(result);"
+                "NativeMethods.weaveffi_free_bytes(result, (UIntPtr){size});"
             ));
-        }
-        TypeRef::Enum(name) => {
-            let cn = local_type_name(name);
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line(format!("return ({cn})Marshal.ReadInt32(result);"));
-        }
-        _ => {
-            w.line("return result;");
+            w.line("return value;");
         }
     }
     out.push_str(&w.finish());
@@ -3366,8 +3596,6 @@ fn render_map_return_call(
     err: ErrCtx,
     indent: &str,
 ) {
-    let k_cs = cs_type(k);
-    let v_cs = cs_type(v);
     let args_part = if call_args.is_empty() {
         String::new()
     } else {
@@ -3378,15 +3606,8 @@ fn render_map_return_call(
         "NativeMethods.{c_sym}({args_part}out var outKeys, out var outValues, out var outLen, ref err);"
     ));
     w.line(err.check_stmt());
-    w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
-    let key_read = marshal_read_element(k, "outKeys", "i");
-    let val_read = marshal_read_element(v, "outValues", "i");
-    w.line("for (int i = 0; i < (int)outLen; i++)");
-    w.block("{", "}", |w| {
-        w.line(format!("dict[{key_read}] = {val_read};"));
-    });
-    w.line("return dict;");
     out.push_str(&w.finish());
+    render_map_decode(out, k, v, "outKeys", "outValues", "outLen", indent);
 }
 
 fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
@@ -3411,8 +3632,9 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
         TypeRef::F64 => format!(
             "BitConverter.Int64BitsToDouble(Marshal.ReadInt64({arr} + {idx} * sizeof(long)))"
         ),
+        // C `bool` array slots are one byte each.
         TypeRef::Bool => {
-            format!("Marshal.ReadInt32({arr} + {idx} * sizeof(int)) != 0")
+            format!("Marshal.ReadByte({arr} + {idx} * 1) != 0")
         }
         TypeRef::Handle => {
             format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
@@ -3430,11 +3652,34 @@ fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
             let cn = local_type_name(name);
             format!("({cn})Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
         }
-        TypeRef::Struct(name) | TypeRef::Interface(name) => {
+        // Owned object pointer slots, adopted by their wrappers.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::Interface(name) => {
             let cn = local_type_name(name);
             format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
         }
-        _ => "default".into(),
+        // An optional pointer element occupies one pointer slot; null = none.
+        // The double read keeps this a single expression.
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::Interface(_)
+                    | TypeRef::TypedHandle(_)
+            ) =>
+        {
+            let cn = match inner.as_ref() {
+                TypeRef::Record(name)
+                | TypeRef::RichEnum(name)
+                | TypeRef::Interface(name)
+                | TypeRef::TypedHandle(name) => local_type_name(name),
+                _ => unreachable!(),
+            };
+            format!(
+                "Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size) == IntPtr.Zero ? null : new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))"
+            )
+        }
+        other => unreachable!("unsupported element type {other:?}"),
     }
 }
 
@@ -3840,7 +4085,7 @@ mod tests {
         assert_eq!(cs_type(&TypeRef::StringUtf8), "string");
         assert_eq!(cs_type(&TypeRef::Handle), "ulong");
         assert_eq!(cs_type(&TypeRef::Bytes), "byte[]");
-        assert_eq!(cs_type(&TypeRef::Struct("Foo".into())), "Foo");
+        assert_eq!(cs_type(&TypeRef::Record("Foo".into())), "Foo");
         assert_eq!(cs_type(&TypeRef::Enum("Bar".into())), "Bar");
         assert_eq!(cs_type(&TypeRef::Optional(Box::new(TypeRef::I32))), "int?");
         assert_eq!(
@@ -3848,7 +4093,7 @@ mod tests {
             "string?"
         );
         assert_eq!(
-            cs_type(&TypeRef::Optional(Box::new(TypeRef::Struct("X".into())))),
+            cs_type(&TypeRef::Optional(Box::new(TypeRef::Record("X".into())))),
             "X?"
         );
         assert_eq!(cs_type(&TypeRef::List(Box::new(TypeRef::I32))), "int[]");
@@ -3864,11 +4109,13 @@ mod tests {
     #[test]
     fn pinvoke_type_mapping() {
         assert_eq!(pinvoke_type(&TypeRef::I32), "int");
-        assert_eq!(pinvoke_type(&TypeRef::Bool), "int");
+        // C `bool` is one byte, not int-widened.
+        assert_eq!(pinvoke_type(&TypeRef::Bool), "byte");
+        assert_eq!(pinvoke_type(&TypeRef::RichEnum("Foo".into())), "IntPtr");
         assert_eq!(pinvoke_type(&TypeRef::StringUtf8), "IntPtr");
         assert_eq!(pinvoke_type(&TypeRef::Handle), "ulong");
         assert_eq!(pinvoke_type(&TypeRef::Bytes), "IntPtr");
-        assert_eq!(pinvoke_type(&TypeRef::Struct("Foo".into())), "IntPtr");
+        assert_eq!(pinvoke_type(&TypeRef::Record("Foo".into())), "IntPtr");
         assert_eq!(pinvoke_type(&TypeRef::Enum("Bar".into())), "int");
         assert_eq!(
             pinvoke_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
@@ -4503,7 +4750,7 @@ mod tests {
             "Foo?"
         );
         assert_eq!(
-            cs_type(&TypeRef::Optional(Box::new(TypeRef::Struct("Bar".into())))),
+            cs_type(&TypeRef::Optional(Box::new(TypeRef::Record("Bar".into())))),
             "Bar?"
         );
     }
@@ -4520,7 +4767,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 r#async: false,
                 cancellable: false,
@@ -4596,6 +4843,12 @@ mod tests {
             cs.contains("Marshal.Copy(result, arr, 0, (int)outLen)"),
             "missing Marshal.Copy: {cs}"
         );
+        // The producer-owned array buffer is released after the copy
+        // (`ReturnFree::Array`): len * sizeof(int32).
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * 4));"),
+            "missing array buffer release: {cs}"
+        );
     }
 
     #[test]
@@ -4639,6 +4892,18 @@ mod tests {
         assert!(
             cs.contains("new Dictionary<int, double>()"),
             "missing dict creation: {cs}"
+        );
+        // Both producer-owned parallel buffers are released after the copy
+        // (`ReturnFree::MapBuffers`): i32 keys and f64 values.
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(outKeys, (UIntPtr)((int)outLen * 4));"),
+            "missing key buffer release: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "NativeMethods.weaveffi_free_bytes(outValues, (UIntPtr)((int)outLen * 8));"
+            ),
+            "missing value buffer release: {cs}"
         );
     }
 
@@ -4845,7 +5110,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     r#async: false,
                     cancellable: false,
@@ -5311,12 +5576,23 @@ mod tests {
         );
 
         assert!(
-            cs.contains("Marshal.ReadInt32(ptr) != 0"),
+            cs.contains("Marshal.ReadByte(ptr) != 0"),
             "missing optional bool unmarshal: {cs}"
         );
         assert!(
             cs.contains("BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr))"),
             "missing optional f64 unmarshal: {cs}"
+        );
+        // Producer-boxed optional scalars are freed after the dereference
+        // (the `ReturnFree::BoxedScalar` contract), both in field getters
+        // and in optional scalar returns.
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)1);"),
+            "missing boxed bool release: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, (UIntPtr)8);"),
+            "missing boxed i64 return release: {cs}"
         );
     }
 
@@ -5548,7 +5824,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     r#async: false,
                     cancellable: false,
@@ -5564,7 +5840,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                     doc: None,
                     r#async: false,
                     cancellable: false,
@@ -5936,7 +6212,7 @@ mod tests {
                 params: vec![Param {
                     name: "data".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ))))),
                     mutable: false,
                     doc: None,
@@ -6036,7 +6312,7 @@ mod tests {
                     name: "contacts".into(),
                     ty: TypeRef::Map(
                         Box::new(TypeRef::Enum("Color".into())),
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ),
                     mutable: false,
                     doc: None,
@@ -6173,7 +6449,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 r#async: false,
                 cancellable: false,
@@ -6253,7 +6529,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -6431,6 +6707,254 @@ mod tests {
         assert!(
             cs.contains("GCHandle.FromIntPtr(context).Free()"),
             "missing GCHandle.Free in callback: {cs}"
+        );
+    }
+
+    /// A module with one async function per given return type, named `run0`,
+    /// `run1`, ... in order, plus a `Contact` record for object results.
+    fn async_api(returns: Vec<Option<TypeRef>>) -> Api {
+        let functions = returns
+            .into_iter()
+            .enumerate()
+            .map(|(i, ret)| Function {
+                name: format!("run{i}"),
+                params: vec![],
+                returns: ret,
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                throws: false,
+                deprecated: None,
+                since: None,
+            })
+            .collect();
+        make_api(vec![Module {
+            name: "tasks".into(),
+            functions,
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::Handle,
+                    doc: None,
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }])
+    }
+
+    /// Async result buffers are borrowed for the callback's duration
+    /// (`AsyncProtocol` clause 2): strings and bytes are deep-copied inside
+    /// the callback and never freed by the consumer.
+    #[test]
+    fn dotnet_async_borrowed_results_copied_never_freed() {
+        let cs = render_csharp(
+            &async_api(vec![
+                Some(TypeRef::StringUtf8),
+                Some(TypeRef::Bytes),
+                Some(TypeRef::Optional(Box::new(TypeRef::I64))),
+            ]),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        // String result: copied, not freed.
+        assert!(
+            cs.contains("tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? \"\");"),
+            "async string result must copy: {cs}"
+        );
+        assert!(
+            !cs.contains("weaveffi_free_string(result)"),
+            "async string result must not be freed by the consumer: {cs}"
+        );
+        // Bytes result: copied via the (result, resultLen) pair, not freed.
+        assert!(
+            cs.contains("Marshal.Copy(result, arr, 0, (int)resultLen);"),
+            "async bytes result must copy: {cs}"
+        );
+        assert!(
+            !cs.contains("weaveffi_free_bytes(result"),
+            "async bytes result must not be freed by the consumer: {cs}"
+        );
+        // Boxed optional scalar result: dereferenced, box left alone.
+        assert!(
+            cs.contains(
+                "tcs.SetResult(result == IntPtr.Zero ? (long?)null : Marshal.ReadInt64(result));"
+            ),
+            "async optional scalar result must dereference the borrowed box: {cs}"
+        );
+    }
+
+    /// Owned-object async results are the exception to the borrowed-results
+    /// rule: the callback receives ownership and the wrapper adopts the
+    /// pointer. List results copy the borrowed buffer, adopting object
+    /// elements and copying string elements without freeing them.
+    #[test]
+    fn dotnet_async_object_and_list_results() {
+        let cs = render_csharp(
+            &async_api(vec![
+                Some(TypeRef::Record("Contact".into())),
+                Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
+                Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+            ]),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        // Record result adopted by its wrapper.
+        assert!(
+            cs.contains("tcs.SetResult(new Contact(result));"),
+            "async record result must be adopted: {cs}"
+        );
+        // List results decode the two-slot (result, resultLen) pair; string
+        // elements are copied without a consumer-side free, record elements
+        // adopted.
+        assert!(
+            cs.contains("IntPtr result, UIntPtr resultLen"),
+            "async list delegate must carry the length slot: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(result, i * IntPtr.Size)) ?? \"\";"
+            ),
+            "async string list elements must copy: {cs}"
+        );
+        assert!(
+            cs.contains("arr[i] = new Contact(Marshal.ReadIntPtr(result, i * IntPtr.Size));"),
+            "async record list elements must be adopted: {cs}"
+        );
+        // No release calls anywhere in this API: every native buffer here is
+        // an async result, borrowed for the callback's duration.
+        assert!(
+            !cs.contains("NativeMethods.weaveffi_free_string(")
+                && !cs.contains("NativeMethods.weaveffi_free_bytes("),
+            "async list/map buffers are borrowed and must not be freed: {cs}"
+        );
+        // Map results decode the three-slot parallel-buffer form.
+        assert!(
+            cs.contains("IntPtr resultKeys, IntPtr resultValues, UIntPtr resultLen"),
+            "async map delegate must carry both buffers: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(resultKeys, i * IntPtr.Size)) ?? \"\"] = Marshal.ReadInt32(resultValues + i * sizeof(int));"
+            ),
+            "async map entries must copy: {cs}"
+        );
+        assert!(
+            cs.contains("tcs.SetResult(dict);"),
+            "async map result must resolve the task: {cs}"
+        );
+    }
+
+    /// The iterator contract (`IteratorProtocol`): the sequence streams
+    /// through a single `yield return` enumerator (one C `next` per
+    /// `MoveNext`), frees each string element after conversion, destroys the
+    /// native iterator exactly once from the compiler-generated `finally`,
+    /// and refuses a second enumeration instead of double-destroying.
+    #[test]
+    fn iterator_streams_lazily_and_destroys_once() {
+        let cs = render_csharp(
+            &kv_api(),
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        // The single-use wrapper class and the wrapped return.
+        assert!(
+            cs.contains("internal sealed class WeaveFFIOnceEnumerable<T> : IEnumerable<T>"),
+            "once-enumerable class missing: {cs}"
+        );
+        assert!(
+            cs.contains("return new WeaveFFIOnceEnumerable<string>(EnumerateListKeys(iter));"),
+            "iterator wrapper must return the once-enumerable: {cs}"
+        );
+        assert!(
+            cs.contains("this sequence can be enumerated only once"),
+            "second enumeration must throw: {cs}"
+        );
+        // One C next call per MoveNext, inside a lazy yield-return method.
+        assert_eq!(
+            cs.matches(
+                "weaveffi_kv_Store_ListKeysIterator_next(iter, out var out_item, ref iterErr)"
+            )
+            .count(),
+            1,
+            "exactly one next call site expected: {cs}"
+        );
+        assert!(
+            cs.contains("yield return item;"),
+            "enumerator must stream lazily: {cs}"
+        );
+        // Each yielded string is freed after conversion (ElemFree::String).
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_string(out_item);"),
+            "string elements must be freed: {cs}"
+        );
+        // Destroy exactly once, from the enumerator's finally (which C#'s
+        // foreach reaches through Dispose() on early abandonment too).
+        assert_eq!(
+            cs.matches("NativeMethods.weaveffi_kv_Store_ListKeysIterator_destroy(iter);")
+                .count(),
+            1,
+            "exactly one destroy call site expected: {cs}"
+        );
+        assert!(cs.contains("finally"), "destroy must run in finally: {cs}");
+    }
+
+    /// A list-of-strings return frees each element with
+    /// `weaveffi_free_string` after copying, then releases the array buffer
+    /// with `weaveffi_free_bytes` (`ReturnFree::Array` with
+    /// `ElemFree::String`).
+    #[test]
+    fn string_list_return_frees_elements_and_buffer() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "names".into(),
+            params: vec![],
+            returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            throws: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let cs = render_csharp(
+            &api,
+            "WeaveFFI",
+            true,
+            "weaveffi",
+            "weaveffi.yml",
+            "WeaveFFI.cs",
+        );
+        assert!(
+            cs.contains("var itemPtr = Marshal.ReadIntPtr(result, i * IntPtr.Size);")
+                && cs.contains("NativeMethods.weaveffi_free_string(itemPtr);"),
+            "string elements must be freed after copying: {cs}"
+        );
+        assert!(
+            cs.contains(
+                "NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * IntPtr.Size));"
+            ),
+            "array buffer must be released: {cs}"
         );
     }
 
@@ -6805,7 +7329,7 @@ mod tests {
                     name: "describe".into(),
                     params: vec![Param {
                         name: "shape".into(),
-                        ty: TypeRef::Struct("Shape".into()),
+                        ty: TypeRef::RichEnum("Shape".into()),
                         mutable: false,
                         doc: None,
                     }],
@@ -6822,7 +7346,7 @@ mod tests {
                     params: vec![
                         Param {
                             name: "shape".into(),
-                            ty: TypeRef::Struct("Shape".into()),
+                            ty: TypeRef::RichEnum("Shape".into()),
                             mutable: false,
                             doc: None,
                         },
@@ -6833,7 +7357,7 @@ mod tests {
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Struct("Shape".into())),
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
                     doc: None,
                     r#async: false,
                     cancellable: false,
@@ -7342,7 +7866,7 @@ mod tests {
             cs.contains("tcs.SetException(KvException.FromCode(wErr.Code, msg));"),
             "async throws must fault with the typed exception: {cs}"
         );
-        let iter = method_slice(&cs, "private static IEnumerable<string> EnumerateListKeys(");
+        let iter = method_slice(&cs, "private static IEnumerator<string> EnumerateListKeys(");
         assert!(
             iter.contains("WeaveFFIError.CheckKv(iterErr);"),
             "iterator next-check must be typed: {iter}"

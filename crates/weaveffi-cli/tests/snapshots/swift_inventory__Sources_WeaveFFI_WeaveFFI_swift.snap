@@ -54,6 +54,16 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+@inline(__always)
+func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
+}
+
+@inline(__always)
+func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+}
+
 /// Typed errors reported by the `products` module.
 public enum ProductsError: Error, LocalizedError {
     case invalidPrice(message: String)
@@ -140,7 +150,14 @@ public class Product {
         var outLen: Int = 0
         let rv = weaveffi_products_Product_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return (0..<outLen).map { String(cString: rv[$0]!) }
+        defer { wvFreeArray(rv, outLen) }
+        var items: [String] = []
+        items.reserveCapacity(outLen)
+        for i in 0..<outLen {
+            items.append(String(cString: rv[i]!))
+            weaveffi_free_string(rv[i])
+        }
+        return items
     }
 }
 
@@ -184,6 +201,7 @@ public final class Catalog {
         let rv = weaveffi_products_Catalog_search(ptr, weaveffi_products_Category(category.rawValue), &outLen, &err)
         trap(&err)
         guard let rv = rv else { return [] }
+        defer { wvFreeArray(rv, outLen) }
         return (0..<outLen).map { Product(ptr: rv[$0]!) }
     }
     public func updatePrice(id: Int64, price: Double) throws -> Bool {
@@ -284,6 +302,7 @@ public class Order {
         var outLen: Int = 0
         let rv = weaveffi_orders_Order_get_items(ptr, &outLen)
         guard let rv = rv else { return [] }
+        defer { wvFreeArray(rv, outLen) }
         return (0..<outLen).map { OrderItem(ptr: rv[$0]!) }
     }
 

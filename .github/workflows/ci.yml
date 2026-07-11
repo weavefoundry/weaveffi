@@ -147,11 +147,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The generated Go bindings surface iter<T> as iter.Seq/iter.Seq2,
+      # which needs Go 1.23; Ubuntu's packaged golang-go is older and can't
+      # fetch the newer toolchain on demand.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
       - name: Install consumer toolchains
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang g++ python3 golang-go ruby-ffi
+            clang g++ python3 ruby-ffi
           sudo snap install kotlin --classic
 
       - name: Run conformance harness

@@ -16,6 +16,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdexcept>
 #include <exception>
 #include <future>
+#include <cstddef>
+#include <iterator>
 #include <functional>
 #include <mutex>
 
@@ -332,7 +334,9 @@ public:
     std::vector<uint8_t> value() const {
         size_t len = 0;
         auto* raw = weaveffi_kv_Entry_get_value(static_cast<const weaveffi_kv_Entry*>(handle_), &len);
-        return std::vector<uint8_t>(raw, raw + len);
+        std::vector<uint8_t> ret(raw, raw + len);
+        weaveffi_free_bytes(const_cast<uint8_t*>(raw), len);
+        return ret;
     }
 
     /** Unix-timestamp seconds when the entry was created */
@@ -344,7 +348,9 @@ public:
     std::optional<int64_t> expires_at() const {
         auto* raw = weaveffi_kv_Entry_get_expires_at(static_cast<const weaveffi_kv_Entry*>(handle_));
         if (!raw) return std::nullopt;
-        return *raw;
+        auto ret = *raw;
+        weaveffi_free_bytes(reinterpret_cast<uint8_t*>(raw), sizeof(*raw));
+        return ret;
     }
 
     /** Free-form labels attached to the entry */
@@ -353,7 +359,11 @@ public:
         auto* raw = weaveffi_kv_Entry_get_tags(static_cast<const weaveffi_kv_Entry*>(handle_), &len);
         std::vector<std::string> ret;
         ret.reserve(len);
-        for (size_t i = 0; i < len; ++i) ret.emplace_back(raw[i]);
+        for (size_t i = 0; i < len; ++i) {
+            ret.emplace_back(raw[i]);
+            weaveffi_free_string(raw[i]);
+        }
+        weaveffi_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));
         return ret;
     }
 
@@ -366,7 +376,11 @@ public:
         std::unordered_map<std::string, std::string> ret;
         for (size_t i = 0; i < len; ++i) {
             ret[std::string(out_keys[i])] = std::string(out_values[i]);
+            weaveffi_free_string(out_keys[i]);
+            weaveffi_free_string(out_values[i]);
         }
+        weaveffi_free_bytes(reinterpret_cast<uint8_t*>(out_keys), len * sizeof(*out_keys));
+        weaveffi_free_bytes(reinterpret_cast<uint8_t*>(out_values), len * sizeof(*out_values));
         return ret;
     }
 
@@ -523,25 +537,101 @@ public:
         return result;
     }
 
-    /** Stream every key, optionally filtered by a prefix */
-    std::vector<std::string> list_keys(const std::optional<std::string>& prefix) const {
+    /**
+     * A lazy, move-only range over the `std::string` elements produced by `list_keys()`.
+     *
+     * Each iteration step pulls exactly one element from the producer, so results stream in constant memory. The range owns the producer-side iterator and releases it exactly once: eagerly when the range is exhausted, or from the destructor when iteration is abandoned early.
+     */
+    class ListKeysIterator {
+        weaveffi_kv_Store_ListKeysIterator* handle_;
+
+    public:
+        /** Adopts ownership of the raw producer iterator handle. */
+        explicit ListKeysIterator(weaveffi_kv_Store_ListKeysIterator* h) : handle_(h) {}
+
+        ~ListKeysIterator() {
+            if (handle_) weaveffi_kv_Store_ListKeysIterator_destroy(handle_);
+        }
+
+        ListKeysIterator(const ListKeysIterator&) = delete;
+        ListKeysIterator& operator=(const ListKeysIterator&) = delete;
+
+        ListKeysIterator(ListKeysIterator&& other) noexcept : handle_(other.handle_) {
+            other.handle_ = nullptr;
+        }
+
+        ListKeysIterator& operator=(ListKeysIterator&& other) noexcept {
+            if (this != &other) {
+                if (handle_) weaveffi_kv_Store_ListKeysIterator_destroy(handle_);
+                handle_ = other.handle_;
+                other.handle_ = nullptr;
+            }
+            return *this;
+        }
+
+        /** Pulls the next element from the producer, or `std::nullopt` once exhausted (which releases the producer iterator eagerly). A producer error throws the module's typed exception after releasing the iterator. */
+        std::optional<std::string> next() {
+            if (!handle_) return std::nullopt;
+            weaveffi_error err{};
+            const char* item{};
+            int32_t has_item = weaveffi_kv_Store_ListKeysIterator_next(handle_, &item, &err);
+            if (err.code != 0) {
+                weaveffi_kv_Store_ListKeysIterator_destroy(handle_);
+                handle_ = nullptr;
+                detail::check_kv(err);
+            }
+            if (has_item == 0) {
+                weaveffi_kv_Store_ListKeysIterator_destroy(handle_);
+                handle_ = nullptr;
+                return std::nullopt;
+            }
+            std::string value(item);
+            weaveffi_free_string(item);
+            return value;
+        }
+
+        /** Sentinel type marking the end of the range. */
+        struct sentinel {};
+
+        /** Single-pass input iterator; each increment pulls one element from the producer. */
+        class iterator {
+            ListKeysIterator* range_;
+            std::optional<std::string> current_;
+
+        public:
+            using iterator_category = std::input_iterator_tag;
+            using value_type = std::string;
+            using difference_type = std::ptrdiff_t;
+            using pointer = std::string*;
+            using reference = std::string&;
+
+            /** Binds to `range` and pulls the first element. */
+            explicit iterator(ListKeysIterator* range) : range_(range), current_(range->next()) {}
+            reference operator*() { return *current_; }
+            pointer operator->() { return &*current_; }
+            iterator& operator++() { current_ = range_->next(); return *this; }
+            void operator++(int) { current_ = range_->next(); }
+            bool operator==(sentinel) const { return !current_.has_value(); }
+            bool operator!=(sentinel) const { return current_.has_value(); }
+        };
+
+        /** Begins iteration by pulling the first element. */
+        iterator begin() { return iterator(this); }
+
+        /** The past-the-end sentinel. */
+        sentinel end() const { return sentinel{}; }
+    };
+
+    /**
+     * Stream every key, optionally filtered by a prefix
+     *
+     * @return A lazy `ListKeysIterator` range that streams one element per iteration step and releases the producer iterator when exhausted or destroyed.
+     */
+    ListKeysIterator list_keys(const std::optional<std::string>& prefix) const {
         weaveffi_error err{};
         weaveffi_kv_Store_ListKeysIterator* iter = weaveffi_kv_Store_list_keys(static_cast<const weaveffi_kv_Store*>(handle_), prefix.has_value() ? prefix.value().c_str() : nullptr, &err);
         detail::check_kv(err);
-        std::vector<std::string> ret;
-        while (true) {
-            const char* item{};
-            int32_t has_item = weaveffi_kv_Store_ListKeysIterator_next(iter, &item, &err);
-            if (err.code != 0) {
-                weaveffi_kv_Store_ListKeysIterator_destroy(iter);
-                detail::check_kv(err);
-            }
-            if (has_item == 0) break;
-            ret.emplace_back(item);
-            weaveffi_free_string(item);
-        }
-        weaveffi_kv_Store_ListKeysIterator_destroy(iter);
-        return ret;
+        return ListKeysIterator(iter);
     }
 
     /** Return the number of live entries in the store */

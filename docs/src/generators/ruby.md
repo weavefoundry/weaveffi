@@ -49,7 +49,7 @@ named `events` produces `lib/events.rb` and `events.gemspec`;
 | `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
 | `[T]`        | `Array`            | `:pointer` + `:size_t`         |
 | `{K: V}`     | `Hash`             | key/value pointer arrays + `:size_t` |
-| `iter<T>`    | `Array`            | `:pointer` iterator handle     |
+| `iter<T>`    | `Enumerator` (lazy) | `:pointer` iterator handle    |
 
 Booleans cross as `:int32` (`0`/`1`); the wrapper converts both
 directions.
@@ -310,6 +310,10 @@ class Store
     # ...
   end
 
+  def list_keys(prefix) # lazy Enumerator; see Iterators
+    # ...
+  end
+
   def count() # generic check only (no throws)
     # ...
   end
@@ -487,14 +491,17 @@ gem_name = "my_bindings"
   `read_string`, then calls `weaveffi_free_string` to release the
   Rust-owned buffer.
 - **Bytes:** an `FFI::MemoryPointer` is allocated for inputs; outputs
-  are read with `read_string(len)` and the Rust side is responsible
-  for the buffer it returned.
+  are copied with `read_string(len)` and the returned buffer is
+  released with `weaveffi_free_bytes`.
 - **Structs and interfaces:** wrappers hold an `FFI::AutoPointer`
   whose `release` callback invokes the C `_destroy` function on GC.
   Use the explicit `destroy` method for deterministic cleanup.
-- **Maps:** keys and values are marshalled into parallel
-  `FFI::MemoryPointer` buffers; the wrapper rebuilds a Ruby `Hash`
-  from the returned arrays.
+- **Lists and maps:** elements are copied into a Ruby `Array` or
+  `Hash`; string elements are freed individually with
+  `weaveffi_free_string`, then the backing pointer buffers are freed
+  with `weaveffi_free_bytes`.
+- **Boxed optional scalars:** an absent value is `nil`; a present one
+  is dereferenced and the box is freed with `weaveffi_free_bytes`.
 
 ## Async support
 
@@ -542,6 +549,16 @@ result = t.value  # joins; re-raises a WeaveFFI::Error from the call
 The local `callback` reference keeps the `FFI::Function` alive until
 `queue.pop` returns, so the completion callback cannot be collected
 mid-flight.
+
+Result ownership follows the async contract: string, bytes, array,
+map, and boxed optional scalar results are borrowed for the callback's
+duration, so the callback copies them into Ruby values (`read_string`,
+element reads) before it returns and never frees them; the producer
+does after the callback returns. Object results (records, rich enums,
+interfaces, including optional ones) are the exception: the callback
+receives ownership, and the wrapper adopts the pointer into its
+`FFI::AutoPointer` (as `TaskResult.new(result)` does above), so the
+destructor runs on GC or an explicit `destroy`.
 
 For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`
@@ -614,10 +631,10 @@ WeaveFFI.unregister_message_listener(id)
 
 ## Iterators
 
-Functions returning `iter<T>` receive an opaque iterator handle from
-the C ABI. The wrapper drains it eagerly with the generated `_next`
-binding, frees each returned string, destroys the handle, and returns
-a fully materialised `Array`; there's no lazy `Enumerator`:
+Functions returning `iter<T>` return a lazy `Enumerator` that streams
+one element per pull: each consumer step issues exactly one call to
+the generated `_next` binding, so nothing is drained up front. Call
+`.to_a` if you want an eager `Array`:
 
 ```ruby
 attach_function :weaveffi_events_get_messages, [:pointer], :pointer
@@ -626,31 +643,56 @@ attach_function :weaveffi_events_GetMessagesIterator_next,
 attach_function :weaveffi_events_GetMessagesIterator_destroy,
                 [:pointer], :void
 
+# Return an iterator over all sent messages
+# Returns a lazy Enumerator that streams one element per pull; call
+# `.to_a` to collect eagerly. The underlying producer iterator is
+# launched on the first pull, so launch errors raise at that point
+# rather than when this method returns. The iterator handle is
+# released exactly once, when iteration finishes or is abandoned
+# early (for example by `break`).
 def self.get_messages()
-  err = ErrorStruct.new
-  iter = weaveffi_events_get_messages(err)
-  check_error!(err)
-  items = []
-  return items if iter.null?
-  loop do
-    out_item = FFI::MemoryPointer.new(:pointer)
-    item_err = ErrorStruct.new
-    has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)
-    # ... destroy the iterator and check_error! if item_err is set ...
-    break if has_item.zero?
-    item_ptr = out_item.read_pointer
-    # ... empty string for NULL ...
-    items << item_ptr.read_string
-    weaveffi_free_string(item_ptr)
+  Enumerator.new do |y|
+    err = ErrorStruct.new
+    iter = weaveffi_events_get_messages(err)
+    begin
+      check_error!(err)
+      unless iter.null?
+        loop do
+          out_item = FFI::MemoryPointer.new(:pointer)
+          item_err = ErrorStruct.new
+          has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)
+          check_error!(item_err)
+          break if has_item.zero?
+          item_ptr = out_item.read_pointer
+          if item_ptr.null?
+            y << ''
+          else
+            item = item_ptr.read_string
+            weaveffi_free_string(item_ptr)
+            y << item
+          end
+        end
+      end
+    ensure
+      weaveffi_events_GetMessagesIterator_destroy(iter) unless iter.null?
+    end
   end
-  weaveffi_events_GetMessagesIterator_destroy(iter)
-  items
 end
 ```
 
-If `_next` reports an error the wrapper destroys the handle first and
-then raises `WeaveFFI::Error` via `check_error!`; on success the
-handle is destroyed before the array is returned.
+The producer iterator launches on the first pull, so a launch error
+raises then, not when the method returns. Each string element is
+copied with `read_string` and freed with `weaveffi_free_string`;
+record elements are adopted by their `FFI::AutoPointer`-backed
+wrapper. The `ensure` block destroys the handle exactly once, whether
+iteration exhausts, raises, or is abandoned early (Ruby runs `ensure`
+when the enumerator's fiber is torn down, for example after `break`).
+
+The per-step error check follows the function's error strategy: the
+throwing `kvstore` sample's `Store#list_keys` checks the launcher and
+each `next` with `check_kv_error!`, so a failing step raises the typed
+`KvError` subclass; the non-throwing `get_messages` uses the generic
+`check_error!`, which raises only on a producer bug.
 
 ## Troubleshooting
 

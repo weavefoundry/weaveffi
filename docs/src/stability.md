@@ -40,6 +40,14 @@ minor release, with a schema-version bump), but the contract is "no
 contract." Things that have already changed during 0.x:
 
 - IR type-reference syntax (`callback` was removed in `0.3.0`).
+- The IR `TypeRef::Struct` variant was split into `Named` (the
+  unresolved parsed form), `Record`, and `RichEnum`, and a shared
+  marshalling-plan module (`weaveffi_core::plan`) now states the
+  calling contracts every generator renders. Generated wrapper
+  surfaces changed with it: `iter<T>` returns became each target's
+  native lazy iteration idiom (Go `[]T` became an `iter.Seq`, C++
+  `std::vector<T>` became a range type), and async result buffers
+  became producer-freed after the completion callback returns.
 - Schema `0.5.0` introduced first-class interfaces (`interfaces:`, objects
   with constructors, methods, and statics) and per-function typed errors
   (`throws:`), and made bare type names unique across the whole API. The

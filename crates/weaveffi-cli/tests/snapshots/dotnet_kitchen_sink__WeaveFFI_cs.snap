@@ -95,6 +95,35 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>A lazily streamed sequence backed by a native iterator.
+    /// It can be enumerated exactly once; enumerate it promptly (or call
+    /// a materializing operator such as ToList) and let the enumerator be
+    /// disposed to release the native iterator.</summary>
+    internal sealed class WeaveFFIOnceEnumerable<T> : IEnumerable<T>
+    {
+        private IEnumerator<T>? _enumerator;
+
+        internal WeaveFFIOnceEnumerable(IEnumerator<T> enumerator)
+        {
+            _enumerator = enumerator;
+        }
+
+        public IEnumerator<T> GetEnumerator()
+        {
+            var e = System.Threading.Interlocked.Exchange(ref _enumerator, null);
+            if (e == null)
+            {
+                throw new InvalidOperationException("this sequence can be enumerated only once");
+            }
+            return e;
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
+        }
+    }
+
     /// <summary>A reusable token referenced across modules</summary>
     public class Token : IDisposable
     {
@@ -245,8 +274,12 @@ namespace WeaveFFI
                 var arr = new string[(int)len];
                 for (int i = 0; i < (int)len; i++)
                 {
-                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                    var itemPtr = Marshal.ReadIntPtr(ptr, i * IntPtr.Size);
+                    var item = Marshal.PtrToStringUTF8(itemPtr) ?? "";
+                    NativeMethods.weaveffi_free_string(itemPtr);
+                    arr[i] = item;
                 }
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
                 return arr;
             }
         }
@@ -257,9 +290,20 @@ namespace WeaveFFI
             {
                 NativeMethods.weaveffi_kitchen_Item_get_attrs(_handle, out var outKeys, out var outValues, out var outLen);
                 var dict = new Dictionary<string, string>();
-                for (int i = 0; i < (int)outLen; i++)
+                if (outKeys != IntPtr.Zero && outValues != IntPtr.Zero)
                 {
-                    dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size)) ?? ""] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outValues, i * IntPtr.Size)) ?? "";
+                    for (int i = 0; i < (int)outLen; i++)
+                    {
+                        var keyPtr = Marshal.ReadIntPtr(outKeys, i * IntPtr.Size);
+                        var key = Marshal.PtrToStringUTF8(keyPtr) ?? "";
+                        NativeMethods.weaveffi_free_string(keyPtr);
+                        var valuePtr = Marshal.ReadIntPtr(outValues, i * IntPtr.Size);
+                        var value = Marshal.PtrToStringUTF8(valuePtr) ?? "";
+                        NativeMethods.weaveffi_free_string(valuePtr);
+                        dict[key] = value;
+                    }
+                    NativeMethods.weaveffi_free_bytes(outKeys, (UIntPtr)((int)outLen * IntPtr.Size));
+                    NativeMethods.weaveffi_free_bytes(outValues, (UIntPtr)((int)outLen * IntPtr.Size));
                 }
                 return dict;
             }
@@ -271,7 +315,9 @@ namespace WeaveFFI
             {
                 var ptr = NativeMethods.weaveffi_kitchen_Item_get_parent(_handle);
                 if (ptr == IntPtr.Zero) return null;
-                return Marshal.ReadInt64(ptr);
+                var value = Marshal.ReadInt64(ptr);
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)8);
+                return value;
             }
         }
 
@@ -441,7 +487,7 @@ namespace WeaveFFI
             }
             try
             {
-                var result = NativeMethods.weaveffi_kitchen_Item_create(id, namePtr, count, enabled ? 1 : 0, ratio, nick, payloadPin.AddrOfPinnedObject(), (UIntPtr)payload.Length, tags.Length == 0 ? IntPtr.Zero : tagsPin.AddrOfPinnedObject(), (UIntPtr)tags.Length, attrs.Count == 0 ? IntPtr.Zero : attrsKeysPin.AddrOfPinnedObject(), attrs.Count == 0 ? IntPtr.Zero : attrsValsPin.AddrOfPinnedObject(), (UIntPtr)attrs.Count, parentPtr, token.Handle, (int)priority, ref err);
+                var result = NativeMethods.weaveffi_kitchen_Item_create(id, namePtr, count, (byte)(enabled ? 1 : 0), ratio, nick, payloadPin.AddrOfPinnedObject(), (UIntPtr)payload.Length, tags.Length == 0 ? IntPtr.Zero : tagsPin.AddrOfPinnedObject(), (UIntPtr)tags.Length, attrs.Count == 0 ? IntPtr.Zero : attrsKeysPin.AddrOfPinnedObject(), attrs.Count == 0 ? IntPtr.Zero : attrsValsPin.AddrOfPinnedObject(), (UIntPtr)attrs.Count, parentPtr, token.Handle, (int)priority, ref err);
                 WeaveFFIError.Check(err);
                 return new Item(result);
             }
@@ -556,7 +602,7 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_shared_ping(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_Item_create(long id, IntPtr name, int count, int enabled, double ratio, uint nick, IntPtr payload_ptr, UIntPtr payload_len, IntPtr tags, UIntPtr tags_len, IntPtr attrs_keys, IntPtr attrs_values, UIntPtr attrs_len, IntPtr parent, IntPtr token, int priority, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_Item_create(long id, IntPtr name, int count, byte enabled, double ratio, uint nick, IntPtr payload_ptr, UIntPtr payload_len, IntPtr tags, UIntPtr tags_len, IntPtr attrs_keys, IntPtr attrs_values, UIntPtr attrs_len, IntPtr parent, IntPtr token, int priority, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kitchen_Item_destroy(IntPtr ptr);
@@ -571,7 +617,7 @@ namespace WeaveFFI
         internal static extern int weaveffi_kitchen_Item_get_count(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_get_enabled", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_Item_get_enabled(IntPtr ptr);
+        internal static extern byte weaveffi_kitchen_Item_get_enabled(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Item_get_ratio", CallingConvention = CallingConvention.Cdecl)]
         internal static extern double weaveffi_kitchen_Item_get_ratio(IntPtr ptr);
@@ -622,7 +668,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_kitchen_unregister_ready_listener(ulong id);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_bool_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_bool_id(int x, ref WeaveFFIError err);
+        internal static extern byte weaveffi_kitchen_bool_id(byte x, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_i32_id", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_kitchen_i32_id(int x, ref WeaveFFIError err);
@@ -752,7 +798,7 @@ namespace WeaveFFI
         public static bool BoolId(bool x)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kitchen_bool_id(x ? 1 : 0, ref err);
+            var result = NativeMethods.weaveffi_kitchen_bool_id((byte)(x ? 1 : 0), ref err);
             WeaveFFIError.Check(err);
             return result != 0;
         }
@@ -905,8 +951,10 @@ namespace WeaveFFI
             var arr = new Item[(int)outLen];
             for (int i = 0; i < (int)outLen; i++)
             {
-                arr[i] = new Item(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                var item = new Item(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                arr[i] = item;
             }
+            NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * IntPtr.Size));
             return arr;
         }
 
@@ -917,23 +965,37 @@ namespace WeaveFFI
             NativeMethods.weaveffi_kitchen_get_attrs(out var outKeys, out var outValues, out var outLen, ref err);
             WeaveFFIError.Check(err);
             var dict = new Dictionary<string, int>();
-            for (int i = 0; i < (int)outLen; i++)
+            if (outKeys != IntPtr.Zero && outValues != IntPtr.Zero)
             {
-                dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size)) ?? ""] = Marshal.ReadInt32(outValues + i * sizeof(int));
+                for (int i = 0; i < (int)outLen; i++)
+                {
+                    var keyPtr = Marshal.ReadIntPtr(outKeys, i * IntPtr.Size);
+                    var key = Marshal.PtrToStringUTF8(keyPtr) ?? "";
+                    NativeMethods.weaveffi_free_string(keyPtr);
+                    var value = Marshal.ReadInt32(outValues + i * sizeof(int));
+                    dict[key] = value;
+                }
+                NativeMethods.weaveffi_free_bytes(outKeys, (UIntPtr)((int)outLen * IntPtr.Size));
+                NativeMethods.weaveffi_free_bytes(outValues, (UIntPtr)((int)outLen * 4));
             }
             return dict;
         }
 
         /// <summary>Iterator return type</summary>
+        /// <remarks>Streams lazily: each element is pulled from the native
+        /// iterator on demand, and the iterator is destroyed when enumeration
+        /// completes or the enumerator is disposed (a <c>foreach</c> disposes it
+        /// automatically, including on early exit). The returned sequence can be
+        /// enumerated only once.</remarks>
         public static IEnumerable<Item> StreamItems()
         {
             var err = new WeaveFFIError();
             var iter = NativeMethods.weaveffi_kitchen_stream_items(ref err);
             WeaveFFIError.Check(err);
-            return EnumerateStreamItems(iter);
+            return new WeaveFFIOnceEnumerable<Item>(EnumerateStreamItems(iter));
         }
 
-        private static IEnumerable<Item> EnumerateStreamItems(IntPtr iter)
+        private static IEnumerator<Item> EnumerateStreamItems(IntPtr iter)
         {
             try
             {
@@ -982,9 +1044,7 @@ namespace WeaveFFI
                             return;
                         }
                     }
-                    var str = Marshal.PtrToStringUTF8(result);
-                    NativeMethods.weaveffi_free_string(result);
-                    tcs.SetResult(str);
+                    tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? "");
                 }
                 finally
                 {
@@ -1034,9 +1094,7 @@ namespace WeaveFFI
                             return;
                         }
                     }
-                    var str = Marshal.PtrToStringUTF8(result);
-                    NativeMethods.weaveffi_free_string(result);
-                    tcs.SetResult(str);
+                    tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? "");
                 }
                 finally
                 {

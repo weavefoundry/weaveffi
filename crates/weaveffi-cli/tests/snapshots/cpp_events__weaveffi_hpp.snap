@@ -15,6 +15,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
+#include <cstddef>
+#include <iterator>
 #include <functional>
 #include <mutex>
 
@@ -154,25 +156,101 @@ inline void send_message(const std::string& text) {
     detail::check(err);
 }
 
-/** Return an iterator over all sent messages */
-inline std::vector<std::string> get_messages() {
+/**
+ * A lazy, move-only range over the `std::string` elements produced by `get_messages()`.
+ *
+ * Each iteration step pulls exactly one element from the producer, so results stream in constant memory. The range owns the producer-side iterator and releases it exactly once: eagerly when the range is exhausted, or from the destructor when iteration is abandoned early.
+ */
+class GetMessagesIterator {
+    weaveffi_events_GetMessagesIterator* handle_;
+
+public:
+    /** Adopts ownership of the raw producer iterator handle. */
+    explicit GetMessagesIterator(weaveffi_events_GetMessagesIterator* h) : handle_(h) {}
+
+    ~GetMessagesIterator() {
+        if (handle_) weaveffi_events_GetMessagesIterator_destroy(handle_);
+    }
+
+    GetMessagesIterator(const GetMessagesIterator&) = delete;
+    GetMessagesIterator& operator=(const GetMessagesIterator&) = delete;
+
+    GetMessagesIterator(GetMessagesIterator&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    GetMessagesIterator& operator=(GetMessagesIterator&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_events_GetMessagesIterator_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** Pulls the next element from the producer, or `std::nullopt` once exhausted (which releases the producer iterator eagerly). A producer error throws the generic WeaveFFIError after releasing the iterator. */
+    std::optional<std::string> next() {
+        if (!handle_) return std::nullopt;
+        weaveffi_error err{};
+        const char* item{};
+        int32_t has_item = weaveffi_events_GetMessagesIterator_next(handle_, &item, &err);
+        if (err.code != 0) {
+            weaveffi_events_GetMessagesIterator_destroy(handle_);
+            handle_ = nullptr;
+            detail::check(err);
+        }
+        if (has_item == 0) {
+            weaveffi_events_GetMessagesIterator_destroy(handle_);
+            handle_ = nullptr;
+            return std::nullopt;
+        }
+        std::string value(item);
+        weaveffi_free_string(item);
+        return value;
+    }
+
+    /** Sentinel type marking the end of the range. */
+    struct sentinel {};
+
+    /** Single-pass input iterator; each increment pulls one element from the producer. */
+    class iterator {
+        GetMessagesIterator* range_;
+        std::optional<std::string> current_;
+
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = std::string;
+        using difference_type = std::ptrdiff_t;
+        using pointer = std::string*;
+        using reference = std::string&;
+
+        /** Binds to `range` and pulls the first element. */
+        explicit iterator(GetMessagesIterator* range) : range_(range), current_(range->next()) {}
+        reference operator*() { return *current_; }
+        pointer operator->() { return &*current_; }
+        iterator& operator++() { current_ = range_->next(); return *this; }
+        void operator++(int) { current_ = range_->next(); }
+        bool operator==(sentinel) const { return !current_.has_value(); }
+        bool operator!=(sentinel) const { return current_.has_value(); }
+    };
+
+    /** Begins iteration by pulling the first element. */
+    iterator begin() { return iterator(this); }
+
+    /** The past-the-end sentinel. */
+    sentinel end() const { return sentinel{}; }
+};
+
+/**
+ * Return an iterator over all sent messages
+ *
+ * @return A lazy `GetMessagesIterator` range that streams one element per iteration step and releases the producer iterator when exhausted or destroyed.
+ */
+inline GetMessagesIterator get_messages() {
     weaveffi_error err{};
     weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
     detail::check(err);
-    std::vector<std::string> ret;
-    while (true) {
-        const char* item{};
-        int32_t has_item = weaveffi_events_GetMessagesIterator_next(iter, &item, &err);
-        if (err.code != 0) {
-            weaveffi_events_GetMessagesIterator_destroy(iter);
-            detail::check(err);
-        }
-        if (has_item == 0) break;
-        ret.emplace_back(item);
-        weaveffi_free_string(item);
-    }
-    weaveffi_events_GetMessagesIterator_destroy(iter);
-    return ret;
+    return GetMessagesIterator(iter);
 }
 
 } // namespace events

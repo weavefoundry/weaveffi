@@ -57,6 +57,35 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>A lazily streamed sequence backed by a native iterator.
+    /// It can be enumerated exactly once; enumerate it promptly (or call
+    /// a materializing operator such as ToList) and let the enumerator be
+    /// disposed to release the native iterator.</summary>
+    internal sealed class WeaveFFIOnceEnumerable<T> : IEnumerable<T>
+    {
+        private IEnumerator<T>? _enumerator;
+
+        internal WeaveFFIOnceEnumerable(IEnumerator<T> enumerator)
+        {
+            _enumerator = enumerator;
+        }
+
+        public IEnumerator<T> GetEnumerator()
+        {
+            var e = System.Threading.Interlocked.Exchange(ref _enumerator, null);
+            if (e == null)
+            {
+                throw new InvalidOperationException("this sequence can be enumerated only once");
+            }
+            return e;
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
+        }
+    }
+
     internal static class NativeMethods
     {
         private const string LibName = "weaveffi";
@@ -141,15 +170,20 @@ namespace WeaveFFI
         }
 
         /// <summary>Return an iterator over all sent messages</summary>
+        /// <remarks>Streams lazily: each element is pulled from the native
+        /// iterator on demand, and the iterator is destroyed when enumeration
+        /// completes or the enumerator is disposed (a <c>foreach</c> disposes it
+        /// automatically, including on early exit). The returned sequence can be
+        /// enumerated only once.</remarks>
         public static IEnumerable<string> GetMessages()
         {
             var err = new WeaveFFIError();
             var iter = NativeMethods.weaveffi_events_get_messages(ref err);
             WeaveFFIError.Check(err);
-            return EnumerateGetMessages(iter);
+            return new WeaveFFIOnceEnumerable<string>(EnumerateGetMessages(iter));
         }
 
-        private static IEnumerable<string> EnumerateGetMessages(IntPtr iter)
+        private static IEnumerator<string> EnumerateGetMessages(IntPtr iter)
         {
             try
             {

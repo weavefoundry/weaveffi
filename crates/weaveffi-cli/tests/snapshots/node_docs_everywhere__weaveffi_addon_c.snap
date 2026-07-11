@@ -123,6 +123,7 @@ static napi_value Napi_weaveffi_docs_Notebook_find(napi_env env, napi_callback_i
           weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
           napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
         }
+        weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
       }
     }
     napi_set_named_property(env, ret, "tags", ret_tags);
@@ -290,6 +291,7 @@ static napi_value Napi_weaveffi_docs_create_document(napi_env env, napi_callback
           weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
           napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
         }
+        weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
       }
     }
     napi_set_named_property(env, ret, "tags", ret_tags);
@@ -343,6 +345,7 @@ static napi_value Napi_weaveffi_docs_get_document(napi_env env, napi_callback_in
             weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
             napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
           }
+          weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
         }
       }
       napi_set_named_property(env, ret, "tags", ret_tags);

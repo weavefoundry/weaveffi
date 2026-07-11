@@ -159,7 +159,10 @@ func (s *Shape) BoundedWeight() uint64 {
 }
 
 func (s *Shape) LabeledLabel() string {
-	return C.GoString(C.weaveffi_shapes_Shape_Labeled_get_label(s.ptr))
+	cStr := C.weaveffi_shapes_Shape_Labeled_get_label(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Shape) LabeledCount() uint8 {

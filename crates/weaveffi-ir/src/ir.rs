@@ -341,17 +341,24 @@ pub enum TypeRef {
     /// Opaque resource handle tagged with the name of what it refers to
     /// (`handle<Name>`), giving generators a distinct type per resource kind.
     TypedHandle(String),
-    /// A user struct *or* an algebraic (rich) enum. Both cross the C ABI as an
-    /// opaque object pointer, so a reference to either is represented the same
-    /// way here; whether the referent is a struct or a sum type is recovered
-    /// from its definition (`module.structs` vs `module.enums` /
-    /// [`EnumDef::is_rich`]) when a generator emits its *declaration*.
+    /// An unresolved reference to a user-defined type, exactly as parsed.
     ///
-    /// The resolution pass leaves a rich-enum reference as `Struct` (it only
-    /// rewrites *C-style* enum references into [`Enum`](Self::Enum), which lower
-    /// by value, and interface references into [`Interface`](Self::Interface));
-    /// see `weaveffi_core::validate::resolve`.
-    Struct(String),
+    /// The parser cannot know whether a bare identifier names a record, an
+    /// enum, or an interface, so every user-type reference starts life as
+    /// `Named`. The resolution pass (`weaveffi_core::validate::resolve`)
+    /// rewrites each occurrence into [`Record`](Self::Record),
+    /// [`RichEnum`](Self::RichEnum), [`Enum`](Self::Enum), or
+    /// [`Interface`](Self::Interface); after a successful validate-and-resolve
+    /// no `Named` reference remains, and generators may treat one as a bug.
+    Named(String),
+    /// A user record (struct). Crosses the C ABI as an opaque object pointer:
+    /// borrowed as a parameter, owned (and eventually destroyed) as a return.
+    Record(String),
+    /// An algebraic (rich) enum: a sum type with at least one payload-carrying
+    /// variant. Crosses the C ABI as an opaque object pointer exactly like a
+    /// [`Record`](Self::Record); its declaration additionally lowers a tag
+    /// getter and per-variant constructors and field getters.
+    RichEnum(String),
     /// A C-style integer enum (no variant payloads). Lowers by value.
     Enum(String),
     /// A user interface (see [`InterfaceDef`]): an opaque object reference.
@@ -359,8 +366,8 @@ pub enum TypeRef {
     /// caller receives a new owned reference it must eventually release.
     ///
     /// The IDL spells an interface reference as its bare (or dotted-qualified)
-    /// name, exactly like a struct; the resolution pass rewrites the parsed
-    /// [`Struct`](Self::Struct) into this variant when the name resolves to an
+    /// name, exactly like a record; the resolution pass rewrites the parsed
+    /// [`Named`](Self::Named) into this variant when the name resolves to an
     /// interface declaration.
     Interface(String),
     /// Borrowed string slice (`&str`): a non-owning view valid only for the
@@ -386,9 +393,9 @@ pub enum TypeRef {
 /// Handles primitive names (`i32`, `string`, `bytes`, `handle`, and so on),
 /// borrowed forms (`&str`, `&[u8]`), typed handles (`handle<Name>`), iterators
 /// (`iter<T>`), lists (`[T]`), maps (`{K:V}`), and the optional suffix (`T?`).
-/// Any other bare identifier is taken to be a user-defined struct, enum, or
-/// interface name and returned as [`TypeRef::Struct`]; the
-/// struct-versus-enum-versus-interface distinction is resolved later against
+/// Any other bare identifier is taken to be a user-defined record, enum, or
+/// interface name and returned as [`TypeRef::Named`]; the
+/// record-versus-enum-versus-interface distinction is resolved later against
 /// the module's declarations.
 ///
 /// # Errors
@@ -446,7 +453,34 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
         "handle" => Ok(TypeRef::Handle),
         "&str" => Ok(TypeRef::BorrowedStr),
         "&[u8]" => Ok(TypeRef::BorrowedBytes),
-        name => Ok(TypeRef::Struct(name.to_string())),
+        name => Ok(TypeRef::Named(name.to_string())),
+    }
+}
+
+impl TypeRef {
+    /// The referenced user-type name for any user-defined reference variant
+    /// ([`Named`](Self::Named), [`Record`](Self::Record),
+    /// [`RichEnum`](Self::RichEnum), [`Enum`](Self::Enum),
+    /// [`Interface`](Self::Interface), or
+    /// [`TypedHandle`](Self::TypedHandle)), or `None` for every other type.
+    pub fn user_name(&self) -> Option<&str> {
+        match self {
+            TypeRef::Named(n)
+            | TypeRef::Record(n)
+            | TypeRef::RichEnum(n)
+            | TypeRef::Enum(n)
+            | TypeRef::Interface(n)
+            | TypeRef::TypedHandle(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// `true` when this reference lowers across the C ABI as an opaque object
+    /// pointer to a user-declared data type: a [`Record`](Self::Record) or a
+    /// [`RichEnum`](Self::RichEnum). Interfaces also cross as opaque pointers
+    /// but carry a distinct ownership convention, so they are excluded.
+    pub fn is_object_ref(&self) -> bool {
+        matches!(self, TypeRef::Record(_) | TypeRef::RichEnum(_))
     }
 }
 
@@ -469,7 +503,11 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::BorrowedBytes => "&[u8]".to_string(),
         TypeRef::Handle => "handle".to_string(),
         TypeRef::TypedHandle(name) => format!("handle<{name}>"),
-        TypeRef::Struct(name) | TypeRef::Enum(name) | TypeRef::Interface(name) => name.clone(),
+        TypeRef::Named(name)
+        | TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::Enum(name)
+        | TypeRef::Interface(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
@@ -797,7 +835,7 @@ modules: []
 
     #[test]
     fn typeref_struct_variant_serializes() {
-        let ty = TypeRef::Struct("Point".to_string());
+        let ty = TypeRef::Named("Point".to_string());
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""Point""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
@@ -808,7 +846,7 @@ modules: []
     fn struct_field_with_struct_type() {
         let field = StructField {
             name: "origin".to_string(),
-            ty: TypeRef::Struct("Point".to_string()),
+            ty: TypeRef::Named("Point".to_string()),
             doc: None,
             default: None,
         };
@@ -819,7 +857,7 @@ modules: []
 
     #[test]
     fn typeref_is_not_copy() {
-        let a = TypeRef::Struct("Foo".to_string());
+        let a = TypeRef::Named("Foo".to_string());
         let b = a.clone();
         assert_eq!(a, b);
     }
@@ -1001,11 +1039,11 @@ modules:
     fn parse_type_ref_struct() {
         assert_eq!(
             parse_type_ref("Contact"),
-            Ok(TypeRef::Struct("Contact".into()))
+            Ok(TypeRef::Named("Contact".into()))
         );
         assert_eq!(
             parse_type_ref("MyWidget"),
-            Ok(TypeRef::Struct("MyWidget".into()))
+            Ok(TypeRef::Named("MyWidget".into()))
         );
     }
 
@@ -1021,7 +1059,7 @@ modules:
         );
         assert_eq!(
             parse_type_ref("Contact?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::Struct(
+            Ok(TypeRef::Optional(Box::new(TypeRef::Named(
                 "Contact".into()
             ))))
         );
@@ -1039,7 +1077,7 @@ modules:
         );
         assert_eq!(
             parse_type_ref("[Contact]"),
-            Ok(TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))))
+            Ok(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
         );
     }
 
@@ -1054,7 +1092,7 @@ modules:
         assert_eq!(
             parse_type_ref("[Contact]?"),
             Ok(TypeRef::Optional(Box::new(TypeRef::List(Box::new(
-                TypeRef::Struct("Contact".into())
+                TypeRef::Named("Contact".into())
             )))))
         );
     }
@@ -1103,7 +1141,7 @@ modules:
 
     #[test]
     fn typeref_optional_struct_round_trip() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::Struct("Contact".into())));
+        let ty = TypeRef::Optional(Box::new(TypeRef::Named("Contact".into())));
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""Contact?""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
@@ -1112,7 +1150,7 @@ modules:
 
     #[test]
     fn typeref_list_struct_round_trip() {
-        let ty = TypeRef::List(Box::new(TypeRef::Struct("Contact".into())));
+        let ty = TypeRef::List(Box::new(TypeRef::Named("Contact".into())));
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""[Contact]""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
@@ -1136,7 +1174,7 @@ modules:
         let f = &api.modules[0].functions[0];
         assert_eq!(
             f.returns,
-            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+            Some(TypeRef::Optional(Box::new(TypeRef::Named(
                 "Contact".into()
             ))))
         );
@@ -1157,7 +1195,7 @@ modules:
         let f = &api.modules[0].functions[0];
         assert_eq!(
             f.returns,
-            Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))))
+            Some(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
         );
     }
 
@@ -1168,7 +1206,7 @@ modules:
         set.insert(TypeRef::I32);
         set.insert(TypeRef::Optional(Box::new(TypeRef::I32)));
         set.insert(TypeRef::List(Box::new(TypeRef::I32)));
-        set.insert(TypeRef::Optional(Box::new(TypeRef::Struct("Foo".into()))));
+        set.insert(TypeRef::Optional(Box::new(TypeRef::Named("Foo".into()))));
         set.insert(TypeRef::Map(
             Box::new(TypeRef::StringUtf8),
             Box::new(TypeRef::I32),
@@ -1193,7 +1231,7 @@ modules:
             parse_type_ref("{string:Contact}"),
             Ok(TypeRef::Map(
                 Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::Struct("Contact".into()))
+                Box::new(TypeRef::Named("Contact".into()))
             ))
         );
     }
@@ -1227,7 +1265,7 @@ modules:
     fn typeref_map_struct_round_trip() {
         let ty = TypeRef::Map(
             Box::new(TypeRef::StringUtf8),
-            Box::new(TypeRef::Struct("Contact".into())),
+            Box::new(TypeRef::Named("Contact".into())),
         );
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""{string:Contact}""#);
@@ -1286,7 +1324,7 @@ modules:
             parse_type_ref("{string:Contact}"),
             Ok(TypeRef::Map(
                 Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::Struct("Contact".into())),
+                Box::new(TypeRef::Named("Contact".into())),
             ))
         );
     }
@@ -1333,7 +1371,7 @@ modules:
         );
         assert_eq!(
             parse_type_ref("iter<Contact>"),
-            Ok(TypeRef::Iterator(Box::new(TypeRef::Struct(
+            Ok(TypeRef::Iterator(Box::new(TypeRef::Named(
                 "Contact".into()
             ))))
         );
@@ -1350,7 +1388,7 @@ modules:
 
     #[test]
     fn typeref_iterator_struct_round_trip() {
-        let ty = TypeRef::Iterator(Box::new(TypeRef::Struct("Contact".into())));
+        let ty = TypeRef::Iterator(Box::new(TypeRef::Named("Contact".into())));
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""iter<Contact>""#);
         let back: TypeRef = serde_json::from_str(&json).unwrap();
@@ -1798,7 +1836,7 @@ modules:
     fn parse_type_ref_does_not_yield_callback() {
         assert_eq!(
             parse_type_ref("callback"),
-            Ok(TypeRef::Struct("callback".into()))
+            Ok(TypeRef::Named("callback".into()))
         );
     }
 
@@ -1920,9 +1958,9 @@ modules:
         let ty = TypeRef::Interface("Store".to_string());
         let json = serde_json::to_string(&ty).unwrap();
         assert_eq!(json, r#""Store""#);
-        // Deserialization yields `Struct`; the resolver rewrites it later.
+        // Deserialization yields `Named`; the resolver rewrites it later.
         let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, TypeRef::Struct("Store".into()));
+        assert_eq!(back, TypeRef::Named("Store".into()));
     }
 
     #[test]

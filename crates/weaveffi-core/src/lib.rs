@@ -14,6 +14,7 @@ pub mod errors;
 pub mod model;
 pub mod package;
 pub mod pkg;
+pub mod plan;
 pub mod platform;
 pub mod utils;
 pub mod validate;

@@ -23,7 +23,7 @@ Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex 
 
 ### Structs
 
-Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields.
+Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields. A returned struct handle is owned by the consumer; the JS wrapper's `free()` releases it via the struct's `_destroy` symbol.
 
 ### Enums
 
@@ -31,11 +31,15 @@ Enums are passed as **`i32` values** corresponding to the variant's integer disc
 
 ### Optionals
 
-Optional values use **`0` / `null`** to represent the absent case. For numeric optionals, a separate `_is_present` flag (`i32`: 0 or 1) is used. For handle-typed optionals, a null pointer (`0`) signals absence.
+Optional values use **`0` / `null`** to represent the absent case. Scalar optionals are boxed by pointer (a null pointer signals absence); handle-typed and string optionals pass a null pointer (`0`) directly.
 
 ### Lists
 
 Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+
+### Iterators
+
+`iter<T>` functions return a **lazy JS iterator** (typed `IterableIterator<T>`): each `next()` issues exactly one producer call, so iteration streams in constant memory. The producer handle is destroyed exactly once, on exhaustion or via `return()` when iteration stops early (a `for...of` loop calls `return()` automatically on `break` or `throw`). Abandoning an iterator without exhausting or closing it leaks the handle.
 
 ### Error Handling
 
@@ -44,7 +48,10 @@ pointer as the last argument to each Wasm function. Your Wasm module must
 export the following functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
+- `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
+- `weaveffi_free_string(ptr: i32)`: free a producer-returned C string
+- `weaveffi_free_bytes(ptr: i32, len: i32)`: free a producer-returned buffer
 
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
@@ -381,7 +388,7 @@ Passed as opaque handle (`i64`).
 | `weaveffi_kitchen_Item_get_payload` | `i32, i32` |
 | `weaveffi_kitchen_Item_get_tags` | `i32, i32` |
 | `weaveffi_kitchen_Item_get_attrs` | `i64` |
-| `weaveffi_kitchen_Item_get_parent` | `i32, i32` |
+| `weaveffi_kitchen_Item_get_parent` | `i32` |
 | `weaveffi_kitchen_Item_get_token` | `i64` |
 | `weaveffi_kitchen_Item_get_priority` | `i32` |
 
@@ -401,7 +408,7 @@ Builder for `Item`.
 | `weaveffi_kitchen_Item_Builder_set_payload` | `i32` handle, `i32, i32` value | none |
 | `weaveffi_kitchen_Item_Builder_set_tags` | `i32` handle, `i32, i32` value | none |
 | `weaveffi_kitchen_Item_Builder_set_attrs` | `i32` handle, `i64` value | none |
-| `weaveffi_kitchen_Item_Builder_set_parent` | `i32` handle, `i32, i32` value | none |
+| `weaveffi_kitchen_Item_Builder_set_parent` | `i32` handle, `i32` value | none |
 | `weaveffi_kitchen_Item_Builder_set_token` | `i32` handle, `i64` value | none |
 | `weaveffi_kitchen_Item_Builder_set_priority` | `i32` handle, `i32` value | none |
 | `weaveffi_kitchen_Item_Builder_build` | `i32` handle | `i32` (handle) |

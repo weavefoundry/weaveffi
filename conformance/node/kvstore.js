@@ -61,14 +61,14 @@ expect(store.put('beta', payload, EntryKind.Volatile, 3600) === true, 'put beta 
 
 expect(store.count() === 2, 'count == 2');
 
-// Iterator-backed method return: keys stream in sorted order, optionally
-// filtered by prefix.
-const keys = store.listKeys(null);
+// Iterator-backed method return: a lazy iterable streaming keys in sorted
+// order (one producer next per step), optionally filtered by prefix.
+const keys = [...store.listKeys(null)];
 expect(
-  Array.isArray(keys) && keys.length === 2 && keys[0] === 'alpha' && keys[1] === 'beta',
+  keys.length === 2 && keys[0] === 'alpha' && keys[1] === 'beta',
   `listKeys yields sorted keys (got ${JSON.stringify(keys)})`
 );
-const filtered = store.listKeys('al');
+const filtered = [...store.listKeys('al')];
 expect(
   filtered.length === 1 && filtered[0] === 'alpha',
   `listKeys honors the prefix (got ${JSON.stringify(filtered)})`

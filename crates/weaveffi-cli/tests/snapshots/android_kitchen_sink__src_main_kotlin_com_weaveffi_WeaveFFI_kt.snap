@@ -15,11 +15,34 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        @Volatile private var callbackExceptionHandler: ((Throwable) -> Unit)? = null
+
+        /**
+         * Installs a handler for exceptions thrown by listener callbacks and
+         * async continuations on native producer threads. These exceptions have
+         * no Kotlin caller to propagate to; when no handler is installed, they
+         * are logged with their stack trace and dropped. Pass `null` to
+         * restore the default logging behavior.
+         */
+        @JvmStatic fun setCallbackExceptionHandler(handler: ((Throwable) -> Unit)?) {
+            callbackExceptionHandler = handler
+        }
+
+        // Invoked from the JNI glue; rethrowing signals "no handler" so the
+        // glue falls back to ExceptionDescribe.
+        @JvmStatic private fun dispatchCallbackException(t: Throwable) {
+            callbackExceptionHandler?.invoke(t) ?: throw t
+        }
+
         /**
          * Trivial cross-module helper
          */
         @JvmStatic external fun ping(): String
-        /** Subscribe to OnReady events */
+        /**
+         * Subscribe to OnReady events
+         *
+         * Exceptions thrown by the callback cannot propagate to a caller (events fire on a producer thread); they are delivered to the handler installed via [setCallbackExceptionHandler], or logged with their stack trace and dropped when no handler is set.
+         */
         @JvmStatic external fun registerReadyListener(callback: (Int, String) -> Unit): Long
         @JvmStatic external fun unregisterReadyListener(id: Long)
         /**
@@ -65,7 +88,8 @@ class WeaveFFI {
         /**
          * Iterator return type
          */
-        @JvmStatic external fun streamItems(): Iterator<Long>
+        @JvmStatic private external fun streamItemsJni(): Long
+        @JvmStatic fun streamItems(): Iterator<Item> = KitchenStreamItemsIterator(streamItemsJni())
         /**
          * Returns the shared Token type from another module
          */
@@ -324,6 +348,53 @@ class Gadget internal constructor(internal var handle: Long) : java.io.Closeable
 
     protected fun finalize() {
         close()
+    }
+}
+
+/**
+ * A lazy iterator over the `Item` elements streamed by [streamItems]. Each step pulls
+ * exactly one element from the native producer. The native handle is
+ * released when the producer is exhausted, when [close] is called, or by
+ * the finalizer if the iterator is abandoned, whichever comes first.
+ */
+class KitchenStreamItemsIterator internal constructor(private var handle: Long) : Iterator<Item>, java.io.Closeable {
+    private var nextSlot: Array<Any?>? = null
+
+    override fun hasNext(): Boolean {
+        if (nextSlot != null) return true
+        if (handle == 0L) return false
+        val slot = nativeNext(handle)
+        if (slot == null) {
+            close()
+            return false
+        }
+        nextSlot = slot
+        return true
+    }
+
+    override fun next(): Item {
+        if (!hasNext()) throw NoSuchElementException()
+        val raw = nextSlot!![0]
+        nextSlot = null
+        return Item(raw as Long)
+    }
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNext(handle: Long): Array<Any?>?
+        @JvmStatic private external fun nativeDestroy(handle: Long)
     }
 }
 

@@ -118,7 +118,7 @@ export class Store {
    * Maps to C function: weaveffi_kv_Store_list_keys
    * @throws {KvError}
    */
-  listKeys(prefix: string | null): string[];
+  listKeys(prefix: string | null): IterableIterator<string>;
   /**
    * Return the number of live entries in the store
    * Maps to C function: weaveffi_kv_Store_count

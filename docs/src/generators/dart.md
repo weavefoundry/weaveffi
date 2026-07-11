@@ -41,7 +41,7 @@ required; the generated `.dart` file is ready to import.
 | `T?`         | `T?`                | same as inner type     | same as inner type   |
 | `[T]`        | `List<T>`           | `Pointer<Void>`        | `Pointer<Void>`      |
 | `{K: V}`     | `Map<K, V>`         | `Pointer<Void>`        | `Pointer<Void>`      |
-| `iter<T>`    | `Iterable<T>`       | `Pointer<Void>`        | `Pointer<Void>`      |
+| `iter<T>`    | `Iterable<T>` (lazy) | `Pointer<Void>`       | `Pointer<Void>`      |
 
 Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 
@@ -134,10 +134,15 @@ class Contact {
 
   String get name {
     final result = _weaveffiContactsContactGetName(_handle);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 }
 ```
+
+String getters copy the returned pointer with `toDartString()` and
+release the producer's allocation with `weaveffi_free_string`.
 
 Each function emits a native typedef, Dart typedef, lookup, and
 top-level wrapper:
@@ -250,6 +255,7 @@ class Store {
 
   bool put(String key, List<int> value, EntryKind kind, int? ttlSeconds) { /* throws KvException */ }
   Entry? get(String key) { /* throws KvException */ }
+  Iterable<String> listKeys(String? prefix) sync* { /* see Iterators */ }
   int count() { /* generic check only (no throws) */ }
 
   /// Throws [KvException] on domain errors.
@@ -426,8 +432,12 @@ Flutter:
 
 - **Strings:** Dart `String` values are converted with
   `toNativeUtf8()`. The wrapper frees the resulting pointer in a
-  `finally` block. Returned UTF-8 pointers are decoded with
-  `toDartString()`.
+  `finally` block. Returned UTF-8 pointers are copied with
+  `toDartString()` and then released with `weaveffi_free_string`.
+- **Bytes, lists, and maps:** returned buffers are copied into Dart
+  collections, then the producer's allocation is released. String
+  elements are freed individually with `weaveffi_free_string` before
+  the backing buffer is freed with `weaveffi_free_bytes`.
 - **Structs and interfaces:** wrappers hold a `Pointer<Void>`. The
   `dispose()` method calls the corresponding `_destroy` C function.
   Always wrap usage in `try`/`finally`:
@@ -442,7 +452,12 @@ Flutter:
   ```
 
 - **Optionals:** `T?` returns check the native pointer against
-  `nullptr` before wrapping; absent struct optionals become `null`.
+  `nullptr` before wrapping; absent optionals become `null`. A boxed
+  optional scalar is dereferenced, then the box is freed with
+  `weaveffi_free_bytes`.
+- **Iterators:** each yielded element is copied (or, for records,
+  adopted by its wrapper class), and the iterator handle is destroyed
+  exactly once; see [Iterators](#iterators).
 
 ## Callbacks and listeners
 
@@ -547,6 +562,15 @@ once; input buffers are released in `whenComplete` once the future
 settles. The `dart:async` import is only emitted when the IDL contains
 at least one async function.
 
+Result ownership follows the async contract: the callback borrows
+string, bytes, list, map, and boxed optional scalar results, so the
+callback body deep-copies them into Dart values before it returns and
+never frees them (the producer does, after the callback returns).
+Object results (records, rich enums, interfaces, including optional
+ones) are the exception: the callback receives ownership, and the
+wrapper adopts the pointer, as `TaskResult._(result)` does above; its
+`dispose()` owns the eventual destroy.
+
 For a callable marked `throws: true`, the completion callback maps an
 error through the domain mapper (`_mapTaskException` above,
 `_mapKvException` on `Store.compact()`), so the future fails with the
@@ -561,32 +585,66 @@ targets surface cancellation tokens.
 
 ## Iterators
 
-`iter<T>` returns surface as `Iterable<T>`. The wrapper launches the
-iterator, drains it eagerly into a `List<T>` through the generated
-`_next` binding, then destroys the iterator handle:
+`iter<T>` returns surface as `Iterable<T>` backed by a `sync*`
+generator, so they are fully lazy: nothing runs until the consumer
+starts iterating, and each element pulls exactly one native `next`
+call. Iterating the returned `Iterable` again launches a fresh native
+iterator. From the `events` sample:
 
 ```dart
 /// Return an iterator over all sent messages
-Iterable<String> getMessages() {
+///
+/// Returns a lazy [Iterable]: elements are pulled from the native
+/// iterator one at a time (one native `next` call per element), and
+/// iterating the result again launches a fresh native iterator.
+///
+/// The native iterator handle is destroyed exactly once: eagerly when
+/// the iteration completes or fails, or by a GC finalizer if the
+/// iteration is abandoned before it is exhausted.
+Iterable<String> getMessages() sync* {
   final err = calloc<_WeaveFFIError>();
+  final outItem = calloc<Pointer<Utf8>>();
+  Pointer<Void> iter = nullptr;
+  final anchor = _IteratorLifetime();
   try {
-    final iter = _weaveffiEventsGetMessages(err);
+    iter = _weaveffiEventsGetMessages(err);
     _checkError(err);
-    final items = <String>[];
-    final outItem = calloc<Pointer<Utf8>>();
+    _weaveffiEventsGetMessagesIteratorDestroyFinalizer.attach(anchor, iter, detach: anchor);
     while (_weaveffiEventsGetMessagesIteratorNext(iter, outItem, err) != 0) {
       _checkError(err);
-      items.add(outItem.value.toDartString());
+      final itemPtr = outItem.value;
+      final item = itemPtr.toDartString();
+      _weaveffiFreeString(itemPtr);
+      yield item;
     }
     _checkError(err);
-    calloc.free(outItem);
-    _weaveffiEventsGetMessagesIteratorDestroy(iter);
-    return items;
   } finally {
+    if (iter != nullptr) {
+      _weaveffiEventsGetMessagesIteratorDestroyFinalizer.detach(anchor);
+      _weaveffiEventsGetMessagesIteratorDestroy(iter);
+      iter = nullptr;
+    }
+    calloc.free(outItem);
     calloc.free(err);
   }
 }
 ```
+
+Each yielded string is copied with `toDartString()` and its producer
+allocation released with `weaveffi_free_string`; record elements are
+adopted by their wrapper class instead. The handle lifecycle covers
+early abandonment: the `finally` block runs when the loop exhausts,
+when a step fails, or when the consumer stops iterating (Dart closes
+the suspended `sync*` frame on `break`). If an iteration is abandoned
+without ever resuming the frame, the `_IteratorLifetime` anchor's
+`NativeFinalizer` destroys the handle at GC time; an eagerly destroyed
+handle detaches first, so the destroy runs exactly once either way.
+
+Errors from the launcher and from each `next` follow the function's
+error strategy: the throwing `kvstore` sample's `Store.listKeys`
+checks each step with `_checkKvException` and throws the typed
+`KvException` subclasses from the step that failed; the non-throwing
+`getMessages` throws `WeaveFFIException` only for producer bugs.
 
 ## Troubleshooting
 

@@ -30,6 +30,8 @@ export interface TaskResult {
   readonly id: bigint;
   readonly value: string;
   readonly success: boolean;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export interface WeaveffiWasmModule {

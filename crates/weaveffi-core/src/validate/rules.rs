@@ -35,7 +35,9 @@ fn callback_param_type_supported(ty: &TypeRef) -> bool {
                 | TypeRef::BorrowedStr
                 | TypeRef::Handle
                 | TypeRef::TypedHandle(_)
-                | TypeRef::Struct(_)
+                | TypeRef::Named(_)
+                | TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
                 | TypeRef::Bytes
                 | TypeRef::BorrowedBytes
         )
@@ -80,7 +82,11 @@ fn slot_element(ty: &TypeRef) -> bool {
     scalar_element(ty)
         || matches!(
             ty,
-            TypeRef::Handle | TypeRef::TypedHandle(_) | TypeRef::Struct(_)
+            TypeRef::Handle
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Named(_)
+                | TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
         )
 }
 
@@ -199,7 +205,7 @@ pub(super) fn check_global_error_code_names(modules: &[Module], errors: &mut Vec
 
 /// Collect the bare names of every interface declared anywhere in the module
 /// tree. Validation runs before reference resolution, so an interface
-/// reference is still spelled `TypeRef::Struct(name)` and positional rules
+/// reference is still spelled `TypeRef::Named(name)` and positional rules
 /// need this set to recognize one.
 pub(super) fn collect_interface_names(modules: &[Module], out: &mut BTreeSet<String>) {
     for m in modules {
@@ -652,7 +658,13 @@ fn unsupported_element_shape(ty: &TypeRef) -> Option<&TypeRef> {
             // NULL entries in a pointer array express "none", so optional
             // structs/handles stay representable inside lists.
             TypeRef::Optional(o)
-                if matches!(o.as_ref(), TypeRef::Struct(_) | TypeRef::TypedHandle(_)) =>
+                if matches!(
+                    o.as_ref(),
+                    TypeRef::Named(_)
+                        | TypeRef::Record(_)
+                        | TypeRef::RichEnum(_)
+                        | TypeRef::TypedHandle(_)
+                ) =>
             {
                 None
             }
@@ -689,7 +701,7 @@ fn check_element_shapes(
 /// positions where interfaces are wholly disallowed (callback parameters).
 fn references_interface(ty: &TypeRef, ctx: &TypeCtx<'_>) -> bool {
     match ty {
-        TypeRef::Struct(name) | TypeRef::Interface(name) => ctx.is_interface(name),
+        TypeRef::Named(name) | TypeRef::Interface(name) => ctx.is_interface(name),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             references_interface(inner, ctx)
         }
@@ -702,7 +714,10 @@ fn references_interface(ty: &TypeRef, ctx: &TypeCtx<'_>) -> bool {
 /// to the debug spelling for composite shapes.
 fn type_ref_display(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::Struct(name) | TypeRef::Interface(name) => name.clone(),
+        TypeRef::Named(name)
+        | TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::Interface(name) => name.clone(),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             type_ref_display(inner)
         }
@@ -724,7 +739,7 @@ fn check_interface_positions(
     errors: &mut Vec<ValidationError>,
 ) {
     match ty {
-        TypeRef::Struct(name) | TypeRef::Interface(name) => {
+        TypeRef::Named(name) | TypeRef::Interface(name) => {
             if ctx.is_interface(name) && !top {
                 errors.push(ValidationError::InterfaceInInvalidPosition {
                     name: name.clone(),
@@ -793,7 +808,9 @@ fn type_exists(modules: &[Module], name: &str) -> bool {
 
 fn validate_type_ref(ty: &TypeRef, ctx: &TypeCtx<'_>, errors: &mut Vec<ValidationError>) {
     match ty {
-        TypeRef::Struct(name)
+        TypeRef::Named(name)
+        | TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
         | TypeRef::Interface(name)
         | TypeRef::Enum(name)
         | TypeRef::TypedHandle(name) => {
@@ -806,7 +823,9 @@ fn validate_type_ref(ty: &TypeRef, ctx: &TypeCtx<'_>, errors: &mut Vec<Validatio
         }
         TypeRef::Map(k, v) => {
             let bad_key = match k.as_ref() {
-                TypeRef::Struct(name) => Some(format!("struct {name}")),
+                TypeRef::Named(name) | TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+                    Some(format!("struct {name}"))
+                }
                 TypeRef::List(_) => Some("list".to_string()),
                 TypeRef::Map(_, _) => Some("map".to_string()),
                 _ => None,

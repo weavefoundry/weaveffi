@@ -25,9 +25,10 @@ export interface WeaveffiWasmModule {
     sendMessage(text: string): void;
     /**
      * Return an iterator over all sent messages
+     * @returns A lazy iterator: one producer step per `next()` call. Exhaust it or call `return()` to release the producer handle (a `for...of` loop does both automatically); an abandoned iterator leaks the handle.
      * @throws {WeaveFFIError} if the native call fails
      */
-    getMessages(): string[];
+    getMessages(): IterableIterator<string>;
   };
 }
 

@@ -82,8 +82,9 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Decode a producer-owned array of `len` C strings at `base` (each
-// freed); the array container itself is owned by the producer.
+// Decode an array of `len` C strings at `base`, freeing each string
+// after copying (the consumer owns the elements); the caller releases
+// the array container separately.
 function _takeStrArray(wasm, base, len) {
   const out = [];
   if (base === 0) return out;
@@ -187,6 +188,12 @@ class TaskResult {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new TaskResult(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_tasks_TaskResult_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 

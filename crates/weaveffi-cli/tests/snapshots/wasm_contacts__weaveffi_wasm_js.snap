@@ -184,6 +184,12 @@ class Contact {
     _freeErr(wasm, _err);
     return new Contact(wasm, _r);
   }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_contacts_Contact_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
 }
 
 /**
@@ -276,6 +282,7 @@ export async function loadWeaveffiWasm(url) {
         const dv = new DataView(wasm.memory.buffer);
         for (let i = 0; i < _len; i++) _out.push(new Contact(wasm, dv.getInt32(_r + i * 4, true)));
       }
+      if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
       return _out;
     }
     remove(id) {

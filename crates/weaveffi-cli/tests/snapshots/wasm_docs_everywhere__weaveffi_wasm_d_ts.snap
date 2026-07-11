@@ -47,6 +47,8 @@ export interface Document {
   readonly status: Status;
   /** Free-form tags for grouping */
   readonly tags: string[];
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /**

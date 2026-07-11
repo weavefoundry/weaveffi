@@ -123,11 +123,17 @@ func (s *Contact) Id() int64 {
 }
 
 func (s *Contact) FirstName() string {
-	return C.GoString(C.weaveffi_contacts_Contact_get_first_name(s.ptr))
+	cStr := C.weaveffi_contacts_Contact_get_first_name(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Contact) LastName() string {
-	return C.GoString(C.weaveffi_contacts_Contact_get_last_name(s.ptr))
+	cStr := C.weaveffi_contacts_Contact_get_last_name(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Contact) Email() *string {
@@ -136,6 +142,7 @@ func (s *Contact) Email() *string {
 		return nil
 	}
 	v := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
 	return &v
 }
 
@@ -200,6 +207,7 @@ func (s *ContactBook) List() []*Contact {
 		for i, v := range unsafe.Slice((**C.weaveffi_contacts_Contact)(unsafe.Pointer(result)), count) {
 			goResult[i] = &Contact{ptr: v}
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }

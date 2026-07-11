@@ -157,7 +157,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_TaskResult_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_tasks_TaskResult_create(long id, IntPtr value, int success, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_tasks_TaskResult_create(long id, IntPtr value, byte success, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_TaskResult_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_tasks_TaskResult_destroy(IntPtr ptr);
@@ -169,7 +169,7 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_tasks_TaskResult_get_value(IntPtr ptr);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_TaskResult_get_success", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_tasks_TaskResult_get_success(IntPtr ptr);
+        internal static extern byte weaveffi_tasks_TaskResult_get_success(IntPtr ptr);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_task(IntPtr context, IntPtr err, IntPtr result);
@@ -184,7 +184,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_tasks_run_batch_async(IntPtr names, UIntPtr names_len, AsyncCb_weaveffi_tasks_run_batch callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_tasks_cancel_task", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_tasks_cancel_task(long id, ref WeaveFFIError err);
+        internal static extern byte weaveffi_tasks_cancel_task(long id, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_n_tasks(IntPtr context, IntPtr err, int result);
@@ -266,7 +266,15 @@ namespace WeaveFFI
                             return;
                         }
                     }
-                    tcs.SetResult(result);
+                    var arr = new TaskResult[(int)resultLen];
+                    if (result != IntPtr.Zero)
+                    {
+                        for (int i = 0; i < (int)resultLen; i++)
+                        {
+                            arr[i] = new TaskResult(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                        }
+                    }
+                    tcs.SetResult(arr);
                 }
                 finally
                 {

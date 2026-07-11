@@ -151,6 +151,12 @@ class Canvas {
     _freeErr(wasm, _err);
     return new Canvas(wasm, _r);
   }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_graphics_Canvas_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
 }
 
 class Shape {
@@ -180,6 +186,12 @@ class Shape {
     _freeErr(wasm, _err);
     return new Shape(wasm, _r);
   }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_graphics_shapes_Shape_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
 }
 
 class Detail {
@@ -198,6 +210,12 @@ class Detail {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Detail(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_graphics_shapes_geometry_Detail_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 

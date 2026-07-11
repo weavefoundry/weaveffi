@@ -126,7 +126,11 @@ mod tests {
     use weaveffi::abi::{self, weaveffi_error};
 
     type TaskCbMsg = (i32, *mut TaskResult);
-    type BatchCbMsg = (bool, *mut *mut TaskResult, usize);
+    /// Batch completions carry the adopted element pointers as addresses: the
+    /// pointer-array buffer itself is borrowed for the callback's duration
+    /// (the launcher frees it after the callback returns), so the callback
+    /// copies the element pointers out before returning.
+    type BatchCbMsg = (bool, Vec<usize>);
 
     extern "C" fn task_callback(
         context: *mut c_void,
@@ -150,7 +154,12 @@ mod tests {
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<BatchCbMsg>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        let _ = tx.send((had_error, results, results_len));
+        // Copy the borrowed pointer array before returning; the element
+        // objects themselves are adopted (owned by this callback's consumer).
+        let elems: Vec<usize> = (0..results_len)
+            .map(|i| unsafe { *results.add(i) } as usize)
+            .collect();
+        let _ = tx.send((had_error, elems));
     }
 
     extern "C" fn n_tasks_callback(context: *mut c_void, err: *mut weaveffi_error, result: i32) {
@@ -159,17 +168,13 @@ mod tests {
         let _ = tx.send((had_error, result));
     }
 
-    /// Free a returned `[TaskResult]`: destroy each element, then reclaim the
-    /// pointer array the launcher allocated (the same shape the conformance
-    /// consumers free a list-of-struct return).
-    fn free_results(results: *mut *mut TaskResult, len: usize) {
-        if results.is_null() {
-            return;
+    /// Destroy the adopted `[TaskResult]` elements. The launcher already
+    /// freed the borrowed pointer-array buffer after the callback returned;
+    /// only the element objects were adopted by the consumer.
+    fn free_results(results: &[usize]) {
+        for &addr in results {
+            weaveffi_tasks_TaskResult_destroy(addr as *mut TaskResult);
         }
-        for i in 0..len {
-            weaveffi_tasks_TaskResult_destroy(unsafe { *results.add(i) });
-        }
-        unsafe { drop(Vec::from_raw_parts(results, len, len)) };
     }
 
     /// Intentionally leak a callback-context box.
@@ -242,24 +247,23 @@ mod tests {
             tx_ptr as *mut c_void,
         );
 
-        let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (had_error, results) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         leak_ctx(tx_ptr);
         assert!(!had_error);
-        assert_eq!(results_len, 3);
-        assert!(!results.is_null());
+        assert_eq!(results.len(), 3);
 
-        for i in 0..results_len {
-            let r = unsafe { &**results.add(i) };
+        for &addr in &results {
+            let r = unsafe { &*(addr as *const TaskResult) };
             assert!(r.id > 0);
             assert!(r.success);
         }
 
-        let r0 = unsafe { &**results };
+        let r0 = unsafe { &*(results[0] as *const TaskResult) };
         assert!(r0.value.contains("task-a"));
-        let r2 = unsafe { &**results.add(2) };
+        let r2 = unsafe { &*(results[2] as *const TaskResult) };
         assert!(r2.value.contains("task-c"));
 
-        free_results(results, results_len);
+        free_results(&results);
     }
 
     #[test]
@@ -269,11 +273,10 @@ mod tests {
 
         weaveffi_tasks_run_batch_async(std::ptr::null(), 0, batch_callback, tx_ptr as *mut c_void);
 
-        let (had_error, results, results_len) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (had_error, results) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
         assert!(!had_error);
-        assert_eq!(results_len, 0);
-        assert!(results.is_null());
+        assert!(results.is_empty());
     }
 
     #[test]

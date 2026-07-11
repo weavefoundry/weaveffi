@@ -31,6 +31,8 @@ export interface Canvas {
   readonly width: number;
   /** Reference down into a nested module */
   readonly root: Shape;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /** A measurement unit shared with nested submodules. */
@@ -46,11 +48,15 @@ export interface Shape {
   readonly unit: Unit;
   /** Reference down into a deeper module */
   readonly detail: Detail;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /** A struct two levels deep. */
 export interface Detail {
   readonly area: number;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export interface WeaveffiWasmModule {

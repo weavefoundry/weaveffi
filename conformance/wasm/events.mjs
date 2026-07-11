@@ -36,9 +36,11 @@ function expect(cond, msg) {
 api.events.sendMessage('alpha');
 api.events.sendMessage('beta');
 
-const msgs = api.events.getMessages();
+// getMessages returns a lazy iterable (one producer next per step); spread
+// drains it here.
+const msgs = [...api.events.getMessages()];
 expect(
-  Array.isArray(msgs) && msgs.length === 2 && msgs[0] === 'alpha' && msgs[1] === 'beta',
+  msgs.length === 2 && msgs[0] === 'alpha' && msgs[1] === 'beta',
   `iterator yields messages in order (got ${JSON.stringify(msgs)})`
 );
 

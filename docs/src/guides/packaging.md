@@ -189,3 +189,9 @@ artifact model than the native matrix: a WebAssembly module is a single portable
 binary, and Android ships per-ABI libraries (`arm64-v8a`, and so on) that map to
 Android-specific targets rather than the desktop/server platforms above. Use
 `weaveffi generate` for their source bindings.
+
+One Android packaging caveat: the generated JNI glue defines a `JNI_OnLoad`
+whenever the module declares async functions or listeners (it caches the
+class references the exception-handler hook needs). Each generated module
+must therefore link into its own shared library; compiling the glue for two
+modules into one `.so` would collide on the duplicate `JNI_OnLoad` symbol.

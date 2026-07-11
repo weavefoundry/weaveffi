@@ -124,7 +124,10 @@ func (s *Product) Id() int64 {
 }
 
 func (s *Product) Name() string {
-	return C.GoString(C.weaveffi_products_Product_get_name(s.ptr))
+	cStr := C.weaveffi_products_Product_get_name(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Product) Description() *string {
@@ -133,6 +136,7 @@ func (s *Product) Description() *string {
 		return nil
 	}
 	v := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
 	return &v
 }
 
@@ -152,7 +156,9 @@ func (s *Product) Tags() []string {
 	if count > 0 && result != nil {
 		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
 			goResult[i] = C.GoString(v)
+			C.weaveffi_free_string(v)
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -207,6 +213,7 @@ func (s *Catalog) Search(category Category) []*Product {
 		for i, v := range unsafe.Slice((**C.weaveffi_products_Product)(unsafe.Pointer(result)), count) {
 			goResult[i] = &Product{ptr: v}
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -313,6 +320,7 @@ func (s *Order) Items() []*OrderItem {
 		for i, v := range unsafe.Slice((**C.weaveffi_orders_OrderItem)(unsafe.Pointer(result)), count) {
 			goResult[i] = &OrderItem{ptr: v}
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -322,7 +330,10 @@ func (s *Order) Total() float64 {
 }
 
 func (s *Order) Status() string {
-	return C.GoString(C.weaveffi_orders_Order_get_status(s.ptr))
+	cStr := C.weaveffi_orders_Order_get_status(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Order) Close() {

@@ -4,9 +4,10 @@
 // and listeners at bare snake_case names inside the per-module namespace
 // (`weaveffi::events::send_message`, not `weaveffi::events_send_message`).
 // Two key assertions:
-//  - `events::get_messages()` returns a populated `std::vector<std::string>`:
-//    that only compiles and runs if the wrapper uses the real opaque-iterator
-//    ABI (launcher + next/destroy).
+//  - `events::get_messages()` returns a lazy single-pass range (RAII handle,
+//    `begin()`/`end()`, one producer `next` per step): that only compiles and
+//    runs if the wrapper uses the real opaque-iterator ABI
+//    (launcher + next/destroy).
 //  - the `std::function` listener wrapper round-trips: register pins the
 //    closure, the producer fires it synchronously on send, unregister stops
 //    delivery.
@@ -30,7 +31,10 @@ int main() {
     assert(received[0] == "alpha");
     assert(received[1] == "beta");
 
-    std::vector<std::string> msgs = weaveffi::events::get_messages();
+    // The lazy range materializes through iteration: one producer `next` per
+    // step, handle destroyed on exhaustion.
+    std::vector<std::string> msgs;
+    for (auto&& m : weaveffi::events::get_messages()) msgs.push_back(m);
     assert(msgs.size() == 2);
     assert(msgs[0] == "alpha");
     assert(msgs[1] == "beta");
@@ -39,7 +43,16 @@ int main() {
     weaveffi::events::unregister_message_listener(sub);
     weaveffi::events::send_message("gamma");
     assert(received.size() == 2);
-    assert(weaveffi::events::get_messages().size() == 3);
+    msgs.clear();
+    for (auto&& m : weaveffi::events::get_messages()) msgs.push_back(m);
+    assert(msgs.size() == 3);
+
+    // Abandoning the range early destroys the handle via RAII.
+    {
+        auto range = weaveffi::events::get_messages();
+        auto it = range.begin();
+        assert(*it == "alpha");
+    }
 
     std::printf("cpp/events: OK\n");
     return 0;

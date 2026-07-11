@@ -58,6 +58,8 @@ export interface Product {
   readonly price: number;
   readonly category: Category;
   readonly tags: string[];
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export declare const Category: Readonly<{
@@ -101,6 +103,8 @@ export interface OrderItem {
   readonly product_id: bigint;
   readonly quantity: number;
   readonly unit_price: number;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export interface Order {
@@ -108,6 +112,8 @@ export interface Order {
   readonly items: OrderItem[];
   readonly total: number;
   readonly status: string;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export interface WeaveffiWasmModule {

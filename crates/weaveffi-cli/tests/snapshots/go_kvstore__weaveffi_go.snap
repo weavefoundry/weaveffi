@@ -18,6 +18,7 @@ import "C"
 
 import (
 	"fmt"
+	"iter"
 	"sync"
 	"unsafe"
 )
@@ -183,7 +184,10 @@ func (s *Entry) Id() int64 {
 
 // Key: UTF-8 lookup key
 func (s *Entry) Key() string {
-	return C.GoString(C.weaveffi_kv_Entry_get_key(s.ptr))
+	cStr := C.weaveffi_kv_Entry_get_key(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 // Value: Opaque binary payload
@@ -193,7 +197,9 @@ func (s *Entry) Value() []byte {
 	if result == nil {
 		return nil
 	}
-	return C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
+	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
+	C.weaveffi_free_bytes(result, cOutLen)
+	return goResult
 }
 
 // CreatedAt: Unix-timestamp seconds when the entry was created
@@ -208,6 +214,7 @@ func (s *Entry) ExpiresAt() *int64 {
 		return nil
 	}
 	v := int64(*cVal)
+	C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cVal)), C.size_t(unsafe.Sizeof(*cVal)))
 	return &v
 }
 
@@ -220,7 +227,9 @@ func (s *Entry) Tags() []string {
 	if count > 0 && result != nil {
 		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
 			goResult[i] = C.GoString(v)
+			C.weaveffi_free_string(v)
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -238,7 +247,11 @@ func (s *Entry) Metadata() map[string]string {
 		valSlice := unsafe.Slice(cMapVals, count)
 		for i := 0; i < count; i++ {
 			goResult[C.GoString(keySlice[i])] = C.GoString(valSlice[i])
+			C.weaveffi_free_string(keySlice[i])
+			C.weaveffi_free_string(valSlice[i])
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))
 	}
 	return goResult
 }
@@ -449,32 +462,44 @@ func (s *Store) Delete(key string) (bool, error) {
 }
 
 // ListKeys: Stream every key, optionally filtered by a prefix
-func (s *Store) ListKeys(prefix *string) ([]string, error) {
-	var cPrefix *C.char
-	if prefix != nil {
-		cPrefix = C.CString(*prefix)
-		defer C.free(unsafe.Pointer(cPrefix))
-	}
-	var cErr C.weaveffi_error
-	it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefix, &cErr)
-	if cErr.code != 0 {
-		return nil, wvMapKv(wvTakeError(&cErr))
-	}
-	defer C.weaveffi_kv_Store_ListKeysIterator_destroy(it)
-	goResult := []string{}
-	for {
-		var outItem *C.char
-		var iterErr C.weaveffi_error
-		if C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) == 0 {
-			break
+// Returns a lazy sequence: the producer iterator is launched on first
+// iteration and one producer next call runs per element. The iterator is
+// destroyed exactly once, whether the sequence is exhausted or abandoned
+// early; each range over the sequence launches a fresh producer iterator.
+// A launch or per-element error is yielded as the final (zero value,
+// error) pair, and iteration stops.
+func (s *Store) ListKeys(prefix *string) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		var cPrefix *C.char
+		if prefix != nil {
+			cPrefix = C.CString(*prefix)
+			defer C.free(unsafe.Pointer(cPrefix))
 		}
-		if iterErr.code != 0 {
-			return nil, wvMapKv(wvTakeError(&iterErr))
+		var cErr C.weaveffi_error
+		it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefix, &cErr)
+		if cErr.code != 0 {
+			yield("", wvMapKv(wvTakeError(&cErr)))
+			return
 		}
-		goResult = append(goResult, C.GoString(outItem))
-		C.weaveffi_free_string(outItem)
+		defer C.weaveffi_kv_Store_ListKeysIterator_destroy(it)
+		for {
+			var outItem *C.char
+			var iterErr C.weaveffi_error
+			ok := C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) != 0
+			if iterErr.code != 0 {
+				yield("", wvMapKv(wvTakeError(&iterErr)))
+				return
+			}
+			if !ok {
+				return
+			}
+			item := C.GoString(outItem)
+			C.weaveffi_free_string(outItem)
+			if !yield(item, nil) {
+				return
+			}
+		}
 	}
-	return goResult, nil
 }
 
 // Count: Return the number of live entries in the store
@@ -512,7 +537,7 @@ func goWv_weaveffi_kv_Store_compact_callback(context unsafe.Pointer, err *C.weav
 }
 
 // Compact: Reclaim space asynchronously; returns the number of bytes reclaimed
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func (s *Store) Compact() (int64, error) {
 	ch := make(chan wvOutcomeKvStoreCompact, 1)
 	ctxID := wvCallbackStore(ch)

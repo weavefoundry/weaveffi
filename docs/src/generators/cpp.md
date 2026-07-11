@@ -42,7 +42,7 @@ directory can be dropped into any CMake build.
 | `T?`         | `std::optional<T>`                   | `const std::optional<T>&`   |
 | `[T]`        | `std::vector<T>`                     | `const std::vector<T>&`     |
 | `{K: V}`     | `std::unordered_map<K, V>`           | `const std::unordered_map<K, V>&` |
-| `iter<T>`    | `std::vector<T>` (return only; see [Iterators](#iterators)) | n/a |
+| `iter<T>`    | generated lazy range class (return only; see [Iterators](#iterators)) | n/a |
 
 ## Example IDL → generated code
 
@@ -237,6 +237,9 @@ public:
     /** Return the number of live entries in the store */
     int64_t count() const;           // no throws: generic check only
 
+    /** Stream every key, optionally filtered by a prefix */
+    ListKeysIterator list_keys(const std::optional<std::string>& prefix) const;
+
     /** Reclaim space asynchronously; returns the number of bytes reclaimed */
     std::future<int64_t> compact(weaveffi_cancel_token* cancel_token = nullptr) const;
 
@@ -339,9 +342,15 @@ Then `#include "weaveffi.hpp"` and link against the Rust shared library
 - Strings returned from getters are copied into `std::string` and the
   raw pointer is freed via `weaveffi_free_string` before returning.
 - Optional fields use `std::optional<T>`; a `nullptr` from the C layer
-  becomes `std::nullopt`.
-- `std::vector<T>` returns own their contents. List parameters borrow
-  the underlying buffer for the duration of the call.
+  becomes `std::nullopt`. A returned optional scalar arrives boxed
+  behind a pointer; the wrapper dereferences it and frees the box with
+  `weaveffi_free_bytes`.
+- `std::vector<T>` returns own their contents: the wrapper copies each
+  element (freeing string elements individually with
+  `weaveffi_free_string`), then releases the producer's buffer with
+  `weaveffi_free_bytes`; map returns release both parallel key/value
+  buffers the same way. List parameters borrow the underlying buffer
+  for the duration of the call.
 
 ## Callbacks and listeners
 
@@ -436,11 +445,17 @@ inline std::future<Contact> fetch_contact(int32_t id) {
 ```
 
 Use it with `.get()` (blocking) or compose with your event loop. The
-promise is completed (or rejected) exactly once in the completion lambda,
-which then deletes it. An async callable with `throws: true` rejects with
-the module's typed domain exception (`detail::make_kv_error` and friends);
-one without `throws` rejects with the generic `WeaveFFIError` only when the
-producer has a bug.
+completion lambda runs exactly once, on an arbitrary producer thread; it
+completes (or rejects) the promise and then deletes it. Result buffers
+passed to the callback (strings, bytes, arrays, and the error message)
+are borrowed from the producer for the callback's duration, so the
+lambda copies them into C++ values before returning and never frees
+them. Owned-object results are the exception: the callback receives
+ownership, so `Contact(result)` above adopts the pointer into a RAII
+wrapper. An async callable with `throws: true` rejects with the
+module's typed domain exception (`detail::make_kv_error` and friends);
+one without `throws` rejects with the generic `WeaveFFIError` only when
+the producer has a bug.
 
 When the IDL marks the callable `cancellable: true`, the wrapper gains
 a trailing `weaveffi_cancel_token*` parameter defaulting to `nullptr`.
@@ -464,33 +479,86 @@ cancel token; see [Async functions](../guides/async.md).
 
 ## Iterators
 
-`iter<T>` return values surface as a plain `std::vector<T>`: the
-wrapper drains the C iterator with `_next`, frees each element,
-destroys the iterator handle, and returns the collected values. From the `events`
-sample (`get_messages` returns `iter<string>`, trimmed):
+`iter<T>` return values surface as a generated move-only RAII range
+class with `begin()`/`end()`, so results stream in constant memory:
+nothing is drained up front, and each iteration step pulls exactly one
+element from the producer through `_next`. From the `events` sample
+(`get_messages` returns `iter<string>`, trimmed):
 
 ```cpp
-inline std::vector<std::string> get_messages() {
+/**
+ * A lazy, move-only range over the `std::string` elements produced by `get_messages()`.
+ */
+class GetMessagesIterator {
+    weaveffi_events_GetMessagesIterator* handle_;
+
+public:
+    ~GetMessagesIterator() {
+        if (handle_) weaveffi_events_GetMessagesIterator_destroy(handle_);
+    }
+    GetMessagesIterator(const GetMessagesIterator&) = delete;
+    GetMessagesIterator(GetMessagesIterator&&) noexcept;
+
+    /** Pulls the next element, or `std::nullopt` once exhausted. */
+    std::optional<std::string> next() {
+        if (!handle_) return std::nullopt;
+        weaveffi_error err{};
+        const char* item{};
+        int32_t has_item = weaveffi_events_GetMessagesIterator_next(handle_, &item, &err);
+        if (err.code != 0) {
+            weaveffi_events_GetMessagesIterator_destroy(handle_);
+            handle_ = nullptr;
+            detail::check(err);
+        }
+        if (has_item == 0) {
+            weaveffi_events_GetMessagesIterator_destroy(handle_);
+            handle_ = nullptr;
+            return std::nullopt;
+        }
+        std::string value(item);
+        weaveffi_free_string(item);
+        return value;
+    }
+
+    struct sentinel {};
+
+    /** Single-pass input iterator; each increment pulls one element. */
+    class iterator { /* input_iterator_tag; compares against sentinel */ };
+
+    iterator begin() { return iterator(this); }
+    sentinel end() const { return sentinel{}; }
+};
+
+inline GetMessagesIterator get_messages() {
     weaveffi_error err{};
     weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
     detail::check(err);
-    std::vector<std::string> ret;
-    while (true) {
-        const char* item{};
-        int32_t has_item = weaveffi_events_GetMessagesIterator_next(iter, &item, &err);
-        // ... destroy iterator + throw on error ...
-        if (has_item == 0) break;
-        ret.emplace_back(item);
-        weaveffi_free_string(item);
-    }
-    weaveffi_events_GetMessagesIterator_destroy(iter);
-    return ret;
+    return GetMessagesIterator(iter);
 }
 ```
 
-Iteration is eager; the full sequence is materialized before the
-wrapper returns. Drop to the C ABI (`_next`/`_destroy`) if you need
-streaming consumption.
+The range is single-pass: `begin()` returns an input iterator that
+compares against a sentinel, so a plain range-`for` works:
+
+```cpp
+for (const std::string& message : weaveffi::events::get_messages()) {
+    std::cout << message << '\n';
+}
+```
+
+Each pulled string is copied into `std::string` and its native
+allocation freed with `weaveffi_free_string`; record elements are
+adopted by RAII wrappers. The producer iterator is destroyed exactly
+once: eagerly when `next()` reports exhaustion (or an error), or from
+the range's destructor when iteration is abandoned early (the handle
+is nulled, so a double destroy is impossible).
+
+Errors from the launcher and from each `next` follow the function's
+error strategy. A throwing function like the `kvstore` sample's
+`Store::list_keys` checks both through `detail::check_kv`, so the step
+that failed throws the typed `KvError` subclass (after releasing the
+iterator); a non-throwing function like `get_messages` throws the
+generic `WeaveFFIError` only for producer bugs.
 
 ## Troubleshooting
 

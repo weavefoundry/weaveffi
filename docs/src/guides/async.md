@@ -13,6 +13,14 @@ async function declares `throws: true`, the failure that settles the
 future is the module's typed domain error (see the
 [Error Handling Guide](errors.md)).
 
+The completion contract every wrapper implements is stated once, in
+`weaveffi_core::plan::AsyncProtocol`: the callback fires exactly once
+per launch, from an arbitrary producer thread, and the result it
+receives is either borrowed (copy it inside the callback) or adopted
+(own it and destroy it later). See
+[Result ownership and threading](#result-ownership-and-threading)
+below.
+
 ## When to use
 
 Use async functions for:
@@ -101,17 +109,24 @@ pub extern "C" fn weaveffi_net_fetch_data_async(
     let url_str = abi::c_ptr_to_string(url).unwrap_or_default();
     let ctx = context as usize;
     std::thread::spawn(move || {
-        let payload = std::ffi::CString::new(format!("payload from {url_str}"))
-            .unwrap()
-            .into_raw();
+        let payload = abi::string_to_c_ptr(&format!("payload from {url_str}"));
         callback(ctx as *mut c_void, std::ptr::null_mut(), payload);
+        // The string is borrowed by the callback: the producer frees it
+        // after the callback returns, so the consumer must have copied.
+        abi::free_string(payload);
     });
 }
 ```
 
 The async launcher symbol always carries the `_async` suffix
 (`weaveffi_net_fetch_data_async`), keeping the name free for a possible
-synchronous variant.
+synchronous variant. Note who frees the result: buffer results
+(strings, byte arrays, lists, boxed optional scalars) are owned by the
+producer, which releases them after the callback returns; the
+macro-generated launchers do exactly this. Owned-object results
+(records, rich enums, interfaces) are the exception: the callback
+receives ownership of the pointer. See
+[Result ownership and threading](#result-ownership-and-threading).
 
 ### 3. Call it from each target
 
@@ -201,7 +216,8 @@ void weaveffi_net_fetch_data_async(
 
 The `err` argument of the callback carries the domain code for a
 `throws: true` function; on a non-throwing function a non-zero code
-only ever reports a producer bug.
+only ever reports a producer bug (see
+[Throws versus Trap](errors.md#throws-versus-trap)).
 
 For `cancellable: true` the launcher takes a token slot before the
 callback, and the runtime provides the token lifecycle:
@@ -220,6 +236,44 @@ bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token* token);
 void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 ```
 
+### Result ownership and threading
+
+The completion contract has three clauses, stated once in
+`weaveffi_core::plan::AsyncProtocol` and rendered by every wrapper:
+
+1. **Single completion.** The callback fires exactly once per launch.
+   The wrapper resolves its native future idiom (a Python `asyncio`
+   future, a JS `Promise`, a Swift continuation, a C#
+   `TaskCompletionSource`, a Go channel) exactly once and then
+   releases the registration.
+2. **Borrowed results.** Result buffers passed to the callback
+   (strings, bytes, arrays, boxed optional scalars) are owned by the
+   producer and valid **only for the callback's duration**: the
+   wrapper deep-copies them before the callback returns and must not
+   free them. The producer releases them after the callback returns;
+   the macro-generated launchers do this for you. Owned-object results
+   (records, rich enums, and interfaces, including optionals of them)
+   are the exception: the callback receives ownership and adopts the
+   pointer into the wrapper's disposal idiom, which eventually calls
+   the type's `_destroy` symbol.
+3. **Foreign-thread delivery.** The callback runs on an arbitrary
+   producer thread, so the wrapper hops back to its native scheduler
+   before touching consumer state (Python's
+   `call_soon_threadsafe`, Node's thread-safe function, a dispatched
+   Swift continuation) rather than resolving inline where the target's
+   runtime forbids it.
+
+The error struct passed to the callback is also producer-owned and
+borrowed for the callback's duration: the wrapper copies the code and
+message inside the callback, and the producer releases the message
+afterward. A wrapper may also call `weaveffi_error_clear` itself; the
+clear is idempotent (it nulls the message pointer), so the producer's
+own release stays safe.
+
+If you consume the raw C surface directly, the same rules apply to
+your callback: copy every buffer before returning, adopt object
+pointers, and never free a borrowed result.
+
 ### Per-target async surface
 
 | Target  | Async surface                              | Cancel token exposure (`cancellable: true`) |
@@ -229,7 +283,7 @@ void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 | Swift   | `async` (`async throws` with `throws: true`) | not exposed; wrapper passes `nil`        |
 | Kotlin  | `suspend fun`                               | not exposed; wrapper passes `0L`          |
 | Node.js | `Promise<T>` (thread-safe function settling) | not exposed; wrapper passes `NULL`      |
-| Python  | `async def` (executor thread + event)       | not exposed; wrapper passes `None`       |
+| Python  | `async def` (asyncio future settled via `call_soon_threadsafe`) | not exposed; wrapper passes `None` |
 | .NET    | `Task<T>`                                   | not exposed; wrapper passes `IntPtr.Zero` |
 | Dart    | `Future<T>` (`NativeCallable.listener`)     | not exposed; wrapper passes `nullptr`    |
 | Wasm    | `Promise<T>` (table trampolines)            | not exposed; wrapper passes `0`          |
@@ -246,8 +300,8 @@ cooperative cancellation from one of those targets.
 Every binding pins the user-supplied `void* context` and the callback
 closure for the lifetime of the operation, then releases them exactly
 once on the callback path. The matrix below is the contract every
-generator implements; each row is verified by a
-`{generator}_async_pins_callback_for_lifetime` unit test.
+generator implements; each row is asserted by that generator's unit
+tests.
 
 | Target  | Pin (allocate / retain)                                | Unpin (free / release) on callback             | Notes |
 |---------|---------------------------------------------------------|------------------------------------------------|-------|
@@ -255,7 +309,7 @@ generator implements; each row is verified by a
 | .NET    | `GCHandle.Alloc(callback, GCHandleType.Normal)`         | `GCHandle.FromIntPtr(context).Free()`           | The catch path also frees the handle on synchronous failure. |
 | Kotlin  | JNI `(*env)->NewGlobalRef(env, callback)`               | `(*env)->DeleteGlobalRef(env, ctx->callback)`   | The JNI shim `malloc`s and `free`s the per-call context exactly once. |
 | Node.js | `napi_create_promise(env, &deferred, &promise)`         | `napi_resolve_deferred` or `napi_reject_deferred` | The N-API runtime owns the deferred; the per-call context is `malloc`-ed and freed exactly once. |
-| Python  | `_cb = ctypes.CFUNCTYPE(...)(impl)` (kept by helper)     | `_ev.set()` in the callback's `finally` releases the helper's `_ev.wait()` | The helper blocks on the event so `_cb` (and its trampoline) outlive the callback. |
+| Python  | `_token = _async_register(_cb)` stores the `ctypes.CFUNCTYPE` trampoline in the module-level `_async_pending` dict | `_async_pending.pop(_token, None)` when the callback fires | The callback settles the `asyncio` future via `loop.call_soon_threadsafe`; no thread blocks waiting. |
 | C++     | `new std::promise<T>()` plus the lambda capture          | `delete p;` once at the end of the lambda       | The lambda owns the heap promise on every exit branch. |
 | Dart    | `NativeCallable<...>.listener(...)`                      | `callable.close()` in `finally` and on the catch path | Pointer-typed parameters are kept alive in `whenComplete`. |
 | Wasm    | `_registerTrampoline` per signature plus `_asyncContexts.set(ctxId, ...)` per call | `_asyncContexts.delete(ctxId)` in the trampoline | Per-call resolver closures are removed after resolve/reject. |
@@ -295,3 +349,11 @@ For every async-capable target:
 - **Returning `null` instead of invoking the callback**: the contract
   is that the callback fires **exactly once** for every async call,
   including on cancellation.
+- **Holding a result pointer past the callback**: buffer results are
+  producer-owned and freed as soon as the callback returns. Copy the
+  data inside the callback; a stashed pointer dangles.
+- **Freeing a borrowed result inside the callback**: strings, bytes,
+  and array buffers belong to the producer, which frees them itself.
+  Freeing them in the callback double-frees. The only pointers the
+  callback owns are object results (records, rich enums, interfaces),
+  which it must eventually `_destroy` exactly once.

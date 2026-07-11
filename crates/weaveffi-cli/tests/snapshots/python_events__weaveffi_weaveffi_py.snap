@@ -47,9 +47,11 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
-_lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
+# The free helpers take raw addresses (`c_void_p`) so wrappers can release
+# owned producer allocations they hold as plain integers or typed pointers.
+_lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
 _lib.weaveffi_free_string.restype = None
-_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.weaveffi_free_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _lib.weaveffi_free_bytes.restype = None
 
 
@@ -83,6 +85,15 @@ def _bytes_to_string(ptr) -> Optional[str]:
     if ptr is None:
         return None
     return ptr.decode("utf-8")
+
+
+def _take_string(ptr) -> Optional[str]:
+    """Copy an owned C string (a raw address) and free the producer buffer."""
+    if not ptr:
+        return None
+    _s = ctypes.string_at(ptr).decode("utf-8")
+    _lib.weaveffi_free_string(ptr)
+    return _s
 
 
 # Registered listener trampolines, keyed by subscription id. Holding
@@ -131,6 +142,10 @@ def send_message(text: str) -> None:
 
 
 class _GetMessagesIterator:
+    """Lazy iterator over a producer stream: each step pulls one element
+    across the C boundary. The native handle is released exactly once, on
+    exhaustion, on close(), or when the iterator is garbage collected."""
+
     def __init__(self, ptr):
         self._ptr = ptr
         self._done = False
@@ -142,9 +157,9 @@ class _GetMessagesIterator:
         if self._done:
             raise StopIteration
         _next_fn = _lib.weaveffi_events_GetMessagesIterator_next
-        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
         _next_fn.restype = ctypes.c_int32
-        _out_item = ctypes.c_char_p()
+        _out_item = ctypes.c_void_p()
         _err = _WeaveFFIErrorStruct()
         _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
         _check_error(_err)
@@ -152,7 +167,12 @@ class _GetMessagesIterator:
             self._done = True
             self._destroy()
             raise StopIteration
-        return _bytes_to_string(_out_item.value)
+        return _take_string(_out_item.value)
+
+    def close(self):
+        """Release the native iterator without draining it."""
+        self._done = True
+        self._destroy()
 
     def _destroy(self):
         if self._ptr is not None:
@@ -167,7 +187,10 @@ class _GetMessagesIterator:
 
 
 def get_messages() -> Iterator[str]:
-    """Return an iterator over all sent messages
+    """
+    Return an iterator over all sent messages
+
+    Returns a lazy iterator: each step pulls one element from the producer. Exhaust or close() the iterator to release its native handle (garbage collection also releases it).
     """
     _fn = _lib.weaveffi_events_get_messages
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
@@ -175,22 +198,6 @@ def get_messages() -> Iterator[str]:
     _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
-    _next_fn = _lib.weaveffi_events_GetMessagesIterator_next
-    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _next_fn.restype = ctypes.c_int32
-    _destroy_fn = _lib.weaveffi_events_GetMessagesIterator_destroy
-    _destroy_fn.argtypes = [ctypes.c_void_p]
-    _destroy_fn.restype = None
-    _items = []
-    while True:
-        _out_item = ctypes.c_char_p()
-        _item_err = _WeaveFFIErrorStruct()
-        _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
-        _check_error(_item_err)
-        if not _has:
-            break
-        _items.append(_bytes_to_string(_out_item.value))
-    _destroy_fn(_result)
-    return _items
+    return _GetMessagesIterator(_result)
 
 # END weaveffi.py

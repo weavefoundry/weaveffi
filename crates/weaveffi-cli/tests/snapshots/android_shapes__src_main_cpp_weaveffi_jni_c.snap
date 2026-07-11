@@ -51,11 +51,11 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_sumBytes(JNIEnv* env, jclass 
     jbyte* values_elems = (*env)->GetByteArrayElements(env, values, NULL);
     jsize values_len = (*env)->GetArrayLength(env, values);
     uint64_t rv = weaveffi_shapes_sum_bytes((const uint8_t*)values_elems, (size_t)values_len, &err);
+    (*env)->ReleaseByteArrayElements(env, values, values_elems, 0);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
-    (*env)->ReleaseByteArrayElements(env, values, values_elems, 0);
     return (jlong) rv;
 }
 
@@ -113,11 +113,11 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Shape_nativeNewLabeled(JNIEnv* env, jc
     weaveffi_error err = {0, NULL};
     const char* label_chars = (*env)->GetStringUTFChars(env, label, NULL);
     weaveffi_shapes_Shape* rv = weaveffi_shapes_Shape_Labeled_new(label_chars, (uint8_t)count, &err);
+    (*env)->ReleaseStringUTFChars(env, label, label_chars);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
-    (*env)->ReleaseStringUTFChars(env, label, label_chars);
     return (jlong)(intptr_t)rv;
 }
 

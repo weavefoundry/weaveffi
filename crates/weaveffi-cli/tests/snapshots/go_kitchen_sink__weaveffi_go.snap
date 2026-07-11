@@ -19,6 +19,7 @@ import "C"
 
 import (
 	"fmt"
+	"iter"
 	"sync"
 	"unsafe"
 )
@@ -117,7 +118,10 @@ func (s *Token) Id() int64 {
 }
 
 func (s *Token) Label() string {
-	return C.GoString(C.weaveffi_shared_Token_get_label(s.ptr))
+	cStr := C.weaveffi_shared_Token_get_label(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *Token) Close() {
@@ -200,7 +204,10 @@ func (s *Item) Id() int64 {
 
 // Name: Display name
 func (s *Item) Name() string {
-	return C.GoString(C.weaveffi_kitchen_Item_get_name(s.ptr))
+	cStr := C.weaveffi_kitchen_Item_get_name(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 // Count: Initial count
@@ -228,7 +235,9 @@ func (s *Item) Payload() []byte {
 	if result == nil {
 		return nil
 	}
-	return C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
+	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
+	C.weaveffi_free_bytes(result, cOutLen)
+	return goResult
 }
 
 func (s *Item) Tags() []string {
@@ -239,7 +248,9 @@ func (s *Item) Tags() []string {
 	if count > 0 && result != nil {
 		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
 			goResult[i] = C.GoString(v)
+			C.weaveffi_free_string(v)
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -256,7 +267,11 @@ func (s *Item) Attrs() map[string]string {
 		valSlice := unsafe.Slice(cMapVals, count)
 		for i := 0; i < count; i++ {
 			goResult[C.GoString(keySlice[i])] = C.GoString(valSlice[i])
+			C.weaveffi_free_string(keySlice[i])
+			C.weaveffi_free_string(valSlice[i])
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))
 	}
 	return goResult
 }
@@ -267,6 +282,7 @@ func (s *Item) Parent() *int64 {
 		return nil
 	}
 	v := int64(*cVal)
+	C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cVal)), C.size_t(unsafe.Sizeof(*cVal)))
 	return &v
 }
 
@@ -677,6 +693,7 @@ func ListItems() []*Item {
 		for i, v := range unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count) {
 			goResult[i] = &Item{ptr: v}
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -696,28 +713,41 @@ func GetAttrs() map[string]int32 {
 		valSlice := unsafe.Slice(cMapVals, count)
 		for i := 0; i < count; i++ {
 			goResult[C.GoString(keySlice[i])] = int32(valSlice[i])
+			C.weaveffi_free_string(keySlice[i])
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))
 	}
 	return goResult
 }
 
 // StreamItems: Iterator return type
-func StreamItems() []*Item {
-	var cErr C.weaveffi_error
-	it := C.weaveffi_kitchen_stream_items(&cErr)
-	wvTrap(&cErr)
-	defer C.weaveffi_kitchen_StreamItemsIterator_destroy(it)
-	goResult := []*Item{}
-	for {
-		var outItem *C.weaveffi_kitchen_Item
-		var iterErr C.weaveffi_error
-		if C.weaveffi_kitchen_StreamItemsIterator_next(it, &outItem, &iterErr) == 0 {
-			break
+// Returns a lazy sequence: the producer iterator is launched on first
+// iteration and one producer next call runs per element. The iterator is
+// destroyed exactly once, whether the sequence is exhausted or abandoned
+// early; each range over the sequence launches a fresh producer iterator.
+// A reported error can only be a producer bug and panics with the
+// weaveffi message.
+func StreamItems() iter.Seq[*Item] {
+	return func(yield func(*Item) bool) {
+		var cErr C.weaveffi_error
+		it := C.weaveffi_kitchen_stream_items(&cErr)
+		wvTrap(&cErr)
+		defer C.weaveffi_kitchen_StreamItemsIterator_destroy(it)
+		for {
+			var outItem *C.weaveffi_kitchen_Item
+			var iterErr C.weaveffi_error
+			ok := C.weaveffi_kitchen_StreamItemsIterator_next(it, &outItem, &iterErr) != 0
+			wvTrap(&iterErr)
+			if !ok {
+				return
+			}
+			item := &Item{ptr: outItem}
+			if !yield(item) {
+				return
+			}
 		}
-		wvTrap(&iterErr)
-		goResult = append(goResult, &Item{ptr: outItem})
 	}
-	return goResult
 }
 
 // CrossModuleToken: Returns the shared Token type from another module
@@ -741,19 +771,18 @@ func goWv_weaveffi_kitchen_do_async_callback(context unsafe.Pointer, err *C.weav
 	}
 	ch := v.(chan wvOutcomeKitchenDoAsync)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeKitchenDoAsync{err: wvMapKitchen(wvTakeError(err))}
+		ch <- wvOutcomeKitchenDoAsync{err: wvBrandError(wvTakeError(err))}
 		return
 	}
 	val := ""
 	if result != nil {
 		val = C.GoString(result)
-		C.weaveffi_free_string(result)
 	}
 	ch <- wvOutcomeKitchenDoAsync{val: val}
 }
 
 // DoAsync: Async operation
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func DoAsync(input string) string {
 	ch := make(chan wvOutcomeKitchenDoAsync, 1)
 	ctxID := wvCallbackStore(ch)
@@ -780,19 +809,18 @@ func goWv_weaveffi_kitchen_do_cancellable_callback(context unsafe.Pointer, err *
 	}
 	ch := v.(chan wvOutcomeKitchenDoCancellable)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeKitchenDoCancellable{err: wvMapKitchen(wvTakeError(err))}
+		ch <- wvOutcomeKitchenDoCancellable{err: wvBrandError(wvTakeError(err))}
 		return
 	}
 	val := ""
 	if result != nil {
 		val = C.GoString(result)
-		C.weaveffi_free_string(result)
 	}
 	ch <- wvOutcomeKitchenDoCancellable{val: val}
 }
 
 // DoCancellable: Cancellable async operation
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func DoCancellable(input string) string {
 	ch := make(chan wvOutcomeKitchenDoCancellable, 1)
 	ctxID := wvCallbackStore(ch)

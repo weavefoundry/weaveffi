@@ -98,31 +98,39 @@ module WeaveFFI
   end
 
   # Return an iterator over all sent messages
+  # Returns a lazy Enumerator that streams one element per pull; call
+  # `.to_a` to collect eagerly. The underlying producer iterator is
+  # launched on the first pull, so launch errors raise at that point
+  # rather than when this method returns. The iterator handle is
+  # released exactly once, when iteration finishes or is abandoned
+  # early (for example by `break`).
   def self.get_messages()
-    err = ErrorStruct.new
-    iter = weaveffi_events_get_messages(err)
-    check_error!(err)
-    items = []
-    return items if iter.null?
-    loop do
-      out_item = FFI::MemoryPointer.new(:pointer)
-      item_err = ErrorStruct.new
-      has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)
-      if item_err[:code] != 0
-        weaveffi_events_GetMessagesIterator_destroy(iter)
-        check_error!(item_err)
-      end
-      break if has_item.zero?
-      item_ptr = out_item.read_pointer
-      if item_ptr.null?
-        items << ''
-      else
-        items << item_ptr.read_string
-        weaveffi_free_string(item_ptr)
+    Enumerator.new do |y|
+      err = ErrorStruct.new
+      iter = weaveffi_events_get_messages(err)
+      begin
+        check_error!(err)
+        unless iter.null?
+          loop do
+            out_item = FFI::MemoryPointer.new(:pointer)
+            item_err = ErrorStruct.new
+            has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)
+            check_error!(item_err)
+            break if has_item.zero?
+            item_ptr = out_item.read_pointer
+            if item_ptr.null?
+              y << ''
+            else
+              item = item_ptr.read_string
+              weaveffi_free_string(item_ptr)
+              y << item
+            end
+          end
+        end
+      ensure
+        weaveffi_events_GetMessagesIterator_destroy(iter) unless iter.null?
       end
     end
-    weaveffi_events_GetMessagesIterator_destroy(iter)
-    items
   end
 end
 

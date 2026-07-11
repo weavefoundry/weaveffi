@@ -45,8 +45,10 @@ int main() {
     assert(store.put("beta", payload, EntryKind::Volatile, std::nullopt));
     assert(store.count() == 2);
 
-    // Iterator-backed listing materialized into a vector.
-    std::vector<std::string> keys = store.list_keys(std::nullopt);
+    // Iterator-backed listing: a lazy single-pass range, drained into a
+    // vector here (one producer `next` per step).
+    std::vector<std::string> keys;
+    for (auto&& k : store.list_keys(std::nullopt)) keys.push_back(k);
     assert(keys.size() == 2);
     bool saw_alpha = false, saw_beta = false;
     for (const auto& k : keys) {

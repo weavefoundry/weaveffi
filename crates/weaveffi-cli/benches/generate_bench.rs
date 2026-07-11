@@ -100,12 +100,15 @@ fn build_large_api() -> Api {
                         },
                         Param {
                             name: "c".into(),
-                            ty: TypeRef::Struct(format!("M{m}Struct0")),
+                            // The synthetic API skips the resolve pass, so
+                            // user-type references use the resolved `Record`
+                            // form the generators require.
+                            ty: TypeRef::Record(format!("M{m}Struct0")),
                             mutable: false,
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(format!(
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(format!(
                         "M{m}Struct1"
                     ))))),
                     throws: false,

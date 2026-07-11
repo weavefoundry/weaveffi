@@ -37,6 +37,8 @@ export declare class InvalidInput extends KitchenErrorsError {
 export interface Token {
   readonly id: bigint;
   readonly label: string;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /** Kitchen sink struct exercising every field feature */
@@ -59,6 +61,8 @@ export interface Item {
   /** Cross-module struct reference */
   readonly token: Token;
   readonly priority: Priority;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /** Task priority levels */
@@ -173,9 +177,10 @@ export interface WeaveffiWasmModule {
     getAttrs(): Record<string, number>;
     /**
      * Iterator return type
+     * @returns A lazy iterator: one producer step per `next()` call. Exhaust it or call `return()` to release the producer handle (a `for...of` loop does both automatically); an abandoned iterator leaks the handle.
      * @throws {WeaveFFIError} if the native call fails
      */
-    streamItems(): Item[];
+    streamItems(): IterableIterator<Item>;
     /**
      * Returns the shared Token type from another module
      * @throws {WeaveFFIError} if the native call fails

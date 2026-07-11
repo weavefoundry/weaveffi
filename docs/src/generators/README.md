@@ -29,6 +29,13 @@ uses a feature the selected target cannot deliver (no silent skips).
 
 Notes:
 
+- **Iterators are lazy.** Every target wraps the C ABI's
+  handle/`_next`/`_destroy` triple in its native lazy idiom (Go
+  `iter.Seq`, Swift `Sequence`, C++ input-iterator range, Kotlin
+  `Iterator`, JS iterables, Python iterators, .NET `IEnumerable<T>`,
+  Dart `Iterable`, Ruby `Enumerator`), pulling one element per
+  consumer step and destroying the handle exactly once. C exposes the
+  raw symbols directly.
 - **Go and Ruby async** wrappers block the calling thread until the
   producer's completion callback fires (a channel receive in Go, a
   `Queue#pop` in Ruby). Run them from a goroutine or Ruby thread for

@@ -194,12 +194,12 @@ fn large_api() -> Api {
                         },
                         Param {
                             name: "c".to_string(),
-                            ty: TypeRef::Struct(format!("M{m}Struct0")),
+                            ty: TypeRef::Named(format!("M{m}Struct0")),
                             mutable: false,
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(format!(
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Named(format!(
                         "M{m}Struct1"
                     ))))),
                     r#async: false,

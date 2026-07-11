@@ -2,16 +2,18 @@
 //!
 //! Emits a JavaScript loader plus TypeScript type definitions for the
 //! companion N-API addon. Async functions surface as `Promise`-returning
-//! functions, interfaces surface as JS classes over opaque native handles,
-//! and each declared error domain surfaces as an `Error` subclass extending
-//! the generic `WeaveFFIError` brand. Implements [`LanguageBackend`]; the
-//! shared driver bridges it into the generator pipeline.
+//! functions, `iter<T>` functions surface as lazy `IterableIterator<T>`
+//! wrappers that pull one element per step, interfaces surface as JS classes
+//! over opaque native handles, and each declared error domain surfaces as an
+//! `Error` subclass extending the generic `WeaveFFIError` brand. Implements
+//! [`LanguageBackend`]; the shared driver bridges it into the generator
+//! pipeline.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
@@ -19,15 +21,18 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::abi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
+use weaveffi_core::codegen::common::{
+    emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
+};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::{type_name as error_type_name, ERROR_BRAND};
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
-    InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::ElemFree;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
@@ -398,19 +403,6 @@ fn js_str_literal(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn is_c_ptr_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::Bytes
-            | TypeRef::Struct(_)
-            | TypeRef::Interface(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-            | TypeRef::Iterator(_)
-    )
-}
-
 fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I8 => "int8_t".into(),
@@ -431,9 +423,10 @@ fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        // Structs and interfaces share the opaque-pointer lowering; only the
-        // ownership convention differs, which element contexts don't touch.
-        TypeRef::Struct(s) | TypeRef::Interface(s) => {
+        // Records, rich enums, and interfaces share the opaque-pointer
+        // lowering; only the ownership convention differs, which element
+        // contexts don't touch.
+        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
             format!("{}*", c_abi_struct_name(s, module, prefix))
         }
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
@@ -441,6 +434,7 @@ fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
             c_elem_type(inner, module, prefix)
         }
         TypeRef::Map(_, _) => "void*".into(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -462,13 +456,15 @@ fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::Handle => "weaveffi_handle_t".into(),
         TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
         // A returned interface transfers ownership of a new object reference;
-        // the pointer spelling matches a struct return.
-        TypeRef::Struct(s) | TypeRef::Interface(s) => {
+        // the pointer spelling matches a record return.
+        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
             format!("{}*", c_abi_struct_name(s, module, prefix))
         }
         TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
         TypeRef::Optional(inner) => {
-            if is_c_ptr_type(inner) {
+            // Pointer returns stay nullable pointers (null = none); scalar
+            // returns are boxed by the producer, matching the ABI lowering.
+            if is_c_pointer_type(inner) {
                 c_ret_type_str(inner, module, prefix)
             } else {
                 format!("{}*", c_elem_type(inner, module, prefix))
@@ -477,6 +473,7 @@ fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
         TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module, prefix)),
         TypeRef::Map(_, _) => "void".into(),
         TypeRef::Iterator(_) => "void*".into(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -491,7 +488,8 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
         | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::TypedHandle(_)
-        | TypeRef::Struct(_) => "napi_get_value_int64",
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_) => "napi_get_value_int64",
         // f32 is read as a double then narrowed to float at the use site.
         TypeRef::F32 | TypeRef::F64 => "napi_get_value_double",
         TypeRef::Bool => "napi_get_value_bool",
@@ -557,9 +555,157 @@ fn emit_error_check_c(out: &mut String, prefix: &str) {
     out.push_str("  }\n");
 }
 
-/// Emit one callable's `Napi_*` entry point (plus its async machinery when
-/// needed) and register its JS export. `self_tag` is the interface `c_tag`
-/// for an instance method, whose wrapped pointer arrives as `args[0]`.
+/// Emit the shared state cell every lazy iterator external wraps. The cell
+/// owns the native iterator handle; `next` on exhaustion, the JS wrapper's
+/// `return()`, and the external's finalizer all null it before destroying,
+/// so the handle is destroyed exactly once no matter which path runs first.
+fn render_iter_state_c(out: &mut String, prefix: &str) {
+    out.push_str("typedef struct {\n");
+    out.push_str("    void* iter;\n");
+    out.push_str(&format!("}} {prefix}_napi_iter_state;\n\n"));
+}
+
+/// Read the iterator state cell back out of the external in `args[0]`.
+fn emit_iter_state_read(out: &mut String, prefix: &str) {
+    out.push_str("  size_t argc = 1;\n");
+    out.push_str("  napi_value args[1];\n");
+    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
+    out.push_str("  void* iter_data = NULL;\n");
+    out.push_str("  napi_get_value_external(env, args[0], &iter_data);\n");
+    out.push_str(&format!(
+        "  {prefix}_napi_iter_state* state = ({prefix}_napi_iter_state*)iter_data;\n"
+    ));
+}
+
+/// Emit one iterator-returning callable's lazy machinery: the external's
+/// finalizer (the safety net for abandoned iterators), the per-step `next`
+/// entry point, and the explicit `destroy` entry point the JS wrapper's
+/// `return()` calls on early exit.
+///
+/// `next` issues exactly one native pull. When the producer reports done (or
+/// faults), the native handle is destroyed eagerly and the cell nulled; a
+/// per-step fault then throws the code-carrying error, which the JS wrapper
+/// maps per the callable's error strategy. A produced element is converted
+/// and released per its element plan: strings are freed with
+/// `weaveffi_free_string` after the JS string is created, record pointers are
+/// adopted by the struct-object materialization (which destroys them), and
+/// rich-enum pointers surface as owned raw handles the JS class adopts.
+fn render_iterator_napi_fns(
+    out: &mut String,
+    f: &FnBinding,
+    ib: &IteratorBinding,
+    module: &str,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
+) {
+    let c_name = &f.c_base;
+    let tag = &ib.iter_tag;
+    let next_sym = &ib.next.symbol;
+    let destroy_sym = &ib.destroy_symbol;
+    let proto = ib.protocol(f, module, prefix);
+
+    // Finalizer: reclaim abandoned iterators when the external is collected.
+    out.push_str(&format!(
+        "static void {c_name}_napi_iter_finalize(napi_env env, void* data, void* hint) {{\n"
+    ));
+    out.push_str("    (void)env;\n");
+    out.push_str("    (void)hint;\n");
+    out.push_str(&format!(
+        "    {prefix}_napi_iter_state* state = ({prefix}_napi_iter_state*)data;\n"
+    ));
+    out.push_str("    if (state->iter != NULL) {\n");
+    out.push_str(&format!("        {destroy_sym}(({tag}*)state->iter);\n"));
+    out.push_str("        state->iter = NULL;\n");
+    out.push_str("    }\n");
+    out.push_str("    free(state);\n");
+    out.push_str("}\n\n");
+
+    // One pull per call; `undefined` signals exhaustion to the JS wrapper.
+    out.push_str(&format!(
+        "static napi_value Napi_{next_sym}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    emit_iter_state_read(out, prefix);
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  if (state == NULL || state->iter == NULL) {\n");
+    out.push_str("    napi_get_undefined(env, &ret);\n");
+    out.push_str("    return ret;\n");
+    out.push_str("  }\n");
+    let et = c_elem_type(&ib.elem, module, prefix);
+    out.push_str(&format!("  {et} iter_item;\n"));
+    out.push_str("  weaveffi_error iter_err = {0};\n");
+    out.push_str(&format!(
+        "  if (!{next_sym}(({tag}*)state->iter, &iter_item, &iter_err)) {{\n"
+    ));
+    out.push_str(&format!("    {destroy_sym}(({tag}*)state->iter);\n"));
+    out.push_str("    state->iter = NULL;\n");
+    out.push_str("    if (iter_err.code != 0) {\n");
+    out.push_str(&format!(
+        "      napi_throw(env, {prefix}_napi_error_value(env, iter_err.code, iter_err.message));\n"
+    ));
+    out.push_str("      weaveffi_error_clear(&iter_err);\n");
+    out.push_str("      return NULL;\n");
+    out.push_str("    }\n");
+    out.push_str("    napi_get_undefined(env, &ret);\n");
+    out.push_str("    return ret;\n");
+    out.push_str("  }\n");
+    match &ib.elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(
+                "  napi_create_string_utf8(env, iter_item ? iter_item : \"\", NAPI_AUTO_LENGTH, &ret);\n",
+            );
+            if matches!(proto.elem_free, ElemFree::String) {
+                out.push_str("  weaveffi_free_string((char*)iter_item);\n");
+            }
+        }
+        TypeRef::Record(name) => {
+            emit_struct_to_object(
+                out,
+                "env",
+                name,
+                "iter_item",
+                "ret",
+                module,
+                prefix,
+                structs,
+                "  ",
+                true,
+            );
+        }
+        TypeRef::RichEnum(_) => {
+            out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)iter_item, &ret);\n");
+        }
+        other => {
+            out.push_str(&format!(
+                "  {}\n",
+                napi_create_leaf("env", other, "iter_item", "ret")
+            ));
+        }
+    }
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+
+    // Explicit destroy, guarded so destroy-after-exhaustion (or a double
+    // `return()`) is a no-op rather than a double free.
+    out.push_str(&format!(
+        "static napi_value Napi_{destroy_sym}(napi_env env, napi_callback_info info) {{\n"
+    ));
+    emit_iter_state_read(out, prefix);
+    out.push_str("  if (state != NULL && state->iter != NULL) {\n");
+    out.push_str(&format!("    {destroy_sym}(({tag}*)state->iter);\n"));
+    out.push_str("    state->iter = NULL;\n");
+    out.push_str("  }\n");
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  napi_get_undefined(env, &ret);\n");
+    out.push_str("  return ret;\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit one callable's `Napi_*` entry point (plus its async or iterator
+/// machinery when needed) and register its JS export(s). `self_tag` is the
+/// interface `c_tag` for an instance method, whose wrapped pointer arrives as
+/// `args[0]`. An iterator-returning callable additionally exports its
+/// per-iterator `next`/`destroy` entry points under `{js_name}_iterNext` and
+/// `{js_name}_iterDestroy`, which the JS wrapper drives lazily.
 #[allow(clippy::too_many_arguments)]
 fn render_callable_napi(
     out: &mut String,
@@ -573,11 +719,22 @@ fn render_callable_napi(
 ) {
     let c_name = &f.c_base;
     let napi_name = format!("Napi_{c_name}");
-    all_exports.push((js_name, napi_name.clone()));
 
     if f.is_async {
         render_async_machinery(out, f, c_name, module, prefix, structs);
     }
+    if let CallShape::Iterator(ib) = &f.shape {
+        render_iterator_napi_fns(out, f, ib, module, prefix, structs);
+        all_exports.push((
+            format!("{js_name}_iterNext"),
+            format!("Napi_{}", ib.next.symbol),
+        ));
+        all_exports.push((
+            format!("{js_name}_iterDestroy"),
+            format!("Napi_{}", ib.destroy_symbol),
+        ));
+    }
+    all_exports.push((js_name, napi_name.clone()));
 
     out.push_str(&format!(
         "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
@@ -607,6 +764,10 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
     });
     if has_error_paths {
         render_error_value_helper_c(&mut out, prefix);
+    }
+
+    if model_has_iterators(model) {
+        render_iter_state_c(&mut out, prefix);
     }
 
     let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
@@ -1011,7 +1172,7 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
                         w.line(format!("uint8_t* {n0};"));
                         w.line(format!("size_t {};", slots[1].name));
                     }
-                    TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                         w.line(format!("void* {n0};"));
                     }
                     TypeRef::Optional(inner) => match inner.as_ref() {
@@ -1023,7 +1184,7 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
                             w.line(format!("uint8_t* {n0};"));
                             w.line(format!("size_t {};", slots[1].name));
                         }
-                        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                             w.line(format!("void* {n0};"));
                         }
                         other => {
@@ -1052,6 +1213,7 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
                     TypeRef::Interface(_) => {
                         unreachable!("validated: interface not a callback param")
                     }
+                    TypeRef::Named(_) => unreachable!("unresolved type reference"),
                 }
             }
         },
@@ -1116,7 +1278,7 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
                     "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
                 ));
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                 out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
             }
             TypeRef::Optional(inner) => match inner.as_ref() {
@@ -1131,7 +1293,7 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
                         "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
                     ));
                 }
-                TypeRef::Struct(_) | TypeRef::TypedHandle(_) => {
+                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
                     out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
                 }
                 _ => {
@@ -1177,6 +1339,7 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
             }
             TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
             TypeRef::Interface(_) => unreachable!("validated: interface not a callback param"),
+            TypeRef::Named(_) => unreachable!("unresolved type reference"),
         }
     }
     out.push_str("    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);\n");
@@ -1232,7 +1395,7 @@ fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize, prefix: 
                 "        napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target});\n"
             ));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
             "        napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target});\n"
         )),
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -1245,7 +1408,7 @@ fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize, prefix: 
                     "        if (p->{n0}_has) napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target}); else napi_get_null(env, &{target});\n"
                 ));
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
+            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
                 "        if (p->{n0}) napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target}); else napi_get_null(env, &{target});\n"
             )),
             other => {
@@ -1289,6 +1452,7 @@ fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize, prefix: 
         }
         TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
         TypeRef::Interface(_) => unreachable!("validated: interface not a callback param"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -1545,7 +1709,8 @@ fn render_async_machinery(
         Some(TypeRef::Handle) => out.push_str("    uint64_t result;\n"),
         Some(
             TypeRef::TypedHandle(_)
-            | TypeRef::Struct(_)
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
             | TypeRef::Interface(_)
             | TypeRef::Iterator(_),
         ) => out.push_str("    void* result;\n"),
@@ -1554,7 +1719,10 @@ fn render_async_machinery(
                 out.push_str("    char* result;\n");
                 out.push_str("    int result_null;\n");
             }
-            TypeRef::Struct(_) | TypeRef::Interface(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::Interface(_)
+            | TypeRef::TypedHandle(_) => {
                 out.push_str("    void* result;\n");
             }
             other => {
@@ -1583,6 +1751,7 @@ fn render_async_machinery(
             }
             out.push_str("    size_t result_len;\n");
         }
+        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     out.push_str(&format!("}} {actx};\n\n"));
 
@@ -1628,11 +1797,13 @@ fn render_async_machinery(
                 "        if (result != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result, result_len); }\n",
             );
         }
-        // Ownership of struct/interface/handle/iterator results transfers to
-        // the receiver, so the pointer stays valid across the thread hop.
+        // Owned-object results (records, rich enums, interfaces, handles,
+        // iterators) are adopted by the receiver, so the pointer stays valid
+        // across the thread hop; everything borrowed is deep-copied above.
         Some(
             TypeRef::TypedHandle(_)
-            | TypeRef::Struct(_)
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
             | TypeRef::Interface(_)
             | TypeRef::Iterator(_),
         ) => {
@@ -1643,7 +1814,10 @@ fn render_async_machinery(
                 out.push_str("        ctx->result_null = result == NULL;\n");
                 out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
             }
-            TypeRef::Struct(_) | TypeRef::Interface(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::Interface(_)
+            | TypeRef::TypedHandle(_) => {
                 out.push_str("        ctx->result = (void*)result;\n");
             }
             _ => {
@@ -1686,6 +1860,7 @@ fn render_async_machinery(
                 }
             }
         }
+        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     out.push_str("    }\n");
     out.push_str("    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);\n");
@@ -1739,12 +1914,18 @@ fn render_async_machinery(
         Some(TypeRef::Handle) => {
             out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
         }
-        // An interface result stays the raw owned pointer here; the JS loader
-        // wraps the settled handle in the interface class.
-        Some(TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Iterator(_)) => {
+        // An interface or rich-enum result stays the raw owned pointer here;
+        // the JS loader wraps the settled handle in its class, which owns
+        // disposal.
+        Some(
+            TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::Iterator(_),
+        ) => {
             out.push_str("        napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n");
         }
-        Some(TypeRef::Struct(name)) => {
+        Some(TypeRef::Record(name)) => {
             emit_struct_to_object(
                 out,
                 "env",
@@ -1764,7 +1945,7 @@ fn render_async_machinery(
                     "        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : \"\", NAPI_AUTO_LENGTH, &val);\n",
                 );
             }
-            TypeRef::Struct(name) => {
+            TypeRef::Record(name) => {
                 out.push_str(
                     "        if (ctx->result == NULL) { napi_get_null(env, &val); } else {\n",
                 );
@@ -1782,7 +1963,7 @@ fn render_async_machinery(
                 );
                 out.push_str("        }\n");
             }
-            TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::RichEnum(_) => {
                 out.push_str(
                     "        if (ctx->result == NULL) napi_get_null(env, &val); else napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
                 );
@@ -1818,6 +1999,7 @@ fn render_async_machinery(
             out.push_str("            napi_set_property(env, val, mk, mv);\n");
             out.push_str("        }\n");
         }
+        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     out.push_str("        napi_resolve_deferred(env, ctx->deferred, val);\n");
     out.push_str("    }\n");
@@ -2081,10 +2263,11 @@ fn emit_param(
             ));
             c_args.push(format!("({prefix}_{module}_{e}){name}"));
         }
-        // Structs and interfaces arrive as int64 handles wrapping the opaque
-        // pointer; interfaces additionally get unwrapped from their JS class
-        // by the loader before reaching the addon (borrow: pointer only).
-        TypeRef::Struct(s) | TypeRef::Interface(s) => {
+        // Records, rich enums, and interfaces arrive as int64 handles wrapping
+        // the opaque pointer; rich enums and interfaces additionally get
+        // unwrapped from their JS class by the loader before reaching the
+        // addon (borrow: pointer only).
+        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
             let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
@@ -2113,6 +2296,7 @@ fn emit_param(
             emit_map_param(out, c_args, cleanups, k, v, name, idx, module, prefix);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -2226,9 +2410,10 @@ fn emit_optional_param(
             c_args.push(name.into());
             cleanups.push(format!("  free({name});\n"));
         }
-        // An optional struct or interface is a nullable opaque pointer: JS
-        // null/undefined passes NULL, anything else the wrapped handle.
-        TypeRef::Struct(s) | TypeRef::Interface(s) => {
+        // An optional record, rich enum, or interface is a nullable opaque
+        // pointer: JS null/undefined passes NULL, anything else the wrapped
+        // handle.
+        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
             let abi = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!(
@@ -2348,7 +2533,7 @@ fn emit_list_param(
             ));
             out.push_str(&format!("    {name}_arr[{name}_i] = {name}_s;\n"));
         }
-        TypeRef::Struct(_) => {
+        TypeRef::Record(_) | TypeRef::RichEnum(_) => {
             out.push_str(&format!("    int64_t {name}_sp;\n"));
             out.push_str(&format!(
                 "    napi_get_value_int64(env, {name}_el, &{name}_sp);\n"
@@ -2508,16 +2693,18 @@ fn emit_ret_out_params(
             c_args.push("&out_len".into());
         }
         TypeRef::Map(k, v) => {
+            // The C ABI hands back the base of each producer-allocated array,
+            // so the out-params are pointers to the array pointers.
             let kt = c_elem_type(k, module, prefix);
             let vt = c_elem_type(v, module, prefix);
             out.push_str(&format!("  {kt}* out_keys = NULL;\n"));
             out.push_str(&format!("  {vt}* out_values = NULL;\n"));
             out.push_str("  size_t out_len = 0;\n");
-            c_args.push("out_keys".into());
-            c_args.push("out_values".into());
+            c_args.push("&out_keys".into());
+            c_args.push("&out_values".into());
             c_args.push("&out_len".into());
         }
-        TypeRef::Optional(inner) if is_c_ptr_type(inner) => {
+        TypeRef::Optional(inner) if is_c_pointer_type(inner) => {
             emit_ret_out_params(out, c_args, inner, module, prefix);
         }
         _ => {}
@@ -2617,8 +2804,10 @@ fn napi_create_leaf(env: &str, ty: &TypeRef, expr: &str, target: &str) -> String
 }
 
 /// Convert a single collection *element* C expression `expr` (a list item or map
-/// value) into the napi value `target`. Owned element strings are freed after
-/// the copy, matching the C ABI's transfer-on-return contract.
+/// value) into the napi value `target`. Owned elements are released after the
+/// copy per their element plan: strings via `weaveffi_free_string`, record
+/// elements via their `_destroy` (after materializing the JS object), and
+/// rich-enum pointers surface as raw handles the JS wrapper class adopts.
 #[allow(clippy::too_many_arguments)]
 fn emit_elem_to_napi(
     out: &mut String,
@@ -2640,10 +2829,15 @@ fn emit_elem_to_napi(
                 out.push_str(&format!("{indent}weaveffi_free_string((char*)({expr}));\n"));
             }
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Record(name) => {
             emit_struct_to_object(
-                out, env, name, expr, target, module, prefix, structs, indent, false,
+                out, env, name, expr, target, module, prefix, structs, indent, true,
             );
+        }
+        TypeRef::RichEnum(_) => {
+            out.push_str(&format!(
+                "{indent}napi_create_int64({env}, (int64_t)(intptr_t)({expr}), &{target});\n"
+            ));
         }
         _ => out.push_str(&format!(
             "{indent}{}\n",
@@ -2716,7 +2910,7 @@ fn emit_struct_field_to_napi(
             }
             out.push_str(&format!("{indent}}}\n"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Record(name) => {
             emit_struct_to_object(
                 out,
                 env,
@@ -2729,6 +2923,14 @@ fn emit_struct_field_to_napi(
                 indent,
                 true,
             );
+        }
+        // A rich-enum field getter hands back an owned pointer surfaced as a
+        // raw handle; the JS side wraps it in the enum class, which owns
+        // disposal.
+        TypeRef::RichEnum(_) => {
+            out.push_str(&format!(
+                "{indent}napi_create_int64({env}, (int64_t)(intptr_t){getter}({pv}), &{fv});\n"
+            ));
         }
         TypeRef::Optional(inner)
             if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
@@ -2750,8 +2952,8 @@ fn emit_struct_field_to_napi(
             out.push_str(" }\n");
             out.push_str(&format!("{indent}}}\n"));
         }
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Struct(_)) => {
-            let TypeRef::Struct(name) = inner.as_ref() else {
+        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Record(_)) => {
+            let TypeRef::Record(name) = inner.as_ref() else {
                 unreachable!()
             };
             let abi = c_abi_struct_name(name, module, prefix);
@@ -2776,11 +2978,16 @@ fn emit_struct_field_to_napi(
             out.push_str(&format!("{indent}  }}\n"));
             out.push_str(&format!("{indent}}}\n"));
         }
-        // An optional typed handle lowers to a nullable opaque pointer that the
-        // field surfaces as the integer handle (or null), like the non-optional
-        // case but guarded on NULL.
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::TypedHandle(_)) => {
-            let TypeRef::TypedHandle(name) = inner.as_ref() else {
+        // An optional typed handle or rich enum lowers to a nullable opaque
+        // pointer that the field surfaces as the integer handle (or null),
+        // like the non-optional case but guarded on NULL.
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::TypedHandle(_) | TypeRef::RichEnum(_)
+            ) =>
+        {
+            let (TypeRef::TypedHandle(name) | TypeRef::RichEnum(name)) = inner.as_ref() else {
                 unreachable!()
             };
             let abi = c_abi_struct_name(name, module, prefix);
@@ -2819,7 +3026,7 @@ fn emit_struct_field_to_napi(
                 "{indent}  if ({fv}_data == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
             ));
             out.push_str(&format!(
-                "{indent}  else {{ void* {fv}_buf; napi_create_buffer_copy({env}, {fv}_len, {fv}_data, &{fv}_buf, &{fv}); }}\n"
+                "{indent}  else {{ void* {fv}_buf; napi_create_buffer_copy({env}, {fv}_len, {fv}_data, &{fv}_buf, &{fv}); weaveffi_free_bytes((uint8_t*){fv}_data, {fv}_len); }}\n"
             ));
             out.push_str(&format!("{indent}}}\n"));
         }
@@ -2851,6 +3058,9 @@ fn emit_struct_field_to_napi(
                 "{indent}      napi_set_element({env}, {fv}, (uint32_t){fv}_i, {fv}_e);\n"
             ));
             out.push_str(&format!("{indent}    }}\n"));
+            out.push_str(&format!(
+                "{indent}    weaveffi_free_bytes((uint8_t*){fv}_arr, {fv}_len * sizeof(*{fv}_arr));\n"
+            ));
             out.push_str(&format!("{indent}  }}\n"));
             out.push_str(&format!("{indent}}}\n"));
         }
@@ -2864,58 +3074,99 @@ fn emit_struct_field_to_napi(
             out.push_str(&format!(
                 "{indent}  {getter}({pv}, &{fv}_keys, &{fv}_vals, &{fv}_len);\n"
             ));
-            out.push_str(&format!("{indent}  napi_create_object({env}, &{fv});\n"));
-            out.push_str(&format!(
-                "{indent}  if ({fv}_keys != NULL && {fv}_vals != NULL) {{\n"
-            ));
-            out.push_str(&format!(
-                "{indent}    for (size_t {fv}_i = 0; {fv}_i < {fv}_len; {fv}_i++) {{\n"
-            ));
-            out.push_str(&format!("{indent}      napi_value {fv}_v;\n"));
-            emit_elem_to_napi(
+            emit_map_pairs_to_napi(
                 out,
                 env,
+                k,
                 v,
-                &format!("{fv}_vals[{fv}_i]"),
-                &format!("{fv}_v"),
+                &format!("{fv}_keys"),
+                &format!("{fv}_vals"),
+                &format!("{fv}_len"),
+                fv,
                 module,
                 prefix,
                 structs,
-                &format!("{indent}      "),
+                &format!("{indent}  "),
             );
-            match k.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str(&format!(
-                        "{indent}      napi_set_named_property({env}, {fv}, {fv}_keys[{fv}_i], {fv}_v);\n"
-                    ));
-                    if matches!(k.as_ref(), TypeRef::StringUtf8) {
-                        out.push_str(&format!(
-                            "{indent}      weaveffi_free_string((char*){fv}_keys[{fv}_i]);\n"
-                        ));
-                    }
-                }
-                other => {
-                    out.push_str(&format!("{indent}      napi_value {fv}_k;\n"));
-                    out.push_str(&format!(
-                        "{indent}      {}\n",
-                        napi_create_leaf(
-                            env,
-                            other,
-                            &format!("{fv}_keys[{fv}_i]"),
-                            &format!("{fv}_k")
-                        )
-                    ));
-                    out.push_str(&format!(
-                        "{indent}      napi_set_property({env}, {fv}, {fv}_k, {fv}_v);\n"
-                    ));
-                }
-            }
-            out.push_str(&format!("{indent}    }}\n"));
-            out.push_str(&format!("{indent}  }}\n"));
             out.push_str(&format!("{indent}}}\n"));
         }
         _ => out.push_str(&format!("{indent}napi_get_null({env}, &{fv});\n")),
     }
+}
+
+/// Build the JS object `target` from the parallel `keys`/`vals` arrays of a
+/// returned map, releasing what the consumer owes: each copied string key or
+/// value via `weaveffi_free_string`, then both producer-allocated arrays via
+/// `weaveffi_free_bytes`.
+#[allow(clippy::too_many_arguments)]
+fn emit_map_pairs_to_napi(
+    out: &mut String,
+    env: &str,
+    k: &TypeRef,
+    v: &TypeRef,
+    keys: &str,
+    vals: &str,
+    len: &str,
+    target: &str,
+    module: &str,
+    prefix: &str,
+    structs: &HashMap<String, StructBinding>,
+    indent: &str,
+) {
+    out.push_str(&format!("{indent}napi_create_object({env}, &{target});\n"));
+    out.push_str(&format!(
+        "{indent}if ({keys} != NULL && {vals} != NULL) {{\n"
+    ));
+    out.push_str(&format!(
+        "{indent}  for (size_t {target}_i = 0; {target}_i < {len}; {target}_i++) {{\n"
+    ));
+    out.push_str(&format!("{indent}    napi_value {target}_v;\n"));
+    emit_elem_to_napi(
+        out,
+        env,
+        v,
+        &format!("{vals}[{target}_i]"),
+        &format!("{target}_v"),
+        module,
+        prefix,
+        structs,
+        &format!("{indent}    "),
+    );
+    match k {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            out.push_str(&format!(
+                "{indent}    napi_set_named_property({env}, {target}, {keys}[{target}_i], {target}_v);\n"
+            ));
+            if matches!(k, TypeRef::StringUtf8) {
+                out.push_str(&format!(
+                    "{indent}    weaveffi_free_string((char*){keys}[{target}_i]);\n"
+                ));
+            }
+        }
+        other => {
+            out.push_str(&format!("{indent}    napi_value {target}_k;\n"));
+            out.push_str(&format!(
+                "{indent}    {}\n",
+                napi_create_leaf(
+                    env,
+                    other,
+                    &format!("{keys}[{target}_i]"),
+                    &format!("{target}_k")
+                )
+            ));
+            out.push_str(&format!(
+                "{indent}    napi_set_property({env}, {target}, {target}_k, {target}_v);\n"
+            ));
+        }
+    }
+    out.push_str(&format!("{indent}  }}\n"));
+    out.push_str(&format!("{indent}}}\n"));
+    out.push_str(&format!(
+        "{indent}weaveffi_free_bytes((uint8_t*){keys}, {len} * sizeof(*{keys}));\n"
+    ));
+    out.push_str(&format!(
+        "{indent}weaveffi_free_bytes((uint8_t*){vals}, {len} * sizeof(*{vals}));\n"
+    ));
 }
 
 fn emit_ret_to_napi(
@@ -2944,13 +3195,16 @@ fn emit_ret_to_napi(
         TypeRef::BorrowedStr => {
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
         }
-        // A returned interface is an owned object reference surfaced as the
-        // raw handle; the JS loader wraps it in the interface class (which
-        // owns disposal), so the addon must not destroy it here.
-        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Interface(_) => {
+        // A returned interface or rich enum is an owned object reference
+        // surfaced as the raw handle; the JS loader wraps it in its class
+        // (which owns disposal), so the addon must not destroy it here.
+        TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Interface(_)
+        | TypeRef::RichEnum(_) => {
             out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Record(name) => {
             emit_struct_to_object(
                 out, "env", name, "result", "ret", module, prefix, structs, "  ", true,
             );
@@ -2973,95 +3227,47 @@ fn emit_ret_to_napi(
             out.push_str("  }\n");
         }
         TypeRef::List(inner) => emit_list_ret(out, inner, module, prefix, "  ", structs),
-        TypeRef::Map(_, _) => {
-            out.push_str("  napi_create_object(env, &ret);\n");
+        TypeRef::Map(k, v) => {
+            emit_map_pairs_to_napi(
+                out,
+                "env",
+                k,
+                v,
+                "out_keys",
+                "out_values",
+                "out_len",
+                "ret",
+                module,
+                prefix,
+                structs,
+                "  ",
+            );
         }
-        TypeRef::Iterator(inner) => {
-            // The `next`/`destroy` symbols come from the lowered shape: an
-            // interface method's iterator tag hangs off the interface `c_tag`,
-            // which a name-based reconstruction would get wrong.
-            let CallShape::Iterator(ib) = &f.shape else {
-                unreachable!("iterator return on a non-iterator shape");
-            };
-            let et = c_elem_type(inner, module, prefix);
-            out.push_str("  napi_create_array(env, &ret);\n");
-            out.push_str("  uint32_t iter_idx = 0;\n");
-            out.push_str(&format!("  {et} iter_item;\n"));
-            // The iterator's `_next` reports per-step faults through a trailing
-            // error out-param; it is part of the C ABI signature and must be
-            // threaded through even when we surface drained items as an array.
-            out.push_str("  weaveffi_error iter_err = {0};\n");
+        TypeRef::Iterator(_) => {
+            // Lazy: the launcher's owned iterator handle is boxed into a
+            // heap-allocated state cell and wrapped in a JS external. The
+            // JS wrapper drives the per-iterator `next`/`destroy` entry
+            // points one element at a time; the external's finalizer is the
+            // safety net for abandoned iterators.
+            let c_name = &f.c_base;
             out.push_str(&format!(
-                "  while ({}(result, &iter_item, &iter_err)) {{\n",
-                ib.next.symbol
+                "  {prefix}_napi_iter_state* iter_state = ({prefix}_napi_iter_state*)calloc(1, sizeof({prefix}_napi_iter_state));\n"
             ));
-            out.push_str("    napi_value elem;\n");
-            match inner.as_ref() {
-                TypeRef::I32 => {
-                    out.push_str("    napi_create_int32(env, iter_item, &elem);\n");
-                }
-                TypeRef::U32 => {
-                    out.push_str("    napi_create_uint32(env, iter_item, &elem);\n");
-                }
-                TypeRef::I64 => {
-                    out.push_str("    napi_create_int64(env, iter_item, &elem);\n");
-                }
-                TypeRef::F64 => {
-                    out.push_str("    napi_create_double(env, iter_item, &elem);\n");
-                }
-                TypeRef::I8 | TypeRef::I16 => {
-                    out.push_str("    napi_create_int32(env, iter_item, &elem);\n");
-                }
-                TypeRef::U8 | TypeRef::U16 => {
-                    out.push_str("    napi_create_uint32(env, iter_item, &elem);\n");
-                }
-                TypeRef::U64 => {
-                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
-                }
-                TypeRef::F32 => {
-                    out.push_str("    napi_create_double(env, iter_item, &elem);\n");
-                }
-                TypeRef::Bool => {
-                    out.push_str("    napi_get_boolean(env, iter_item, &elem);\n");
-                }
-                TypeRef::TypedHandle(_) | TypeRef::Handle => {
-                    out.push_str(
-                        "    napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);\n",
-                    );
-                }
-                TypeRef::StringUtf8 => {
-                    out.push_str(
-                        "    napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);\n",
-                    );
-                    out.push_str("    weaveffi_free_string(iter_item);\n");
-                }
-                TypeRef::Struct(_) | TypeRef::Enum(_) => {
-                    out.push_str(
-                        "    napi_create_int64(env, (int64_t)(intptr_t)iter_item, &elem);\n",
-                    );
-                }
-                _ => {
-                    out.push_str("    napi_create_int64(env, (int64_t)iter_item, &elem);\n");
-                }
-            }
-            out.push_str("    napi_set_element(env, ret, iter_idx++, elem);\n");
-            out.push_str("  }\n");
-            out.push_str(&format!("  {}(result);\n", ib.destroy_symbol));
-            // A per-step fault ends the drain with a non-zero `iter_err`; the
-            // iterator is already freed above, so throw the code-carrying
-            // error instead of returning the partial array.
-            out.push_str("  if (iter_err.code != 0) {\n");
+            out.push_str("  iter_state->iter = (void*)result;\n");
             out.push_str(&format!(
-                "    napi_throw(env, {prefix}_napi_error_value(env, iter_err.code, iter_err.message));\n"
+                "  napi_create_external(env, iter_state, {c_name}_napi_iter_finalize, NULL, &ret);\n"
             ));
-            out.push_str("    weaveffi_error_clear(&iter_err);\n");
-            out.push_str("    return NULL;\n");
-            out.push_str("  }\n");
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str("  return ret;\n");
 }
 
+/// Emit the present-case conversion of an optional return (the NULL case was
+/// already handled by the caller). Pointer-lowered optionals (`is_c_pointer_type`)
+/// reuse the inner type's return plan on `result` directly; everything else is
+/// a producer-boxed scalar that is dereferenced and then released per
+/// `ReturnFree::BoxedScalar` (`weaveffi_free_bytes(ptr, sizeof(T))`).
 fn emit_optional_ret_inner(
     out: &mut String,
     inner: &TypeRef,
@@ -3069,64 +3275,77 @@ fn emit_optional_ret_inner(
     prefix: &str,
     structs: &HashMap<String, StructBinding>,
 ) {
+    // The boxed-scalar release owed after dereferencing the producer's box.
+    let free_box = "    weaveffi_free_bytes((uint8_t*)result, sizeof(*result));\n";
     match inner {
         TypeRef::I32 => {
             out.push_str("    napi_create_int32(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::U32 => {
             out.push_str("    napi_create_uint32(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::I64 => {
             out.push_str("    napi_create_int64(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::F64 => {
             out.push_str("    napi_create_double(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::I8 | TypeRef::I16 => {
             out.push_str("    napi_create_int32(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::U8 | TypeRef::U16 => {
             out.push_str("    napi_create_uint32(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::U64 => {
             out.push_str("    napi_create_int64(env, (int64_t)*result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::F32 => {
             out.push_str("    napi_create_double(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::Bool => {
             out.push_str("    napi_get_boolean(env, *result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)*result, &ret);\n");
-            out.push_str("    free(result);\n");
+        TypeRef::Handle => {
+            out.push_str("    napi_create_int64(env, (int64_t)*result, &ret);\n");
+            out.push_str(free_box);
         }
         TypeRef::Enum(_) => {
             out.push_str("    napi_create_int32(env, (int32_t)*result, &ret);\n");
-            out.push_str("    free(result);\n");
+            out.push_str(free_box);
         }
         TypeRef::StringUtf8 => {
             out.push_str("    napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
             out.push_str("    weaveffi_free_string(result);\n");
         }
-        TypeRef::Struct(name) => {
+        TypeRef::BorrowedStr => {
+            out.push_str("    napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
+        }
+        TypeRef::Bytes => {
+            out.push_str("    napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
+            out.push_str("    weaveffi_free_bytes((uint8_t*)result, out_len);\n");
+        }
+        TypeRef::BorrowedBytes => {
+            out.push_str("    napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
+        }
+        TypeRef::Record(name) => {
             emit_struct_to_object(
                 out, "env", name, "result", "ret", module, prefix, structs, "    ", true,
             );
         }
-        // An optional interface lowers to one nullable owned pointer, so
-        // `result` is the object itself (the NULL case was already handled):
-        // surface the raw handle without dereferencing or freeing it.
-        TypeRef::Interface(_) => {
+        // An optional interface, rich enum, or typed handle lowers to one
+        // nullable pointer, so `result` is the object itself: surface the raw
+        // handle without dereferencing or freeing it (the JS wrapper class
+        // adopts owned references and owns their disposal).
+        TypeRef::Interface(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
             out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         }
         TypeRef::List(li) => emit_list_ret(out, li, module, prefix, "    ", structs),
@@ -3189,7 +3408,7 @@ fn emit_list_ret(
         TypeRef::Enum(_) => out.push_str(&format!(
             "{ind}  napi_create_int32(env, (int32_t)result[ret_i], &elem);\n"
         )),
-        TypeRef::Struct(name) => {
+        TypeRef::Record(name) => {
             let elem_indent = format!("{ind}  ");
             emit_struct_to_object(
                 out,
@@ -3204,6 +3423,11 @@ fn emit_list_ret(
                 true,
             );
         }
+        // Rich-enum elements cross as owned raw handles; the consumer wraps
+        // them in the enum class, which owns disposal.
+        TypeRef::RichEnum(_) => out.push_str(&format!(
+            "{ind}  napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);\n"
+        )),
         _ => out.push_str(&format!(
             "{ind}  napi_create_int64(env, (int64_t)result[ret_i], &elem);\n"
         )),
@@ -3212,7 +3436,11 @@ fn emit_list_ret(
         "{ind}  napi_set_element(env, ret, (uint32_t)ret_i, elem);\n"
     ));
     out.push_str(&format!("{ind}}}\n"));
-    out.push_str(&format!("{ind}free(result);\n"));
+    // The array buffer itself is producer-allocated; release it with the
+    // runtime's own deallocator, per `ReturnFree::Array`.
+    out.push_str(&format!(
+        "{ind}weaveffi_free_bytes((uint8_t*)result, out_len * sizeof(*result));\n"
+    ));
 }
 
 fn ts_type_for(ty: &TypeRef) -> String {
@@ -3231,12 +3459,13 @@ fn ts_type_for(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
         TypeRef::Handle => "bigint".into(),
-        // Structs, enums, interfaces, and typed handles surface as bare local
-        // TS names. A cross-module reference (e.g. `handle<Store>` resolved to
-        // `kv.Store`) must annotate the *local* type `Store`; the qualified IR
-        // name is not a declared TS type in this module.
+        // Records, rich enums, plain enums, interfaces, and typed handles
+        // surface as bare local TS names. A cross-module reference (e.g.
+        // `handle<Store>` resolved to `kv.Store`) must annotate the *local*
+        // type `Store`; the qualified IR name is not a declared TS type in
+        // this module.
         TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
-        TypeRef::Struct(name) => local_type_name(name).to_string(),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).to_string(),
         TypeRef::Interface(name) => local_type_name(name).to_string(),
         TypeRef::Enum(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
@@ -3249,10 +3478,12 @@ fn ts_type_for(ty: &TypeRef) -> String {
             }
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+        // `iter<T>` is a lazy pull stream, not a materialized array.
         TypeRef::Iterator(inner) => {
             let t = ts_type_for(inner);
-            format!("{t}[]")
+            format!("IterableIterator<{t}>")
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -3402,19 +3633,6 @@ fn render_struct_builder_dts(out: &mut String, s: &StructBinding) {
     out.push_str(&w.finish());
 }
 
-/// The set of *local* names of every rich (algebraic) enum in the model. Used
-/// to recognize a rich enum where it surfaces as `TypeRef::Struct` in a
-/// function signature (rich enums lower to opaque struct pointers).
-fn rich_enum_names(model: &BindingModel) -> HashSet<String> {
-    model
-        .modules
-        .iter()
-        .flat_map(|m| m.enums.iter())
-        .filter(|e| e.is_rich())
-        .map(|e| e.name.clone())
-        .collect()
-}
-
 /// How a wrapper rebuilds a class-typed result from the raw addon value.
 struct RetWrap {
     /// The local JS class name.
@@ -3429,10 +3647,10 @@ struct RetWrap {
 /// Recognize a class-typed return carried directly or as an `Optional`.
 /// Deeper nestings (list/map elements) are rejected by validation for
 /// interfaces and flow through unwrapped for rich enums.
-fn js_ret_wrap(ret: Option<&TypeRef>, rich: &HashSet<String>) -> Option<RetWrap> {
-    fn direct(ty: &TypeRef, rich: &HashSet<String>, optional: bool) -> Option<RetWrap> {
+fn js_ret_wrap(ret: Option<&TypeRef>) -> Option<RetWrap> {
+    fn direct(ty: &TypeRef, optional: bool) -> Option<RetWrap> {
         match ty {
-            TypeRef::Struct(n) if rich.contains(local_type_name(n)) => Some(RetWrap {
+            TypeRef::RichEnum(n) => Some(RetWrap {
                 cls: local_type_name(n).to_string(),
                 optional,
                 iface: false,
@@ -3446,25 +3664,24 @@ fn js_ret_wrap(ret: Option<&TypeRef>, rich: &HashSet<String>) -> Option<RetWrap>
         }
     }
     match ret? {
-        TypeRef::Optional(inner) => direct(inner, rich, true),
-        ty => direct(ty, rich, false),
+        TypeRef::Optional(inner) => direct(inner, true),
+        ty => direct(ty, false),
     }
 }
 
 /// The addon-argument expression for one logical parameter: interface and
 /// rich-enum instances are unwrapped to their raw `_handle` (a borrow; the
 /// callee never takes ownership), everything else passes through.
-fn js_arg_expr(js_name: &str, ty: &TypeRef, rich: &HashSet<String>) -> String {
-    fn wrapper_class<'t>(ty: &'t TypeRef, rich: &HashSet<String>) -> Option<&'t str> {
+fn js_arg_expr(js_name: &str, ty: &TypeRef) -> String {
+    fn wrapper_class(ty: &TypeRef) -> Option<&str> {
         match ty {
-            TypeRef::Struct(n) if rich.contains(local_type_name(n)) => Some(local_type_name(n)),
-            TypeRef::Interface(n) => Some(local_type_name(n)),
+            TypeRef::RichEnum(n) | TypeRef::Interface(n) => Some(local_type_name(n)),
             _ => None,
         }
     }
     let cls = match ty {
-        TypeRef::Optional(inner) => wrapper_class(inner, rich),
-        ty => wrapper_class(ty, rich),
+        TypeRef::Optional(inner) => wrapper_class(inner),
+        ty => wrapper_class(ty),
     };
     match cls {
         Some(c) => format!("{js_name} instanceof {c} ? {js_name}._handle : {js_name}"),
@@ -3544,22 +3761,23 @@ fn render_error_classes_js(out: &mut String, eb: &ErrorBinding) {
 
 /// Emit one wrapper callable's body: unwrap class-typed arguments to raw
 /// handles, invoke the addon binding through the rebranding helper, and wrap
-/// a class-typed result. Shared by free functions and interface members
-/// (`self_expr` supplies the leading handle of an instance method).
+/// a class-typed result. Iterator-returning callables launch the native
+/// iterator and hand its external to the shared lazy iterator class. Shared
+/// by free functions and interface members (`self_expr` supplies the leading
+/// handle of an instance method).
 fn emit_wrapper_body_js(
     w: &mut CodeWriter,
     f: &FnBinding,
     addon_name: &str,
     self_expr: Option<&str>,
     map_expr: &str,
-    rich: &HashSet<String>,
 ) {
     let mut args: Vec<String> = Vec::new();
     if let Some(s) = self_expr {
         args.push(s.to_string());
     }
     for p in &f.params {
-        args.push(js_arg_expr(&js_param_name(&p.name), &p.ty, rich));
+        args.push(js_arg_expr(&js_param_name(&p.name), &p.ty));
     }
     let args = args.join(", ");
     let invoke = if f.is_async {
@@ -3569,7 +3787,22 @@ fn emit_wrapper_body_js(
     };
     let call = format!("{invoke}(addon.{addon_name}, [{args}], {map_expr})");
 
-    let Some(wrap) = js_ret_wrap(f.ret.as_ref(), rich) else {
+    if let Some(TypeRef::Iterator(inner)) = f.ret.as_ref() {
+        // Launch, then wrap the external in the lazy iterator: one native
+        // `next` per consumer step, `destroy` on exhaustion or early exit.
+        // Rich-enum elements arrive as owned raw handles the class adopts.
+        let wrap_elem = match inner.as_ref() {
+            TypeRef::RichEnum(n) => format!("(_e) => new {}(_e)", local_type_name(n)),
+            _ => "null".to_string(),
+        };
+        w.line(format!("const _it = {call};"));
+        w.line(format!(
+            "return new WeaveFFIIterator(_it, addon.{addon_name}_iterNext, addon.{addon_name}_iterDestroy, {map_expr}, {wrap_elem});"
+        ));
+        return;
+    }
+
+    let Some(wrap) = js_ret_wrap(f.ret.as_ref()) else {
         w.line(format!("return {call};"));
         return;
     };
@@ -3610,7 +3843,6 @@ fn render_interface_class_js(
     i: &InterfaceBinding,
     m: &ModuleBinding,
     strip: bool,
-    rich: &HashSet<String>,
 ) {
     let name = &i.name;
     let destroy_js = wrapper_name(&m.path, &iface_member_base(name, "destroy"), strip);
@@ -3628,7 +3860,7 @@ fn render_interface_class_js(
             let args: Vec<String> = c
                 .params
                 .iter()
-                .map(|p| js_arg_expr(&js_param_name(&p.name), &p.ty, rich))
+                .map(|p| js_arg_expr(&js_param_name(&p.name), &p.ty))
                 .collect();
             let map = js_error_map_expr(c, error);
             w.block(format!("constructor({}) {{", params.join(", ")), "}", |w| {
@@ -3653,7 +3885,7 @@ fn render_interface_class_js(
                 format!("static {factory}({}) {{", params.join(", ")),
                 "}",
                 |w| {
-                    emit_wrapper_body_js(w, c, &addon_name, None, &map, rich);
+                    emit_wrapper_body_js(w, c, &addon_name, None, &map);
                 },
             );
         }
@@ -3663,7 +3895,7 @@ fn render_interface_class_js(
             let params: Vec<String> = f.params.iter().map(|p| js_param_name(&p.name)).collect();
             let map = js_error_map_expr(f, error);
             w.block(format!("{method}({}) {{", params.join(", ")), "}", |w| {
-                emit_wrapper_body_js(w, f, &addon_name, Some("this._handle"), &map, rich);
+                emit_wrapper_body_js(w, f, &addon_name, Some("this._handle"), &map);
             });
         }
         for f in &i.statics {
@@ -3675,7 +3907,7 @@ fn render_interface_class_js(
                 format!("static {method}({}) {{", params.join(", ")),
                 "}",
                 |w| {
-                    emit_wrapper_body_js(w, f, &addon_name, None, &map, rich);
+                    emit_wrapper_body_js(w, f, &addon_name, None, &map);
                 },
             );
         }
@@ -3710,6 +3942,68 @@ fn render_interface_class_js(
         },
     );
     w.line(format!("wv.{name} = {name};"));
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// True when any callable in the model returns `iter<T>`, so the addon and
+/// loader must emit the shared lazy-iterator support.
+fn model_has_iterators(model: &BindingModel) -> bool {
+    model.modules.iter().any(|m| {
+        m.callables()
+            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
+    })
+}
+
+/// Emit the shared lazy iterator class the JS loader hands out for every
+/// `iter<T>` callable. It implements the iterator protocol over the addon's
+/// per-iterator `next`/`destroy` entry points: one native pull per `next()`,
+/// eager release on exhaustion (the addon destroys the handle when the
+/// producer reports done), and `return()` releases the handle on early exit
+/// so `for...of` breaks clean up deterministically. Abandoned iterators are
+/// reclaimed by the external's native finalizer.
+fn render_iterator_class_js(out: &mut String) {
+    let mut w = CodeWriter::two_space();
+    w.raw(
+        "// Lazy iterator over a native producer: one native `next` per step.\n\
+         // The native handle is released on exhaustion, by `return()` on early\n\
+         // exit, or by the external's finalizer if the iterator is abandoned.\n",
+    );
+    w.block("class WeaveFFIIterator {", "}", |w| {
+        w.block(
+            "constructor(ext, nextFn, destroyFn, map, wrapElem) {",
+            "}",
+            |w| {
+                w.line("this._ext = ext;");
+                w.line("this._nextFn = nextFn;");
+                w.line("this._destroyFn = destroyFn;");
+                w.line("this._map = map;");
+                w.line("this._wrapElem = wrapElem;");
+                w.line("this._done = false;");
+            },
+        );
+        w.block("next() {", "}", |w| {
+            w.block("if (this._done) {", "}", |w| {
+                w.line("return { done: true, value: undefined };");
+            });
+            w.line("const _v = __invoke(this._nextFn, [this._ext], this._map);");
+            w.block("if (_v === undefined) {", "}", |w| {
+                w.line("this._done = true;");
+                w.line("return { done: true, value: undefined };");
+            });
+            w.line("return { done: false, value: this._wrapElem ? this._wrapElem(_v) : _v };");
+        });
+        w.block("return(value) {", "}", |w| {
+            w.block("if (!this._done) {", "}", |w| {
+                w.line("this._done = true;");
+                w.line("this._destroyFn(this._ext);");
+            });
+            w.line("return { done: true, value };");
+        });
+        w.block("[Symbol.iterator]() {", "}", |w| {
+            w.line("return this;");
+        });
+    });
     w.blank();
     out.push_str(&w.finish());
 }
@@ -3776,7 +4070,9 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
          }}\n\n"
     ));
 
-    let rich = rich_enum_names(model);
+    if model_has_iterators(model) {
+        render_iterator_class_js(&mut out);
+    }
 
     for m in &model.modules {
         if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
@@ -3788,7 +4084,7 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
             }
         }
         for i in &m.interfaces {
-            render_interface_class_js(&mut out, i, m, strip, &rich);
+            render_interface_class_js(&mut out, i, m, strip);
         }
     }
 
@@ -3804,7 +4100,7 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
                 format!("wv.{js} = function ({}) {{", params.join(", ")),
                 "};",
                 |w| {
-                    emit_wrapper_body_js(w, f, &js, None, &map, &rich);
+                    emit_wrapper_body_js(w, f, &js, None, &map);
                 },
             );
             out.push_str(&w.finish());
@@ -4311,7 +4607,7 @@ mod tests {
 
     #[test]
     fn ts_type_for_struct_and_enum() {
-        assert_eq!(ts_type_for(&TypeRef::Struct("Contact".into())), "Contact");
+        assert_eq!(ts_type_for(&TypeRef::Record("Contact".into())), "Contact");
         assert_eq!(ts_type_for(&TypeRef::Enum("Color".into())), "Color");
         assert_eq!(
             ts_type_for(&TypeRef::TypedHandle("Contact".into())),
@@ -4327,7 +4623,7 @@ mod tests {
             ts_type_for(&TypeRef::TypedHandle("kv.Store".into())),
             "Store"
         );
-        assert_eq!(ts_type_for(&TypeRef::Struct("kv.Store".into())), "Store");
+        assert_eq!(ts_type_for(&TypeRef::Record("kv.Store".into())), "Store");
         assert_eq!(ts_type_for(&TypeRef::Enum("kv.Kind".into())), "Kind");
     }
 
@@ -4421,7 +4717,7 @@ mod tests {
                 mutable: false,
                 doc: None,
             }],
-            returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+            returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                 "Contact".into(),
             )))),
             doc: None,
@@ -4434,7 +4730,7 @@ mod tests {
         m.functions.push(Function {
             name: "list_contacts".into(),
             params: vec![],
-            returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+            returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
             doc: None,
             r#async: false,
             cancellable: false,
@@ -4553,7 +4849,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                         "Contact".into(),
                     )))),
                     doc: None,
@@ -4566,7 +4862,7 @@ mod tests {
                 Function {
                     name: "list_contacts".to_string(),
                     params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                     doc: None,
                     r#async: false,
                     cancellable: false,
@@ -5187,7 +5483,7 @@ mod tests {
                 params: vec![Param {
                     name: "data".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ))))),
                     mutable: false,
                     doc: None,
@@ -5273,7 +5569,7 @@ mod tests {
                     name: "contacts".into(),
                     ty: TypeRef::Map(
                         Box::new(TypeRef::Enum("Color".into())),
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ),
                     mutable: false,
                     doc: None,
@@ -5357,7 +5653,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 r#async: false,
                 cancellable: false,
@@ -5423,7 +5719,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -5721,7 +6017,7 @@ mod tests {
                     name: "describe".into(),
                     params: vec![Param {
                         name: "shape".into(),
-                        ty: TypeRef::Struct("Shape".into()),
+                        ty: TypeRef::RichEnum("Shape".into()),
                         mutable: false,
                         doc: None,
                     }],
@@ -5738,7 +6034,7 @@ mod tests {
                     params: vec![
                         Param {
                             name: "shape".into(),
-                            ty: TypeRef::Struct("Shape".into()),
+                            ty: TypeRef::RichEnum("Shape".into()),
                             mutable: false,
                             doc: None,
                         },
@@ -5749,7 +6045,7 @@ mod tests {
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Struct("Shape".into())),
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
                     doc: None,
                     r#async: false,
                     cancellable: false,
@@ -6267,36 +6563,149 @@ mod tests {
     }
 
     #[test]
-    fn iterator_drain_checks_per_step_error() {
+    fn iterator_addon_is_lazy() {
         let addon = addon_for(&make_api(vec![kv_module()]), true);
 
-        // The drain threads the per-step error slot through the model's
-        // `next` symbol (hanging off the interface tag, not the member name).
+        // The launch entry point never drains: it boxes the owned handle
+        // into a state cell and wraps it in an external with a finalizer.
+        assert!(
+            !addon.contains("while (weaveffi_kv_Store_ListKeysIterator_next"),
+            "the addon must not drain the iterator into an array: {addon}"
+        );
         assert!(
             addon.contains(
-                "while (weaveffi_kv_Store_ListKeysIterator_next(result, &iter_item, &iter_err)) {"
+                "weaveffi_napi_iter_state* iter_state = (weaveffi_napi_iter_state*)calloc(1, sizeof(weaveffi_napi_iter_state));"
             ),
-            "drain must pass the error slot to next: {addon}"
+            "launch must box the handle into a state cell: {addon}"
         );
-        // A non-zero slot after the drain throws the code-carrying error
-        // (list_keys is `throws`, so the JS layer maps it to the domain).
+        assert!(
+            addon.contains(
+                "napi_create_external(env, iter_state, weaveffi_kv_Store_list_keys_napi_iter_finalize, NULL, &ret);"
+            ),
+            "launch must wrap the cell in an external with a finalizer: {addon}"
+        );
+
+        // Per-iterator `next` and `destroy` entry points hang off the model's
+        // iterator-tag symbols and export under the wrapper's addon name.
+        assert!(
+            addon.contains(
+                "static napi_value Napi_weaveffi_kv_Store_ListKeysIterator_next(napi_env env, napi_callback_info info) {"
+            ),
+            "missing the per-iterator next entry point: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static napi_value Napi_weaveffi_kv_Store_ListKeysIterator_destroy(napi_env env, napi_callback_info info) {"
+            ),
+            "missing the per-iterator destroy entry point: {addon}"
+        );
+        assert!(
+            addon.contains("\"Store_list_keys_iterNext\"")
+                && addon.contains("\"Store_list_keys_iterDestroy\""),
+            "next/destroy must export under the wrapper's addon names: {addon}"
+        );
+
+        // One producer pull per call, threading the per-step error slot.
+        assert!(
+            addon.contains(
+                "if (!weaveffi_kv_Store_ListKeysIterator_next((weaveffi_kv_Store_ListKeysIterator*)state->iter, &iter_item, &iter_err)) {"
+            ),
+            "next must issue exactly one producer pull with the error slot: {addon}"
+        );
+        // A per-step fault throws the code-carrying error (list_keys is
+        // `throws`, so the JS layer maps it to the domain class).
         assert!(
             addon.contains(
                 "napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));"
             ),
-            "drain must throw the per-step error: {addon}"
+            "next must throw the per-step error: {addon}"
         );
-        // The iterator is destroyed before the check, so the error path does
-        // not leak the handle.
-        let destroy = addon
-            .find("weaveffi_kv_Store_ListKeysIterator_destroy(result);")
-            .expect("drain must destroy the iterator");
-        let check = addon
-            .find("if (iter_err.code != 0) {")
-            .expect("drain must check iter_err");
+        // Each yielded string element is freed after the JS string exists.
+        let convert = addon
+            .find("napi_create_string_utf8(env, iter_item ? iter_item : \"\", NAPI_AUTO_LENGTH, &ret);")
+            .expect("next must convert the yielded element");
+        let free = addon
+            .find("weaveffi_free_string((char*)iter_item);")
+            .expect("next must free the yielded string");
         assert!(
-            destroy < check,
-            "destroy must precede the error check: {addon}"
+            convert < free,
+            "the element must be converted before it is freed: {addon}"
+        );
+
+        // Every destroy site nulls the cell first, so exhaustion, explicit
+        // destroy, and the finalizer never double-free.
+        assert!(
+            addon.contains(
+                "weaveffi_kv_Store_ListKeysIterator_destroy((weaveffi_kv_Store_ListKeysIterator*)state->iter);"
+            ),
+            "destroy must release through the state cell: {addon}"
+        );
+        assert!(
+            addon.contains("if (state != NULL && state->iter != NULL) {"),
+            "explicit destroy must guard against double-destroy: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "static void weaveffi_kv_Store_list_keys_napi_iter_finalize(napi_env env, void* data, void* hint) {"
+            ),
+            "abandoned iterators must be reclaimed by a finalizer: {addon}"
+        );
+    }
+
+    #[test]
+    fn iterator_js_class_implements_protocol() {
+        let index = index_for(&make_api(vec![kv_module()]), true);
+
+        // The shared class implements the iterator protocol lazily.
+        assert!(
+            index.contains("class WeaveFFIIterator {"),
+            "missing the shared iterator class: {index}"
+        );
+        assert!(
+            index.contains("[Symbol.iterator]() {"),
+            "the class must be iterable: {index}"
+        );
+        assert!(
+            index.contains("return(value) {"),
+            "the class must clean up on early exit: {index}"
+        );
+        // One native pull per step, routed through the rebranding helper.
+        assert!(
+            index.contains("const _v = __invoke(this._nextFn, [this._ext], this._map);"),
+            "next() must issue one native pull: {index}"
+        );
+        // Early exit destroys the native handle exactly once.
+        assert!(
+            index.contains("this._destroyFn(this._ext);"),
+            "return() must destroy the native handle: {index}"
+        );
+
+        // The method wrapper launches, then hands the external to the class
+        // with its per-iterator next/destroy bindings and error mapping.
+        assert!(
+            index.contains(
+                "const _it = __invoke(addon.Store_list_keys, [this._handle, prefix], __kvErrorFrom);"
+            ),
+            "the wrapper must launch the native iterator: {index}"
+        );
+        assert!(
+            index.contains(
+                "return new WeaveFFIIterator(_it, addon.Store_list_keys_iterNext, addon.Store_list_keys_iterDestroy, __kvErrorFrom, null);"
+            ),
+            "the wrapper must return the lazy iterator: {index}"
+        );
+    }
+
+    #[test]
+    fn iterator_dts_is_iterable_iterator() {
+        let dts = dts_for(&make_api(vec![kv_module()]), true);
+        assert!(
+            dts.contains("IterableIterator<string>"),
+            "iter<string> must surface as IterableIterator<string>: {dts}"
+        );
+        assert!(
+            !dts.contains("string[]"),
+            "iter<T> must not surface as an array: {dts}"
         );
     }
 

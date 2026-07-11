@@ -54,6 +54,16 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+@inline(__always)
+func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
+}
+
+@inline(__always)
+func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+}
+
 private final class ContinuationRef<T, E: Error> {
     let value: CheckedContinuation<T, E>
     init(_ value: CheckedContinuation<T, E>) { self.value = value }
@@ -156,7 +166,14 @@ public class Document {
         var outLen: Int = 0
         let rv = weaveffi_docs_Document_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return (0..<outLen).map { String(cString: rv[$0]!) }
+        defer { wvFreeArray(rv, outLen) }
+        var items: [String] = []
+        items.reserveCapacity(outLen)
+        for i in 0..<outLen {
+            items.append(String(cString: rv[i]!))
+            weaveffi_free_string(rv[i])
+        }
+        return items
     }
 }
 
@@ -200,10 +217,10 @@ public class DocumentBuilder {
     }
 
     public func build() throws -> Document {
-        guard let id = _id else { fatalError("missing field: id") }
-        guard let title = _title else { fatalError("missing field: title") }
-        guard let status = _status else { fatalError("missing field: status") }
-        guard let tags = _tags else { fatalError("missing field: tags") }
+        guard let id = _id else { throw WeaveFFIError.error(code: -1, message: "missing field: id") }
+        guard let title = _title else { throw WeaveFFIError.error(code: -1, message: "missing field: title") }
+        guard let status = _status else { throw WeaveFFIError.error(code: -1, message: "missing field: status") }
+        guard let tags = _tags else { throw WeaveFFIError.error(code: -1, message: "missing field: tags") }
         var err = weaveffi_error(code: 0, message: nil)
         let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
         defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }

@@ -27,6 +27,8 @@ export interface Numerics {
   readonly h: bigint;
   readonly i: number;
   readonly j: number;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /** An algebraic shape (sum type with associated data) */

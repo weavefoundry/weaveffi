@@ -1,31 +1,47 @@
-//! Type-reference resolution: rewrites bare struct names into enum or
-//! interface references and qualifies cross-module references with the
-//! owning module's dot-joined path. Runs after the rule checks pass.
+//! Type-reference resolution: rewrites parsed [`TypeRef::Named`] references
+//! into their resolved kinds ([`TypeRef::Record`], [`TypeRef::RichEnum`],
+//! [`TypeRef::Enum`], or [`TypeRef::Interface`]) and qualifies cross-module
+//! references with the owning module's dot-joined path. Runs after the rule
+//! checks pass, so every name is known to resolve.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use weaveffi_ir::ir::{Api, Function, Module, TypeRef};
 
-/// How a bare type name resolves: a struct, a C-style enum, an algebraic
+/// How a bare type name resolves: a record, a C-style enum, an algebraic
 /// (rich) enum, or an interface. The kinds differ in their C ABI lowering: a
-/// C-style enum is a by-value integer ([`TypeRef::Enum`]), a rich enum is an
-/// opaque object pointer (kept as [`TypeRef::Struct`]), and an interface is
-/// an opaque object reference with its own ownership convention
-/// ([`TypeRef::Interface`]), so the resolver must know which to emit for
-/// every reference.
+/// C-style enum is a by-value integer ([`TypeRef::Enum`]), a record and a rich
+/// enum are opaque object pointers ([`TypeRef::Record`] /
+/// [`TypeRef::RichEnum`]), and an interface is an opaque object reference with
+/// its own ownership convention ([`TypeRef::Interface`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TypeKind {
-    Struct,
+    Record,
     Enum,
     RichEnum,
     Interface,
 }
 
+impl TypeKind {
+    /// Build the resolved [`TypeRef`] for this kind with the given (possibly
+    /// module-qualified) name.
+    fn type_ref(self, name: String) -> TypeRef {
+        match self {
+            TypeKind::Record => TypeRef::Record(name),
+            TypeKind::Enum => TypeRef::Enum(name),
+            TypeKind::RichEnum => TypeRef::RichEnum(name),
+            TypeKind::Interface => TypeRef::Interface(name),
+        }
+    }
+}
+
 /// Resolve every type reference in `api` in place.
 ///
-/// Bare names that refer to C-style enums are rewritten to [`TypeRef::Enum`]
-/// (by-value lowering), names that refer to interfaces are rewritten to
-/// [`TypeRef::Interface`], and cross-module references are qualified with the
-/// owning module's dot-joined path. Runs after the rule checks pass.
+/// Every [`TypeRef::Named`] is rewritten to the variant matching its
+/// declaration: [`TypeRef::Record`] for structs, [`TypeRef::RichEnum`] for
+/// algebraic enums, [`TypeRef::Enum`] for C-style enums, and
+/// [`TypeRef::Interface`] for interfaces. Cross-module references are
+/// qualified with the owning module's dot-joined path. Runs after the rule
+/// checks pass, so no unresolved `Named` reference remains afterwards.
 pub fn resolve_type_refs(api: &mut Api) {
     let mut global_types: BTreeMap<String, (String, TypeKind)> = BTreeMap::new();
     for module in &api.modules {
@@ -50,7 +66,7 @@ fn index_module_types(
     let path = join_module_path(parent_path, &module.name);
     for s in &module.structs {
         out.entry(s.name.clone())
-            .or_insert((path.clone(), TypeKind::Struct));
+            .or_insert((path.clone(), TypeKind::Record));
     }
     for e in &module.enums {
         let kind = if e.is_rich() {
@@ -79,24 +95,7 @@ fn resolve_module_type_refs(
     global_types: &BTreeMap<String, (String, TypeKind)>,
 ) {
     let module_path = join_module_path(parent_path, &module.name);
-    // Only *C-style* enums are rewritten to `TypeRef::Enum` (by-value lowering).
-    // A rich (algebraic) enum is left as `TypeRef::Struct` because it crosses
-    // the ABI as an opaque object pointer, exactly like a struct, so it does
-    // not belong in `local_enum_names`.
-    let local_enum_names: BTreeSet<String> = module
-        .enums
-        .iter()
-        .filter(|e| !e.is_rich())
-        .map(|e| e.name.clone())
-        .collect();
-    let local_struct_names: BTreeSet<String> =
-        module.structs.iter().map(|s| s.name.clone()).collect();
-    let local_interface_names: BTreeSet<String> =
-        module.interfaces.iter().map(|i| i.name.clone()).collect();
     let ctx = ResolveCtx {
-        local_enum_names: &local_enum_names,
-        local_struct_names: &local_struct_names,
-        local_interface_names: &local_interface_names,
         current_module: &module_path,
         global_types,
     };
@@ -136,6 +135,11 @@ fn resolve_module_type_refs(
             }
         }
     }
+    for cb in &mut module.callbacks {
+        for p in &mut cb.params {
+            resolve_single_type_ref(&mut p.ty, &ctx);
+        }
+    }
     for child in &mut module.modules {
         resolve_module_type_refs(child, &module_path, global_types);
     }
@@ -144,9 +148,6 @@ fn resolve_module_type_refs(
 /// Bundled lookup tables for resolving a single type reference within one
 /// module, so the recursive resolver does not thread several parameters.
 struct ResolveCtx<'a> {
-    local_enum_names: &'a BTreeSet<String>,
-    local_struct_names: &'a BTreeSet<String>,
-    local_interface_names: &'a BTreeSet<String>,
     current_module: &'a str,
     global_types: &'a BTreeMap<String, (String, TypeKind)>,
 }
@@ -164,39 +165,25 @@ fn join_module_path(parent_path: &str, name: &str) -> String {
 
 fn resolve_single_type_ref(ty: &mut TypeRef, ctx: &ResolveCtx<'_>) {
     match ty {
-        // A bare reference to a local C-style enum becomes a by-value `Enum`;
-        // a local interface becomes an `Interface` object reference. A local
-        // rich enum or struct is left as `Struct` (opaque pointer).
-        TypeRef::Struct(name) if ctx.local_enum_names.contains(name.as_str()) => {
-            let name = std::mem::take(name);
-            *ty = TypeRef::Enum(name);
-        }
-        TypeRef::Struct(name) if ctx.local_interface_names.contains(name.as_str()) => {
-            let name = std::mem::take(name);
-            *ty = TypeRef::Interface(name);
-        }
-        TypeRef::Struct(name) if !ctx.local_struct_names.contains(name.as_str()) => {
+        // A parsed bare name resolves against the global type index; a
+        // reference declared outside the current module is additionally
+        // qualified with the owner's dot-joined path so the C ABI lowering
+        // and every generator emit the owner's symbol prefix.
+        TypeRef::Named(name) => {
             if let Some((mod_name, kind)) = ctx.global_types.get(name.as_str()) {
-                if mod_name != ctx.current_module {
-                    let qualified = format!("{mod_name}.{name}");
-                    match kind {
-                        // C-style enum: by-value reference.
-                        TypeKind::Enum => *ty = TypeRef::Enum(qualified),
-                        // Interface: object reference with the owner's path.
-                        TypeKind::Interface => *ty = TypeRef::Interface(qualified),
-                        // Struct or rich enum: opaque-pointer reference, kept
-                        // as `Struct` with the owner's qualified path.
-                        TypeKind::Struct | TypeKind::RichEnum => *name = qualified,
-                    }
-                }
+                let resolved_name = if mod_name == ctx.current_module {
+                    std::mem::take(name)
+                } else {
+                    format!("{mod_name}.{name}")
+                };
+                *ty = kind.type_ref(resolved_name);
             }
         }
-        // A typed handle's target is always a struct. When that struct lives in
-        // a different module (e.g. `handle<Store>` in a `kv.stats` submodule
-        // referring to `kv.Store`), qualify it to the owner's path so the C ABI
-        // lowering and every generator emit the owner's symbol prefix rather
-        // than the referrer's. Mirrors the `Struct` arm above.
-        TypeRef::TypedHandle(name) if !ctx.local_struct_names.contains(name.as_str()) => {
+        // A typed handle's target may live in a different module (e.g.
+        // `handle<Store>` in a `kv.stats` submodule referring to `kv.Store`);
+        // qualify it to the owner's path so the C ABI lowering emits the
+        // owner's symbol prefix rather than the referrer's.
+        TypeRef::TypedHandle(name) => {
             if let Some((mod_name, _kind)) = ctx.global_types.get(name.as_str()) {
                 if mod_name != ctx.current_module {
                     *name = format!("{mod_name}.{name}");

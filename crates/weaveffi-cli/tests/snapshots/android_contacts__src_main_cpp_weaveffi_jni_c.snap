@@ -46,13 +46,13 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Contact_nativeCreate(JNIEnv* env, jcla
         email_chars = (*env)->GetStringUTFChars(env, email, NULL);
     }
     weaveffi_contacts_Contact* rv = weaveffi_contacts_Contact_create((int64_t)id, first_name_chars, last_name_chars, email_chars, (int32_t)contact_type, &err);
+    (*env)->ReleaseStringUTFChars(env, first_name, first_name_chars);
+    (*env)->ReleaseStringUTFChars(env, last_name, last_name_chars);
+    if (email != NULL) { (*env)->ReleaseStringUTFChars(env, email, email_chars); }
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
-    (*env)->ReleaseStringUTFChars(env, first_name, first_name_chars);
-    (*env)->ReleaseStringUTFChars(env, last_name, last_name_chars);
-    if (email != NULL) { (*env)->ReleaseStringUTFChars(env, email, email_chars); }
     return (jlong)(intptr_t)rv;
 }
 
@@ -111,13 +111,13 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_ContactBook_nativeAdd(JNIEnv* env, jcl
         email_chars = (*env)->GetStringUTFChars(env, email, NULL);
     }
     weaveffi_contacts_Contact* rv = weaveffi_contacts_ContactBook_add((const weaveffi_contacts_ContactBook*)(intptr_t)selfHandle, first_name_chars, last_name_chars, email_chars, (int32_t)contact_type, &err);
+    (*env)->ReleaseStringUTFChars(env, first_name, first_name_chars);
+    (*env)->ReleaseStringUTFChars(env, last_name, last_name_chars);
+    if (email != NULL) { (*env)->ReleaseStringUTFChars(env, email, email_chars); }
     if (err.code != 0) {
         throw_weaveffi_contacts_ContactsError(env, &err);
         return 0;
     }
-    (*env)->ReleaseStringUTFChars(env, first_name, first_name_chars);
-    (*env)->ReleaseStringUTFChars(env, last_name, last_name_chars);
-    if (email != NULL) { (*env)->ReleaseStringUTFChars(env, email, email_chars); }
     return (jlong)(intptr_t)rv;
 }
 
@@ -134,13 +134,17 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_ContactBook_nativeGet(JNIEnv* env, jcl
 JNIEXPORT jlongArray JNICALL Java_com_weaveffi_ContactBook_nativeList(JNIEnv* env, jclass clazz, jlong selfHandle) {
     weaveffi_error err = {0, NULL};
     size_t out_len = 0;
-    const int64_t* rv = (const int64_t*)weaveffi_contacts_ContactBook_list((const weaveffi_contacts_ContactBook*)(intptr_t)selfHandle, &out_len, &err);
+    void* const* rv = (void* const*)weaveffi_contacts_ContactBook_list((const weaveffi_contacts_ContactBook*)(intptr_t)selfHandle, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
     }
     jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
-    if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }
+    for (jsize _li = 0; result && rv && _li < (jsize)out_len; _li++) {
+        jlong _lv = (jlong)(intptr_t)rv[_li];
+        (*env)->SetLongArrayRegion(env, result, _li, 1, &_lv);
+    }
+    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));
     return result;
 }
 

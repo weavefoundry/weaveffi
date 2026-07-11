@@ -244,7 +244,9 @@ module WeaveFFI
     def expires_at
       result = WeaveFFI.weaveffi_kv_Entry_get_expires_at(@handle)
       return nil if result.null?
-      result.read_int64
+      value = result.read_int64
+      WeaveFFI.weaveffi_free_bytes(result, FFI.type_size(:int64))
+      value
     end
 
     # Free-form labels attached to the entry
@@ -253,7 +255,11 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_kv_Entry_get_tags(@handle, out_len)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| p.null? ? '' : p.read_string }
+      ptrs = result.read_array_of_pointer(len)
+      items = ptrs.map { |p| p.null? ? '' : p.read_string }
+      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
 
     # Arbitrary string-valued metadata pairs
@@ -266,7 +272,14 @@ module WeaveFFI
       keys_ptr = out_keys.read_pointer
       vals_ptr = out_values.read_pointer
       return {} if keys_ptr.null? || vals_ptr.null?
-      keys_ptr.read_array_of_pointer(len).zip(vals_ptr.read_array_of_pointer(len)).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v.null? ? '' : v.read_string }
+      keys = keys_ptr.read_array_of_pointer(len)
+      vals = vals_ptr.read_array_of_pointer(len)
+      hash = keys.zip(vals).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v.null? ? '' : v.read_string }
+      keys.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      vals.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      WeaveFFI.weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))
+      WeaveFFI.weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:pointer))
+      hash
     end
   end
 
@@ -415,31 +428,39 @@ module WeaveFFI
     end
 
     # Stream every key, optionally filtered by a prefix
+    # Returns a lazy Enumerator that streams one element per pull; call
+    # `.to_a` to collect eagerly. The underlying producer iterator is
+    # launched on the first pull, so launch errors raise at that point
+    # rather than when this method returns. The iterator handle is
+    # released exactly once, when iteration finishes or is abandoned
+    # early (for example by `break`).
     def list_keys(prefix)
-      err = ErrorStruct.new
-      iter = WeaveFFI.weaveffi_kv_Store_list_keys(@handle, prefix, err)
-      WeaveFFI.check_kv_error!(err)
-      items = []
-      return items if iter.null?
-      loop do
-        out_item = FFI::MemoryPointer.new(:pointer)
-        item_err = ErrorStruct.new
-        has_item = WeaveFFI.weaveffi_kv_Store_ListKeysIterator_next(iter, out_item, item_err)
-        if item_err[:code] != 0
-          WeaveFFI.weaveffi_kv_Store_ListKeysIterator_destroy(iter)
-          WeaveFFI.check_kv_error!(item_err)
-        end
-        break if has_item.zero?
-        item_ptr = out_item.read_pointer
-        if item_ptr.null?
-          items << ''
-        else
-          items << item_ptr.read_string
-          WeaveFFI.weaveffi_free_string(item_ptr)
+      Enumerator.new do |y|
+        err = ErrorStruct.new
+        iter = WeaveFFI.weaveffi_kv_Store_list_keys(@handle, prefix, err)
+        begin
+          WeaveFFI.check_kv_error!(err)
+          unless iter.null?
+            loop do
+              out_item = FFI::MemoryPointer.new(:pointer)
+              item_err = ErrorStruct.new
+              has_item = WeaveFFI.weaveffi_kv_Store_ListKeysIterator_next(iter, out_item, item_err)
+              WeaveFFI.check_kv_error!(item_err)
+              break if has_item.zero?
+              item_ptr = out_item.read_pointer
+              if item_ptr.null?
+                y << ''
+              else
+                item = item_ptr.read_string
+                WeaveFFI.weaveffi_free_string(item_ptr)
+                y << item
+              end
+            end
+          end
+        ensure
+          WeaveFFI.weaveffi_kv_Store_ListKeysIterator_destroy(iter) unless iter.null?
         end
       end
-      WeaveFFI.weaveffi_kv_Store_ListKeysIterator_destroy(iter)
-      items
     end
 
     # Return the number of live entries in the store
@@ -458,7 +479,8 @@ module WeaveFFI
     end
 
     # Reclaim space asynchronously; returns the number of bytes reclaimed
-    # Blocks until the async producer completes (cancellation token not exposed; pass-through is NULL).
+    # Blocks the current thread until the async producer completes; the
+    # result (or error) is delivered through the completion callback (cancellation token not exposed; pass-through is NULL).
     def compact()
       queue = Queue.new
       callback = FFI::Function.new(:void, [:pointer, :pointer, :int64]) do |_context, err_ptr, result|
