@@ -3,6 +3,7 @@ name: Bench
 on:
   push:
     branches: [ main ]
+  pull_request:
 
 jobs:
   bench:
@@ -20,7 +21,23 @@ jobs:
         with:
           cache-targets: true
 
+      # PR smoke run: criterion's `--test` mode executes every benchmark
+      # body exactly once, with no warmup or sampling. This catches
+      # panics and stale fixtures (clippy already compile-checks the
+      # harnesses on PRs, but only execution catches runtime failures)
+      # without spending minutes collecting numbers that are too noisy
+      # to compare on shared runners.
+      - name: Run cargo bench (smoke)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          cargo bench -p weaveffi-core --bench codegen_bench -- --test
+          cargo bench -p weaveffi-cli  --bench generate_bench -- --test
+
+      # Full sampled run on main; the uploaded artifact is the historical
+      # record of the numbers.
       - name: Run cargo bench
+        if: github.event_name == 'push'
         # The two criterion harnesses (`weaveffi-core` and `weaveffi-cli`)
         # accept `--noplot`; the workspace `cargo bench --workspace` flag
         # also fans out to the default `libtest` harness in every other
@@ -36,6 +53,7 @@ jobs:
           } 2>&1 | tee bench.txt
 
       - name: Upload bench results
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: bench-results
