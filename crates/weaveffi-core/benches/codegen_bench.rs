@@ -114,13 +114,15 @@ fn calculator_api() -> Api {
     }
 }
 
-/// 10 modules x (50 functions + 5 structs + 3 enums) each
+/// 10 modules x (50 functions + 5 structs + 3 enums) each. Type names are
+/// namespaced per module (`M0Struct0`, ...) because bare type names must be
+/// unique across the whole API.
 fn large_api() -> Api {
     let modules = (0..10)
         .map(|m| {
             let structs: Vec<StructDef> = (0..5)
                 .map(|s| StructDef {
-                    name: format!("Struct{s}"),
+                    name: format!("M{m}Struct{s}"),
                     doc: None,
                     fields: vec![
                         StructField {
@@ -148,7 +150,7 @@ fn large_api() -> Api {
 
             let enums: Vec<EnumDef> = (0..3)
                 .map(|e| EnumDef {
-                    name: format!("Enum{e}"),
+                    name: format!("M{m}Enum{e}"),
                     doc: None,
                     variants: vec![
                         EnumVariant {
@@ -192,14 +194,14 @@ fn large_api() -> Api {
                         },
                         Param {
                             name: "c".to_string(),
-                            ty: TypeRef::Struct("Struct0".to_string()),
+                            ty: TypeRef::Struct(format!("M{m}Struct0")),
                             mutable: false,
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
-                        "Struct1".to_string(),
-                    )))),
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(format!(
+                        "M{m}Struct1"
+                    ))))),
                     r#async: false,
                     cancellable: false,
                     throws: false,
