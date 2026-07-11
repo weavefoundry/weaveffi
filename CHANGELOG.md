@@ -1,3 +1,13 @@
+## [0.16.0](https://github.com/weavefoundry/weaveffi/compare/v0.15.0...v0.16.0) (2026-07-11)
+
+### ⚠ BREAKING CHANGES
+
+* rebuild generators on a shared marshalling plan (#30)
+
+### Features
+
+* rebuild generators on a shared marshalling plan ([#30](https://github.com/weavefoundry/weaveffi/issues/30)) ([eb4c4aa](https://github.com/weavefoundry/weaveffi/commit/eb4c4aa14ff8b74b8878f7b149342d0079074685))
+
 ## [0.15.0](https://github.com/weavefoundry/weaveffi/compare/v0.14.1...v0.15.0) (2026-07-10)
 
 ### ⚠ BREAKING CHANGES
