@@ -761,7 +761,9 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                             "{ind}_state[\"val\"] = _bytes_to_string(result)\n"
                         ));
                     }
-                    TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
+                    TypeRef::Record(name)
+                    | TypeRef::RichEnum(name)
+                    | TypeRef::TypedHandle(name) => {
                         let name = local_type_name(name);
                         out.push_str(&format!("{ind}if not result:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
@@ -1778,14 +1780,18 @@ fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
         // duration of the call, so opaque pointers (including interface
         // references) pass through raw rather than being wrapped in an owning
         // class whose __del__ would free them.
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => n.into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else None")
             }
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
             | TypeRef::Interface(_) => n.into(),
             TypeRef::List(elem) => {
                 let read = py_read_element(&format!("{n}[_i]"), elem);
@@ -2265,7 +2271,9 @@ fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             format!("*[_string_to_bytes(v) for v in {name}]")
         }
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => {
             format!("*[v._ptr for v in {name}]")
         }
@@ -2281,7 +2289,9 @@ fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
             format!("*[_string_to_bytes({var}) for {var} in {list_name}]")
         }
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => {
             format!("*[{var}._ptr for {var} in {list_name}]")
         }
@@ -2394,14 +2404,18 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         }
         // Object parameters are borrowed: pass the wrapper's raw pointer;
         // the callee never takes ownership.
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => {
             vec![format!("{name}._ptr")]
         }
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_{name}_c")],
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
             | TypeRef::Interface(_) => {
                 vec![format!("{name}._ptr if {name} is not None else None")]
             }
@@ -2602,9 +2616,7 @@ fn render_list_return(out: &mut String, inner: &TypeRef, ind: &str, empty: &str)
         w.line(format!("return {empty}"));
     });
     let elem = py_read_owned_element("_result[_i]", inner);
-    w.line(format!(
-        "_items = [{elem} for _i in range(_out_len.value)]"
-    ));
+    w.line(format!("_items = [{elem} for _i in range(_out_len.value)]"));
     w.line(format!(
         "_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
         py_owned_elem_scalar(inner)
@@ -6242,8 +6254,10 @@ mod tests {
             "should create a future: {code}"
         );
         assert!(
-            code.contains("_cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, \
-                           ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)"),
+            code.contains(
+                "_cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, \
+                           ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)"
+            ),
             "should build the CFUNCTYPE trampoline: {code}"
         );
         assert!(
@@ -6653,10 +6667,7 @@ mod tests {
         );
         // One producer pull per step, and disposal is single-shot via
         // exhaustion, close(), or garbage collection.
-        assert!(
-            py.contains("def __next__(self):"),
-            "missing __next__: {py}"
-        );
+        assert!(py.contains("def __next__(self):"), "missing __next__: {py}");
         assert!(
             py.contains("_next_fn = _lib.weaveffi_data_ListItemsIterator_next"),
             "missing per-step next call: {py}"

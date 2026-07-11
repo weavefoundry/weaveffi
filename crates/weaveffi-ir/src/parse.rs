@@ -1076,10 +1076,7 @@ modules:
             TypeRef::Optional(Box::new(TypeRef::StringUtf8))
         );
         assert_eq!(product.fields[3].ty, TypeRef::F64);
-        assert_eq!(
-            product.fields[4].ty,
-            TypeRef::Named("Category".to_string())
-        );
+        assert_eq!(product.fields[4].ty, TypeRef::Named("Category".to_string()));
         assert_eq!(
             product.fields[5].ty,
             TypeRef::List(Box::new(TypeRef::StringUtf8))

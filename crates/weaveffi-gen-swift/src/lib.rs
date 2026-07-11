@@ -888,7 +888,9 @@ fn render_swift_wrapper(
 
     // Ownership helpers: release a producer-allocated array buffer (after its
     // elements have been copied or adopted) and a boxed optional scalar.
-    out.push_str("@inline(__always)\nfunc wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {\n");
+    out.push_str(
+        "@inline(__always)\nfunc wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {\n",
+    );
     out.push_str("    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)\n");
     out.push_str("}\n\n");
 
@@ -1765,13 +1767,17 @@ fn write_swift_params_sig(out: &mut String, params: &[ParamBinding], ctx: SwiftC
 /// the owning Swift class would `*_destroy` a borrowed handle on ARC release.
 fn swift_cb_param_type(ty: &TypeRef, ctx: SwiftCtx) -> String {
     match ty {
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-            "OpaquePointer?".into()
-        }
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => "OpaquePointer?".into(),
         TypeRef::Optional(inner)
             if matches!(
                 inner.as_ref(),
-                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+                TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_)
             ) =>
         {
             "OpaquePointer?".into()
@@ -1810,7 +1816,10 @@ fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
                 "{n0} != nil ? [UInt8](UnsafeBufferPointer(start: {n0}, count: Int({n1}))) : []"
             )
         }
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n0,
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => n0,
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 format!("{n0}.map {{ String(cString: $0) }}")
@@ -1824,7 +1833,10 @@ fn swift_cb_arg_expr(p: &ParamBinding, ctx: SwiftCtx) -> String {
                 format!("{n0}.map {{ {local}(rawValue: $0.pointee.rawValue)! }}")
             }
             TypeRef::Bool => format!("{n0}.map {{ $0.pointee != 0 }}"),
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n0,
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => n0,
             _ => format!("{n0}.map {{ $0.pointee }}"),
         },
         TypeRef::List(inner) => {
@@ -2060,7 +2072,10 @@ fn render_swift_async_function(
                         e = enum_name
                     ));
                 }
-                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => {
                     out.push_str(&format!(
                         "{}let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
                         base,
@@ -2090,7 +2105,10 @@ fn render_swift_async_function(
                     ));
                 } else if matches!(
                     k.as_ref(),
-                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+                    TypeRef::Record(_)
+                        | TypeRef::RichEnum(_)
+                        | TypeRef::TypedHandle(_)
+                        | TypeRef::Interface(_)
                 ) {
                     out.push_str(&format!(
                         "{}let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
@@ -2108,7 +2126,10 @@ fn render_swift_async_function(
                     ));
                 } else if matches!(
                     v.as_ref(),
-                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_)
+                    TypeRef::Record(_)
+                        | TypeRef::RichEnum(_)
+                        | TypeRef::TypedHandle(_)
+                        | TypeRef::Interface(_)
                 ) {
                     out.push_str(&format!(
                         "{}let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
@@ -2367,7 +2388,10 @@ fn render_async_resume_result(
                     indent
                 ));
             }
-            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name) => {
                 let name = ctx.ty_name(local_type_name(name));
                 out.push_str(&format!(
                     "{}contRef.value.resume(returning: result.map {{ {}(ptr: $0) }})\n",
@@ -2424,7 +2448,10 @@ fn render_async_resume_result(
                         indent, name
                     ));
                 }
-                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+                TypeRef::Record(name)
+                | TypeRef::RichEnum(name)
+                | TypeRef::TypedHandle(name)
+                | TypeRef::Interface(name) => {
                     let name = ctx.ty_name(local_type_name(name));
                     out.push_str(&format!(
                         "{}contRef.value.resume(returning: (0..<len).map {{ {}(ptr: result[$0]!) }})\n",
@@ -2498,17 +2525,19 @@ fn build_c_call_args(params: &[ParamBinding], c_prefix: &str, module_name: &str)
             // An interface param borrows the wrapper's handle for the call,
             // exactly like the struct wrappers do; the receiver stays alive
             // for the duration of the call frame that owns it.
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-                args.push(format!("{}.ptr", p.name))
-            }
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => args.push(format!("{}.ptr", p.name)),
             TypeRef::Enum(enum_name) => args.push(format!(
                 "{c_prefix}_{}_{}({}.rawValue)",
                 module_name, enum_name, p.name
             )),
             TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-                    args.push(format!("{}?.ptr", p.name))
-                }
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => args.push(format!("{}?.ptr", p.name)),
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => args.push(format!("{}_ptr", p.name)),
                 TypeRef::Bytes | TypeRef::BorrowedBytes => {
                     args.push(format!("{}_ptr", p.name));
@@ -2764,9 +2793,10 @@ fn swift_c_ptr_element(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "UnsafePointer<CChar>?".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "UInt8".to_string(),
         TypeRef::Enum(_) => "Int32".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_) => {
-            "OpaquePointer?".to_string()
-        }
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => "OpaquePointer?".to_string(),
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "OpaquePointer?".to_string()
         }
@@ -3109,7 +3139,10 @@ fn is_string_elem(ty: &TypeRef) -> bool {
 fn list_array_source(inner: &TypeRef, name: &str) -> String {
     match inner {
         TypeRef::Enum(_) => format!("{name}_raw"),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             format!("{name}_ptrs")
         }
         _ if is_string_elem(inner) => format!("{name}_cstrs"),
@@ -3120,7 +3153,10 @@ fn list_array_source(inner: &TypeRef, name: &str) -> String {
 fn map_array_source(ty: &TypeRef, name: &str, suffix: &str) -> String {
     match ty {
         TypeRef::Enum(_) => format!("{name}_{suffix}Raw"),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             format!("{name}_{suffix}Ptrs")
         }
         _ if is_string_elem(ty) => format!("{name}_{suffix}Cstrs"),
@@ -3210,7 +3246,10 @@ fn render_buffered_call(
                         e = enum_name
                     ));
                 }
-                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                TypeRef::Record(_)
+                | TypeRef::RichEnum(_)
+                | TypeRef::TypedHandle(_)
+                | TypeRef::Interface(_) => {
                     out.push_str(&format!(
                         "        let {n}_ptrs = {n}.map {{ $0.ptr }}\n",
                         n = p.name
@@ -3234,7 +3273,10 @@ fn render_buffered_call(
                             n = p.name, m = module_name, e = e
                         ));
                     }
-                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                    TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_) => {
                         out.push_str(&format!(
                             "        let {n}_keysPtrs = {n}_keys.map {{ $0.ptr }}\n",
                             n = p.name
@@ -3249,7 +3291,10 @@ fn render_buffered_call(
                             n = p.name, m = module_name, e = e
                         ));
                     }
-                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                    TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::TypedHandle(_)
+                    | TypeRef::Interface(_) => {
                         out.push_str(&format!(
                             "        let {n}_valuesPtrs = {n}_values.map {{ $0.ptr }}\n",
                             n = p.name
@@ -6246,7 +6291,13 @@ mod tests {
 
     #[test]
     fn swift_iterator_emits_lazy_sequence_class() {
-        let out = render(&iter_api(false), "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render(
+            &iter_api(false),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         // A final class conforming to Sequence & IteratorProtocol owns the
         // handle; the wrapper returns it instead of a drained array.
         assert!(
@@ -6274,7 +6325,13 @@ mod tests {
 
     #[test]
     fn swift_iterator_next_pulls_one_element_and_destroys() {
-        let out = render(&iter_api(false), "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render(
+            &iter_api(false),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         // Exactly one producer `next` call, inside `next()`.
         assert_eq!(
             out.matches("weaveffi_data_ListItemsIterator_next(").count(),
@@ -6315,7 +6372,13 @@ mod tests {
 
     #[test]
     fn swift_throwing_iterator_stores_per_next_error() {
-        let out = render(&iter_api(true), "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+        let out = render(
+            &iter_api(true),
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        );
         // Launch errors throw through the domain checker in the wrapper.
         assert!(
             out.contains("public static func listItems() throws -> DataListItemsIterator {"),

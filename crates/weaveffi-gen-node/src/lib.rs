@@ -28,12 +28,11 @@ use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::{type_name as error_type_name, ERROR_BRAND};
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
-    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    StructBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
-use weaveffi_core::plan::ElemFree;
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::ElemFree;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
@@ -660,7 +659,16 @@ fn render_iterator_napi_fns(
         }
         TypeRef::Record(name) => {
             emit_struct_to_object(
-                out, "env", name, "iter_item", "ret", module, prefix, structs, "  ", true,
+                out,
+                "env",
+                name,
+                "iter_item",
+                "ret",
+                module,
+                prefix,
+                structs,
+                "  ",
+                true,
             );
         }
         TypeRef::RichEnum(_) => {
@@ -3190,7 +3198,10 @@ fn emit_ret_to_napi(
         // A returned interface or rich enum is an owned object reference
         // surfaced as the raw handle; the JS loader wraps it in its class
         // (which owns disposal), so the addon must not destroy it here.
-        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Interface(_) | TypeRef::RichEnum(_) => {
+        TypeRef::TypedHandle(_)
+        | TypeRef::Handle
+        | TypeRef::Interface(_)
+        | TypeRef::RichEnum(_) => {
             out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
         }
         TypeRef::Record(name) => {
@@ -3827,7 +3838,12 @@ fn emit_wrapper_body_js(
 /// named `new` becomes the JS `constructor`; every other constructor becomes
 /// a static factory; methods pass the wrapped handle as the leading addon
 /// argument; statics are static methods.
-fn render_interface_class_js(out: &mut String, i: &InterfaceBinding, m: &ModuleBinding, strip: bool) {
+fn render_interface_class_js(
+    out: &mut String,
+    i: &InterfaceBinding,
+    m: &ModuleBinding,
+    strip: bool,
+) {
     let name = &i.name;
     let destroy_js = wrapper_name(&m.path, &iface_member_base(name, "destroy"), strip);
     let error = m.error.as_ref();
@@ -3933,10 +3949,10 @@ fn render_interface_class_js(out: &mut String, i: &InterfaceBinding, m: &ModuleB
 /// True when any callable in the model returns `iter<T>`, so the addon and
 /// loader must emit the shared lazy-iterator support.
 fn model_has_iterators(model: &BindingModel) -> bool {
-    model
-        .modules
-        .iter()
-        .any(|m| m.callables().any(|f| matches!(f.shape, CallShape::Iterator(_))))
+    model.modules.iter().any(|m| {
+        m.callables()
+            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
+    })
 }
 
 /// Emit the shared lazy iterator class the JS loader hands out for every
@@ -3954,14 +3970,18 @@ fn render_iterator_class_js(out: &mut String) {
          // exit, or by the external's finalizer if the iterator is abandoned.\n",
     );
     w.block("class WeaveFFIIterator {", "}", |w| {
-        w.block("constructor(ext, nextFn, destroyFn, map, wrapElem) {", "}", |w| {
-            w.line("this._ext = ext;");
-            w.line("this._nextFn = nextFn;");
-            w.line("this._destroyFn = destroyFn;");
-            w.line("this._map = map;");
-            w.line("this._wrapElem = wrapElem;");
-            w.line("this._done = false;");
-        });
+        w.block(
+            "constructor(ext, nextFn, destroyFn, map, wrapElem) {",
+            "}",
+            |w| {
+                w.line("this._ext = ext;");
+                w.line("this._nextFn = nextFn;");
+                w.line("this._destroyFn = destroyFn;");
+                w.line("this._map = map;");
+                w.line("this._wrapElem = wrapElem;");
+                w.line("this._done = false;");
+            },
+        );
         w.block("next() {", "}", |w| {
             w.block("if (this._done) {", "}", |w| {
                 w.line("return { done: true, value: undefined };");

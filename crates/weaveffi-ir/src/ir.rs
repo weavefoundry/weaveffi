@@ -366,8 +366,8 @@ pub enum TypeRef {
     /// caller receives a new owned reference it must eventually release.
     ///
     /// The IDL spells an interface reference as its bare (or dotted-qualified)
-    /// name, exactly like a struct; the resolution pass rewrites the parsed
-    /// [`Struct`](Self::Struct) into this variant when the name resolves to an
+    /// name, exactly like a record; the resolution pass rewrites the parsed
+    /// [`Named`](Self::Named) into this variant when the name resolves to an
     /// interface declaration.
     Interface(String),
     /// Borrowed string slice (`&str`): a non-owning view valid only for the

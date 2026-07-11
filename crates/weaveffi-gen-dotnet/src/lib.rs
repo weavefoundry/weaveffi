@@ -1626,7 +1626,15 @@ fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) 
                 "NativeMethods.{getter_sym}(_handle, out var outKeys, out var outValues, out var outLen);"
             ));
             let mut tmp = String::new();
-            render_map_decode(&mut tmp, k, v, "outKeys", "outValues", "outLen", "                ");
+            render_map_decode(
+                &mut tmp,
+                k,
+                v,
+                "outKeys",
+                "outValues",
+                "outLen",
+                "                ",
+            );
             w.raw(tmp);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
@@ -1787,7 +1795,9 @@ fn render_map_decode(
     let v_cs = cs_type(v);
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
-    w.line(format!("if ({keys} != IntPtr.Zero && {values} != IntPtr.Zero)"));
+    w.line(format!(
+        "if ({keys} != IntPtr.Zero && {values} != IntPtr.Zero)"
+    ));
     w.block("{", "}", |w| {
         w.line(format!("for (int i = 0; i < (int){len}; i++)"));
         w.block("{", "}", |w| {
@@ -2717,9 +2727,8 @@ fn render_iterator_wrapper_method(
         w.line(format!("[Obsolete(\"{}\")]", msg.replace('"', "\\\"")));
     }
 
-    let wrap_return = format!(
-        "return new WeaveFFIOnceEnumerable<{elem_cs}>(Enumerate{method_name}(iter));"
-    );
+    let wrap_return =
+        format!("return new WeaveFFIOnceEnumerable<{elem_cs}>(Enumerate{method_name}(iter));");
     w.line(format!(
         "public {staticness}IEnumerable<{elem_cs}> {method_name}({})",
         params_sig.join(", ")
@@ -6779,7 +6788,9 @@ mod tests {
         );
         // Boxed optional scalar result: dereferenced, box left alone.
         assert!(
-            cs.contains("tcs.SetResult(result == IntPtr.Zero ? (long?)null : Marshal.ReadInt64(result));"),
+            cs.contains(
+                "tcs.SetResult(result == IntPtr.Zero ? (long?)null : Marshal.ReadInt64(result));"
+            ),
             "async optional scalar result must dereference the borrowed box: {cs}"
         );
     }
@@ -6882,8 +6893,10 @@ mod tests {
         );
         // One C next call per MoveNext, inside a lazy yield-return method.
         assert_eq!(
-            cs.matches("weaveffi_kv_Store_ListKeysIterator_next(iter, out var out_item, ref iterErr)")
-                .count(),
+            cs.matches(
+                "weaveffi_kv_Store_ListKeysIterator_next(iter, out var out_item, ref iterErr)"
+            )
+            .count(),
             1,
             "exactly one next call site expected: {cs}"
         );

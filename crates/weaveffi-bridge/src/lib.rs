@@ -443,9 +443,7 @@ fn extract_member(item: &syn::ImplItemFn, iface: &str, is_ctor: bool) -> syn::Re
     } else {
         match return_type_from_syn(&item.sig.output)? {
             // `fn hand(&self) -> Self` style returns name the interface.
-            Some(TypeRef::Named(name)) if name == "Self" => {
-                Some(TypeRef::Named(iface.to_string()))
-            }
+            Some(TypeRef::Named(name)) if name == "Self" => Some(TypeRef::Named(iface.to_string())),
             other => other,
         }
     };

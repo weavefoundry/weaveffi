@@ -405,7 +405,9 @@ fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
 fn input_array_ffi(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Utf8>>".into(),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => "Pointer<Pointer<Void>>".into(),
         _ => format!("Pointer<{}>", scalar_ffi(elem).0),
     }
@@ -438,7 +440,9 @@ fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
             other => vec![ptr(&format!("Pointer<{}>", scalar_ffi(other).0))],
         },
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => {
             vec![ptr("Pointer<Void>")]
         }
@@ -456,7 +460,9 @@ fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String
     match ty {
         TypeRef::Bool => vec![name.to_string()],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
-        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_)
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
         | TypeRef::Interface(_) => {
             vec![format!("{name}._handle")]
         }
@@ -518,7 +524,9 @@ fn emit_optional_input(
             frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
             vec![p]
         }
-        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_)
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
         | TypeRef::Interface(_) => {
             vec![format!("{name}?._handle ?? nullptr")]
         }
@@ -638,7 +646,9 @@ fn emit_map_input(
 fn elem_to_native(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{expr}.toNativeUtf8()"),
-        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_)
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
         | TypeRef::Interface(_) => {
             format!("{expr}._handle")
         }
@@ -689,7 +699,9 @@ fn return_ffi(ty: &TypeRef) -> (String, String) {
 fn map_out_ffi(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Pointer<Utf8>>>".into(),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => "Pointer<Pointer<Pointer<Void>>>".into(),
         _ => format!("Pointer<Pointer<{}>>", scalar_ffi(elem).0),
     }
@@ -706,7 +718,9 @@ fn map_elem_read(arr: &str, idx: &str, ty: &TypeRef) -> String {
             "{}.fromValue({arr}[{idx}])",
             local_type_name(n).to_upper_camel_case()
         ),
-        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::TypedHandle(n)
+        TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::TypedHandle(n)
         | TypeRef::Interface(n) => {
             format!(
                 "{}._({arr}[{idx}])",
@@ -849,7 +863,9 @@ fn read_value(expr: &str, ty: &TypeRef) -> String {
             "{}.fromValue({expr})",
             local_type_name(n).to_upper_camel_case()
         ),
-        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::TypedHandle(n)
+        TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::TypedHandle(n)
         | TypeRef::Interface(n) => {
             format!("{}._({expr})", local_type_name(n).to_upper_camel_case())
         }
@@ -863,7 +879,9 @@ fn read_value(expr: &str, ty: &TypeRef) -> String {
 fn elem_pointee(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
         | TypeRef::Interface(_) => "Pointer<Void>".into(),
         _ => scalar_ffi(elem).0.to_string(),
     }
@@ -1059,10 +1077,10 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
         out.push_str("final Map<int, NativeCallable> _listenerCallables = {};\n");
     }
 
-    let has_iterators = model
-        .modules
-        .iter()
-        .any(|m| m.callables().any(|f| matches!(f.shape, CallShape::Iterator(_))));
+    let has_iterators = model.modules.iter().any(|m| {
+        m.callables()
+            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
+    });
     if has_iterators {
         out.push_str("\n// Anchors one live native iteration for its GC-finalizer backstop.\n");
         out.push_str("// A suspended `sync*` frame keeps the anchor reachable; abandoning the\n");
@@ -1097,7 +1115,13 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
             render_listener(&mut out, module, l, config.strip_module_prefix);
         }
         for f in &module.functions {
-            render_function(&mut out, module, f, config.strip_module_prefix, &model.prefix);
+            render_function(
+                &mut out,
+                module,
+                f,
+                config.strip_module_prefix,
+                &model.prefix,
+            );
         }
     }
 
@@ -2121,7 +2145,9 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
             format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({len}).toList()")
         }
         // Borrowed for the duration of the callback: do not dispose().
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name)
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
         | TypeRef::Interface(name) => {
             format!("{}._({n0})", local_type_name(name).to_upper_camel_case())
         }
@@ -2270,10 +2296,9 @@ fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(String, String)> {
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
             vec![ptr("Pointer<Uint8>".into()), ("Size".into(), "int".into())]
         }
-        Some(TypeRef::List(inner)) => vec![
-            ptr(input_array_ffi(inner)),
-            ("Size".into(), "int".into()),
-        ],
+        Some(TypeRef::List(inner)) => {
+            vec![ptr(input_array_ffi(inner)), ("Size".into(), "int".into())]
+        }
         Some(TypeRef::Map(k, v)) => vec![
             ptr(input_array_ffi(k)),
             ptr(input_array_ffi(v)),
@@ -2309,7 +2334,11 @@ fn async_cb_arg_names(ret: Option<&TypeRef>) -> Vec<String> {
     match ret {
         None => {}
         Some(TypeRef::Map(_, _)) => {
-            names.extend(["resultKeys".into(), "resultValues".into(), "resultLen".into()]);
+            names.extend([
+                "resultKeys".into(),
+                "resultValues".into(),
+                "resultLen".into(),
+            ]);
         }
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
             names.extend(["result".into(), "resultLen".into()]);
@@ -4924,7 +4953,9 @@ mod tests {
         let body = &body[..body.find("\n  }").expect("member end")];
         // One `next` per consumer step, yielded straight out of the loop.
         assert!(
-            body.contains("while (_weaveffiKvStoreListKeysIteratorNext(iter, outItem, err) != 0) {"),
+            body.contains(
+                "while (_weaveffiKvStoreListKeysIteratorNext(iter, outItem, err) != 0) {"
+            ),
             "missing per-element next loop: {body}"
         );
         assert!(body.contains("yield item;"), "missing yield: {body}");
@@ -5276,7 +5307,10 @@ mod tests {
     #[test]
     fn record_list_return_adopts_elements_and_frees_buffer() {
         let dart = render_dart_module(
-            &returning("all", TypeRef::List(Box::new(TypeRef::Record("Item".into())))),
+            &returning(
+                "all",
+                TypeRef::List(Box::new(TypeRef::Record("Item".into()))),
+            ),
             "weaveffi",
             "weaveffi.yml",
         );
@@ -5380,7 +5414,9 @@ mod tests {
             "async bytes result must be copied: {dart}"
         );
         // Borrowed: the callback must not release the producer's buffers.
-        let cb = &dart[dart.find("Future<List<String>> fetchNames()").expect("wrapper")..];
+        let cb = &dart[dart
+            .find("Future<List<String>> fetchNames()")
+            .expect("wrapper")..];
         let cb = &cb[..cb.find("\n}").expect("end")];
         assert!(
             !cb.contains("_weaveffiFree"),

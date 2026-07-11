@@ -322,14 +322,22 @@ mod tests {
     #[test]
     fn object_returns_are_adopted_with_destroy_symbols() {
         assert_eq!(
-            return_free(Some(&TypeRef::Record("Contact".into())), "contacts", "weaveffi"),
+            return_free(
+                Some(&TypeRef::Record("Contact".into())),
+                "contacts",
+                "weaveffi"
+            ),
             ReturnFree::OwnedObject {
                 destroy_symbol: "weaveffi_contacts_Contact_destroy".into()
             }
         );
         // Cross-module references resolve to the owner's symbol path.
         assert_eq!(
-            return_free(Some(&TypeRef::Interface("kv.Store".into())), "kv_stats", "weaveffi"),
+            return_free(
+                Some(&TypeRef::Interface("kv.Store".into())),
+                "kv_stats",
+                "weaveffi"
+            ),
             ReturnFree::OwnedObject {
                 destroy_symbol: "weaveffi_kv_Store_destroy".into()
             }

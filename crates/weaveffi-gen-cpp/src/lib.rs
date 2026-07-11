@@ -501,11 +501,10 @@ fn render_cpp_header(
     }
     // The lazy iterator range classes need std::input_iterator_tag and
     // std::ptrdiff_t.
-    if model
-        .modules
-        .iter()
-        .any(|m| m.callables().any(|f| matches!(f.shape, CallShape::Iterator(_))))
-    {
+    if model.modules.iter().any(|m| {
+        m.callables()
+            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
+    }) {
         out.push_str("#include <cstddef>\n");
         out.push_str("#include <iterator>\n");
     }
@@ -1482,7 +1481,8 @@ fn render_getter_list(out: &mut String, inner: &TypeRef, getter: &str, cast: &st
     let mut w = CodeWriter::four_space().with_depth(2);
     w.line("size_t len = 0;");
     w.line(format!("auto* raw = {getter}({cast}, &len);"));
-    let free_array = format!("{prefix}_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));");
+    let free_array =
+        format!("{prefix}_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));");
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line("std::vector<std::string> ret;");
@@ -3757,9 +3757,7 @@ mod tests {
         );
         assert!(h.contains("auto ret = *result;"), "should dereference: {h}");
         assert!(
-            h.contains(
-                "weaveffi_free_bytes(reinterpret_cast<uint8_t*>(result), sizeof(*result));"
-            ),
+            h.contains("weaveffi_free_bytes(reinterpret_cast<uint8_t*>(result), sizeof(*result));"),
             "boxed optional scalar must be released after copying: {h}"
         );
     }
@@ -3880,7 +3878,9 @@ mod tests {
             Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
         )];
         let h = render(&api_of(vec![m]));
-        let f = &h[h.find("inline std::vector<std::string> list_names()").unwrap()..];
+        let f = &h[h
+            .find("inline std::vector<std::string> list_names()")
+            .unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
         assert!(
             f.contains("ret.emplace_back(result[i]);")
@@ -3941,9 +3941,7 @@ mod tests {
             "list getter must free each string element: {g}"
         );
         assert!(
-            g.contains(
-                "weaveffi_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));"
-            ),
+            g.contains("weaveffi_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));"),
             "list getter must release the array buffer: {g}"
         );
     }
@@ -4383,7 +4381,9 @@ mod tests {
         let h = render(&kvstore_api());
         // The public return type is the nested range class, never a vector.
         assert!(
-            h.contains("ListKeysIterator list_keys(const std::optional<std::string>& prefix) const {"),
+            h.contains(
+                "ListKeysIterator list_keys(const std::optional<std::string>& prefix) const {"
+            ),
             "missing lazy iterator method: {h}"
         );
         assert!(
@@ -4458,7 +4458,8 @@ mod tests {
             "each increment must pull exactly one element: {h}"
         );
         assert_eq!(
-            h.matches("weaveffi_kv_Store_ListKeysIterator_next(").count(),
+            h.matches("weaveffi_kv_Store_ListKeysIterator_next(")
+                .count(),
             2,
             "next symbol should appear in the extern decl and next() only: {h}"
         );
@@ -5165,7 +5166,11 @@ mod tests {
             },
             Function {
                 r#async: true,
-                ..func("build_report", vec![], Some(TypeRef::Record("Report".into())))
+                ..func(
+                    "build_report",
+                    vec![],
+                    Some(TypeRef::Record("Report".into())),
+                )
             },
         ];
         let h = render(&api_of(vec![m]));

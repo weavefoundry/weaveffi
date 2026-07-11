@@ -160,7 +160,11 @@ pub(crate) fn slot_tokens_for(p: &AbiParam, f: &FnBinding, sig: &syn::Signature)
 
 /// Render the slot list for a function signature, honoring producer-written
 /// typed-handle types (see [`slot_tokens_for`]).
-pub(crate) fn fn_slots(params: &[AbiParam], f: &FnBinding, sig: &syn::Signature) -> Vec<TokenStream> {
+pub(crate) fn fn_slots(
+    params: &[AbiParam],
+    f: &FnBinding,
+    sig: &syn::Signature,
+) -> Vec<TokenStream> {
     params.iter().map(|p| slot_tokens_for(p, f, sig)).collect()
 }
 

@@ -22,9 +22,9 @@ use weaveffi_core::model::{
     FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding,
     ParamBinding, RichVariantBinding, StructBinding,
 };
-use weaveffi_core::plan::{elem_free, ElemFree, ErrorStrategy};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
+use weaveffi_core::plan::{elem_free, ElemFree, ErrorStrategy};
 use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -368,9 +368,7 @@ fn c_opaque_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
         TypeRef::Record(n)
         | TypeRef::RichEnum(n)
         | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => {
-            c_abi_struct_name(n, module, prefix)
-        }
+        | TypeRef::Interface(n) => c_abi_struct_name(n, module, prefix),
         _ => String::new(),
     }
 }
@@ -400,9 +398,7 @@ fn return_uses_unsafe(ty: &TypeRef) -> bool {
             | TypeRef::RichEnum(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::Interface(_) => return_uses_unsafe(inner),
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _) => {
-                true
-            }
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _) => true,
             // Boxed optional scalars are freed through an unsafe.Pointer cast.
             _ => true,
         },
@@ -1528,9 +1524,9 @@ fn emit_async_result_send(
                 w.line(format!("ch <- {outcome}{{val: val}}"));
             }
             TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => {
+            | TypeRef::RichEnum(n)
+            | TypeRef::TypedHandle(n)
+            | TypeRef::Interface(n) => {
                 let g = local_type_name(n).to_upper_camel_case();
                 w.line(format!("var val *{g}"));
                 w.block("if result != nil {", "}", |w| {
@@ -1560,7 +1556,9 @@ fn emit_async_result_send(
             w.line("count := int(result_len)");
             let mut body = String::new();
             // Borrowed for the callback's duration: copy, do not free.
-            decode_list(&mut body, "val", inner, "result", "count", prefix, module, false);
+            decode_list(
+                &mut body, "val", inner, "result", "count", prefix, module, false,
+            );
             w.raw(body);
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
@@ -2062,9 +2060,9 @@ fn render_getter(
                 w.line(format!("return {ret}({getter}(s.ptr))"));
             }
             TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) => {
+            | TypeRef::Record(n)
+            | TypeRef::RichEnum(n)
+            | TypeRef::Interface(n) => {
                 let inner = local_type_name(n).to_upper_camel_case();
                 w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
             }
@@ -2080,9 +2078,9 @@ fn render_getter(
                     w.line("return &v");
                 }
                 TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) => {
+                | TypeRef::Record(n)
+                | TypeRef::RichEnum(n)
+                | TypeRef::Interface(n) => {
                     let inner_go = local_type_name(n).to_upper_camel_case();
                     w.line(format!("cPtr := {getter}(s.ptr)"));
                     w.block("if cPtr == nil {", "}", |w| {
@@ -2441,7 +2439,10 @@ fn render_iterator_fn(
             format!("func({elem_go}, error) bool"),
         )
     } else {
-        (format!("iter.Seq[{elem_go}]"), format!("func({elem_go}) bool"))
+        (
+            format!("iter.Seq[{elem_go}]"),
+            format!("func({elem_go}) bool"),
+        )
     };
     let header = match receiver {
         Some(ty) => format!(
@@ -4423,7 +4424,9 @@ mod tests {
         );
         // One producer next call per consumer step.
         assert!(
-            go.contains("ok := C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) != 0"),
+            go.contains(
+                "ok := C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) != 0"
+            ),
             "iterator must pull one element per step: {go}"
         );
         assert!(

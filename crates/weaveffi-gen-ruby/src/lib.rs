@@ -25,8 +25,8 @@ use weaveffi_core::model::{
     RichVariantBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
-use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
@@ -2146,8 +2146,7 @@ fn render_iterator_function_wrapper(
                     w.block("loop do", "end", |w| {
                         // `next` params: (iter, out_item, <elem out slots>, out_err).
                         let elem = &it.elem;
-                        let needs_len =
-                            matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
+                        let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
                         let item_mem = rb_mem_type(elem);
                         w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
                         if needs_len {
@@ -2236,9 +2235,7 @@ fn render_iterator_item_yield(
         TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let local = local_type_name(name);
             w.line("item_ptr = out_item.read_pointer");
-            w.line(format!(
-                "y << {local}.new(item_ptr) unless item_ptr.null?"
-            ));
+            w.line(format!("y << {local}.new(item_ptr) unless item_ptr.null?"));
         }
         // A yielded interface is a new owned reference; wrap it without
         // re-running initialize.
@@ -2622,9 +2619,7 @@ fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str, qualifi
             ));
         }
         TypeRef::Bool => {
-            w.line(format!(
-                "items = result.{reader}(len).map {{ |v| v != 0 }}"
-            ));
+            w.line(format!("items = result.{reader}(len).map {{ |v| v != 0 }}"));
         }
         _ => {
             w.line(format!("items = result.{reader}(len)"));
@@ -4019,7 +4014,9 @@ mod tests {
         assert!(!body.contains(".to_a"), "no hidden collect: {code}");
         // The launch happens inside the block, so an unstarted enumerator
         // never acquires (and thus can never leak) a handle.
-        let launch = body.find("iter = weaveffi_events_get_messages(err)").expect("launch");
+        let launch = body
+            .find("iter = weaveffi_events_get_messages(err)")
+            .expect("launch");
         let enum_open = body.find("Enumerator.new do |y|").expect("enumerator");
         assert!(enum_open < launch, "launch inside enumerator block: {code}");
         // Destroy runs from an ensure block, guarding early break, and each
@@ -4048,9 +4045,7 @@ mod tests {
             functions: vec![Function {
                 name: "scan_entries".into(),
                 params: vec![],
-                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record(
-                    "Entry".into(),
-                )))),
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
                 doc: None,
                 throws: false,
                 r#async: false,

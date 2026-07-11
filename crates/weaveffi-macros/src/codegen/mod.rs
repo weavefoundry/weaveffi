@@ -124,14 +124,15 @@ fn resolve_sibling_named_refs(api: &mut Api) {
         }
     }
     fn walk_module(module: &mut Module) {
-        let callables = module.functions.iter_mut().chain(
-            module.interfaces.iter_mut().flat_map(|i| {
+        let callables = module
+            .functions
+            .iter_mut()
+            .chain(module.interfaces.iter_mut().flat_map(|i| {
                 i.constructors
                     .iter_mut()
                     .chain(i.methods.iter_mut())
                     .chain(i.statics.iter_mut())
-            }),
-        );
+            }));
         for f in callables {
             for p in &mut f.params {
                 walk_type(&mut p.ty);
