@@ -30,6 +30,6 @@ export function sendMessage(text: string): void
  * Return an iterator over all sent messages
  * Maps to C function: weaveffi_events_get_messages
  */
-export function getMessages(): string[]
+export function getMessages(): IterableIterator<string>
 
 // END types.d.ts

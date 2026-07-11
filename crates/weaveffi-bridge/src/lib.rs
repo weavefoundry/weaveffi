@@ -293,7 +293,7 @@ pub fn type_ref_from_syn(ty: &syn::Type) -> syn::Result<TypeRef> {
                         Box::new(type_ref_from_syn(v)?),
                     ))
                 }
-                other => Ok(TypeRef::Struct(other.to_string())),
+                other => Ok(TypeRef::Named(other.to_string())),
             }
         }
         _ => Err(syn::Error::new(ty.span(), "unsupported type syntax")),
@@ -443,8 +443,8 @@ fn extract_member(item: &syn::ImplItemFn, iface: &str, is_ctor: bool) -> syn::Re
     } else {
         match return_type_from_syn(&item.sig.output)? {
             // `fn hand(&self) -> Self` style returns name the interface.
-            Some(TypeRef::Struct(name)) if name == "Self" => {
-                Some(TypeRef::Struct(iface.to_string()))
+            Some(TypeRef::Named(name)) if name == "Self" => {
+                Some(TypeRef::Named(iface.to_string()))
             }
             other => other,
         }
@@ -902,7 +902,7 @@ mod tests {
         );
         assert_eq!(
             m.functions[0].returns,
-            Some(TypeRef::Struct("Contact".into()))
+            Some(TypeRef::Named("Contact".into()))
         );
         assert_eq!(m.functions[0].params[0].ty, TypeRef::Handle);
     }
@@ -962,7 +962,7 @@ mod tests {
             s.fields[1].ty,
             TypeRef::Optional(Box::new(TypeRef::StringUtf8))
         );
-        assert_eq!(s.fields[2].ty, TypeRef::Struct("ContactType".into()));
+        assert_eq!(s.fields[2].ty, TypeRef::Named("ContactType".into()));
     }
 
     #[test]

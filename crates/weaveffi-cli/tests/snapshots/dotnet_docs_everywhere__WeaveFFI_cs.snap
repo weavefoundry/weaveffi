@@ -167,8 +167,12 @@ namespace WeaveFFI
                 var arr = new string[(int)len];
                 for (int i = 0; i < (int)len; i++)
                 {
-                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                    var itemPtr = Marshal.ReadIntPtr(ptr, i * IntPtr.Size);
+                    var item = Marshal.PtrToStringUTF8(itemPtr) ?? "";
+                    NativeMethods.weaveffi_free_string(itemPtr);
+                    arr[i] = item;
                 }
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
                 return arr;
             }
         }
@@ -398,7 +402,7 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_docs_get_document(long id, ref WeaveFFIError err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void AsyncCb_weaveffi_docs_publish_async(IntPtr context, IntPtr err, int result);
+        internal delegate void AsyncCb_weaveffi_docs_publish_async(IntPtr context, IntPtr err, byte result);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_publish_async_async", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_docs_publish_async_async(long id, AsyncCb_weaveffi_docs_publish_async callback, IntPtr context);

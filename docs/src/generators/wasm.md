@@ -44,7 +44,7 @@ producer thread, **callbacks and listeners are not supported**; see
 | `EnumName` (rich / algebraic) | `i32` pointer into linear memory (0 = null) | wrapper `class` (e.g. `Shape`) |
 | `T?`         | 0 / null pointer; scalars boxed by pointer | `T \| null` |
 | `[T]`        | `i32` pointer + `i32` length | `Array` copy |
-| `iter<T>`    | iterator handle + `next` out-param | drained into an `Array` |
+| `iter<T>`    | iterator handle + `next` out-param | lazy `IterableIterator<T>` |
 
 ## Example IDL → generated code
 
@@ -63,8 +63,10 @@ signatures; strings, arrays, and error handling are taken care of
 inside the wrapper:
 
 ```javascript
-api.events.sendMessage('hello');        // throws WeaveFFIError on failure
-const all = api.events.getMessages();   // iter<string> -> string[]
+api.events.sendMessage('hello');            // throws WeaveFFIError on failure
+for (const m of api.events.getMessages()) { // iter<string> -> lazy iterable
+  console.log(m);
+}
 ```
 
 Structs come back as wrapper classes holding the native handle, with a
@@ -91,7 +93,7 @@ export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;
   events: {
     sendMessage(text: string): void;
-    getMessages(): string[];
+    getMessages(): IterableIterator<string>;
   };
 }
 
@@ -376,6 +378,45 @@ parameter; the loader passes a null token, so cancellation isn't
 surfaced on this target (`Store.compact()` runs to completion). An IDL
 function that models cancellation itself is exposed as a plain function
 in the same namespace (e.g. `api.tasks.cancelTask(id)`).
+
+## Iterators
+
+`iter<T>` returns are lazy: the wrapper launches the producer iterator
+and hands back a shared `_WeaveFFIIterator` implementing the JS
+iterator protocol over the iterator handle. Nothing is drained; each
+`next()` issues exactly one producer `next` call through a per-element
+slot staged in linear memory. From the `events` sample:
+
+```js
+getMessages() {
+  const _err = _allocErr(wasm);
+  const _it = wasm.weaveffi_events_get_messages(_err);
+  _checkErr(wasm, _err);
+  _freeErr(wasm, _err);
+  return new _WeaveFFIIterator(wasm, _it, 4,
+    (it, slot, ep) => wasm.weaveffi_events_GetMessagesIterator_next(it, slot, ep),
+    (it) => wasm.weaveffi_events_GetMessagesIterator_destroy(it),
+    _checkErr, (w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true)));
+}
+```
+
+The class settles the handle's lifecycle exactly once: `_close()`
+destroys the producer iterator, frees the element slot, and nulls the
+handle. It runs eagerly on exhaustion, on a `next` error, or from
+`return()` when iteration stops early; a `for...of` loop calls
+`return()` automatically on `break` or `throw`. There is no reliable
+finalization hook across the runtimes this loader supports, so
+abandoning an iterator without exhausting or closing it leaks the
+producer handle.
+
+Each decoded element is copied out of linear memory and its producer
+allocation released (`_takeCStr` frees strings via
+`weaveffi_free_string`). Errors from the launcher and from each `next`
+follow the function's error strategy: a throwing function such as the
+`kvstore` sample's `Store.listKeys` checks each step with the domain
+checker and throws the typed `KvError` subclasses; a non-throwing one
+like `getMessages` throws the generic `WeaveFFIError` only for
+producer bugs. The TypeScript declaration is `IterableIterator<T>`.
 
 ## Capabilities and `allow_unsupported`
 

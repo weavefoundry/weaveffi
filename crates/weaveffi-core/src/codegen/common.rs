@@ -131,10 +131,10 @@ pub fn walk_modules_with_path<'a>(
 /// Predicate: returns `true` when the IR type is represented as a
 /// pointer at the C ABI boundary.
 ///
-/// String types, byte buffers, struct values (including rich/algebraic enums,
-/// which are spelled `Struct` after resolution), interfaces, typed handles,
-/// lists, maps, and iterators all cross the ABI as pointers. Scalars
-/// (`i32`/`bool`/etc.), `Handle`, and a C-style `Enum(_)` cross by value.
+/// String types, byte buffers, record values, rich (algebraic) enums,
+/// interfaces, typed handles, lists, maps, and iterators all cross the ABI as
+/// pointers. Scalars (`i32`/`bool`/etc.), `Handle`, and a C-style `Enum(_)`
+/// cross by value.
 ///
 /// `Optional(T)` is *not* automatically a pointer here: callers that
 /// care about Optional pointer-ness (the C/C++ generators) recurse
@@ -146,7 +146,8 @@ pub fn is_c_pointer_type(ty: &TypeRef) -> bool {
             | TypeRef::BorrowedStr
             | TypeRef::Bytes
             | TypeRef::BorrowedBytes
-            | TypeRef::Struct(_)
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
             | TypeRef::Interface(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::List(_)
@@ -405,7 +406,9 @@ mod tests {
             TypeRef::BorrowedStr,
             TypeRef::Bytes,
             TypeRef::BorrowedBytes,
-            TypeRef::Struct("X".into()),
+            TypeRef::Record("X".into()),
+            TypeRef::RichEnum("Y".into()),
+            TypeRef::Interface("Z".into()),
             TypeRef::TypedHandle("X".into()),
             TypeRef::List(Box::new(TypeRef::I32)),
             TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),

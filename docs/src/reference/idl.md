@@ -883,6 +883,23 @@ modules:
         doc: "Lazily iterates over matching contacts"
 ```
 
+Laziness is part of the binding contract, not just the C ABI shape.
+Every generated wrapper surfaces `iter<T>` as its language's native
+lazy iteration idiom: an `iter.Seq` in Go (`iter.Seq2` when the
+function throws), a `Sequence` in Swift, an input-iterator range in
+C++, an iterator in Python, an `Enumerator` in Ruby, an
+`IEnumerable<T>` in C#, an `Iterable<T>` in Dart, an iterable in
+JavaScript, and an `Iterator<T>` with `close()` in Kotlin. The wrapper
+issues one producer `next` call per consumer step; no target drains
+the sequence into a hidden list. The underlying iterator handle is
+destroyed exactly once, eagerly on exhaustion or from the wrapper's
+disposal idiom when iteration is abandoned early, and errors from the
+launch and from each `next` follow the function's error strategy (see
+the [Error Handling guide](../guides/errors.md#throws-versus-trap)).
+The full pull contract is stated in
+`weaveffi_core::plan::IteratorProtocol`; element ownership is covered
+in the [Memory Ownership guide](../guides/memory.md#iterator-elements).
+
 Iterators are only valid as **return types**. The validator rejects
 iterators in parameter positions.
 

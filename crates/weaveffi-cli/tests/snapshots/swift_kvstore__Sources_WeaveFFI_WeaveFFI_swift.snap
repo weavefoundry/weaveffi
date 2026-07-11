@@ -54,6 +54,16 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+@inline(__always)
+func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
+}
+
+@inline(__always)
+func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+}
+
 private final class ContinuationRef<T, E: Error> {
     let value: CheckedContinuation<T, E>
     init(_ value: CheckedContinuation<T, E>) { self.value = value }
@@ -169,7 +179,9 @@ public class Entry {
     /// Optional unix-timestamp seconds at which the entry expires
     public var expires_at: Int64? {
         let p = weaveffi_kv_Entry_get_expires_at(ptr)
-        return p?.pointee
+        guard let p = p else { return nil }
+        defer { wvFreeBox(p) }
+        return p.pointee
     }
 
     /// Free-form labels attached to the entry
@@ -177,7 +189,14 @@ public class Entry {
         var outLen: Int = 0
         let rv = weaveffi_kv_Entry_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return (0..<outLen).map { String(cString: rv[$0]!) }
+        defer { wvFreeArray(rv, outLen) }
+        var items: [String] = []
+        items.reserveCapacity(outLen)
+        for i in 0..<outLen {
+            items.append(String(cString: rv[i]!))
+            weaveffi_free_string(rv[i])
+        }
+        return items
     }
 
     /// Arbitrary string-valued metadata pairs
@@ -187,9 +206,12 @@ public class Entry {
         var outLen: Int = 0
         weaveffi_kv_Entry_get_metadata(ptr, &outKeysPtr, &outValuesPtr, &outLen)
         guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
+        defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }
         var result: [String: String] = [:]
         for i in 0..<outLen {
             result[String(cString: outKeys[i]!)] = String(cString: outValues[i]!)
+            weaveffi_free_string(outKeys[i])
+            weaveffi_free_string(outValues[i])
         }
         return result
     }
@@ -257,13 +279,13 @@ public class EntryBuilder {
     }
 
     public func build() throws -> Entry {
-        guard let id = _id else { fatalError("missing field: id") }
-        guard let key = _key else { fatalError("missing field: key") }
-        guard let value = _value else { fatalError("missing field: value") }
-        guard let created_at = _created_at else { fatalError("missing field: created_at") }
-        guard let expires_at = _expires_at else { fatalError("missing field: expires_at") }
-        guard let tags = _tags else { fatalError("missing field: tags") }
-        guard let metadata = _metadata else { fatalError("missing field: metadata") }
+        guard let id = _id else { throw WeaveFFIError.error(code: -1, message: "missing field: id") }
+        guard let key = _key else { throw WeaveFFIError.error(code: -1, message: "missing field: key") }
+        guard let value = _value else { throw WeaveFFIError.error(code: -1, message: "missing field: value") }
+        guard let created_at = _created_at else { throw WeaveFFIError.error(code: -1, message: "missing field: created_at") }
+        guard let expires_at = _expires_at else { throw WeaveFFIError.error(code: -1, message: "missing field: expires_at") }
+        guard let tags = _tags else { throw WeaveFFIError.error(code: -1, message: "missing field: tags") }
+        guard let metadata = _metadata else { throw WeaveFFIError.error(code: -1, message: "missing field: metadata") }
         var err = weaveffi_error(code: 0, message: nil)
         let value_bytes = Array(value)
         let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
@@ -357,22 +379,19 @@ public final class Store {
         return result
     }
     /// Stream every key, optionally filtered by a prefix
-    public func listKeys(prefix: String?) throws -> [String] {
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   producer; the underlying iterator is destroyed when the sequence is
+    ///   exhausted or deinitialized.
+    /// - Throws: The module's typed error if the launch fails. Mid-stream
+    ///   errors end iteration and are stored in the sequence's `error`
+    ///   property instead of being thrown.
+    public func listKeys(prefix: String?) throws -> KvStoreListKeysIterator {
         var err = weaveffi_error(code: 0, message: nil)
-        let result: [String] = try withOptionalCString(prefix) { prefix_ptr in
+        let result: KvStoreListKeysIterator = try withOptionalCString(prefix) { prefix_ptr in
                 let iter = weaveffi_kv_Store_list_keys(ptr, prefix_ptr, &err)
                 try checkKv(&err)
-                guard let iter = iter else { return [] }
-                var items: [String] = []
-                var iterItem: UnsafePointer<CChar>? = nil
-                var iterErr = weaveffi_error(code: 0, message: nil)
-                while weaveffi_kv_Store_ListKeysIterator_next(iter, &iterItem, &iterErr) != 0 {
-                    items.append(String(cString: iterItem!))
-                    weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
-                }
-                weaveffi_kv_Store_ListKeysIterator_destroy(iter)
-                try checkKv(&iterErr)
-                return items
+                guard let iter = iter else { throw WeaveFFIError.error(code: -1, message: "null iterator") }
+                return KvStoreListKeysIterator(handle: iter)
         }
         return result
     }
@@ -426,6 +445,55 @@ public final class Store {
         let rv = weaveffi_kv_Store_default_capacity(&err)
         trap(&err)
         return rv
+    }
+}
+
+/// A lazy sequence over the `String` elements streamed by `weaveffi_kv_Store_list_keys`.
+///
+/// Each `next()` call pulls exactly one element from the producer. The
+/// underlying C iterator is destroyed eagerly on exhaustion and from
+/// `deinit` when iteration is abandoned early.
+///
+/// If the producer reports an error mid-stream, iteration ends and the
+/// error is stored in ``error`` for the caller to inspect after the loop.
+public final class KvStoreListKeysIterator: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+    /// The error that ended iteration early, if any.
+    public private(set) var error: Error?
+
+    init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        destroyHandle()
+    }
+
+    private func destroyHandle() {
+        guard let handle = handle else { return }
+        weaveffi_kv_Store_ListKeysIterator_destroy(handle)
+        self.handle = nil
+    }
+
+    /// Pulls the next element from the producer, or returns `nil` once the
+    /// stream is exhausted (destroying the underlying iterator).
+    public func next() -> String? {
+        guard let handle = handle else { return nil }
+        var item: UnsafePointer<CChar>? = nil
+        var err = weaveffi_error(code: 0, message: nil)
+        if weaveffi_kv_Store_ListKeysIterator_next(handle, &item, &err) == 0 {
+            if err.code != 0 {
+                let code = err.code
+                let message = err.message.flatMap { String(cString: $0) } ?? ""
+                weaveffi_error_clear(&err)
+                self.error = mapKv(code: code, message: message)
+            }
+            destroyHandle()
+            return nil
+        }
+        let element = String(cString: item!)
+        weaveffi_free_string(item)
+        return element
     }
 }
 

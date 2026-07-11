@@ -51,7 +51,7 @@ The package directory follows the IDL `package.name` (a package named
 | `T?`         | `Optional[T]`        | `ctypes.POINTER(scalar)` for values; same pointer for strings/structs |
 | `[T]`        | `List[T]`            | `ctypes.POINTER(scalar)` + `ctypes.c_size_t` |
 | `{K: V}`     | `Dict[K, V]`         | key/value pointer arrays + `ctypes.c_size_t` |
-| `iter<T>`    | `Iterator[T]`        | opaque `ctypes.c_void_p` iterator handle |
+| `iter<T>`    | `Iterator[T]` (lazy) | opaque `ctypes.c_void_p` iterator handle |
 
 Booleans cross the boundary as `c_int32` (`0`/`1`) because C has no
 standard fixed-width boolean type across ABIs.
@@ -164,9 +164,13 @@ class Contact:
     def name(self) -> str:
         _fn = _lib.weaveffi_contacts_Contact_get_name
         _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_char_p
-        return _bytes_to_string(_fn(self._ptr)) or ""
+        _fn.restype = ctypes.c_void_p
+        return _take_string(_fn(self._ptr)) or ""
 ```
+
+String getters return the C string as a raw address; `_take_string`
+copies it into a Python `str` and frees the producer's buffer with
+`weaveffi_free_string`, so the getter doesn't leak.
 
 The accompanying `.pyi` stub mirrors the public surface for IDE/mypy:
 
@@ -296,8 +300,11 @@ class Store:
     def delete(self, key: str) -> bool: ...
 
     async def compact(self) -> int:
-        _loop = asyncio.get_event_loop()
-        return await _loop.run_in_executor(None, self._compact_sync)
+        _fn = _lib.weaveffi_kv_Store_compact_async
+        _loop = asyncio.get_running_loop()
+        _fut = _loop.create_future()
+        # ... completion callback resolves _fut via call_soon_threadsafe ...
+        return await _fut
 
     def legacy_put(self, key: str, value: bytes) -> bool:
         import warnings
@@ -468,11 +475,21 @@ constructors, and `@property` getters) for IDE and `mypy` support.
 - **Strings in:** Python `str` is encoded to UTF-8 by `_string_to_bytes`
   before crossing the boundary. ctypes manages the lifetime of the
   temporary buffer.
-- **Strings out:** Returned `c_char_p` is decoded via
-  `_bytes_to_string`. The Rust runtime owns the original pointer; the
-  preamble registers `weaveffi_free_string` for cleanup.
+- **Strings out:** owned `const char*` returns come back as raw
+  addresses; `_take_string` copies the text and immediately calls
+  `weaveffi_free_string` on the producer's buffer. (`_bytes_to_string`
+  is reserved for borrowed strings, such as listener callback
+  parameters, which the wrapper must not free.)
 - **Bytes:** copied in via a ctypes array, copied out via slicing
-  (`_result[:_out_len.value]`). Rust frees the original buffer.
+  (`_result[:_out_len.value]`); the wrapper then releases the
+  producer's buffer with `weaveffi_free_bytes`.
+- **Optional scalars out:** the producer boxes the value behind a
+  pointer (null means `None`); the wrapper dereferences it and frees
+  the box with `weaveffi_free_bytes`.
+- **Lists and maps out:** each element is copied (string elements
+  through `_take_string`, which frees them individually), then the
+  array buffer itself, or both parallel key/value buffers for a map,
+  is released with `weaveffi_free_bytes`.
 - **Structs:** wrappers hold an opaque `c_void_p`. `__del__` calls the
   matching `_destroy` C function. For deterministic cleanup, use the
   `_PointerGuard` context manager:
@@ -485,66 +502,91 @@ constructors, and `@property` getters) for IDE and `mypy` support.
 ## Async support
 
 Async IDL functions (`async: true`) are exposed as `async def`
-wrappers. Each wrapper delegates to a generated blocking
-`_<name>_sync` helper via `run_in_executor`, so the asyncio event loop
-stays free while a worker thread waits for the native completion
-callback:
+wrappers that integrate directly with asyncio; no worker thread blocks
+waiting for the result. The wrapper creates a future on the running
+loop, builds a `ctypes.CFUNCTYPE` completion callback, calls the
+`_async`-suffixed C launcher (which returns immediately), and awaits
+the future. From the `kvstore` sample's `Store.compact`:
 
 ```python
-async def run_task(name: str) -> "TaskResult":
-    """
+async def compact(self) -> int:
+    """Reclaim space asynchronously; returns the number of bytes reclaimed
+
     Raises
     ------
-    TaskError
+    KvError
         If the call reports one of the domain's error codes.
     """
-    _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _run_task_sync, name)
-```
+    _fn = _lib.weaveffi_kv_Store_compact_async
+    _loop = asyncio.get_running_loop()
+    _fut = _loop.create_future()
 
-The `_sync` helper builds a `ctypes.CFUNCTYPE` completion callback,
-calls the `_async`-suffixed C launcher, and blocks on a
-`threading.Event` until the C side fires the callback. When the
-callable is marked `throws: true`, an error reported through the
-callback is re-raised through the domain mapper (here
-`_task_error_from`), so `await` raises the typed exception:
-
-```python
-def _run_task_sync(name: str) -> "TaskResult":
-    _fn = _lib.weaveffi_tasks_run_task_async
-    _ev = threading.Event()
-    _state = {"err": None, "val": None}
     def _cb_impl(context, err, result):
-        try:
-            if err and err.contents.code != 0:
-                # ... decode the error, weaveffi_error_clear ...
-                _state["err"] = _task_error_from(_code, _msg)
+        # Fires exactly once, on a producer thread: convert (copying
+        # borrowed buffers) here, then hop back to the event loop.
+        _state = {"err": None, "val": None}
+        if err and err.contents.code != 0:
+            _code = err.contents.code
+            _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
+            _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+            _state["err"] = _kv_error_from(_code, _msg)
+        else:
+            _state["val"] = result
+
+        def _resolve():
+            _async_pending.pop(_token, None)
+            # A cancelled future must not be resolved.
+            if _fut.cancelled():
+                return
+            if _state["err"] is not None:
+                _fut.set_exception(_state["err"])
             else:
-                # ... null-pointer guard ...
-                _state["val"] = TaskResult(result)
-        finally:
-            _ev.set()
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p,
-                                ctypes.POINTER(_WeaveFFIErrorStruct),
-                                ctypes.c_void_p)
+                _fut.set_result(_state["val"])
+
+        _loop.call_soon_threadsafe(_resolve)
+
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_int64)
     _cb = _cb_type(_cb_impl)
-    _fn.argtypes = [ctypes.c_char_p, _cb_type, ctypes.c_void_p]
+    _token = _async_register(_cb)  # pinned until completion
+    _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
     _fn.restype = None
-    _fn(_string_to_bytes(name), _cb, None)
-    _ev.wait()
-    if _state["err"] is not None:
-        raise _state["err"]
-    return _state["val"]
+    _fn(self._ptr, None, _cb, None)
+    return await _fut
 ```
 
-Async interface methods work the same way as bound methods:
-`Store.compact()` is an `async def` delegating to `self._compact_sync`.
+The completion callback fires exactly once, on an arbitrary producer
+thread. Result buffers passed to it (strings, bytes, arrays) are owned
+by the producer and valid only for the callback's duration, so the
+wrapper deep-copies them inside the callback and never frees them.
+Owned-object results (structs, rich enums, interfaces, including
+optional ones) are the exception: the callback receives ownership and
+adopts the pointer into a wrapper class. Conversion happens on the
+producer thread; the wrapper then hops back to the event loop with
+`loop.call_soon_threadsafe` to resolve the future, since asyncio
+futures must not be touched from foreign threads.
+
+When the callable is marked `throws: true`, an error reported through
+the callback is mapped through the domain mapper (here
+`_kv_error_from`) and set as the future's exception, so `await` raises
+the typed error. For a non-throwing callable a non-zero code can only
+be a producer bug; the wrapper raises the generic `WeaveFFIError`
+rather than swallowing it.
+
+Each callback trampoline is pinned in the module-level `_async_pending`
+dict until completion, so the GC cannot collect an object the producer
+still holds, even if the awaiting coroutine is cancelled. A cancelled
+future is never resolved, but the native operation itself keeps
+running.
+
+Async interface methods work the same way as bound methods: the
+receiver pointer is passed as the launcher's leading argument.
 
 For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter; the Python wrapper always passes `None` (NULL)
-for it. The token is not exposed, so cancelling the awaiting asyncio
-task does not stop the native operation. Cancellation tokens are
-currently surfaced only by the C and C++ targets.
+for it, as in the `compact` example above. The token is not exposed,
+so cancelling the awaiting asyncio task does not stop the native
+operation. Cancellation tokens are currently surfaced only by the C
+and C++ targets.
 
 ## Callbacks and listeners
 
@@ -614,38 +656,70 @@ unregister_message_listener(listener_id)
 ## Iterators
 
 Functions returning `iter<T>` receive an opaque iterator handle from
-the C ABI (`weaveffi_events_get_messages`). The wrapper drains it
-eagerly with the generated `_next` binding
-(`weaveffi_events_GetMessagesIterator_next`), destroys the handle, and
-returns the collected items; the signature is annotated
-`Iterator[str]`:
+the C ABI (`weaveffi_events_get_messages`) and wrap it in a generated
+lazy iterator class. The wrapper returns immediately; nothing is
+drained, and each consumer step issues exactly one producer `next`
+call (`weaveffi_events_GetMessagesIterator_next`). The signature is
+annotated `Iterator[str]`:
 
 ```python
 def get_messages() -> Iterator[str]:
+    """
+    Return an iterator over all sent messages
+
+    Returns a lazy iterator: each step pulls one element from the producer. Exhaust or close() the iterator to release its native handle (garbage collection also releases it).
+    """
     _fn = _lib.weaveffi_events_get_messages
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
-    # ... argtypes/restype for _next_fn and _destroy_fn ...
-    _items = []
-    while True:
-        _out_item = ctypes.c_char_p()
-        _item_err = _WeaveFFIErrorStruct()
-        _has = _next_fn(_result, ctypes.byref(_out_item),
-                        ctypes.byref(_item_err))
-        _check_error(_item_err)
-        if not _has:
-            break
-        _items.append(_bytes_to_string(_out_item.value))
-    _destroy_fn(_result)
-    return _items
+    return _GetMessagesIterator(_result)
 ```
 
-An error from `_next` raises `WeaveFFIError`; on success the iterator
-handle is destroyed before the wrapper returns, so no native state
-outlives the call.
+The per-function iterator class implements the Python iterator
+protocol. Each `__next__` pulls one element, checks the step's error
+slot, and copies the yielded string with `_take_string` (which also
+frees the producer's buffer per element):
+
+```python
+class _GetMessagesIterator:
+    """Lazy iterator over a producer stream: each step pulls one element
+    across the C boundary. The native handle is released exactly once, on
+    exhaustion, on close(), or when the iterator is garbage collected."""
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        # ... argtypes/restype for _next_fn ...
+        _out_item = ctypes.c_void_p()
+        _err = _WeaveFFIErrorStruct()
+        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
+        _check_error(_err)
+        if not _has:
+            self._done = True
+            self._destroy()
+            raise StopIteration
+        return _take_string(_out_item.value)
+
+    def close(self):
+        """Release the native iterator without draining it."""
+        self._done = True
+        self._destroy()
+```
+
+The native handle is destroyed exactly once: eagerly on exhaustion,
+via `close()` when iteration is abandoned early, or from `__del__` as
+a garbage-collection backstop. `_destroy` nulls the stored pointer, so
+a double destroy is impossible.
+
+Errors from the launcher and from each `next` follow the function's
+error strategy. A throwing iterator such as the `kvstore` sample's
+`Store.list_keys` checks each step with `_check_kv_error` and raises
+the typed domain error (`KeyNotFound`, `IoError`, ...) from the step
+that failed; a non-throwing iterator like `get_messages` raises the
+generic `WeaveFFIError` only for producer bugs.
 
 ## Troubleshooting
 

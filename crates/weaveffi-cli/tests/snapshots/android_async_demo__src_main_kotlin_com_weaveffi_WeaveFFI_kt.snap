@@ -15,6 +15,25 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
+        @Volatile private var callbackExceptionHandler: ((Throwable) -> Unit)? = null
+
+        /**
+         * Installs a handler for exceptions thrown by listener callbacks and
+         * async continuations on native producer threads. These exceptions have
+         * no Kotlin caller to propagate to; when no handler is installed, they
+         * are logged with their stack trace and dropped. Pass `null` to
+         * restore the default logging behavior.
+         */
+        @JvmStatic fun setCallbackExceptionHandler(handler: ((Throwable) -> Unit)?) {
+            callbackExceptionHandler = handler
+        }
+
+        // Invoked from the JNI glue; rethrowing signals "no handler" so the
+        // glue falls back to ExceptionDescribe.
+        @JvmStatic private fun dispatchCallbackException(t: Throwable) {
+            callbackExceptionHandler?.invoke(t) ?: throw t
+        }
+
         @JvmStatic private external fun runTaskAsync(name: String, callback: Any)
         @JvmStatic suspend fun runTask(name: String): TaskResult {
             val raw: Long = suspendCancellableCoroutine { cont ->

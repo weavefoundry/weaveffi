@@ -55,11 +55,11 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_createOrder(JNIEnv* env, jcla
     jlong* items_elems = (*env)->GetLongArrayElements(env, items, NULL);
     jsize items_len = (*env)->GetArrayLength(env, items);
     int64_t rv = weaveffi_orders_create_order((const void*)items_elems, (size_t)items_len, &err);
+    (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
     if (err.code != 0) {
         throw_weaveffi_orders_OrdersError(env, &err);
         return 0;
     }
-    (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
     return (jlong) rv;
 }
 
@@ -108,10 +108,6 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Product_nativeCreate(JNIEnv* env, jcla
         tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
     }
     weaveffi_products_Product* rv = weaveffi_products_Product_create((int64_t)id, name_chars, description_chars, (double)price, (int32_t)category, (const char* const*)tags_elems, (size_t)tags_len, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
     if (description != NULL) { (*env)->ReleaseStringUTFChars(env, description, description_chars); }
     for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
@@ -119,6 +115,10 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Product_nativeCreate(JNIEnv* env, jcla
     }
     free((void*)tags_elems);
     free(tags_jstrs);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return 0;
+    }
     return (jlong)(intptr_t)rv;
 }
 
@@ -169,6 +169,7 @@ JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_Product_nativeGetTags(JNIEnv* e
             weaveffi_free_string(rv[i]);
         }
     }
+    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(const char*));
     return jout;
 }
 
@@ -186,11 +187,11 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeAddProduct(JNIEnv* env, 
     weaveffi_error err = {0, NULL};
     const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
     weaveffi_products_Product* rv = weaveffi_products_Catalog_add_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, name_chars, (double)price, (int32_t)category, &err);
+    (*env)->ReleaseStringUTFChars(env, name, name_chars);
     if (err.code != 0) {
         throw_weaveffi_products_ProductsError(env, &err);
         return 0;
     }
-    (*env)->ReleaseStringUTFChars(env, name, name_chars);
     return (jlong)(intptr_t)rv;
 }
 
@@ -207,13 +208,17 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeGetProduct(JNIEnv* env, 
 JNIEXPORT jlongArray JNICALL Java_com_weaveffi_Catalog_nativeSearch(JNIEnv* env, jclass clazz, jlong selfHandle, jint category) {
     weaveffi_error err = {0, NULL};
     size_t out_len = 0;
-    const int64_t* rv = (const int64_t*)weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int32_t)category, &out_len, &err);
+    void* const* rv = (void* const*)weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int32_t)category, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
     }
     jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
-    if (result && rv) { (*env)->SetLongArrayRegion(env, result, 0, (jsize)out_len, (const jlong*)rv); }
+    for (jsize _li = 0; result && rv && _li < (jsize)out_len; _li++) {
+        jlong _lv = (jlong)(intptr_t)rv[_li];
+        (*env)->SetLongArrayRegion(env, result, _li, 1, &_lv);
+    }
+    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));
     return result;
 }
 
@@ -276,12 +281,12 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Order_nativeCreate(JNIEnv* env, jclass
     jsize items_len = (*env)->GetArrayLength(env, items);
     const char* status_chars = (*env)->GetStringUTFChars(env, status, NULL);
     weaveffi_orders_Order* rv = weaveffi_orders_Order_create((int64_t)id, (const void*)items_elems, (size_t)items_len, (double)total, status_chars, &err);
+    (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
+    (*env)->ReleaseStringUTFChars(env, status, status_chars);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
-    (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
-    (*env)->ReleaseStringUTFChars(env, status, status_chars);
     return (jlong)(intptr_t)rv;
 }
 
@@ -296,9 +301,13 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Order_nativeGetId(JNIEnv* env, jclass 
 
 JNIEXPORT jlongArray JNICALL Java_com_weaveffi_Order_nativeGetItems(JNIEnv* env, jclass clazz, jlong handle) {
     size_t out_len = 0;
-    const int64_t* rv = (const int64_t*)weaveffi_orders_Order_get_items((const weaveffi_orders_Order*)(intptr_t)handle, &out_len);
+    void* const* rv = (void* const*)weaveffi_orders_Order_get_items((const weaveffi_orders_Order*)(intptr_t)handle, &out_len);
     jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);
-    if (jout && rv) { (*env)->SetLongArrayRegion(env, jout, 0, (jsize)out_len, (const jlong*)rv); }
+    for (jsize i = 0; jout && rv && i < (jsize)out_len; i++) {
+        jlong lv = (jlong)(intptr_t)rv[i];
+        (*env)->SetLongArrayRegion(env, jout, i, 1, &lv);
+    }
+    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));
     return jout;
 }
 

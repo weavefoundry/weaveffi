@@ -872,7 +872,7 @@ fn unknown_type_ref_rejected() {
                 name: "do_stuff".to_string(),
                 params: vec![Param {
                     name: "x".to_string(),
-                    ty: TypeRef::Struct("Foo".to_string()),
+                    ty: TypeRef::Named("Foo".to_string()),
                     mutable: false,
                     doc: None,
                 }],
@@ -911,7 +911,7 @@ fn valid_struct_ref_passes() {
                 name: "do_stuff".to_string(),
                 params: vec![Param {
                     name: "p".to_string(),
-                    ty: TypeRef::Struct("Point".to_string()),
+                    ty: TypeRef::Named("Point".to_string()),
                     mutable: false,
                     doc: None,
                 }],
@@ -947,7 +947,7 @@ fn unknown_type_ref_in_optional_rejected() {
                 name: "do_stuff".to_string(),
                 params: vec![Param {
                     name: "x".to_string(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::Struct("Bar".to_string()))),
+                    ty: TypeRef::Optional(Box::new(TypeRef::Named("Bar".to_string()))),
                     mutable: false,
                     doc: None,
                 }],
@@ -985,7 +985,7 @@ fn unknown_type_ref_in_list_rejected() {
             functions: vec![Function {
                 name: "do_stuff".to_string(),
                 params: vec![],
-                returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Baz".to_string())))),
+                returns: Some(TypeRef::List(Box::new(TypeRef::Named("Baz".to_string())))),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -1023,7 +1023,7 @@ fn struct_field_referencing_unknown_type() {
                 doc: None,
                 fields: vec![StructField {
                     name: "inner".to_string(),
-                    ty: TypeRef::Struct("Nonexistent".to_string()),
+                    ty: TypeRef::Named("Nonexistent".to_string()),
                     doc: None,
                     default: None,
                 }],
@@ -1054,7 +1054,7 @@ fn function_param_with_optional_struct() {
                 name: "save".to_string(),
                 params: vec![Param {
                     name: "c".to_string(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::Struct("Contact".to_string()))),
+                    ty: TypeRef::Optional(Box::new(TypeRef::Named("Contact".to_string()))),
                     mutable: false,
                     doc: None,
                 }],
@@ -1136,7 +1136,7 @@ fn nested_optional_list_validates() {
                 name: "list_contacts".to_string(),
                 params: vec![],
                 returns: Some(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
-                    TypeRef::Struct("Contact".to_string()),
+                    TypeRef::Named("Contact".to_string()),
                 ))))),
                 doc: None,
                 throws: false,
@@ -1270,7 +1270,7 @@ fn map_of_struct_value_field_rejected() {
                     name: "parts".to_string(),
                     ty: TypeRef::Map(
                         Box::new(TypeRef::StringUtf8),
-                        Box::new(TypeRef::Struct("Widget".to_string())),
+                        Box::new(TypeRef::Named("Widget".to_string())),
                     ),
                     doc: None,
                     default: None,
@@ -1377,7 +1377,7 @@ fn resolve_enum_ref_in_function_param() {
                 name: "paint".to_string(),
                 params: vec![Param {
                     name: "color".to_string(),
-                    ty: TypeRef::Struct("Color".to_string()),
+                    ty: TypeRef::Named("Color".to_string()),
                     mutable: false,
                     doc: None,
                 }],
@@ -1417,7 +1417,7 @@ fn resolve_enum_ref_in_optional() {
                 name: "paint".to_string(),
                 params: vec![Param {
                     name: "color".to_string(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::Struct("Color".to_string()))),
+                    ty: TypeRef::Optional(Box::new(TypeRef::Named("Color".to_string()))),
                     mutable: false,
                     doc: None,
                 }],
@@ -1457,7 +1457,7 @@ fn struct_ref_not_changed() {
                 name: "save".to_string(),
                 params: vec![Param {
                     name: "c".to_string(),
-                    ty: TypeRef::Struct("Contact".to_string()),
+                    ty: TypeRef::Named("Contact".to_string()),
                     mutable: false,
                     doc: None,
                 }],
@@ -1483,7 +1483,7 @@ fn struct_ref_not_changed() {
     validate_api(&mut api, None).unwrap();
     assert_eq!(
         api.modules[0].functions[0].params[0].ty,
-        TypeRef::Struct("Contact".to_string())
+        TypeRef::Record("Contact".to_string())
     );
 }
 
@@ -1531,7 +1531,7 @@ fn map_with_struct_key_rejected() {
                 name: "get_map".to_string(),
                 params: vec![],
                 returns: Some(TypeRef::Map(
-                    Box::new(TypeRef::Struct("Point".to_string())),
+                    Box::new(TypeRef::Named("Point".to_string())),
                     Box::new(TypeRef::I32),
                 )),
                 doc: None,
@@ -1960,7 +1960,7 @@ fn resolve_enum_ref_in_struct_field() {
                 doc: None,
                 fields: vec![StructField {
                     name: "color".to_string(),
-                    ty: TypeRef::Struct("Color".to_string()),
+                    ty: TypeRef::Named("Color".to_string()),
                     doc: None,
                     default: None,
                 }],
@@ -2315,7 +2315,7 @@ fn cross_module_struct_ref_passes() {
                     name: "place_order".to_string(),
                     params: vec![Param {
                         name: "item".to_string(),
-                        ty: TypeRef::Struct("Product".to_string()),
+                        ty: TypeRef::Named("Product".to_string()),
                         mutable: false,
                         doc: None,
                     }],
@@ -2353,7 +2353,7 @@ fn cross_module_struct_ref_passes() {
     validate_api(&mut api, None).unwrap();
     assert_eq!(
         api.modules[0].functions[0].params[0].ty,
-        TypeRef::Struct("catalog.Product".to_string())
+        TypeRef::Record("catalog.Product".to_string())
     );
 }
 
@@ -2367,7 +2367,7 @@ fn cross_module_enum_ref_passes() {
                 functions: vec![Function {
                     name: "get_status".to_string(),
                     params: vec![],
-                    returns: Some(TypeRef::Struct("Status".to_string())),
+                    returns: Some(TypeRef::Named("Status".to_string())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -2416,7 +2416,7 @@ fn cross_module_unknown_still_rejected() {
                     name: "do_stuff".to_string(),
                     params: vec![Param {
                         name: "x".to_string(),
-                        ty: TypeRef::Struct("Nonexistent".to_string()),
+                        ty: TypeRef::Named("Nonexistent".to_string()),
                         mutable: false,
                         doc: None,
                     }],
@@ -2603,7 +2603,7 @@ fn resolve_qualifies_reference_to_nested_module_type() {
             name: "app".to_string(),
             functions: vec![function_returning(
                 "make",
-                TypeRef::Struct("Widget".to_string()),
+                TypeRef::Named("Widget".to_string()),
             )],
             interfaces: vec![],
             structs: vec![],
@@ -2629,7 +2629,7 @@ fn resolve_qualifies_reference_to_nested_module_type() {
     validate_api(&mut api, None).unwrap();
     assert_eq!(
         api.modules[0].functions[0].returns,
-        Some(TypeRef::Struct("app.ui.Widget".to_string()))
+        Some(TypeRef::Record("app.ui.Widget".to_string()))
     );
 }
 
@@ -2653,7 +2653,7 @@ fn resolve_qualifies_nested_module_reference_to_parent_type() {
                 name: "inner".to_string(),
                 functions: vec![function_returning(
                     "fetch",
-                    TypeRef::Struct("Token".to_string()),
+                    TypeRef::Named("Token".to_string()),
                 )],
                 interfaces: vec![],
                 structs: vec![],
@@ -2670,7 +2670,7 @@ fn resolve_qualifies_nested_module_reference_to_parent_type() {
     validate_api(&mut api, None).unwrap();
     assert_eq!(
         api.modules[0].modules[0].functions[0].returns,
-        Some(TypeRef::Struct("lib.Token".to_string()))
+        Some(TypeRef::Record("lib.Token".to_string()))
     );
 }
 
@@ -2760,7 +2760,7 @@ fn resolve_converts_nested_enum_reference_to_enum_variant() {
                 name: "consumer".to_string(),
                 functions: vec![function_returning(
                     "status",
-                    TypeRef::Struct("Phase".to_string()),
+                    TypeRef::Named("Phase".to_string()),
                 )],
                 interfaces: vec![],
                 structs: vec![],
@@ -3134,7 +3134,7 @@ fn no_warning_mutable_on_pointer_type() {
                     },
                     Param {
                         name: "obj".to_string(),
-                        ty: TypeRef::Struct("Thing".into()),
+                        ty: TypeRef::Named("Thing".into()),
                         mutable: true,
                         doc: None,
                     },

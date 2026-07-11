@@ -103,6 +103,35 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>A lazily streamed sequence backed by a native iterator.
+    /// It can be enumerated exactly once; enumerate it promptly (or call
+    /// a materializing operator such as ToList) and let the enumerator be
+    /// disposed to release the native iterator.</summary>
+    internal sealed class WeaveFFIOnceEnumerable<T> : IEnumerable<T>
+    {
+        private IEnumerator<T>? _enumerator;
+
+        internal WeaveFFIOnceEnumerable(IEnumerator<T> enumerator)
+        {
+            _enumerator = enumerator;
+        }
+
+        public IEnumerator<T> GetEnumerator()
+        {
+            var e = System.Threading.Interlocked.Exchange(ref _enumerator, null);
+            if (e == null)
+            {
+                throw new InvalidOperationException("this sequence can be enumerated only once");
+            }
+            return e;
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator()
+        {
+            return GetEnumerator();
+        }
+    }
+
     /// <summary>Persistence semantics applied to a stored entry</summary>
     public enum EntryKind
     {
@@ -178,7 +207,9 @@ namespace WeaveFFI
             {
                 var ptr = NativeMethods.weaveffi_kv_Entry_get_expires_at(_handle);
                 if (ptr == IntPtr.Zero) return null;
-                return Marshal.ReadInt64(ptr);
+                var value = Marshal.ReadInt64(ptr);
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)8);
+                return value;
             }
         }
 
@@ -192,8 +223,12 @@ namespace WeaveFFI
                 var arr = new string[(int)len];
                 for (int i = 0; i < (int)len; i++)
                 {
-                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                    var itemPtr = Marshal.ReadIntPtr(ptr, i * IntPtr.Size);
+                    var item = Marshal.PtrToStringUTF8(itemPtr) ?? "";
+                    NativeMethods.weaveffi_free_string(itemPtr);
+                    arr[i] = item;
                 }
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
                 return arr;
             }
         }
@@ -205,9 +240,20 @@ namespace WeaveFFI
             {
                 NativeMethods.weaveffi_kv_Entry_get_metadata(_handle, out var outKeys, out var outValues, out var outLen);
                 var dict = new Dictionary<string, string>();
-                for (int i = 0; i < (int)outLen; i++)
+                if (outKeys != IntPtr.Zero && outValues != IntPtr.Zero)
                 {
-                    dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outKeys, i * IntPtr.Size)) ?? ""] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(outValues, i * IntPtr.Size)) ?? "";
+                    for (int i = 0; i < (int)outLen; i++)
+                    {
+                        var keyPtr = Marshal.ReadIntPtr(outKeys, i * IntPtr.Size);
+                        var key = Marshal.PtrToStringUTF8(keyPtr) ?? "";
+                        NativeMethods.weaveffi_free_string(keyPtr);
+                        var valuePtr = Marshal.ReadIntPtr(outValues, i * IntPtr.Size);
+                        var value = Marshal.PtrToStringUTF8(valuePtr) ?? "";
+                        NativeMethods.weaveffi_free_string(valuePtr);
+                        dict[key] = value;
+                    }
+                    NativeMethods.weaveffi_free_bytes(outKeys, (UIntPtr)((int)outLen * IntPtr.Size));
+                    NativeMethods.weaveffi_free_bytes(outValues, (UIntPtr)((int)outLen * IntPtr.Size));
                 }
                 return dict;
             }
@@ -437,6 +483,11 @@ namespace WeaveFFI
         }
 
         /// <summary>Stream every key, optionally filtered by a prefix</summary>
+        /// <remarks>Streams lazily: each element is pulled from the native
+        /// iterator on demand, and the iterator is destroyed when enumeration
+        /// completes or the enumerator is disposed (a <c>foreach</c> disposes it
+        /// automatically, including on early exit). The returned sequence can be
+        /// enumerated only once.</remarks>
         /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
         public IEnumerable<string> ListKeys(string? prefix)
         {
@@ -446,7 +497,7 @@ namespace WeaveFFI
             {
                 var iter = NativeMethods.weaveffi_kv_Store_list_keys(_handle, prefixPtr, ref err);
                 WeaveFFIError.CheckKv(err);
-                return EnumerateListKeys(iter);
+                return new WeaveFFIOnceEnumerable<string>(EnumerateListKeys(iter));
             }
             finally
             {
@@ -454,7 +505,7 @@ namespace WeaveFFI
             }
         }
 
-        private static IEnumerable<string> EnumerateListKeys(IntPtr iter)
+        private static IEnumerator<string> EnumerateListKeys(IntPtr iter)
         {
             try
             {
@@ -684,13 +735,13 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_kv_Store_open(IntPtr path, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_put", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_Store_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, int kind, IntPtr ttl_seconds, ref WeaveFFIError err);
+        internal static extern byte weaveffi_kv_Store_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, int kind, IntPtr ttl_seconds, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_get", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kv_Store_get(IntPtr self, IntPtr key, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_delete", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_Store_delete(IntPtr self, IntPtr key, ref WeaveFFIError err);
+        internal static extern byte weaveffi_kv_Store_delete(IntPtr self, IntPtr key, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_list_keys", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kv_Store_list_keys(IntPtr self, IntPtr prefix, ref WeaveFFIError out_err);
@@ -714,7 +765,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_kv_Store_compact_async(IntPtr self, IntPtr cancel_token, AsyncCb_weaveffi_kv_Store_compact callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_legacy_put", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kv_Store_legacy_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, ref WeaveFFIError err);
+        internal static extern byte weaveffi_kv_Store_legacy_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_default_capacity", CallingConvention = CallingConvention.Cdecl)]
         internal static extern long weaveffi_kv_Store_default_capacity(ref WeaveFFIError err);

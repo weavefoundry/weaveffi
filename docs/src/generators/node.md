@@ -45,7 +45,7 @@ rich-enum classes, and camelCased function wrappers.
 | `T?`          | `T \| null`          |
 | `[T]`         | `T[]`                |
 | `{K: V}`      | `Record<K, V>`       |
-| `iter<T>`     | `T[]` (drained)      |
+| `iter<T>`     | `IterableIterator<T>` (lazy) |
 
 ## Example IDL → generated code
 
@@ -184,7 +184,8 @@ class Store {
     return __invoke(addon.Store_put, [this._handle, key, value, kind, ttlSeconds], __kvErrorFrom);
   }
   listKeys(prefix) {
-    return __invoke(addon.Store_list_keys, [this._handle, prefix], __kvErrorFrom);
+    const _it = __invoke(addon.Store_list_keys, [this._handle, prefix], __kvErrorFrom);
+    return new WeaveFFIIterator(_it, addon.Store_list_keys_iterNext, addon.Store_list_keys_iterDestroy, __kvErrorFrom, null);
   }
   count() {
     return __invoke(addon.Store_count, [this._handle], __generic);
@@ -217,6 +218,8 @@ export class Store {
   static open(path: string): Store;
   /** @throws {KvError} */
   put(key: string, value: Buffer, kind: EntryKind, ttlSeconds: number | null): boolean;
+  /** @throws {KvError} */
+  listKeys(prefix: string | null): IterableIterator<string>;
   count(): number;
   /** @throws {KvError} */
   compact(): Promise<number>;
@@ -397,9 +400,9 @@ env var can point the loader at any built addon (the
   handles at GC time).
 - Typed handles (`handle<Struct>`) pass through as opaque values;
   release them through the API's own teardown function.
-- `iter<T>` returns are drained eagerly inside the addon: it loops the
-  C `_next` function into a JS array, frees each native item, and
-  destroys the iterator handle before returning.
+- `iter<T>` returns are lazy JS iterables; see
+  [Iterators](#iterators). The native handle is released on
+  exhaustion, on early exit, or by a finalizer as a backstop.
 - Errors from the C ABI are converted into JavaScript `Error` instances
   by the addon, then rebranded into the typed error classes by the
   loader before bubbling up to the caller.
@@ -432,6 +435,14 @@ static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err, 
 }
 ```
 
+The completion callback fires exactly once, on the producer thread.
+Result buffers passed to it (strings, byte buffers, arrays) are
+borrowed for the callback's duration, so the callback deep-copies them
+(note the `strdup` on the error message above) before returning and
+never frees them. Owned-object results are the exception: the callback
+receives ownership of the pointer (`ctx->result = (void*)result`
+above) and the settle callback wraps it into the JS-side owner.
+
 Rejected promises carry the C error message plus a numeric `code`
 property; the loader rebrands the rejection into the module's typed
 error class when the callable declares `throws: true` (an async method
@@ -444,6 +455,66 @@ For functions marked `cancellable: true` the addon passes `NULL` for
 the C ABI's cancel-token slot; the token is not surfaced to JS and
 there is no `AbortSignal` parameter. Only the C, C++, and Kotlin
 targets expose cancellation tokens.
+
+## Iterators
+
+`iter<T>` returns are lazy: the addon hands back an opaque external
+wrapping the native iterator handle, and the loader wraps it in a
+shared `WeaveFFIIterator` class implementing the JS iterator protocol.
+Nothing is drained up front; each `next()` issues exactly one native
+`_iterNext` call. From the `events` sample's `index.js`:
+
+```js
+// Lazy iterator over a native producer: one native `next` per step.
+// The native handle is released on exhaustion, by `return()` on early
+// exit, or by the external's finalizer if the iterator is abandoned.
+class WeaveFFIIterator {
+  next() {
+    if (this._done) {
+      return { done: true, value: undefined };
+    }
+    const _v = __invoke(this._nextFn, [this._ext], this._map);
+    if (_v === undefined) {
+      this._done = true;
+      return { done: true, value: undefined };
+    }
+    return { done: false, value: this._wrapElem ? this._wrapElem(_v) : _v };
+  }
+  return(value) {
+    if (!this._done) {
+      this._done = true;
+      this._destroyFn(this._ext);
+    }
+    return { done: true, value };
+  }
+  [Symbol.iterator]() {
+    return this;
+  }
+}
+
+wv.getMessages = function () {
+  const _it = __invoke(addon.getMessages, [], __generic);
+  return new WeaveFFIIterator(_it, addon.getMessages_iterNext, addon.getMessages_iterDestroy, __generic, null);
+};
+```
+
+The TypeScript declaration is `IterableIterator<T>`, so a plain
+`for...of` loop works and `break`ing out of it triggers `return()`,
+which destroys the native iterator early. The addon's `_iterNext`
+binding pulls one element, copies it into a JS value (freeing the
+native string), and destroys the iterator eagerly when the producer
+reports exhaustion; the external's N-API finalizer backstops abandoned
+iterators at GC time, nulling the stored handle so a double destroy is
+impossible. Struct elements are copied into plain JS objects (and the
+native struct destroyed) per step; rich-enum elements arrive as owned
+raw handles that the loader adopts into their wrapper class via the
+`wrapElem` hook.
+
+Errors from the launcher and each `next` step follow the function's
+error strategy: `Store.listKeys` (throws) rebrands a failing step
+through `__kvErrorFrom` into the typed `KvError` subclasses, while
+the non-throwing `getMessages` throws the generic `WeaveFFIError`
+only for producer bugs.
 
 ## Callbacks and listeners
 

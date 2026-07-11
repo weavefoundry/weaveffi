@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// ignore_for_file: non_constant_identifier_names, camel_case_types
+// ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
@@ -35,6 +35,16 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+typedef _NativeWeaveffiFreeString = Void Function(Pointer<Utf8>);
+typedef _DartWeaveffiFreeString = void Function(Pointer<Utf8>);
+final _weaveffiFreeString = _lib.lookupFunction<
+    _NativeWeaveffiFreeString, _DartWeaveffiFreeString>('weaveffi_free_string');
+
+typedef _NativeWeaveffiFreeBytes = Void Function(Pointer<Uint8>, Size);
+typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
+final _weaveffiFreeBytes = _lib.lookupFunction<
+    _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
+
 /// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
@@ -56,6 +66,13 @@ void _checkError(Pointer<_WeaveFFIError> err) {
 // Live listener trampolines by subscription id. Holding the
 // NativeCallable here keeps its native thunk alive until unregistered.
 final Map<int, NativeCallable> _listenerCallables = {};
+
+// Anchors one live native iteration for its GC-finalizer backstop.
+// A suspended `sync*` frame keeps the anchor reachable; abandoning the
+// iteration drops the frame, and the finalizer destroys the native
+// iterator handle. Exhausted iterations detach before destroying
+// eagerly, so the handle is destroyed exactly once either way.
+final class _IteratorLifetime implements Finalizable {}
 
 typedef _NativeCb_weaveffi_events_OnMessage_fn = Void Function(Pointer<Utf8>, Pointer<Void>);
 
@@ -117,24 +134,42 @@ typedef _NativeWeaveffiEventsGetMessagesIteratorDestroy = Void Function(Pointer<
 typedef _DartWeaveffiEventsGetMessagesIteratorDestroy = void Function(Pointer<Void>);
 final _weaveffiEventsGetMessagesIteratorDestroy = _lib.lookupFunction<
     _NativeWeaveffiEventsGetMessagesIteratorDestroy, _DartWeaveffiEventsGetMessagesIteratorDestroy>('weaveffi_events_GetMessagesIterator_destroy');
+final _weaveffiEventsGetMessagesIteratorDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_events_GetMessagesIterator_destroy'));
 
 /// Return an iterator over all sent messages
-Iterable<String> getMessages() {
+///
+/// Returns a lazy [Iterable]: elements are pulled from the native
+/// iterator one at a time (one native `next` call per element), and
+/// iterating the result again launches a fresh native iterator.
+///
+/// The native iterator handle is destroyed exactly once: eagerly when
+/// the iteration completes or fails, or by a GC finalizer if the
+/// iteration is abandoned before it is exhausted.
+Iterable<String> getMessages() sync* {
   final err = calloc<_WeaveFFIError>();
+  final outItem = calloc<Pointer<Utf8>>();
+  Pointer<Void> iter = nullptr;
+  final anchor = _IteratorLifetime();
   try {
-    final iter = _weaveffiEventsGetMessages(err);
+    iter = _weaveffiEventsGetMessages(err);
     _checkError(err);
-    final items = <String>[];
-    final outItem = calloc<Pointer<Utf8>>();
+    _weaveffiEventsGetMessagesIteratorDestroyFinalizer.attach(anchor, iter, detach: anchor);
     while (_weaveffiEventsGetMessagesIteratorNext(iter, outItem, err) != 0) {
       _checkError(err);
-      items.add(outItem.value.toDartString());
+      final itemPtr = outItem.value;
+      final item = itemPtr.toDartString();
+      _weaveffiFreeString(itemPtr);
+      yield item;
     }
     _checkError(err);
-    calloc.free(outItem);
-    _weaveffiEventsGetMessagesIteratorDestroy(iter);
-    return items;
   } finally {
+    if (iter != nullptr) {
+      _weaveffiEventsGetMessagesIteratorDestroyFinalizer.detach(anchor);
+      _weaveffiEventsGetMessagesIteratorDestroy(iter);
+      iter = nullptr;
+    }
+    calloc.free(outItem);
     calloc.free(err);
   }
 }

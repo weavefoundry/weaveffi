@@ -146,7 +146,10 @@ func (s *TaskResult) Id() int64 {
 }
 
 func (s *TaskResult) Value() string {
-	return C.GoString(C.weaveffi_tasks_TaskResult_get_value(s.ptr))
+	cStr := C.weaveffi_tasks_TaskResult_get_value(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 func (s *TaskResult) Success() bool {
@@ -179,7 +182,7 @@ func goWv_weaveffi_tasks_run_task_callback(context unsafe.Pointer, err *C.weavef
 	ch <- wvOutcomeTasksRunTask{val: &TaskResult{ptr: result}}
 }
 
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func RunTask(name string) (*TaskResult, error) {
 	ch := make(chan wvOutcomeTasksRunTask, 1)
 	ctxID := wvCallbackStore(ch)
@@ -206,7 +209,7 @@ func goWv_weaveffi_tasks_run_batch_callback(context unsafe.Pointer, err *C.weave
 	}
 	ch := v.(chan wvOutcomeTasksRunBatch)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeTasksRunBatch{err: wvMapTasks(wvTakeError(err))}
+		ch <- wvOutcomeTasksRunBatch{err: wvBrandError(wvTakeError(err))}
 		return
 	}
 	count := int(result_len)
@@ -219,7 +222,7 @@ func goWv_weaveffi_tasks_run_batch_callback(context unsafe.Pointer, err *C.weave
 	ch <- wvOutcomeTasksRunBatch{val: val}
 }
 
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func RunBatch(names []string) []*TaskResult {
 	ch := make(chan wvOutcomeTasksRunBatch, 1)
 	ctxID := wvCallbackStore(ch)
@@ -265,13 +268,13 @@ func goWv_weaveffi_tasks_run_n_tasks_callback(context unsafe.Pointer, err *C.wea
 	}
 	ch := v.(chan wvOutcomeTasksRunNTasks)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeTasksRunNTasks{err: wvMapTasks(wvTakeError(err))}
+		ch <- wvOutcomeTasksRunNTasks{err: wvBrandError(wvTakeError(err))}
 		return
 	}
 	ch <- wvOutcomeTasksRunNTasks{val: int32(result)}
 }
 
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func RunNTasks(n int32) int32 {
 	ch := make(chan wvOutcomeTasksRunNTasks, 1)
 	ctxID := wvCallbackStore(ch)

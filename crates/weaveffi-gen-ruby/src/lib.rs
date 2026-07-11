@@ -25,6 +25,7 @@ use weaveffi_core::model::{
     RichVariantBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{
@@ -485,13 +486,19 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("{name}_buf"), format!("{name}.bytesize")]
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             vec![format!("{name}.handle")]
         }
         TypeRef::Optional(inner) if !is_c_pointer_type(inner) => vec![format!("{name}_c")],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![name.to_string()],
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => {
                 vec![format!("{name}&.handle")]
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
@@ -512,6 +519,7 @@ fn rb_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("{name}.length"),
         ],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -521,7 +529,9 @@ fn rb_element_expr(var: &str, ty: &TypeRef) -> String {
             format!("{var}.null? ? '' : {var}.read_string")
         }
         TypeRef::TypedHandle(name) => format!("{name}.new({var})"),
-        TypeRef::Struct(name) => format!("{}.new({var})", local_type_name(name)),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            format!("{}.new({var})", local_type_name(name))
+        }
         // Owned interface references wrap without re-running initialize.
         TypeRef::Interface(name) => format!("{}._from_ptr({var})", local_type_name(name)),
         TypeRef::Bool => format!("{var} != 0"),
@@ -556,13 +566,14 @@ fn rb_error_checker_name(eb: &ErrorBinding) -> String {
     format!("check_{}!", rb_error_stem(eb))
 }
 
-/// The error-check call a callable's out-err slot goes through: the module
-/// domain's typed checker when the callable throws, the generic
-/// `check_error!` (plain `Error`; panics and marshalling failures only)
-/// otherwise.
+/// The error-check call a callable's out-err slot goes through, per the
+/// function's [`ErrorStrategy`]: the module domain's typed checker for
+/// [`ErrorStrategy::Throws`], the generic `check_error!` (plain `Error`;
+/// producer panics and marshalling failures only) for
+/// [`ErrorStrategy::Trap`].
 fn rb_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
-    match error {
-        Some(eb) if f.throws => rb_error_checker_name(eb),
+    match (f.error_strategy(), error) {
+        (ErrorStrategy::Throws, Some(eb)) => rb_error_checker_name(eb),
         _ => "check_error!".to_string(),
     }
 }
@@ -1260,7 +1271,7 @@ fn render_getter(out: &mut String, method: &str, field: &FieldBinding, rb_module
             let (k, v) = get_map_kv(&field.ty).unwrap();
             let is_optional = matches!(&field.ty, TypeRef::Optional(_));
             let mut tmp = String::new();
-            render_map_return_code(&mut tmp, k, v, ind, is_optional);
+            render_map_return_code(&mut tmp, k, v, ind, is_optional, Some(rb_module_name));
             w.raw(tmp);
         } else if !out_params.is_empty() {
             w.line("out_len = FFI::MemoryPointer.new(:size_t)");
@@ -1625,13 +1636,16 @@ fn rb_cb_arg_expr(n: &str, ty: &TypeRef) -> String {
         TypeRef::Enum(_) => n.into(),
         // Borrowed by contract: the producer owns callback arguments for the
         // duration of the call, so opaque pointers pass through raw.
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n.into(),
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => n.into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => n.into(),
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 format!("({n}_ptr.null? ? nil : {n}_ptr.read_string({n}_len))")
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) => n.into(),
+            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => n.into(),
             TypeRef::Bool => format!("({n}.null? ? nil : ({n}.read_int32 != 0))"),
             TypeRef::List(_) | TypeRef::Map(_, _) => {
                 format!("({n}.null? ? nil : {})", rb_cb_list_expr(n, inner))
@@ -1643,6 +1657,7 @@ fn rb_cb_arg_expr(n: &str, ty: &TypeRef) -> String {
         },
         TypeRef::List(_) | TypeRef::Map(_, _) => rb_cb_list_expr(n, ty),
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -1787,7 +1802,14 @@ fn render_sync_function_wrapper(
                         let (k, v) = get_map_kv(ret_ty).unwrap();
                         let is_optional = matches!(ret_ty, TypeRef::Optional(_));
                         let mut tmp = String::new();
-                        render_map_return_code(&mut tmp, k, v, &ind, is_optional);
+                        render_map_return_code(
+                            &mut tmp,
+                            k,
+                            v,
+                            &ind,
+                            is_optional,
+                            scope.module_name(),
+                        );
                         w.raw(tmp);
                     } else {
                         let mut tmp = String::new();
@@ -1806,6 +1828,13 @@ fn render_sync_function_wrapper(
 /// releases the GVL, and the ffi gem delivers cross-thread callbacks safely).
 /// Blocking is the idiomatic Ruby surface; callers needing concurrency wrap
 /// the call in their own Thread or Fiber scheduler.
+///
+/// The trampoline (`callback` local) stays referenced by the wrapper's stack
+/// frame until `queue.pop` returns, which happens only after the producer has
+/// invoked it, so the GC cannot collect it mid-flight. Per
+/// [`weaveffi_core::plan::AsyncProtocol`], the trampoline copies borrowed
+/// result buffers before returning and never frees them; the error slot
+/// follows the function's [`ErrorStrategy`].
 fn render_async_function_wrapper(
     out: &mut String,
     module: &ModuleBinding,
@@ -1819,8 +1848,10 @@ fn render_async_function_wrapper(
     let q = scope.qualifier();
     // A completion error raises the typed domain error for throwing
     // callables; the generic Error otherwise (panics, marshalling).
-    let error_expr = match module.error.as_ref() {
-        Some(eb) if f.throws => format!("{q}{}(code, msg)", rb_error_factory_name(eb)),
+    let error_expr = match (f.error_strategy(), module.error.as_ref()) {
+        (ErrorStrategy::Throws, Some(eb)) => {
+            format!("{q}{}(code, msg)", rb_error_factory_name(eb))
+        }
         _ => "Error.new(code, msg)".to_string(),
     };
     let params: Vec<String> = f.params.iter().map(|p| p.name.to_snake_case()).collect();
@@ -1830,8 +1861,9 @@ fn render_async_function_wrapper(
     let mut d = String::new();
     emit_doc(&mut d, &f.doc, &doc_ind);
     w.raw(d);
+    w.line("# Blocks the current thread until the async producer completes; the");
     w.line(format!(
-        "# Blocks until the async producer completes{}.",
+        "# result (or error) is delivered through the completion callback{}.",
         if f.cancellable {
             " (cancellation token not exposed; pass-through is NULL)"
         } else {
@@ -1870,12 +1902,7 @@ fn render_async_function_wrapper(
                 w.line("else");
                 w.scope(|w| {
                     let mut tmp = String::new();
-                    render_async_result_push(
-                        &mut tmp,
-                        &f.ret,
-                        &format!("{ind}    "),
-                        scope.module_name(),
-                    );
+                    render_async_result_push(&mut tmp, &f.ret, &format!("{ind}    "));
                     w.raw(tmp);
                 });
                 w.line("end");
@@ -1909,16 +1936,15 @@ fn render_async_function_wrapper(
 
 /// Push the converted async result onto the queue. Result slots are named by
 /// [`abi::callback_result_params`]: `result` (+ `result_len`, or
-/// `result_keys`/`result_values`/`result_len` for maps). `qualifier` is the
-/// top-level Ruby module name when rendering inside a class body, where
-/// module singleton calls (`weaveffi_free_*`) need an explicit receiver.
-fn render_async_result_push(
-    out: &mut String,
-    ret: &Option<TypeRef>,
-    ind: &str,
-    qualifier: Option<&str>,
-) {
-    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
+/// `result_keys`/`result_values`/`result_len` for maps).
+///
+/// Per the async completion contract ([`weaveffi_core::plan::AsyncProtocol`]),
+/// string, bytes, array, and map result buffers are producer-owned and
+/// borrowed for the callback's duration: the callback deep-copies them before
+/// returning and never frees them. Owned-object results (records, rich enums,
+/// interfaces) are the exception: the callback receives ownership, so the
+/// pointer is adopted by a finalizer-bearing wrapper.
+fn render_async_result_push(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     let Some(ty) = ret else {
         w.line("queue << nil");
@@ -1946,32 +1972,14 @@ fn render_async_result_push(
             w.line("queue << result");
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("if result.null?");
-            w.scope(|w| {
-                w.line("queue << ''");
-            });
-            w.line("else");
-            w.scope(|w| {
-                w.line("s = result.read_string");
-                w.line(format!("{m}weaveffi_free_string(result)"));
-                w.line("queue << s");
-            });
-            w.line("end");
+            // Borrowed for the callback's duration: copy, don't free.
+            w.line("queue << (result.null? ? '' : result.read_string)");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("if result.null?");
-            w.scope(|w| {
-                w.line("queue << ''.b");
-            });
-            w.line("else");
-            w.scope(|w| {
-                w.line("data = result.read_string(result_len)");
-                w.line(format!("{m}weaveffi_free_bytes(result, result_len)"));
-                w.line("queue << data");
-            });
-            w.line("end");
+            // Borrowed for the callback's duration: copy, don't free.
+            w.line("queue << (result.null? ? ''.b : result.read_string(result_len))");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let local = local_type_name(name);
             w.line("if result.null?");
             w.scope(|w| {
@@ -1998,13 +2006,15 @@ fn render_async_result_push(
             w.line("end");
         }
         TypeRef::List(elem) => {
+            // Borrowed array buffer: copy the elements, don't free. Object
+            // elements transfer ownership and are adopted by their wrappers.
             let reader = rb_array_reader(elem);
             let map_suffix = match elem.as_ref() {
                 TypeRef::Bool => ".map { |v| v != 0 }".to_string(),
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                     ".map { |p| p.null? ? '' : p.read_string }".to_string()
                 }
-                TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                     format!(".map {{ |p| {}.new(p) }}", local_type_name(name))
                 }
                 TypeRef::Interface(name) => {
@@ -2029,19 +2039,10 @@ fn render_async_result_push(
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line("if result.null?");
-                w.scope(|w| {
-                    w.line("queue << nil");
-                });
-                w.line("else");
-                w.scope(|w| {
-                    w.line("s = result.read_string");
-                    w.line(format!("{m}weaveffi_free_string(result)"));
-                    w.line("queue << s");
-                });
-                w.line("end");
+                // Borrowed for the callback's duration: copy, don't free.
+                w.line("queue << (result.null? ? nil : result.read_string)");
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                 let local = local_type_name(name);
                 w.line(format!(
                     "queue << (result.null? ? nil : {local}.new(result))"
@@ -2062,17 +2063,29 @@ fn render_async_result_push(
             }
             _ => {
                 let mut tmp = String::new();
-                render_async_result_push(&mut tmp, &Some((**inner).clone()), ind, qualifier);
+                render_async_result_push(&mut tmp, &Some((**inner).clone()), ind);
                 w.raw(tmp);
             }
         },
         TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
 
-/// Iterator wrapper: launch, drain `next` into an Array, destroy. Errors
-/// during iteration destroy the handle before raising.
+/// Iterator wrapper: returns a lazy `Enumerator` per the pull contract stated
+/// by [`weaveffi_core::plan::IteratorProtocol`].
+///
+/// The producer iterator launches *inside* the enumerator block, on the first
+/// pull, so a handle cannot leak when the returned enumerator is never
+/// started (launch errors therefore raise on the first pull rather than at
+/// call time). Each consumer step issues exactly one C `next` call, each
+/// yielded element is released per its element plan (strings and bytes freed
+/// after copying; record and rich-enum pointers adopted by their
+/// finalizer-bearing wrappers), and `destroy` runs exactly once from an
+/// `ensure` block, so an early `break` or an error raised mid-iteration still
+/// releases the handle. Launch and per-`next` errors follow the function's
+/// [`ErrorStrategy`].
 fn render_iterator_function_wrapper(
     out: &mut String,
     module: &ModuleBinding,
@@ -2092,12 +2105,17 @@ fn render_iterator_function_wrapper(
     let mut d = String::new();
     emit_doc(&mut d, &f.doc, &doc_ind);
     w.raw(d);
+    w.line("# Returns a lazy Enumerator that streams one element per pull; call");
+    w.line("# `.to_a` to collect eagerly. The underlying producer iterator is");
+    w.line("# launched on the first pull, so launch errors raise at that point");
+    w.line("# rather than when this method returns. The iterator handle is");
+    w.line("# released exactly once, when iteration finishes or is abandoned");
+    w.line("# early (for example by `break`).");
     w.block(scope.def_open(f, &params), "end", |w| {
         if let Some(msg) = &f.deprecated {
             let escaped = msg.replace('"', "\\\"");
             w.line(format!("warn \"[DEPRECATED] {escaped}\""));
         }
-        w.line("err = ErrorStruct.new");
         for p in &f.params {
             let mut pc = String::new();
             render_param_conversion(&mut pc, &p.name.to_snake_case(), &p.ty, &ind);
@@ -2111,51 +2129,76 @@ fn render_iterator_function_wrapper(
             call_args.extend(rb_call_args(&p.name.to_snake_case(), &p.ty));
         }
         call_args.push("err".into());
-        w.line(format!(
-            "iter = {q}{}({})",
-            it.launch.symbol,
-            call_args.join(", ")
-        ));
-        w.line(format!("{q}{checker}(err)"));
-        w.line("items = []");
-        w.line("return items if iter.null?");
-        w.block("loop do", "end", |w| {
-            // `next` params: (iter, out_item, <extra elem out slots>, out_err).
-            let elem = &it.elem;
-            let needs_len = matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
-            let item_mem = rb_mem_type(elem);
-            w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
-            if needs_len {
-                w.line("out_item_len = FFI::MemoryPointer.new(:size_t)");
-            }
-            w.line("item_err = ErrorStruct.new");
-            let next_args = if needs_len {
-                "iter, out_item, out_item_len, item_err"
-            } else {
-                "iter, out_item, item_err"
-            };
-            w.line(format!("has_item = {q}{}({next_args})", it.next.symbol));
-            w.line("if item_err[:code] != 0");
+        // The block closes over the converted argument buffers above, so they
+        // stay referenced (and un-collected) until the launch call runs.
+        w.block("Enumerator.new do |y|", "end", |w| {
+            w.line("err = ErrorStruct.new");
+            w.line(format!(
+                "iter = {q}{}({})",
+                it.launch.symbol,
+                call_args.join(", ")
+            ));
+            w.line("begin");
             w.scope(|w| {
-                w.line(format!("{q}{}(iter)", it.destroy_symbol));
-                w.line(format!("{q}{checker}(item_err)"));
+                w.line(format!("{q}{checker}(err)"));
+                w.line("unless iter.null?");
+                w.scope(|w| {
+                    w.block("loop do", "end", |w| {
+                        // `next` params: (iter, out_item, <elem out slots>, out_err).
+                        let elem = &it.elem;
+                        let needs_len =
+                            matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
+                        let item_mem = rb_mem_type(elem);
+                        w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
+                        if needs_len {
+                            w.line("out_item_len = FFI::MemoryPointer.new(:size_t)");
+                        }
+                        w.line("item_err = ErrorStruct.new");
+                        let next_args = if needs_len {
+                            "iter, out_item, out_item_len, item_err"
+                        } else {
+                            "iter, out_item, item_err"
+                        };
+                        w.line(format!("has_item = {q}{}({next_args})", it.next.symbol));
+                        w.line(format!("{q}{checker}(item_err)"));
+                        w.line("break if has_item.zero?");
+                        let mut tmp = String::new();
+                        render_iterator_item_yield(
+                            &mut tmp,
+                            elem,
+                            &"  ".repeat(depth + 5),
+                            scope.module_name(),
+                        );
+                        w.raw(tmp);
+                    });
+                });
+                w.line("end");
+            });
+            w.line("ensure");
+            w.scope(|w| {
+                // Exactly one destroy per launched handle: this ensure runs
+                // once whether iteration exhausts, raises, or is abandoned by
+                // an early break from the consumer.
+                w.line(format!("{q}{}(iter) unless iter.null?", it.destroy_symbol));
             });
             w.line("end");
-            w.line("break if has_item.zero?");
-            let mut tmp = String::new();
-            render_iterator_item_push(&mut tmp, elem, &format!("{ind}  "), scope.module_name());
-            w.raw(tmp);
         });
-        w.line(format!("{q}{}(iter)", it.destroy_symbol));
-        w.line("items");
     });
     out.push_str(&w.finish());
 }
 
-/// Convert the value written into `out_item` and append it to `items`.
-/// `qualifier` is the top-level Ruby module name when rendering inside a
-/// class body, where `weaveffi_free_*` calls need an explicit receiver.
-fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str, qualifier: Option<&str>) {
+/// Convert the value written into `out_item` and yield it to the enumerator's
+/// yielder `y`, releasing the element per its [`weaveffi_core::plan::ElemFree`]
+/// plan first (copy, free, then yield, so an early `break` during the yield
+/// cannot leak the element). `qualifier` is the top-level Ruby module name
+/// when rendering inside a class body, where `weaveffi_free_*` calls need an
+/// explicit receiver.
+fn render_iterator_item_yield(
+    out: &mut String,
+    elem: &TypeRef,
+    ind: &str,
+    qualifier: Option<&str>,
+) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match elem {
@@ -2163,12 +2206,13 @@ fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str, qualif
             w.line("item_ptr = out_item.read_pointer");
             w.line("if item_ptr.null?");
             w.scope(|w| {
-                w.line("items << ''");
+                w.line("y << ''");
             });
             w.line("else");
             w.scope(|w| {
-                w.line("items << item_ptr.read_string");
+                w.line("item = item_ptr.read_string");
                 w.line(format!("{m}weaveffi_free_string(item_ptr)"));
+                w.line("y << item");
             });
             w.line("end");
         }
@@ -2177,20 +2221,23 @@ fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str, qualif
             w.line("item_len = out_item_len.read(:size_t)");
             w.line("if item_ptr.null?");
             w.scope(|w| {
-                w.line("items << ''.b");
+                w.line("y << ''.b");
             });
             w.line("else");
             w.scope(|w| {
-                w.line("items << item_ptr.read_string(item_len)");
+                w.line("item = item_ptr.read_string(item_len)");
                 w.line(format!("{m}weaveffi_free_bytes(item_ptr, item_len)"));
+                w.line("y << item");
             });
             w.line("end");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        // A yielded record or rich enum is a new owned reference; the wrapper
+        // adopts the pointer and its finalizer runs the destroy symbol.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let local = local_type_name(name);
             w.line("item_ptr = out_item.read_pointer");
             w.line(format!(
-                "items << {local}.new(item_ptr) unless item_ptr.null?"
+                "y << {local}.new(item_ptr) unless item_ptr.null?"
             ));
         }
         // A yielded interface is a new owned reference; wrap it without
@@ -2199,15 +2246,15 @@ fn render_iterator_item_push(out: &mut String, elem: &TypeRef, ind: &str, qualif
             let local = local_type_name(name);
             w.line("item_ptr = out_item.read_pointer");
             w.line(format!(
-                "items << {local}._from_ptr(item_ptr) unless item_ptr.null?"
+                "y << {local}._from_ptr(item_ptr) unless item_ptr.null?"
             ));
         }
         TypeRef::Bool => {
-            w.line("items << (out_item.read_int32 != 0)");
+            w.line("y << (out_item.read_int32 != 0)");
         }
         _ => {
             let read = rb_read_method(elem);
-            w.line(format!("items << out_item.{read}"));
+            w.line(format!("y << out_item.{read}"));
         }
     }
     out.push_str(&w.finish());
@@ -2321,7 +2368,10 @@ fn render_element_array_write(
                 "{buf_name}_buf.write_array_of_int32({list_expr}.map {{ |v| v ? 1 : 0 }})"
             ));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             w.line(format!(
                 "{buf_name}_buf.write_array_of_pointer({list_expr}.map(&:handle))"
             ));
@@ -2409,7 +2459,9 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             w.line("raise Error.new(-1, 'null pointer') if result.null?");
             w.line(format!("{name}.new(result)"));
         }
-        TypeRef::Struct(name) => {
+        // An owned object return is adopted by its finalizer-bearing wrapper,
+        // which eventually runs the destroy symbol.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
             w.line("raise Error.new(-1, 'null pointer') if result.null?");
             w.line(format!("{}.new(result)", local_type_name(name)));
         }
@@ -2421,7 +2473,7 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
         TypeRef::List(inner) => {
             w.line("return [] if result.null?");
             let mut tmp = String::new();
-            render_list_return_body(&mut tmp, inner, ind);
+            render_list_return_body(&mut tmp, inner, ind, qualifier);
             w.raw(tmp);
         }
         TypeRef::Iterator(_) => {
@@ -2437,6 +2489,7 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             w.line("raise Error.new(-1, 'null pointer') if result.null?");
             w.line(format!("{local}._from_ptr(result)"));
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -2460,7 +2513,7 @@ fn render_optional_return_code(
             w.line("return nil if result.null?");
             w.line(format!("{name}.new(result)"));
         }
-        TypeRef::Struct(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
             w.line("return nil if result.null?");
             w.line(format!("{}.new(result)", local_type_name(name)));
         }
@@ -2477,25 +2530,36 @@ fn render_optional_return_code(
             w.line(format!("{m}weaveffi_free_bytes(result, len)"));
             w.line("data");
         }
+        // A present boxed scalar is a producer-allocated buffer: dereference,
+        // then release it with the runtime's free_bytes.
         TypeRef::Bool => {
             w.line("return nil if result.null?");
-            w.line("result.read_int32 != 0");
+            w.line("value = result.read_int32 != 0");
+            w.line(format!(
+                "{m}weaveffi_free_bytes(result, FFI.type_size(:int32))"
+            ));
+            w.line("value");
         }
         TypeRef::List(elem) => {
             w.line("return nil if result.null?");
             let mut tmp = String::new();
-            render_list_return_body(&mut tmp, elem, ind);
+            render_list_return_body(&mut tmp, elem, ind, qualifier);
             w.raw(tmp);
         }
         TypeRef::Map(k, v) => {
             let mut tmp = String::new();
-            render_map_return_code(&mut tmp, k, v, ind, true);
+            render_map_return_code(&mut tmp, k, v, ind, true, qualifier);
             w.raw(tmp);
         }
         _ if !is_c_pointer_type(inner) => {
             let read = rb_read_method(inner);
+            let mem = rb_mem_type(inner);
             w.line("return nil if result.null?");
-            w.line(format!("result.{read}"));
+            w.line(format!("value = result.{read}"));
+            w.line(format!(
+                "{m}weaveffi_free_bytes(result, FFI.type_size({mem}))"
+            ));
+            w.line("value");
         }
         _ => {
             w.line("result");
@@ -2504,42 +2568,89 @@ fn render_optional_return_code(
     out.push_str(&w.finish());
 }
 
-fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str) {
+/// The `.each` line releasing one converted element array per its
+/// [`weaveffi_core::plan::ElemFree`] plan: string elements are freed with the
+/// runtime's `free_string`; record and rich-enum elements owe nothing here
+/// because their wrappers adopted the pointers; by-value elements owe nothing.
+fn rb_elem_free_line(list_var: &str, elem: &TypeRef, m: &str) -> Option<String> {
+    match elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => Some(format!(
+            "{list_var}.each {{ |p| {m}weaveffi_free_string(p) unless p.null? }}"
+        )),
+        _ => None,
+    }
+}
+
+/// Render the body converting an array return (`result` + `out_len`) into a
+/// Ruby Array, honoring [`weaveffi_core::plan::ReturnFree::Array`]: each
+/// element is released per its element plan after copying (object elements
+/// are adopted by their wrappers instead), then the array buffer itself is
+/// released with the runtime's `free_bytes`.
+fn render_list_return_body(out: &mut String, inner: &TypeRef, ind: &str, qualifier: Option<&str>) {
+    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     w.line("len = out_len.read(:size_t)");
     let reader = rb_array_reader(inner);
+    let mem = rb_mem_type(inner);
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "result.{reader}(len).map {{ |p| p.null? ? '' : p.read_string }}"
-            ));
+            w.line(format!("ptrs = result.{reader}(len)"));
+            w.line("items = ptrs.map { |p| p.null? ? '' : p.read_string }");
+            if let Some(free) = rb_elem_free_line("ptrs", inner, &m) {
+                w.line(free);
+            }
         }
         TypeRef::TypedHandle(name) => {
-            w.line(format!("result.{reader}(len).map {{ |p| {name}.new(p) }}"));
+            w.line(format!(
+                "items = result.{reader}(len).map {{ |p| {name}.new(p) }}"
+            ));
         }
-        TypeRef::Struct(name) => {
+        // Record and rich-enum elements transfer ownership; the wrappers
+        // adopt the pointers, so no per-element free is owed here.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
             let local = local_type_name(name);
-            w.line(format!("result.{reader}(len).map {{ |p| {local}.new(p) }}"));
+            w.line(format!(
+                "items = result.{reader}(len).map {{ |p| {local}.new(p) }}"
+            ));
         }
         // Listed interfaces are new owned references; wrap each without
         // re-running initialize.
         TypeRef::Interface(name) => {
             let local = local_type_name(name);
             w.line(format!(
-                "result.{reader}(len).map {{ |p| {local}._from_ptr(p) }}"
+                "items = result.{reader}(len).map {{ |p| {local}._from_ptr(p) }}"
             ));
         }
         TypeRef::Bool => {
-            w.line(format!("result.{reader}(len).map {{ |v| v != 0 }}"));
+            w.line(format!(
+                "items = result.{reader}(len).map {{ |v| v != 0 }}"
+            ));
         }
         _ => {
-            w.line(format!("result.{reader}(len)"));
+            w.line(format!("items = result.{reader}(len)"));
         }
     }
+    w.line(format!(
+        "{m}weaveffi_free_bytes(result, len * FFI.type_size({mem}))"
+    ));
+    w.line("items");
     out.push_str(&w.finish());
 }
 
-fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str, optional: bool) {
+/// Render the body converting a map return (parallel `out_keys`/`out_values`
+/// buffers + `out_len`) into a Ruby Hash, honoring
+/// [`weaveffi_core::plan::ReturnFree::MapBuffers`]: each key and value is
+/// released per its element plan after copying, then both parallel arrays are
+/// released with the runtime's `free_bytes`.
+fn render_map_return_code(
+    out: &mut String,
+    k: &TypeRef,
+    v: &TypeRef,
+    ind: &str,
+    optional: bool,
+    qualifier: Option<&str>,
+) {
+    let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let null_val = if optional { "nil" } else { "{}" };
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     w.line("len = out_len.read(:size_t)");
@@ -2552,10 +2663,27 @@ fn render_map_return_code(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str,
     let v_reader = rb_array_reader(v);
     let k_expr = rb_element_expr("k", k);
     let v_expr = rb_element_expr("v", v);
+    w.line(format!("keys = keys_ptr.{k_reader}(len)"));
+    w.line(format!("vals = vals_ptr.{v_reader}(len)"));
     w.line(format!(
-        "keys_ptr.{k_reader}(len).zip(vals_ptr.{v_reader}(len))\
+        "hash = keys.zip(vals)\
          .each_with_object({{}}) {{ |(k, v), h| h[{k_expr}] = {v_expr} }}"
     ));
+    if let Some(free) = rb_elem_free_line("keys", k, &m) {
+        w.line(free);
+    }
+    if let Some(free) = rb_elem_free_line("vals", v, &m) {
+        w.line(free);
+    }
+    w.line(format!(
+        "{m}weaveffi_free_bytes(keys_ptr, len * FFI.type_size({}))",
+        rb_mem_type(k)
+    ));
+    w.line(format!(
+        "{m}weaveffi_free_bytes(vals_ptr, len * FFI.type_size({}))",
+        rb_mem_type(v)
+    ));
+    w.line("hash");
     out.push_str(&w.finish());
 }
 
@@ -3582,6 +3710,97 @@ mod tests {
     }
 
     #[test]
+    fn list_of_strings_return_frees_elements_and_buffer() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![plain_fn(
+                "list_names",
+                vec![],
+                Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+            )],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        // Each string element is freed after copying, then the array buffer
+        // itself is released.
+        assert!(
+            code.contains("ptrs.each { |p| weaveffi_free_string(p) unless p.null? }"),
+            "element strings freed: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_free_bytes(result, len * FFI.type_size(:pointer))"),
+            "array buffer freed: {code}"
+        );
+    }
+
+    #[test]
+    fn scalar_list_return_frees_buffer() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![plain_fn(
+                "list_ids",
+                vec![],
+                Some(TypeRef::List(Box::new(TypeRef::I32))),
+            )],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("weaveffi_free_bytes(result, len * FFI.type_size(:int32))"),
+            "array buffer freed: {code}"
+        );
+    }
+
+    #[test]
+    fn map_return_frees_key_strings_and_both_buffers() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![plain_fn(
+                "get_metadata",
+                vec![],
+                Some(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32),
+                )),
+            )],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("keys.each { |p| weaveffi_free_string(p) unless p.null? }"),
+            "key strings freed: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))"),
+            "keys buffer freed: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:int32))"),
+            "values buffer freed: {code}"
+        );
+    }
+
+    #[test]
+    fn boxed_optional_scalar_return_is_freed() {
+        let api = make_api(vec![simple_module(
+            "data",
+            vec![plain_fn(
+                "find_count",
+                vec![],
+                Some(TypeRef::Optional(Box::new(TypeRef::I32))),
+            )],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        // The producer boxes an optional scalar; the wrapper dereferences,
+        // then releases the box.
+        assert!(
+            code.contains("value = result.read_int32"),
+            "boxed scalar dereferenced: {code}"
+        );
+        assert!(
+            code.contains("weaveffi_free_bytes(result, FFI.type_size(:int32))"),
+            "boxed scalar freed: {code}"
+        );
+    }
+
+    #[test]
     fn struct_return_wraps_in_class() {
         let api = make_api(vec![Module {
             name: "data".into(),
@@ -3593,7 +3812,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Item".into())),
+                returns: Some(TypeRef::Record("Item".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -3676,10 +3895,47 @@ mod tests {
             code.contains("raise value if value.is_a?(Error)"),
             "error re-raise: {code}"
         );
-        // The owned result string is read then freed.
+        // The generated doc states plainly that the call blocks.
         assert!(
-            code.contains("weaveffi_free_string(result)"),
-            "result freed: {code}"
+            code.contains("# Blocks the current thread until the async producer completes"),
+            "blocking doc: {code}"
+        );
+        // The completion callback copies the borrowed result buffer and must
+        // not free it: the producer owns callback result buffers.
+        assert!(
+            code.contains("result.read_string"),
+            "result copied in callback: {code}"
+        );
+        assert!(
+            !code.contains("weaveffi_free_string(result)"),
+            "borrowed callback buffer must not be freed: {code}"
+        );
+    }
+
+    #[test]
+    fn async_bytes_result_copied_not_freed() {
+        let api = make_api(vec![simple_module(
+            "io",
+            vec![Function {
+                name: "fetch".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                throws: false,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        assert!(
+            code.contains("result.read_string(result_len)"),
+            "bytes copied in callback: {code}"
+        );
+        assert!(
+            !code.contains("weaveffi_free_bytes(result, result_len)"),
+            "borrowed callback bytes must not be freed: {code}"
         );
     }
 
@@ -3717,19 +3973,152 @@ mod tests {
             ),
             "destroy attach: {code}"
         );
-        // The wrapper drains via the iterator protocol, not the list ABI
+        // The wrapper pulls via the iterator protocol, not the list ABI
         // (the old lowering wrongly passed an out_len the symbol lacks).
         assert!(
             code.contains(
                 "has_item = weaveffi_events_GetMessagesIterator_next(iter, out_item, item_err)"
             ),
-            "drain loop: {code}"
+            "pull loop: {code}"
         );
         assert!(
-            code.contains("weaveffi_events_GetMessagesIterator_destroy(iter)"),
-            "destroy after drain: {code}"
+            code.contains("weaveffi_events_GetMessagesIterator_destroy(iter) unless iter.null?"),
+            "destroy on disposal: {code}"
         );
         assert!(!code.contains("out_len"), "no stray out_len: {code}");
+    }
+
+    #[test]
+    fn iterator_returns_lazy_enumerator_with_ensured_destroy() {
+        let api = make_api(vec![simple_module(
+            "events",
+            vec![Function {
+                name: "get_messages".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+        )]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        let body = code
+            .split("def self.get_messages()")
+            .nth(1)
+            .expect("wrapper body");
+        let body = body.split("\n  end\n").next().expect("wrapper body end");
+        // Lazy Enumerator, never a hidden drain into an Array.
+        assert!(
+            body.contains("Enumerator.new do |y|"),
+            "lazy Enumerator: {code}"
+        );
+        assert!(!body.contains("items = []"), "no eager drain: {code}");
+        assert!(!body.contains(".to_a"), "no hidden collect: {code}");
+        // The launch happens inside the block, so an unstarted enumerator
+        // never acquires (and thus can never leak) a handle.
+        let launch = body.find("iter = weaveffi_events_get_messages(err)").expect("launch");
+        let enum_open = body.find("Enumerator.new do |y|").expect("enumerator");
+        assert!(enum_open < launch, "launch inside enumerator block: {code}");
+        // Destroy runs from an ensure block, guarding early break, and each
+        // yielded string is freed after copying.
+        let ensure_pos = body.find("ensure").expect("ensure block");
+        let destroy_pos = body
+            .find("weaveffi_events_GetMessagesIterator_destroy(iter)")
+            .expect("destroy call");
+        assert!(ensure_pos < destroy_pos, "destroy inside ensure: {code}");
+        assert!(
+            body.contains("weaveffi_free_string(item_ptr)"),
+            "yielded string freed after copy: {code}"
+        );
+        assert!(body.contains("y << item"), "yields through yielder: {code}");
+        // The generated docs describe the lazy contract.
+        assert!(
+            code.contains("# Returns a lazy Enumerator"),
+            "doc states Enumerator return: {code}"
+        );
+    }
+
+    #[test]
+    fn iterator_of_records_adopts_each_element() {
+        let api = make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![Function {
+                name: "scan_entries".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record(
+                    "Entry".into(),
+                )))),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            interfaces: vec![],
+            structs: vec![StructDef {
+                name: "Entry".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "key".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let code = render(&api, "WeaveFFI", "weaveffi");
+        // Each yielded record pointer is adopted by the wrapper class, whose
+        // AutoPointer finalizer owns the destroy.
+        assert!(
+            code.contains("y << Entry.new(item_ptr) unless item_ptr.null?"),
+            "record element adopted: {code}"
+        );
+        assert!(
+            code.contains("Enumerator.new do |y|"),
+            "record iterator is lazy: {code}"
+        );
+    }
+
+    #[test]
+    fn interface_iterator_method_is_lazy_and_qualified() {
+        let mut m = simple_module("kv", vec![]);
+        m.interfaces = vec![InterfaceDef {
+            name: "Store".into(),
+            doc: None,
+            constructors: vec![plain_fn("new", vec![], None)],
+            methods: vec![plain_fn(
+                "keys",
+                vec![],
+                Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+            )],
+            statics: vec![],
+        }];
+        let code = render(&make_api(vec![m]), "WeaveFFI", "weaveffi");
+        let body = code.split("def keys()").nth(1).expect("keys wrapper");
+        assert!(
+            body.contains("Enumerator.new do |y|"),
+            "method iterator is lazy: {code}"
+        );
+        assert!(
+            body.contains("iter = WeaveFFI.weaveffi_kv_Store_keys(@handle, err)"),
+            "launch passes self and qualifies: {code}"
+        );
+        assert!(
+            body.contains(
+                "WeaveFFI.weaveffi_kv_Store_KeysIterator_destroy(iter) unless iter.null?"
+            ),
+            "qualified ensure destroy: {code}"
+        );
     }
 
     #[test]
@@ -3833,7 +4222,7 @@ mod tests {
         assert_eq!(types(&TypeRef::Handle), vec![":uint64"]);
         assert_eq!(types(&TypeRef::StringUtf8), vec![":string"]);
         assert_eq!(types(&TypeRef::Enum("Color".into())), vec![":int32"]);
-        assert_eq!(types(&TypeRef::Struct("Foo".into())), vec![":pointer"]);
+        assert_eq!(types(&TypeRef::Record("Foo".into())), vec![":pointer"]);
     }
 
     #[test]
@@ -3910,7 +4299,7 @@ mod tests {
             functions: vec![Function {
                 name: "list_items".into(),
                 params: vec![],
-                returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
+                returns: Some(TypeRef::List(Box::new(TypeRef::Record("Item".into())))),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -3953,7 +4342,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct("Item".into())))),
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record("Item".into())))),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4026,7 +4415,7 @@ mod tests {
                             mutable: false,
                             doc: None,
                         }],
-                        returns: Some(TypeRef::Struct("Contact".into())),
+                        returns: Some(TypeRef::Record("Contact".into())),
                         doc: None,
                         throws: false,
                         r#async: false,
@@ -4037,7 +4426,7 @@ mod tests {
                     Function {
                         name: "list_contacts".into(),
                         params: vec![],
-                        returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                        returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                         doc: None,
                         throws: false,
                         r#async: false,
@@ -4204,7 +4593,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4571,7 +4960,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4627,7 +5016,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -4800,7 +5189,7 @@ mod tests {
                     name: "describe".into(),
                     params: vec![Param {
                         name: "shape".into(),
-                        ty: TypeRef::Struct("Shape".into()),
+                        ty: TypeRef::RichEnum("Shape".into()),
                         mutable: false,
                         doc: None,
                     }],
@@ -4817,7 +5206,7 @@ mod tests {
                     params: vec![
                         Param {
                             name: "shape".into(),
-                            ty: TypeRef::Struct("Shape".into()),
+                            ty: TypeRef::RichEnum("Shape".into()),
                             mutable: false,
                             doc: None,
                         },
@@ -4828,7 +5217,7 @@ mod tests {
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Struct("Shape".into())),
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
                     doc: None,
                     throws: false,
                     r#async: false,

@@ -37,10 +37,14 @@ do {
     expect(fetched?.key == "alpha", "get alpha key")
     expect(fetched?.value == payload, "get alpha value")
 
-    // Iterator lowering, materialized to [String] in the BTreeMap's sorted order.
-    let keys = try store.listKeys(prefix: nil)
+    // Iterator lowering: a lazy single-pass Sequence pulled one element per
+    // step, drained here into [String] (the BTreeMap's sorted order). A
+    // per-next producer error would end iteration and set `.error`.
+    let keysIter = try store.listKeys(prefix: nil)
+    let keys = Array(keysIter)
+    expect(keysIter.error == nil, "listKeys iteration error-free")
     expect(keys == ["alpha", "beta"], "listKeys sorted (got \(keys))")
-    expect(try store.listKeys(prefix: "al") == ["alpha"], "listKeys prefix filter")
+    expect(Array(try store.listKeys(prefix: "al")) == ["alpha"], "listKeys prefix filter")
 
     // A missing key raises the typed domain error's keyNotFound case (1001).
     do {

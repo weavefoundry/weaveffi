@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// ignore_for_file: non_constant_identifier_names, camel_case_types
+// ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
@@ -36,6 +36,16 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+typedef _NativeWeaveffiFreeString = Void Function(Pointer<Utf8>);
+typedef _DartWeaveffiFreeString = void Function(Pointer<Utf8>);
+final _weaveffiFreeString = _lib.lookupFunction<
+    _NativeWeaveffiFreeString, _DartWeaveffiFreeString>('weaveffi_free_string');
+
+typedef _NativeWeaveffiFreeBytes = Void Function(Pointer<Uint8>, Size);
+typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
+final _weaveffiFreeBytes = _lib.lookupFunction<
+    _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
+
 /// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
   final int code;
@@ -57,6 +67,13 @@ void _checkError(Pointer<_WeaveFFIError> err) {
 // Live listener trampolines by subscription id. Holding the
 // NativeCallable here keeps its native thunk alive until unregistered.
 final Map<int, NativeCallable> _listenerCallables = {};
+
+// Anchors one live native iteration for its GC-finalizer backstop.
+// A suspended `sync*` frame keeps the anchor reachable; abandoning the
+// iteration drops the frame, and the finalizer destroys the native
+// iterator handle. Exhausted iterations detach before destroying
+// eagerly, so the handle is destroyed exactly once either way.
+final class _IteratorLifetime implements Finalizable {}
 
 typedef _NativeWeaveffiSharedTokenDestroy = Void Function(Pointer<Void>);
 typedef _DartWeaveffiSharedTokenDestroy = void Function(Pointer<Void>);
@@ -89,7 +106,9 @@ class Token {
 
   String get label {
     final result = _weaveffiSharedTokenGetLabel(_handle);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 }
 
@@ -104,7 +123,9 @@ String ping() {
   try {
     final result = _weaveffiSharedPing(err);
     _checkError(err);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   } finally {
     calloc.free(err);
   }
@@ -181,8 +202,8 @@ typedef _DartWeaveffiKitchenItemGetCount = int Function(Pointer<Void>);
 final _weaveffiKitchenItemGetCount = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetCount, _DartWeaveffiKitchenItemGetCount>('weaveffi_kitchen_Item_get_count');
 
-typedef _NativeWeaveffiKitchenItemGetEnabled = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiKitchenItemGetEnabled = int Function(Pointer<Void>);
+typedef _NativeWeaveffiKitchenItemGetEnabled = Bool Function(Pointer<Void>);
+typedef _DartWeaveffiKitchenItemGetEnabled = bool Function(Pointer<Void>);
 final _weaveffiKitchenItemGetEnabled = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemGetEnabled, _DartWeaveffiKitchenItemGetEnabled>('weaveffi_kitchen_Item_get_enabled');
 
@@ -244,7 +265,9 @@ class Item {
   /// Display name
   String get name {
     final result = _weaveffiKitchenItemGetName(_handle);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 
   /// Initial count
@@ -256,7 +279,7 @@ class Item {
   /// Whether the item is enabled
   bool get enabled {
     final result = _weaveffiKitchenItemGetEnabled(_handle);
-    return result != 0;
+    return result;
   }
 
   /// Scaling ratio
@@ -275,8 +298,10 @@ class Item {
     try {
       final result = _weaveffiKitchenItemGetPayload(_handle, outLen);
       final n = outLen.value;
-      if (result == nullptr || n == 0) return <int>[];
-      return List<int>.generate(n, (i) => result[i]);
+      if (result == nullptr) return <int>[];
+      final bytes = List<int>.generate(n, (i) => result[i]);
+      _weaveffiFreeBytes(result, n);
+      return bytes;
     } finally {
       calloc.free(outLen);
     }
@@ -287,9 +312,14 @@ class Item {
     try {
       final result = _weaveffiKitchenItemGetTags(_handle, outLen);
       final n = outLen.value;
-      if (result == nullptr || n == 0) return <String>[];
+      if (result == nullptr) return <String>[];
       final arr = result.cast<Pointer<Utf8>>();
-      return List<String>.generate(n, (i) => arr[i].toDartString());
+      final items = List<String>.generate(n, (i) => arr[i].toDartString());
+      for (var i = 0; i < n; i++) {
+        _weaveffiFreeString(arr[i]);
+      }
+      _weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Utf8>>());
+      return items;
     } finally {
       calloc.free(outLen);
     }
@@ -308,6 +338,18 @@ class Item {
       for (var i = 0; i < n; i++) {
         m[keys[i].toDartString()] = vals[i].toDartString();
       }
+      for (var i = 0; i < n; i++) {
+        _weaveffiFreeString(keys[i]);
+      }
+      for (var i = 0; i < n; i++) {
+        _weaveffiFreeString(vals[i]);
+      }
+      if (keys != nullptr) {
+        _weaveffiFreeBytes(keys.cast(), n * sizeOf<Pointer<Utf8>>());
+      }
+      if (vals != nullptr) {
+        _weaveffiFreeBytes(vals.cast(), n * sizeOf<Pointer<Utf8>>());
+      }
       return m;
     } finally {
       calloc.free(outKeys);
@@ -319,7 +361,9 @@ class Item {
   int? get parent {
     final result = _weaveffiKitchenItemGetParent(_handle);
     if (result == nullptr) return null;
-    return result.value;
+    final value = result.value;
+    _weaveffiFreeBytes(result.cast(), sizeOf<Int64>());
+    return value;
   }
 
   /// Cross-module struct reference
@@ -334,8 +378,8 @@ class Item {
   }
 }
 
-typedef _NativeWeaveffiKitchenItemCreate = Pointer<Void> Function(Int64, Pointer<Utf8>, Int32, Int32, Double, Uint32, Pointer<Uint8>, Size, Pointer<Pointer<Utf8>>, Size, Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>, Size, Pointer<Int64>, Pointer<Void>, Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKitchenItemCreate = Pointer<Void> Function(int, Pointer<Utf8>, int, int, double, int, Pointer<Uint8>, int, Pointer<Pointer<Utf8>>, int, Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>, int, Pointer<Int64>, Pointer<Void>, int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiKitchenItemCreate = Pointer<Void> Function(Int64, Pointer<Utf8>, Int32, Bool, Double, Uint32, Pointer<Uint8>, Size, Pointer<Pointer<Utf8>>, Size, Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>, Size, Pointer<Int64>, Pointer<Void>, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenItemCreate = Pointer<Void> Function(int, Pointer<Utf8>, int, bool, double, int, Pointer<Uint8>, int, Pointer<Pointer<Utf8>>, int, Pointer<Pointer<Utf8>>, Pointer<Pointer<Utf8>>, int, Pointer<Int64>, Pointer<Void>, int, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenItemCreate = _lib.lookupFunction<
     _NativeWeaveffiKitchenItemCreate, _DartWeaveffiKitchenItemCreate>('weaveffi_kitchen_Item_create');
 
@@ -487,7 +531,7 @@ class ItemBuilder {
   }
     final err = calloc<_WeaveFFIError>();
     try {
-      final result = _weaveffiKitchenItemCreate(id, namePtr, count, enabled ? 1 : 0, ratio, nick, payloadPtr, payload.length, tagsPtr, tags.length, attrsKeys, attrsVals, attrs.length, parentPtr, token._handle, priority.value, err);
+      final result = _weaveffiKitchenItemCreate(id, namePtr, count, enabled, ratio, nick, payloadPtr, payload.length, tagsPtr, tags.length, attrsKeys, attrsVals, attrs.length, parentPtr, token._handle, priority.value, err);
       _checkError(err);
       return Item._(result);
     } finally {
@@ -555,7 +599,9 @@ class Gadget {
     try {
       final result = _weaveffiKitchenGadgetDescribe(_handle, err);
       _checkError(err);
-      return result.toDartString();
+      final value = result.toDartString();
+      _weaveffiFreeString(result);
+      return value;
     } finally {
       calloc.free(err);
     }
@@ -581,7 +627,9 @@ class Gadget {
     try {
       final result = _weaveffiKitchenGadgetVersion(err);
       _checkError(err);
-      return result.toDartString();
+      final value = result.toDartString();
+      _weaveffiFreeString(result);
+      return value;
     } finally {
       calloc.free(err);
     }
@@ -617,8 +665,8 @@ void unregisterReadyListener(int id) {
   _listenerCallables.remove(id)?.close();
 }
 
-typedef _NativeWeaveffiKitchenBoolId = Int32 Function(Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKitchenBoolId = int Function(int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiKitchenBoolId = Bool Function(Bool, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenBoolId = bool Function(bool, Pointer<_WeaveFFIError>);
 final _weaveffiKitchenBoolId = _lib.lookupFunction<
     _NativeWeaveffiKitchenBoolId, _DartWeaveffiKitchenBoolId>('weaveffi_kitchen_bool_id');
 
@@ -626,9 +674,9 @@ final _weaveffiKitchenBoolId = _lib.lookupFunction<
 bool boolId(bool x) {
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenBoolId(x ? 1 : 0, err);
+    final result = _weaveffiKitchenBoolId(x, err);
     _checkError(err);
-    return result != 0;
+    return result;
   } finally {
     calloc.free(err);
   }
@@ -709,7 +757,9 @@ String echoString(String s) {
   try {
     final result = _weaveffiKitchenEchoString(sPtr, err);
     _checkError(err);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   } finally {
     calloc.free(sPtr);
     calloc.free(err);
@@ -730,8 +780,10 @@ List<int> echoBytes(List<int> b) {
     final result = _weaveffiKitchenEchoBytes(bPtr, b.length, outLen, err);
     _checkError(err);
     final n = outLen.value;
-    if (result == nullptr || n == 0) return <int>[];
-    return List<int>.generate(n, (i) => result[i]);
+    if (result == nullptr) return <int>[];
+    final bytes = List<int>.generate(n, (i) => result[i]);
+    _weaveffiFreeBytes(result, n);
+    return bytes;
   } finally {
     if (bPtr != nullptr) calloc.free(bPtr);
     calloc.free(outLen);
@@ -751,7 +803,9 @@ String echoBorrowedStr(String s) {
   try {
     final result = _weaveffiKitchenEchoBorrowedStr(sPtr, err);
     _checkError(err);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   } finally {
     calloc.free(sPtr);
     calloc.free(err);
@@ -773,8 +827,10 @@ List<int> echoBorrowedBytes(List<int> b) {
     final result = _weaveffiKitchenEchoBorrowedBytes(bPtr, b.length, outLen, err);
     _checkError(err);
     final n = outLen.value;
-    if (result == nullptr || n == 0) return <int>[];
-    return List<int>.generate(n, (i) => result[i]);
+    if (result == nullptr) return <int>[];
+    final bytes = List<int>.generate(n, (i) => result[i]);
+    _weaveffiFreeBytes(result, n);
+    return bytes;
   } finally {
     if (bPtr != nullptr) calloc.free(bPtr);
     calloc.free(outLen);
@@ -849,9 +905,11 @@ List<Item> listItems() {
     final result = _weaveffiKitchenListItems(outLen, err);
     _checkError(err);
     final n = outLen.value;
-    if (result == nullptr || n == 0) return <Item>[];
+    if (result == nullptr) return <Item>[];
     final arr = result.cast<Pointer<Void>>();
-    return List<Item>.generate(n, (i) => Item._(arr[i]));
+    final items = List<Item>.generate(n, (i) => Item._(arr[i]));
+    _weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Void>>());
+    return items;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -879,6 +937,15 @@ Map<String, int> getAttrs() {
     for (var i = 0; i < n; i++) {
       m[keys[i].toDartString()] = vals[i];
     }
+    for (var i = 0; i < n; i++) {
+      _weaveffiFreeString(keys[i]);
+    }
+    if (keys != nullptr) {
+      _weaveffiFreeBytes(keys.cast(), n * sizeOf<Pointer<Utf8>>());
+    }
+    if (vals != nullptr) {
+      _weaveffiFreeBytes(vals.cast(), n * sizeOf<Int32>());
+    }
     return m;
   } finally {
     calloc.free(outKeys);
@@ -902,24 +969,42 @@ typedef _NativeWeaveffiKitchenStreamItemsIteratorDestroy = Void Function(Pointer
 typedef _DartWeaveffiKitchenStreamItemsIteratorDestroy = void Function(Pointer<Void>);
 final _weaveffiKitchenStreamItemsIteratorDestroy = _lib.lookupFunction<
     _NativeWeaveffiKitchenStreamItemsIteratorDestroy, _DartWeaveffiKitchenStreamItemsIteratorDestroy>('weaveffi_kitchen_StreamItemsIterator_destroy');
+final _weaveffiKitchenStreamItemsIteratorDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_kitchen_StreamItemsIterator_destroy'));
 
 /// Iterator return type
-Iterable<Item> streamItems() {
+///
+/// Returns a lazy [Iterable]: elements are pulled from the native
+/// iterator one at a time (one native `next` call per element), and
+/// iterating the result again launches a fresh native iterator.
+///
+/// The native iterator handle is destroyed exactly once: eagerly when
+/// the iteration completes or fails, or by a GC finalizer if the
+/// iteration is abandoned before it is exhausted.
+///
+/// Each yielded element is owned by the caller: call its `dispose()`
+/// when you are done with it.
+Iterable<Item> streamItems() sync* {
   final err = calloc<_WeaveFFIError>();
+  final outItem = calloc<Pointer<Void>>();
+  Pointer<Void> iter = nullptr;
+  final anchor = _IteratorLifetime();
   try {
-    final iter = _weaveffiKitchenStreamItems(err);
+    iter = _weaveffiKitchenStreamItems(err);
     _checkError(err);
-    final items = <Item>[];
-    final outItem = calloc<Pointer<Void>>();
+    _weaveffiKitchenStreamItemsIteratorDestroyFinalizer.attach(anchor, iter, detach: anchor);
     while (_weaveffiKitchenStreamItemsIteratorNext(iter, outItem, err) != 0) {
       _checkError(err);
-      items.add(Item._(outItem.value));
+      yield Item._(outItem.value);
     }
     _checkError(err);
-    calloc.free(outItem);
-    _weaveffiKitchenStreamItemsIteratorDestroy(iter);
-    return items;
   } finally {
+    if (iter != nullptr) {
+      _weaveffiKitchenStreamItemsIteratorDestroyFinalizer.detach(anchor);
+      _weaveffiKitchenStreamItemsIteratorDestroy(iter);
+      iter = nullptr;
+    }
+    calloc.free(outItem);
     calloc.free(err);
   }
 }
@@ -1067,7 +1152,9 @@ String hello() {
   try {
     final result = _weaveffiKitchenNestedHello(err);
     _checkError(err);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   } finally {
     calloc.free(err);
   }

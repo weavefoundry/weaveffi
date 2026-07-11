@@ -13,6 +13,7 @@ pub mod codegen;
 pub mod errors;
 pub mod model;
 pub mod package;
+pub mod plan;
 pub mod pkg;
 pub mod platform;
 pub mod utils;

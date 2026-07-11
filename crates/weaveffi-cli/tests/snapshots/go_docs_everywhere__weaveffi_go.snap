@@ -173,7 +173,10 @@ func (s *Document) Id() int64 {
 
 // Title: Human-readable title shown in lists
 func (s *Document) Title() string {
-	return C.GoString(C.weaveffi_docs_Document_get_title(s.ptr))
+	cStr := C.weaveffi_docs_Document_get_title(s.ptr)
+	goResult := C.GoString(cStr)
+	C.weaveffi_free_string(cStr)
+	return goResult
 }
 
 // Status: Current lifecycle status
@@ -190,7 +193,9 @@ func (s *Document) Tags() []string {
 	if count > 0 && result != nil {
 		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
 			goResult[i] = C.GoString(v)
+			C.weaveffi_free_string(v)
 		}
+		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
 	}
 	return goResult
 }
@@ -424,7 +429,7 @@ func goWv_weaveffi_docs_publish_async_callback(context unsafe.Pointer, err *C.we
 	}
 	ch := v.(chan wvOutcomeDocsPublishAsync)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeDocsPublishAsync{err: wvMapDocs(wvTakeError(err))}
+		ch <- wvOutcomeDocsPublishAsync{err: wvBrandError(wvTakeError(err))}
 		return
 	}
 	ch <- wvOutcomeDocsPublishAsync{val: cToBool(result)}
@@ -434,7 +439,7 @@ func goWv_weaveffi_docs_publish_async_callback(context unsafe.Pointer, err *C.we
 //
 // Parameters:
 //   - id: Identifier of the document to publish
-// Blocks until the async producer completes.
+// Blocks the calling goroutine until the async producer completes.
 func PublishAsync(id int64) bool {
 	ch := make(chan wvOutcomeDocsPublishAsync, 1)
 	ctxID := wvCallbackStore(ch)

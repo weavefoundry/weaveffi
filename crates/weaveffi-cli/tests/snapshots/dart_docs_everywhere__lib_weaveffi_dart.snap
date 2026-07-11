@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// ignore_for_file: non_constant_identifier_names, camel_case_types
+// ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
@@ -35,6 +35,16 @@ typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
+
+typedef _NativeWeaveffiFreeString = Void Function(Pointer<Utf8>);
+typedef _DartWeaveffiFreeString = void Function(Pointer<Utf8>);
+final _weaveffiFreeString = _lib.lookupFunction<
+    _NativeWeaveffiFreeString, _DartWeaveffiFreeString>('weaveffi_free_string');
+
+typedef _NativeWeaveffiFreeBytes = Void Function(Pointer<Uint8>, Size);
+typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
+final _weaveffiFreeBytes = _lib.lookupFunction<
+    _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
 
 /// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
@@ -156,7 +166,9 @@ class Document {
   /// Human-readable title shown in lists
   String get title {
     final result = _weaveffiDocsDocumentGetTitle(_handle);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 
   /// Current lifecycle status
@@ -171,9 +183,14 @@ class Document {
     try {
       final result = _weaveffiDocsDocumentGetTags(_handle, outLen);
       final n = outLen.value;
-      if (result == nullptr || n == 0) return <String>[];
+      if (result == nullptr) return <String>[];
       final arr = result.cast<Pointer<Utf8>>();
-      return List<String>.generate(n, (i) => arr[i].toDartString());
+      final items = List<String>.generate(n, (i) => arr[i].toDartString());
+      for (var i = 0; i < n; i++) {
+        _weaveffiFreeString(arr[i]);
+      }
+      _weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Utf8>>());
+      return items;
     } finally {
       calloc.free(outLen);
     }
@@ -432,7 +449,7 @@ Document? getDocument(int id) {
   }
 }
 
-typedef _NativeAsyncCb_weaveffi_docs_publish_async = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Int32);
+typedef _NativeAsyncCb_weaveffi_docs_publish_async = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Bool);
 
 typedef _NativeWeaveffiDocsPublishAsyncAsync = Void Function(Int64, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_docs_publish_async>>, Pointer<Void>);
 typedef _DartWeaveffiDocsPublishAsyncAsync = void Function(int, Pointer<NativeFunction<_NativeAsyncCb_weaveffi_docs_publish_async>>, Pointer<Void>);
@@ -443,7 +460,7 @@ final _weaveffiDocsPublishAsyncAsync = _lib.lookupFunction<
 Future<bool> publishAsync(int id) {
   final completer = Completer<bool>();
   late NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async> callable;
-  callable = NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, int result) {
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_docs_publish_async>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, bool result) {
     try {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
@@ -452,7 +469,7 @@ Future<bool> publishAsync(int id) {
         completer.completeError(WeaveFFIException(code, msg));
         return;
       }
-      completer.complete(result != 0);
+      completer.complete(result);
     } catch (e) {
       completer.completeError(e);
     } finally {

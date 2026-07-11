@@ -97,6 +97,7 @@ static napi_value Napi_weaveffi_products_Catalog_add_product(napi_env env, napi_
           weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
           napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
         }
+        weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
       }
     }
     napi_set_named_property(env, ret, "tags", ret_tags);
@@ -159,6 +160,7 @@ static napi_value Napi_weaveffi_products_Catalog_get_product(napi_env env, napi_
           weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
           napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
         }
+        weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
       }
     }
     napi_set_named_property(env, ret, "tags", ret_tags);
@@ -225,6 +227,7 @@ static napi_value Napi_weaveffi_products_Catalog_search(napi_env env, napi_callb
             weaveffi_free_string((char*)(elem_tags_arr[elem_tags_i]));
             napi_set_element(env, elem_tags, (uint32_t)elem_tags_i, elem_tags_e);
           }
+          weaveffi_free_bytes((uint8_t*)elem_tags_arr, elem_tags_len * sizeof(*elem_tags_arr));
         }
       }
       napi_set_named_property(env, elem, "tags", elem_tags);
@@ -232,7 +235,7 @@ static napi_value Napi_weaveffi_products_Catalog_search(napi_env env, napi_callb
     }
     napi_set_element(env, ret, (uint32_t)ret_i, elem);
   }
-  free(result);
+  weaveffi_free_bytes((uint8_t*)result, out_len * sizeof(*result));
   return ret;
 }
 
@@ -358,9 +361,11 @@ static napi_value Napi_weaveffi_orders_get_order(napi_env env, napi_callback_inf
             napi_value ret_items_e_unit_price;
             napi_create_double(env, weaveffi_orders_OrderItem_get_unit_price(ret_items_e_p), &ret_items_e_unit_price);
             napi_set_named_property(env, ret_items_e, "unit_price", ret_items_e_unit_price);
+            weaveffi_orders_OrderItem_destroy(ret_items_e_p);
           }
           napi_set_element(env, ret_items, (uint32_t)ret_items_i, ret_items_e);
         }
+        weaveffi_free_bytes((uint8_t*)ret_items_arr, ret_items_len * sizeof(*ret_items_arr));
       }
     }
     napi_set_named_property(env, ret, "items", ret_items);

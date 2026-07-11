@@ -13,7 +13,10 @@ catch and match on the codes you declared.
 A callable **without** `throws` has a plain signature: no `throws` clause,
 no error return. It cannot report a domain error; the only failures it can
 experience are producer bugs (a panic, a marshalling failure), and those
-surface as a generic branded error or a trap rather than a typed error.
+trap loudly through the target's programming-error idiom rather than
+surfacing as a typed error. The two interpretations are named once, in
+`weaveffi_core::plan::ErrorStrategy`, and every generator renders the
+same pair; see [Throws versus Trap](#throws-versus-trap).
 
 Underneath, every generated symbol still reports through the C-level
 out-error parameter (`weaveffi_error*`) with an integer code and an
@@ -227,6 +230,29 @@ callable they surface as the target's unrecoverable idiom (a Swift
 
 ## Reference
 
+### Throws versus Trap
+
+Every synchronous C ABI entry point carries a trailing `out_err`, and
+every async completion callback carries an `err` slot, regardless of
+`throws`. What differs is the *meaning* of a non-zero code, and every
+backend agrees on it because the two interpretations are stated once as
+`weaveffi_core::plan::ErrorStrategy`:
+
+- **Throws** (`throws: true`): a non-zero code is a typed domain error.
+  The wrapper maps the code onto the module's error domain (an
+  exception subclass, a Swift `Error` enum case, a Go `error` value)
+  and surfaces it through the target's normal error channel so callers
+  can catch and match on it.
+- **Trap** (no `throws`): the only way `out_err` reports failure is a
+  producer bug (most commonly a caught panic, code `-2`). The wrapper
+  surfaces it through the target's *programming-error* idiom (a Python
+  `WeaveFFIError`, a Go `panic`, a Swift `fatalError`, a C# exception).
+  A trapped failure is never silently ignored, and it is never dressed
+  up as a typed domain error.
+
+The per-target rendering of both strategies is tabulated
+[below](#per-target-surface).
+
 At the ABI level, `weaveffi_error.code` means:
 
 | Code               | Meaning                                              |
@@ -241,9 +267,11 @@ On the typed path, a wrapper maps a non-zero code to the matching declared
 case of the domain type and falls back to the generic branded error for
 any code the domain doesn't declare.
 
-Per target, the two error paths surface as:
+### Per-target surface
 
-| Target   | Throwing callable (`throws: true`)          | Non-throwing failure (producer bug)      |
+Per target, the two strategies surface as:
+
+| Target   | Throws (`throws: true`)                     | Trap (producer bug)                      |
 |----------|----------------------------------------------|------------------------------------------|
 | C        | `weaveffi_error { code, message }` struct    | same struct (code `-2` or `1`)           |
 | Swift    | `throws`, typed domain enum                  | `fatalError`                             |
@@ -288,7 +316,8 @@ on `err.message`.
   callable needs an `errors:` block on its module or an ancestor.
 - **Expecting a typed error from a non-throwing function**: a callable
   without `throws` cannot deliver a domain error; a failure there is a
-  producer bug and surfaces as the generic brand or a trap.
+  producer bug and traps through the target's programming-error idiom
+  (see [Throws versus Trap](#throws-versus-trap)).
 - **Not initialising the struct**: always start with
   `{0, NULL}` (or the language equivalent). Stale `code` values from
   earlier calls produce confusing failures.

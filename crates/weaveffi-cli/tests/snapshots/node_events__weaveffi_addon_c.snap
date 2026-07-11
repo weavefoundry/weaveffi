@@ -21,6 +21,10 @@ static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const ch
     return err;
 }
 
+typedef struct {
+    void* iter;
+} weaveffi_napi_iter_state;
+
 typedef struct weaveffi_napi_listener_ctx {
     napi_threadsafe_function tsfn;
     uint64_t id;
@@ -117,6 +121,63 @@ static napi_value Napi_weaveffi_events_send_message(napi_env env, napi_callback_
   return ret;
 }
 
+static void weaveffi_events_get_messages_napi_iter_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)data;
+    if (state->iter != NULL) {
+        weaveffi_events_GetMessagesIterator_destroy((weaveffi_events_GetMessagesIterator*)state->iter);
+        state->iter = NULL;
+    }
+    free(state);
+}
+
+static napi_value Napi_weaveffi_events_GetMessagesIterator_next(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* iter_data = NULL;
+  napi_get_value_external(env, args[0], &iter_data);
+  weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)iter_data;
+  napi_value ret;
+  if (state == NULL || state->iter == NULL) {
+    napi_get_undefined(env, &ret);
+    return ret;
+  }
+  const char* iter_item;
+  weaveffi_error iter_err = {0};
+  if (!weaveffi_events_GetMessagesIterator_next((weaveffi_events_GetMessagesIterator*)state->iter, &iter_item, &iter_err)) {
+    weaveffi_events_GetMessagesIterator_destroy((weaveffi_events_GetMessagesIterator*)state->iter);
+    state->iter = NULL;
+    if (iter_err.code != 0) {
+      napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));
+      weaveffi_error_clear(&iter_err);
+      return NULL;
+    }
+    napi_get_undefined(env, &ret);
+    return ret;
+  }
+  napi_create_string_utf8(env, iter_item ? iter_item : "", NAPI_AUTO_LENGTH, &ret);
+  weaveffi_free_string((char*)iter_item);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_events_GetMessagesIterator_destroy(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* iter_data = NULL;
+  napi_get_value_external(env, args[0], &iter_data);
+  weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)iter_data;
+  if (state != NULL && state->iter != NULL) {
+    weaveffi_events_GetMessagesIterator_destroy((weaveffi_events_GetMessagesIterator*)state->iter);
+    state->iter = NULL;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
+  return ret;
+}
+
 static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
@@ -128,22 +189,9 @@ static napi_value Napi_weaveffi_events_get_messages(napi_env env, napi_callback_
     return NULL;
   }
   napi_value ret;
-  napi_create_array(env, &ret);
-  uint32_t iter_idx = 0;
-  const char* iter_item;
-  weaveffi_error iter_err = {0};
-  while (weaveffi_events_GetMessagesIterator_next(result, &iter_item, &iter_err)) {
-    napi_value elem;
-    napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);
-    weaveffi_free_string(iter_item);
-    napi_set_element(env, ret, iter_idx++, elem);
-  }
-  weaveffi_events_GetMessagesIterator_destroy(result);
-  if (iter_err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));
-    weaveffi_error_clear(&iter_err);
-    return NULL;
-  }
+  weaveffi_napi_iter_state* iter_state = (weaveffi_napi_iter_state*)calloc(1, sizeof(weaveffi_napi_iter_state));
+  iter_state->iter = (void*)result;
+  napi_create_external(env, iter_state, weaveffi_events_get_messages_napi_iter_finalize, NULL, &ret);
   return ret;
 }
 
@@ -152,9 +200,11 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "registerMessageListener", NULL, Napi_weaveffi_events_register_message_listener, NULL, NULL, NULL, napi_default, NULL },
     { "unregisterMessageListener", NULL, Napi_weaveffi_events_unregister_message_listener, NULL, NULL, NULL, napi_default, NULL },
     { "sendMessage", NULL, Napi_weaveffi_events_send_message, NULL, NULL, NULL, napi_default, NULL },
+    { "getMessages_iterNext", NULL, Napi_weaveffi_events_GetMessagesIterator_next, NULL, NULL, NULL, napi_default, NULL },
+    { "getMessages_iterDestroy", NULL, Napi_weaveffi_events_GetMessagesIterator_destroy, NULL, NULL, NULL, napi_default, NULL },
     { "getMessages", NULL, Napi_weaveffi_events_get_messages, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 4, props);
+  napi_define_properties(env, exports, 6, props);
   return exports;
 }
 

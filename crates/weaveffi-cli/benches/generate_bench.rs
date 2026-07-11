@@ -100,12 +100,12 @@ fn build_large_api() -> Api {
                         },
                         Param {
                             name: "c".into(),
-                            ty: TypeRef::Struct(format!("M{m}Struct0")),
+                            ty: TypeRef::Named(format!("M{m}Struct0")),
                             mutable: false,
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(format!(
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Named(format!(
                         "M{m}Struct1"
                     ))))),
                     throws: false,

@@ -245,7 +245,7 @@ go_consumer() {
     sed "s#__MODPATH__#$modpath#g" "$ROOT/conformance/go/$src" > "$moddir/main.go"
     cat > "$moddir/go.mod" <<EOF
 module conformance
-go 1.21
+go 1.23
 require $modpath v0.0.0
 replace $modpath => $GENROOT/$sample/go
 EOF

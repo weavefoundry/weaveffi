@@ -489,6 +489,16 @@ The launcher returns immediately; WeaveFFI invokes the callback
 exactly once, with either a result or a populated error, from the
 producer's worker thread.
 
+Ownership inside the callback follows the async contract. Result
+buffers (strings, bytes, arrays, map buffers, boxed optional scalars)
+are borrowed: they stay owned by the producer and are valid only for
+the callback's duration, so copy anything you need before returning
+and don't free them. Owned-object results (records, rich enums,
+interfaces, including optional ones) are the exception: the callback
+receives ownership of the pointer and must eventually pass it to the
+matching `_destroy`. The `err` struct is likewise borrowed; copy its
+code and message inside the callback.
+
 For `cancellable: true` functions the launcher gains a
 `weaveffi_cancel_token*` slot before the callback, and the runtime
 provides the token lifecycle. Async interface methods follow the same
@@ -536,10 +546,11 @@ void weaveffi_events_GetMessagesIterator_destroy(
 
 `_next` writes the next element into the one-slot out-param and
 returns `1`, or returns `0` when exhausted (leaving `*out_item`
-untouched). Failures are reported through `out_err`. Element ownership
-follows the usual return rules; here each `const char*` must be freed
-with `weaveffi_free_string`. Always call `_destroy` when done, even if
-iteration stopped early:
+untouched). Failures are reported through `out_err`, so check it after
+the loop ends. Element ownership follows the usual return rules; each
+`next` hands over an element the consumer now owns, so here each
+`const char*` must be freed with `weaveffi_free_string`. Call
+`_destroy` exactly once when done, even if iteration stopped early:
 
 ```c
 weaveffi_error err = {0, NULL};
@@ -549,8 +560,12 @@ while (weaveffi_events_GetMessagesIterator_next(iter, &item, &err) == 1) {
     printf("%s\n", item);
     weaveffi_free_string(item);
 }
+if (err.code != 0) { /* a failing step ended the loop */ }
 weaveffi_events_GetMessagesIterator_destroy(iter);
 ```
+
+The higher-level targets wrap exactly these three symbols in their
+native lazy idioms; only the C surface exposes them raw.
 
 ## Troubleshooting
 

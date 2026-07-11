@@ -103,11 +103,11 @@ pub fn element_ctype(ty: &TypeRef, module: &str) -> CType {
         TypeRef::TypedHandle(n) => typed_handle_ctype(n, module),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => CType::const_ptr(CType::Char),
         TypeRef::Bytes | TypeRef::BorrowedBytes => CType::const_ptr(CType::Uint8),
-        // A struct or rich (algebraic) enum crosses the ABI as an opaque object
-        // pointer; both are spelled `TypeRef::Struct` after resolution. An
-        // interface object uses the same pointer spelling.
-        TypeRef::Struct(s) => CType::ptr(struct_tag(s, module)),
+        // A record or rich (algebraic) enum crosses the ABI as an opaque
+        // object pointer. An interface object uses the same pointer spelling.
+        TypeRef::Record(s) | TypeRef::RichEnum(s) => CType::ptr(struct_tag(s, module)),
         TypeRef::Interface(i) => interface_ptr_ctype(i, module),
+        TypeRef::Named(n) => unreachable!("unresolved type reference '{n}' reached ABI lowering"),
         TypeRef::Enum(e) => enum_ctype(e, module),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
             element_ctype(inner, module)
@@ -154,14 +154,15 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
         ],
         TypeRef::Handle => vec![AbiParam::new(name, CType::Handle)],
         TypeRef::TypedHandle(n) => vec![AbiParam::new(name, typed_handle_ctype(n, module))],
-        // A struct or rich enum is passed as a (const) pointer to its opaque tag.
-        TypeRef::Struct(s) => vec![AbiParam::new(
+        // A record or rich enum is passed as a (const) pointer to its opaque tag.
+        TypeRef::Record(s) | TypeRef::RichEnum(s) => vec![AbiParam::new(
             name,
             CType::Ptr {
                 konst: west_if_immut,
                 pointee: Box::new(struct_tag(s, module)),
             },
         )],
+        TypeRef::Named(n) => unreachable!("unresolved type reference '{n}' reached ABI lowering"),
         // An interface parameter borrows the object for the call: the callee
         // reads through the const pointer and never takes ownership.
         TypeRef::Interface(i) => vec![AbiParam::new(
@@ -269,8 +270,9 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
         },
         TypeRef::Handle => no_out(CType::Handle),
         TypeRef::TypedHandle(n) => no_out(typed_handle_ctype(n, module)),
-        // A struct or rich enum is returned as an owning pointer to its tag.
-        TypeRef::Struct(s) => no_out(CType::ptr(struct_tag(s, module))),
+        // A record or rich enum is returned as an owning pointer to its tag.
+        TypeRef::Record(s) | TypeRef::RichEnum(s) => no_out(CType::ptr(struct_tag(s, module))),
+        TypeRef::Named(n) => unreachable!("unresolved type reference '{n}' reached ABI lowering"),
         // A returned interface transfers ownership of a new object reference.
         TypeRef::Interface(i) => no_out(interface_ptr_ctype(i, module)),
         TypeRef::Enum(e) => no_out(enum_ctype(e, module)),
@@ -440,13 +442,13 @@ mod tests {
 
     #[test]
     fn struct_return_is_pointer() {
-        let r = lower_return(&TypeRef::Struct("Contact".into()), "contacts");
+        let r = lower_return(&TypeRef::Record("Contact".into()), "contacts");
         assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_contacts_Contact*");
     }
 
     #[test]
     fn cross_module_struct_param_resolves_module() {
-        let p = lower_param("c", &TypeRef::Struct("other.Contact".into()), "ops", false);
+        let p = lower_param("c", &TypeRef::Record("other.Contact".into()), "ops", false);
         assert_eq!(render(&p), ["const weaveffi_other_Contact* c"]);
     }
 
@@ -498,7 +500,7 @@ mod tests {
     #[test]
     fn nested_module_struct_return_flattens_path() {
         // Multi-level nesting: `a.b.Widget` -> `weaveffi_a_b_Widget*`.
-        let r = lower_return(&TypeRef::Struct("a.b.Widget".into()), "root");
+        let r = lower_return(&TypeRef::Record("a.b.Widget".into()), "root");
         assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_a_b_Widget*");
     }
 }

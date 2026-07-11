@@ -17,6 +17,7 @@ import "C"
 
 import (
 	"fmt"
+	"iter"
 	"sync"
 	"unsafe"
 )
@@ -143,23 +144,33 @@ func SendMessage(text string) {
 }
 
 // GetMessages: Return an iterator over all sent messages
-func GetMessages() []string {
-	var cErr C.weaveffi_error
-	it := C.weaveffi_events_get_messages(&cErr)
-	wvTrap(&cErr)
-	defer C.weaveffi_events_GetMessagesIterator_destroy(it)
-	goResult := []string{}
-	for {
-		var outItem *C.char
-		var iterErr C.weaveffi_error
-		if C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) == 0 {
-			break
+// Returns a lazy sequence: the producer iterator is launched on first
+// iteration and one producer next call runs per element. The iterator is
+// destroyed exactly once, whether the sequence is exhausted or abandoned
+// early; each range over the sequence launches a fresh producer iterator.
+// A reported error can only be a producer bug and panics with the
+// weaveffi message.
+func GetMessages() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		var cErr C.weaveffi_error
+		it := C.weaveffi_events_get_messages(&cErr)
+		wvTrap(&cErr)
+		defer C.weaveffi_events_GetMessagesIterator_destroy(it)
+		for {
+			var outItem *C.char
+			var iterErr C.weaveffi_error
+			ok := C.weaveffi_events_GetMessagesIterator_next(it, &outItem, &iterErr) != 0
+			wvTrap(&iterErr)
+			if !ok {
+				return
+			}
+			item := C.GoString(outItem)
+			C.weaveffi_free_string(outItem)
+			if !yield(item) {
+				return
+			}
 		}
-		wvTrap(&iterErr)
-		goResult = append(goResult, C.GoString(outItem))
-		C.weaveffi_free_string(outItem)
 	}
-	return goResult
 }
 
 

@@ -210,7 +210,11 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_docs_Document_get_tags(@handle, out_len)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| p.null? ? '' : p.read_string }
+      ptrs = result.read_array_of_pointer(len)
+      items = ptrs.map { |p| p.null? ? '' : p.read_string }
+      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
   end
 
@@ -382,7 +386,8 @@ module WeaveFFI
   end
 
   # Publish a document in the background
-  # Blocks until the async producer completes.
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback.
   def self.publish_async(id)
     queue = Queue.new
     callback = FFI::Function.new(:void, [:pointer, :pointer, :int32]) do |_context, err_ptr, result|

@@ -128,8 +128,9 @@ function _takeBytes(wasm, ptr, len) {
   return copy;
 }
 
-// Decode a producer-owned array of `len` C strings at `base` (each
-// freed); the array container itself is owned by the producer.
+// Decode an array of `len` C strings at `base`, freeing each string
+// after copying (the consumer owns the elements); the caller releases
+// the array container separately.
 function _takeStrArray(wasm, base, len) {
   const out = [];
   if (base === 0) return out;
@@ -196,6 +197,64 @@ function _checkErrRef(wasm, errPtr, mkErr) {
   throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);
 }
 
+// Lazy wrapper over a producer iterator handle, implementing the JS
+// iterator protocol: each next() issues exactly one producer next call
+// and yields one converted element, so iteration streams in constant
+// memory. The handle is destroyed exactly once: eagerly on exhaustion,
+// on a next error, or from return() when iteration stops early (a
+// for...of loop calls return() automatically on break or throw).
+// Abandoning an iterator without exhausting or closing it leaks the
+// producer handle: JS has no finalization hook that is reliable across
+// every target this loader supports.
+class _WeaveFFIIterator {
+  constructor(wasm, handle, stride, callNext, destroy, check, decode) {
+    this._wasm = wasm;
+    this._handle = handle;
+    this._stride = stride;
+    this._callNext = callNext;
+    this._destroyFn = destroy;
+    this._check = check;
+    this._decode = decode;
+    this._slot = wasm.weaveffi_alloc(stride);
+  }
+  // Destroy the handle and release the element slot exactly once.
+  _close() {
+    if (this._handle === 0) return;
+    this._destroyFn(this._handle);
+    this._handle = 0;
+    this._wasm.weaveffi_dealloc(this._slot, this._stride);
+    this._slot = 0;
+  }
+  next() {
+    if (this._handle === 0) return { done: true, value: undefined };
+    const wasm = this._wasm;
+    const _err = _allocErr(wasm);
+    let _has;
+    try {
+      _has = this._callNext(this._handle, this._slot, _err);
+      // Throws (and releases the slot) on a non-zero code.
+      this._check(wasm, _err);
+    } catch (e) {
+      this._close();
+      throw e;
+    }
+    _freeErr(wasm, _err);
+    if (_has === 0) {
+      this._close();
+      return { done: true, value: undefined };
+    }
+    return { done: false, value: this._decode(wasm, this._slot) };
+  }
+  // Early-exit cleanup; for...of calls this on break/throw.
+  return(value) {
+    this._close();
+    return { done: true, value };
+  }
+  [Symbol.iterator]() {
+    return this;
+  }
+}
+
 function _registerTrampoline(table, paramTypes, handler) {
   const idx = table.grow(1);
   table.set(idx, new WebAssembly.Function(
@@ -245,7 +304,9 @@ class Entry {
     const _r = wasm.weaveffi_kv_Entry_get_expires_at(this._handle);
     if (_r === 0) return null;
     const _dv = new DataView(wasm.memory.buffer);
-    return _dv.getBigInt64(_r, true);
+    const _v = _dv.getBigInt64(_r, true);
+    wasm.weaveffi_free_bytes(_r, 8);
+    return _v;
   }
   get tags() {
     const wasm = this._wasm;
@@ -255,6 +316,7 @@ class Entry {
     const _len = _dv.getUint32(_lp, true);
     wasm.weaveffi_dealloc(_lp, 4);
     const _out = _takeStrArray(wasm, _r, _len);
+    if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
     return _out;
   }
   get metadata() {
@@ -274,6 +336,8 @@ class Entry {
     const _out_v = _takeStrArray(wasm, _va, _len);
     const _out = {};
     for (let i = 0; i < _len; i++) _out[_out_k[i]] = _out_v[i];
+    if (_ka !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_ka, _len * 4);
+    if (_va !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_va, _len * 4);
     return _out;
   }
   static create(wasm, id, key, value, created_at, expires_at, tags, metadata) {
@@ -329,6 +393,12 @@ class Entry {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Entry(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_kv_Entry_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 
@@ -423,9 +493,17 @@ class EntryBuilder {
     const wasm = this._wasm;
     const _err = _allocErr(wasm);
     const _r = wasm.weaveffi_kv_Entry_Builder_build(this._b, _err);
+    wasm.weaveffi_kv_Entry_Builder_destroy(this._b);
+    this._b = 0;
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Entry(wasm, _r);
+  }
+  free() {
+    if (this._b !== 0) {
+      this._wasm.weaveffi_kv_Entry_Builder_destroy(this._b);
+      this._b = 0;
+    }
   }
 }
 
@@ -455,6 +533,12 @@ class Stats {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Stats(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_kv_stats_Stats_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 
@@ -577,19 +661,10 @@ export async function loadWeaveffiWasm(url) {
       if (a0_p !== 0) wasm.weaveffi_dealloc(a0_p, a0_s);
       _checkKvError(wasm, _err);
       _freeErr(wasm, _err);
-      const _out = [];
-      const _ip = wasm.weaveffi_alloc(4);
-      const _ierr = _allocErr(wasm);
-      while (wasm.weaveffi_kv_Store_ListKeysIterator_next(_it, _ip, _ierr) !== 0) {
-        _checkErr(wasm, _ierr);
-        const _dv = new DataView(wasm.memory.buffer);
-        _out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));
-      }
-      _checkErr(wasm, _ierr);
-      _freeErr(wasm, _ierr);
-      wasm.weaveffi_dealloc(_ip, 4);
-      wasm.weaveffi_kv_Store_ListKeysIterator_destroy(_it);
-      return _out;
+      return new _WeaveFFIIterator(wasm, _it, 4,
+        (it, slot, ep) => wasm.weaveffi_kv_Store_ListKeysIterator_next(it, slot, ep),
+        (it) => wasm.weaveffi_kv_Store_ListKeysIterator_destroy(it),
+        _checkKvError, (w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true)));
     }
     count() {
       const _err = _allocErr(wasm);

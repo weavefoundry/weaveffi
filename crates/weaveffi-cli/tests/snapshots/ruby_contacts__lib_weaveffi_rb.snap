@@ -237,7 +237,9 @@ module WeaveFFI
       WeaveFFI.check_error!(err)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| Contact.new(p) }
+      items = result.read_array_of_pointer(len).map { |p| Contact.new(p) }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
 
     def remove(id)

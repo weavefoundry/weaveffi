@@ -63,6 +63,8 @@ export interface Entry {
   readonly tags: string[];
   /** Arbitrary string-valued metadata pairs */
   readonly metadata: Record<string, string>;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 /** Persistence semantics applied to a stored entry */
@@ -99,9 +101,10 @@ export declare class Store {
   delete(key: string): boolean;
   /**
    * Stream every key, optionally filtered by a prefix
+   * @returns A lazy iterator: one producer step per `next()` call. Exhaust it or call `return()` to release the producer handle (a `for...of` loop does both automatically); an abandoned iterator leaks the handle.
    * @throws {KvError} on a domain error code
    */
-  listKeys(prefix: string | null): string[];
+  listKeys(prefix: string | null): IterableIterator<string>;
   /**
    * Return the number of live entries in the store
    * @throws {WeaveFFIError} if the native call fails
@@ -140,6 +143,8 @@ export interface Stats {
   readonly total_bytes: bigint;
   /** Number of entries past their TTL but not yet evicted */
   readonly expired_entries: bigint;
+  /** Releases the producer-owned handle exactly once. */
+  free(): void;
 }
 
 export interface WeaveffiWasmModule {

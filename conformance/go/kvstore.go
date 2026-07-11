@@ -67,15 +67,24 @@ func main() {
 	expect(kerr.Code == wv.KvErrorKeyNotFound,
 		fmt.Sprintf("missing key code == 1001 (got %d)", kerr.Code))
 
-	// Iterator-backed list-of-string method, with and without the prefix.
-	keys, err := store.ListKeys(nil)
-	expect(err == nil && len(keys) == 2, "list_keys len == 2")
+	// Iterator-backed method: a lazy iter.Seq2[string, error], with and
+	// without the prefix. Errors surface per step through the second value.
+	var keys []string
+	for k, serr := range store.ListKeys(nil) {
+		expect(serr == nil, "list_keys step error")
+		keys = append(keys, k)
+	}
+	expect(len(keys) == 2, "list_keys len == 2")
 	sort.Strings(keys)
 	expect(keys[0] == "alpha" && keys[1] == "beta", "list_keys values")
 
 	prefix := "al"
-	keys, err = store.ListKeys(&prefix)
-	expect(err == nil && len(keys) == 1 && keys[0] == "alpha", "list_keys prefix filter")
+	keys = keys[:0]
+	for k, serr := range store.ListKeys(&prefix) {
+		expect(serr == nil, "list_keys prefix step error")
+		keys = append(keys, k)
+	}
+	expect(len(keys) == 1 && keys[0] == "alpha", "list_keys prefix filter")
 
 	// Deprecated member keeps working.
 	ok, err = store.LegacyPut("legacy", payload)

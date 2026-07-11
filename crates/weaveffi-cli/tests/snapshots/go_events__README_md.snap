@@ -11,7 +11,7 @@ Auto-generated Go bindings using CGo.
 
 ## Prerequisites
 
-- Go >= 1.21
+- Go >= 1.23 (the bindings return standard `iter` package sequences)
 - A C compiler (gcc or clang) accessible to CGo
 - The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`,
   or `weaveffi.dll`) and the C header (`weaveffi.h`)

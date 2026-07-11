@@ -21,6 +21,10 @@ static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const ch
     return err;
 }
 
+typedef struct {
+    void* iter;
+} weaveffi_napi_iter_state;
+
 typedef struct weaveffi_napi_listener_ctx {
     napi_threadsafe_function tsfn;
     uint64_t id;
@@ -141,7 +145,7 @@ static napi_value Napi_weaveffi_kv_Store_get(napi_env env, napi_callback_info in
         size_t ret_value_len;
         const uint8_t* ret_value_data = (const uint8_t*)weaveffi_kv_Entry_get_value(ret_p, &ret_value_len);
         if (ret_value_data == NULL) { napi_get_null(env, &ret_value); }
-        else { void* ret_value_buf; napi_create_buffer_copy(env, ret_value_len, ret_value_data, &ret_value_buf, &ret_value); }
+        else { void* ret_value_buf; napi_create_buffer_copy(env, ret_value_len, ret_value_data, &ret_value_buf, &ret_value); weaveffi_free_bytes((uint8_t*)ret_value_data, ret_value_len); }
       }
       napi_set_named_property(env, ret, "value", ret_value);
       napi_value ret_created_at;
@@ -166,6 +170,7 @@ static napi_value Napi_weaveffi_kv_Store_get(napi_env env, napi_callback_info in
             weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
             napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
           }
+          weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
         }
       }
       napi_set_named_property(env, ret, "tags", ret_tags);
@@ -185,6 +190,8 @@ static napi_value Napi_weaveffi_kv_Store_get(napi_env env, napi_callback_info in
             weaveffi_free_string((char*)ret_metadata_keys[ret_metadata_i]);
           }
         }
+        weaveffi_free_bytes((uint8_t*)ret_metadata_keys, ret_metadata_len * sizeof(*ret_metadata_keys));
+        weaveffi_free_bytes((uint8_t*)ret_metadata_vals, ret_metadata_len * sizeof(*ret_metadata_vals));
       }
       napi_set_named_property(env, ret, "metadata", ret_metadata);
       weaveffi_kv_Entry_destroy(ret_p);
@@ -216,6 +223,63 @@ static napi_value Napi_weaveffi_kv_Store_delete(napi_env env, napi_callback_info
   return ret;
 }
 
+static void weaveffi_kv_Store_list_keys_napi_iter_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)data;
+    if (state->iter != NULL) {
+        weaveffi_kv_Store_ListKeysIterator_destroy((weaveffi_kv_Store_ListKeysIterator*)state->iter);
+        state->iter = NULL;
+    }
+    free(state);
+}
+
+static napi_value Napi_weaveffi_kv_Store_ListKeysIterator_next(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* iter_data = NULL;
+  napi_get_value_external(env, args[0], &iter_data);
+  weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)iter_data;
+  napi_value ret;
+  if (state == NULL || state->iter == NULL) {
+    napi_get_undefined(env, &ret);
+    return ret;
+  }
+  const char* iter_item;
+  weaveffi_error iter_err = {0};
+  if (!weaveffi_kv_Store_ListKeysIterator_next((weaveffi_kv_Store_ListKeysIterator*)state->iter, &iter_item, &iter_err)) {
+    weaveffi_kv_Store_ListKeysIterator_destroy((weaveffi_kv_Store_ListKeysIterator*)state->iter);
+    state->iter = NULL;
+    if (iter_err.code != 0) {
+      napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));
+      weaveffi_error_clear(&iter_err);
+      return NULL;
+    }
+    napi_get_undefined(env, &ret);
+    return ret;
+  }
+  napi_create_string_utf8(env, iter_item ? iter_item : "", NAPI_AUTO_LENGTH, &ret);
+  weaveffi_free_string((char*)iter_item);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_kv_Store_ListKeysIterator_destroy(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* iter_data = NULL;
+  napi_get_value_external(env, args[0], &iter_data);
+  weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)iter_data;
+  if (state != NULL && state->iter != NULL) {
+    weaveffi_kv_Store_ListKeysIterator_destroy((weaveffi_kv_Store_ListKeysIterator*)state->iter);
+    state->iter = NULL;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
+  return ret;
+}
+
 static napi_value Napi_weaveffi_kv_Store_list_keys(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value args[2];
@@ -240,22 +304,9 @@ static napi_value Napi_weaveffi_kv_Store_list_keys(napi_env env, napi_callback_i
     return NULL;
   }
   napi_value ret;
-  napi_create_array(env, &ret);
-  uint32_t iter_idx = 0;
-  const char* iter_item;
-  weaveffi_error iter_err = {0};
-  while (weaveffi_kv_Store_ListKeysIterator_next(result, &iter_item, &iter_err)) {
-    napi_value elem;
-    napi_create_string_utf8(env, iter_item, NAPI_AUTO_LENGTH, &elem);
-    weaveffi_free_string(iter_item);
-    napi_set_element(env, ret, iter_idx++, elem);
-  }
-  weaveffi_kv_Store_ListKeysIterator_destroy(result);
-  if (iter_err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));
-    weaveffi_error_clear(&iter_err);
-    return NULL;
-  }
+  weaveffi_napi_iter_state* iter_state = (weaveffi_napi_iter_state*)calloc(1, sizeof(weaveffi_napi_iter_state));
+  iter_state->iter = (void*)result;
+  napi_create_external(env, iter_state, weaveffi_kv_Store_list_keys_napi_iter_finalize, NULL, &ret);
   return ret;
 }
 
@@ -493,6 +544,8 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "Store_put", NULL, Napi_weaveffi_kv_Store_put, NULL, NULL, NULL, napi_default, NULL },
     { "Store_get", NULL, Napi_weaveffi_kv_Store_get, NULL, NULL, NULL, napi_default, NULL },
     { "Store_delete", NULL, Napi_weaveffi_kv_Store_delete, NULL, NULL, NULL, napi_default, NULL },
+    { "Store_list_keys_iterNext", NULL, Napi_weaveffi_kv_Store_ListKeysIterator_next, NULL, NULL, NULL, napi_default, NULL },
+    { "Store_list_keys_iterDestroy", NULL, Napi_weaveffi_kv_Store_ListKeysIterator_destroy, NULL, NULL, NULL, napi_default, NULL },
     { "Store_list_keys", NULL, Napi_weaveffi_kv_Store_list_keys, NULL, NULL, NULL, napi_default, NULL },
     { "Store_count", NULL, Napi_weaveffi_kv_Store_count, NULL, NULL, NULL, napi_default, NULL },
     { "Store_clear", NULL, Napi_weaveffi_kv_Store_clear, NULL, NULL, NULL, napi_default, NULL },
@@ -503,7 +556,7 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "unregisterEvictionListener", NULL, Napi_weaveffi_kv_unregister_eviction_listener, NULL, NULL, NULL, napi_default, NULL },
     { "getStats", NULL, Napi_weaveffi_kv_stats_get_stats, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 14, props);
+  napi_define_properties(env, exports, 16, props);
   return exports;
 }
 

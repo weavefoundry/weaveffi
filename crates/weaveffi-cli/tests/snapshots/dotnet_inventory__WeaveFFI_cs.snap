@@ -207,8 +207,12 @@ namespace WeaveFFI
                 var arr = new string[(int)len];
                 for (int i = 0; i < (int)len; i++)
                 {
-                    arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(ptr, i * IntPtr.Size)) ?? "";
+                    var itemPtr = Marshal.ReadIntPtr(ptr, i * IntPtr.Size);
+                    var item = Marshal.PtrToStringUTF8(itemPtr) ?? "";
+                    NativeMethods.weaveffi_free_string(itemPtr);
+                    arr[i] = item;
                 }
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
                 return arr;
             }
         }
@@ -285,8 +289,10 @@ namespace WeaveFFI
             var arr = new Product[(int)outLen];
             for (int i = 0; i < (int)outLen; i++)
             {
-                arr[i] = new Product(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                var item = new Product(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                arr[i] = item;
             }
+            NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * IntPtr.Size));
             return arr;
         }
 
@@ -404,8 +410,10 @@ namespace WeaveFFI
                 var arr = new OrderItem[(int)len];
                 for (int i = 0; i < (int)len; i++)
                 {
-                    arr[i] = new OrderItem(Marshal.ReadIntPtr(ptr, i * IntPtr.Size));
+                    var item = new OrderItem(Marshal.ReadIntPtr(ptr, i * IntPtr.Size));
+                    arr[i] = item;
                 }
+                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
                 return arr;
             }
         }
@@ -495,10 +503,10 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_products_Catalog_search(IntPtr self, int category, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_update_price", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_products_Catalog_update_price(IntPtr self, long id, double price, ref WeaveFFIError err);
+        internal static extern byte weaveffi_products_Catalog_update_price(IntPtr self, long id, double price, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_remove", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_products_Catalog_remove(IntPtr self, long id, ref WeaveFFIError err);
+        internal static extern byte weaveffi_products_Catalog_remove(IntPtr self, long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_create", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_orders_OrderItem_create(long product_id, int quantity, double unit_price, ref WeaveFFIError err);
@@ -540,10 +548,10 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_orders_get_order(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_cancel_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_orders_cancel_order(long id, ref WeaveFFIError err);
+        internal static extern byte weaveffi_orders_cancel_order(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_add_product_to_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_orders_add_product_to_order(long order_id, IntPtr product, ref WeaveFFIError err);
+        internal static extern byte weaveffi_orders_add_product_to_order(long order_id, IntPtr product, ref WeaveFFIError err);
 
     }
 

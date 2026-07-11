@@ -47,7 +47,7 @@ stays buildable under any name.
 | `EnumName` (rich)  | `EnumName` (class)    | Wraps `OpaquePointer`, like a struct |
 | `T?`         | `T?`                        | Optional pointer / sentinel      |
 | `[T]`        | `[T]`                       | Pointer + length                 |
-| `iter<T>`    | `[T]`                       | Drained eagerly via `_next`      |
+| `iter<T>`    | generated `Sequence` class  | Lazy; one `_next` call per step  |
 
 ## Example IDL → generated code
 
@@ -251,6 +251,9 @@ public final class Store {
     /// Return the number of live entries in the store
     public func count() -> Int64          // no throws: traps on producer bugs
 
+    /// Stream every key, optionally filtered by a prefix
+    public func listKeys(prefix: String?) throws -> KvStoreListKeysIterator
+
     /// Reclaim space asynchronously; returns the number of bytes reclaimed
     public func compact() async throws -> Int64
 
@@ -368,6 +371,11 @@ sample (see `conformance/run.sh`).
   `[UInt8]` array and passes it via `withUnsafeBufferPointer`; returned
   `bytes` are copied into `Data` and the Rust buffer is freed with
   `weaveffi_free_bytes`.
+- Returned optional scalars arrive boxed behind a pointer; the wrapper
+  dereferences the value and frees the box with the `wvFreeBox` helper.
+  Returned arrays and maps free each string element individually, then
+  release the buffer(s) with `wvFreeArray`; both helpers call
+  `weaveffi_free_bytes`.
 
 ## Async support
 
@@ -406,6 +414,16 @@ public static func runTask(name: String) async throws -> TaskResult {
     }
 }
 ```
+
+The completion callback fires exactly once, on an arbitrary producer
+thread, and the continuation is resumed exactly once from inside it.
+Result buffers passed to the callback (strings, bytes, arrays) are
+borrowed from the producer for the callback's duration: the wrapper
+copies them (for example `String(cString:)` on the error message)
+before the callback returns and never frees them. Owned-object results
+are the exception: `run_task` returns a struct, so the callback adopts
+the pointer into a new `TaskResult`, whose `deinit` eventually frees
+it.
 
 `run_task` declares `throws: true`, so the continuation rejects with the
 typed `TaskError` (via `mapTasks`). An async callable without `throws` is
@@ -479,34 +497,83 @@ yourself (e.g. `DispatchQueue.main.async` or `await MainActor.run`).
 
 ## Iterators
 
-`iter<T>` returns are drained eagerly: the wrapper calls the generated
-`_next` C function until it reports exhaustion, frees each element,
-destroys the iterator handle, and returns a Swift array. From the
-`events` sample (`get_messages` returns `iter<string>` and doesn't
-declare `throws`, so the wrapper is non-throwing and traps on producer
-bugs):
+`iter<T>` returns are lazy: the wrapper returns a generated
+`final class` conforming to `Sequence` and `IteratorProtocol` that
+wraps the opaque C iterator handle. Nothing is drained up front; each
+`next()` call pulls exactly one element from the producer, copies it
+into Swift memory, and frees the element's native allocation (strings
+via `weaveffi_free_string`). From the `events` sample (`get_messages`
+returns `iter<string>` and doesn't declare `throws`, so the wrapper is
+non-throwing and traps on producer bugs):
 
 ```swift
-public static func getMessages() -> [String] {
+/// A lazy sequence over the `String` elements streamed by `weaveffi_events_get_messages`.
+///
+/// Each `next()` call pulls exactly one element from the producer. The
+/// underlying C iterator is destroyed eagerly on exhaustion and from
+/// `deinit` when iteration is abandoned early.
+public final class EventsGetMessagesIterator: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+
+    deinit {
+        destroyHandle()
+    }
+
+    /// Pulls the next element from the producer, or returns `nil` once the
+    /// stream is exhausted (destroying the underlying iterator).
+    public func next() -> String? {
+        guard let handle = handle else { return nil }
+        var item: UnsafePointer<CChar>? = nil
+        var err = weaveffi_error(code: 0, message: nil)
+        if weaveffi_events_GetMessagesIterator_next(handle, &item, &err) == 0 {
+            // ... a non-zero code is a producer bug: fatalError ...
+            destroyHandle()
+            return nil
+        }
+        let element = String(cString: item!)
+        weaveffi_free_string(item)
+        return element
+    }
+}
+
+public static func getMessages() -> EventsGetMessagesIterator {
     var err = weaveffi_error(code: 0, message: nil)
     let iter = weaveffi_events_get_messages(&err)
     trap(&err)
-    guard let iter = iter else { return [] }
-    var items: [String] = []
-    var iterItem: UnsafePointer<CChar>? = nil
-    var iterErr = weaveffi_error(code: 0, message: nil)
-    while weaveffi_events_GetMessagesIterator_next(iter, &iterItem, &iterErr) != 0 {
-        items.append(String(cString: iterItem!))
-        weaveffi_free_string(UnsafeMutablePointer(mutating: iterItem))
-    }
-    weaveffi_events_GetMessagesIterator_destroy(iter)
-    trap(&iterErr)
-    return items
+    guard let iter = iter else { fatalError("-1: null iterator") }
+    return EventsGetMessagesIterator(handle: iter)
 }
 ```
 
-A throwing iterator function (like `Store.listKeys(prefix:)` in the
-`kvstore` sample) uses the typed checker instead and declares `throws`.
+The handle is destroyed exactly once: eagerly when `next()` reports
+exhaustion, or from `deinit` when the sequence is abandoned early
+(`destroyHandle` nulls the stored handle, so a double destroy is
+impossible). Since the class conforms to `Sequence`, callers just
+write `for message in Events.getMessages() { ... }`; the sequence is
+single-pass.
+
+A throwing iterator function like the `kvstore` sample's
+`Store.listKeys(prefix:)` declares `throws` and routes a launch
+failure through the typed checker (`checkKv`). Swift's
+`IteratorProtocol.next()` can't throw, so a mid-stream error can't
+surface on the step that failed; instead it ends iteration and is
+stored in the sequence's public `error` property for the caller to
+inspect after the loop:
+
+```swift
+/// If the producer reports an error mid-stream, iteration ends and the
+/// error is stored in ``error`` for the caller to inspect after the loop.
+public final class KvStoreListKeysIterator: Sequence, IteratorProtocol {
+    /// The error that ended iteration early, if any.
+    public private(set) var error: Error?
+    // ... same handle lifecycle as above; a failing next() maps the
+    // code through mapKv, stores it in `error`, and returns nil ...
+}
+
+let keys = try store.listKeys(prefix: nil)
+for key in keys { print(key) }
+if let error = keys.error { throw error }
+```
 
 ## Troubleshooting
 

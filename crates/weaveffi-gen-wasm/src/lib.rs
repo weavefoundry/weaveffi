@@ -28,6 +28,7 @@ use weaveffi_core::model::{
     RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::utils::{
     local_type_name, render_json_prelude, render_prelude, render_trailer, CommentStyle,
 };
@@ -214,7 +215,8 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::TypedHandle(_)
-        | TypeRef::Struct(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
         | TypeRef::Interface(_)
         | TypeRef::Iterator(_)
         | TypeRef::Map(_, _) => "i64",
@@ -226,13 +228,18 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::BorrowedBytes
         | TypeRef::List(_) => "i32, i32",
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_)
-            | TypeRef::Handle
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::Interface(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::Iterator(_)
             | TypeRef::Map(_, _) => "i64",
-            _ => "i32, i32",
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => "i32, i32",
+            // Optional strings are a nullable char*; optional scalars
+            // (including `handle`) are boxed by pointer. Both are one i32.
+            _ => "i32",
         },
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -253,19 +260,27 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
             "ptr + len in linear memory"
         }
         TypeRef::TypedHandle(_) | TypeRef::Handle => "opaque pointer",
-        TypeRef::Struct(_) | TypeRef::Interface(_) => "opaque handle in linear memory",
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_) => {
+            "opaque handle in linear memory"
+        }
         TypeRef::Enum(_) => "variant discriminant",
         TypeRef::List(_) => "ptr + len in linear memory",
         TypeRef::Map(_, _) => "opaque handle in linear memory",
         TypeRef::Iterator(_) => "opaque iterator handle",
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_)
-            | TypeRef::Handle
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::Interface(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::Iterator(_)
             | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
-            _ => "is_present flag + value",
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "nullable pointer, 0 = absent",
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
+                "ptr + len, null ptr = absent"
+            }
+            _ => "boxed scalar pointer, 0 = absent",
         },
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -285,13 +300,14 @@ fn type_display(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
         TypeRef::TypedHandle(_) | TypeRef::Handle => "handle".into(),
-        TypeRef::Struct(n) => local_type_name(n).to_string(),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => local_type_name(n).to_string(),
         TypeRef::Enum(n) => n.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_display(inner)),
         TypeRef::List(inner) => format!("[{}]", type_display(inner)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
         TypeRef::Interface(n) => local_type_name(n).to_string(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -352,24 +368,38 @@ fn render_wasm_readme(
         "The host cannot inspect struct fields directly; use the generated accessor functions ",
     );
     out.push_str(&format!(
-        "(`{prefix}_{{module}}_{{struct}}_get_{{field}}`) to read/write fields.\n\n"
+        "(`{prefix}_{{module}}_{{struct}}_get_{{field}}`) to read/write fields. ",
     ));
+    out.push_str(
+        "A returned struct handle is owned by the consumer; the JS wrapper's `free()` \
+         releases it via the struct's `_destroy` symbol.\n\n",
+    );
     out.push_str("### Enums\n\n");
     out.push_str("Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.\n\n");
     out.push_str("### Optionals\n\n");
     out.push_str("Optional values use **`0` / `null`** to represent the absent case. ");
-    out.push_str("For numeric optionals, a separate `_is_present` flag (`i32`: 0 or 1) is used. ");
-    out.push_str("For handle-typed optionals, a null pointer (`0`) signals absence.\n\n");
+    out.push_str("Scalar optionals are boxed by pointer (a null pointer signals absence); ");
+    out.push_str("handle-typed and string optionals pass a null pointer (`0`) directly.\n\n");
     out.push_str("### Lists\n\n");
     out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
     out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
-    out.push_str("for allocating and freeing the backing memory.\n");
+    out.push_str("for allocating and freeing the backing memory.\n\n");
+    out.push_str("### Iterators\n\n");
+    out.push_str("`iter<T>` functions return a **lazy JS iterator** (typed ");
+    out.push_str("`IterableIterator<T>`): each `next()` issues exactly one producer call, so ");
+    out.push_str("iteration streams in constant memory. The producer handle is destroyed ");
+    out.push_str("exactly once, on exhaustion or via `return()` when iteration stops early ");
+    out.push_str("(a `for...of` loop calls `return()` automatically on `break` or `throw`). ");
+    out.push_str("Abandoning an iterator without exhausting or closing it leaks the handle.\n");
     out.push_str("\n### Error Handling\n\n");
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
     out.push_str("pointer as the last argument to each Wasm function. Your Wasm module must\n");
     out.push_str("export the following functions:\n\n");
     out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
+    out.push_str("- `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");
+    out.push_str("- `weaveffi_free_string(ptr: i32)`: free a producer-returned C string\n");
+    out.push_str("- `weaveffi_free_bytes(ptr: i32, len: i32)`: free a producer-returned buffer\n");
     out.push_str("\nWrappers of functions declared `throws` raise the declaring module's typed\n");
     out.push_str("error class (a `WeaveFFIError` subclass with a per-code subclass, such as\n");
     out.push_str("`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only\n");
@@ -653,6 +683,17 @@ fn is_string_type(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr)
 }
 
+/// True when an async return carries a list or map with string elements,
+/// whose borrowed buffers the completion callback reads without freeing.
+fn async_ret_has_string_buffers(ret: Option<&TypeRef>) -> bool {
+    match ret {
+        Some(TypeRef::List(inner)) => is_string_type(inner),
+        Some(TypeRef::Map(k, v)) => is_string_type(k) || is_string_type(v),
+        Some(TypeRef::Optional(inner)) => async_ret_has_string_buffers(Some(inner)),
+        _ => false,
+    }
+}
+
 /// Visit every boundary-crossing type in `api` (function params + returns and
 /// struct field types), recursing into composite types, and return whether any
 /// satisfies `pred`.
@@ -801,7 +842,10 @@ fn emit_stage_input(
             args.push(format!("{tmp}_l"));
             cleanup.push(format!("wasm.weaveffi_dealloc({tmp}_p, {tmp}_l);"));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             args.push(format!("{value}._handle"));
         }
         TypeRef::Bool
@@ -820,7 +864,10 @@ fn emit_stage_input(
             args.push(js_arg_scalar(ty, value));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => {
                 args.push(format!("({value} ? {value}._handle : 0)"));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
@@ -906,6 +953,7 @@ fn emit_stage_input(
             args.push(kargs[1].clone());
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as an input"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -942,7 +990,10 @@ fn emit_stage_list(
                 "for (const [ep, es] of {tmp}_ep) wasm.weaveffi_dealloc(ep, es);"
             ));
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             w.block("{", "}", |w| {
                 w.line("const dv = new DataView(wasm.memory.buffer);");
                 w.line(format!("for (let i = 0; i < {tmp}_n; i++) dv.setInt32({tmp}_base + i * 4, {tmp}_arr[i]._handle, true);"));
@@ -975,8 +1026,23 @@ fn emit_stage_list(
     out.push_str(&w.finish());
 }
 
-/// Emit `const {target} = ...;` building a JS array of `inner` elements from the
-/// producer-owned C array at `base` (`len` elements). Assumes `wasm` in scope.
+/// How string elements read out of a producer array are released, per the
+/// [`weaveffi_core::plan`] ownership contracts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ElemOwnership {
+    /// Synchronous-return elements: the consumer owns each string and frees it
+    /// with `{prefix}_free_string` after copying.
+    Owned,
+    /// Async-callback elements: string buffers are borrowed for the callback's
+    /// duration, so they are copied out but never freed here.
+    Borrowed,
+}
+
+/// Emit `const {target} = ...;` building a JS array of `inner` elements from
+/// the C array at `base` (`len` elements). String elements are freed or left
+/// alone per `ownership`; record/rich-enum and interface elements are owned
+/// object pointers adopted by their wrapper classes either way. Assumes
+/// `wasm` in scope.
 fn emit_read_list_into(
     out: &mut String,
     indent: &str,
@@ -984,15 +1050,23 @@ fn emit_read_list_into(
     base: &str,
     len: &str,
     target: &str,
+    ownership: ElemOwnership,
 ) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "const {target} = _takeStrArray(wasm, {base}, {len});"
-            ));
-        }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => match ownership {
+            ElemOwnership::Owned => {
+                w.line(format!(
+                    "const {target} = _takeStrArray(wasm, {base}, {len});"
+                ));
+            }
+            ElemOwnership::Borrowed => {
+                w.line(format!(
+                    "const {target} = _readStrArray(wasm, {base}, {len});"
+                ));
+            }
+        },
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let cls = local_type_name(name);
             w.line(format!("const {target} = [];"));
             w.block("{", "}", |w| {
@@ -1027,7 +1101,8 @@ fn emit_read_list_into(
 }
 
 /// Emit `const {target} = ...;` building a JS object (`Record`) from the
-/// producer-owned parallel key/value C arrays. Assumes `wasm` in scope.
+/// parallel key/value C arrays, with string elements released per
+/// `ownership`. Assumes `wasm` in scope.
 #[allow(clippy::too_many_arguments)]
 fn emit_read_map_into(
     out: &mut String,
@@ -1038,9 +1113,10 @@ fn emit_read_map_into(
     va: &str,
     len: &str,
     target: &str,
+    ownership: ElemOwnership,
 ) {
-    emit_read_list_into(out, indent, k, ka, len, &format!("{target}_k"));
-    emit_read_list_into(out, indent, v, va, len, &format!("{target}_v"));
+    emit_read_list_into(out, indent, k, ka, len, &format!("{target}_k"), ownership);
+    emit_read_list_into(out, indent, v, va, len, &format!("{target}_v"), ownership);
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.line(format!("const {target} = {{}};"));
     w.line(format!(
@@ -1139,7 +1215,7 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("return _takeCStr(wasm, {r});"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let cls = local_type_name(name);
             w.line(format!("return new {cls}(wasm, {r});"));
         }
@@ -1150,15 +1226,32 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
             w.line(format!("return _takeBytes(wasm, {r}, _len);"));
         }
         TypeRef::List(inner) => {
+            let stride = wasm_stride(inner);
             w.line("const _dv = new DataView(wasm.memory.buffer);");
             w.line("const _len = _dv.getUint32(_lp, true);");
             w.line("wasm.weaveffi_dealloc(_lp, 4);");
             let mut tmp = String::new();
-            emit_read_list_into(&mut tmp, indent, inner, r, "_len", "_out");
+            emit_read_list_into(
+                &mut tmp,
+                indent,
+                inner,
+                r,
+                "_len",
+                "_out",
+                ElemOwnership::Owned,
+            );
             w.raw(tmp);
+            // The consumer owns the returned array buffer; release it after
+            // copying the elements out (each element already freed per its
+            // own plan above).
+            w.line(format!(
+                "if ({r} !== 0 && _len !== 0) wasm.weaveffi_free_bytes({r}, _len * {stride});"
+            ));
             w.line("return _out;");
         }
         TypeRef::Map(k, v) => {
+            let k_stride = wasm_stride(k);
+            let v_stride = wasm_stride(v);
             w.line("const _dv = new DataView(wasm.memory.buffer);");
             w.line("const _ka = _dv.getUint32(_kp, true);");
             w.line("const _va = _dv.getUint32(_vp, true);");
@@ -1167,12 +1260,30 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
             w.line("wasm.weaveffi_dealloc(_vp, 4);");
             w.line("wasm.weaveffi_dealloc(_lp, 4);");
             let mut tmp = String::new();
-            emit_read_map_into(&mut tmp, indent, k, v, "_ka", "_va", "_len", "_out");
+            emit_read_map_into(
+                &mut tmp,
+                indent,
+                k,
+                v,
+                "_ka",
+                "_va",
+                "_len",
+                "_out",
+                ElemOwnership::Owned,
+            );
             w.raw(tmp);
+            // The consumer owns both parallel arrays; release them after
+            // copying the entries out.
+            w.line(format!(
+                "if (_ka !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_ka, _len * {k_stride});"
+            ));
+            w.line(format!(
+                "if (_va !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_va, _len * {v_stride});"
+            ));
             w.line("return _out;");
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                 let cls = local_type_name(name);
                 w.line(format!("return {r} === 0 ? null : new {cls}(wasm, {r});"));
             }
@@ -1190,11 +1301,16 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
                 w.raw(tmp);
             }
             scalar => {
+                // Boxed optional scalar: dereference the box, then release it
+                // (the consumer owns the box per the return-free plan).
+                let width = scalar_width(scalar);
                 let getter = wasm_read_scalar_elem(scalar, "_dv", r, "0")
                     .replace(&format!("{r} + 0 * {}", wasm_stride(scalar)), r);
                 w.line(format!("if ({r} === 0) return null;"));
                 w.line("const _dv = new DataView(wasm.memory.buffer);");
-                w.line(format!("return {getter};"));
+                w.line(format!("const _v = {getter};"));
+                w.line(format!("wasm.weaveffi_free_bytes({r}, {width});"));
+                w.line("return _v;");
             }
         },
         TypeRef::Iterator(_) => unreachable!("iterator returns handled separately"),
@@ -1202,6 +1318,7 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
             let cls = local_type_name(name);
             w.line(format!("return {cls}._wrap({r});"));
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -1224,13 +1341,14 @@ fn ts_type_for(ty: &TypeRef) -> String {
         // Every 64-bit integer crosses the JS boundary as a BigInt: wasm i64
         // results arrive as BigInt and i64 arguments are BigInt-coerced.
         TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "bigint".into(),
-        // Structs, enums, typed handles, and interfaces surface as bare local
-        // TS names; a cross-module reference (resolved to e.g. `kv.Store`)
-        // must name the local `Store`, not the qualified IR name which is
-        // undeclared here.
+        // Records, rich enums, plain enums, typed handles, and interfaces
+        // surface as bare local TS names; a cross-module reference (resolved
+        // to e.g. `kv.Store`) must name the local `Store`, not the qualified
+        // IR name which is undeclared here.
         TypeRef::TypedHandle(name)
         | TypeRef::Enum(name)
-        | TypeRef::Struct(name)
+        | TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
         | TypeRef::Interface(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         TypeRef::List(inner) => {
@@ -1241,11 +1359,14 @@ fn ts_type_for(ty: &TypeRef) -> String {
                 format!("{inner_ts}[]")
             }
         }
+        // `iter<T>` streams lazily; the wrapper is a JS iterator, never a
+        // drained array.
         TypeRef::Iterator(inner) => {
             let t = ts_type_for(inner);
-            format!("{t}[]")
+            format!("IterableIterator<{t}>")
         }
         TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -1341,23 +1462,24 @@ fn js_error_checker_name(eb: &ErrorBinding) -> String {
     format!("_check{}", eb.type_name)
 }
 
-/// The error-check helper a callable's out-err slot routes through: the
-/// module domain's typed checker when the callable throws, the generic
-/// `_checkErr` (plain `WeaveFFIError`; panics and marshalling failures only)
-/// otherwise.
+/// The error-check helper a callable's out-err slot routes through, per its
+/// [`ErrorStrategy`]: the module domain's typed checker for
+/// [`ErrorStrategy::Throws`], the generic `_checkErr` (plain `WeaveFFIError`;
+/// panics and marshalling failures only) for [`ErrorStrategy::Trap`].
 fn js_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
-    match error {
-        Some(eb) if f.throws => js_error_checker_name(eb),
+    match (f.error_strategy(), error) {
+        (ErrorStrategy::Throws, Some(eb)) => js_error_checker_name(eb),
         _ => "_checkErr".to_string(),
     }
 }
 
 /// The rejection factory a throwing async callable stores in its context so
 /// the completion callback maps domain codes to the typed error, or `None`
-/// for non-throwing callables (which reject with the generic brand error).
+/// for [`ErrorStrategy::Trap`] callables (which reject with the generic
+/// brand error).
 fn js_err_factory(f: &FnBinding, error: Option<&ErrorBinding>) -> Option<String> {
-    match error {
-        Some(eb) if f.throws => Some(js_error_factory_name(eb)),
+    match (f.error_strategy(), error) {
+        (ErrorStrategy::Throws, Some(eb)) => Some(js_error_factory_name(eb)),
         _ => None,
     }
 }
@@ -1428,6 +1550,8 @@ fn render_wasm_dts(
                     ts_type_for(&field.ty)
                 ));
             }
+            out.push_str("  /** Releases the producer-owned handle exactly once. */\n");
+            out.push_str("  free(): void;\n");
             out.push_str("}\n\n");
         }
 
@@ -1549,13 +1673,22 @@ fn dts_ret(f: &FnBinding) -> String {
     }
 }
 
-/// The JSDoc tag list for one callable: `@deprecated` first when present,
-/// then the `@throws` tag matching the throws split (the typed domain error
-/// for throwing callables, the generic brand error otherwise).
+/// The JSDoc tag list for one callable: `@deprecated` first when present, a
+/// streaming note for iterator-returning callables, then the `@throws` tag
+/// matching the throws split (the typed domain error for throwing callables,
+/// the generic brand error otherwise).
 fn dts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
     let mut tags = Vec::new();
     if let Some(msg) = &f.deprecated {
         tags.push(format!("@deprecated {msg}"));
+    }
+    if matches!(f.shape, CallShape::Iterator(_)) {
+        tags.push(
+            "@returns A lazy iterator: one producer step per `next()` call. Exhaust it or \
+             call `return()` to release the producer handle (a `for...of` loop does both \
+             automatically); an abandoned iterator leaks the handle."
+                .to_string(),
+        );
     }
     match error {
         Some(eb) if f.throws => tags.push(format!(
@@ -1907,12 +2040,14 @@ fn collect_called_symbols(model: &BindingModel) -> Vec<String> {
             for f in &s.fields {
                 push_unique(&mut syms, &f.getter_symbol);
             }
+            push_unique(&mut syms, &s.destroy_symbol);
             if let Some(b) = &s.builder {
                 push_unique(&mut syms, &b.new_symbol);
                 for (_field, setter) in &b.setters {
                     push_unique(&mut syms, setter);
                 }
                 push_unique(&mut syms, &b.build_symbol);
+                push_unique(&mut syms, &b.destroy_symbol);
             }
         }
         for f in m.callables() {
@@ -1972,12 +2107,36 @@ fn render_wasm_js_stub(
     let needs_bytes = api_deep_any(api, &|t| {
         matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes)
     });
+    // `weaveffi_free_bytes` releases byte returns, list/map container
+    // buffers, and boxed optional-scalar returns.
+    let needs_free_bytes = needs_bytes
+        || api_deep_any(api, &|t| match t {
+            TypeRef::List(_) | TypeRef::Map(_, _) => true,
+            TypeRef::Optional(inner) => !weaveffi_core::codegen::common::is_c_pointer_type(inner),
+            _ => false,
+        });
     let needs_str_array = api_deep_any(api, &|t| match t {
         TypeRef::List(inner) => is_string_type(inner),
         TypeRef::Map(k, v) => is_string_type(k) || is_string_type(v),
         TypeRef::Iterator(inner) => is_string_type(inner),
         _ => false,
     });
+    // Async list/map results arrive borrowed: their string elements are read
+    // without freeing, through a separate helper.
+    let needs_borrowed_str_array = has_async
+        && model
+            .modules
+            .iter()
+            .flat_map(ModuleBinding::callables)
+            .filter(|f| f.is_async)
+            .any(|f| async_ret_has_string_buffers(f.ret.as_ref()));
+    // Any iterator-returning callable pulls in the shared lazy-iterator
+    // wrapper class.
+    let has_iterators = model
+        .modules
+        .iter()
+        .flat_map(ModuleBinding::callables)
+        .any(|f| matches!(f.shape, CallShape::Iterator(_)));
 
     out.push_str("// WeaveFFI Wasm bindings (auto-generated)\n");
     out.push_str("//\n");
@@ -2049,8 +2208,9 @@ fn render_wasm_js_stub(
     }
 
     if needs_str_array {
-        out.push_str("// Decode a producer-owned array of `len` C strings at `base` (each\n");
-        out.push_str("// freed); the array container itself is owned by the producer.\n");
+        out.push_str("// Decode an array of `len` C strings at `base`, freeing each string\n");
+        out.push_str("// after copying (the consumer owns the elements); the caller releases\n");
+        out.push_str("// the array container separately.\n");
         out.push_str("function _takeStrArray(wasm, base, len) {\n");
         out.push_str("  const out = [];\n");
         out.push_str("  if (base === 0) return out;\n");
@@ -2060,6 +2220,21 @@ fn render_wasm_js_stub(
             "  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));\n",
         );
         out.push_str("  for (const p of ptrs) out.push(_takeCStr(wasm, p));\n");
+        out.push_str("  return out;\n");
+        out.push_str("}\n\n");
+    }
+
+    if needs_borrowed_str_array {
+        out.push_str("// Decode an array of `len` borrowed C strings at `base` without\n");
+        out.push_str("// freeing anything: async completion callbacks receive buffers the\n");
+        out.push_str("// producer owns and reclaims after the callback returns.\n");
+        out.push_str("function _readStrArray(wasm, base, len) {\n");
+        out.push_str("  const out = [];\n");
+        out.push_str("  if (base === 0) return out;\n");
+        out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
+        out.push_str(
+            "  for (let i = 0; i < len; i++) out.push(_readCStr(wasm, dv.getUint32(base + i * 4, true)));\n",
+        );
         out.push_str("  return out;\n");
         out.push_str("}\n\n");
     }
@@ -2108,6 +2283,66 @@ fn render_wasm_js_stub(
             ));
             out.push_str("}\n\n");
         }
+    }
+
+    if has_iterators {
+        out.push_str("// Lazy wrapper over a producer iterator handle, implementing the JS\n");
+        out.push_str("// iterator protocol: each next() issues exactly one producer next call\n");
+        out.push_str("// and yields one converted element, so iteration streams in constant\n");
+        out.push_str("// memory. The handle is destroyed exactly once: eagerly on exhaustion,\n");
+        out.push_str("// on a next error, or from return() when iteration stops early (a\n");
+        out.push_str("// for...of loop calls return() automatically on break or throw).\n");
+        out.push_str("// Abandoning an iterator without exhausting or closing it leaks the\n");
+        out.push_str("// producer handle: JS has no finalization hook that is reliable across\n");
+        out.push_str("// every target this loader supports.\n");
+        out.push_str("class _WeaveFFIIterator {\n");
+        out.push_str("  constructor(wasm, handle, stride, callNext, destroy, check, decode) {\n");
+        out.push_str("    this._wasm = wasm;\n");
+        out.push_str("    this._handle = handle;\n");
+        out.push_str("    this._stride = stride;\n");
+        out.push_str("    this._callNext = callNext;\n");
+        out.push_str("    this._destroyFn = destroy;\n");
+        out.push_str("    this._check = check;\n");
+        out.push_str("    this._decode = decode;\n");
+        out.push_str("    this._slot = wasm.weaveffi_alloc(stride);\n");
+        out.push_str("  }\n");
+        out.push_str("  // Destroy the handle and release the element slot exactly once.\n");
+        out.push_str("  _close() {\n");
+        out.push_str("    if (this._handle === 0) return;\n");
+        out.push_str("    this._destroyFn(this._handle);\n");
+        out.push_str("    this._handle = 0;\n");
+        out.push_str("    this._wasm.weaveffi_dealloc(this._slot, this._stride);\n");
+        out.push_str("    this._slot = 0;\n");
+        out.push_str("  }\n");
+        out.push_str("  next() {\n");
+        out.push_str("    if (this._handle === 0) return { done: true, value: undefined };\n");
+        out.push_str("    const wasm = this._wasm;\n");
+        out.push_str("    const _err = _allocErr(wasm);\n");
+        out.push_str("    let _has;\n");
+        out.push_str("    try {\n");
+        out.push_str("      _has = this._callNext(this._handle, this._slot, _err);\n");
+        out.push_str("      // Throws (and releases the slot) on a non-zero code.\n");
+        out.push_str("      this._check(wasm, _err);\n");
+        out.push_str("    } catch (e) {\n");
+        out.push_str("      this._close();\n");
+        out.push_str("      throw e;\n");
+        out.push_str("    }\n");
+        out.push_str("    _freeErr(wasm, _err);\n");
+        out.push_str("    if (_has === 0) {\n");
+        out.push_str("      this._close();\n");
+        out.push_str("      return { done: true, value: undefined };\n");
+        out.push_str("    }\n");
+        out.push_str("    return { done: false, value: this._decode(wasm, this._slot) };\n");
+        out.push_str("  }\n");
+        out.push_str("  // Early-exit cleanup; for...of calls this on break/throw.\n");
+        out.push_str("  return(value) {\n");
+        out.push_str("    this._close();\n");
+        out.push_str("    return { done: true, value };\n");
+        out.push_str("  }\n");
+        out.push_str("  [Symbol.iterator]() {\n");
+        out.push_str("    return this;\n");
+        out.push_str("  }\n");
+        out.push_str("}\n\n");
     }
 
     if has_async {
@@ -2236,7 +2471,7 @@ fn render_wasm_js_stub(
                     format!("{prefix}_free_string"),
                 ));
             }
-            if needs_bytes {
+            if needs_free_bytes {
                 bindings.push((
                     "weaveffi_free_bytes".to_string(),
                     format!("{prefix}_free_bytes"),
@@ -2401,10 +2636,11 @@ fn render_js_module_object(
 }
 
 /// Emit one callable in the shape its [`CallShape`] and the mode call for:
-/// iterator members drain eagerly, async members return a `Promise` (or an
-/// explicit throwing stub in Emscripten mode), and everything else is a plain
-/// synchronous wrapper. `self_arg` threads the instance handle for interface
-/// methods; `error` is the module's effective domain for the throws split.
+/// iterator members return a lazy JS iterator, async members return a
+/// `Promise` (or an explicit throwing stub in Emscripten mode), and
+/// everything else is a plain synchronous wrapper. `self_arg` threads the
+/// instance handle for interface methods; `error` is the module's effective
+/// domain for the throws split.
 fn emit_js_callable(
     out: &mut String,
     f: &FnBinding,
@@ -2561,10 +2797,41 @@ fn emit_js_function_wrapper(
     out.push_str(&w.finish());
 }
 
-/// Emit an iterator-returning function as a method that drains the iterator
-/// eagerly into a JS array (matching the `T[]` TypeScript shape). The acquire
-/// call routes through the throws-aware checker; `next` failures are always
-/// producer panics, so they stay on the generic checker.
+/// The single-expression `(w, p) => ...` closure converting one element out
+/// of an iterator's `next` slot at pointer `p`, applying the per-element
+/// release plan (`ElemFree`): a string is copied out of wasm memory and then
+/// freed with `{prefix}_free_string`, a record or rich-enum pointer is
+/// adopted by its wrapper class, an interface pointer by `_wrap`, and a
+/// by-value element is read directly.
+fn js_iter_decode_closure(elem: &TypeRef, stride: u32) -> String {
+    match elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            "(w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true))".into()
+        }
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
+            let cls = local_type_name(name);
+            format!("(w, p) => new {cls}(w, new DataView(w.memory.buffer).getInt32(p, true))")
+        }
+        TypeRef::Interface(name) => {
+            let cls = local_type_name(name);
+            format!("(w, p) => {cls}._wrap(new DataView(w.memory.buffer).getInt32(p, true))")
+        }
+        scalar => {
+            let read = wasm_read_scalar_elem(scalar, "new DataView(w.memory.buffer)", "p", "0")
+                .replace(&format!("p + 0 * {stride}"), "p");
+            format!("(w, p) => {read}")
+        }
+    }
+}
+
+/// Emit an iterator-returning function as a method returning a lazy JS
+/// iterator over the producer's iterator handle (the TypeScript type is
+/// `IterableIterator<T>`). The wrapper issues one producer `next` call per
+/// consumer step, converts and frees each element per its plan, and destroys
+/// the handle exactly once: on exhaustion, on a `next` error, or from
+/// `return()` when the consumer stops early. Both the launch call and every
+/// `next` route their out-err slot through the throws-aware checker, so a
+/// throwing function's domain errors keep their typed class.
 fn emit_js_iterator_function_wrapper(
     out: &mut String,
     f: &FnBinding,
@@ -2608,6 +2875,7 @@ fn emit_js_iterator_function_wrapper(
     }
     args.push("_err".to_string());
     let stride = wasm_stride(&ib.elem);
+    let decode = js_iter_decode_closure(&ib.elem, stride);
     w.scope(|w| {
         w.raw(&staged);
         w.line("const _err = _allocErr(wasm);");
@@ -2621,42 +2889,13 @@ fn emit_js_iterator_function_wrapper(
         }
         w.line(format!("{checker}(wasm, _err);"));
         w.line("_freeErr(wasm, _err);");
-        w.line("const _out = [];");
-        w.line(format!("const _ip = wasm.weaveffi_alloc({stride});"));
-        w.line("const _ierr = _allocErr(wasm);");
-        w.block(
-            format!("while (wasm.{}(_it, _ip, _ierr) !== 0) {{", ib.next.symbol),
-            "}",
-            |w| {
-                w.line("_checkErr(wasm, _ierr);");
-                w.line("const _dv = new DataView(wasm.memory.buffer);");
-                match &ib.elem {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        w.line("_out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));");
-                    }
-                    TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
-                        let cls = local_type_name(name);
-                        w.line(format!(
-                            "_out.push(new {cls}(wasm, _dv.getInt32(_ip, true)));"
-                        ));
-                    }
-                    TypeRef::Interface(name) => {
-                        let cls = local_type_name(name);
-                        w.line(format!("_out.push({cls}._wrap(_dv.getInt32(_ip, true)));"));
-                    }
-                    scalar => {
-                        let elem = wasm_read_scalar_elem(scalar, "_dv", "_ip", "0")
-                            .replace(&format!("_ip + 0 * {stride}"), "_ip");
-                        w.line(format!("_out.push({elem});"));
-                    }
-                }
-            },
-        );
-        w.line("_checkErr(wasm, _ierr);");
-        w.line("_freeErr(wasm, _ierr);");
-        w.line(format!("wasm.weaveffi_dealloc(_ip, {stride});"));
-        w.line(format!("wasm.{}(_it);", ib.destroy_symbol));
-        w.line("return _out;");
+        w.line(format!("return new _WeaveFFIIterator(wasm, _it, {stride},"));
+        w.line(format!(
+            "  (it, slot, ep) => wasm.{}(it, slot, ep),",
+            ib.next.symbol
+        ));
+        w.line(format!("  (it) => wasm.{}(it),", ib.destroy_symbol));
+        w.line(format!("  {checker}, {decode});"));
     });
     w.line(decl.close());
     out.push_str(&w.finish());
@@ -2680,7 +2919,8 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
             | TypeRef::Enum(_)
             | TypeRef::StringUtf8
             | TypeRef::BorrowedStr
-            | TypeRef::Struct(_)
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
             | TypeRef::Interface(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::Iterator(_),
@@ -2706,7 +2946,6 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
             params.push("i32");
         }
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::Handle => params.push("i64"),
             TypeRef::Map(_, _) => {
                 params.push("i32");
                 params.push("i32");
@@ -2716,10 +2955,12 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
                 params.push("i32");
                 params.push("i32");
             }
-            // struct/typed-handle/iterator (null pointer) and scalars/strings
-            // (boxed by pointer) all arrive as a single i32.
+            // Record/rich-enum/interface/typed-handle (null pointer = absent),
+            // strings (nullable pointer), and every scalar including `handle`
+            // (boxed by pointer) all arrive as a single i32 pointer.
             _ => params.push("i32"),
         },
+        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     params
 }
@@ -2729,6 +2970,13 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
 /// registered with [`async_cb_wasm_params`] widths. `mk_err` is the domain
 /// factory stored as the context's `mkErr` for throwing callables, so the
 /// completion callback rejects with the typed error.
+///
+/// The unwrap runs inside the completion callback, so it follows the async
+/// borrowing contract: string, byte, and array buffers are producer-owned and
+/// valid only for the callback's duration, so they are deep-copied out of
+/// wasm memory and never freed here. Owned-object results (records, rich
+/// enums, interfaces) are the exception: the callback receives ownership and
+/// the pointer is adopted by its wrapper class.
 fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_err: Option<&str>) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let base = match mk_err {
@@ -2736,6 +2984,19 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
         None => "resolve, reject".to_string(),
     };
     let plain = format!("_asyncContexts.set(ctxId, {{ {base} }});");
+    // Optional aggregates share the plain aggregate decoding: the readers
+    // decode a null base to an empty aggregate.
+    let ret = match ret {
+        Some(TypeRef::Optional(inner))
+            if matches!(
+                inner.as_ref(),
+                TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _)
+            ) =>
+        {
+            Some(inner.as_ref())
+        }
+        other => other,
+    };
     let Some(ret) = ret else {
         w.line(plain);
         out.push_str(&w.finish());
@@ -2761,9 +3022,10 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
             w.line(plain);
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("{open}(w, p) => _takeCStr(w, p) }});"));
+            // Borrowed: copy out of wasm memory, never free.
+            w.line(format!("{open}(w, p) => _readCStr(w, p) }});"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let cls = local_type_name(name);
             w.line(format!("{open}(w, h) => new {cls}(w, h) }});"));
         }
@@ -2772,7 +3034,7 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
             w.line(format!("{open}(w, h) => {cls}._wrap(h) }});"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                 let cls = local_type_name(name);
                 w.line(format!(
                     "{open}(w, h) => h === 0 ? null : new {cls}(w, h) }});"
@@ -2785,15 +3047,20 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
                 ));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("{open}(w, p) => _takeCStr(w, p) }});"));
+                w.line(format!("{open}(w, p) => _readCStr(w, p) }});"));
             }
-            _ => {
-                w.line(plain);
+            scalar => {
+                // Boxed optional scalar: the box is borrowed, so dereference
+                // without freeing.
+                let read = wasm_read_scalar_elem(scalar, "new DataView(w.memory.buffer)", "p", "0")
+                    .replace(&format!("p + 0 * {}", wasm_stride(scalar)), "p");
+                w.line(format!("{open}(w, p) => p === 0 ? null : {read} }});"));
             }
         },
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            // Borrowed: slice() deep-copies out of wasm memory, never free.
             w.line(format!(
-                "{open}(w, ptr, len) => _takeBytes(w, ptr, len) }});"
+                "{open}(w, ptr, len) => ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice() }});"
             ));
         }
         TypeRef::List(inner) => {
@@ -2801,7 +3068,15 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
                 w.line("const wasm = w;");
                 let ind = w.indent_str();
                 let mut tmp = String::new();
-                emit_read_list_into(&mut tmp, &ind, inner, "base", "len", "_out");
+                emit_read_list_into(
+                    &mut tmp,
+                    &ind,
+                    inner,
+                    "base",
+                    "len",
+                    "_out",
+                    ElemOwnership::Borrowed,
+                );
                 w.raw(tmp);
                 w.line("return _out;");
             });
@@ -2811,7 +3086,17 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
                 w.line("const wasm = w;");
                 let ind = w.indent_str();
                 let mut tmp = String::new();
-                emit_read_map_into(&mut tmp, &ind, k, v, "ka", "va", "len", "_out");
+                emit_read_map_into(
+                    &mut tmp,
+                    &ind,
+                    k,
+                    v,
+                    "ka",
+                    "va",
+                    "len",
+                    "_out",
+                    ElemOwnership::Borrowed,
+                );
                 w.raw(tmp);
                 w.line("return _out;");
             });
@@ -2819,6 +3104,7 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
         TypeRef::Iterator(_) => {
             w.line(plain);
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -3009,8 +3295,9 @@ fn emit_interface_class(
     out.push_str(&w.finish());
 }
 
-/// Emit the module-level `class` for a struct: constructor, field getters, and
-/// a static `create(...)` factory.
+/// Emit the module-level `class` for a struct: constructor, field getters, a
+/// static `create(...)` factory, and `free()` releasing the producer-owned
+/// handle exactly once (the consumer owns every struct handle it receives).
 fn emit_struct_class(out: &mut String, s: &StructBinding) {
     let cls = &s.name;
     let mut w = CodeWriter::two_space();
@@ -3027,6 +3314,13 @@ fn emit_struct_class(out: &mut String, s: &StructBinding) {
         let mut tmp = String::new();
         emit_struct_create(&mut tmp, s);
         w.raw(tmp);
+        // Explicit cleanup: release the producer-owned handle exactly once.
+        w.block("free() {", "}", |w| {
+            w.block("if (this._handle !== 0) {", "}", |w| {
+                w.line(format!("this._wasm.{}(this._handle);", s.destroy_symbol));
+                w.line("this._handle = 0;");
+            });
+        });
     });
     w.blank();
     out.push_str(&w.finish());
@@ -3042,7 +3336,7 @@ fn emit_struct_class(out: &mut String, s: &StructBinding) {
 /// (`circleRadius`), and an explicit `free()` releasing the handle once. The
 /// constructor signature and `_handle` field match the struct wrapper, so the
 /// existing function-wrapper marshalling (`x._handle` in, `new Shape(wasm, r)`
-/// out; a rich enum lowers to `TypeRef::Struct`) works unchanged.
+/// out; a rich enum crosses the ABI exactly like a record) works unchanged.
 fn emit_rich_enum_class(out: &mut String, e: &EnumBinding) {
     let Some(rich) = e.rich.as_ref() else {
         return;
@@ -3140,7 +3434,7 @@ fn emit_rich_enum_factory(out: &mut String, enum_name: &str, v: &RichVariantBind
                 &mut cleanup,
             );
         }
-        let ret = TypeRef::Struct(enum_name.to_string());
+        let ret = TypeRef::RichEnum(enum_name.to_string());
         emit_return_decode(
             &mut inner,
             &ind,
@@ -3200,7 +3494,7 @@ fn emit_struct_create(out: &mut String, s: &StructBinding) {
                     &mut cleanup,
                 );
             }
-            let ret = TypeRef::Struct(s.name.clone());
+            let ret = TypeRef::Record(s.name.clone());
             emit_return_decode(
                 &mut inner,
                 &ind,
@@ -3217,6 +3511,9 @@ fn emit_struct_create(out: &mut String, s: &StructBinding) {
 }
 
 /// Emit the fluent `class XBuilder` for a struct that opted into a builder.
+/// The builder is single-use: `build()` releases the builder handle via its
+/// destroy symbol (whether or not the build succeeds), so abandoning a
+/// builder before `build()` leaks the handle unless `free()` is called.
 fn emit_builder_class(out: &mut String, s: &StructBinding) {
     let Some(b) = &s.builder else {
         return;
@@ -3255,18 +3552,32 @@ fn emit_builder_class(out: &mut String, s: &StructBinding) {
         w.block("build() {", "}", |w| {
             w.line("const wasm = this._wasm;");
             let ind = w.indent_str();
-            let ret = TypeRef::Struct(cls.clone());
+            let ret = TypeRef::Record(cls.clone());
             let mut tmp = String::new();
+            // The builder handle is released right after the build call (the
+            // destroy symbol is valid whether or not the build succeeded), so
+            // a failed build cannot leak the builder.
             emit_return_decode(
                 &mut tmp,
                 &ind,
                 Some(&ret),
                 &b.build_symbol,
                 &["this._b".to_string()],
-                &[],
+                &[
+                    format!("wasm.{}(this._b);", b.destroy_symbol),
+                    "this._b = 0;".to_string(),
+                ],
                 Some("_checkErr"),
             );
             w.raw(tmp);
+        });
+        // Explicit cleanup for an abandoned builder: release the handle
+        // exactly once (a completed build() has already released it).
+        w.block("free() {", "}", |w| {
+            w.block("if (this._b !== 0) {", "}", |w| {
+                w.line(format!("this._wasm.{}(this._b);", b.destroy_symbol));
+                w.line("this._b = 0;");
+            });
         });
     });
     w.blank();
@@ -3557,7 +3868,16 @@ mod tests {
         let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Optionals"));
         assert!(readme.contains("`0` / `null`"));
-        assert!(readme.contains("_is_present"));
+        assert!(readme.contains("boxed by pointer"));
+    }
+
+    #[test]
+    fn readme_documents_lazy_iterators() {
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        assert!(readme.contains("### Iterators"));
+        assert!(readme.contains("lazy JS iterator"));
+        assert!(readme.contains("`return()`"));
+        assert!(readme.contains("destroyed"));
     }
 
     #[test]
@@ -3703,7 +4023,8 @@ mod tests {
         assert_eq!(wasm_type(&TypeRef::StringUtf8), "i32, i32");
         assert_eq!(wasm_type(&TypeRef::Bytes), "i32, i32");
         assert_eq!(wasm_type(&TypeRef::Handle), "i64");
-        assert_eq!(wasm_type(&TypeRef::Struct("Foo".into())), "i64");
+        assert_eq!(wasm_type(&TypeRef::Record("Foo".into())), "i64");
+        assert_eq!(wasm_type(&TypeRef::RichEnum("Shape".into())), "i64");
         assert_eq!(wasm_type(&TypeRef::Enum("Bar".into())), "i32");
         assert_eq!(
             wasm_type(&TypeRef::List(Box::new(TypeRef::I32))),
@@ -3717,13 +4038,11 @@ mod tests {
             "i64"
         );
         assert_eq!(
-            wasm_type(&TypeRef::Optional(Box::new(TypeRef::Struct("Foo".into())))),
+            wasm_type(&TypeRef::Optional(Box::new(TypeRef::Record("Foo".into())))),
             "i64"
         );
-        assert_eq!(
-            wasm_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
-            "i32, i32"
-        );
+        // Optional scalars are boxed by pointer: one i32 slot.
+        assert_eq!(wasm_type(&TypeRef::Optional(Box::new(TypeRef::I32))), "i32");
     }
 
     #[test]
@@ -3736,7 +4055,11 @@ mod tests {
             "ptr + len in linear memory"
         );
         assert_eq!(
-            wasm_type_note(&TypeRef::Struct("X".into())),
+            wasm_type_note(&TypeRef::Record("X".into())),
+            "opaque handle in linear memory"
+        );
+        assert_eq!(
+            wasm_type_note(&TypeRef::RichEnum("X".into())),
             "opaque handle in linear memory"
         );
         assert_eq!(
@@ -3744,12 +4067,12 @@ mod tests {
             "variant discriminant"
         );
         assert_eq!(
-            wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::Struct("S".into())))),
+            wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::Record("S".into())))),
             "opaque handle, 0 = absent"
         );
         assert_eq!(
             wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::I32))),
-            "is_present flag + value"
+            "boxed scalar pointer, 0 = absent"
         );
     }
 
@@ -3757,7 +4080,8 @@ mod tests {
     fn type_display_round_trips() {
         assert_eq!(type_display(&TypeRef::I32), "i32");
         assert_eq!(type_display(&TypeRef::StringUtf8), "string");
-        assert_eq!(type_display(&TypeRef::Struct("Foo".into())), "Foo");
+        assert_eq!(type_display(&TypeRef::Record("Foo".into())), "Foo");
+        assert_eq!(type_display(&TypeRef::RichEnum("Shape".into())), "Shape");
         assert_eq!(
             type_display(&TypeRef::Optional(Box::new(TypeRef::I32))),
             "i32?"
@@ -3787,7 +4111,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -4158,7 +4482,7 @@ mod tests {
                 params: vec![Param {
                     name: "data".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ))))),
                     mutable: false,
                     doc: None,
@@ -4256,7 +4580,7 @@ mod tests {
                     name: "contacts".into(),
                     ty: TypeRef::Map(
                         Box::new(TypeRef::Enum("Color".into())),
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ),
                     mutable: false,
                     doc: None,
@@ -4335,7 +4659,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4405,7 +4729,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -4874,7 +5198,7 @@ mod tests {
     /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
     /// f64 payload, two f32 payloads, and a string + u8 payload, plus a plain
     /// sibling enum and free functions taking/returning the rich enum (already
-    /// lowered to `TypeRef::Struct`) so the handle marshalling is exercised too.
+    /// resolved to `TypeRef::RichEnum`) so the handle marshalling is exercised too.
     fn rich_enum_api() -> Api {
         fn field(name: &str, ty: TypeRef) -> StructField {
             StructField {
@@ -4891,7 +5215,7 @@ mod tests {
                     name: "describe".into(),
                     params: vec![Param {
                         name: "shape".into(),
-                        ty: TypeRef::Struct("Shape".into()),
+                        ty: TypeRef::RichEnum("Shape".into()),
                         mutable: false,
                         doc: None,
                     }],
@@ -4908,7 +5232,7 @@ mod tests {
                     params: vec![
                         Param {
                             name: "shape".into(),
-                            ty: TypeRef::Struct("Shape".into()),
+                            ty: TypeRef::RichEnum("Shape".into()),
                             mutable: false,
                             doc: None,
                         },
@@ -4919,7 +5243,7 @@ mod tests {
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Struct("Shape".into())),
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -5147,7 +5471,7 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        // A rich enum lowers to TypeRef::Struct, so functions pass the handle in
+        // A rich enum crosses the ABI as an opaque handle, so functions pass it in
         // and wrap the returned handle out, identical to a struct.
         assert!(
             js.contains("wasm.weaveffi_shapes_describe(shape._handle, _err)"),
@@ -5607,12 +5931,85 @@ mod tests {
     }
 
     #[test]
-    fn interface_iterator_member_drains_with_self() {
+    fn interface_iterator_member_returns_lazy_iterator_with_self() {
         let js = kv_js();
         assert!(js.contains("listKeys() {"), "{js}");
+        // The launch call threads the instance handle and the throws-aware
+        // error slot.
         assert!(
             js.contains("const _it = wasm.weaveffi_kv_Store_list_keys(this._handle, _err);"),
             "{js}"
+        );
+        // The wrapper hands the handle to the lazy iterator instead of
+        // draining it into an array.
+        assert!(
+            js.contains("return new _WeaveFFIIterator(wasm, _it, 4,"),
+            "{js}"
+        );
+        assert!(
+            js.contains(
+                "(it, slot, ep) => wasm.weaveffi_kv_Store_ListKeysIterator_next(it, slot, ep),"
+            ),
+            "{js}"
+        );
+        assert!(
+            js.contains("(it) => wasm.weaveffi_kv_Store_ListKeysIterator_destroy(it),"),
+            "{js}"
+        );
+        // No eager while-drain remains anywhere in the glue.
+        assert!(!js.contains("while (wasm."), "{js}");
+    }
+
+    #[test]
+    fn lazy_iterator_class_implements_protocol_and_destroys_once() {
+        let js = kv_js();
+        assert!(js.contains("class _WeaveFFIIterator {"), "{js}");
+        // Iterator protocol: next(), return() for early exit, and
+        // [Symbol.iterator]() making it iterable.
+        assert!(js.contains("  next() {"), "{js}");
+        assert!(js.contains("  return(value) {"), "{js}");
+        assert!(js.contains("  [Symbol.iterator]() {"), "{js}");
+        // One producer next call per consumer step.
+        assert!(
+            js.contains("_has = this._callNext(this._handle, this._slot, _err);"),
+            "{js}"
+        );
+        // Destroy exactly once: _close() nulls the handle, and every path
+        // (exhaustion, next error, early return) funnels through it.
+        assert!(js.contains("if (this._handle === 0) return;"), "{js}");
+        assert!(js.contains("this._destroyFn(this._handle);"), "{js}");
+        assert_eq!(js.matches("this._close();").count(), 3, "{js}");
+        // Abandonment leak is documented at the class site.
+        assert!(js.contains("leaks the"), "{js}");
+    }
+
+    #[test]
+    fn lazy_iterator_frees_string_elements_per_plan() {
+        let js = kv_js();
+        // Each yielded string element is copied out of wasm memory and then
+        // freed with the runtime's free_string (via _takeCStr).
+        assert!(
+            js.contains(
+                "(w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true)));"
+            ),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn lazy_iterator_next_errors_follow_error_strategy() {
+        let js = kv_js();
+        // list_keys does not throw, so both launch and next route through the
+        // generic trap checker.
+        let list_keys = js
+            .split("listKeys() {")
+            .nth(1)
+            .and_then(|s| s.split("\n  }").next())
+            .expect("listKeys body");
+        assert!(list_keys.contains("_checkErr(wasm, _err);"), "{list_keys}");
+        assert!(
+            list_keys.contains("_checkErr, (w, p) =>"),
+            "next checker must match the function's error strategy: {list_keys}"
         );
     }
 
@@ -5733,7 +6130,14 @@ mod tests {
             dts.contains("put(key: string, ttlSeconds: bigint): void;"),
             "{dts}"
         );
-        assert!(dts.contains("listKeys(): string[];"), "{dts}");
+        assert!(
+            dts.contains("listKeys(): IterableIterator<string>;"),
+            "{dts}"
+        );
+        assert!(
+            dts.contains("@returns A lazy iterator"),
+            "iterator members should document the streaming contract: {dts}"
+        );
         assert!(dts.contains("compact(): Promise<void>;"), "{dts}");
         assert!(dts.contains("static defaultCapacity(): bigint;"), "{dts}");
         assert!(dts.contains("free(): void;"), "{dts}");
@@ -5781,5 +6185,241 @@ mod tests {
             "{js}"
         );
         assert!(!js.contains("weaveffi_kv_Store_compact_async"), "{js}");
+        // Iterator surface symbols are bound so the lazy wrapper can call them.
+        assert!(
+            js.contains(
+                "weaveffi_kv_Store_ListKeysIterator_next: m['_weaveffi_kv_Store_ListKeysIterator_next'],"
+            ),
+            "{js}"
+        );
+    }
+
+    // --- Ownership audit: return-marshalling release calls ---
+
+    /// A one-module API with a single free function of the given return type.
+    fn returning_api(ret: TypeRef, is_async: bool) -> Api {
+        make_api(vec![Module {
+            name: "m".into(),
+            functions: vec![member("get_it", vec![], Some(ret), false, is_async)],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }])
+    }
+
+    fn js_for_api(api: &Api) -> String {
+        js_stub_for(
+            api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+            false,
+        )
+    }
+
+    #[test]
+    fn list_return_frees_elements_and_container() {
+        let js = js_for_api(&returning_api(
+            TypeRef::List(Box::new(TypeRef::StringUtf8)),
+            false,
+        ));
+        // Each string element is freed by _takeStrArray; the array buffer
+        // itself is then released with free_bytes.
+        assert!(js.contains("_takeStrArray(wasm, _r, _len);"), "{js}");
+        assert!(
+            js.contains("if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);"),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn map_return_frees_both_parallel_arrays() {
+        let js = js_for_api(&returning_api(
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            false,
+        ));
+        assert!(
+            js.contains("if (_ka !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_ka, _len * 4);"),
+            "{js}"
+        );
+        assert!(
+            js.contains("if (_va !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_va, _len * 4);"),
+            "{js}"
+        );
+    }
+
+    #[test]
+    fn optional_scalar_return_frees_the_box() {
+        let js = js_for_api(&returning_api(
+            TypeRef::Optional(Box::new(TypeRef::I32)),
+            false,
+        ));
+        assert!(js.contains("if (_r === 0) return null;"), "{js}");
+        assert!(js.contains("wasm.weaveffi_free_bytes(_r, 4);"), "{js}");
+    }
+
+    #[test]
+    fn struct_wrapper_releases_handle_via_free() {
+        let js = js_stub_for(
+            &sample_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+            false,
+        );
+        assert!(
+            js.contains("this._wasm.weaveffi_math_Point_destroy(this._handle);"),
+            "struct free() must call the destroy symbol: {js}"
+        );
+        let dts = dts_for(
+            &sample_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+            false,
+        );
+        assert!(
+            dts.contains("free(): void;"),
+            "struct interface must declare free(): {dts}"
+        );
+    }
+
+    #[test]
+    fn builder_build_releases_builder_handle() {
+        let api = make_api(vec![Module {
+            name: "geo".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "x".into(),
+                    ty: TypeRef::F64,
+                    doc: None,
+                    default: None,
+                }],
+                builder: true,
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }]);
+        let js = js_for_api(&api);
+        // build() destroys the single-use builder handle before the error
+        // check, so a failed build cannot leak it.
+        assert!(
+            js.contains("wasm.weaveffi_geo_Point_Builder_destroy(this._b);"),
+            "{js}"
+        );
+        assert!(js.contains("this._b = 0;"), "{js}");
+        // An abandoned builder can still be released explicitly.
+        assert!(
+            js.contains("this._wasm.weaveffi_geo_Point_Builder_destroy(this._b);"),
+            "{js}"
+        );
+    }
+
+    // --- Async completion contract: borrowed buffers are copied, not freed ---
+
+    #[test]
+    fn async_string_result_is_copied_not_freed() {
+        let js = js_for_api(&returning_api(TypeRef::StringUtf8, true));
+        assert!(
+            js.contains("unwrap: (w, p) => _readCStr(w, p) });"),
+            "async string results are borrowed and must not be freed: {js}"
+        );
+        assert!(
+            !js.contains("unwrap: (w, p) => _takeCStr"),
+            "async unwrap must not free the producer's string: {js}"
+        );
+    }
+
+    #[test]
+    fn async_bytes_result_is_copied_not_freed() {
+        let js = js_for_api(&returning_api(TypeRef::Bytes, true));
+        assert!(
+            js.contains("new Uint8Array(w.memory.buffer, ptr, len).slice() });"),
+            "async bytes results must be deep-copied: {js}"
+        );
+        assert!(
+            !js.contains("unwrap: (w, ptr, len) => _takeBytes"),
+            "async unwrap must not free the producer's buffer: {js}"
+        );
+    }
+
+    #[test]
+    fn async_string_list_result_reads_borrowed_elements() {
+        let js = js_for_api(&returning_api(
+            TypeRef::List(Box::new(TypeRef::StringUtf8)),
+            true,
+        ));
+        assert!(
+            js.contains("function _readStrArray(wasm, base, len) {"),
+            "{js}"
+        );
+        assert!(js.contains("_readStrArray(wasm, base, len);"), "{js}");
+        // The borrowed array buffer is never freed by the callback.
+        assert!(!js.contains("wasm.weaveffi_free_bytes(base"), "{js}");
+    }
+
+    #[test]
+    fn async_optional_scalar_result_unboxes_without_freeing() {
+        let js = js_for_api(&returning_api(
+            TypeRef::Optional(Box::new(TypeRef::I32)),
+            true,
+        ));
+        assert!(
+            js.contains(
+                "unwrap: (w, p) => p === 0 ? null : new DataView(w.memory.buffer).getInt32(p, true) });"
+            ),
+            "async optional scalars arrive as a borrowed box: {js}"
+        );
+    }
+
+    #[test]
+    fn async_record_result_is_adopted() {
+        let api = make_api(vec![Module {
+            name: "m".into(),
+            functions: vec![member(
+                "get_it",
+                vec![],
+                Some(TypeRef::Record("Contact".into())),
+                false,
+                true,
+            )],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I32,
+                    doc: None,
+                    default: None,
+                }],
+                builder: false,
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }]);
+        let js = js_for_api(&api);
+        // An owned-object result transfers ownership: the callback adopts the
+        // pointer into a wrapper whose free() calls the destroy symbol.
+        assert!(
+            js.contains("unwrap: (w, h) => new Contact(w, h) });"),
+            "{js}"
+        );
     }
 }

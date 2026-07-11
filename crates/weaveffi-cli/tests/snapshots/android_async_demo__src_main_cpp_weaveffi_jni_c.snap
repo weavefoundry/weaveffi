@@ -29,7 +29,37 @@ typedef struct {
     jobject callback;
 } weaveffi_jni_async_ctx;
 
-static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, void* result) {
+static jclass weaveffi_jni_entry_class = NULL;
+static jmethodID weaveffi_jni_dispatch_exc = NULL;
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    (void)reserved;
+    JNIEnv* env = NULL;
+    if ((*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6) != JNI_OK) { return JNI_ERR; }
+    jclass cls = (*env)->FindClass(env, "com/weaveffi/WeaveFFI");
+    if (cls == NULL) { (*env)->ExceptionClear(env); return JNI_VERSION_1_6; }
+    weaveffi_jni_entry_class = (jclass)(*env)->NewGlobalRef(env, cls);
+    weaveffi_jni_dispatch_exc = (*env)->GetStaticMethodID(env, weaveffi_jni_entry_class, "dispatchCallbackException", "(Ljava/lang/Throwable;)V");
+    if (weaveffi_jni_dispatch_exc == NULL) { (*env)->ExceptionClear(env); }
+    return JNI_VERSION_1_6;
+}
+
+static void weaveffi_jni_handle_uncaught(JNIEnv* env) {
+    if (!(*env)->ExceptionCheck(env)) { return; }
+    jthrowable ex = (*env)->ExceptionOccurred(env);
+    (*env)->ExceptionClear(env);
+    if (weaveffi_jni_entry_class != NULL && weaveffi_jni_dispatch_exc != NULL) {
+        (*env)->CallStaticVoidMethod(env, weaveffi_jni_entry_class, weaveffi_jni_dispatch_exc, ex);
+        if (!(*env)->ExceptionCheck(env)) { (*env)->DeleteLocalRef(env, ex); return; }
+        (*env)->ExceptionClear(env);
+    }
+    (*env)->Throw(env, ex);
+    (*env)->ExceptionDescribe(env);
+    (*env)->ExceptionClear(env);
+    (*env)->DeleteLocalRef(env, ex);
+}
+
+static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
     JNIEnv* env = NULL;
     int attached = 0;
@@ -51,7 +81,7 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, v
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
-    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    weaveffi_jni_handle_uncaught(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
     JavaVM* jvm = ctx->jvm;
     free(ctx);
@@ -67,7 +97,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_runTaskAsync(JNIEnv* env, jcla
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
 }
 
-static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, void* result) {
+static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
     JNIEnv* env = NULL;
     int attached = 0;
@@ -82,12 +112,16 @@ static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, 
         jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);
     } else {
-        jobject boxed = (jobject)(intptr_t)result;
+        jlongArray boxed = (*env)->NewLongArray(env, (jsize)result_len);
+        for (jsize _li = 0; boxed && result && _li < (jsize)result_len; _li++) {
+            jlong _lv = (jlong)(intptr_t)result[_li];
+            (*env)->SetLongArrayRegion(env, boxed, _li, 1, &_lv);
+        }
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
-    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    weaveffi_jni_handle_uncaught(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
     JavaVM* jvm = ctx->jvm;
     free(ctx);
@@ -145,7 +179,7 @@ static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
     }
-    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    weaveffi_jni_handle_uncaught(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
     JavaVM* jvm = ctx->jvm;
     free(ctx);
@@ -173,11 +207,11 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_TaskResult_nativeCreate(JNIEnv* env, j
     weaveffi_error err = {0, NULL};
     const char* value_chars = (*env)->GetStringUTFChars(env, value, NULL);
     weaveffi_tasks_TaskResult* rv = weaveffi_tasks_TaskResult_create((int64_t)id, value_chars, (bool)(success == JNI_TRUE), &err);
+    (*env)->ReleaseStringUTFChars(env, value, value_chars);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return 0;
     }
-    (*env)->ReleaseStringUTFChars(env, value, value_chars);
     return (jlong)(intptr_t)rv;
 }
 

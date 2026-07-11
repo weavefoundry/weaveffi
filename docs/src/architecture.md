@@ -17,7 +17,8 @@ Input: annotated Rust (.rs) or an IDL (YAML/JSON/TOML)
 Parse        ── weaveffi-ir::parse (IDL) | weaveffi-bridge (.rs): builds an `Api` IR
    │
    ▼
-Validate     ── weaveffi-core::validate: rejects errors, collects warnings
+Validate     ── weaveffi-core::validate: rejects errors, collects warnings,
+   │            and rewrites every parsed type reference to its resolved kind
    │
    ▼
 Resolve      ── weaveffi-cli `CliConfig`: merges --config TOML and the
@@ -78,9 +79,9 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. |
 | `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens, the `lift_*`/`lower_*` marshalling converters the macro calls, and the `export_runtime!` macro. |
 | `weaveffi-bridge`    | The single Rust-to-IR extractor: maps `#[weaveffi::module]`-annotated source (`syn` AST) to an `Api`. Shared by the proc-macro and the CLI's `extract`/`generate <file.rs>`. |
-| `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro family. Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). |
+| `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro family. Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). Emission is decomposed into nine focused submodules under `src/codegen/` (sync calls, async launchers, iterators, records, enums, interfaces, callbacks, marshalling, and shared helpers), each stating which clause of the `weaveffi_core::plan` contracts it implements. |
 | `weaveffi`           | The producer facade a Rust cdylib depends on: re-exports the `weaveffi-macros` attributes, `export_runtime!`, and `weaveffi-abi` as `weaveffi::abi`. |
-| `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
+| `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata).                    |
 | `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry in `config.rs`), and dispatches the `Orchestrator`. Subcommands live under `commands/` (`generate`, `validate`, `diff`, `format`, `package`, `new`, `watch`); `doctor.rs`, `extract.rs`, and `scaffold.rs` sit beside `main.rs`; `config.rs` holds the target registry and config resolution; `report.rs` formats CLI output. |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
@@ -161,9 +162,24 @@ that matter most:
   object type; every interface also receives an implicit destroy symbol.
 - `TypeRef` enumerates every supported type reference: primitives
   (`I32`, `U32`, `I64`, `F64`, `Bool`, `StringUtf8`, `Bytes`, `Handle`,
-  `BorrowedStr`, `BorrowedBytes`), user types (`Struct(String)`,
-  `Enum(String)`, `Interface(String)`, `TypedHandle(String)`), and the
-  four composite shapes (`Optional`, `List`, `Map`, `Iterator`).
+  `BorrowedStr`, `BorrowedBytes`), user types (`Named(String)`,
+  `Record(String)`, `RichEnum(String)`, `Enum(String)`,
+  `Interface(String)`, `TypedHandle(String)`), and the four composite
+  shapes (`Optional`, `List`, `Map`, `Iterator`).
+
+User-type references are two-phase. The parser cannot know whether a
+bare identifier names a record, an enum, or an interface, so every
+user-type reference starts life as `TypeRef::Named`. The resolution
+pass (`weaveffi_core::validate::resolve_type_refs`, run by
+`validate_api` after the rule checks pass) rewrites each occurrence
+into `Record` (a struct), `RichEnum` (an algebraic enum), `Enum` (a
+C-style enum), or `Interface`, and qualifies cross-module references
+with the owning module's dot-joined path. Generators run strictly
+post-resolution: no `Named` reference remains, and a generator may
+treat one as a bug (the core ABI lowering panics on it). `Record` and
+`RichEnum` share the opaque-object-pointer ABI
+(`TypeRef::is_object_ref()` returns true for both), while `Enum`
+lowers by value as an integer.
 
 Every IR type derives `Debug`, `Clone`, `PartialEq`, `Serialize`, and
 `Deserialize`. `Eq` is derived where possible; a few types (`Api`,
@@ -212,7 +228,9 @@ Errors enforced today:
   interfaces at least one member.
 - Enum discriminant uniqueness within an enum.
 - Type references resolve by bare name across the whole API and are
-  qualified to their owning module during resolution (see
+  qualified to their owning module during resolution, which also
+  rewrites each parsed `TypeRef::Named` reference into its resolved
+  kind (see [The IR](#the-ir) and
   [Cross-module references](reference/idl.md#cross-module-type-references)).
 - Interface members (constructors, methods, statics) share one namespace
   per interface; constructors declare no return and cannot be async;
@@ -387,6 +405,8 @@ managed by the `CodeWriter` toolkit (see below) rather than by hand-rolled
 - `codegen::common`: module-tree traversal (`walk_modules`,
   `walk_modules_with_path`), the `is_c_pointer_type` ABI classifier,
   doc-comment emission (`emit_doc`), and `pascal_case` naming.
+- `plan`: the marshalling plan, the language-neutral calling contracts
+  every backend renders (see [The marshalling plan](#the-marshalling-plan)).
 
 ### The `CodeWriter` emission toolkit
 
@@ -512,6 +532,48 @@ not consume the C lowering.
 When you add a parameter shape or change how a type crosses the
 boundary, change `weaveffi_core::abi` and let the consumers inherit it;
 the snapshot suite will show every generator the edit touches.
+
+## The marshalling plan
+
+The ABI lowering model answers *which symbols exist and what their C
+signatures are*. `weaveffi_core::plan` is a distinct layer one level
+up, sitting between that lowering and the syntax backends: a
+language-neutral statement of the calling contracts every backend
+renders, the questions the eleven generators used to answer
+independently (and inconsistently):
+
+- **Errors.** `ErrorStrategy` (`Throws` | `Trap`): when a call reports
+  through `out_err`, is the non-zero code a typed domain error the
+  caller can catch (`throws: true`), or a producer bug the wrapper must
+  trap on? `FnBinding::error_strategy()` answers it once. See the
+  [Error Handling guide](guides/errors.md#throws-versus-trap).
+- **Ownership.** `ReturnFree` and `ElemFree` (via the `return_free` and
+  `elem_free` functions): after copying a returned value, or one
+  array/map/iterator element, into a native one, exactly which runtime
+  release call does the wrapper owe (`{prefix}_free_string`,
+  `{prefix}_free_bytes`, a type's `_destroy` symbol), if any?
+- **Iterators.** `IteratorProtocol` (`IteratorBinding::protocol`): the
+  `iter<T>` pull contract, including the requirement that wrappers stay
+  lazy (one producer `next` call per consumer step, never a hidden
+  drain into a list), the per-element release plan, and the
+  destroy-exactly-once handle lifecycle.
+- **Async.** `AsyncProtocol` (`AsyncBinding::protocol`): the
+  completion-callback contract: the callback fires exactly once from an
+  arbitrary producer thread, borrowed result buffers are valid only for
+  the callback's duration, and owned-object results are adopted by the
+  consumer.
+
+Generators are thin syntax backends over this shared plan: a backend
+that renders these plans in its own syntax cannot drift from the others
+on semantics; only the spelling differs. The producer side consumes the
+same contracts: each `weaveffi-macros` codegen submodule states which
+plan clause it implements (the generated `_async` launchers free
+borrowed result buffers after the callback returns, iterator thunks
+yield one element per `_next`, and error dispatch follows
+`ErrorStrategy`), so the emitted glue and every consumer wrapper agree
+by construction. When a generator needs a free/destroy or throws/trap
+decision, it should consume the plan rather than re-derive the fact
+with a local match.
 
 ## Determinism
 

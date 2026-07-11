@@ -325,7 +325,7 @@ modules:
             s.fields[3].ty,
             TypeRef::Optional(Box::new(TypeRef::StringUtf8))
         );
-        assert_eq!(s.fields[4].ty, TypeRef::Struct("ContactType".to_string()));
+        assert_eq!(s.fields[4].ty, TypeRef::Named("ContactType".to_string()));
 
         // The 0.5.0 surface replaces the handle-based free functions with the
         // ContactBook interface and a typed error domain.
@@ -359,8 +359,8 @@ modules:
             add.params[2].ty,
             TypeRef::Optional(Box::new(TypeRef::StringUtf8))
         );
-        assert_eq!(add.params[3].ty, TypeRef::Struct("ContactType".to_string()));
-        assert_eq!(add.returns, Some(TypeRef::Struct("Contact".to_string())));
+        assert_eq!(add.params[3].ty, TypeRef::Named("ContactType".to_string()));
+        assert_eq!(add.returns, Some(TypeRef::Named("Contact".to_string())));
         assert!(add.throws);
         let get = &book.methods[1];
         assert_eq!(get.name, "get");
@@ -370,7 +370,7 @@ modules:
         assert_eq!(list.name, "list");
         assert_eq!(
             list.returns,
-            Some(TypeRef::List(Box::new(TypeRef::Struct(
+            Some(TypeRef::List(Box::new(TypeRef::Named(
                 "Contact".to_string()
             ))))
         );
@@ -565,7 +565,7 @@ modules:
         let api = parse_api_str(yaml, "yaml").unwrap();
         let param = &api.modules[0].functions[0].params[0];
         assert_eq!(param.name, "contact");
-        assert_eq!(param.ty, TypeRef::Struct("Contact".to_string()));
+        assert_eq!(param.ty, TypeRef::Named("Contact".to_string()));
     }
 
     #[test]
@@ -586,7 +586,7 @@ modules:
         let params = &api.modules[0].functions[0].params;
         assert_eq!(
             params[0].ty,
-            TypeRef::List(Box::new(TypeRef::Optional(Box::new(TypeRef::Struct(
+            TypeRef::List(Box::new(TypeRef::Optional(Box::new(TypeRef::Named(
                 "Contact".to_string()
             )))))
         );
@@ -704,16 +704,16 @@ modules:
         assert_eq!(m.structs[1].name, "Rect");
         assert_eq!(
             m.structs[1].fields[0].ty,
-            TypeRef::Struct("Point".to_string())
+            TypeRef::Named("Point".to_string())
         );
 
-        assert_eq!(m.functions[0].params[0].ty, TypeRef::Struct("Point".into()));
+        assert_eq!(m.functions[0].params[0].ty, TypeRef::Named("Point".into()));
         assert_eq!(m.functions[0].returns, Some(TypeRef::F64));
         assert_eq!(
             m.functions[1].params[0].ty,
-            TypeRef::List(Box::new(TypeRef::Struct("Point".into())))
+            TypeRef::List(Box::new(TypeRef::Named("Point".into())))
         );
-        assert_eq!(m.functions[1].returns, Some(TypeRef::Struct("Rect".into())));
+        assert_eq!(m.functions[1].returns, Some(TypeRef::Named("Rect".into())));
     }
 
     #[test]
@@ -751,7 +751,7 @@ modules:
         assert_eq!(e.variants[2].doc, None);
         assert_eq!(
             m.functions[0].params[0].ty,
-            TypeRef::Struct("ContactType".into())
+            TypeRef::Named("ContactType".into())
         );
     }
 
@@ -788,7 +788,7 @@ modules:
         );
         assert_eq!(
             m.functions[0].returns,
-            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+            Some(TypeRef::Optional(Box::new(TypeRef::Named(
                 "Contact".into()
             ))))
         );
@@ -826,7 +826,7 @@ modules:
         assert_eq!(fns[0].params[0].ty, TypeRef::List(Box::new(TypeRef::I32)));
         assert_eq!(
             fns[1].returns,
-            Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))))
+            Some(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
         );
         assert_eq!(fns[2].params[0].ty, TypeRef::List(Box::new(TypeRef::I64)));
     }
@@ -860,7 +860,7 @@ modules:
         assert_eq!(
             fns[0].returns,
             Some(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
-                TypeRef::Struct("Contact".into())
+                TypeRef::Named("Contact".into())
             )))))
         );
         assert_eq!(
@@ -984,11 +984,11 @@ modules:
         assert_eq!(m.functions[0].returns, Some(TypeRef::Handle));
         assert_eq!(
             m.functions[1].returns,
-            Some(TypeRef::Struct("Contact".into()))
+            Some(TypeRef::Named("Contact".into()))
         );
         assert_eq!(
             m.functions[2].returns,
-            Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into()))))
+            Some(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
         );
         assert_eq!(m.functions[3].returns, Some(TypeRef::Bool));
         assert_eq!(m.functions[4].returns, Some(TypeRef::I32));
@@ -1037,7 +1037,7 @@ modules:
             f.returns,
             Some(TypeRef::Map(
                 Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::Struct("Contact".into()))
+                Box::new(TypeRef::Named("Contact".into()))
             ))
         );
     }
@@ -1078,7 +1078,7 @@ modules:
         assert_eq!(product.fields[3].ty, TypeRef::F64);
         assert_eq!(
             product.fields[4].ty,
-            TypeRef::Struct("Category".to_string())
+            TypeRef::Named("Category".to_string())
         );
         assert_eq!(
             product.fields[5].ty,
@@ -1103,7 +1103,7 @@ modules:
         assert_eq!(add_product.name, "add_product");
         assert_eq!(
             add_product.returns,
-            Some(TypeRef::Struct("Product".to_string()))
+            Some(TypeRef::Named("Product".to_string()))
         );
         assert!(add_product.throws);
         let get_product = &catalog.methods[1];
@@ -1114,7 +1114,7 @@ modules:
         assert_eq!(search.name, "search");
         assert_eq!(
             search.returns,
-            Some(TypeRef::List(Box::new(TypeRef::Struct(
+            Some(TypeRef::List(Box::new(TypeRef::Named(
                 "Product".to_string()
             ))))
         );
@@ -1151,7 +1151,7 @@ modules:
         assert_eq!(order.fields.len(), 4);
         assert_eq!(
             order.fields[1].ty,
-            TypeRef::List(Box::new(TypeRef::Struct("OrderItem".to_string())))
+            TypeRef::List(Box::new(TypeRef::Named("OrderItem".to_string())))
         );
 
         assert_eq!(orders.functions[0].name, "create_order");
@@ -1160,7 +1160,7 @@ modules:
         assert_eq!(orders.functions[1].name, "get_order");
         assert_eq!(
             orders.functions[1].returns,
-            Some(TypeRef::Struct("Order".to_string()))
+            Some(TypeRef::Named("Order".to_string()))
         );
         assert!(orders.functions[1].throws);
         assert_eq!(orders.functions[2].name, "cancel_order");
@@ -1174,7 +1174,7 @@ modules:
         assert_eq!(orders.functions[3].params[1].name, "product");
         assert_eq!(
             orders.functions[3].params[1].ty,
-            TypeRef::Struct("Product".to_string())
+            TypeRef::Named("Product".to_string())
         );
     }
 
@@ -1214,7 +1214,7 @@ modules:
         assert!(run_task.throws);
         assert_eq!(
             run_task.returns,
-            Some(TypeRef::Struct("TaskResult".to_string()))
+            Some(TypeRef::Named("TaskResult".to_string()))
         );
 
         let run_batch = &m.functions[1];
@@ -1222,7 +1222,7 @@ modules:
         assert!(run_batch.r#async);
         assert_eq!(
             run_batch.returns,
-            Some(TypeRef::List(Box::new(TypeRef::Struct(
+            Some(TypeRef::List(Box::new(TypeRef::Named(
                 "TaskResult".to_string()
             ))))
         );
@@ -1289,7 +1289,7 @@ modules:
             f1.returns,
             Some(TypeRef::Map(
                 Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::Struct("Contact".into()))
+                Box::new(TypeRef::Named("Contact".into()))
             ))
         );
 

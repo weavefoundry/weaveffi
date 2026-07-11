@@ -291,6 +291,7 @@ public class Store : IDisposable
 
     public bool Put(string key, byte[] value, EntryKind kind, long? ttlSeconds) { /* throws KvException */ }
     public Entry? Get(string key) { /* throws KvException */ }
+    public IEnumerable<string> ListKeys(string? prefix) { /* lazy; see Memory and ownership */ }
     public long Count() { /* generic check only (no throws) */ }
 
     /// <exception cref="KvException">Thrown when the call reports a KvError code.</exception>
@@ -512,12 +513,21 @@ runs on a non-deterministic schedule.
   string properties do not require any disposal.
 - Strings passed as parameters are marshalled with
   `Marshal.StringToCoTaskMemUTF8` and freed in a `finally` block.
+- Returned `byte[]`, array, and dictionary buffers are copied into
+  managed memory and released with `weaveffi_free_bytes`; string
+  elements are freed individually with `weaveffi_free_string` first.
 - Optional struct returns surface as `IntPtr.Zero` from the C ABI and
-  become `null` in C#.
-- `iter<T>` functions return a lazy `IEnumerable<T>` that pulls items
-  through the C `_next` function as you enumerate; the native iterator
-  handle is destroyed in a `finally` block when enumeration completes
-  or the enumerator is disposed early.
+  become `null` in C#. A boxed optional scalar is dereferenced and its
+  box freed with `weaveffi_free_bytes`.
+- `iter<T>` functions return a lazy, single-use `IEnumerable<T>`
+  (`WeaveFFIOnceEnumerable<T>`) that pulls one item through the C
+  `_next` function per enumeration step; each string element is copied
+  and freed with `weaveffi_free_string`, and the native iterator
+  handle is destroyed in a `finally` block when enumeration completes,
+  a step fails, or the enumerator is disposed early (a `foreach`
+  disposes it automatically, including on early exit). A throwing
+  function checks the launch and each step with the domain checker
+  (`Store.ListKeys` throws `KvException` from the failing step).
 
 ## Async support
 
@@ -567,6 +577,14 @@ public static async Task<TaskResult> RunTask(string name)
   (`KvException.FromCode` on `Store.Compact()`); otherwise a failure
   can only be a producer bug and faults the task with
   `WeaveFFIException`.
+- Result ownership follows the async contract: string, bytes, array,
+  map, and boxed optional scalar results are borrowed for the
+  callback's duration, so the callback deep-copies them into managed
+  values and never frees them (the producer does after the callback
+  returns). Object results (records, rich enums, interfaces, including
+  optional ones) are the exception: the callback receives ownership,
+  and the wrapper adopts the pointer, as `new TaskResult(result)` does
+  above.
 
 Async interface methods follow the same pattern as instance methods:
 `await store.Compact()` returns `Task<long>`.

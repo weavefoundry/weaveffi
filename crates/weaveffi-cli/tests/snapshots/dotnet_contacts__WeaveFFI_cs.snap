@@ -239,8 +239,10 @@ namespace WeaveFFI
             var arr = new Contact[(int)outLen];
             for (int i = 0; i < (int)outLen; i++)
             {
-                arr[i] = new Contact(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                var item = new Contact(Marshal.ReadIntPtr(result, i * IntPtr.Size));
+                arr[i] = item;
             }
+            NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * IntPtr.Size));
             return arr;
         }
 
@@ -323,7 +325,7 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_contacts_ContactBook_list(IntPtr self, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_remove", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_contacts_ContactBook_remove(IntPtr self, long id, ref WeaveFFIError err);
+        internal static extern byte weaveffi_contacts_ContactBook_remove(IntPtr self, long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_contacts_ContactBook_count", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_contacts_ContactBook_count(IntPtr self, ref WeaveFFIError err);

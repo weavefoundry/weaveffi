@@ -2,8 +2,9 @@
 //
 // Exercises the napi_threadsafe_function listener path (register -> the
 // producer fires synchronously on send, the TSFN queues onto the JS thread ->
-// unregister releases the TSFN and stops delivery) and the iterator-drained
-// getMessages, through the generated wrapper layer (index.js): function names
+// unregister releases the TSFN and stops delivery) and the lazy iterable
+// getMessages (one producer next per step, drained here via spread), through
+// the generated wrapper layer (index.js): function names
 // are lowerCamelCase with the module prefix stripped by default. Listener
 // delivery is asynchronous (event-loop tick), so assertions run after a
 // setImmediate boundary. The harness passes the built addon via WV_ADDON; the
@@ -44,9 +45,9 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
     `listener received sends (got ${JSON.stringify(received)})`
   );
 
-  const msgs = wv.getMessages();
+  const msgs = [...wv.getMessages()];
   expect(
-    Array.isArray(msgs) && msgs.length === 2 && msgs[0] === 'alpha' && msgs[1] === 'beta',
+    msgs.length === 2 && msgs[0] === 'alpha' && msgs[1] === 'beta',
     `iterator yields messages in order (got ${JSON.stringify(msgs)})`
   );
 
@@ -55,7 +56,13 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
   wv.sendMessage('gamma');
   await tick();
   expect(received.length === 2, `no delivery after unregister (got ${JSON.stringify(received)})`);
-  expect(wv.getMessages().length === 3, 'producer kept recording');
+  expect([...wv.getMessages()].length === 3, 'producer kept recording');
+
+  // Early return closes the underlying producer handle without draining.
+  const it = wv.getMessages()[Symbol.iterator]();
+  const first = it.next();
+  expect(!first.done && first.value === 'alpha', 'lazy first element');
+  if (typeof it.return === 'function') it.return();
 
   if (failures > 0) process.exit(1);
   console.log('node/events: OK');

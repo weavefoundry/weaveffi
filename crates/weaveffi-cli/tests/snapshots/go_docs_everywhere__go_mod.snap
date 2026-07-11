@@ -7,6 +7,6 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 module weaveffi
 
-go 1.21
+go 1.23
 
 // END go.mod

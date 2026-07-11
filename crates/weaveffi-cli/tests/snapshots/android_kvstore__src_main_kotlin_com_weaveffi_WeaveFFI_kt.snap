@@ -15,7 +15,30 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        /** Subscribe to per-key eviction notifications */
+        @Volatile private var callbackExceptionHandler: ((Throwable) -> Unit)? = null
+
+        /**
+         * Installs a handler for exceptions thrown by listener callbacks and
+         * async continuations on native producer threads. These exceptions have
+         * no Kotlin caller to propagate to; when no handler is installed, they
+         * are logged with their stack trace and dropped. Pass `null` to
+         * restore the default logging behavior.
+         */
+        @JvmStatic fun setCallbackExceptionHandler(handler: ((Throwable) -> Unit)?) {
+            callbackExceptionHandler = handler
+        }
+
+        // Invoked from the JNI glue; rethrowing signals "no handler" so the
+        // glue falls back to ExceptionDescribe.
+        @JvmStatic private fun dispatchCallbackException(t: Throwable) {
+            callbackExceptionHandler?.invoke(t) ?: throw t
+        }
+
+        /**
+         * Subscribe to per-key eviction notifications
+         *
+         * Exceptions thrown by the callback cannot propagate to a caller (events fire on a producer thread); they are delivered to the handler installed via [setCallbackExceptionHandler], or logged with their stack trace and dropped when no handler is set.
+         */
         @JvmStatic external fun registerEvictionListener(callback: (String) -> Unit): Long
         @JvmStatic external fun unregisterEvictionListener(id: Long)
         /**
@@ -152,7 +175,7 @@ class Store internal constructor(internal var handle: Long) : java.io.Closeable 
         @JvmStatic private external fun nativePut(selfHandle: Long, key: String, value: ByteArray, kind: Int, ttlSeconds: Long?): Boolean
         @JvmStatic private external fun nativeGet(selfHandle: Long, key: String): Long?
         @JvmStatic private external fun nativeDelete(selfHandle: Long, key: String): Boolean
-        @JvmStatic private external fun nativeListKeys(selfHandle: Long, prefix: String?): Iterator<String>
+        @JvmStatic private external fun nativeListKeys(selfHandle: Long, prefix: String?): Long
         @JvmStatic private external fun nativeCount(selfHandle: Long): Long
         @JvmStatic private external fun nativeClear(selfHandle: Long): Unit
         @JvmStatic private external fun nativeCompactAsync(selfHandle: Long, cancelToken: Long, callback: Any)
@@ -188,7 +211,7 @@ class Store internal constructor(internal var handle: Long) : java.io.Closeable 
     /**
      * Stream every key, optionally filtered by a prefix
      */
-    fun listKeys(prefix: String?): Iterator<String> = nativeListKeys(handle, prefix)
+    fun listKeys(prefix: String?): Iterator<String> = KvStoreListKeysIterator(nativeListKeys(handle, prefix))
 
     /**
      * Return the number of live entries in the store
@@ -222,6 +245,53 @@ class Store internal constructor(internal var handle: Long) : java.io.Closeable 
 
     protected fun finalize() {
         close()
+    }
+}
+
+/**
+ * A lazy iterator over the `String` elements streamed by [listKeys]. Each step pulls
+ * exactly one element from the native producer. The native handle is
+ * released when the producer is exhausted, when [close] is called, or by
+ * the finalizer if the iterator is abandoned, whichever comes first.
+ */
+class KvStoreListKeysIterator internal constructor(private var handle: Long) : Iterator<String>, java.io.Closeable {
+    private var nextSlot: Array<Any?>? = null
+
+    override fun hasNext(): Boolean {
+        if (nextSlot != null) return true
+        if (handle == 0L) return false
+        val slot = nativeNext(handle)
+        if (slot == null) {
+            close()
+            return false
+        }
+        nextSlot = slot
+        return true
+    }
+
+    override fun next(): String {
+        if (!hasNext()) throw NoSuchElementException()
+        val raw = nextSlot!![0]
+        nextSlot = null
+        return raw as String
+    }
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNext(handle: Long): Array<Any?>?
+        @JvmStatic private external fun nativeDestroy(handle: Long)
     }
 }
 

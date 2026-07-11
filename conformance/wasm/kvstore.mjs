@@ -9,7 +9,7 @@
 // marshalling path the generator emits: NUL-terminated string args, the bytes
 // getter (Entry.value), the optional-scalar getter (Entry.expires_at), the
 // list getter (Entry.tags), the map getter (Entry.metadata over parallel
-// key/value arrays), an iterator-drained list-of-string return (listKeys), the
+// key/value arrays), a lazy iterator-backed string stream (listKeys), the
 // fluent builder + static create factory, the kv.stats submodule taking the
 // interface as a parameter, and the async, i64-returning compact via the
 // callback trampoline.
@@ -81,9 +81,9 @@ expect(store.count() === 2n, 'count == 2');
 expect(Store.defaultCapacity() === 1000000n, 'Store.defaultCapacity == 1_000_000');
 
 // Iterator-backed list-of-string return, drained eagerly into an array.
-const keys = store.listKeys(null).sort();
+const keys = [...store.listKeys(null)].sort();
 expect(keys.length === 2 && keys[0] === 'alpha' && keys[1] === 'beta', 'listKeys values');
-const filtered = store.listKeys('al');
+const filtered = [...store.listKeys('al')];
 expect(filtered.length === 1 && filtered[0] === 'alpha', 'listKeys prefix filter');
 
 // Struct return + getters over every complex field type.

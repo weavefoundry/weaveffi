@@ -154,6 +154,12 @@ class Numerics {
     _freeErr(wasm, _err);
     return new Numerics(wasm, _r);
   }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_shapes_Numerics_destroy(this._handle);
+      this._handle = 0;
+    }
+  }
 }
 
 class Shape {

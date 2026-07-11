@@ -92,8 +92,9 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Decode a producer-owned array of `len` C strings at `base` (each
-// freed); the array container itself is owned by the producer.
+// Decode an array of `len` C strings at `base`, freeing each string
+// after copying (the consumer owns the elements); the caller releases
+// the array container separately.
 function _takeStrArray(wasm, base, len) {
   const out = [];
   if (base === 0) return out;
@@ -203,6 +204,7 @@ class Document {
     const _len = _dv.getUint32(_lp, true);
     wasm.weaveffi_dealloc(_lp, 4);
     const _out = _takeStrArray(wasm, _r, _len);
+    if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
     return _out;
   }
   static create(wasm, id, title, status, tags) {
@@ -224,6 +226,12 @@ class Document {
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Document(wasm, _r);
+  }
+  free() {
+    if (this._handle !== 0) {
+      this._wasm.weaveffi_docs_Document_destroy(this._handle);
+      this._handle = 0;
+    }
   }
 }
 
@@ -269,9 +277,17 @@ class DocumentBuilder {
     const wasm = this._wasm;
     const _err = _allocErr(wasm);
     const _r = wasm.weaveffi_docs_Document_Builder_build(this._b, _err);
+    wasm.weaveffi_docs_Document_Builder_destroy(this._b);
+    this._b = 0;
     _checkErr(wasm, _err);
     _freeErr(wasm, _err);
     return new Document(wasm, _r);
+  }
+  free() {
+    if (this._b !== 0) {
+      this._wasm.weaveffi_docs_Document_Builder_destroy(this._b);
+      this._b = 0;
+    }
   }
 }
 

@@ -312,7 +312,11 @@ public:
         auto* raw = weaveffi_docs_Document_get_tags(static_cast<const weaveffi_docs_Document*>(handle_), &len);
         std::vector<std::string> ret;
         ret.reserve(len);
-        for (size_t i = 0; i < len; ++i) ret.emplace_back(raw[i]);
+        for (size_t i = 0; i < len; ++i) {
+            ret.emplace_back(raw[i]);
+            weaveffi_free_string(raw[i]);
+        }
+        weaveffi_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));
         return ret;
     }
 

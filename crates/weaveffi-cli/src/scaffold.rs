@@ -1136,7 +1136,7 @@ mod tests {
                 functions: vec![Function {
                     name: "cross".into(),
                     params: vec![],
-                    returns: Some(TypeRef::Struct("shared.Token".into())),
+                    returns: Some(TypeRef::Record("shared.Token".into())),
                     doc: None,
                     r#async: false,
                     cancellable: false,

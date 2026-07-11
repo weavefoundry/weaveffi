@@ -47,9 +47,11 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
-_lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
+# The free helpers take raw addresses (`c_void_p`) so wrappers can release
+# owned producer allocations they hold as plain integers or typed pointers.
+_lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
 _lib.weaveffi_free_string.restype = None
-_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.weaveffi_free_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _lib.weaveffi_free_bytes.restype = None
 
 
@@ -84,8 +86,35 @@ def _bytes_to_string(ptr) -> Optional[str]:
         return None
     return ptr.decode("utf-8")
 
+
+def _take_string(ptr) -> Optional[str]:
+    """Copy an owned C string (a raw address) and free the producer buffer."""
+    if not ptr:
+        return None
+    _s = ctypes.string_at(ptr).decode("utf-8")
+    _lib.weaveffi_free_string(ptr)
+    return _s
+
 import asyncio
 import threading
+
+
+# Pending async completion trampolines, keyed by an integer token.
+# Holding the ctypes function objects here keeps them alive until the
+# producer fires the completion callback, even when the awaiting
+# coroutine has been cancelled; each entry is removed on completion.
+_async_pending: Dict[int, object] = {}
+_async_lock = threading.Lock()
+_async_next_token = 0
+
+
+def _async_register(cb) -> int:
+    global _async_next_token
+    with _async_lock:
+        _async_next_token += 1
+        _token = _async_next_token
+        _async_pending[_token] = cb
+    return _token
 
 
 # Registered listener trampolines, keyed by subscription id. Holding
@@ -122,9 +151,9 @@ class Token:
     def label(self) -> str:
         _fn = _lib.weaveffi_shared_Token_get_label
         _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_char_p
+        _fn.restype = ctypes.c_void_p
         _result = _fn(self._ptr)
-        return _bytes_to_string(_result) or ""
+        return _take_string(_result) or ""
 
 
 
@@ -133,11 +162,11 @@ def ping() -> str:
     """
     _fn = _lib.weaveffi_shared_ping
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_char_p
+    _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
-    return _bytes_to_string(_result) or ""
+    return _take_string(_result) or ""
 
 
 # === Module: kitchen ===
@@ -229,9 +258,9 @@ class Item:
         """Display name"""
         _fn = _lib.weaveffi_kitchen_Item_get_name
         _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_char_p
+        _fn.restype = ctypes.c_void_p
         _result = _fn(self._ptr)
-        return _bytes_to_string(_result) or ""
+        return _take_string(_result) or ""
 
 
     @property
@@ -282,33 +311,40 @@ class Item:
         _result = _fn(self._ptr, ctypes.byref(_out_len))
         if not _result:
             return b""
-        return bytes(_result[:_out_len.value])
+        _val = bytes(_result[:_out_len.value])
+        _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))
+        return _val
 
 
     @property
     def tags(self) -> List[str]:
         _fn = _lib.weaveffi_kitchen_Item_get_tags
         _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
-        _fn.restype = ctypes.POINTER(ctypes.c_char_p)
+        _fn.restype = ctypes.POINTER(ctypes.c_void_p)
         _out_len = ctypes.c_size_t(0)
         _result = _fn(self._ptr, ctypes.byref(_out_len))
         if not _result:
             return []
-        return [_bytes_to_string(_result[_i]) for _i in range(_out_len.value)]
+        _items = [_take_string(_result[_i]) for _i in range(_out_len.value)]
+        _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))
+        return _items
 
 
     @property
     def attrs(self) -> Dict[str, str]:
         _fn = _lib.weaveffi_kitchen_Item_get_attrs
-        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.c_size_t)]
+        _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(ctypes.c_size_t)]
         _fn.restype = None
-        _out_keys = ctypes.POINTER(ctypes.c_char_p)()
-        _out_values = ctypes.POINTER(ctypes.c_char_p)()
+        _out_keys = ctypes.POINTER(ctypes.c_void_p)()
+        _out_values = ctypes.POINTER(ctypes.c_void_p)()
         _out_len = ctypes.c_size_t(0)
         _fn(self._ptr, ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len))
         if not _out_keys or not _out_values:
             return {}
-        return {_bytes_to_string(_out_keys[_i]): _bytes_to_string(_out_values[_i]) for _i in range(_out_len.value)}
+        _map = {_take_string(_out_keys[_i]): _take_string(_out_values[_i]) for _i in range(_out_len.value)}
+        _lib.weaveffi_free_bytes(_out_keys, ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))
+        _lib.weaveffi_free_bytes(_out_values, ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))
+        return _map
 
 
     @property
@@ -319,7 +355,9 @@ class Item:
         _result = _fn(self._ptr)
         if not _result:
             return None
-        return _result[0]
+        _val = _result[0]
+        _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(ctypes.sizeof(ctypes.c_int64)))
+        return _val
 
 
     @property
@@ -481,11 +519,11 @@ class Gadget:
         """
         _fn = _lib.weaveffi_kitchen_Gadget_describe
         _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-        _fn.restype = ctypes.c_char_p
+        _fn.restype = ctypes.c_void_p
         _err = _WeaveFFIErrorStruct()
         _result = _fn(self._ptr, ctypes.byref(_err))
         _check_error(_err)
-        return _bytes_to_string(_result) or ""
+        return _take_string(_result) or ""
 
 
     def poke(self, times: int) -> int:
@@ -511,11 +549,11 @@ class Gadget:
         """
         _fn = _lib.weaveffi_kitchen_Gadget_version
         _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
-        _fn.restype = ctypes.c_char_p
+        _fn.restype = ctypes.c_void_p
         _err = _WeaveFFIErrorStruct()
         _result = _fn(ctypes.byref(_err))
         _check_error(_err)
-        return _bytes_to_string(_result) or ""
+        return _take_string(_result) or ""
 
 
 
@@ -605,11 +643,11 @@ def f64_id(x: float) -> float:
 def echo_string(s: str) -> str:
     _fn = _lib.weaveffi_kitchen_echo_string
     _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_char_p
+    _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
     _check_error(_err)
-    return _bytes_to_string(_result) or ""
+    return _take_string(_result) or ""
 
 
 def echo_bytes(b: bytes) -> bytes:
@@ -623,7 +661,9 @@ def echo_bytes(b: bytes) -> bytes:
     _check_error(_err)
     if not _result:
         return b""
-    return bytes(_result[:_out_len.value])
+    _val = bytes(_result[:_out_len.value])
+    _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))
+    return _val
 
 
 def echo_borrowed_str(s: str) -> str:
@@ -631,11 +671,11 @@ def echo_borrowed_str(s: str) -> str:
     """
     _fn = _lib.weaveffi_kitchen_echo_borrowed_str
     _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_char_p
+    _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
     _check_error(_err)
-    return _bytes_to_string(_result) or ""
+    return _take_string(_result) or ""
 
 
 def echo_borrowed_bytes(b: bytes) -> bytes:
@@ -651,7 +691,9 @@ def echo_borrowed_bytes(b: bytes) -> bytes:
     _check_error(_err)
     if not _result:
         return b""
-    return bytes(_result[:_out_len.value])
+    _val = bytes(_result[:_out_len.value])
+    _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))
+    return _val
 
 
 def open_handle() -> int:
@@ -711,27 +753,36 @@ def list_items() -> List["Item"]:
     _check_error(_err)
     if not _result:
         return []
-    return [Item(_result[_i]) for _i in range(_out_len.value)]
+    _items = [Item(_result[_i]) for _i in range(_out_len.value)]
+    _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))
+    return _items
 
 
 def get_attrs() -> Dict[str, int]:
     """Map return type
     """
     _fn = _lib.weaveffi_kitchen_get_attrs
-    _fn.argtypes = [ctypes.POINTER(ctypes.POINTER(ctypes.c_char_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.argtypes = [ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)), ctypes.POINTER(ctypes.POINTER(ctypes.c_int32)), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = None
     _err = _WeaveFFIErrorStruct()
-    _out_keys = ctypes.POINTER(ctypes.c_char_p)()
+    _out_keys = ctypes.POINTER(ctypes.c_void_p)()
     _out_values = ctypes.POINTER(ctypes.c_int32)()
     _out_len = ctypes.c_size_t(0)
     _fn(ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len), ctypes.byref(_err))
     _check_error(_err)
     if not _out_keys or not _out_values:
         return {}
-    return {_bytes_to_string(_out_keys[_i]): _out_values[_i] for _i in range(_out_len.value)}
+    _map = {_take_string(_out_keys[_i]): _out_values[_i] for _i in range(_out_len.value)}
+    _lib.weaveffi_free_bytes(_out_keys, ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))
+    _lib.weaveffi_free_bytes(_out_values, ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_int32)))
+    return _map
 
 
 class _StreamItemsIterator:
+    """Lazy iterator over a producer stream: each step pulls one element
+    across the C boundary. The native handle is released exactly once, on
+    exhaustion, on close(), or when the iterator is garbage collected."""
+
     def __init__(self, ptr):
         self._ptr = ptr
         self._done = False
@@ -755,6 +806,11 @@ class _StreamItemsIterator:
             raise StopIteration
         return Item(_out_item.value)
 
+    def close(self):
+        """Release the native iterator without draining it."""
+        self._done = True
+        self._destroy()
+
     def _destroy(self):
         if self._ptr is not None:
             _destroy_fn = _lib.weaveffi_kitchen_StreamItemsIterator_destroy
@@ -768,7 +824,10 @@ class _StreamItemsIterator:
 
 
 def stream_items() -> Iterator["Item"]:
-    """Iterator return type
+    """
+    Iterator return type
+
+    Returns a lazy iterator: each step pulls one element from the producer. Exhaust or close() the iterator to release its native handle (garbage collection also releases it).
     """
     _fn = _lib.weaveffi_kitchen_stream_items
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
@@ -776,23 +835,7 @@ def stream_items() -> Iterator["Item"]:
     _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
-    _next_fn = _lib.weaveffi_kitchen_StreamItemsIterator_next
-    _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _next_fn.restype = ctypes.c_int32
-    _destroy_fn = _lib.weaveffi_kitchen_StreamItemsIterator_destroy
-    _destroy_fn.argtypes = [ctypes.c_void_p]
-    _destroy_fn.restype = None
-    _items = []
-    while True:
-        _out_item = ctypes.c_void_p()
-        _item_err = _WeaveFFIErrorStruct()
-        _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))
-        _check_error(_item_err)
-        if not _has:
-            break
-        _items.append(Item(_out_item.value))
-    _destroy_fn(_result)
-    return _items
+    return _StreamItemsIterator(_result)
 
 
 def cross_module_token() -> "Token":
@@ -809,80 +852,84 @@ def cross_module_token() -> "Token":
     return Token(_result)
 
 
-def _do_async_sync(input: str) -> str:
-    """Async operation
-    """
-    _fn = _lib.weaveffi_kitchen_do_async_async
-    _ev = threading.Event()
-    _state = {"err": None, "val": None}
-    def _cb_impl(context, err, result):
-        try:
-            if err and err.contents.code != 0:
-                _code = err.contents.code
-                _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
-                _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveFFIError(_code, _msg)
-            else:
-                _s = _bytes_to_string(result) or "" if result else ""
-                if result:
-                    _lib.weaveffi_free_string(result)
-                _state["val"] = _s
-        finally:
-            _ev.set()
-    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)
-    _cb = _cb_type(_cb_impl)
-    _fn.argtypes = [ctypes.c_char_p, _cb_type, ctypes.c_void_p]
-    _fn.restype = None
-    _fn(_string_to_bytes(input), _cb, None)
-    _ev.wait()
-    if _state["err"] is not None:
-        raise _state["err"]
-    return _state["val"]
-
-
 async def do_async(input: str) -> str:
     """Async operation
     """
-    _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _do_async_sync, input)
+    _fn = _lib.weaveffi_kitchen_do_async_async
+    _loop = asyncio.get_running_loop()
+    _fut = _loop.create_future()
 
-
-def _do_cancellable_sync(input: str) -> str:
-    """Cancellable async operation
-    """
-    _fn = _lib.weaveffi_kitchen_do_cancellable_async
-    _ev = threading.Event()
-    _state = {"err": None, "val": None}
     def _cb_impl(context, err, result):
-        try:
-            if err and err.contents.code != 0:
-                _code = err.contents.code
-                _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
-                _lib.weaveffi_error_clear(ctypes.byref(err.contents))
-                _state["err"] = WeaveFFIError(_code, _msg)
+        # Fires exactly once, on a producer thread: convert (copying
+        # borrowed buffers) here, then hop back to the event loop.
+        _state = {"err": None, "val": None}
+        if err and err.contents.code != 0:
+            _code = err.contents.code
+            _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
+            _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+            _state["err"] = WeaveFFIError(_code, _msg)
+        else:
+            _state["val"] = _bytes_to_string(result) or ""
+
+        def _resolve():
+            _async_pending.pop(_token, None)
+            # A cancelled future must not be resolved.
+            if _fut.cancelled():
+                return
+            if _state["err"] is not None:
+                _fut.set_exception(_state["err"])
             else:
-                _s = _bytes_to_string(result) or "" if result else ""
-                if result:
-                    _lib.weaveffi_free_string(result)
-                _state["val"] = _s
-        finally:
-            _ev.set()
+                _fut.set_result(_state["val"])
+
+        _loop.call_soon_threadsafe(_resolve)
+
     _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)
     _cb = _cb_type(_cb_impl)
-    _fn.argtypes = [ctypes.c_char_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
+    _token = _async_register(_cb)  # pinned until completion
+    _fn.argtypes = [ctypes.c_char_p, _cb_type, ctypes.c_void_p]
     _fn.restype = None
-    _fn(_string_to_bytes(input), None, _cb, None)
-    _ev.wait()
-    if _state["err"] is not None:
-        raise _state["err"]
-    return _state["val"]
+    _fn(_string_to_bytes(input), _cb, None)
+    return await _fut
 
 
 async def do_cancellable(input: str) -> str:
     """Cancellable async operation
     """
-    _loop = asyncio.get_event_loop()
-    return await _loop.run_in_executor(None, _do_cancellable_sync, input)
+    _fn = _lib.weaveffi_kitchen_do_cancellable_async
+    _loop = asyncio.get_running_loop()
+    _fut = _loop.create_future()
+
+    def _cb_impl(context, err, result):
+        # Fires exactly once, on a producer thread: convert (copying
+        # borrowed buffers) here, then hop back to the event loop.
+        _state = {"err": None, "val": None}
+        if err and err.contents.code != 0:
+            _code = err.contents.code
+            _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
+            _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+            _state["err"] = WeaveFFIError(_code, _msg)
+        else:
+            _state["val"] = _bytes_to_string(result) or ""
+
+        def _resolve():
+            _async_pending.pop(_token, None)
+            # A cancelled future must not be resolved.
+            if _fut.cancelled():
+                return
+            if _state["err"] is not None:
+                _fut.set_exception(_state["err"])
+            else:
+                _fut.set_result(_state["val"])
+
+        _loop.call_soon_threadsafe(_resolve)
+
+    _cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)
+    _cb = _cb_type(_cb_impl)
+    _token = _async_register(_cb)  # pinned until completion
+    _fn.argtypes = [ctypes.c_char_p, ctypes.c_void_p, _cb_type, ctypes.c_void_p]
+    _fn.restype = None
+    _fn(_string_to_bytes(input), None, _cb, None)
+    return await _fut
 
 
 def legacy_op() -> int:
@@ -918,10 +965,10 @@ def hello() -> str:
     """
     _fn = _lib.weaveffi_kitchen_nested_hello
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_char_p
+    _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
-    return _bytes_to_string(_result) or ""
+    return _take_string(_result) or ""
 
 # END weaveffi.py

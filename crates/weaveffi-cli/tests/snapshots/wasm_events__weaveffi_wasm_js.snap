@@ -58,8 +58,9 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Decode a producer-owned array of `len` C strings at `base` (each
-// freed); the array container itself is owned by the producer.
+// Decode an array of `len` C strings at `base`, freeing each string
+// after copying (the consumer owns the elements); the caller releases
+// the array container separately.
 function _takeStrArray(wasm, base, len) {
   const out = [];
   if (base === 0) return out;
@@ -96,6 +97,64 @@ function _checkErr(wasm, errPtr) {
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
   wasm.weaveffi_dealloc(errPtr, 8);
+}
+
+// Lazy wrapper over a producer iterator handle, implementing the JS
+// iterator protocol: each next() issues exactly one producer next call
+// and yields one converted element, so iteration streams in constant
+// memory. The handle is destroyed exactly once: eagerly on exhaustion,
+// on a next error, or from return() when iteration stops early (a
+// for...of loop calls return() automatically on break or throw).
+// Abandoning an iterator without exhausting or closing it leaks the
+// producer handle: JS has no finalization hook that is reliable across
+// every target this loader supports.
+class _WeaveFFIIterator {
+  constructor(wasm, handle, stride, callNext, destroy, check, decode) {
+    this._wasm = wasm;
+    this._handle = handle;
+    this._stride = stride;
+    this._callNext = callNext;
+    this._destroyFn = destroy;
+    this._check = check;
+    this._decode = decode;
+    this._slot = wasm.weaveffi_alloc(stride);
+  }
+  // Destroy the handle and release the element slot exactly once.
+  _close() {
+    if (this._handle === 0) return;
+    this._destroyFn(this._handle);
+    this._handle = 0;
+    this._wasm.weaveffi_dealloc(this._slot, this._stride);
+    this._slot = 0;
+  }
+  next() {
+    if (this._handle === 0) return { done: true, value: undefined };
+    const wasm = this._wasm;
+    const _err = _allocErr(wasm);
+    let _has;
+    try {
+      _has = this._callNext(this._handle, this._slot, _err);
+      // Throws (and releases the slot) on a non-zero code.
+      this._check(wasm, _err);
+    } catch (e) {
+      this._close();
+      throw e;
+    }
+    _freeErr(wasm, _err);
+    if (_has === 0) {
+      this._close();
+      return { done: true, value: undefined };
+    }
+    return { done: false, value: this._decode(wasm, this._slot) };
+  }
+  // Early-exit cleanup; for...of calls this on break/throw.
+  return(value) {
+    this._close();
+    return { done: true, value };
+  }
+  [Symbol.iterator]() {
+    return this;
+  }
 }
 
 /**
@@ -149,19 +208,10 @@ export async function loadWeaveffiWasm(url) {
         const _it = wasm.weaveffi_events_get_messages(_err);
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
-        const _out = [];
-        const _ip = wasm.weaveffi_alloc(4);
-        const _ierr = _allocErr(wasm);
-        while (wasm.weaveffi_events_GetMessagesIterator_next(_it, _ip, _ierr) !== 0) {
-          _checkErr(wasm, _ierr);
-          const _dv = new DataView(wasm.memory.buffer);
-          _out.push(_takeCStr(wasm, _dv.getUint32(_ip, true)));
-        }
-        _checkErr(wasm, _ierr);
-        _freeErr(wasm, _ierr);
-        wasm.weaveffi_dealloc(_ip, 4);
-        wasm.weaveffi_events_GetMessagesIterator_destroy(_it);
-        return _out;
+        return new _WeaveFFIIterator(wasm, _it, 4,
+          (it, slot, ep) => wasm.weaveffi_events_GetMessagesIterator_next(it, slot, ep),
+          (it) => wasm.weaveffi_events_GetMessagesIterator_destroy(it),
+          _checkErr, (w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true)));
       },
       registerMessageListener() {
         throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");

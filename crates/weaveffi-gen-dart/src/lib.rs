@@ -24,6 +24,7 @@ use weaveffi_core::model::{
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::{ElemFree, ErrorStrategy};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -297,13 +298,16 @@ fn dart_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "List<int>".into(),
-        // Structs, enums, typed handles, and interfaces all surface as bare
-        // local Dart classes. A cross-module reference (resolved to e.g.
-        // `kv.Store`) must still name the local `Store` class, not the
-        // qualified IR name.
-        TypeRef::TypedHandle(n) | TypeRef::Enum(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
-            local_type_name(n).to_upper_camel_case()
-        }
+        // Records, rich enums, C-style enums, typed handles, and interfaces
+        // all surface as bare local Dart classes. A cross-module reference
+        // (resolved to e.g. `kv.Store`) must still name the local `Store`
+        // class, not the qualified IR name.
+        TypeRef::TypedHandle(n)
+        | TypeRef::Enum(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => local_type_name(n).to_upper_camel_case(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::Optional(inner) => format!("{}?", dart_type(inner)),
         TypeRef::List(inner) => format!("List<{}>", dart_type(inner)),
         TypeRef::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
@@ -332,12 +336,17 @@ fn native_ffi_type(ty: &TypeRef) -> String {
         TypeRef::I64 | TypeRef::Handle => "Int64".into(),
         TypeRef::F32 => "Float".into(),
         TypeRef::F64 => "Double".into(),
-        TypeRef::Bool | TypeRef::Enum(_) => "Int32".into(),
+        // A C `bool` is one byte; `Bool` keeps by-value slots, boxed
+        // optionals, and element strides in step with the producer.
+        TypeRef::Bool => "Bool".into(),
+        TypeRef::Enum(_) => "Int32".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => "Pointer<Void>".into(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::Optional(inner) => native_ffi_type(inner),
         TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
@@ -354,14 +363,16 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
         | TypeRef::U32
         | TypeRef::U64
         | TypeRef::Handle
-        | TypeRef::Bool
         | TypeRef::Enum(_) => "int".into(),
+        TypeRef::Bool => "bool".into(),
         TypeRef::F32 | TypeRef::F64 => "double".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => "Pointer<Void>".into(),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::Optional(inner) => dart_ffi_type(inner),
         TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
     }
@@ -369,7 +380,9 @@ fn dart_ffi_type(ty: &TypeRef) -> String {
 
 // ── Complex-type marshaling (inputs, getters, returns) ──
 
-/// dart:ffi (native, dart) types of a leaf scalar passed by value.
+/// dart:ffi (native, dart) types of a leaf scalar passed by value or stored
+/// as a boxed or array element. `Bool` is one byte, matching the producer's C
+/// `bool`, so element strides and boxed-scalar frees stay honest.
 fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
     match ty {
         TypeRef::I8 => ("Int8", "int"),
@@ -378,7 +391,8 @@ fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
         TypeRef::U16 => ("Uint16", "int"),
         TypeRef::U32 => ("Uint32", "int"),
         TypeRef::U64 => ("Uint64", "int"),
-        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ("Int32", "int"),
+        TypeRef::I32 | TypeRef::Enum(_) => ("Int32", "int"),
+        TypeRef::Bool => ("Bool", "bool"),
         TypeRef::I64 | TypeRef::Handle => ("Int64", "int"),
         TypeRef::F32 => ("Float", "double"),
         TypeRef::F64 => ("Double", "double"),
@@ -391,9 +405,8 @@ fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
 fn input_array_ffi(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Utf8>>".into(),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-            "Pointer<Pointer<Void>>".into()
-        }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => "Pointer<Pointer<Void>>".into(),
         _ => format!("Pointer<{}>", scalar_ffi(elem).0),
     }
 }
@@ -418,13 +431,15 @@ fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
         ],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-                vec![ptr("Pointer<Void>")]
-            }
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => vec![ptr("Pointer<Void>")],
             other => vec![ptr(&format!("Pointer<{}>", scalar_ffi(other).0))],
         },
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             vec![ptr("Pointer<Void>")]
         }
         _ => {
@@ -439,11 +454,13 @@ fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
 /// statements to `frees`. Mirrors the `(ptr, len)` / `(keys, vals, len)` ABI.
 fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String>) -> Vec<String> {
     match ty {
-        TypeRef::Bool => vec![format!("{name} ? 1 : 0")],
+        TypeRef::Bool => vec![name.to_string()],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => {
             vec![format!("{name}._handle")]
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::I8
         | TypeRef::I16
         | TypeRef::I32
@@ -501,13 +518,13 @@ fn emit_optional_input(
             frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
             vec![p]
         }
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => {
             vec![format!("{name}?._handle ?? nullptr")]
         }
         other => {
             let (native, _) = scalar_ffi(other);
             let val = match other {
-                TypeRef::Bool => format!("{name} ? 1 : 0"),
                 TypeRef::Enum(_) => format!("{name}.value"),
                 _ => name.to_string(),
             };
@@ -621,10 +638,10 @@ fn emit_map_input(
 fn elem_to_native(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{expr}.toNativeUtf8()"),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => {
             format!("{expr}._handle")
         }
-        TypeRef::Bool => format!("{expr} ? 1 : 0"),
         TypeRef::Enum(_) => format!("{expr}.value"),
         _ => expr.to_string(),
     }
@@ -646,7 +663,8 @@ fn optional_inner_is_pointer(inner: &TypeRef) -> bool {
         inner,
         TypeRef::StringUtf8
             | TypeRef::BorrowedStr
-            | TypeRef::Struct(_)
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
             | TypeRef::TypedHandle(_)
             | TypeRef::Interface(_)
     )
@@ -671,14 +689,16 @@ fn return_ffi(ty: &TypeRef) -> (String, String) {
 fn map_out_ffi(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Pointer<Utf8>>>".into(),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-            "Pointer<Pointer<Pointer<Void>>>".into()
-        }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => "Pointer<Pointer<Pointer<Void>>>".into(),
         _ => format!("Pointer<Pointer<{}>>", scalar_ffi(elem).0),
     }
 }
 
-/// Read one decoded map key/value (`arr` is the `outX.value` array pointer).
+/// Read one decoded array/map element (`arr` is the typed array pointer).
+/// A string element is copied (the caller owes its release separately); an
+/// object element is adopted by its wrapper class, whose `dispose()` owns the
+/// eventual destroy. A `Bool` slot already reads back as a Dart `bool`.
 fn map_elem_read(arr: &str, idx: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{arr}[{idx}].toDartString()"),
@@ -686,8 +706,8 @@ fn map_elem_read(arr: &str, idx: &str, ty: &TypeRef) -> String {
             "{}.fromValue({arr}[{idx}])",
             local_type_name(n).to_upper_camel_case()
         ),
-        TypeRef::Bool => format!("{arr}[{idx}] != 0"),
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::TypedHandle(n)
+        | TypeRef::Interface(n) => {
             format!(
                 "{}._({arr}[{idx}])",
                 local_type_name(n).to_upper_camel_case()
@@ -763,13 +783,18 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
             w.line("final n = outLen.value;");
-            w.line("if (result == nullptr || n == 0) return <int>[];");
-            w.line("return List<int>.generate(n, (i) => result[i]);");
+            w.line("if (result == nullptr) return <int>[];");
+            w.line("final bytes = List<int>.generate(n, (i) => result[i]);");
+            // Copy first, then release the producer's buffer.
+            w.line("_weaveffiFreeBytes(result, n);");
+            w.line("return bytes;");
             out.push_str(&w.finish());
         }
         TypeRef::Map(k, v) => {
             let kt = dart_type(k);
             let vt = dart_type(v);
+            let kp = elem_pointee(k);
+            let vp = elem_pointee(v);
             let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
             w.line("final n = outLen.value;");
             w.line(format!("final m = <{kt}, {vt}>{{}};"));
@@ -784,6 +809,30 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
                 ));
             });
             w.line("}");
+            // Release each copied string element, then both parallel arrays.
+            for (arr, ty) in [("keys", k), ("vals", v)] {
+                if matches!(ty.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+                    w.line("for (var i = 0; i < n; i++) {");
+                    w.scope(|w| {
+                        w.line(format!("_weaveffiFreeString({arr}[i]);"));
+                    });
+                    w.line("}");
+                }
+            }
+            w.line("if (keys != nullptr) {");
+            w.scope(|w| {
+                w.line(format!(
+                    "_weaveffiFreeBytes(keys.cast(), n * sizeOf<{kp}>());"
+                ));
+            });
+            w.line("}");
+            w.line("if (vals != nullptr) {");
+            w.scope(|w| {
+                w.line(format!(
+                    "_weaveffiFreeBytes(vals.cast(), n * sizeOf<{vp}>());"
+                ));
+            });
+            w.line("}");
             w.line("return m;");
             out.push_str(&w.finish());
         }
@@ -792,6 +841,7 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
 }
 
 /// Convert a single native leaf value (`expr`) into its Dart representation.
+/// A `Bool` slot already reads back as a Dart `bool`.
 fn read_value(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{expr}.toDartString()"),
@@ -799,22 +849,22 @@ fn read_value(expr: &str, ty: &TypeRef) -> String {
             "{}.fromValue({expr})",
             local_type_name(n).to_upper_camel_case()
         ),
-        TypeRef::Bool => format!("{expr} != 0"),
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::TypedHandle(n)
+        | TypeRef::Interface(n) => {
             format!("{}._({expr})", local_type_name(n).to_upper_camel_case())
         }
         _ => expr.to_string(),
     }
 }
 
-/// dart:ffi pointee type allocated for an iterator's `out_item` slot (the C slot
-/// is `T*`, so we allocate one `T`).
-fn iter_item_pointee(elem: &TypeRef) -> String {
+/// dart:ffi pointee type of one element slot: an iterator's `out_item`
+/// allocation, a returned array's element, or a returned map's key/value
+/// element (the C slot is `T*`).
+fn elem_pointee(elem: &TypeRef) -> String {
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
-            "Pointer<Void>".into()
-        }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => "Pointer<Void>".into(),
         _ => scalar_ffi(elem).0.to_string(),
     }
 }
@@ -912,7 +962,9 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
     let resolved = pkg::resolve(api, None, Some(input_basename));
     let lib_base = resolved.ident_name();
 
-    out.push_str("// ignore_for_file: non_constant_identifier_names, camel_case_types\n\n");
+    out.push_str(
+        "// ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element\n\n",
+    );
     out.push_str("import 'dart:ffi';\n");
     out.push_str("import 'dart:io' show Platform;\n");
     if has_async {
@@ -957,6 +1009,28 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
         "void",
     );
 
+    // Runtime release helpers: every returned `const char*` is freed with
+    // `weaveffi_free_string` after copying, and every producer-allocated
+    // buffer (bytes, array, map, boxed optional scalar) with
+    // `weaveffi_free_bytes`. The runtime always exports these under the
+    // canonical `weaveffi_` names, like `weaveffi_error_clear`.
+    emit_typedef_and_lookup(
+        &mut out,
+        "weaveffi_free_string",
+        "Pointer<Utf8>",
+        "Pointer<Utf8>",
+        "Void",
+        "void",
+    );
+    emit_typedef_and_lookup(
+        &mut out,
+        "weaveffi_free_bytes",
+        "Pointer<Uint8>, Size",
+        "Pointer<Uint8>, int",
+        "Void",
+        "void",
+    );
+
     out.push_str(
         "\n/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.\n",
     );
@@ -985,6 +1059,19 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
         out.push_str("final Map<int, NativeCallable> _listenerCallables = {};\n");
     }
 
+    let has_iterators = model
+        .modules
+        .iter()
+        .any(|m| m.callables().any(|f| matches!(f.shape, CallShape::Iterator(_))));
+    if has_iterators {
+        out.push_str("\n// Anchors one live native iteration for its GC-finalizer backstop.\n");
+        out.push_str("// A suspended `sync*` frame keeps the anchor reachable; abandoning the\n");
+        out.push_str("// iteration drops the frame, and the finalizer destroys the native\n");
+        out.push_str("// iterator handle. Exhausted iterations detach before destroying\n");
+        out.push_str("// eagerly, so the handle is destroyed exactly once either way.\n");
+        out.push_str("final class _IteratorLifetime implements Finalizable {}\n");
+    }
+
     // Canonical member order per module: error domain, enums, structs,
     // interfaces, callbacks, listeners, functions.
     for module in &model.modules {
@@ -1001,7 +1088,7 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
             }
         }
         for i in &module.interfaces {
-            render_interface(&mut out, module, i);
+            render_interface(&mut out, module, i, &model.prefix);
         }
         for cb in &module.callbacks {
             render_callback_typedef(&mut out, cb);
@@ -1010,7 +1097,7 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
             render_listener(&mut out, module, l, config.strip_module_prefix);
         }
         for f in &module.functions {
-            render_function(&mut out, module, f, config.strip_module_prefix);
+            render_function(&mut out, module, f, config.strip_module_prefix, &model.prefix);
         }
     }
 
@@ -1035,6 +1122,11 @@ fn dart_str_literal(s: &str) -> String {
 
 /// Error-reporting context for one wrapper: which check helper guards its
 /// out-err slot and which exception its async completion path constructs.
+///
+/// The split follows [`ErrorStrategy`]: a throwing callable maps `out_err`
+/// onto the module's typed domain exception, while a non-throwing callable
+/// traps through the generic brand exception (a reported error there is only
+/// ever a producer bug, never a domain error).
 #[derive(Clone, Copy)]
 struct ErrCtx<'a> {
     /// `true` when the wrapper surfaces typed domain errors (`throws: true`).
@@ -1140,11 +1232,11 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     out.push_str(&w.finish());
 }
 
-/// The [`ErrCtx`] for one callable of `module`: its own `throws` flag paired
+/// The [`ErrCtx`] for one callable of `module`: its [`ErrorStrategy`] paired
 /// with the exception class of the domain in effect (own or inherited).
 fn err_ctx<'a>(f: &FnBinding, exception: Option<&'a str>) -> ErrCtx<'a> {
     ErrCtx {
-        throws: f.throws,
+        throws: matches!(f.error_strategy(), ErrorStrategy::Throws),
         exception,
     }
 }
@@ -1156,7 +1248,7 @@ fn err_ctx<'a>(f: &FnBinding, exception: Option<&'a str>) -> ErrCtx<'a> {
 /// other constructor as a named factory (`Store.open(...)`), instance methods
 /// that pass `_handle` as the implicit leading FFI argument, and statics as
 /// `static` methods. Member FFI typedefs and lookups stay at file scope.
-fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding) {
+fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding, prefix: &str) {
     let class_name = i.name.to_upper_camel_case();
     emit_typedef_and_lookup(
         out,
@@ -1187,6 +1279,8 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
             &kind,
             &c.name.to_lower_camel_case(),
             err_ctx(c, exc.as_deref()),
+            module,
+            prefix,
         );
     }
     for m in &i.methods {
@@ -1197,6 +1291,8 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
             &DartDecl::Method,
             &m.name.to_lower_camel_case(),
             err_ctx(m, exc.as_deref()),
+            module,
+            prefix,
         );
     }
     for s in &i.statics {
@@ -1207,6 +1303,8 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
             &DartDecl::Static,
             &s.name.to_lower_camel_case(),
             err_ctx(s, exc.as_deref()),
+            module,
+            prefix,
         );
     }
 
@@ -1525,7 +1623,8 @@ fn render_dart_builder(out: &mut String, s: &StructBinding) {
 /// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the
 /// Dart struct wrapper: it owns the C handle behind a private `_handle` (so the
 /// existing function marshalling, `x._handle` in, `Name._(result)` out, keeps
-/// working unchanged, since a rich enum lowers to `TypeRef::Struct`), frees it
+/// working unchanged, since a `TypeRef::RichEnum` reference shares the
+/// record's opaque-pointer ABI), frees it
 /// once in `dispose()`, and exposes a `tag` discriminant reader, one `factory`
 /// per variant (`Shape.circle(2.5)`), and per-variant field getters namespaced
 /// by variant (`circleRadius`) to avoid collisions. The opaque-object surface
@@ -1786,9 +1885,27 @@ impl DartDecl<'_> {
             } => format!("factory {class_name}.{name}({params}) {{"),
         }
     }
+
+    /// The opening line of a `sync*` generator wrapper (an `iter<T>` return).
+    /// Constructors never return iterators, so no factory spelling exists.
+    fn open_line_sync_star(&self, ret: &str, name: &str, params: &str) -> String {
+        match self {
+            DartDecl::TopLevel | DartDecl::Method => format!("{ret} {name}({params}) sync* {{"),
+            DartDecl::Static => format!("static {ret} {name}({params}) sync* {{"),
+            DartDecl::Factory { .. } => {
+                unreachable!("constructors cannot return iterators")
+            }
+        }
+    }
 }
 
-fn render_function(out: &mut String, module: &ModuleBinding, f: &FnBinding, strip: bool) {
+fn render_function(
+    out: &mut String,
+    module: &ModuleBinding,
+    f: &FnBinding,
+    strip: bool,
+    prefix: &str,
+) {
     let name = wrapper_name(&module.path, &f.name, strip).to_lower_camel_case();
     let exc = module
         .error
@@ -1802,6 +1919,8 @@ fn render_function(out: &mut String, module: &ModuleBinding, f: &FnBinding, stri
         &DartDecl::TopLevel,
         &name,
         err_ctx(f, exc.as_deref()),
+        module,
+        prefix,
     );
     out.push_str(&decl);
 }
@@ -1809,6 +1928,9 @@ fn render_function(out: &mut String, module: &ModuleBinding, f: &FnBinding, stri
 /// Render one callable: its FFI typedefs and lookups into `lookups` (always
 /// top-level) and its Dart wrapper declaration into `decl` (top-level for a
 /// free function, spliced into the class body for an interface member).
+/// `module` and `prefix` locate the callable for the plan's per-element
+/// release decisions (an iterator's [`ElemFree`]).
+#[allow(clippy::too_many_arguments)]
 fn render_callable(
     lookups: &mut String,
     decl: &mut String,
@@ -1816,6 +1938,8 @@ fn render_callable(
     kind: &DartDecl,
     name: &str,
     err: ErrCtx,
+    module: &ModuleBinding,
+    prefix: &str,
 ) {
     // `c_base` is the prefixed `{prefix}_{module}_{name}` symbol the shared
     // BindingModel already computed; the async/iterator suffixing matches the C
@@ -1882,7 +2006,8 @@ fn render_callable(
         &dart_ret,
     );
 
-    // Iterator-returning functions also bind the element `next`/`destroy` symbols.
+    // Iterator-returning functions also bind the element `next`/`destroy`
+    // symbols plus the GC-finalizer backstop for abandoned iterations.
     if let CallShape::Iterator(ib) = &f.shape {
         emit_iter_lookups(lookups, ib);
     }
@@ -1890,8 +2015,16 @@ fn render_callable(
     let mut w = CodeWriter::two_space();
     w.blank();
     emit_wrapper_doc(&mut w, f, err);
-    w.line(kind.open_line(&pub_ret, name, &wrapper_params.join(", ")));
-    {
+    let params = wrapper_params.join(", ");
+    if let CallShape::Iterator(ib) = &f.shape {
+        // The wrapper is a lazy `sync*` generator; everything (staging,
+        // launch, per-element pulls, cleanup) lives in the generator body.
+        w.line(kind.open_line_sync_star(&pub_ret, name, &params));
+        let mut body = String::new();
+        emit_iterator_body(&mut body, f, c_sym, ib, err, module, prefix);
+        w.raw(body);
+    } else {
+        w.line(kind.open_line(&pub_ret, name, &params));
         let mut body = String::new();
         emit_function_body(&mut body, f, c_sym, err);
         w.raw(body);
@@ -1900,18 +2033,39 @@ fn render_callable(
     decl.push_str(&w.finish());
 }
 
-/// Emit a wrapper's doc comment, the typed-exception note for a throwing
-/// callable, and its `@Deprecated` annotation when present.
+/// Emit a wrapper's doc comment, the streaming/disposal note for an iterator
+/// callable, the typed-exception note for a throwing callable, and its
+/// `@Deprecated` annotation when present.
 fn emit_wrapper_doc(w: &mut CodeWriter, f: &FnBinding, err: ErrCtx) {
     {
         let mut d = String::new();
         emit_doc(&mut d, &f.doc, "");
         w.raw(d);
     }
-    if let Some(exc) = err.thrown_exception() {
-        if f.doc.is_some() {
+    let mut has_content = f.doc.is_some();
+    let separator = |w: &mut CodeWriter, has_content: &mut bool| {
+        if *has_content {
             w.line("///");
         }
+        *has_content = true;
+    };
+    if let CallShape::Iterator(ib) = &f.shape {
+        separator(w, &mut has_content);
+        w.line("/// Returns a lazy [Iterable]: elements are pulled from the native");
+        w.line("/// iterator one at a time (one native `next` call per element), and");
+        w.line("/// iterating the result again launches a fresh native iterator.");
+        w.line("///");
+        w.line("/// The native iterator handle is destroyed exactly once: eagerly when");
+        w.line("/// the iteration completes or fails, or by a GC finalizer if the");
+        w.line("/// iteration is abandoned before it is exhausted.");
+        if ib.elem.is_object_ref() {
+            w.line("///");
+            w.line("/// Each yielded element is owned by the caller: call its `dispose()`");
+            w.line("/// when you are done with it.");
+        }
+    }
+    if let Some(exc) = err.thrown_exception() {
+        separator(w, &mut has_content);
         w.line(format!("/// Throws [{exc}] on domain errors."));
     }
     if let Some(msg) = &f.deprecated {
@@ -1953,8 +2107,8 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
         | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::F32
-        | TypeRef::F64 => n0,
-        TypeRef::Bool => format!("{n0} != 0"),
+        | TypeRef::F64
+        | TypeRef::Bool => n0,
         TypeRef::Enum(name) => format!(
             "{}.fromValue({n0})",
             local_type_name(name).to_upper_camel_case()
@@ -1967,9 +2121,11 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
             format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({len}).toList()")
         }
         // Borrowed for the duration of the callback: do not dispose().
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             format!("{}._({n0})", local_type_name(name).to_upper_camel_case())
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 format!("{n0} == nullptr ? null : {n0}.toDartString()")
@@ -1978,13 +2134,15 @@ fn cb_arg_expr(p: &ParamBinding) -> String {
                 let len = p.abi[1].name.to_lower_camel_case();
                 format!("{n0} == nullptr ? null : {n0}.asTypedList({len}).toList()")
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name) => {
                 format!(
                     "{n0} == nullptr ? null : {}._({n0})",
                     local_type_name(name).to_upper_camel_case()
                 )
             }
-            TypeRef::Bool => format!("{n0} == nullptr ? null : {n0}.value != 0"),
             TypeRef::Enum(name) => format!(
                 "{n0} == nullptr ? null : {}.fromValue({n0}.value)",
                 local_type_name(name).to_upper_camel_case()
@@ -2102,46 +2260,63 @@ fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding, str
 /// Returns the (native, dart) FFI types of the trailing callback parameters
 /// (those after `(context, err)`) for an async function with the given return
 /// type. The empty vec means the callback signature is `(context, err)` with
-/// no extra payload.
-fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(&'static str, &'static str)> {
+/// no extra payload. Buffer results arrive as borrowed `(ptr, len)` pairs
+/// typed like the sync array shapes; a map arrives as parallel key/value
+/// arrays.
+fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(String, String)> {
+    let ptr = |s: String| (s.clone(), s);
     match ret {
         None => vec![],
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
-            vec![("Pointer<Uint8>", "Pointer<Uint8>"), ("Size", "int")]
+            vec![ptr("Pointer<Uint8>".into()), ("Size".into(), "int".into())]
         }
-        Some(TypeRef::List(_) | TypeRef::Iterator(_)) => {
-            vec![("Pointer<Void>", "Pointer<Void>"), ("Size", "int")]
-        }
-        Some(TypeRef::Map(_, _)) => vec![
-            ("Pointer<Void>", "Pointer<Void>"),
-            ("Pointer<Void>", "Pointer<Void>"),
-            ("Size", "int"),
+        Some(TypeRef::List(inner)) => vec![
+            ptr(input_array_ffi(inner)),
+            ("Size".into(), "int".into()),
         ],
-        Some(t) => vec![{
-            let n: &'static str = match t {
-                TypeRef::I32 | TypeRef::U32 | TypeRef::Bool | TypeRef::Enum(_) => "Int32",
-                TypeRef::I64 | TypeRef::Handle | TypeRef::TypedHandle(_) => "Int64",
-                TypeRef::F64 => "Double",
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
-                TypeRef::Struct(_) | TypeRef::Interface(_) => "Pointer<Void>",
-                _ => "Pointer<Void>",
-            };
-            let d: &'static str = match t {
-                TypeRef::I32
-                | TypeRef::U32
-                | TypeRef::I64
-                | TypeRef::Bool
-                | TypeRef::Enum(_)
-                | TypeRef::Handle
-                | TypeRef::TypedHandle(_) => "int",
-                TypeRef::F64 => "double",
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>",
-                TypeRef::Struct(_) | TypeRef::Interface(_) => "Pointer<Void>",
-                _ => "Pointer<Void>",
-            };
-            (n, d)
+        Some(TypeRef::Map(k, v)) => vec![
+            ptr(input_array_ffi(k)),
+            ptr(input_array_ffi(v)),
+            ("Size".into(), "int".into()),
+        ],
+        Some(TypeRef::Optional(inner)) => vec![match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => ptr("Pointer<Utf8>".into()),
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => ptr("Pointer<Void>".into()),
+            // A boxed optional scalar arrives as a nullable pointer-to-scalar.
+            other => ptr(format!("Pointer<{}>", scalar_ffi(other).0)),
+        }],
+        Some(t) => vec![match t {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => ptr("Pointer<Utf8>".into()),
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => ptr("Pointer<Void>".into()),
+            other => {
+                let (n, d) = scalar_ffi(other);
+                (n.into(), d.into())
+            }
         }],
     }
+}
+
+/// The Dart parameter names of an async callback's trailing result slots,
+/// mirroring [`async_cb_extra_params`].
+fn async_cb_arg_names(ret: Option<&TypeRef>) -> Vec<String> {
+    let mut names = vec!["context".to_string(), "err".to_string()];
+    match ret {
+        None => {}
+        Some(TypeRef::Map(_, _)) => {
+            names.extend(["resultKeys".into(), "resultValues".into(), "resultLen".into()]);
+        }
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+            names.extend(["result".into(), "resultLen".into()]);
+        }
+        Some(_) => names.push("result".into()),
+    }
+    names
 }
 
 /// Render one async callable: its callback typedef and launcher lookup into
@@ -2162,7 +2337,7 @@ fn render_async_function(
     let cb_extras = async_cb_extra_params(f.ret.as_ref());
     let cb_native_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
         .chain(std::iter::once("Pointer<_WeaveFFIError>".to_string()))
-        .chain(cb_extras.iter().map(|(n, _)| (*n).to_string()))
+        .chain(cb_extras.iter().map(|(n, _)| n.clone()))
         .collect();
 
     let cb_typedef = format!("_NativeAsyncCb_{c_sym}");
@@ -2222,18 +2397,9 @@ fn render_async_function(
 
     let cb_dart_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
         .chain(std::iter::once("Pointer<_WeaveFFIError>".to_string()))
-        .chain(cb_extras.iter().map(|(_, d)| (*d).to_string()))
+        .chain(cb_extras.iter().map(|(_, d)| d.clone()))
         .collect();
-    let cb_arg_names: Vec<String> = (0..cb_dart_params.len())
-        .map(|i| match i {
-            0 => "context".to_string(),
-            1 => "err".to_string(),
-            2 => "result".to_string(),
-            3 => "resultLen".to_string(),
-            4 => "resultLenExtra".to_string(),
-            _ => format!("arg{i}"),
-        })
-        .collect();
+    let cb_arg_names = async_cb_arg_names(f.ret.as_ref());
     let cb_param_decls: Vec<String> = cb_dart_params
         .iter()
         .zip(cb_arg_names.iter())
@@ -2248,9 +2414,11 @@ fn render_async_function(
         let pname = p.name.to_lower_camel_case();
         call_args.push(match &p.ty {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{pname}Ptr"),
-            TypeRef::Bool => format!("{pname} ? 1 : 0"),
             TypeRef::Enum(_) => format!("{pname}.value"),
-            TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
+            TypeRef::TypedHandle(_)
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::Interface(_) => {
                 format!("{pname}._handle")
             }
             _ => pname,
@@ -2341,54 +2509,94 @@ fn render_async_function(
     decl.push_str(&w.finish());
 }
 
+/// Emit the callback statements that resolve the completer from the result
+/// slots. Borrowed buffers (strings, bytes, arrays, map buffers, boxed
+/// optional scalars) are valid only for the callback's duration, so they are
+/// deep-copied here and never freed; an owned-object result (record, rich
+/// enum, interface) is instead adopted by its wrapper class.
 fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match ty {
         None => {
             w.line("completer.complete();");
         }
-        Some(TypeRef::Bool) => {
-            w.line("completer.complete(result != 0);");
-        }
         Some(TypeRef::Enum(name)) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("completer.complete({n}.fromValue(result));"));
         }
-        Some(TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name)) => {
+        // The callback receives ownership of an object result; the wrapper
+        // adopts the pointer and its `dispose()` owns the eventual destroy.
+        Some(
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name),
+        ) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("completer.complete({n}._(result));"));
         }
+        // Borrowed: copy before the callback returns, never free.
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
             w.line("completer.complete(result.toDartString());");
         }
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line("if (result == nullptr) {");
+        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            w.line("completer.complete(result == nullptr");
+            w.line("    ? <int>[]");
+            w.line("    : List<int>.generate(resultLen, (i) => result[i]));");
+        }
+        Some(TypeRef::List(inner)) => {
+            let dt = dart_type(inner);
+            let read = map_elem_read("result", "i", inner);
+            w.line("completer.complete(result == nullptr");
+            w.line(format!("    ? <{dt}>[]"));
+            w.line(format!(
+                "    : List<{dt}>.generate(resultLen, (i) => {read}));"
+            ));
+        }
+        Some(TypeRef::Map(k, v)) => {
+            let (kt, vt) = (dart_type(k), dart_type(v));
+            let kread = map_elem_read("resultKeys", "i", k);
+            let vread = map_elem_read("resultValues", "i", v);
+            w.line(format!("final map = <{kt}, {vt}>{{}};"));
+            w.line("if (resultKeys != nullptr) {");
+            w.scope(|w| {
+                w.line("for (var i = 0; i < resultLen; i++) {");
                 w.scope(|w| {
-                    w.line("completer.complete(null);");
+                    w.line(format!("map[{kread}] = {vread};"));
                 });
-                w.line("} else {");
-                w.scope(|w| {
+                w.line("}");
+            });
+            w.line("}");
+            w.line("completer.complete(map);");
+        }
+        Some(TypeRef::Optional(inner)) => {
+            w.line("if (result == nullptr) {");
+            w.scope(|w| {
+                w.line("completer.complete(null);");
+            });
+            w.line("} else {");
+            w.scope(|w| match inner.as_ref() {
+                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                     w.line("completer.complete(result.toDartString());");
-                });
-                w.line("}");
-            }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
-                let n = local_type_name(name).to_upper_camel_case();
-                w.line("if (result == nullptr) {");
-                w.scope(|w| {
-                    w.line("completer.complete(null);");
-                });
-                w.line("} else {");
-                w.scope(|w| {
+                }
+                TypeRef::Record(name)
+                | TypeRef::RichEnum(name)
+                | TypeRef::TypedHandle(name)
+                | TypeRef::Interface(name) => {
+                    let n = local_type_name(name).to_upper_camel_case();
                     w.line(format!("completer.complete({n}._(result));"));
-                });
-                w.line("}");
-            }
-            _ => {
-                w.line("completer.complete(result);");
-            }
-        },
+                }
+                TypeRef::Enum(name) => {
+                    let n = local_type_name(name).to_upper_camel_case();
+                    w.line(format!("completer.complete({n}.fromValue(result.value));"));
+                }
+                // Boxed optional scalar: copy the value, never free the box.
+                _ => {
+                    w.line("completer.complete(result.value);");
+                }
+            });
+            w.line("}");
+        }
         Some(_) => {
             w.line("completer.complete(result);");
         }
@@ -2397,11 +2605,6 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
 }
 
 fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx) {
-    if let CallShape::Iterator(ib) = &f.shape {
-        emit_iterator_body(out, f, c_sym, ib, err);
-        return;
-    }
-
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     if f.has_self {
@@ -2455,7 +2658,13 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx)
     out.push_str(&w.finish());
 }
 
-/// Bind the element `next`/`destroy` symbols of an iterator-returning function.
+/// Bind the element `next`/`destroy` symbols of an iterator-returning
+/// function, plus a `NativeFinalizer` over the destroy symbol. The finalizer
+/// is the disposal backstop for abandoned iterations: Dart runs a `sync*`
+/// body only inside `moveNext`, so a consumer that stops pulling (a broken
+/// `for` loop, `first`, `take`) never resumes the generator and its `finally`
+/// block never runs; the finalizer reclaims the native handle when the
+/// suspended frame is collected instead.
 fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
     let item = input_array_ffi(&ib.elem);
     emit_typedef_and_lookup(
@@ -2474,16 +2683,39 @@ fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
         "Void",
         "void",
     );
+    out.push_str(&format!(
+        "final _{}Finalizer = NativeFinalizer(\n    \
+         _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('{}'));\n",
+        ib.destroy_symbol.to_lower_camel_case(),
+        ib.destroy_symbol
+    ));
 }
 
-/// Launch the iterator, then drain it via `next`/`destroy` into a `List<T>`.
+/// Emit the `sync*` generator body of an `iter<T>` wrapper.
+///
+/// The body runs lazily, on the first pull: it stages the inputs, launches
+/// the C iterator, and then issues exactly one producer `next` call per
+/// yielded element, releasing each element per the plan's [`ElemFree`] after
+/// copying (strings through `weaveffi_free_string`; object elements are
+/// adopted by their wrapper class, whose `dispose()` owns the destroy).
+///
+/// The handle is destroyed exactly once. The `try`/`finally` destroys it when
+/// iteration exhausts, a launch or `next` error throws, or the generator is
+/// otherwise torn down, then nulls the local handle so the finalizer detach
+/// path cannot double-destroy. For iterations abandoned mid-stream (where the
+/// `finally` never runs, see [`emit_iter_lookups`]) the `NativeFinalizer`
+/// attached to the generator-local anchor destroys the handle when the frame
+/// is collected; the eager path detaches before destroying.
 fn emit_iterator_body(
     out: &mut String,
     f: &FnBinding,
     c_sym: &str,
     ib: &IteratorBinding,
     err: ErrCtx,
+    module: &ModuleBinding,
+    prefix: &str,
 ) {
+    let proto = ib.protocol(f, &module.path, prefix);
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     if f.has_self {
@@ -2504,39 +2736,52 @@ fn emit_iterator_body(
 
     let var = c_sym.to_lower_camel_case();
     let elem = &ib.elem;
-    let dt = dart_type(elem);
+    let next_var = ib.next.symbol.to_lower_camel_case();
+    let destroy_var = ib.destroy_symbol.to_lower_camel_case();
 
     let mut w = CodeWriter::two_space().with_depth(1);
     w.raw(staging);
     w.line("final err = calloc<_WeaveFFIError>();");
+    w.line(format!("final outItem = calloc<{}>();", elem_pointee(elem)));
+    w.line("Pointer<Void> iter = nullptr;");
+    w.line("final anchor = _IteratorLifetime();");
     w.line("try {");
     w.scope(|w| {
-        w.line(format!("final iter = _{var}({});", call_args.join(", ")));
+        w.line(format!("iter = _{var}({});", call_args.join(", ")));
         w.line(err.check_stmt());
-        w.line(format!("final items = <{dt}>[];"));
         w.line(format!(
-            "final outItem = calloc<{}>();",
-            iter_item_pointee(elem)
+            "_{destroy_var}Finalizer.attach(anchor, iter, detach: anchor);"
         ));
-        w.line(format!(
-            "while (_{}(iter, outItem, err) != 0) {{",
-            ib.next.symbol.to_lower_camel_case()
-        ));
+        w.line(format!("while (_{next_var}(iter, outItem, err) != 0) {{"));
         w.scope(|w| {
             w.line(err.check_stmt());
-            w.line(format!("items.add({});", read_value("outItem.value", elem)));
+            match &proto.elem_free {
+                ElemFree::String => {
+                    w.line("final itemPtr = outItem.value;");
+                    w.line("final item = itemPtr.toDartString();");
+                    w.line("_weaveffiFreeString(itemPtr);");
+                    w.line("yield item;");
+                }
+                // The consumer adopts an object element; its wrapper's
+                // dispose() owns the eventual destroy.
+                ElemFree::Object { .. } | ElemFree::None => {
+                    w.line(format!("yield {};", read_value("outItem.value", elem)));
+                }
+            }
         });
         w.line("}");
         w.line(err.check_stmt());
-        w.line("calloc.free(outItem);");
-        w.line(format!(
-            "_{}(iter);",
-            ib.destroy_symbol.to_lower_camel_case()
-        ));
-        w.line("return items;");
     });
     w.line("} finally {");
     w.scope(|w| {
+        w.line("if (iter != nullptr) {");
+        w.scope(|w| {
+            w.line(format!("_{destroy_var}Finalizer.detach(anchor);"));
+            w.line(format!("_{destroy_var}(iter);"));
+            w.line("iter = nullptr;");
+        });
+        w.line("}");
+        w.line("calloc.free(outItem);");
         for fr in &frees {
             w.line(fr);
         }
@@ -2545,94 +2790,93 @@ fn emit_iterator_body(
     out.push_str(&w.finish());
 }
 
-/// Materialises a `T**` + `out_len` C return into a Dart `List<T>`. The array
-/// buffer is owned by the callee per the WeaveFFI ABI; element ownership (e.g.
-/// struct handles) transfers to the caller, who disposes each element.
+/// Materialises a `T*` + `out_len` C return into a Dart `List<T>`, then
+/// releases what the wrapper owes per the plan: string elements through
+/// `weaveffi_free_string` after copying, and the producer-allocated array
+/// buffer itself through `weaveffi_free_bytes` (`n * sizeOf<elem>`). Object
+/// elements transfer ownership to the caller, who disposes each wrapper.
 fn emit_list_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.line("final n = outLen.value;");
     let dt = dart_type(inner);
-    w.line(format!("if (result == nullptr || n == 0) return <{dt}>[];"));
-    match inner {
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line("final arr = result.cast<Pointer<Void>>();");
-            w.line(format!(
-                "return List<{n}>.generate(n, (i) => {n}._(arr[i]));"
-            ));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("final arr = result.cast<Pointer<Utf8>>();");
-            w.line("return List<String>.generate(n, (i) => arr[i].toDartString());");
-        }
-        TypeRef::I64 | TypeRef::Handle => {
-            w.line("final arr = result.cast<Int64>();");
-            w.line("return List<int>.generate(n, (i) => arr[i]);");
-        }
-        TypeRef::F64 => {
-            w.line("final arr = result.cast<Double>();");
-            w.line("return List<double>.generate(n, (i) => arr[i]);");
-        }
-        TypeRef::Bool => {
-            w.line("final arr = result.cast<Int32>();");
-            w.line("return List<bool>.generate(n, (i) => arr[i] != 0);");
-        }
-        TypeRef::Enum(name) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line("final arr = result.cast<Int32>();");
-            w.line(format!(
-                "return List<{n}>.generate(n, (i) => {n}.fromValue(arr[i]));"
-            ));
-        }
-        _ => {
-            // I32/U32 and any other word-sized element.
-            w.line("final arr = result.cast<Int32>();");
-            w.line("return List<int>.generate(n, (i) => arr[i]);");
-        }
+    w.line(format!("if (result == nullptr) return <{dt}>[];"));
+    let pointee = elem_pointee(inner);
+    w.line(format!("final arr = result.cast<{pointee}>();"));
+    w.line(format!(
+        "final items = List<{dt}>.generate(n, (i) => {});",
+        map_elem_read("arr", "i", inner)
+    ));
+    if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
+        w.line("for (var i = 0; i < n; i++) {");
+        w.scope(|w| {
+            w.line("_weaveffiFreeString(arr[i]);");
+        });
+        w.line("}");
     }
+    w.line(format!(
+        "_weaveffiFreeBytes(result.cast(), n * sizeOf<{pointee}>());"
+    ));
+    w.line("return items;");
     out.push_str(&w.finish());
 }
 
+/// Emit the post-call conversion of a simple (non-out-param) return, paying
+/// the release the wrapper owes per the plan: a returned string is copied and
+/// then freed with `weaveffi_free_string`, a boxed optional scalar is
+/// dereferenced and freed with `weaveffi_free_bytes`, and an owned object
+/// pointer is adopted by its wrapper class (whose `dispose()` owns the
+/// destroy).
 fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("return result.toDartString();");
-        }
-        TypeRef::Bool => {
-            w.line("return result != 0;");
+            w.line("final value = result.toDartString();");
+            w.line("_weaveffiFreeString(result);");
+            w.line("return value;");
         }
         TypeRef::Enum(name) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("return {n}.fromValue(result);"));
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             let n = local_type_name(name).to_upper_camel_case();
             w.line(format!("return {n}._(result);"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 w.line("if (result == nullptr) return null;");
-                w.line("return result.toDartString();");
+                w.line("final value = result.toDartString();");
+                w.line("_weaveffiFreeString(result);");
+                w.line("return value;");
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
                 w.line("if (result == nullptr) return null;");
                 w.line(format!("return {n}._(result);"));
             }
-            // Optional scalars/bools/enums lower to a nullable pointer-to-scalar.
-            TypeRef::Bool => {
-                w.line("if (result == nullptr) return null;");
-                w.line("return result.value != 0;");
-            }
+            // Optional scalars/bools/enums lower to a producer-boxed nullable
+            // pointer-to-scalar: dereference, then free the box.
             TypeRef::Enum(name) => {
                 let n = local_type_name(name).to_upper_camel_case();
                 w.line("if (result == nullptr) return null;");
-                w.line(format!("return {n}.fromValue(result.value);"));
+                w.line(format!("final value = {n}.fromValue(result.value);"));
+                w.line("_weaveffiFreeBytes(result.cast(), sizeOf<Int32>());");
+                w.line("return value;");
             }
-            _ => {
+            other => {
+                let native = scalar_ffi(other).0;
                 w.line("if (result == nullptr) return null;");
-                w.line("return result.value;");
+                w.line("final value = result.value;");
+                w.line(format!(
+                    "_weaveffiFreeBytes(result.cast(), sizeOf<{native}>());"
+                ));
+                w.line("return value;");
             }
         },
         _ => {
@@ -2769,7 +3013,8 @@ mod tests {
         assert_eq!(dart_type(&TypeRef::Bool), "bool");
         assert_eq!(dart_type(&TypeRef::StringUtf8), "String");
         assert_eq!(dart_type(&TypeRef::Handle), "int");
-        assert_eq!(dart_type(&TypeRef::Struct("Foo".into())), "Foo");
+        assert_eq!(dart_type(&TypeRef::Record("Foo".into())), "Foo");
+        assert_eq!(dart_type(&TypeRef::RichEnum("Shape".into())), "Shape");
         assert_eq!(dart_type(&TypeRef::Enum("Bar".into())), "Bar");
         assert_eq!(
             dart_type(&TypeRef::TypedHandle("Session".into())),
@@ -2798,11 +3043,16 @@ mod tests {
         assert_eq!(native_ffi_type(&TypeRef::U32), "Uint32");
         assert_eq!(native_ffi_type(&TypeRef::I64), "Int64");
         assert_eq!(native_ffi_type(&TypeRef::F64), "Double");
-        assert_eq!(native_ffi_type(&TypeRef::Bool), "Int32");
+        // A C `bool` is one byte; `Bool` keeps strides and frees honest.
+        assert_eq!(native_ffi_type(&TypeRef::Bool), "Bool");
         assert_eq!(native_ffi_type(&TypeRef::StringUtf8), "Pointer<Utf8>");
         assert_eq!(native_ffi_type(&TypeRef::Handle), "Int64");
         assert_eq!(
-            native_ffi_type(&TypeRef::Struct("X".into())),
+            native_ffi_type(&TypeRef::Record("X".into())),
+            "Pointer<Void>"
+        );
+        assert_eq!(
+            native_ffi_type(&TypeRef::RichEnum("X".into())),
             "Pointer<Void>"
         );
         assert_eq!(native_ffi_type(&TypeRef::Enum("X".into())), "Int32");
@@ -3206,6 +3456,16 @@ mod tests {
             dart.contains("calloc.free(msgPtr)"),
             "missing free for string: {dart}"
         );
+        // The returned `const char*` is owned by the caller: copy first,
+        // then release it through the runtime.
+        assert!(
+            dart.contains("final value = result.toDartString();\n    _weaveffiFreeString(result);"),
+            "returned string must be copied then freed: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_free_string'"),
+            "missing weaveffi_free_string lookup: {dart}"
+        );
     }
 
     #[test]
@@ -3232,8 +3492,20 @@ mod tests {
             dart.contains("bool isValid(bool flag)"),
             "missing signature: {dart}"
         );
-        assert!(dart.contains("flag ? 1 : 0"), "missing bool-to-int: {dart}");
-        assert!(dart.contains("result != 0"), "missing int-to-bool: {dart}");
+        // A C `bool` crosses as the one-byte dart:ffi `Bool`, so the wrapper
+        // passes and returns Dart bools without integer conversions.
+        assert!(
+            dart.contains("Bool Function(Bool, Pointer<_WeaveFFIError>)"),
+            "missing Bool native signature: {dart}"
+        );
+        assert!(
+            dart.contains("bool Function(bool, Pointer<_WeaveFFIError>)"),
+            "missing bool dart signature: {dart}"
+        );
+        assert!(
+            !dart.contains("flag ? 1 : 0") && !dart.contains("result != 0;"),
+            "bool must not round-trip through ints: {dart}"
+        );
     }
 
     #[test]
@@ -3322,7 +3594,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -3647,7 +3919,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -3658,7 +3930,7 @@ mod tests {
                 Function {
                     name: "list_contacts".into(),
                     params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -3876,7 +4148,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -3930,7 +4202,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -4052,7 +4324,7 @@ mod tests {
                     name: "describe".into(),
                     params: vec![Param {
                         name: "shape".into(),
-                        ty: TypeRef::Struct("Shape".into()),
+                        ty: TypeRef::RichEnum("Shape".into()),
                         mutable: false,
                         doc: None,
                     }],
@@ -4069,7 +4341,7 @@ mod tests {
                     params: vec![
                         Param {
                             name: "shape".into(),
-                            ty: TypeRef::Struct("Shape".into()),
+                            ty: TypeRef::RichEnum("Shape".into()),
                             mutable: false,
                             doc: None,
                         },
@@ -4080,7 +4352,7 @@ mod tests {
                             doc: None,
                         },
                     ],
-                    returns: Some(TypeRef::Struct("Shape".into())),
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -4305,8 +4577,9 @@ mod tests {
             "missing per-variant getter symbols: {dart}"
         );
         assert!(
-            dart.contains("return result.toDartString();"),
-            "string getter must decode the C string: {dart}"
+            dart.contains("final value = result.toDartString();")
+                && dart.contains("_weaveffiFreeString(result);"),
+            "string getter must decode the C string and free it: {dart}"
         );
         // Carries the per-variant field doc through the namespaced getter.
         assert!(
@@ -4318,7 +4591,7 @@ mod tests {
     #[test]
     fn rich_enum_functions_marshal_opaque_handle() {
         let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
-        // Functions taking/returning the rich enum lower it to TypeRef::Struct,
+        // Functions taking/returning the rich enum reference it as RichEnum,
         // so they pass the opaque handle in and wrap the handle out unchanged.
         assert!(
             dart.contains("String describe(Shape shape)"),
@@ -4622,8 +4895,8 @@ mod tests {
     fn interface_iterator_method_checks_domain() {
         let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
         assert!(
-            dart.contains("Iterable<String> listKeys() {"),
-            "missing iterator method: {dart}"
+            dart.contains("Iterable<String> listKeys() sync* {"),
+            "missing lazy iterator method: {dart}"
         );
         assert!(
             dart.contains("_weaveffiKvStoreListKeys(_handle, err)"),
@@ -4634,7 +4907,139 @@ mod tests {
             .expect("listKeys body")..];
         assert!(
             body.contains("_checkKvException(err);"),
-            "throwing iterator must drain through the domain check: {dart}"
+            "throwing iterator must route launch and next through the domain check: {dart}"
+        );
+    }
+
+    /// The `iter<T>` wrapper must be a lazy `sync*` generator: one producer
+    /// `next` call per yielded element, no hidden drain into a list, and a
+    /// `try`/`finally` that destroys the handle exactly once (nulling it) on
+    /// exhaustion, error, or generator teardown.
+    #[test]
+    fn iterator_wrapper_is_lazy_sync_star() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        let body = &dart[dart
+            .find("Iterable<String> listKeys() sync* {")
+            .expect("sync* wrapper")..];
+        let body = &body[..body.find("\n  }").expect("member end")];
+        // One `next` per consumer step, yielded straight out of the loop.
+        assert!(
+            body.contains("while (_weaveffiKvStoreListKeysIteratorNext(iter, outItem, err) != 0) {"),
+            "missing per-element next loop: {body}"
+        );
+        assert!(body.contains("yield item;"), "missing yield: {body}");
+        assert!(
+            !body.contains(".add(") && !body.contains("return items;"),
+            "iterator must not drain into a list: {body}"
+        );
+        // Destroy exactly once, guarded and nulled, from the finally block.
+        assert!(body.contains("} finally {"), "missing finally: {body}");
+        assert!(
+            body.contains("if (iter != nullptr) {")
+                && body.contains("_weaveffiKvStoreListKeysIteratorDestroy(iter);")
+                && body.contains("iter = nullptr;"),
+            "finally must destroy once and null the handle: {body}"
+        );
+        // String elements are copied then freed per ElemFree::String.
+        assert!(
+            body.contains("final item = itemPtr.toDartString();")
+                && body.contains("_weaveffiFreeString(itemPtr);"),
+            "string elements must be copied then freed: {body}"
+        );
+    }
+
+    /// Abandoned iterations (a broken `for`, `first`, `take`) never resume a
+    /// `sync*` body, so its `finally` cannot run; the wrapper attaches a
+    /// `NativeFinalizer` backstop to a generator-local anchor and detaches it
+    /// before the eager destroy so double-destroy is impossible.
+    #[test]
+    fn iterator_wrapper_has_finalizer_backstop() {
+        let dart = render_dart_module(&store_api(), "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("final class _IteratorLifetime implements Finalizable {}"),
+            "missing iterator lifetime anchor class: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "final _weaveffiKvStoreListKeysIteratorDestroyFinalizer = NativeFinalizer("
+            ),
+            "missing NativeFinalizer over the destroy symbol: {dart}"
+        );
+        let body = &dart[dart
+            .find("Iterable<String> listKeys() sync* {")
+            .expect("sync* wrapper")..];
+        let body = &body[..body.find("\n  }").expect("member end")];
+        assert!(
+            body.contains(
+                "_weaveffiKvStoreListKeysIteratorDestroyFinalizer.attach(anchor, iter, detach: anchor);"
+            ),
+            "launch must attach the finalizer backstop: {body}"
+        );
+        assert!(
+            body.contains("_weaveffiKvStoreListKeysIteratorDestroyFinalizer.detach(anchor);"),
+            "eager destroy must detach the backstop first: {body}"
+        );
+    }
+
+    /// A free function returning `iter<record>` yields adopted wrapper
+    /// objects (the caller disposes each) and documents the streaming and
+    /// disposal contract.
+    #[test]
+    fn iterator_of_records_yields_adopted_wrappers() {
+        let api = make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![Function {
+                name: "entries".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
+                doc: Some("Streams every entry.".into()),
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Entry".into(),
+                doc: None,
+                builder: false,
+                fields: vec![StructField {
+                    name: "key".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api, "weaveffi", "kv.yml");
+        assert!(
+            dart.contains("Iterable<Entry> entries() sync* {"),
+            "missing record iterator wrapper: {dart}"
+        );
+        assert!(
+            dart.contains("yield Entry._(outItem.value);"),
+            "record elements must be adopted by their wrapper: {dart}"
+        );
+        // Non-throwing: launch and next errors trap via the generic check.
+        let body = &dart[dart.find("Iterable<Entry> entries()").expect("body")..];
+        assert!(
+            body.contains("_checkError(err);"),
+            "trap-strategy iterator must use the generic check: {dart}"
+        );
+        // The generated doc states the streaming and disposal contract.
+        assert!(
+            dart.contains("/// Returns a lazy [Iterable]:"),
+            "missing streaming doc: {dart}"
+        );
+        assert!(
+            dart.contains("/// Each yielded element is owned by the caller:"),
+            "missing element ownership doc: {dart}"
         );
     }
 
@@ -4785,7 +5190,11 @@ mod tests {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let path = std::path::Path::new(manifest_dir).join("../../samples/contacts/contacts.yml");
         let src = std::fs::read_to_string(path).expect("contacts sample readable");
-        let api = weaveffi_ir::parse::parse_api_str(&src, "yaml").expect("contacts sample parses");
+        let mut api =
+            weaveffi_ir::parse::parse_api_str(&src, "yaml").expect("contacts sample parses");
+        // Generators run strictly post-resolution: rewrite every parsed
+        // `Named` reference into its resolved kind first, as the CLI does.
+        weaveffi_core::validate::resolve_type_refs(&mut api);
         let dart = render_dart_module(&api, "weaveffi", "contacts.yml");
         assert!(
             dart.contains("enum ContactType {"),
@@ -4803,6 +5212,179 @@ mod tests {
         assert!(
             dart.contains("weaveffi_contacts_ContactBook_add"),
             "missing ContactBook add member symbol: {dart}"
+        );
+    }
+
+    /// One-function module helper for the ownership-audit tests below.
+    fn returning(name: &str, returns: TypeRef) -> Api {
+        make_api(vec![simple_module(vec![Function {
+            name: name.into(),
+            params: vec![],
+            returns: Some(returns),
+            doc: None,
+            throws: false,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])])
+    }
+
+    #[test]
+    fn bytes_return_copies_then_frees_buffer() {
+        let dart = render_dart_module(
+            &returning("blob", TypeRef::Bytes),
+            "weaveffi",
+            "weaveffi.yml",
+        );
+        assert!(
+            dart.contains("final bytes = List<int>.generate(n, (i) => result[i]);"),
+            "bytes must be copied: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiFreeBytes(result, n);"),
+            "bytes buffer must be freed after copying: {dart}"
+        );
+        assert!(
+            dart.contains("'weaveffi_free_bytes'"),
+            "missing weaveffi_free_bytes lookup: {dart}"
+        );
+    }
+
+    #[test]
+    fn string_list_return_frees_elements_and_buffer() {
+        let dart = render_dart_module(
+            &returning("names", TypeRef::List(Box::new(TypeRef::StringUtf8))),
+            "weaveffi",
+            "weaveffi.yml",
+        );
+        assert!(
+            dart.contains("final arr = result.cast<Pointer<Utf8>>();"),
+            "missing element cast: {dart}"
+        );
+        // Each copied string element is released, then the array itself.
+        assert!(
+            dart.contains("_weaveffiFreeString(arr[i]);"),
+            "string elements must be freed after copying: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Utf8>>());"),
+            "array buffer must be freed: {dart}"
+        );
+    }
+
+    #[test]
+    fn record_list_return_adopts_elements_and_frees_buffer() {
+        let dart = render_dart_module(
+            &returning("all", TypeRef::List(Box::new(TypeRef::Record("Item".into())))),
+            "weaveffi",
+            "weaveffi.yml",
+        );
+        // Object elements transfer to the caller (no per-element free); only
+        // the array buffer is released.
+        assert!(
+            dart.contains("List<Item>.generate(n, (i) => Item._(arr[i]));"),
+            "record elements must be adopted: {dart}"
+        );
+        assert!(
+            !dart.contains("_weaveffiFreeString(arr[i]);"),
+            "record elements must not be string-freed: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Void>>());"),
+            "array buffer must be freed: {dart}"
+        );
+    }
+
+    #[test]
+    fn map_return_frees_string_elements_and_parallel_arrays() {
+        let dart = render_dart_module(
+            &returning(
+                "tally",
+                TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            ),
+            "weaveffi",
+            "weaveffi.yml",
+        );
+        assert!(
+            dart.contains("_weaveffiFreeString(keys[i]);"),
+            "string keys must be freed after copying: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiFreeBytes(keys.cast(), n * sizeOf<Pointer<Utf8>>());"),
+            "keys array must be freed: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiFreeBytes(vals.cast(), n * sizeOf<Int32>());"),
+            "values array must be freed: {dart}"
+        );
+    }
+
+    #[test]
+    fn boxed_optional_scalar_return_is_freed() {
+        let dart = render_dart_module(
+            &returning("level", TypeRef::Optional(Box::new(TypeRef::I64))),
+            "weaveffi",
+            "weaveffi.yml",
+        );
+        assert!(
+            dart.contains("if (result == nullptr) return null;"),
+            "missing null check: {dart}"
+        );
+        assert!(
+            dart.contains("final value = result.value;")
+                && dart.contains("_weaveffiFreeBytes(result.cast(), sizeOf<Int64>());"),
+            "boxed scalar must be dereferenced then freed: {dart}"
+        );
+    }
+
+    /// Async result buffers are borrowed for the callback's duration: the
+    /// wrapper deep-copies them inside the callback and never frees them.
+    #[test]
+    fn async_buffer_results_copy_and_never_free() {
+        let api = make_api(vec![simple_module(vec![
+            Function {
+                name: "fetch_names".into(),
+                params: vec![],
+                returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                throws: false,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            },
+            Function {
+                name: "fetch_blob".into(),
+                params: vec![],
+                returns: Some(TypeRef::Bytes),
+                doc: None,
+                throws: false,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            },
+        ])]);
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("Future<List<String>> fetchNames()"),
+            "missing async list wrapper: {dart}"
+        );
+        assert!(
+            dart.contains(": List<String>.generate(resultLen, (i) => result[i].toDartString()));"),
+            "async list result must be copied element-wise: {dart}"
+        );
+        assert!(
+            dart.contains(": List<int>.generate(resultLen, (i) => result[i]));"),
+            "async bytes result must be copied: {dart}"
+        );
+        // Borrowed: the callback must not release the producer's buffers.
+        let cb = &dart[dart.find("Future<List<String>> fetchNames()").expect("wrapper")..];
+        let cb = &cb[..cb.find("\n}").expect("end")];
+        assert!(
+            !cb.contains("_weaveffiFree"),
+            "async callback must never free borrowed result buffers: {cb}"
         );
     }
 

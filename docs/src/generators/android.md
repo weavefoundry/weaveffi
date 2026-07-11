@@ -42,7 +42,7 @@ layer bridges them to the C ABI.
 | `[i32]`        | `IntArray`             | `IntArray`            | `jintArray`    |
 | `[i64]`        | `LongArray`            | `LongArray`           | `jlongArray`   |
 | `[string]`     | `Array<String>`        | `Array<String>`       | `jobjectArray` |
-| `iter<T>`      | `Iterator<T>`          | `Iterator<T>`         | `jobject`      |
+| `iter<T>`      | `Long` (iterator handle) | `Iterator<T>` (lazy wrapper class) | `jlong`  |
 
 ## Example IDL → generated code
 
@@ -266,6 +266,9 @@ class Store internal constructor(internal var handle: Long) : java.io.Closeable 
     /** Remove the entry for the given key, returning true if it existed */
     fun delete(key: String): Boolean = nativeDelete(handle, key)
 
+    /** Stream every key, optionally filtered by a prefix */
+    fun listKeys(prefix: String?): Iterator<String> = KvStoreListKeysIterator(nativeListKeys(handle, prefix))
+
     /** Reclaim space asynchronously; returns the number of bytes reclaimed */
     suspend fun compact(): Long = suspendCancellableCoroutine { cont ->
         nativeCompactAsync(handle, 0L, WeaveContinuation(cont) { code, message -> KvException.fromCode(code, message) })
@@ -443,11 +446,15 @@ during GC but is not a substitute for deterministic cleanup.
 - Strings returned from JNI are fresh Java strings; the JNI shim frees
   the underlying Rust pointer with `weaveffi_free_string` before
   returning.
-- Byte arrays returned from JNI are copied with `SetByteArrayRegion`
-  before the Rust buffer is freed.
+- Byte arrays returned from JNI are copied with `SetByteArrayRegion`,
+  then the Rust buffer is freed with `weaveffi_free_bytes`.
+- Returned string arrays and maps free each element with
+  `weaveffi_free_string` after copying, then release the array buffer
+  (or both parallel key/value buffers) with `weaveffi_free_bytes`.
 - Optional values are passed as boxed wrappers (`Integer`, `Long`,
   `Double`, `Boolean`); the JNI shim unboxes and forwards them to the C
-  ABI.
+  ABI. A returned boxed optional scalar is read and its box freed with
+  `weaveffi_free_bytes`.
 
 ## Async support
 
@@ -511,14 +518,26 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, v
         if ((*ctx->jvm)->AttachCurrentThread(ctx->jvm, (void**)&env, NULL) != JNI_OK) { free(ctx); return; }
         attached = 1;
     }
-    /* ... calls callback.onError(String) or callback.onSuccess(Object) ... */
-    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    /* ... calls callback.onError(int, String) or callback.onSuccess(Object) ... */
+    weaveffi_jni_handle_uncaught(env);
     (*env)->DeleteGlobalRef(env, ctx->callback);
     JavaVM* jvm = ctx->jvm;
     free(ctx);
     if (attached) (*jvm)->DetachCurrentThread(jvm);
 }
 ```
+
+The completion callback fires exactly once, on a producer thread.
+Result buffers passed to it (strings, byte arrays, arrays) are
+borrowed from the producer for the callback's duration, so the shim
+copies them into Java objects (`NewStringUTF`, `SetByteArrayRegion`)
+inside the callback and never frees them. Owned-object results are the
+exception: the callback receives ownership, resumes the continuation
+with the raw handle, and the suspend wrapper adopts it into the
+wrapper class (`TaskResult(raw)` above). An exception thrown by the
+resumed coroutine goes through the same
+`weaveffi_jni_handle_uncaught` path as listener exceptions (see
+[Callbacks and listeners](#callbacks-and-listeners)).
 
 The generated `build.gradle` does not declare a coroutines dependency;
 add `org.jetbrains.kotlinx:kotlinx-coroutines-android` (or `-core`) to
@@ -590,7 +609,7 @@ static void weaveffi_events_OnMessage_fn_jni_tramp(const char* message, void* co
     jclass fn_cls = (*env)->GetObjectClass(env, ctx->callback);
     jmethodID invoke = (*env)->GetMethodID(env, fn_cls, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;");
     (*env)->CallObjectMethod(env, ctx->callback, invoke, _a0);
-    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    weaveffi_jni_handle_uncaught(env);
     (*env)->PopLocalFrame(env, NULL);
     if (attached) (*ctx->jvm)->DetachCurrentThread(ctx->jvm);
 }
@@ -609,30 +628,131 @@ The callback runs on the producer's thread, whichever thread the
 native side fires the event from. For UI work, hop to the main thread
 yourself (e.g. `withContext(Dispatchers.Main)` or `Handler.post`).
 
-## Iterators
-
-`iter<T>` returns surface as `Iterator<T>` in Kotlin, but the shim
-drains the native iterator eagerly: it calls the generated `_next` C
-function until exhaustion, copies each element into a
-`java.util.ArrayList` (freeing the Rust string as it goes), destroys
-the iterator handle, and returns the list's `iterator()`. From the
-`events` sample (`get_messages` returns `iter<string>`):
+An exception thrown by the Kotlin callback has no caller to propagate
+to, since the frame below it is native producer code. The glue routes
+it through `weaveffi_jni_handle_uncaught`, which delivers it to the
+handler installed on the module companion:
 
 ```kotlin
-@JvmStatic external fun getMessages(): Iterator<String>
+/**
+ * Installs a handler for exceptions thrown by listener callbacks and
+ * async continuations on native producer threads. These exceptions have
+ * no Kotlin caller to propagate to; when no handler is installed, they
+ * are logged with their stack trace and dropped. Pass `null` to
+ * restore the default logging behavior.
+ */
+@JvmStatic fun setCallbackExceptionHandler(handler: ((Throwable) -> Unit)?) {
+    callbackExceptionHandler = handler
+}
 ```
 
-```c
-weaveffi_events_GetMessagesIterator* _iter = weaveffi_events_get_messages(&err);
-/* ... */
-while (weaveffi_events_GetMessagesIterator_next(_iter, &_item, &_iter_err) != 0) {
-    jstring _jitem = _item ? (*env)->NewStringUTF(env, _item) : (*env)->NewStringUTF(env, "");
-    (*env)->CallBooleanMethod(env, _list, _al_add, _jitem);
-    (*env)->DeleteLocalRef(env, _jitem);
-    weaveffi_free_string(_item);
+When a module declares listeners or async functions, the JNI glue also
+defines `JNI_OnLoad`, which caches a global reference to the wrapper
+class and the `dispatchCallbackException` method id so the producer
+thread can deliver exceptions without an extra class lookup.
+
+## Iterators
+
+`iter<T>` returns surface as `Iterator<T>` in Kotlin, backed by a
+generated per-function wrapper class that is fully lazy: the external
+launcher returns the raw iterator handle as a `Long`, and each
+`hasNext()` lookahead issues exactly one `nativeNext` call, which maps
+to one producer `_next` call. Nothing is drained into a hidden list.
+From the `events` sample (`get_messages` returns `iter<string>`):
+
+```kotlin
+@JvmStatic private external fun getMessagesJni(): Long
+@JvmStatic fun getMessages(): Iterator<String> = EventsGetMessagesIterator(getMessagesJni())
+
+/**
+ * A lazy iterator over the `String` elements streamed by [getMessages]. Each step pulls
+ * exactly one element from the native producer. The native handle is
+ * released when the producer is exhausted, when [close] is called, or by
+ * the finalizer if the iterator is abandoned, whichever comes first.
+ */
+class EventsGetMessagesIterator internal constructor(private var handle: Long) : Iterator<String>, java.io.Closeable {
+    private var nextSlot: Array<Any?>? = null
+
+    override fun hasNext(): Boolean {
+        if (nextSlot != null) return true
+        if (handle == 0L) return false
+        val slot = nativeNext(handle)
+        if (slot == null) {
+            close()
+            return false
+        }
+        nextSlot = slot
+        return true
+    }
+
+    override fun next(): String {
+        if (!hasNext()) throw NoSuchElementException()
+        val raw = nextSlot!![0]
+        nextSlot = null
+        return raw as String
+    }
+
+    override fun close() {
+        if (handle != 0L) {
+            nativeDestroy(handle)
+            handle = 0L
+        }
+    }
+
+    protected fun finalize() {
+        close()
+    }
+
+    companion object {
+        init { System.loadLibrary("weaveffi") }
+
+        @JvmStatic private external fun nativeNext(handle: Long): Array<Any?>?
+        @JvmStatic private external fun nativeDestroy(handle: Long)
+    }
 }
-weaveffi_events_GetMessagesIterator_destroy(_iter);
 ```
+
+The JNI `nativeNext` shim pulls one element and returns it in a
+one-slot `Object[]`; `null` means the stream is exhausted. Each string
+element is freed with `weaveffi_free_string` right after `NewStringUTF`
+copies it; when the element type is a struct, the raw handle is
+returned instead and the Kotlin `next()` adopts it into the owning
+wrapper class (`Contact(raw as Long)`), whose `close()` eventually
+destroys it:
+
+```c
+JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_EventsGetMessagesIterator_nativeNext(JNIEnv* env, jclass clazz, jlong handle) {
+    weaveffi_events_GetMessagesIterator* _iter = (weaveffi_events_GetMessagesIterator*)(intptr_t)handle;
+    const char* _item = (const char*)0;
+    weaveffi_error err = {0, NULL};
+    int32_t _has = weaveffi_events_GetMessagesIterator_next(_iter, &_item, &err);
+    if (err.code != 0) {
+        throw_weaveffi_error(env, &err);
+        return NULL;
+    }
+    if (_has == 0) { return NULL; }
+    jstring _jitem = _item ? (*env)->NewStringUTF(env, _item) : (*env)->NewStringUTF(env, "");
+    weaveffi_free_string(_item);
+    jclass _obj_cls = (*env)->FindClass(env, "java/lang/Object");
+    jobjectArray _slot = (*env)->NewObjectArray(env, 1, _obj_cls, NULL);
+    (*env)->SetObjectArrayElement(env, _slot, 0, _jitem);
+    return _slot;
+}
+```
+
+The native handle is destroyed exactly once: `close()` is called
+eagerly when `hasNext()` sees exhaustion, callers can call `close()`
+themselves (the class implements `Closeable`) when abandoning
+iteration early, and the `finalize()` safety net covers abandoned
+iterators during GC. Nulling the handle makes a double destroy
+impossible.
+
+Errors from the launcher and from each `next` follow the function's
+error strategy: the throwing `kvstore` sample's `Store.listKeys` shim
+throws the typed domain exception (`throw_weaveffi_kv_KvError`, so
+`KvException.KeyNotFound` and friends) from the step that failed,
+while the non-throwing `getMessages` throws the generic
+`WeaveFFIException` only for producer bugs.
 
 ## Troubleshooting
 

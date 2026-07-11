@@ -19,9 +19,10 @@ use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding,
-    FieldBinding, FnBinding, InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    RichVariantBinding, StructBinding,
+    FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding,
+    ParamBinding, RichVariantBinding, StructBinding,
 };
+use weaveffi_core::plan::{elem_free, ElemFree, ErrorStrategy};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::platform::Platform;
@@ -268,18 +269,28 @@ fn go_type(ty: &TypeRef) -> String {
         // Structs, interfaces, enums, and typed handles surface as bare local
         // Go types; a cross-module reference (resolved to e.g. `kv.Store`)
         // must name the local `Store` type rather than the qualified `KvStore`.
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+        TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => {
             format!("*{}", local_type_name(n).to_upper_camel_case())
         }
         TypeRef::Enum(n) => local_type_name(n).to_upper_camel_case(),
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => go_type(inner),
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => go_type(inner),
             TypeRef::List(_) | TypeRef::Map(_, _) => go_type(inner),
             TypeRef::Bytes | TypeRef::BorrowedBytes => go_type(inner),
             _ => format!("*{}", go_type(inner)),
         },
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => format!("[]{}", go_type(inner)),
+        TypeRef::List(inner) => format!("[]{}", go_type(inner)),
+        // The bare (non-throwing) sequence type; a throwing iterator wrapper
+        // spells `iter.Seq2[T, error]` at its signature site instead.
+        TypeRef::Iterator(inner) => format!("iter.Seq[{}]", go_type(inner)),
         TypeRef::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -354,7 +365,10 @@ fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
 
 fn c_opaque_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
     match ty {
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+        TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::TypedHandle(n)
+        | TypeRef::Interface(n) => {
             c_abi_struct_name(n, module, prefix)
         }
         _ => String::new(),
@@ -377,7 +391,21 @@ fn return_uses_unsafe(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => true,
         TypeRef::List(_) | TypeRef::Map(_, _) => true,
-        TypeRef::Optional(inner) => return_uses_unsafe(inner),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            // Pointer-shaped optionals reuse the inner conversion (null =
+            // none), so they only need what the inner type needs.
+            TypeRef::StringUtf8
+            | TypeRef::BorrowedStr
+            | TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => return_uses_unsafe(inner),
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _) => {
+                true
+            }
+            // Boxed optional scalars are freed through an unsafe.Pointer cast.
+            _ => true,
+        },
         _ => false,
     }
 }
@@ -396,6 +424,8 @@ fn type_has_bool(ty: &TypeRef) -> bool {
 struct Imports {
     /// `fmt` (error formatting); implied by [`err_infra`](Self::err_infra).
     fmt: bool,
+    /// `iter` (lazy sequences returned by `iter<T>` functions).
+    iter: bool,
     /// `unsafe` (pointer staging for strings/bytes/lists/maps, callback
     /// contexts).
     unsafe_ptr: bool,
@@ -414,6 +444,7 @@ struct Imports {
 fn scan_imports(model: &BindingModel) -> Imports {
     let mut any_callable = false;
     let mut has_async = false;
+    let mut has_iter = false;
     let mut has_listeners = false;
     let mut has_fallible_ctor = false;
     let mut has_domain = false;
@@ -426,6 +457,7 @@ fn scan_imports(model: &BindingModel) -> Imports {
         for f in m.callables() {
             any_callable = true;
             has_async |= f.is_async;
+            has_iter |= matches!(f.shape, CallShape::Iterator(_));
             unsafe_ptr |= f.params.iter().any(|p| param_uses_unsafe(&p.ty))
                 || f.ret.as_ref().is_some_and(return_uses_unsafe);
             bool_helpers |= f.params.iter().any(|p| type_has_bool(&p.ty))
@@ -477,6 +509,7 @@ fn scan_imports(model: &BindingModel) -> Imports {
 
     Imports {
         fmt: err_infra,
+        iter: has_iter,
         unsafe_ptr,
         bool_helpers,
         sync: has_async || has_listeners,
@@ -489,7 +522,9 @@ fn scan_imports(model: &BindingModel) -> Imports {
 fn render_go_mod(module_path: &str, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::DoubleSlash, input_basename);
     let trailer = render_trailer(CommentStyle::DoubleSlash, "go.mod");
-    format!("{prelude}module {module_path}\n\ngo 1.21\n\n{trailer}")
+    // Go 1.23 is required for the standard `iter` package the lazy
+    // `iter<T>` wrappers return.
+    format!("{prelude}module {module_path}\n\ngo 1.23\n\n{trailer}")
 }
 
 fn render_readme(input_basename: &str) -> String {
@@ -502,7 +537,7 @@ Auto-generated Go bindings using CGo.
 
 ## Prerequisites
 
-- Go >= 1.21
+- Go >= 1.23 (the bindings return standard `iter` package sequences)
 - A C compiler (gcc or clang) accessible to CGo
 - The compiled shared library (`libweaveffi.so`, `libweaveffi.dylib`,
   or `weaveffi.dll`) and the C header (`weaveffi.h`)
@@ -656,7 +691,17 @@ struct ErrCtx<'a> {
     stem: Option<&'a str>,
 }
 
-impl ErrCtx<'_> {
+impl<'a> ErrCtx<'a> {
+    /// Build the wrapper error context for `f` from the shared plan's
+    /// [`ErrorStrategy`]: a `Throws` callable returns `(T, error)` through
+    /// `stem`'s typed domain, a `Trap` callable panics via `wvTrap`.
+    fn of(f: &FnBinding, stem: Option<&'a str>) -> Self {
+        Self {
+            throws: matches!(f.error_strategy(), ErrorStrategy::Throws),
+            stem,
+        }
+    }
+
     /// The Go expression converting a taken `(code, message)` pair into an
     /// `error` value.
     fn map_call(&self, args: &str) -> String {
@@ -919,10 +964,13 @@ fn render_go(
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if imports.fmt || imports.unsafe_ptr || imports.sync {
+    if imports.fmt || imports.iter || imports.unsafe_ptr || imports.sync {
         out.push_str("\nimport (\n");
         if imports.fmt {
             out.push_str("\t\"fmt\"\n");
+        }
+        if imports.iter {
+            out.push_str("\t\"iter\"\n");
         }
         if imports.sync {
             out.push_str("\t\"sync\"\n");
@@ -986,10 +1034,7 @@ fn render_go(
         }
         for f in &m.functions {
             let go_name = wrapper_name(&m.path, &f.name, strip_module_prefix).to_upper_camel_case();
-            let err = ErrCtx {
-                throws: f.throws,
-                stem: stem.as_deref(),
-            };
+            let err = ErrCtx::of(f, stem.as_deref());
             if let CallShape::Async(ab) = &f.shape {
                 render_async_function(&mut out, prefix, &m.path, f, ab, &go_name, None, err);
             } else {
@@ -1198,7 +1243,10 @@ fn emit_cb_param_arg(
         }
         // Opaque pointers are borrowed for the duration of the callback; the
         // wrapper must not be Closed by the consumer.
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Interface(name) => {
             let g = local_type_name(name).to_upper_camel_case();
             w.line(format!("{arg} := &{g}{{ptr: {n}}}"));
         }
@@ -1219,7 +1267,10 @@ fn emit_cb_param_arg(
                     ));
                 });
             }
-            TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Interface(name) => {
+            TypeRef::Record(name)
+            | TypeRef::RichEnum(name)
+            | TypeRef::TypedHandle(name)
+            | TypeRef::Interface(name) => {
                 let g = local_type_name(name).to_upper_camel_case();
                 w.line(format!("var {arg} *{g}"));
                 w.block(format!("if {n} != nil {{"), "}", |w| {
@@ -1245,6 +1296,7 @@ fn emit_cb_param_arg(
         TypeRef::List(inner) => {
             w.line(format!("count{idx} := int({}_len)", p.name));
             let mut body = String::new();
+            // Callback arrays are borrowed for the callback's duration.
             decode_list(
                 &mut body,
                 &arg,
@@ -1253,12 +1305,14 @@ fn emit_cb_param_arg(
                 &format!("count{idx}"),
                 prefix,
                 module,
+                false,
             );
             w.raw(body);
         }
         TypeRef::Map(k, v) => {
             w.line(format!("count{idx} := int({}_len)", p.name));
             let mut body = String::new();
+            // Callback buffers are borrowed for the callback's duration.
             decode_map(
                 &mut body,
                 &arg,
@@ -1269,10 +1323,12 @@ fn emit_cb_param_arg(
                 &format!("count{idx}"),
                 prefix,
                 module,
+                false,
             );
             w.raw(body);
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
     arg
@@ -1392,6 +1448,13 @@ fn async_outcome_type(prefix: &str, f: &FnBinding) -> String {
 
 /// Send the converted async result over the outcome channel. Runs inside the
 /// completion trampoline after the error path has been handled.
+///
+/// Result buffers (strings, bytes, arrays, boxed scalars) are borrowed for
+/// the callback's duration per the shared async protocol: they are deep
+/// copied here and never freed (the producer releases them after the
+/// callback returns). Owned-object results are the exception: the callback
+/// receives ownership and the wrapper adopts the pointer (its `Close` calls
+/// the destroy symbol).
 fn emit_async_result_send(
     out: &mut String,
     ret: &Option<TypeRef>,
@@ -1432,36 +1495,42 @@ fn emit_async_result_send(
             ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            // Borrowed for the callback's duration: copy, do not free.
             w.line("val := \"\"");
             w.block("if result != nil {", "}", |w| {
                 w.line("val = C.GoString(result)");
-                w.line("C.weaveffi_free_string(result)");
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            // Borrowed for the callback's duration: copy, do not free.
             w.line("var val []byte");
             w.block("if result != nil {", "}", |w| {
                 w.line("val = C.GoBytes(unsafe.Pointer(result), C.int(result_len))");
-                w.line("C.weaveffi_free_bytes(result, result_len)");
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
-        TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+        TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::TypedHandle(n)
+        | TypeRef::Interface(n) => {
             let g = local_type_name(n).to_upper_camel_case();
             w.line(format!("ch <- {outcome}{{val: &{g}{{ptr: result}}}}"));
         }
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                // Borrowed for the callback's duration: copy, do not free.
                 w.line("var val *string");
                 w.block("if result != nil {", "}", |w| {
                     w.line("v := C.GoString(result)");
-                    w.line("C.weaveffi_free_string(result)");
                     w.line("val = &v");
                 });
                 w.line(format!("ch <- {outcome}{{val: val}}"));
             }
-            TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+            TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::TypedHandle(n)
+        | TypeRef::Interface(n) => {
                 let g = local_type_name(n).to_upper_camel_case();
                 w.line(format!("var val *{g}"));
                 w.block("if result != nil {", "}", |w| {
@@ -1490,13 +1559,15 @@ fn emit_async_result_send(
         TypeRef::List(inner) => {
             w.line("count := int(result_len)");
             let mut body = String::new();
-            decode_list(&mut body, "val", inner, "result", "count", prefix, module);
+            // Borrowed for the callback's duration: copy, do not free.
+            decode_list(&mut body, "val", inner, "result", "count", prefix, module, false);
             w.raw(body);
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Map(k, v) => {
             w.line("count := int(result_len)");
             let mut body = String::new();
+            // Borrowed for the callback's duration: copy, do not free.
             decode_map(
                 &mut body,
                 "val",
@@ -1507,11 +1578,13 @@ fn emit_async_result_send(
                 "count",
                 prefix,
                 module,
+                false,
             );
             w.raw(body);
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -1520,12 +1593,15 @@ fn emit_async_result_send(
 /// completion trampoline and waits on a buffered channel, plus the outcome
 /// type and the exported trampoline itself.
 ///
-/// A throwing wrapper returns `(T, error)` and the trampoline maps a reported
-/// error through the domain (`wvMap{Stem}`); a plain wrapper returns bare `T`
-/// and panics on the calling goroutine when the outcome carries an error
-/// (the trampoline itself must never panic: it runs on a producer thread
-/// entered from C). With `receiver` set, the wrapper is a method on that
-/// wrapper type passing `s.ptr` as the leading launch argument.
+/// The error split follows the shared plan's [`ErrorStrategy`]. A throwing
+/// wrapper returns `(T, error)` and the trampoline maps a reported error
+/// through the domain (`wvMap{Stem}`). A plain wrapper returns bare `T`; a
+/// reported error can only be a producer bug, so the trampoline wraps it as
+/// the generic brand error (never the typed domain) and the wrapper panics
+/// with it on the calling goroutine (the trampoline itself must never panic:
+/// it runs on a producer thread entered from C). With `receiver` set, the
+/// wrapper is a method on that wrapper type passing `s.ptr` as the leading
+/// launch argument.
 #[allow(clippy::too_many_arguments)]
 fn render_async_function(
     out: &mut String,
@@ -1561,7 +1637,13 @@ fn render_async_function(
         .collect();
     let mut tramp_body = String::new();
     emit_async_result_send(&mut tramp_body, &f.ret, &outcome, prefix, module);
-    let map_err = err.map_call("wvTakeError(err)");
+    // A non-throwing function's error slot can only carry a producer bug:
+    // brand it generically rather than dressing it as a typed domain error.
+    let map_err = if err.throws {
+        err.map_call("wvTakeError(err)")
+    } else {
+        "wvBrandError(wvTakeError(err))".to_string()
+    };
     w.line(format!("//export {tramp}"));
     w.block(
         format!("func {tramp}({}) {{", formals.join(", ")),
@@ -1591,7 +1673,7 @@ fn render_async_function(
     let mut doc = String::new();
     emit_fn_doc(&mut doc, &f.doc, &f.params, "", go_name);
     w.raw(doc);
-    w.line("// Blocks until the async producer completes.");
+    w.line("// Blocks the calling goroutine until the async producer completes.");
     if let Some(msg) = &f.deprecated {
         w.line(format!("// Deprecated: {msg}"));
     }
@@ -1687,8 +1769,9 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
 /// exported per-variant tag constants (reusing the plain-enum const style), one
 /// `New{Enum}{Variant}` constructor per variant calling `{tag}_{V}_new`, and
 /// per-variant field accessors (`{Variant}{Field}()`) reusing the struct getter
-/// marshalling. Because a rich enum resolves to `TypeRef::Struct`, the existing
-/// function/param/return machinery handles it as a value unchanged.
+/// marshalling. Because a rich enum crosses the ABI as an opaque object
+/// pointer (`TypeRef::RichEnum`), the existing function/param/return machinery
+/// shares the record paths unchanged.
 ///
 /// A plain C-style enum is skipped here (it is handled by [`render_enum`]).
 fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: &EnumBinding) {
@@ -1969,12 +2052,19 @@ fn render_getter(
                 w.line(format!("return cToBool({getter}(s.ptr))"));
             }
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("return C.GoString({getter}(s.ptr))"));
+                // The getter returns an owned string: copy, then free.
+                w.line(format!("cStr := {getter}(s.ptr)"));
+                w.line("goResult := C.GoString(cStr)");
+                w.line("C.weaveffi_free_string(cStr)");
+                w.line("return goResult");
             }
             TypeRef::Enum(_) => {
                 w.line(format!("return {ret}({getter}(s.ptr))"));
             }
-            TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+            TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => {
                 let inner = local_type_name(n).to_upper_camel_case();
                 w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
             }
@@ -1984,10 +2074,15 @@ fn render_getter(
                     w.block("if cStr == nil {", "}", |w| {
                         w.line("return nil");
                     });
+                    // The getter returns an owned string: copy, then free.
                     w.line("v := C.GoString(cStr)");
+                    w.line("C.weaveffi_free_string(cStr)");
                     w.line("return &v");
                 }
-                TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+                TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => {
                     let inner_go = local_type_name(n).to_upper_camel_case();
                     w.line(format!("cPtr := {getter}(s.ptr)"));
                     w.block("if cPtr == nil {", "}", |w| {
@@ -2000,7 +2095,9 @@ fn render_getter(
                     w.block("if cVal == nil {", "}", |w| {
                         w.line("return nil");
                     });
+                    // Dereference the producer-boxed scalar, then free it.
                     w.line("v := cToBool(*cVal)");
+                    w.line(boxed_scalar_free("cVal"));
                     w.line("return &v");
                 }
                 _ => {
@@ -2009,7 +2106,9 @@ fn render_getter(
                     w.block("if cVal == nil {", "}", |w| {
                         w.line("return nil");
                     });
+                    // Dereference the producer-boxed scalar, then free it.
                     w.line(format!("v := {inner_go}(*cVal)"));
+                    w.line(boxed_scalar_free("cVal"));
                     w.line("return &v");
                 }
             },
@@ -2019,7 +2118,10 @@ fn render_getter(
                 w.block("if result == nil {", "}", |w| {
                     w.line("return nil");
                 });
-                w.line("return C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))");
+                // The getter returns an owned buffer: copy, then free.
+                w.line("goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))");
+                w.line("C.weaveffi_free_bytes(result, cOutLen)");
+                w.line("return goResult");
             }
             TypeRef::List(inner) => {
                 w.line("var cOutLen C.size_t");
@@ -2027,7 +2129,7 @@ fn render_getter(
                 w.line("count := int(cOutLen)");
                 let mut body = String::new();
                 decode_list(
-                    &mut body, "goResult", inner, "result", "count", prefix, module,
+                    &mut body, "goResult", inner, "result", "count", prefix, module, true,
                 );
                 w.raw(body);
                 w.line("return goResult");
@@ -2043,6 +2145,7 @@ fn render_getter(
                 let mut body = String::new();
                 decode_map(
                     &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
+                    true,
                 );
                 w.raw(body);
                 w.line("return goResult");
@@ -2090,19 +2193,13 @@ fn render_interface(
 
     for c in &iface.constructors {
         let go_name = format!("{}{name}", c.name.to_upper_camel_case());
-        let err = ErrCtx {
-            throws: c.throws,
-            stem,
-        };
+        let err = ErrCtx::of(c, stem);
         render_function(out, prefix, &m.path, c, &go_name, None, err);
     }
 
     for f in &iface.methods {
         let go_name = f.name.to_upper_camel_case();
-        let err = ErrCtx {
-            throws: f.throws,
-            stem,
-        };
+        let err = ErrCtx::of(f, stem);
         if let CallShape::Async(ab) = &f.shape {
             render_async_function(out, prefix, &m.path, f, ab, &go_name, Some(&name), err);
         } else {
@@ -2112,10 +2209,7 @@ fn render_interface(
 
     for f in &iface.statics {
         let go_name = format!("{name}{}", f.name.to_upper_camel_case());
-        let err = ErrCtx {
-            throws: f.throws,
-            stem,
-        };
+        let err = ErrCtx::of(f, stem);
         if let CallShape::Async(ab) = &f.shape {
             render_async_function(out, prefix, &m.path, f, ab, &go_name, None, err);
         } else {
@@ -2139,8 +2233,10 @@ fn render_interface(
 /// A sync or iterator callable: the Go wrapper marshalling parameters in,
 /// invoking the C symbol, checking the error slot per `err` (typed
 /// `(T, error)` when throwing, `wvTrap` panic when plain), and converting the
-/// result out. With `receiver` set, the wrapper is a method on that wrapper
-/// type passing `s.ptr` as the leading C argument.
+/// result out. An iterator-returning callable renders through
+/// [`render_iterator_fn`] as a lazy sequence instead. With `receiver` set,
+/// the wrapper is a method on that wrapper type passing `s.ptr` as the
+/// leading C argument.
 #[allow(clippy::too_many_arguments)]
 fn render_function(
     out: &mut String,
@@ -2151,6 +2247,11 @@ fn render_function(
     receiver: Option<&str>,
     err: ErrCtx,
 ) {
+    if let CallShape::Iterator(ib) = &f.shape {
+        render_iterator_fn(out, prefix, module, f, ib, go_name, receiver, err);
+        return;
+    }
+
     let c_sym = &f.c_base;
 
     let go_params: Vec<String> = f
@@ -2193,19 +2294,6 @@ fn render_function(
         );
     }
 
-    // An iterator-returning function launches an opaque iterator (no out_len),
-    // then this wrapper drains it via the `next`/`destroy` symbols into a slice.
-    if let CallShape::Iterator(ib) = &f.shape {
-        let mut body = String::new();
-        emit_iterator_body(&mut body, &mut pre, &mut c_args, ib, prefix, module, err);
-        w.line(header);
-        w.raw(body);
-        w.line("}");
-        w.blank();
-        out.push_str(&w.finish());
-        return;
-    }
-
     if let Some(ref ret) = f.ret {
         emit_return_out_params(&mut pre, &mut c_args, ret, prefix, module);
     }
@@ -2244,84 +2332,212 @@ fn render_function(
 fn iter_out_item_type(inner: &TypeRef, prefix: &str, module: &str) -> String {
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "*C.char".into(),
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+        TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => {
             format!("*C.{}", c_abi_struct_name(n, module, prefix))
         }
         _ => c_scalar_type(inner, prefix, module).unwrap_or_else(|| "C.int64_t".into()),
     }
 }
 
-/// Append one freshly-pulled iterator element (`item`) to the result slice,
-/// converting to the Go type and releasing any callee-allocated string.
-fn emit_iter_elem_append(out: &mut String, dst: &str, inner: &TypeRef, item: &str) {
-    let mut w = CodeWriter::tabs().with_depth(2);
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("{dst} = append({dst}, C.GoString({item}))"));
-            w.line(format!("C.weaveffi_free_string({item})"));
-        }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
-            let gs = local_type_name(n).to_upper_camel_case();
-            w.line(format!("{dst} = append({dst}, &{gs}{{ptr: {item}}})"));
-        }
-        TypeRef::Bool => {
-            w.line(format!("{dst} = append({dst}, cToBool({item}))"));
-        }
-        _ => {
-            let conv = go_scalar_conv(item, inner);
-            w.line(format!("{dst} = append({dst}, {conv})"));
+/// Re-indent `block` by one tab per non-empty line, used to move depth-1
+/// staging code inside the sequence closure body.
+fn indent_block(block: &str) -> String {
+    let mut out = String::with_capacity(block.len());
+    for line in block.lines() {
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            out.push('\t');
+            out.push_str(line);
+            out.push('\n');
         }
     }
-    out.push_str(&w.finish());
+    out
 }
 
-/// Emit the launch + drain + destroy body of an iterator-returning function.
-/// `pre` already holds the input-parameter staging and `c_args` the launch
-/// arguments (before `out_err`). Both the launch's error slot and each
-/// `next`'s are checked per `err`: a throwing wrapper returns
-/// `(nil, mapped)`, a plain one traps and keeps draining.
+/// Emit the statements converting one freshly-pulled `next` slot (`item`)
+/// into a Go value bound to `dst`, releasing the slot per the protocol's
+/// [`ElemFree`] plan: strings are freed after copying, object pointers are
+/// adopted by the wrapper type (its `Close` calls the plan's destroy symbol),
+/// and by-value elements owe nothing.
+fn emit_iter_elem_bind(w: &mut CodeWriter, dst: &str, inner: &TypeRef, item: &str, ef: &ElemFree) {
+    match ef {
+        ElemFree::String => {
+            w.line(format!("{dst} := C.GoString({item})"));
+            w.line(format!("C.weaveffi_free_string({item})"));
+        }
+        ElemFree::Object { .. } => {
+            let name = inner
+                .user_name()
+                .expect("object element carries a user type name");
+            let gs = local_type_name(name).to_upper_camel_case();
+            w.line(format!("{dst} := &{gs}{{ptr: {item}}}"));
+        }
+        ElemFree::None => match inner {
+            TypeRef::Bool => {
+                w.line(format!("{dst} := cToBool({item})"));
+            }
+            // Typed handles and interfaces are also opaque pointers the
+            // consumer adopts, even though `elem_free` owes no runtime call
+            // for them here.
+            TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+                let gs = local_type_name(n).to_upper_camel_case();
+                w.line(format!("{dst} := &{gs}{{ptr: {item}}}"));
+            }
+            _ => {
+                let conv = go_scalar_conv(item, inner);
+                w.line(format!("{dst} := {conv}"));
+            }
+        },
+    }
+}
+
+/// An `iter<T>`-returning callable, rendered per the shared
+/// [`weaveffi_core::plan::IteratorProtocol`] pull contract as Go's standard
+/// lazy iteration idiom (the `iter` package, Go 1.23+):
+///
+/// - A non-throwing function returns `iter.Seq[T]`. A launch or per-`next`
+///   error can only be a producer bug, so it panics with the weaveffi
+///   message via `wvTrap` ([`ErrorStrategy::Trap`]).
+/// - A throwing function returns `iter.Seq2[T, error]`. A launch or
+///   per-`next` domain error is yielded as the final `(zero, err)` pair and
+///   iteration stops ([`ErrorStrategy::Throws`]).
+///
+/// The producer iterator is launched lazily inside the returned closure, so
+/// an unused sequence allocates nothing on the producer side. One C `next`
+/// call runs per consumer step, each yielded element is released per the
+/// protocol's [`ElemFree`] plan after conversion, and the destroy runs
+/// exactly once through a `defer` inside the closure, whether the sequence
+/// is exhausted, stops on an error, or is abandoned by an early `break`.
 #[allow(clippy::too_many_arguments)]
-fn emit_iterator_body(
+fn render_iterator_fn(
     out: &mut String,
-    pre: &mut String,
-    c_args: &mut Vec<String>,
-    ib: &weaveffi_core::model::IteratorBinding,
     prefix: &str,
     module: &str,
+    f: &FnBinding,
+    ib: &IteratorBinding,
+    go_name: &str,
+    receiver: Option<&str>,
     err: ErrCtx,
 ) {
-    pre.push_str("\tvar cErr C.weaveffi_error\n");
+    let proto = ib.protocol(f, module, prefix);
+    let throws = matches!(proto.error, ErrorStrategy::Throws);
+    let elem = &ib.elem;
+    let elem_go = go_type(elem);
+    let item_ty = iter_out_item_type(elem, prefix, module);
+    let zero = go_zero(elem);
+
+    let go_params: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| format!("{} {}", p.name.to_lower_camel_case(), go_type(&p.ty)))
+        .collect();
+    let (seq_ty, yield_ty) = if throws {
+        (
+            format!("iter.Seq2[{elem_go}, error]"),
+            format!("func({elem_go}, error) bool"),
+        )
+    } else {
+        (format!("iter.Seq[{elem_go}]"), format!("func({elem_go}) bool"))
+    };
+    let header = match receiver {
+        Some(ty) => format!(
+            "func (s *{ty}) {go_name}({}) {seq_ty} {{",
+            go_params.join(", ")
+        ),
+        None => format!("func {go_name}({}) {seq_ty} {{", go_params.join(", ")),
+    };
+
+    let mut w = CodeWriter::tabs();
+    let mut doc = String::new();
+    emit_fn_doc(&mut doc, &f.doc, &f.params, "", go_name);
+    w.raw(doc);
+    w.line("// Returns a lazy sequence: the producer iterator is launched on first");
+    w.line("// iteration and one producer next call runs per element. The iterator is");
+    w.line("// destroyed exactly once, whether the sequence is exhausted or abandoned");
+    w.line("// early; each range over the sequence launches a fresh producer iterator.");
+    if throws {
+        w.line("// A launch or per-element error is yielded as the final (zero value,");
+        w.line("// error) pair, and iteration stops.");
+    } else {
+        w.line("// A reported error can only be a producer bug and panics with the");
+        w.line("// weaveffi message.");
+    }
+    if let Some(msg) = &f.deprecated {
+        w.line(format!("// Deprecated: {msg}"));
+    }
+
+    // Parameter staging runs inside the closure so C strings and buffers are
+    // live at launch time and each range restages them.
+    let mut pre = String::new();
+    let mut c_args: Vec<String> = Vec::new();
+    if receiver.is_some() {
+        c_args.push("s.ptr".into());
+    }
+    for p in &f.params {
+        emit_param(
+            &mut pre,
+            &mut c_args,
+            &p.name.to_lower_camel_case(),
+            &p.ty,
+            prefix,
+            module,
+        );
+    }
     c_args.push("&cErr".into());
 
-    let elem = &ib.elem;
-    let item_ty = iter_out_item_type(elem, prefix, module);
+    // Statements surfacing a non-zero error slot: yield the mapped domain
+    // error and stop when throwing, trap when plain.
+    let emit_err_check = |w: &mut CodeWriter, slot: &str| {
+        if throws {
+            let map = err.map_call(&format!("wvTakeError(&{slot})"));
+            w.block(format!("if {slot}.code != 0 {{"), "}", |w| {
+                w.line(format!("yield({zero}, {map})"));
+                w.line("return");
+            });
+        } else {
+            w.line(format!("wvTrap(&{slot})"));
+        }
+    };
 
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.raw(pre.as_str());
-    w.line(format!(
-        "it := C.{}({})",
-        ib.launch.symbol,
-        c_args.join(", ")
-    ));
-    err.emit_check(&mut w, "cErr", Some("nil"));
-    w.line(format!("defer C.{}(it)", ib.destroy_symbol));
-    w.line(format!("goResult := []{}{{}}", go_type(elem)));
-    w.block("for {", "}", |w| {
-        w.line(format!("var outItem {item_ty}"));
-        w.line("var iterErr C.weaveffi_error");
-        w.block(
-            format!("if C.{}(it, &outItem, &iterErr) == 0 {{", ib.next.symbol),
-            "}",
-            |w| {
-                w.line("break");
-            },
-        );
-        err.emit_check(w, "iterErr", Some("nil"));
-        let mut app = String::new();
-        emit_iter_elem_append(&mut app, "goResult", elem, "outItem");
-        w.raw(app);
+    w.block(header, "}", |w| {
+        w.block(format!("return func(yield {yield_ty}) {{"), "}", |w| {
+            w.raw(indent_block(&pre));
+            w.line("var cErr C.weaveffi_error");
+            w.line(format!(
+                "it := C.{}({})",
+                ib.launch.symbol,
+                c_args.join(", ")
+            ));
+            emit_err_check(w, "cErr");
+            w.line(format!("defer C.{}(it)", ib.destroy_symbol));
+            w.block("for {", "}", |w| {
+                w.line(format!("var outItem {item_ty}"));
+                w.line("var iterErr C.weaveffi_error");
+                w.line(format!(
+                    "ok := C.{}(it, &outItem, &iterErr) != 0",
+                    ib.next.symbol
+                ));
+                emit_err_check(w, "iterErr");
+                w.block("if !ok {", "}", |w| {
+                    w.line("return");
+                });
+                emit_iter_elem_bind(w, "item", elem, "outItem", &proto.elem_free);
+                let yield_call = if throws {
+                    "if !yield(item, nil) {"
+                } else {
+                    "if !yield(item) {"
+                };
+                w.block(yield_call, "}", |w| {
+                    w.line("return");
+                });
+            });
+        });
     });
-    w.line(format!("return goResult{}", err.ok_tail()));
+    w.blank();
     out.push_str(&w.finish());
 }
 
@@ -2355,9 +2571,10 @@ fn emit_param(
             "C.{}({name})",
             c_abi_struct_name(n, module, prefix)
         )),
-        TypeRef::TypedHandle(_) | TypeRef::Struct(_) | TypeRef::Interface(_) => {
-            args.push(format!("{name}.ptr"))
-        }
+        TypeRef::TypedHandle(_)
+        | TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::Interface(_) => args.push(format!("{name}.ptr")),
 
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let cv = format!("c{}", name.to_upper_camel_case());
@@ -2385,6 +2602,7 @@ fn emit_param(
         TypeRef::Map(k, v) => return emit_map_param(pre, args, name, k, v, prefix, module),
 
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     pre.push_str(&w.finish());
 }
@@ -2409,7 +2627,10 @@ fn emit_optional_param(
             });
             args.push(cv);
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             let ct = c_opaque_type(inner, prefix, module);
             w.line(format!("var {cv} *C.{ct}"));
             w.block(format!("if {name} != nil {{"), "}", |w| {
@@ -2481,7 +2702,11 @@ fn emit_list_param(
         w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
             w.line(format!("{pv} = (**C.char)(unsafe.Pointer(&{arr}[0]))"));
         });
-    } else if let TypeRef::Struct(n) | TypeRef::TypedHandle(n) | TypeRef::Interface(n) = inner {
+    } else if let TypeRef::Record(n)
+    | TypeRef::RichEnum(n)
+    | TypeRef::TypedHandle(n)
+    | TypeRef::Interface(n) = inner
+    {
         let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
         let arr = format!("c{cn}Arr");
         w.line(format!("{arr} := make([]*{ct}, len({name}))"));
@@ -2584,7 +2809,7 @@ fn emit_return_out_params(
 ) {
     let mut w = CodeWriter::tabs().with_depth(1);
     match ty {
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        TypeRef::List(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.line("var cOutLen C.size_t");
             args.push("&cOutLen".into());
         }
@@ -2607,6 +2832,15 @@ fn emit_return_out_params(
 }
 
 // ── Return conversion ──
+
+/// The statement releasing a producer-boxed optional scalar (`T*`, null =
+/// none) after dereferencing, per [`weaveffi_core::plan::ReturnFree::BoxedScalar`]:
+/// `weaveffi_free_bytes(ptr, sizeof(T))`.
+fn boxed_scalar_free(ptr: &str) -> String {
+    format!(
+        "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({ptr})), C.size_t(unsafe.Sizeof(*{ptr})))"
+    )
+}
 
 /// Emit the success-path return conversion. `tail` is [`ErrCtx::ok_tail`]:
 /// `", nil"` when the wrapper also returns an error, empty when plain.
@@ -2639,7 +2873,10 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
             let conv = go_scalar_conv("result", ty);
             w.line(format!("return {conv}{tail}"));
         }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+        TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => {
             let g = local_type_name(n).to_upper_camel_case();
             w.line(format!("return &{g}{{ptr: result}}{tail}"));
         }
@@ -2654,7 +2891,10 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
             w.line(format!("return goResult{tail}"));
         }
         TypeRef::Map(k, v) => return emit_map_return(out, k, v, prefix, module, tail),
-        TypeRef::Iterator(inner) => return emit_list_return(out, inner, prefix, module, tail),
+        TypeRef::Iterator(_) => {
+            unreachable!("iterator returns render through the lazy sequence path")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -2670,17 +2910,24 @@ fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str, tail: 
             w.line("C.weaveffi_free_string(result)");
             w.line(format!("return &v{tail}"));
         }
-        TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) => {
+        TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) => {
             let g = local_type_name(n).to_upper_camel_case();
             w.line(format!("return &{g}{{ptr: result}}{tail}"));
         }
         TypeRef::Bool => {
+            // Dereference the producer-boxed scalar, then free it.
             w.line("v := cToBool(*result)");
+            w.line(boxed_scalar_free("result"));
             w.line(format!("return &v{tail}"));
         }
         _ => {
+            // Dereference the producer-boxed scalar, then free it.
             let gt = go_type(inner);
             w.line(format!("v := {gt}(*result)"));
+            w.line(boxed_scalar_free("result"));
             w.line(format!("return &v{tail}"));
         }
     }
@@ -2692,7 +2939,7 @@ fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &st
     w.line("count := int(cOutLen)");
     let mut body = String::new();
     decode_list(
-        &mut body, "goResult", inner, "result", "count", prefix, module,
+        &mut body, "goResult", inner, "result", "count", prefix, module, true,
     );
     w.raw(body);
     w.line(format!("return goResult{tail}"));
@@ -2711,7 +2958,7 @@ fn emit_map_return(
     w.line("count := int(cOutLen)");
     let mut body = String::new();
     decode_map(
-        &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
+        &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module, true,
     );
     w.raw(body);
     w.line(format!("return goResult{tail}"));
@@ -2741,7 +2988,16 @@ fn map_elem_read(expr: &str, ty: &TypeRef) -> String {
 }
 
 /// Emit Go that materializes a C array (`src`, `count` elements of `inner`) into
-/// a fresh slice bound to `dst`. Shared by struct getters and function returns.
+/// a fresh slice bound to `dst`. Shared by struct getters, function returns,
+/// async results, and callback parameters.
+///
+/// With `owned` set the array is a producer-allocated return the consumer
+/// must release after copying: each string element is freed per
+/// [`ElemFree::String`] (object elements are adopted by their wrapper, and
+/// by-value elements owe nothing), then the array buffer itself is released
+/// with `weaveffi_free_bytes`. Borrowed arrays (callback parameters, async
+/// completion results) pass `owned = false` and only copy.
+#[allow(clippy::too_many_arguments)]
 fn decode_list(
     out: &mut String,
     dst: &str,
@@ -2750,8 +3006,10 @@ fn decode_list(
     count: &str,
     prefix: &str,
     module: &str,
+    owned: bool,
 ) {
     let gi = go_type(inner);
+    let free_elem = owned && matches!(elem_free(inner, module, prefix), ElemFree::String);
     let mut w = CodeWriter::tabs().with_depth(1);
     w.line(format!("{dst} := make([]{gi}, {count})"));
     w.block(format!("if {count} > 0 && {src} != nil {{"), "}", |w| {
@@ -2774,9 +3032,16 @@ fn decode_list(
                 "}",
                 |w| {
                     w.line(format!("{dst}[i] = C.GoString(v)"));
+                    if free_elem {
+                        w.line("C.weaveffi_free_string(v)");
+                    }
                 },
             );
-        } else if let TypeRef::TypedHandle(n) | TypeRef::Struct(n) | TypeRef::Interface(n) = inner {
+        } else if let TypeRef::TypedHandle(n)
+        | TypeRef::Record(n)
+        | TypeRef::RichEnum(n)
+        | TypeRef::Interface(n) = inner
+        {
             let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
             let gs = local_type_name(n).to_upper_camel_case();
             w.block(
@@ -2785,9 +3050,16 @@ fn decode_list(
                 ),
                 "}",
                 |w| {
+                    // The consumer adopts each owned element pointer; the
+                    // wrapper's Close calls its destroy symbol.
                     w.line(format!("{dst}[i] = &{gs}{{ptr: v}}"));
                 },
             );
+        }
+        if owned {
+            w.line(format!(
+                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({src})), C.size_t({count})*C.size_t(unsafe.Sizeof(*{src})))"
+            ));
         }
     });
     out.push_str(&w.finish());
@@ -2795,6 +3067,12 @@ fn decode_list(
 
 /// Emit Go that materializes parallel C key/value arrays (`keys`/`vals`, already
 /// typed per [`go_cmap_ptr_type`]) into a fresh map bound to `dst`.
+///
+/// With `owned` set the buffers are producer-allocated returns the consumer
+/// must release after copying: each string key and value is freed per
+/// [`ElemFree::String`], then both parallel arrays are released with
+/// `weaveffi_free_bytes`. Borrowed buffers (callback parameters, async
+/// completion results) pass `owned = false` and only copy.
 #[allow(clippy::too_many_arguments)]
 fn decode_map(
     out: &mut String,
@@ -2804,11 +3082,14 @@ fn decode_map(
     keys: &str,
     vals: &str,
     count: &str,
-    _prefix: &str,
-    _module: &str,
+    prefix: &str,
+    module: &str,
+    owned: bool,
 ) {
     let gk = go_type(k);
     let gv = go_type(v);
+    let free_key = owned && matches!(elem_free(k, module, prefix), ElemFree::String);
+    let free_val = owned && matches!(elem_free(v, module, prefix), ElemFree::String);
     let mut w = CodeWriter::tabs().with_depth(1);
     w.line(format!("{dst} := make(map[{gk}]{gv}, {count})"));
     w.block(
@@ -2821,7 +3102,21 @@ fn decode_map(
                 let kr = map_elem_read("keySlice[i]", k);
                 let vr = map_elem_read("valSlice[i]", v);
                 w.line(format!("{dst}[{kr}] = {vr}"));
+                if free_key {
+                    w.line("C.weaveffi_free_string(keySlice[i])");
+                }
+                if free_val {
+                    w.line("C.weaveffi_free_string(valSlice[i])");
+                }
             });
+            if owned {
+                w.line(format!(
+                    "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({keys})), C.size_t({count})*C.size_t(unsafe.Sizeof(*{keys})))"
+                ));
+                w.line(format!(
+                    "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({vals})), C.size_t({count})*C.size_t(unsafe.Sizeof(*{vals})))"
+                ));
+            }
         },
     );
     out.push_str(&w.finish());
@@ -2952,7 +3247,7 @@ mod tests {
             // Cross-module references reach generators pre-qualified by the
             // validator's resolve step; mirror that spelling here.
             vec![param("store", TypeRef::Interface("kv.Store".into()))],
-            Some(TypeRef::Struct("Stats".into())),
+            Some(TypeRef::Record("Stats".into())),
         ))];
 
         let mut kv = module("kv");
@@ -3027,7 +3322,7 @@ mod tests {
                 throwing(func_of(
                     "get",
                     vec![param("key", TypeRef::StringUtf8)],
-                    Some(TypeRef::Optional(Box::new(TypeRef::Struct("Entry".into())))),
+                    Some(TypeRef::Optional(Box::new(TypeRef::Record("Entry".into())))),
                 )),
                 throwing(func_of(
                     "list_keys",
@@ -3125,17 +3420,17 @@ mod tests {
                         param("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                         param("contact_type", TypeRef::Enum("ContactType".into())),
                     ],
-                    Some(TypeRef::Struct("Contact".into())),
+                    Some(TypeRef::Record("Contact".into())),
                 )),
                 throwing(func_of(
                     "get",
                     vec![param("id", TypeRef::I64)],
-                    Some(TypeRef::Struct("Contact".into())),
+                    Some(TypeRef::Record("Contact".into())),
                 )),
                 func_of(
                     "list",
                     vec![],
-                    Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                 ),
                 func_of(
                     "remove",
@@ -3399,7 +3694,7 @@ mod tests {
         m.functions = vec![func_of(
             "get_contact",
             vec![param("id", TypeRef::Handle)],
-            Some(TypeRef::Struct("Contact".into())),
+            Some(TypeRef::Record("Contact".into())),
         )];
         m.structs = vec![StructDef {
             name: "Contact".into(),
@@ -3450,7 +3745,7 @@ mod tests {
         m.functions = vec![func_of(
             "find",
             vec![param("id", TypeRef::I32)],
-            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+            Some(TypeRef::Optional(Box::new(TypeRef::Record(
                 "Contact".into(),
             )))),
         )];
@@ -3488,7 +3783,7 @@ mod tests {
         m.functions = vec![func_of(
             "list_contacts",
             vec![],
-            Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+            Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
         )];
         m.structs = vec![StructDef {
             name: "Contact".into(),
@@ -3850,12 +4145,25 @@ mod tests {
             "plain async wrapper must panic on a reported error: {go}"
         );
         assert!(
+            go.contains("ch <- wvOutcomeIoRead{err: wvBrandError(wvTakeError(err))}"),
+            "plain async trampoline brands the error, never the domain: {go}"
+        );
+        assert!(
             go.contains("return outcome.val"),
             "plain async wrapper returns the outcome value: {go}"
         );
+        // The completion callback borrows its result buffers: copy, no free.
         assert!(
-            go.contains("C.weaveffi_free_string(result)"),
-            "owned string results must be freed: {go}"
+            !go.contains("C.weaveffi_free_string(result)"),
+            "borrowed async result buffers must not be freed: {go}"
+        );
+        assert!(
+            go.contains("val = C.GoString(result)"),
+            "async string results must be copied before the callback returns: {go}"
+        );
+        assert!(
+            go.contains("// Blocks the calling goroutine until the async producer completes."),
+            "async wrapper must document that it blocks: {go}"
         );
         assert!(
             go.contains("weaveffi_io_write"),
@@ -4079,31 +4387,62 @@ mod tests {
     #[test]
     fn interface_iterator_method_throws() {
         let go = rg(&kv_api());
+        // A throwing iterator returns iter.Seq2[T, error]; the standard iter
+        // package is imported.
         assert!(
-            go.contains("func (s *Store) ListKeys(prefix *string) ([]string, error) {"),
-            "throwing iterator method keeps ([]T, error): {go}"
+            go.contains("func (s *Store) ListKeys(prefix *string) iter.Seq2[string, error] {"),
+            "throwing iterator method returns iter.Seq2[T, error]: {go}"
         );
+        assert!(go.contains("\t\"iter\"\n"), "iter import needed: {go}");
+        // The launch runs lazily inside the returned closure (first pull),
+        // never in the wrapper body itself.
+        let fn_start = go
+            .find("func (s *Store) ListKeys(")
+            .expect("ListKeys wrapper");
+        let fn_text = &go[fn_start..];
+        let closure = fn_text
+            .find("return func(yield func(string, error) bool) {")
+            .expect("sequence closure in ListKeys");
+        let launch = fn_text
+            .find("it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefix, &cErr)")
+            .expect("launch in ListKeys");
         assert!(
-            go.contains("it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefix, &cErr)"),
-            "iterator launch passes s.ptr: {go}"
+            closure < launch,
+            "launch must run inside the closure: {fn_text}"
         );
+        // Launch errors are yielded as the final (zero, err) pair.
+        assert!(
+            go.contains("yield(\"\", wvMapKv(wvTakeError(&cErr)))"),
+            "launch errors are yielded through the domain: {go}"
+        );
+        // Destroy is deferred inside the closure so an early break still
+        // destroys exactly once.
         assert!(
             go.contains("defer C.weaveffi_kv_Store_ListKeysIterator_destroy(it)"),
-            "iterator must be destroyed: {go}"
+            "iterator destroy must be deferred inside the closure: {go}"
+        );
+        // One producer next call per consumer step.
+        assert!(
+            go.contains("ok := C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) != 0"),
+            "iterator must pull one element per step: {go}"
         );
         assert!(
-            go.contains(
-                "if C.weaveffi_kv_Store_ListKeysIterator_next(it, &outItem, &iterErr) == 0 {"
-            ),
-            "iterator must drain via next: {go}"
+            go.contains("yield(\"\", wvMapKv(wvTakeError(&iterErr)))"),
+            "per-element errors are yielded through the domain: {go}"
+        );
+        // Each yielded string element is freed after copying.
+        assert!(
+            go.contains("item := C.GoString(outItem)\n\t\t\tC.weaveffi_free_string(outItem)"),
+            "string elements must be freed after copying: {go}"
         );
         assert!(
-            go.contains("return nil, wvMapKv(wvTakeError(&iterErr))"),
-            "per-element errors map through the domain: {go}"
+            go.contains("if !yield(item, nil) {"),
+            "elements are yielded with a nil error: {go}"
         );
+        // No hidden drain into a slice.
         assert!(
-            go.contains("return goResult, nil"),
-            "successful drain returns `, nil`: {go}"
+            !fn_text[..fn_text.find("\n}\n").unwrap()].contains("append("),
+            "iterator must not drain into a slice: {fn_text}"
         );
     }
 
@@ -4117,16 +4456,59 @@ mod tests {
         )];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func GetMessages() []string {"),
-            "plain iterator returns a bare slice: {go}"
+            go.contains("func GetMessages() iter.Seq[string] {"),
+            "plain iterator returns iter.Seq[T]: {go}"
+        );
+        assert!(
+            go.contains("return func(yield func(string) bool) {"),
+            "plain iterator returns a single-value sequence closure: {go}"
+        );
+        assert!(
+            go.contains("wvTrap(&cErr)"),
+            "plain iterator traps launch errors: {go}"
         );
         assert!(
             go.contains("wvTrap(&iterErr)"),
             "plain iterator traps per-element errors: {go}"
         );
         assert!(
-            !go.contains("func GetMessages() ([]string, error)"),
-            "plain iterator must not return an error: {go}"
+            go.contains("defer C.weaveffi_events_GetMessagesIterator_destroy(it)"),
+            "plain iterator defers destroy inside the closure: {go}"
+        );
+        assert!(
+            go.contains("if !yield(item) {"),
+            "plain iterator yields bare elements: {go}"
+        );
+        assert!(
+            !go.contains("func GetMessages() []string"),
+            "plain iterator must not drain into a slice: {go}"
+        );
+    }
+
+    #[test]
+    fn iterator_object_elements_are_adopted() {
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
+        m.functions = vec![func_of(
+            "iter_contacts",
+            vec![],
+            Some(TypeRef::Iterator(Box::new(TypeRef::Record(
+                "Contact".into(),
+            )))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func IterContacts() iter.Seq[*Contact] {"),
+            "object iterator yields wrapper pointers: {go}"
+        );
+        assert!(
+            go.contains("item := &Contact{ptr: outItem}"),
+            "object elements are adopted by the wrapper: {go}"
         );
     }
 
@@ -4307,7 +4689,10 @@ mod tests {
             go_mod.contains("module weaveffi"),
             "missing module directive: {go_mod}"
         );
-        assert!(go_mod.contains("go 1.21"), "missing go version: {go_mod}");
+        assert!(
+            go_mod.contains("go 1.23"),
+            "go.mod must require Go 1.23 for the iter package: {go_mod}"
+        );
 
         let readme_path = tmp.join("go/README.md");
         assert!(readme_path.exists(), "go/README.md should exist");
@@ -4403,7 +4788,7 @@ mod tests {
         m.functions = vec![func_of(
             "find_contact",
             vec![param("name", TypeRef::StringUtf8)],
-            Some(TypeRef::Struct("Contact".into())),
+            Some(TypeRef::Record("Contact".into())),
         )];
         let go = rg(&api_of(vec![m]));
 
@@ -4441,7 +4826,7 @@ mod tests {
         m.functions = vec![func_of(
             "find_contact",
             vec![param("id", TypeRef::I32)],
-            Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+            Some(TypeRef::Optional(Box::new(TypeRef::Record(
                 "Contact".into(),
             )))),
         )];
@@ -4462,6 +4847,102 @@ mod tests {
             null_check < contact_wrap,
             "optional struct return should check nil before wrapping: {fn_text}"
         );
+    }
+
+    #[test]
+    fn string_list_return_frees_elements_and_buffer() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "list_keys",
+            vec![],
+            Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("goResult[i] = C.GoString(v)\n\t\t\tC.weaveffi_free_string(v)"),
+            "each string element must be freed after copying: {go}"
+        );
+        assert!(
+            go.contains(
+                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))"
+            ),
+            "the array buffer must be released after the copy: {go}"
+        );
+    }
+
+    #[test]
+    fn map_return_frees_string_keys_and_both_buffers() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "counts",
+            vec![],
+            Some(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32),
+            )),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("C.weaveffi_free_string(keySlice[i])"),
+            "each string key must be freed after copying: {go}"
+        );
+        assert!(
+            !go.contains("C.weaveffi_free_string(valSlice[i])"),
+            "by-value map values owe no release: {go}"
+        );
+        assert!(
+            go.contains(
+                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))"
+            ) && go.contains(
+                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))"
+            ),
+            "both parallel map buffers must be released: {go}"
+        );
+    }
+
+    #[test]
+    fn string_getter_frees_after_copy() {
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            builder: false,
+            fields: vec![
+                field("name", TypeRef::StringUtf8),
+                field("photo", TypeRef::Bytes),
+            ],
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("goResult := C.GoString(cStr)\n\tC.weaveffi_free_string(cStr)"),
+            "string getters must free the owned C string after copying: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_free_bytes(result, cOutLen)"),
+            "bytes getters must free the owned buffer after copying: {go}"
+        );
+    }
+
+    #[test]
+    fn boxed_optional_scalar_return_is_freed() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "capacity",
+            vec![],
+            Some(TypeRef::Optional(Box::new(TypeRef::I64))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("v := int64(*result)"),
+            "boxed scalar must be dereferenced: {go}"
+        );
+        assert!(
+            go.contains(
+                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(unsafe.Sizeof(*result)))"
+            ),
+            "the producer-boxed scalar must be freed after dereferencing: {go}"
+        );
+        assert!(go.contains("\t\"unsafe\"\n"), "unsafe import needed: {go}");
     }
 
     // ── Docs ──

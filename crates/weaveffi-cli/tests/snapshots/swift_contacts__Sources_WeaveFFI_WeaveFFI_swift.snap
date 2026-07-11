@@ -54,6 +54,16 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+@inline(__always)
+func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
+}
+
+@inline(__always)
+func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+}
+
 /// Typed errors reported by the `contacts` module.
 public enum ContactsError: Error, LocalizedError {
     case invalidName(message: String)
@@ -183,6 +193,7 @@ public final class ContactBook {
         let rv = weaveffi_contacts_ContactBook_list(ptr, &outLen, &err)
         trap(&err)
         guard let rv = rv else { return [] }
+        defer { wvFreeArray(rv, outLen) }
         return (0..<outLen).map { Contact(ptr: rv[$0]!) }
     }
     public func remove(id: Int64) -> Bool {

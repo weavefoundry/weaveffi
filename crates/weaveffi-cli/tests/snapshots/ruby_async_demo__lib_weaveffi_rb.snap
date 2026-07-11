@@ -148,7 +148,8 @@ module WeaveFFI
     end
   end
 
-  # Blocks until the async producer completes.
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback.
   def self.run_task(name)
     queue = Queue.new
     callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
@@ -172,7 +173,8 @@ module WeaveFFI
     value
   end
 
-  # Blocks until the async producer completes.
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback.
   def self.run_batch(names)
     queue = Queue.new
     callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :size_t]) do |_context, err_ptr, result, result_len|
@@ -202,7 +204,8 @@ module WeaveFFI
     result != 0
   end
 
-  # Blocks until the async producer completes.
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback.
   def self.run_n_tasks(n)
     queue = Queue.new
     callback = FFI::Function.new(:void, [:pointer, :pointer, :int32]) do |_context, err_ptr, result|

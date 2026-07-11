@@ -34,7 +34,9 @@ Events.sendMessage(text: "beta")
 expect(recorder.received == ["alpha", "beta"],
        "listener received sends (got \(recorder.received))")
 
-let msgs = Events.getMessages()
+// getMessages returns a lazy single-pass Sequence: one producer `next` per
+// consumer step, handle destroyed on exhaustion (or by deinit if abandoned).
+let msgs = Array(Events.getMessages())
 expect(msgs == ["alpha", "beta"],
        "iterator yields messages in order (got \(msgs))")
 
@@ -43,6 +45,10 @@ Events.unregisterMessageListener(sub)
 Events.sendMessage(text: "gamma")
 expect(recorder.received == ["alpha", "beta"],
        "no delivery after unregister (got \(recorder.received))")
-expect(Events.getMessages().count == 3, "producer kept recording")
+expect(Array(Events.getMessages()).count == 3, "producer kept recording")
+
+// Abandoning the sequence early releases the handle through deinit.
+let firstOnly = Events.getMessages().first(where: { _ in true })
+expect(firstOnly == "alpha", "early stop yields only the first message")
 
 print("swift/events: OK")

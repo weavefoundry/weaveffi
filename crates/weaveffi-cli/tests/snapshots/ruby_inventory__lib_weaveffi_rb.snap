@@ -185,7 +185,11 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_products_Product_get_tags(@handle, out_len)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| p.null? ? '' : p.read_string }
+      ptrs = result.read_array_of_pointer(len)
+      items = ptrs.map { |p| p.null? ? '' : p.read_string }
+      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
   end
 
@@ -244,7 +248,9 @@ module WeaveFFI
       WeaveFFI.check_error!(err)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| Product.new(p) }
+      items = result.read_array_of_pointer(len).map { |p| Product.new(p) }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
 
     def update_price(id, price)
@@ -396,7 +402,9 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_orders_Order_get_items(@handle, out_len)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| OrderItem.new(p) }
+      items = result.read_array_of_pointer(len).map { |p| OrderItem.new(p) }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
 
     def total

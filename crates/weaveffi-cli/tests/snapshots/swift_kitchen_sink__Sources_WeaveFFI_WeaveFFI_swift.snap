@@ -54,6 +54,16 @@ func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) th
     return try value.withCString { try body($0) }
 }
 
+@inline(__always)
+func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
+}
+
+@inline(__always)
+func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
+    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+}
+
 private final class ContinuationRef<T, E: Error> {
     let value: CheckedContinuation<T, E>
     init(_ value: CheckedContinuation<T, E>) { self.value = value }
@@ -207,7 +217,14 @@ public class Item {
         var outLen: Int = 0
         let rv = weaveffi_kitchen_Item_get_tags(ptr, &outLen)
         guard let rv = rv else { return [] }
-        return (0..<outLen).map { String(cString: rv[$0]!) }
+        defer { wvFreeArray(rv, outLen) }
+        var items: [String] = []
+        items.reserveCapacity(outLen)
+        for i in 0..<outLen {
+            items.append(String(cString: rv[i]!))
+            weaveffi_free_string(rv[i])
+        }
+        return items
     }
 
     public var attrs: [String: String] {
@@ -216,16 +233,21 @@ public class Item {
         var outLen: Int = 0
         weaveffi_kitchen_Item_get_attrs(ptr, &outKeysPtr, &outValuesPtr, &outLen)
         guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
+        defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }
         var result: [String: String] = [:]
         for i in 0..<outLen {
             result[String(cString: outKeys[i]!)] = String(cString: outValues[i]!)
+            weaveffi_free_string(outKeys[i])
+            weaveffi_free_string(outValues[i])
         }
         return result
     }
 
     public var parent: Int64? {
         let p = weaveffi_kitchen_Item_get_parent(ptr)
-        return p?.pointee
+        guard let p = p else { return nil }
+        defer { wvFreeBox(p) }
+        return p.pointee
     }
 
     /// Cross-module struct reference
@@ -334,18 +356,18 @@ public class ItemBuilder {
     }
 
     public func build() throws -> Item {
-        guard let id = _id else { fatalError("missing field: id") }
-        guard let name = _name else { fatalError("missing field: name") }
-        guard let count = _count else { fatalError("missing field: count") }
-        guard let enabled = _enabled else { fatalError("missing field: enabled") }
-        guard let ratio = _ratio else { fatalError("missing field: ratio") }
-        guard let nick = _nick else { fatalError("missing field: nick") }
-        guard let payload = _payload else { fatalError("missing field: payload") }
-        guard let tags = _tags else { fatalError("missing field: tags") }
-        guard let attrs = _attrs else { fatalError("missing field: attrs") }
-        guard let parent = _parent else { fatalError("missing field: parent") }
-        guard let token = _token else { fatalError("missing field: token") }
-        guard let priority = _priority else { fatalError("missing field: priority") }
+        guard let id = _id else { throw WeaveFFIError.error(code: -1, message: "missing field: id") }
+        guard let name = _name else { throw WeaveFFIError.error(code: -1, message: "missing field: name") }
+        guard let count = _count else { throw WeaveFFIError.error(code: -1, message: "missing field: count") }
+        guard let enabled = _enabled else { throw WeaveFFIError.error(code: -1, message: "missing field: enabled") }
+        guard let ratio = _ratio else { throw WeaveFFIError.error(code: -1, message: "missing field: ratio") }
+        guard let nick = _nick else { throw WeaveFFIError.error(code: -1, message: "missing field: nick") }
+        guard let payload = _payload else { throw WeaveFFIError.error(code: -1, message: "missing field: payload") }
+        guard let tags = _tags else { throw WeaveFFIError.error(code: -1, message: "missing field: tags") }
+        guard let attrs = _attrs else { throw WeaveFFIError.error(code: -1, message: "missing field: attrs") }
+        guard let parent = _parent else { throw WeaveFFIError.error(code: -1, message: "missing field: parent") }
+        guard let token = _token else { throw WeaveFFIError.error(code: -1, message: "missing field: token") }
+        guard let priority = _priority else { throw WeaveFFIError.error(code: -1, message: "missing field: priority") }
         var err = weaveffi_error(code: 0, message: nil)
         let payload_bytes = Array(payload)
         let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
@@ -425,6 +447,49 @@ public final class Gadget {
         guard let rv = rv else { fatalError("-1: null string") }
         defer { weaveffi_free_string(rv) }
         return String(cString: rv)
+    }
+}
+
+/// A lazy sequence over the `Item` elements streamed by `weaveffi_kitchen_stream_items`.
+///
+/// Each `next()` call pulls exactly one element from the producer. The
+/// underlying C iterator is destroyed eagerly on exhaustion and from
+/// `deinit` when iteration is abandoned early.
+public final class KitchenStreamItemsIterator: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+
+    init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        destroyHandle()
+    }
+
+    private func destroyHandle() {
+        guard let handle = handle else { return }
+        weaveffi_kitchen_StreamItemsIterator_destroy(handle)
+        self.handle = nil
+    }
+
+    /// Pulls the next element from the producer, or returns `nil` once the
+    /// stream is exhausted (destroying the underlying iterator).
+    public func next() -> Item? {
+        guard let handle = handle else { return nil }
+        var item: OpaquePointer? = nil
+        var err = weaveffi_error(code: 0, message: nil)
+        if weaveffi_kitchen_StreamItemsIterator_next(handle, &item, &err) == 0 {
+            if err.code != 0 {
+                let code = err.code
+                let message = err.message.flatMap { String(cString: $0) } ?? ""
+                weaveffi_error_clear(&err)
+                fatalError("\(code): \(message)")
+            }
+            destroyHandle()
+            return nil
+        }
+        let element = Item(ptr: item!)
+        return element
     }
 }
 
@@ -559,6 +624,7 @@ public enum Kitchen {
         let rv = weaveffi_kitchen_list_items(&outLen, &err)
         trap(&err)
         guard let rv = rv else { return [] }
+        defer { wvFreeArray(rv, outLen) }
         return (0..<outLen).map { Item(ptr: rv[$0]!) }
     }
     /// Map return type
@@ -570,27 +636,24 @@ public enum Kitchen {
         weaveffi_kitchen_get_attrs(&outKeysPtr, &outValuesPtr, &outLen, &err)
         trap(&err)
         guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
+        defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }
         var result: [String: Int32] = [:]
         for i in 0..<outLen {
             result[String(cString: outKeys[i]!)] = outValues[i]
+            weaveffi_free_string(outKeys[i])
         }
         return result
     }
     /// Iterator return type
-    public static func streamItems() -> [Item] {
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   producer; the underlying iterator is destroyed when the sequence is
+    ///   exhausted or deinitialized.
+    public static func streamItems() -> KitchenStreamItemsIterator {
         var err = weaveffi_error(code: 0, message: nil)
         let iter = weaveffi_kitchen_stream_items(&err)
         trap(&err)
-        guard let iter = iter else { return [] }
-        var items: [Item] = []
-        var iterItem: OpaquePointer? = nil
-        var iterErr = weaveffi_error(code: 0, message: nil)
-        while weaveffi_kitchen_StreamItemsIterator_next(iter, &iterItem, &iterErr) != 0 {
-            items.append(Item(ptr: iterItem!))
-        }
-        weaveffi_kitchen_StreamItemsIterator_destroy(iter)
-        trap(&iterErr)
-        return items
+        guard let iter = iter else { fatalError("-1: null iterator") }
+        return KitchenStreamItemsIterator(handle: iter)
     }
     /// Returns the shared Token type from another module
     public static func crossModuleToken() -> Token {
@@ -615,9 +678,7 @@ public enum Kitchen {
                         guard let result = result else {
                             fatalError("-1: null string")
                         }
-                        let str = String(cString: result)
-                        weaveffi_free_string(UnsafeMutablePointer(mutating: result))
-                        contRef.value.resume(returning: str)
+                        contRef.value.resume(returning: String(cString: result))
                     }
                 }, ctx)
             }
@@ -638,9 +699,7 @@ public enum Kitchen {
                         guard let result = result else {
                             fatalError("-1: null string")
                         }
-                        let str = String(cString: result)
-                        weaveffi_free_string(UnsafeMutablePointer(mutating: result))
-                        contRef.value.resume(returning: str)
+                        contRef.value.resume(returning: String(cString: result))
                     }
                 }, ctx)
             }

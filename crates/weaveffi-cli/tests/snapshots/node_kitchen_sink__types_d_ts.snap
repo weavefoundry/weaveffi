@@ -192,7 +192,7 @@ export function getAttrs(): Record<string, number>
  * Iterator return type
  * Maps to C function: weaveffi_kitchen_stream_items
  */
-export function streamItems(): Item[]
+export function streamItems(): IterableIterator<Item>
 /**
  * Returns the shared Token type from another module
  * Maps to C function: weaveffi_kitchen_cross_module_token

@@ -5,7 +5,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
-// ignore_for_file: non_constant_identifier_names, camel_case_types
+// ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
 import 'dart:ffi';
 import 'dart:io' show Platform;
@@ -34,6 +34,16 @@ typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
+
+typedef _NativeWeaveffiFreeString = Void Function(Pointer<Utf8>);
+typedef _DartWeaveffiFreeString = void Function(Pointer<Utf8>);
+final _weaveffiFreeString = _lib.lookupFunction<
+    _NativeWeaveffiFreeString, _DartWeaveffiFreeString>('weaveffi_free_string');
+
+typedef _NativeWeaveffiFreeBytes = Void Function(Pointer<Uint8>, Size);
+typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
+final _weaveffiFreeBytes = _lib.lookupFunction<
+    _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
 
 /// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
 class WeaveFFIException implements Exception {
@@ -145,18 +155,24 @@ class Contact {
 
   String get firstName {
     final result = _weaveffiContactsContactGetFirstName(_handle);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 
   String get lastName {
     final result = _weaveffiContactsContactGetLastName(_handle);
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 
   String? get email {
     final result = _weaveffiContactsContactGetEmail(_handle);
     if (result == nullptr) return null;
-    return result.toDartString();
+    final value = result.toDartString();
+    _weaveffiFreeString(result);
+    return value;
   }
 
   ContactType get contactType {
@@ -190,8 +206,8 @@ typedef _DartWeaveffiContactsContactBookList = Pointer<Void> Function(Pointer<Vo
 final _weaveffiContactsContactBookList = _lib.lookupFunction<
     _NativeWeaveffiContactsContactBookList, _DartWeaveffiContactsContactBookList>('weaveffi_contacts_ContactBook_list');
 
-typedef _NativeWeaveffiContactsContactBookRemove = Int32 Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsContactBookRemove = int Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiContactsContactBookRemove = Bool Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsContactBookRemove = bool Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
 final _weaveffiContactsContactBookRemove = _lib.lookupFunction<
     _NativeWeaveffiContactsContactBookRemove, _DartWeaveffiContactsContactBookRemove>('weaveffi_contacts_ContactBook_remove');
 
@@ -258,9 +274,11 @@ class ContactBook {
       final result = _weaveffiContactsContactBookList(_handle, outLen, err);
       _checkError(err);
       final n = outLen.value;
-      if (result == nullptr || n == 0) return <Contact>[];
+      if (result == nullptr) return <Contact>[];
       final arr = result.cast<Pointer<Void>>();
-      return List<Contact>.generate(n, (i) => Contact._(arr[i]));
+      final items = List<Contact>.generate(n, (i) => Contact._(arr[i]));
+      _weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Void>>());
+      return items;
     } finally {
       calloc.free(outLen);
       calloc.free(err);
@@ -272,7 +290,7 @@ class ContactBook {
     try {
       final result = _weaveffiContactsContactBookRemove(_handle, id, err);
       _checkError(err);
-      return result != 0;
+      return result;
     } finally {
       calloc.free(err);
     }

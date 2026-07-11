@@ -325,7 +325,11 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_kitchen_Item_get_tags(@handle, out_len)
       return [] if result.null?
       len = out_len.read(:size_t)
-      result.read_array_of_pointer(len).map { |p| p.null? ? '' : p.read_string }
+      ptrs = result.read_array_of_pointer(len)
+      items = ptrs.map { |p| p.null? ? '' : p.read_string }
+      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+      items
     end
 
     def attrs
@@ -337,13 +341,22 @@ module WeaveFFI
       keys_ptr = out_keys.read_pointer
       vals_ptr = out_values.read_pointer
       return {} if keys_ptr.null? || vals_ptr.null?
-      keys_ptr.read_array_of_pointer(len).zip(vals_ptr.read_array_of_pointer(len)).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v.null? ? '' : v.read_string }
+      keys = keys_ptr.read_array_of_pointer(len)
+      vals = vals_ptr.read_array_of_pointer(len)
+      hash = keys.zip(vals).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v.null? ? '' : v.read_string }
+      keys.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      vals.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
+      WeaveFFI.weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))
+      WeaveFFI.weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:pointer))
+      hash
     end
 
     def parent
       result = WeaveFFI.weaveffi_kitchen_Item_get_parent(@handle)
       return nil if result.null?
-      result.read_int64
+      value = result.read_int64
+      WeaveFFI.weaveffi_free_bytes(result, FFI.type_size(:int64))
+      value
     end
 
     # Cross-module struct reference
@@ -681,7 +694,9 @@ module WeaveFFI
     check_error!(err)
     return [] if result.null?
     len = out_len.read(:size_t)
-    result.read_array_of_pointer(len).map { |p| Item.new(p) }
+    items = result.read_array_of_pointer(len).map { |p| Item.new(p) }
+    weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
+    items
   end
 
   # Map return type
@@ -696,30 +711,43 @@ module WeaveFFI
     keys_ptr = out_keys.read_pointer
     vals_ptr = out_values.read_pointer
     return {} if keys_ptr.null? || vals_ptr.null?
-    keys_ptr.read_array_of_pointer(len).zip(vals_ptr.read_array_of_int32(len)).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v }
+    keys = keys_ptr.read_array_of_pointer(len)
+    vals = vals_ptr.read_array_of_int32(len)
+    hash = keys.zip(vals).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v }
+    keys.each { |p| weaveffi_free_string(p) unless p.null? }
+    weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))
+    weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:int32))
+    hash
   end
 
   # Iterator return type
+  # Returns a lazy Enumerator that streams one element per pull; call
+  # `.to_a` to collect eagerly. The underlying producer iterator is
+  # launched on the first pull, so launch errors raise at that point
+  # rather than when this method returns. The iterator handle is
+  # released exactly once, when iteration finishes or is abandoned
+  # early (for example by `break`).
   def self.stream_items()
-    err = ErrorStruct.new
-    iter = weaveffi_kitchen_stream_items(err)
-    check_error!(err)
-    items = []
-    return items if iter.null?
-    loop do
-      out_item = FFI::MemoryPointer.new(:pointer)
-      item_err = ErrorStruct.new
-      has_item = weaveffi_kitchen_StreamItemsIterator_next(iter, out_item, item_err)
-      if item_err[:code] != 0
-        weaveffi_kitchen_StreamItemsIterator_destroy(iter)
-        check_error!(item_err)
+    Enumerator.new do |y|
+      err = ErrorStruct.new
+      iter = weaveffi_kitchen_stream_items(err)
+      begin
+        check_error!(err)
+        unless iter.null?
+          loop do
+            out_item = FFI::MemoryPointer.new(:pointer)
+            item_err = ErrorStruct.new
+            has_item = weaveffi_kitchen_StreamItemsIterator_next(iter, out_item, item_err)
+            check_error!(item_err)
+            break if has_item.zero?
+            item_ptr = out_item.read_pointer
+            y << Item.new(item_ptr) unless item_ptr.null?
+          end
+        end
+      ensure
+        weaveffi_kitchen_StreamItemsIterator_destroy(iter) unless iter.null?
       end
-      break if has_item.zero?
-      item_ptr = out_item.read_pointer
-      items << Item.new(item_ptr) unless item_ptr.null?
     end
-    weaveffi_kitchen_StreamItemsIterator_destroy(iter)
-    items
   end
 
   # Returns the shared Token type from another module
@@ -732,7 +760,8 @@ module WeaveFFI
   end
 
   # Async operation
-  # Blocks until the async producer completes.
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback.
   def self.do_async(input)
     queue = Queue.new
     callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
@@ -743,13 +772,7 @@ module WeaveFFI
         weaveffi_error_clear(err_ptr)
         queue << Error.new(code, msg)
       else
-        if result.null?
-          queue << ''
-        else
-          s = result.read_string
-          weaveffi_free_string(result)
-          queue << s
-        end
+        queue << (result.null? ? '' : result.read_string)
       end
     end
     weaveffi_kitchen_do_async_async(input, callback, FFI::Pointer::NULL)
@@ -759,7 +782,8 @@ module WeaveFFI
   end
 
   # Cancellable async operation
-  # Blocks until the async producer completes (cancellation token not exposed; pass-through is NULL).
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback (cancellation token not exposed; pass-through is NULL).
   def self.do_cancellable(input)
     queue = Queue.new
     callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
@@ -770,13 +794,7 @@ module WeaveFFI
         weaveffi_error_clear(err_ptr)
         queue << Error.new(code, msg)
       else
-        if result.null?
-          queue << ''
-        else
-          s = result.read_string
-          weaveffi_free_string(result)
-          queue << s
-        end
+        queue << (result.null? ? '' : result.read_string)
       end
     end
     weaveffi_kitchen_do_cancellable_async(input, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)

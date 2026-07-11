@@ -70,13 +70,13 @@ JNIEXPORT jstring JNICALL Java_com_weaveffi_WeaveFFI_echo(JNIEnv* env, jclass cl
     weaveffi_error err = {0, NULL};
     const char* s_chars = (*env)->GetStringUTFChars(env, s, NULL);
     const char* rv = weaveffi_calculator_echo(s_chars, &err);
+    (*env)->ReleaseStringUTFChars(env, s, s_chars);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
     }
     jstring out = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, "");
     weaveffi_free_string(rv);
-    (*env)->ReleaseStringUTFChars(env, s, s_chars);
     return out;
 }
 

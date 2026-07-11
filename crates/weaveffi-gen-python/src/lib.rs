@@ -26,6 +26,7 @@ use weaveffi_core::model::{
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -108,7 +109,23 @@ impl PythonGenerator {
             .flat_map(|m| m.callables())
             .any(|f| f.is_async);
         if has_async {
-            out.push_str("\nimport asyncio\nimport threading\n");
+            out.push_str(
+                "\nimport asyncio\nimport threading\n\n\n\
+                 # Pending async completion trampolines, keyed by an integer token.\n\
+                 # Holding the ctypes function objects here keeps them alive until the\n\
+                 # producer fires the completion callback, even when the awaiting\n\
+                 # coroutine has been cancelled; each entry is removed on completion.\n\
+                 _async_pending: Dict[int, object] = {}\n\
+                 _async_lock = threading.Lock()\n\
+                 _async_next_token = 0\n\n\n\
+                 def _async_register(cb) -> int:\n    \
+                     global _async_next_token\n    \
+                     with _async_lock:\n        \
+                         _async_next_token += 1\n        \
+                         _token = _async_next_token\n        \
+                         _async_pending[_token] = cb\n    \
+                     return _token\n",
+            );
         }
         let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
         if has_listeners {
@@ -477,12 +494,27 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Handle => "ctypes.c_uint64",
         TypeRef::TypedHandle(_) => "ctypes.c_void_p",
         TypeRef::Bytes | TypeRef::BorrowedBytes => "ctypes.c_uint8",
-        // Structs and interfaces both cross the ABI as opaque object pointers.
-        TypeRef::Struct(_) | TypeRef::Interface(_) => "ctypes.c_void_p",
+        // Records, rich enums, and interfaces all cross the ABI as opaque
+        // object pointers.
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
             "ctypes.c_void_p"
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// The `ctypes` element type for a slot the wrapper *owns and must free*
+/// (list returns, map buffers, iterator `next` slots). Owned string elements
+/// stay raw `c_void_p` addresses so the pointer survives long enough to be
+/// copied and passed to `weaveffi_free_string`; a `c_char_p` slot would be
+/// auto-converted to `bytes` by ctypes, losing the pointer and leaking the
+/// producer allocation.
+fn py_owned_elem_scalar(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "ctypes.c_void_p",
+        _ => py_ctypes_scalar(ty),
     }
 }
 
@@ -507,9 +539,10 @@ fn py_type_hint(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
         TypeRef::Enum(name) => format!("\"{}\"", local_type_name(name)),
-        TypeRef::Struct(name) | TypeRef::Interface(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::Interface(name) => {
             format!("\"{}\"", local_type_name(name))
         }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
         TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
         TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
@@ -569,20 +602,37 @@ fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
         return (
             "None".into(),
             vec![
-                format!("ctypes.POINTER(ctypes.POINTER({}))", py_ctypes_scalar(k)),
-                format!("ctypes.POINTER(ctypes.POINTER({}))", py_ctypes_scalar(v)),
+                format!(
+                    "ctypes.POINTER(ctypes.POINTER({}))",
+                    py_owned_elem_scalar(k)
+                ),
+                format!(
+                    "ctypes.POINTER(ctypes.POINTER({}))",
+                    py_owned_elem_scalar(v)
+                ),
                 "ctypes.POINTER(ctypes.c_size_t)".into(),
             ],
         );
     }
-    // Iterator constructors return the opaque iterator handle; the `_next`
-    // signature is emitted separately by the iterator code path.
-    if matches!(ty, TypeRef::Iterator(_)) {
-        return ("ctypes.c_void_p".into(), vec![]);
+    match ty {
+        // Iterator constructors return the opaque iterator handle; the `_next`
+        // signature is emitted separately by the iterator code path.
+        TypeRef::Iterator(_) => ("ctypes.c_void_p".into(), vec![]),
+        // An owned string return keeps its raw address so the wrapper can
+        // copy it and pass it back to `weaveffi_free_string`; a `c_char_p`
+        // restype would be auto-converted to `bytes`, losing the pointer.
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("ctypes.c_void_p".into(), vec![]),
+        TypeRef::List(inner) => (
+            format!("ctypes.POINTER({})", py_owned_elem_scalar(inner)),
+            vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
+        ),
+        TypeRef::Optional(inner) if is_c_pointer_type(inner) => py_return_info(inner),
+        _ => {
+            let r = abi::lower_return(ty, "");
+            let out = r.out_params.iter().map(|p| py_ctype(&p.ty)).collect();
+            (py_ctype(&r.ret), out)
+        }
     }
-    let r = abi::lower_return(ty, "");
-    let out = r.out_params.iter().map(|p| py_ctype(&p.ty)).collect();
-    (py_ctype(&r.ret), out)
 }
 
 fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
@@ -609,6 +659,11 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
     }
 }
 
+/// Append the success branch of an async completion trampoline: convert the
+/// borrowed `result` slots into the idiomatic value and store it in
+/// `_state["val"]`. Borrowed buffers (strings, bytes, arrays, map buffers)
+/// are copied and never freed; owned object pointers (records, rich enums,
+/// interfaces) are adopted by their wrapper class, which destroys them.
 fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
     match ret {
         None => {
@@ -633,18 +688,20 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!("{ind}_state[\"val\"] = bool(result)\n"));
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+            // `result` arrives as `bytes` (ctypes copies `c_char_p` callback
+            // arguments), so decoding is already a deep copy of the borrowed
+            // producer buffer. The producer frees it; the wrapper must not.
             out.push_str(&format!(
-                "{ind}_s = _bytes_to_string(result) or \"\" if result else \"\"\n"
+                "{ind}_state[\"val\"] = _bytes_to_string(result) or \"\"\n"
             ));
-            out.push_str(&format!("{ind}if result:\n"));
-            out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
-            out.push_str(&format!("{ind}_state[\"val\"] = _s\n"));
         }
         Some(TypeRef::Enum(name)) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
         }
-        Some(TypeRef::Struct(name)) | Some(TypeRef::TypedHandle(name)) => {
+        Some(TypeRef::Record(name))
+        | Some(TypeRef::RichEnum(name))
+        | Some(TypeRef::TypedHandle(name)) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}if result is None:\n"));
             out.push_str(&format!(
@@ -667,14 +724,12 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             ));
         }
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            // Copy the borrowed buffer; the producer owns and frees it.
             out.push_str(&format!("{ind}if not result:\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = b\"\"\n"));
             out.push_str(&format!("{ind}else:\n"));
             out.push_str(&format!("{ind}    _n = int(result_len)\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
-            out.push_str(&format!(
-                "{ind}    _lib.weaveffi_free_bytes(result, ctypes.c_size_t(_n))\n"
-            ));
         }
         Some(TypeRef::List(inner)) => {
             let elem = py_read_element("result[_i]", inner);
@@ -701,14 +756,12 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             if is_c_pointer_type(inner) {
                 match inner.as_ref() {
                     TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _s = _bytes_to_string(result)\n"));
-                        out.push_str(&format!("{ind}    _lib.weaveffi_free_string(result)\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = _s\n"));
+                        // Borrowed; `bytes` conversion already copied it.
+                        out.push_str(&format!(
+                            "{ind}_state[\"val\"] = _bytes_to_string(result)\n"
+                        ));
                     }
-                    TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+                    TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
                         let name = local_type_name(name);
                         out.push_str(&format!("{ind}if not result:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
@@ -725,15 +778,12 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                         ));
                     }
                     TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                        // Copy the borrowed buffer; the producer frees it.
                         out.push_str(&format!("{ind}if not result:\n"));
                         out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
                         out.push_str(&format!("{ind}else:\n"));
                         out.push_str(&format!("{ind}    _n = int(result_len)\n"));
-                        out.push_str(&format!("{ind}    _b = bytes(result[:_n])\n"));
-                        out.push_str(&format!(
-                            "{ind}    _lib.weaveffi_free_bytes(result, ctypes.c_size_t(_n))\n"
-                        ));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = _b\n"));
+                        out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
                     }
                     TypeRef::List(elem) => {
                         let read = py_read_element("result[_i]", elem);
@@ -785,14 +835,24 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
         // Validation rejects `async` + `iter<T>` (AsyncIteratorReturn), so an
         // iterator can never reach an async completion handler.
         Some(TypeRef::Iterator(_)) => unreachable!("async iterator returns are rejected upstream"),
+        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
 }
 
-/// Render the blocking FFI body of an async callable at the body indent
-/// `ind`. A throwing callable maps the completion error through the module
-/// domain's factory (from `error`); a non-throwing one surfaces the generic
-/// `WeaveFFIError`. When `has_self` is set (an instance method), the launcher
-/// receives `self._ptr` as its leading argument.
+/// Render the callback-driven body of an `async def` wrapper at the body
+/// indent `ind`.
+///
+/// The wrapper creates a future on the running `asyncio` loop, builds the
+/// `CFUNCTYPE` completion trampoline for the launcher's callback typedef,
+/// pins it in `_async_pending` until completion, invokes the launcher (which
+/// returns immediately), and awaits the future. The trampoline runs on an
+/// arbitrary producer thread: it copies borrowed result buffers before
+/// returning (owned object pointers are adopted instead), then resolves the
+/// future via `call_soon_threadsafe`. A throwing callable maps the completion
+/// error through the module domain's factory (from `error`); a non-throwing
+/// one traps with the generic `WeaveFFIError`. When `has_self` is set (an
+/// instance method), the launcher receives `self._ptr` as its leading
+/// argument.
 fn render_async_ffi_call_body(
     out: &mut String,
     f: &FnBinding,
@@ -800,38 +860,64 @@ fn render_async_ffi_call_body(
     ind: &str,
     has_self: bool,
 ) {
-    let c_async = format!("{}_async", f.c_base);
-    let err_expr = match error {
-        Some(eb) if f.throws => format!("{}(_code, _msg)", py_error_factory_name(eb)),
+    let CallShape::Async(a) = &f.shape else {
+        unreachable!("render_async_ffi_call_body requires an async call shape");
+    };
+    let err_expr = match (f.error_strategy(), error) {
+        (ErrorStrategy::Throws, Some(eb)) => format!("{}(_code, _msg)", py_error_factory_name(eb)),
         _ => "WeaveFFIError(_code, _msg)".to_string(),
     };
 
-    out.push_str(&format!("{ind}_fn = _lib.{c_async}\n"));
-    out.push_str(&format!("{ind}_ev = threading.Event()\n"));
-    out.push_str(&format!("{ind}_state = {{\"err\": None, \"val\": None}}\n"));
+    out.push_str(&format!("{ind}_fn = _lib.{}\n", a.launch.symbol));
+    out.push_str(&format!("{ind}_loop = asyncio.get_running_loop()\n"));
+    out.push_str(&format!("{ind}_fut = _loop.create_future()\n"));
 
     let trailing = py_async_cb_trailing_fields(&f.ret);
     let mut cb_param_list: Vec<String> = vec!["context".into(), "err".into()];
     cb_param_list.extend(trailing.iter().map(|(n, _)| n.clone()));
     let cb_params_joined = cb_param_list.join(", ");
 
+    out.push('\n');
     out.push_str(&format!("{ind}def _cb_impl({cb_params_joined}):\n"));
-    out.push_str(&format!("{ind}    try:\n"));
     out.push_str(&format!(
-        "{ind}        if err and err.contents.code != 0:\n"
-    ));
-    out.push_str(&format!("{ind}            _code = err.contents.code\n"));
-    out.push_str(&format!(
-        "{ind}            _msg = err.contents.message.decode(\"utf-8\") if err.contents.message else \"\"\n"
+        "{ind}    # Fires exactly once, on a producer thread: convert (copying\n"
     ));
     out.push_str(&format!(
-        "{ind}            _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
+        "{ind}    # borrowed buffers) here, then hop back to the event loop.\n"
     ));
-    out.push_str(&format!("{ind}            _state[\"err\"] = {err_expr}\n"));
+    out.push_str(&format!(
+        "{ind}    _state = {{\"err\": None, \"val\": None}}\n"
+    ));
+    out.push_str(&format!("{ind}    if err and err.contents.code != 0:\n"));
+    out.push_str(&format!("{ind}        _code = err.contents.code\n"));
+    out.push_str(&format!(
+        "{ind}        _msg = err.contents.message.decode(\"utf-8\") if err.contents.message else \"\"\n"
+    ));
+    out.push_str(&format!(
+        "{ind}        _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
+    ));
+    out.push_str(&format!("{ind}        _state[\"err\"] = {err_expr}\n"));
+    out.push_str(&format!("{ind}    else:\n"));
+    append_async_success_handler(out, &f.ret, &format!("{ind}        "));
+    out.push('\n');
+    out.push_str(&format!("{ind}    def _resolve():\n"));
+    out.push_str(&format!("{ind}        _async_pending.pop(_token, None)\n"));
+    out.push_str(&format!(
+        "{ind}        # A cancelled future must not be resolved.\n"
+    ));
+    out.push_str(&format!("{ind}        if _fut.cancelled():\n"));
+    out.push_str(&format!("{ind}            return\n"));
+    out.push_str(&format!("{ind}        if _state[\"err\"] is not None:\n"));
+    out.push_str(&format!(
+        "{ind}            _fut.set_exception(_state[\"err\"])\n"
+    ));
     out.push_str(&format!("{ind}        else:\n"));
-    append_async_success_handler(out, &f.ret, &format!("{ind}            "));
-    out.push_str(&format!("{ind}    finally:\n"));
-    out.push_str(&format!("{ind}        _ev.set()\n"));
+    out.push_str(&format!(
+        "{ind}            _fut.set_result(_state[\"val\"])\n"
+    ));
+    out.push('\n');
+    out.push_str(&format!("{ind}    _loop.call_soon_threadsafe(_resolve)\n"));
+    out.push('\n');
 
     let mut cf_parts: Vec<String> = vec![
         "ctypes.c_void_p".into(),
@@ -843,6 +929,9 @@ fn render_async_ffi_call_body(
         cf_parts.join(", ")
     ));
     out.push_str(&format!("{ind}_cb = _cb_type(_cb_impl)\n"));
+    out.push_str(&format!(
+        "{ind}_token = _async_register(_cb)  # pinned until completion\n"
+    ));
 
     let mut argtypes: Vec<String> = Vec::new();
     if has_self {
@@ -881,11 +970,10 @@ fn render_async_ffi_call_body(
     call_args.push("None".into());
 
     out.push_str(&format!("{ind}_fn({})\n", call_args.join(", ")));
-    out.push_str(&format!("{ind}_ev.wait()\n"));
-    out.push_str(&format!("{ind}if _state[\"err\"] is not None:\n"));
-    out.push_str(&format!("{ind}    raise _state[\"err\"]\n"));
     if f.ret.is_some() {
-        out.push_str(&format!("{ind}return _state[\"val\"]\n"));
+        out.push_str(&format!("{ind}return await _fut\n"));
+    } else {
+        out.push_str(&format!("{ind}await _fut\n"));
     }
 }
 
@@ -1079,9 +1167,11 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
-_lib.weaveffi_free_string.argtypes = [ctypes.c_char_p]
+# The free helpers take raw addresses (`c_void_p`) so wrappers can release
+# owned producer allocations they hold as plain integers or typed pointers.
+_lib.weaveffi_free_string.argtypes = [ctypes.c_void_p]
 _lib.weaveffi_free_string.restype = None
-_lib.weaveffi_free_bytes.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+_lib.weaveffi_free_bytes.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 _lib.weaveffi_free_bytes.restype = None
 
 
@@ -1115,6 +1205,15 @@ def _bytes_to_string(ptr) -> Optional[str]:
     if ptr is None:
         return None
     return ptr.decode("utf-8")
+
+
+def _take_string(ptr) -> Optional[str]:
+    """Copy an owned C string (a raw address) and free the producer buffer."""
+    if not ptr:
+        return None
+    _s = ctypes.string_at(ptr).decode("utf-8")
+    _lib.weaveffi_free_string(ptr)
+    return _s
 "#,
     );
 }
@@ -1484,7 +1583,7 @@ fn render_builder(out: &mut String, s: &StructBinding) {
         out.push_str(&format!("\n        self._{} = value", field.name));
         out.push_str("\n        return self");
     }
-    let ret_ty = py_type_hint(&TypeRef::Struct(s.name.clone()));
+    let ret_ty = py_type_hint(&TypeRef::Record(s.name.clone()));
     out.push_str(&format!("\n\n    def build(self) -> {}:", ret_ty));
     // Marshal every field into the struct's C `create` call with the same
     // lowering used for function parameters, then wrap the returned handle.
@@ -1588,7 +1687,7 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
         }
     }
     for m in &i.methods {
-        render_callable(out, m, error, &FnScope::Method);
+        render_callable(out, m, error, &FnScope::Method { class: &i.name });
     }
     for s in &i.statics {
         render_callable(out, s, error, &FnScope::Static { class: &i.name });
@@ -1679,13 +1778,15 @@ fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
         // duration of the call, so opaque pointers (including interface
         // references) pass through raw rather than being wrapped in an owning
         // class whose __del__ would free them.
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n.into(),
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => n.into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else None")
             }
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => n.into(),
+            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => n.into(),
             TypeRef::List(elem) => {
                 let read = py_read_element(&format!("{n}[_i]"), elem);
                 format!("[{read} for _i in range({n}_len)] if {n} else None")
@@ -1709,6 +1810,7 @@ fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
             format!("{{{kread}: {vread} for _i in range({n}_len)}} if {n}_keys else {{}}")
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -1834,13 +1936,17 @@ fn render_getter(out: &mut String, field: &FieldBinding) {
     if out_argtypes.is_empty() {
         w.line("_result = _fn(self._ptr)");
     } else if let Some((k, v)) = get_map_kv(&field.ty) {
+        // The locals must match the `py_return_info` argtypes exactly: owned
+        // string elements stay `c_void_p` so their raw addresses survive for
+        // `weaveffi_free_string` (ctypes rejects a `c_char_p` local against a
+        // `POINTER(POINTER(c_void_p))` argtype).
         w.line(format!(
             "_out_keys = ctypes.POINTER({})()",
-            py_ctypes_scalar(k)
+            py_owned_elem_scalar(k)
         ));
         w.line(format!(
             "_out_values = ctypes.POINTER({})()",
-            py_ctypes_scalar(v)
+            py_owned_elem_scalar(v)
         ));
         w.line("_out_len = ctypes.c_size_t(0)");
         w.line("_fn(self._ptr, ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len))");
@@ -1864,10 +1970,14 @@ enum FnScope<'a> {
         strip_module_prefix: bool,
     },
     /// An instance method on an interface wrapper: leading `self` parameter,
-    /// `self._ptr` passed as the leading C argument.
-    Method,
-    /// A `@staticmethod` member; carries the wrapper class name so an async
-    /// static's executor call can reference the private sync helper.
+    /// `self._ptr` passed as the leading C argument. Carries the wrapper
+    /// class name, which qualifies the member's iterator helper class.
+    Method {
+        /// The wrapper class name.
+        class: &'a str,
+    },
+    /// A `@staticmethod` member; carries the wrapper class name, which
+    /// qualifies the member's iterator helper class.
     Static {
         /// The wrapper class name.
         class: &'a str,
@@ -1886,7 +1996,18 @@ impl FnScope<'_> {
 
     /// True when the C call receives `self._ptr` as its leading argument.
     fn has_self_slot(&self) -> bool {
-        matches!(self, FnScope::Method)
+        matches!(self, FnScope::Method { .. })
+    }
+
+    /// The owner stem of a member's iterator helper class name:
+    /// `{Interface}_{member}` for members, the bare function name otherwise.
+    fn iterator_owner(&self, fn_name: &str) -> String {
+        match self {
+            FnScope::Method { class } | FnScope::Static { class } => {
+                format!("{class}_{fn_name}")
+            }
+            _ => fn_name.to_string(),
+        }
     }
 
     /// Indentation depth of the `def` line (0 at module scope, 1 in a class).
@@ -1929,7 +2050,7 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
     let raises = error.filter(|_| f.throws).map(|eb| eb.type_name.as_str());
 
     let receiver = match scope {
-        FnScope::Method | FnScope::Init => Some("self"),
+        FnScope::Method { .. } | FnScope::Init => Some("self"),
         FnScope::Factory => Some("cls"),
         _ => None,
     };
@@ -1951,11 +2072,7 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
             .unwrap_or_else(|| "None".to_string()),
     };
 
-    let def_name = if f.is_async {
-        format!("_{func_name}_sync")
-    } else {
-        func_name.clone()
-    };
+    let is_iterator_ret = matches!(f.shape, CallShape::Iterator(_));
 
     // The `_...Iterator` helper class is module-level; a member's helper is
     // emitted by `render_interface` ahead of the wrapper class instead.
@@ -1977,15 +2094,30 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
         w.line(d);
     }
     w.line(format!(
-        "def {}({}) -> {}:",
-        def_name,
+        "{}def {}({}) -> {}:",
+        if f.is_async { "async " } else { "" },
+        func_name,
         params_sig.join(", "),
         ret_hint
     ));
     w.indent();
 
+    // An iterator-returning wrapper documents the streaming contract next to
+    // whatever the IDL says about the function itself.
+    let doc = if is_iterator_ret {
+        let streaming = "Returns a lazy iterator: each step pulls one element from the \
+                         producer. Exhaust or close() the iterator to release its native \
+                         handle (garbage collection also releases it)."
+            .to_string();
+        Some(match &f.doc {
+            Some(d) => format!("{}\n\n{streaming}", d.trim()),
+            None => streaming,
+        })
+    } else {
+        f.doc.clone()
+    };
     let mut fdoc = String::new();
-    emit_fn_docstring(&mut fdoc, &f.doc, &f.params, &ind, raises);
+    emit_fn_docstring(&mut fdoc, &doc, &f.params, &ind, raises);
     w.raw(fdoc);
 
     // Set before any fallible statement so `__del__` never sees a
@@ -2053,11 +2185,11 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
         if let Some((k, v)) = f.ret.as_ref().and_then(get_map_kv) {
             w.line(format!(
                 "_out_keys = ctypes.POINTER({})()",
-                py_ctypes_scalar(k)
+                py_owned_elem_scalar(k)
             ));
             w.line(format!(
                 "_out_values = ctypes.POINTER({})()",
-                py_ctypes_scalar(v)
+                py_owned_elem_scalar(v)
             ));
             w.line("_out_len = ctypes.c_size_t(0)");
         } else if has_out_len {
@@ -2109,58 +2241,20 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
                 out.push_str(&w.finish());
             }
             _ => {
-                out.push_str(&w.finish());
-                if let Some(ret_ty) = &f.ret {
-                    if let (TypeRef::Iterator(inner), CallShape::Iterator(it)) = (ret_ty, &f.shape)
-                    {
-                        render_iterator_return(out, &it.iter_tag, inner, &ind, &checker);
-                    } else {
+                if is_iterator_ret {
+                    // Lazy: hand the caller the iterator wrapper; each step
+                    // pulls one element and the wrapper owns the handle.
+                    let class = py_iterator_class_name(&scope.iterator_owner(&f.name));
+                    w.line(format!("return {class}(_result)"));
+                    out.push_str(&w.finish());
+                } else {
+                    out.push_str(&w.finish());
+                    if let Some(ret_ty) = &f.ret {
                         render_return_value(out, ret_ty, &ind);
                     }
                 }
             }
         }
-    }
-
-    if f.is_async {
-        let params_joined = params_sig.join(", ");
-        let mut w = CodeWriter::four_space().with_depth(depth);
-        w.blank().blank();
-        if let Some(d) = decorator {
-            w.line(d);
-        }
-        w.line(format!(
-            "async def {}({}) -> {}:",
-            func_name, params_joined, ret_hint
-        ));
-        w.indent();
-        let mut adoc = String::new();
-        emit_fn_docstring(&mut adoc, &f.doc, &f.params, &ind, raises);
-        w.raw(adoc);
-        w.line("_loop = asyncio.get_event_loop()");
-        // The sync helper is resolved per scope: bound (`self.`), via the
-        // class name for statics, or the bare module-level name.
-        let target = match scope {
-            FnScope::Method => format!("self.{def_name}"),
-            FnScope::Static { class } => format!("{class}.{def_name}"),
-            _ => def_name.clone(),
-        };
-        let arg_names: Vec<String> = f.params.iter().map(|p| py_name(&p.name)).collect();
-        let executor_args = if arg_names.is_empty() {
-            target
-        } else {
-            format!("{target}, {}", arg_names.join(", "))
-        };
-        if f.ret.is_some() {
-            w.line(format!(
-                "return await _loop.run_in_executor(None, {executor_args})"
-            ));
-        } else {
-            w.line(format!(
-                "await _loop.run_in_executor(None, {executor_args})"
-            ));
-        }
-        out.push_str(&w.finish());
     }
 }
 
@@ -2171,7 +2265,8 @@ fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             format!("*[_string_to_bytes(v) for v in {name}]")
         }
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             format!("*[v._ptr for v in {name}]")
         }
         TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
@@ -2186,7 +2281,8 @@ fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
             format!("*[_string_to_bytes({var}) for {var} in {list_name}]")
         }
         TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             format!("*[{var}._ptr for {var} in {list_name}]")
         }
         TypeRef::Bool => format!("*[1 if {var} else 0 for {var} in {list_name}]"),
@@ -2296,15 +2392,17 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("_{name}_arr"), format!("len({name})")]
         }
-        // An interface parameter is borrowed: pass the wrapper's raw pointer;
+        // Object parameters are borrowed: pass the wrapper's raw pointer;
         // the callee never takes ownership.
-        TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_) => {
             vec![format!("{name}._ptr")]
         }
         TypeRef::Enum(_) => vec![format!("{name}.value")],
         TypeRef::Optional(inner) => match inner.as_ref() {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_{name}_c")],
-            TypeRef::Struct(_) | TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_) => {
                 vec![format!("{name}._ptr if {name} is not None else None")]
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
@@ -2325,6 +2423,7 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
             format!("len(_{name}_keys)"),
         ],
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -2333,7 +2432,10 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 fn py_read_element(expr: &str, ty: &TypeRef) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({expr})"),
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Enum(name) => {
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Enum(name) => {
             let name = local_type_name(name);
             format!("{name}({expr})")
         }
@@ -2344,6 +2446,18 @@ fn py_read_element(expr: &str, ty: &TypeRef) -> String {
         }
         TypeRef::Bool => format!("bool({expr})"),
         _ => expr.to_string(),
+    }
+}
+
+/// The read expression for one element the wrapper *owns* (list returns, map
+/// buffers, iterator `next` slots): string elements are copied and released
+/// through `_take_string` per [`weaveffi_core::plan::ElemFree::String`];
+/// object pointers are adopted by their wrapper class, whose disposal calls
+/// the `_destroy` symbol ([`weaveffi_core::plan::ElemFree::Object`]).
+fn py_read_owned_element(expr: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_take_string({expr})"),
+        _ => py_read_element(expr, ty),
     }
 }
 
@@ -2366,17 +2480,23 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         TypeRef::Bool => {
             w.line("return bool(_result)");
         }
+        // Owned string: copy, then release via `weaveffi_free_string`.
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("return _bytes_to_string(_result) or \"\"");
+            w.line("return _take_string(_result) or \"\"");
         }
+        // Owned buffer: copy, then release via `weaveffi_free_bytes`.
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.line("if not _result:");
             w.scope(|w| {
                 w.line("return b\"\"");
             });
-            w.line("return bytes(_result[:_out_len.value])");
+            w.line("_val = bytes(_result[:_out_len.value])");
+            w.line("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))");
+            w.line("return _val");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        // An owned object pointer is adopted by the wrapper class, whose
+        // disposal calls the type's `_destroy` symbol.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
             w.line("if _result is None:");
             w.scope(|w| {
@@ -2400,9 +2520,10 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         }
         // Compound returns delegate to their own helpers, which append directly.
         TypeRef::Optional(inner) => return render_optional_return(out, inner, ind),
-        TypeRef::List(inner) => return render_list_return(out, inner, ind),
-        TypeRef::Map(k, v) => return render_map_return(out, k, v, ind),
+        TypeRef::List(inner) => return render_list_return(out, inner, ind, "[]"),
+        TypeRef::Map(k, v) => return render_map_return(out, k, v, ind, "{}"),
         TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str(&w.finish());
 }
@@ -2419,13 +2540,15 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
     };
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("return _bytes_to_string(_result)");
+            w.line("return _take_string(_result)");
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             guard_none(&mut w, "None");
-            w.line("return bytes(_result[:_out_len.value])");
+            w.line("_val = bytes(_result[:_out_len.value])");
+            w.line("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))");
+            w.line("return _val");
         }
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
             let name = local_type_name(name);
             w.line("if _result is None:");
             w.scope(|w| {
@@ -2441,18 +2564,25 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             });
             w.line(format!("return {name}._from_ptr(_result)"));
         }
-        TypeRef::Enum(name) => {
-            let name = local_type_name(name);
-            guard_none(&mut w, "None");
-            w.line(format!("return {name}(_result[0])"));
-        }
-        TypeRef::Bool => {
-            guard_none(&mut w, "None");
-            w.line("return bool(_result[0])");
-        }
+        // Optional list and map returns share the non-optional copy-and-free
+        // path with a `None` empty value.
+        TypeRef::List(elem) => return render_list_return(out, elem, ind, "None"),
+        TypeRef::Map(k, v) => return render_map_return(out, k, v, ind, "None"),
+        // Boxed optional scalars: dereference, then release the box with
+        // `weaveffi_free_bytes(ptr, sizeof(T))`.
         _ if !is_c_pointer_type(inner) => {
             guard_none(&mut w, "None");
-            w.line("return _result[0]");
+            let read = match inner {
+                TypeRef::Enum(name) => format!("{}(_result[0])", local_type_name(name)),
+                TypeRef::Bool => "bool(_result[0])".to_string(),
+                _ => "_result[0]".to_string(),
+            };
+            w.line(format!("_val = {read}"));
+            w.line(format!(
+                "_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(ctypes.sizeof({})))",
+                py_ctypes_scalar(inner)
+            ));
+            w.line("return _val");
         }
         _ => {
             w.line("return _result");
@@ -2461,28 +2591,52 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
     out.push_str(&w.finish());
 }
 
-fn render_list_return(out: &mut String, inner: &TypeRef, ind: &str) {
+/// Render a list return: copy each element out of the producer array (owed
+/// per-element releases included), then release the array buffer itself with
+/// `weaveffi_free_bytes(ptr, len * sizeof(elem))`. `empty` is the value
+/// returned for a null array (`[]`, or `None` for an optional list).
+fn render_list_return(out: &mut String, inner: &TypeRef, ind: &str, empty: &str) {
     let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
     w.line("if not _result:");
     w.scope(|w| {
-        w.line("return []");
+        w.line(format!("return {empty}"));
     });
-    let elem = py_read_element("_result[_i]", inner);
-    w.line(format!("return [{elem} for _i in range(_out_len.value)]"));
+    let elem = py_read_owned_element("_result[_i]", inner);
+    w.line(format!(
+        "_items = [{elem} for _i in range(_out_len.value)]"
+    ));
+    w.line(format!(
+        "_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
+        py_owned_elem_scalar(inner)
+    ));
+    w.line("return _items");
     out.push_str(&w.finish());
 }
 
-fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
+/// Render a map return: copy each key and value out of the parallel producer
+/// arrays (owed per-element releases included), then release both arrays with
+/// `weaveffi_free_bytes`. `empty` is the value returned for null buffers
+/// (`{}`, or `None` for an optional map).
+fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str, empty: &str) {
     let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
     w.line("if not _out_keys or not _out_values:");
     w.scope(|w| {
-        w.line("return {}");
+        w.line(format!("return {empty}"));
     });
-    let key_read = py_read_element("_out_keys[_i]", k);
-    let val_read = py_read_element("_out_values[_i]", v);
+    let key_read = py_read_owned_element("_out_keys[_i]", k);
+    let val_read = py_read_owned_element("_out_values[_i]", v);
     w.line(format!(
-        "return {{{key_read}: {val_read} for _i in range(_out_len.value)}}"
+        "_map = {{{key_read}: {val_read} for _i in range(_out_len.value)}}"
     ));
+    w.line(format!(
+        "_lib.weaveffi_free_bytes(_out_keys, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
+        py_owned_elem_scalar(k)
+    ));
+    w.line(format!(
+        "_lib.weaveffi_free_bytes(_out_values, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
+        py_owned_elem_scalar(v)
+    ));
+    w.line("return _map");
     out.push_str(&w.finish());
 }
 
@@ -2490,8 +2644,15 @@ fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str) {
 
 fn py_read_iter_item(inner: &TypeRef) -> String {
     match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "_bytes_to_string(_out_item.value)".into(),
-        TypeRef::Struct(name) | TypeRef::TypedHandle(name) | TypeRef::Enum(name) => {
+        // Owned string element: copy, then `weaveffi_free_string`. The out
+        // slot is a raw `c_void_p`, so the address survives to be freed.
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "_take_string(_out_item.value)".into(),
+        // Owned object element: adopted by the wrapper class, whose disposal
+        // calls the type's `_destroy` symbol.
+        TypeRef::Record(name)
+        | TypeRef::RichEnum(name)
+        | TypeRef::TypedHandle(name)
+        | TypeRef::Enum(name) => {
             let name = local_type_name(name);
             format!("{name}(_out_item.value)")
         }
@@ -2503,10 +2664,21 @@ fn py_read_iter_item(inner: &TypeRef) -> String {
     }
 }
 
+/// The module-level helper class name for one iterator-returning callable.
+/// `owner` is the function name for a free function, or
+/// `{Interface}_{member}` for an interface member.
+fn py_iterator_class_name(owner: &str) -> String {
+    format!("_{}Iterator", pascal_case(owner))
+}
+
 /// Render the module-level `_...Iterator` helper class for one
-/// iterator-returning callable. `checker` is the error-check helper the
-/// `next` calls route their out-err slot through (typed for a throwing
-/// callable, generic otherwise).
+/// iterator-returning callable, satisfying the pull contract of
+/// [`weaveffi_core::plan::IteratorProtocol`]: one producer `next` call per
+/// `__next__`, per-element releases after copying, and exactly one `destroy`
+/// (eagerly on exhaustion, or from `close()`/`__del__` when iteration is
+/// abandoned early). `checker` is the error-check helper the `next` calls
+/// route their out-err slot through (typed for a throwing callable, generic
+/// otherwise).
 fn render_iterator_class(
     out: &mut String,
     iter_tag: &str,
@@ -2514,13 +2686,15 @@ fn render_iterator_class(
     inner: &TypeRef,
     checker: &str,
 ) {
-    let pascal = pascal_case(func_name);
-    let class_name = format!("_{pascal}Iterator");
-    let item_scalar = py_ctypes_scalar(inner);
+    let class_name = py_iterator_class_name(func_name);
+    let item_scalar = py_owned_elem_scalar(inner);
     let read_expr = py_read_iter_item(inner);
 
     out.push_str(&format!("\n\nclass {class_name}:"));
-    out.push_str("\n    def __init__(self, ptr):");
+    out.push_str("\n    \"\"\"Lazy iterator over a producer stream: each step pulls one element");
+    out.push_str("\n    across the C boundary. The native handle is released exactly once, on");
+    out.push_str("\n    exhaustion, on close(), or when the iterator is garbage collected.\"\"\"");
+    out.push_str("\n\n    def __init__(self, ptr):");
     out.push_str("\n        self._ptr = ptr");
     out.push_str("\n        self._done = False");
 
@@ -2547,6 +2721,11 @@ fn render_iterator_class(
     out.push_str("\n            raise StopIteration");
     out.push_str(&format!("\n        return {read_expr}"));
 
+    out.push_str("\n\n    def close(self):");
+    out.push_str("\n        \"\"\"Release the native iterator without draining it.\"\"\"");
+    out.push_str("\n        self._done = True");
+    out.push_str("\n        self._destroy()");
+
     out.push_str("\n\n    def _destroy(self):");
     out.push_str("\n        if self._ptr is not None:");
     out.push_str(&format!(
@@ -2560,44 +2739,6 @@ fn render_iterator_class(
     out.push_str("\n\n    def __del__(self):");
     out.push_str("\n        self._destroy()");
     out.push('\n');
-}
-
-/// Render the eager-drain body of an iterator-returning wrapper. `checker`
-/// is the error-check helper each `next` call routes its out-err through.
-fn render_iterator_return(
-    out: &mut String,
-    iter_tag: &str,
-    inner: &TypeRef,
-    ind: &str,
-    checker: &str,
-) {
-    let item_scalar = py_ctypes_scalar(inner);
-    let read_expr = py_read_iter_item(inner);
-
-    out.push_str(&format!("{ind}_next_fn = _lib.{iter_tag}_next\n"));
-    out.push_str(&format!(
-        "{ind}_next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveFFIErrorStruct)]\n"
-    ));
-    out.push_str(&format!("{ind}_next_fn.restype = ctypes.c_int32\n"));
-
-    out.push_str(&format!("{ind}_destroy_fn = _lib.{iter_tag}_destroy\n"));
-    out.push_str(&format!("{ind}_destroy_fn.argtypes = [ctypes.c_void_p]\n"));
-    out.push_str(&format!("{ind}_destroy_fn.restype = None\n"));
-
-    out.push_str(&format!("{ind}_items = []\n"));
-    out.push_str(&format!("{ind}while True:\n"));
-    out.push_str(&format!("{ind}    _out_item = {item_scalar}()\n"));
-    out.push_str(&format!("{ind}    _item_err = _WeaveFFIErrorStruct()\n"));
-    out.push_str(&format!(
-        "{ind}    _has = _next_fn(_result, ctypes.byref(_out_item), ctypes.byref(_item_err))\n"
-    ));
-    out.push_str(&format!("{ind}    {checker}(_item_err)\n"));
-    out.push_str(&format!("{ind}    if not _has:\n"));
-    out.push_str(&format!("{ind}        break\n"));
-    out.push_str(&format!("{ind}    _items.append({read_expr})\n"));
-
-    out.push_str(&format!("{ind}_destroy_fn(_result)\n"));
-    out.push_str(&format!("{ind}return _items\n"));
 }
 
 // ── Packaging ──
@@ -3267,9 +3408,10 @@ mod tests {
             py.contains("_string_to_bytes(msg)"),
             "missing _string_to_bytes call: {py}"
         );
+        // The owned return string is copied and released via `_take_string`.
         assert!(
-            py.contains("_bytes_to_string(_result)"),
-            "missing _bytes_to_string call: {py}"
+            py.contains("return _take_string(_result) or \"\""),
+            "missing _take_string call: {py}"
         );
     }
 
@@ -3450,9 +3592,10 @@ mod tests {
             py.contains("weaveffi_contacts_Contact_get_name"),
             "missing name getter C call: {py}"
         );
+        // The getter's owned string is copied and released via `_take_string`.
         assert!(
-            py.contains("_bytes_to_string(_result)"),
-            "missing _bytes_to_string in getter: {py}"
+            py.contains("_take_string(_result)"),
+            "missing _take_string in getter: {py}"
         );
         assert!(
             py.contains("def age(self) -> int:"),
@@ -3546,7 +3689,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -3722,10 +3865,19 @@ mod tests {
             "missing optional param conversion: {py}"
         );
         assert!(py.contains("return None"), "missing None return path: {py}");
+        // The boxed scalar is dereferenced, then its box is released.
         assert!(
-            py.contains("return _result[0]"),
+            py.contains("_val = _result[0]"),
             "missing pointer deref: {py}"
         );
+        assert!(
+            py.contains(
+                "_lib.weaveffi_free_bytes(_result, \
+                 ctypes.c_size_t(ctypes.sizeof(ctypes.c_int32)))"
+            ),
+            "missing boxed scalar free: {py}"
+        );
+        assert!(py.contains("return _val"), "missing _val return: {py}");
     }
 
     #[test]
@@ -3757,9 +3909,11 @@ mod tests {
             py.contains("-> Optional[str]:"),
             "missing optional str return: {py}"
         );
+        // The optional owned string is copied and released via `_take_string`,
+        // which itself returns `None` for a null pointer.
         assert!(
-            py.contains("return _bytes_to_string(_result)"),
-            "missing _bytes_to_string for optional string: {py}"
+            py.contains("return _take_string(_result)"),
+            "missing _take_string for optional string: {py}"
         );
     }
 
@@ -3913,9 +4067,10 @@ mod tests {
             py.contains("def email(self) -> Optional[str]:"),
             "missing optional getter: {py}"
         );
+        // Copied and released via `_take_string` (which handles the null case).
         assert!(
-            py.contains("_bytes_to_string(_result)"),
-            "missing _bytes_to_string in optional getter: {py}"
+            py.contains("_take_string(_result)"),
+            "missing _take_string in optional getter: {py}"
         );
     }
 
@@ -4048,7 +4203,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -4059,7 +4214,7 @@ mod tests {
                 Function {
                     name: "list_contacts".into(),
                     params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -4133,7 +4288,7 @@ mod tests {
         assert_eq!(py_type_hint(&TypeRef::StringUtf8), "str");
         assert_eq!(py_type_hint(&TypeRef::Bytes), "bytes");
         assert_eq!(py_type_hint(&TypeRef::Handle), "int");
-        assert_eq!(py_type_hint(&TypeRef::Struct("Foo".into())), "\"Foo\"");
+        assert_eq!(py_type_hint(&TypeRef::Record("Foo".into())), "\"Foo\"");
         assert_eq!(py_type_hint(&TypeRef::Enum("Bar".into())), "\"Bar\"");
         assert_eq!(py_type_hint(&TypeRef::TypedHandle("Foo".into())), "\"Foo\"");
         // Cross-module references (resolved to a qualified IR name) must still
@@ -4145,7 +4300,7 @@ mod tests {
             "qualified typed handle must annotate the local class name"
         );
         assert_eq!(
-            py_type_hint(&TypeRef::Struct("kv.Store".into())),
+            py_type_hint(&TypeRef::Record("kv.Store".into())),
             "\"Store\""
         );
         assert_eq!(py_type_hint(&TypeRef::Enum("kv.Kind".into())), "\"Kind\"");
@@ -4177,7 +4332,7 @@ mod tests {
         assert_eq!(py_ctypes_scalar(&TypeRef::Handle), "ctypes.c_uint64");
         assert_eq!(py_ctypes_scalar(&TypeRef::Bytes), "ctypes.c_uint8");
         assert_eq!(
-            py_ctypes_scalar(&TypeRef::Struct("X".into())),
+            py_ctypes_scalar(&TypeRef::Record("X".into())),
             "ctypes.c_void_p"
         );
         assert_eq!(
@@ -4193,7 +4348,7 @@ mod tests {
             functions: vec![Function {
                 name: "list_items".into(),
                 params: vec![],
-                returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
+                returns: Some(TypeRef::List(Box::new(TypeRef::Record("Item".into())))),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -4354,7 +4509,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -4711,7 +4866,7 @@ mod tests {
                 Function {
                     name: "find_contact".into(),
                     params: vec![],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                         "Contact".into(),
                     )))),
                     doc: None,
@@ -4787,9 +4942,17 @@ mod tests {
             py.contains("-> Optional[bool]:"),
             "missing Optional[bool] return"
         );
+        // The boxed bool is dereferenced, then its box is released.
         assert!(
-            py.contains("return bool(_result[0])"),
+            py.contains("_val = bool(_result[0])"),
             "missing optional bool deref"
+        );
+        assert!(
+            py.contains(
+                "_lib.weaveffi_free_bytes(_result, \
+                 ctypes.c_size_t(ctypes.sizeof(ctypes.c_int32)))"
+            ),
+            "missing boxed bool free"
         );
     }
 
@@ -4828,7 +4991,7 @@ mod tests {
                 Function {
                     name: "get_items".into(),
                     params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Item".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Item".into())))),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -4863,9 +5026,18 @@ mod tests {
             py.contains("-> List[str]:"),
             "missing List[str] return: {py}"
         );
+        // Each owned string element is copied and released, then the array
+        // buffer itself is released.
         assert!(
-            py.contains("_bytes_to_string(_result[_i]) for _i in range(_out_len.value)"),
-            "missing string list _bytes_to_string: {py}"
+            py.contains("_take_string(_result[_i]) for _i in range(_out_len.value)"),
+            "missing string list _take_string: {py}"
+        );
+        assert!(
+            py.contains(
+                "_lib.weaveffi_free_bytes(_result, \
+                 ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))"
+            ),
+            "missing string list array free: {py}"
         );
 
         assert!(
@@ -4950,8 +5122,10 @@ mod tests {
             py.contains("-> Dict[str, int]:"),
             "missing Dict return hint"
         );
+        // Owned string keys stay raw `c_void_p` addresses so each one can be
+        // copied and released; `c_char_p` would lose the pointer.
         assert!(
-            py.contains("_out_keys = ctypes.POINTER(ctypes.c_char_p)()"),
+            py.contains("_out_keys = ctypes.POINTER(ctypes.c_void_p)()"),
             "missing out_keys init"
         );
         assert!(
@@ -4967,8 +5141,23 @@ mod tests {
             "missing empty map check"
         );
         assert!(
-            py.contains("_bytes_to_string(_out_keys[_i]): _out_values[_i]"),
+            py.contains("_take_string(_out_keys[_i]): _out_values[_i]"),
             "missing map comprehension"
+        );
+        // Both parallel buffers are released after copying.
+        assert!(
+            py.contains(
+                "_lib.weaveffi_free_bytes(_out_keys, \
+                 ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))"
+            ),
+            "missing map key buffer free"
+        );
+        assert!(
+            py.contains(
+                "_lib.weaveffi_free_bytes(_out_values, \
+                 ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_int32)))"
+            ),
+            "missing map value buffer free"
         );
     }
 
@@ -5072,7 +5261,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -5083,7 +5272,7 @@ mod tests {
                 Function {
                     name: "list_contacts".into(),
                     params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -5248,7 +5437,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("Contact".into())),
+                    returns: Some(TypeRef::Record("Contact".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -5259,7 +5448,7 @@ mod tests {
                 Function {
                     name: "list_contacts".into(),
                     params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Struct("Contact".into())))),
+                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -5655,7 +5844,7 @@ mod tests {
                 params: vec![Param {
                     name: "data".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ))))),
                     mutable: false,
                     doc: None,
@@ -5741,7 +5930,7 @@ mod tests {
                     name: "contacts".into(),
                     ty: TypeRef::Map(
                         Box::new(TypeRef::Enum("Color".into())),
-                        Box::new(TypeRef::Struct("Contact".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
                     ),
                     mutable: false,
                     doc: None,
@@ -5872,7 +6061,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Struct("Contact".into())),
+                returns: Some(TypeRef::Record("Contact".into())),
                 doc: None,
                 throws: false,
                 r#async: false,
@@ -5968,7 +6157,7 @@ mod tests {
                     mutable: false,
                     doc: None,
                 }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Struct(
+                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
                 doc: None,
@@ -6039,20 +6228,39 @@ mod tests {
             "should import asyncio: {code}"
         );
         assert!(
-            code.contains("def _fetch_data_sync(id: int) -> str:"),
-            "should have sync helper: {code}"
-        );
-        assert!(
             code.contains("async def fetch_data(id: int) -> str:"),
             "should have async wrapper: {code}"
         );
+        // Callback-driven: the wrapper awaits a future resolved by the C
+        // completion callback, rather than blocking an executor thread.
         assert!(
-            code.contains("asyncio.get_event_loop()"),
-            "should use get_event_loop: {code}"
+            code.contains("_loop = asyncio.get_running_loop()"),
+            "should use get_running_loop: {code}"
         );
         assert!(
-            code.contains("run_in_executor(None, _fetch_data_sync, id)"),
-            "should use run_in_executor with sync fn and args: {code}"
+            code.contains("_fut = _loop.create_future()"),
+            "should create a future: {code}"
+        );
+        assert!(
+            code.contains("_cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, \
+                           ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)"),
+            "should build the CFUNCTYPE trampoline: {code}"
+        );
+        assert!(
+            code.contains("_loop.call_soon_threadsafe(_resolve)"),
+            "should resolve via call_soon_threadsafe: {code}"
+        );
+        assert!(
+            code.contains("return await _fut"),
+            "should await the future: {code}"
+        );
+        assert!(
+            !code.contains("run_in_executor"),
+            "executor-based async must be gone: {code}"
+        );
+        assert!(
+            !code.contains("_fetch_data_sync"),
+            "sync helper must be gone: {code}"
         );
     }
 
@@ -6169,11 +6377,11 @@ mod tests {
         );
     }
 
-    /// `ctypes.CFUNCTYPE` instances pin the C trampoline; `_cb` is held alive
-    /// in the local frame for the lifetime of the synchronous helper, which
-    /// blocks on `_ev.wait()` until the C callback fires. The `try/finally`
-    /// around `_state` mutation ensures `_ev.set()` always runs, releasing
-    /// the wait and letting `_cb` drop together with the helper frame.
+    /// `ctypes.CFUNCTYPE` instances pin the C trampoline. Because the wrapper
+    /// suspends at `await` and its frame can be torn down by cancellation, the
+    /// trampoline is registered in the module-level `_async_pending` dict
+    /// under an integer token, and the completion callback pops that entry
+    /// before resolving the future (skipping a cancelled future).
     #[test]
     fn python_async_pins_callback_for_lifetime() {
         let api = make_api(vec![simple_module(vec![Function {
@@ -6194,19 +6402,31 @@ mod tests {
         }])]);
         let code = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         let pin_count = code.matches("_cb = _cb_type(_cb_impl)").count();
-        let wait_count = code.matches("_ev.wait()").count();
-        let set_count = code.matches("_ev.set()").count();
         assert_eq!(
             pin_count, 1,
             "expected one `_cb = _cb_type(_cb_impl)` per async fn, got {pin_count}: {code}"
         );
-        assert_eq!(
-            wait_count, set_count,
-            "every `_ev.wait()` must be matched by an `_ev.set()` in finally: wait={wait_count} set={set_count}: {code}"
+        // The module-level registry and its helper are emitted once.
+        assert!(
+            code.contains("_async_pending: Dict[int, object] = {}"),
+            "missing pending-trampoline registry: {code}"
         );
         assert!(
-            code.contains("finally:\n            _ev.set()"),
-            "_ev.set() must be in a finally block: {code}"
+            code.contains("def _async_register(cb) -> int:"),
+            "missing _async_register helper: {code}"
+        );
+        // Every registration is matched by a pop on completion, and a
+        // cancelled future is left untouched.
+        let register_count = code.matches("_token = _async_register(_cb)").count();
+        let pop_count = code.matches("_async_pending.pop(_token, None)").count();
+        assert_eq!(register_count, 1, "expected one registration: {code}");
+        assert_eq!(
+            register_count, pop_count,
+            "every registration must be popped on completion: {code}"
+        );
+        assert!(
+            code.contains("if _fut.cancelled():"),
+            "missing cancelled-future guard: {code}"
         );
     }
 
@@ -6269,7 +6489,7 @@ mod tests {
                         mutable: false,
                         doc: None,
                     }],
-                    returns: Some(TypeRef::Struct("types.Name".into())),
+                    returns: Some(TypeRef::Record("types.Name".into())),
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -6382,7 +6602,7 @@ mod tests {
             "Iterator[int]"
         );
         assert_eq!(
-            py_type_hint(&TypeRef::Iterator(Box::new(TypeRef::Struct(
+            py_type_hint(&TypeRef::Iterator(Box::new(TypeRef::Record(
                 "Contact".into()
             )))),
             "Iterator[\"Contact\"]"
@@ -6414,16 +6634,74 @@ mod tests {
         }]);
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
-            py.contains("ListItemsIterator"),
-            "should reference iterator type name: {py}"
+            py.contains("class _ListItemsIterator:"),
+            "should emit iterator helper class: {py}"
+        );
+        // Lazy contract: the wrapper hands back the helper instance; nothing
+        // drains the stream into a list.
+        assert!(
+            py.contains("def list_items() -> Iterator[int]:"),
+            "wrapper should be typed Iterator[int]: {py}"
         );
         assert!(
-            py.contains("_next"),
-            "should call _next for iteration: {py}"
+            py.contains("return _ListItemsIterator(_result)"),
+            "wrapper should return the iterator instance: {py}"
         );
         assert!(
-            py.contains("_destroy"),
-            "should call _destroy for cleanup: {py}"
+            !py.contains("_items = []"),
+            "eager draining must be gone: {py}"
+        );
+        // One producer pull per step, and disposal is single-shot via
+        // exhaustion, close(), or garbage collection.
+        assert!(
+            py.contains("def __next__(self):"),
+            "missing __next__: {py}"
+        );
+        assert!(
+            py.contains("_next_fn = _lib.weaveffi_data_ListItemsIterator_next"),
+            "missing per-step next call: {py}"
+        );
+        assert!(py.contains("def close(self):"), "missing close(): {py}");
+        assert!(py.contains("def __del__(self):"), "missing __del__: {py}");
+        assert!(
+            py.contains("_destroy_fn = _lib.weaveffi_data_ListItemsIterator_destroy"),
+            "missing destroy call: {py}"
+        );
+    }
+
+    #[test]
+    fn python_iterator_string_elements_freed() {
+        let api = make_api(vec![Module {
+            name: "data".to_string(),
+            functions: vec![Function {
+                name: "list_names".to_string(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::StringUtf8))),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+        // The out slot is a raw address so the pointer survives to be freed;
+        // each yielded string is copied and released via `_take_string`.
+        assert!(
+            py.contains("_out_item = ctypes.c_void_p()"),
+            "string out slot must be c_void_p: {py}"
+        );
+        assert!(
+            py.contains("return _take_string(_out_item.value)"),
+            "yielded string must be copied then freed: {py}"
         );
     }
 
@@ -6728,27 +7006,24 @@ mod tests {
         }];
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
-        // Async method: private sync helper takes self, passes self._ptr to
-        // the launcher, and the async def dispatches through the bound helper.
+        // Async method: the wrapper itself is the async def, and the launcher
+        // receives self._ptr, the marshalled params, the trampoline, and the
+        // NULL context.
         assert!(
             py.contains("import asyncio"),
             "missing asyncio import: {py}"
-        );
-        assert!(
-            py.contains("def _fetch_sync(self, key: str) -> str:"),
-            "missing async method sync helper: {py}"
-        );
-        assert!(
-            py.contains("_fn(self._ptr, _string_to_bytes(key), _cb, None)"),
-            "async launcher should receive self._ptr first: {py}"
         );
         assert!(
             py.contains("async def fetch(self, key: str) -> str:"),
             "missing async def method: {py}"
         );
         assert!(
-            py.contains("run_in_executor(None, self._fetch_sync, key)"),
-            "async method should dispatch through the bound helper: {py}"
+            py.contains("_fn(self._ptr, _string_to_bytes(key), _cb, None)"),
+            "async launcher should receive self._ptr first: {py}"
+        );
+        assert!(
+            !py.contains("run_in_executor"),
+            "executor-based async must be gone: {py}"
         );
         // A throwing async member maps errors through the domain factory.
         assert!(
@@ -6757,7 +7032,8 @@ mod tests {
         );
 
         // Iterator method: the helper class is emitted at module scope,
-        // qualified by the interface name, and checks the domain error.
+        // qualified by the interface name, and the wrapper hands it back
+        // without draining.
         assert!(
             py.contains("class _StoreListKeysIterator:"),
             "missing interface-qualified iterator helper: {py}"
@@ -6766,12 +7042,22 @@ mod tests {
             py.contains("def list_keys(self) -> Iterator[str]:"),
             "missing iterator method: {py}"
         );
-
-        // Async static: the executor resolves the helper via the class name,
-        // and a non-throwing member falls back to the generic error.
         assert!(
-            py.contains("run_in_executor(None, Store._default_path_sync)"),
-            "async static should dispatch via the class: {py}"
+            py.contains("return _StoreListKeysIterator(_result)"),
+            "iterator method should return the helper instance: {py}"
+        );
+        // Per-next errors route through the domain checker for a throwing
+        // member.
+        assert!(
+            py.contains("_check_kv_error(_err)"),
+            "iterator next should use the domain checker: {py}"
+        );
+
+        // Async static: also callback-driven; a non-throwing member falls
+        // back to the generic error.
+        assert!(
+            py.contains("async def default_path() -> str:"),
+            "missing async static wrapper: {py}"
         );
         assert!(
             py.contains("_state[\"err\"] = WeaveFFIError(_code, _msg)"),

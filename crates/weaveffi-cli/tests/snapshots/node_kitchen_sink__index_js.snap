@@ -56,6 +56,41 @@ function __invokeAsync(fn, args, map) {
   });
 }
 
+// Lazy iterator over a native producer: one native `next` per step.
+// The native handle is released on exhaustion, by `return()` on early
+// exit, or by the external's finalizer if the iterator is abandoned.
+class WeaveFFIIterator {
+  constructor(ext, nextFn, destroyFn, map, wrapElem) {
+    this._ext = ext;
+    this._nextFn = nextFn;
+    this._destroyFn = destroyFn;
+    this._map = map;
+    this._wrapElem = wrapElem;
+    this._done = false;
+  }
+  next() {
+    if (this._done) {
+      return { done: true, value: undefined };
+    }
+    const _v = __invoke(this._nextFn, [this._ext], this._map);
+    if (_v === undefined) {
+      this._done = true;
+      return { done: true, value: undefined };
+    }
+    return { done: false, value: this._wrapElem ? this._wrapElem(_v) : _v };
+  }
+  return(value) {
+    if (!this._done) {
+      this._done = true;
+      this._destroyFn(this._ext);
+    }
+    return { done: true, value };
+  }
+  [Symbol.iterator]() {
+    return this;
+  }
+}
+
 class KitchenErrorsError extends WeaveFFIError {
   constructor(code, message) {
     super(code, message);
@@ -164,7 +199,8 @@ wv.getAttrs = function () {
   return __invoke(addon.getAttrs, [], __generic);
 };
 wv.streamItems = function () {
-  return __invoke(addon.streamItems, [], __generic);
+  const _it = __invoke(addon.streamItems, [], __generic);
+  return new WeaveFFIIterator(_it, addon.streamItems_iterNext, addon.streamItems_iterDestroy, __generic, null);
 };
 wv.crossModuleToken = function () {
   return __invoke(addon.crossModuleToken, [], __generic);
