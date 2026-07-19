@@ -1,3 +1,13 @@
+## [0.17.0](https://github.com/weavefoundry/weaveffi/compare/v0.16.0...v0.17.0) (2026-07-19)
+
+### ⚠ BREAKING CHANGES
+
+* add callback and listener support to the wasm generator (#32)
+
+### Features
+
+* add callback and listener support to the wasm generator ([#32](https://github.com/weavefoundry/weaveffi/issues/32)) ([a9379c5](https://github.com/weavefoundry/weaveffi/commit/a9379c55e1f648014ba6791088968423dbd1c01a)), closes [#31](https://github.com/weavefoundry/weaveffi/issues/31)
+
 ## [0.16.0](https://github.com/weavefoundry/weaveffi/compare/v0.15.0...v0.16.0) (2026-07-11)
 
 ### ⚠ BREAKING CHANGES

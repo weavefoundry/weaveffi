@@ -1,6 +1,6 @@
 [package]
 name = "weaveffi"
-version = "0.16.0"
+version = "0.17.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -10,8 +10,8 @@ keywords = ["ffi", "abi", "bindings", "codegen", "proc-macro"]
 categories = ["development-tools::ffi"]
 
 [dependencies]
-weaveffi-abi = { path = "../weaveffi-abi", version = "0.16.0" }
-weaveffi-macros = { path = "../weaveffi-macros", version = "0.16.0" }
+weaveffi-abi = { path = "../weaveffi-abi", version = "0.17.0" }
+weaveffi-macros = { path = "../weaveffi-macros", version = "0.17.0" }
 
 [lints]
 workspace = true
