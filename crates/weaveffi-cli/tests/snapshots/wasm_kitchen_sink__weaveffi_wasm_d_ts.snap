@@ -207,6 +207,14 @@ export interface WeaveffiWasmModule {
      * @throws {WeaveFFIError} if the native call fails
      */
     newOp(): number;
+    /**
+     * Subscribe to OnReady events
+     *
+     * @returns A subscription id for `unregisterReadyListener()`.
+     */
+    registerReadyListener(callback: (code: number, msg: string) => void): number;
+    /** Unregister a listener previously registered with `registerReadyListener()`. */
+    unregisterReadyListener(id: number): void;
     Gadget: typeof Gadget;
     nested: {
       /**

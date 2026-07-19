@@ -171,8 +171,7 @@ the keys are identical.
 | `[node]`    | `package_name`         | string | `"weaveffi"`       | npm package name in the Node.js loader                                      |
 | `[node]`    | `strip_module_prefix`  | bool   | `true`             | Strip the IR module prefix from emitted JS/TS symbols                       |
 | `[wasm]`    | `module_name`          | string | `"weaveffi_wasm"`  | Module name in the Wasm JS loader                                           |
-| `[wasm]`    | `allow_unsupported`    | bool   | `false`            | Generate anyway when the IDL uses features Wasm cannot deliver (callbacks, listeners); unsupported entry points become explicit throwing stubs |
-| `[wasm]`    | `emscripten`           | bool   | `false`            | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` URL; async functions become throwing stubs |
+| `[wasm]`    | `emscripten`           | bool   | `false`            | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` URL; async functions, callbacks, and listeners become throwing stubs |
 | `[c]`       | `prefix`               | string | `"weaveffi"`       | Prefix prepended to every C ABI symbol (`{prefix}_{module}_{function}`)     |
 | `[cpp]`     | `namespace`            | string | `"weaveffi"`       | C++ namespace for the wrapper                                               |
 | `[cpp]`     | `header_name`          | string | `"weaveffi.hpp"`   | Header file name for the C++ output                                         |

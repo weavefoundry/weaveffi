@@ -1,13 +1,16 @@
 // Conformance consumer: events sample, Wasm (wasm32-unknown-unknown) target.
 //
-// The wasm target declares listeners/callbacks unsupported; the sample opts in
-// via `generators.wasm.allow_unsupported`, so the supported surface (send +
-// the iterator-drained get_messages) must work and the listener register/
-// unregister entry points must exist as explicit stubs that throw.
+// Exercises the function-table trampoline listener path (register -> the
+// producer's emit fires synchronously back into JS during sendMessage ->
+// unregister stops delivery) and the lazy iterable getMessages (one producer
+// next per step, drained here via spread). Unlike the native targets there
+// is no event-loop hop: wasm delivery is same-thread and synchronous, so
+// assertions run immediately after each send.
 //
 // Inputs come from the harness:
 //   WV_WASM: path to the compiled events.wasm
 //   WV_JS:   path to the generated weaveffi_wasm.js (ESM)
+// Run with: node --experimental-wasm-type-reflection (for WebAssembly.Function).
 
 import fs from 'fs';
 
@@ -31,10 +34,24 @@ function expect(cond, msg) {
   }
 }
 
+// Listener registration returns a plain numeric subscription id.
+const received = [];
+const sub = api.events.registerMessageListener((message) => received.push(message));
+expect(typeof sub === 'number' && sub > 0, 'listener id positive');
+
 // Functions surface in lowerCamelCase (module-prefix-free names under the
-// module object).
+// module object). Delivery is synchronous: the callback runs inside each
+// sendMessage call.
 api.events.sendMessage('alpha');
+expect(
+  received.length === 1 && received[0] === 'alpha',
+  `listener received first send synchronously (got ${JSON.stringify(received)})`
+);
 api.events.sendMessage('beta');
+expect(
+  received.length === 2 && received[1] === 'beta',
+  `listener received sends in order (got ${JSON.stringify(received)})`
+);
 
 // getMessages returns a lazy iterable (one producer next per step); spread
 // drains it here.
@@ -48,28 +65,15 @@ expect(
 // still exported for panic/marshalling failures.
 expect(typeof mod.WeaveFFIError === 'function', 'WeaveFFIError exported');
 
-// The unsupported listener surface throws with a clear message instead of
-// silently not existing.
-expect(typeof api.events.registerMessageListener === 'function', 'register stub exists');
-let threw = false;
-try {
-  api.events.registerMessageListener(() => {});
-} catch (e) {
-  threw = true;
-  expect(
-    String(e.message).includes('not supported by the wasm target'),
-    `stub error names the wasm target (got: ${e.message})`
-  );
-}
-expect(threw, 'register stub throws');
+// Unregister stops delivery; the producer still records the message.
+api.events.unregisterMessageListener(sub);
+api.events.sendMessage('gamma');
+expect(received.length === 2, `no delivery after unregister (got ${JSON.stringify(received)})`);
+expect([...api.events.getMessages()].length === 3, 'producer kept recording');
 
-let threwUnregister = false;
-try {
-  api.events.unregisterMessageListener(1);
-} catch (e) {
-  threwUnregister = true;
-}
-expect(threwUnregister, 'unregister stub throws');
+// Unregistering an unknown id is a harmless no-op.
+api.events.unregisterMessageListener(sub);
+api.events.unregisterMessageListener(999999);
 
 if (failures > 0) process.exit(1);
 console.log('wasm/events: OK');

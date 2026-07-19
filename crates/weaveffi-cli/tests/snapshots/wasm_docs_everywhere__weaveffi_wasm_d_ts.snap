@@ -127,6 +127,14 @@ export interface WeaveffiWasmModule {
      * @throws {WeaveFFIError} if the native call fails
      */
     publishAsync(id: bigint): Promise<boolean>;
+    /**
+     * Subscribe to document-saved notifications
+     *
+     * @returns A subscription id for `unregisterSavedListener()`.
+     */
+    registerSavedListener(callback: (docId: bigint, revision: number) => void): number;
+    /** Unregister a listener previously registered with `registerSavedListener()`. */
+    unregisterSavedListener(id: number): void;
     Notebook: typeof Notebook;
   };
 }

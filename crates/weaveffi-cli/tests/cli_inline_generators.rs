@@ -63,56 +63,14 @@ const LISTENER_IDL: &str = concat!(
     "          - { name: text, type: string }\n",
 );
 
-/// The wasm target declares callbacks/listeners unsupported, so generating a
-/// listener-bearing IDL for wasm must fail loudly with an actionable message.
+/// The wasm target supports listeners in its standard loader: a
+/// listener-bearing IDL generates real register/unregister bindings (no
+/// opt-in flag, no capability warning, no throwing stubs).
 #[test]
-fn wasm_rejects_listeners_without_opt_in() {
+fn wasm_generates_listener_bindings() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let yml = dir.path().join("api.yml");
     fs::write(&yml, LISTENER_IDL).expect("failed to write api.yml");
-    let out = dir.path().join("out");
-
-    let assert = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args([
-            "generate",
-            yml.to_str().unwrap(),
-            "-o",
-            out.to_str().unwrap(),
-            "--target",
-            "wasm",
-        ])
-        .assert()
-        .failure();
-
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("target 'wasm' does not support"),
-        "stderr should name the failing target:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("events.message_listener"),
-        "stderr should list the offending declaration:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("allow_unsupported"),
-        "stderr should mention the opt-in escape hatch:\n{stderr}"
-    );
-    assert!(!out.join("wasm").exists(), "no output should be written");
-}
-
-/// `generators.wasm.allow_unsupported: true` downgrades the capability
-/// failure to a warning; the supported surface generates and the listener
-/// becomes an explicit throwing stub.
-#[test]
-fn wasm_allow_unsupported_generates_with_warning() {
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let yml = dir.path().join("api.yml");
-    fs::write(
-        &yml,
-        format!("{LISTENER_IDL}generators:\n  wasm:\n    allow_unsupported: true\n"),
-    )
-    .expect("failed to write api.yml");
     let out = dir.path().join("out");
 
     let assert = assert_cmd::Command::cargo_bin("weaveffi")
@@ -130,30 +88,34 @@ fn wasm_allow_unsupported_generates_with_warning() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
     assert!(
-        stderr.contains("warning: target 'wasm'"),
-        "opting in must still print a warning:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("events.message_listener"),
-        "warning should list what was skipped:\n{stderr}"
+        !stderr.contains("does not support"),
+        "no capability warning should be printed:\n{stderr}"
     );
 
     let js = fs::read_to_string(out.join("wasm/weaveffi_wasm.js"))
         .expect("missing wasm/weaveffi_wasm.js");
     assert!(
-        js.contains("registerMessageListener() {"),
-        "listener should become an explicit stub:\n{js}"
+        js.contains("registerMessageListener(callback) {"),
+        "register should take the JS callback:\n{js}"
     );
     assert!(
-        js.contains("is not supported by the wasm target"),
-        "stub should throw with a clear message:\n{js}"
+        js.contains("wasm.weaveffi_events_register_message_listener("),
+        "register should call the producer symbol:\n{js}"
+    );
+    assert!(
+        !js.contains("is not supported by the wasm target"),
+        "no throwing stubs in the standard loader:\n{js}"
     );
 
     let dts = fs::read_to_string(out.join("wasm/weaveffi_wasm.d.ts"))
         .expect("missing wasm/weaveffi_wasm.d.ts");
     assert!(
-        !dts.contains("registerMessageListener"),
-        "d.ts should omit unsupported entry points:\n{dts}"
+        dts.contains("registerMessageListener(callback: (message: string) => void): number;"),
+        "d.ts should declare the register entry point:\n{dts}"
+    );
+    assert!(
+        dts.contains("unregisterMessageListener(id: number): void;"),
+        "d.ts should declare the unregister entry point:\n{dts}"
     );
 }
 

@@ -25,7 +25,7 @@ uses a feature the selected target cannot deliver (no silent skips).
 | Dart | ✓ (`Future<T>`) | ✓ | ✓ (`NativeCallable`) | ✓ |
 | Go | ✓ (blocking bridge) | ✓ | ✓ (exported trampolines) | ✓ |
 | Ruby | ✓ (blocking bridge) | ✓ | ✓ (`FFI::Function`) | ✓ |
-| Wasm | ✓ (`Promise<T>`) | ✓ | ✗ | ✗ |
+| Wasm | ✓ (`Promise<T>`) | ✓ | ✓ (table trampolines) | ✓ |
 
 Notes:
 
@@ -40,9 +40,13 @@ Notes:
   producer's completion callback fires (a channel receive in Go, a
   `Queue#pop` in Ruby). Run them from a goroutine or Ruby thread for
   concurrency; the native producer still runs off-thread.
-- **Wasm callbacks/listeners** are unsupported: a
-  `wasm32-unknown-unknown` module is single-threaded and has no producer
-  thread to deliver events. Generation fails unless you opt in with
-  `allow_unsupported = true` ([details](wasm.md#capabilities-and-allow_unsupported)),
-  in which case the unsupported entry points become explicit throwing
-  stubs rather than silent no-ops.
+- **Wasm callbacks/listeners deliver synchronously.** The loader
+  installs one long-lived JavaScript trampoline per callback typedef in
+  the module's function table, so the producer's `emit_*` dispatches
+  straight back into JS. Because `wasm32-unknown-unknown` is
+  single-threaded, events fire only while a call into the module is on
+  the stack; a producer that emits from a spawned thread cannot run on
+  this target at all ([details](wasm.md#callbacks-and-listeners)). In
+  [Emscripten mode](wasm.md#emscripten-mode) callbacks, listeners, and
+  async functions become explicit throwing stubs rather than silent
+  no-ops.

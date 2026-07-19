@@ -15,17 +15,18 @@ use std::fmt::Write as _;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi::CType;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
-use weaveffi_core::capabilities::{self, TargetCapabilities};
+use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
 };
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, ErrorBinding, FieldBinding, FnBinding, InterfaceBinding,
-    IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, RichEnumBinding,
-    RichVariantBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
+    RichEnumBinding, RichVariantBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::plan::ErrorStrategy;
@@ -52,19 +53,14 @@ pub struct WasmConfig {
     /// via `[global] c_prefix`; honored so the wasm glue calls the same
     /// exported symbols the producer emits.
     pub prefix: Option<String>,
-    /// Opt in to generating wasm bindings for an IDL that uses features the
-    /// wasm target does not support (callbacks and listeners). The supported
-    /// surface is generated normally; each unsupported entry point becomes an
-    /// explicit stub that throws at call time, and the orchestrator prints a
-    /// warning listing what was skipped. Without this flag, generation fails.
-    pub allow_unsupported: bool,
     /// Target an Emscripten build instead of a bare `wasm32-unknown-unknown`
     /// one. The loader then accepts a pre-initialized Emscripten `Module`
     /// object (or the promise returned by its `MODULARIZE` factory) instead
     /// of a `.wasm` URL, and binds the module's underscore-prefixed exports
-    /// to the symbol names the glue calls. Async functions are not supported
-    /// in this mode; each one becomes an explicit stub that throws at call
-    /// time and is omitted from the TypeScript declarations.
+    /// to the symbol names the glue calls. Async functions, callbacks, and
+    /// listeners are not supported in this mode; each one becomes an explicit
+    /// stub that throws at call time and is omitted from the TypeScript
+    /// declarations.
     pub emscripten: bool,
     /// Basename of the IDL the CLI was invoked with.
     #[serde(skip)]
@@ -98,26 +94,18 @@ impl LanguageBackend for WasmGenerator {
         "wasm"
     }
 
-    /// Callbacks and listeners are not supported. Async completion works
-    /// because each call registers a single-shot trampoline in the wasm
-    /// function table that the producer invokes before the launcher returns
-    /// control; module callbacks/listeners are long-lived and producer-
-    /// initiated (typically from worker threads), and single-threaded
-    /// `wasm32-unknown-unknown` has no thread to deliver them from. Rather
-    /// than pretend (the pre-capability generator silently dropped both),
-    /// declare them unsupported; `allow_unsupported: true` opts in to
-    /// generating the supported surface with explicit throwing stubs.
+    /// Every gated feature is supported. Callbacks and listeners share the
+    /// async machinery: the loader installs one long-lived trampoline per
+    /// callback typedef in the wasm function table and hands its index to the
+    /// producer's `register_*` symbol, so `emit_*` dispatches straight back
+    /// into JavaScript. Because `wasm32-unknown-unknown` is single-threaded,
+    /// delivery is always synchronous: events fire only while a call into the
+    /// module is on the stack (a producer that emits from a spawned thread
+    /// cannot run on this target at all). Emscripten mode emits explicit
+    /// throwing stubs for callbacks, listeners, and async functions instead;
+    /// see [`WasmConfig::emscripten`].
     fn capabilities(&self) -> TargetCapabilities {
-        TargetCapabilities {
-            async_functions: true,
-            callbacks: false,
-            listeners: false,
-            iterators: true,
-        }
-    }
-
-    fn allows_unsupported(&self, config: &Self::Config) -> bool {
-        config.allow_unsupported
+        TargetCapabilities::full()
     }
 
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str {
@@ -351,6 +339,18 @@ fn render_wasm_readme(
                  them.\n\n",
             );
         }
+        if walk_modules(&api.modules).any(|m| !m.listeners.is_empty()) {
+            out.push_str("## Callbacks and Listeners\n\n");
+            out.push_str(
+                "Callbacks and listeners are not supported in Emscripten mode: their \
+                 trampolines rely on `WebAssembly.Function` and a growable \
+                 `__indirect_function_table`, neither of which an Emscripten module \
+                 exposes portably. Each register/unregister entry point is generated \
+                 as an explicit stub that throws at call time and is omitted from the \
+                 TypeScript declarations. Use the standard `wasm32-unknown-unknown` \
+                 loader or a native target when you need them.\n\n",
+            );
+        }
     } else {
         out.push_str("This folder contains a minimal stub to help you load a `wasm32-unknown-unknown` build of your WeaveFFI library.\n\n");
         out.push_str("Build (example):\n\n");
@@ -391,6 +391,25 @@ fn render_wasm_readme(
     out.push_str("exactly once, on exhaustion or via `return()` when iteration stops early ");
     out.push_str("(a `for...of` loop calls `return()` automatically on `break` or `throw`). ");
     out.push_str("Abandoning an iterator without exhausting or closing it leaks the handle.\n");
+    if !emscripten && walk_modules(&api.modules).any(|m| !m.listeners.is_empty()) {
+        out.push_str("\n### Callbacks and Listeners\n\n");
+        out.push_str(
+            "Each listener surfaces as a `register.../unregister...` pair. `register` \
+             takes a plain JS function and returns a numeric subscription id; \
+             `unregister` takes that id and stops delivery. Delivery is **synchronous \
+             and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events \
+             fire only while a call into the module is on the stack (for example, a \
+             producer function that emits during its own execution). A producer that \
+             emits from a spawned thread cannot run on this target at all.\n\n",
+        );
+        out.push_str(
+            "Callback arguments are **borrowed for the duration of the callback**: \
+             strings and byte buffers are copied into JS values before your function \
+             runs, but struct, rich-enum, and interface arguments wrap producer-owned \
+             memory. Read what you need inside the callback and do not retain the \
+             wrapper or call `free()` on it.\n",
+        );
+    }
     out.push_str("\n### Error Handling\n\n");
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
     out.push_str("pointer as the last argument to each Wasm function. Your Wasm module must\n");
@@ -405,8 +424,6 @@ fn render_wasm_readme(
     out.push_str("`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only\n");
     out.push_str("for producer panics and marshalling failures.\n");
 
-    render_unsupported_section(&mut out, api);
-
     if !api.modules.is_empty() {
         render_api_reference(&mut out, api, model);
     }
@@ -414,35 +431,6 @@ fn render_wasm_readme(
     out.push('\n');
     out.push_str(&render_trailer(CommentStyle::Xml, "README.md"));
     out
-}
-
-/// When the IDL uses features the wasm target does not support (callbacks,
-/// listeners; generation only proceeds under `allow_unsupported`), document
-/// exactly what is missing and how it behaves, listing each declaration.
-fn render_unsupported_section(out: &mut String, api: &Api) {
-    let used = capabilities::used_features(api);
-    let caps = LanguageBackend::capabilities(&WasmGenerator);
-    let unsupported: Vec<_> = used
-        .iter()
-        .filter(|(feature, _)| !caps.supports(**feature))
-        .collect();
-    if unsupported.is_empty() {
-        return;
-    }
-    out.push_str("\n## Unsupported Features\n\n");
-    out.push_str(
-        "This IDL uses features the wasm target does not support (generated because\n\
-         `allow_unsupported` is set). Single-threaded `wasm32-unknown-unknown` has no\n\
-         producer thread to deliver events from, so:\n\n",
-    );
-    for (feature, locations) in unsupported {
-        out.push_str(&format!("- **{feature}**: {}\n", locations.join(", ")));
-    }
-    out.push_str(
-        "\nThe TypeScript declarations omit these entry points; the JS module exposes\n\
-         explicit stubs that throw on call. Use a native target (node, python, …) when\n\
-         you need them.\n",
-    );
 }
 
 fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
@@ -694,21 +682,27 @@ fn async_ret_has_string_buffers(ret: Option<&TypeRef>) -> bool {
     }
 }
 
+/// Whether `ty` or any type nested inside it (optional payloads, list and
+/// iterator elements, map keys/values) satisfies `pred`.
+fn typeref_deep_any(ty: &TypeRef, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
+    if pred(ty) {
+        return true;
+    }
+    match ty {
+        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            typeref_deep_any(inner, pred)
+        }
+        TypeRef::Map(k, v) => typeref_deep_any(k, pred) || typeref_deep_any(v, pred),
+        _ => false,
+    }
+}
+
 /// Visit every boundary-crossing type in `api` (function params + returns and
 /// struct field types), recursing into composite types, and return whether any
 /// satisfies `pred`.
 fn api_deep_any(api: &Api, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
     fn deep(ty: &TypeRef, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
-        if pred(ty) {
-            return true;
-        }
-        match ty {
-            TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-                deep(inner, pred)
-            }
-            TypeRef::Map(k, v) => deep(k, pred) || deep(v, pred),
-            _ => false,
-        }
+        typeref_deep_any(ty, pred)
     }
     fn fn_any(f: &weaveffi_ir::ir::Function, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
         f.params.iter().any(|p| deep(&p.ty, pred))
@@ -1710,16 +1704,27 @@ fn render_dts_module_interface(
     indent: &str,
     emscripten: bool,
 ) {
-    fn tree_has_content(m: &Module, path: &str, by_path: &HashMap<&str, &ModuleBinding>) -> bool {
-        let here = by_path
-            .get(path)
-            .is_some_and(|mb| !mb.functions.is_empty() || !mb.interfaces.is_empty());
-        here || m
-            .modules
-            .iter()
-            .any(|sub| tree_has_content(sub, &format!("{path}_{}", sub.name), by_path))
+    fn tree_has_content(
+        m: &Module,
+        path: &str,
+        by_path: &HashMap<&str, &ModuleBinding>,
+        include_listeners: bool,
+    ) -> bool {
+        let here = by_path.get(path).is_some_and(|mb| {
+            !mb.functions.is_empty()
+                || !mb.interfaces.is_empty()
+                || (include_listeners && !mb.listeners.is_empty())
+        });
+        here || m.modules.iter().any(|sub| {
+            tree_has_content(
+                sub,
+                &format!("{path}_{}", sub.name),
+                by_path,
+                include_listeners,
+            )
+        })
     }
-    if !tree_has_content(m, module_path, by_path) {
+    if !tree_has_content(m, module_path, by_path, !emscripten) {
         return;
     }
     let mb = by_path[module_path];
@@ -1743,6 +1748,15 @@ fn render_dts_module_interface(
                 dts_ret(f)
             ));
         }
+        // Listeners are throwing stubs in Emscripten mode; omitting them here
+        // makes the gap a compile-time error for TS consumers.
+        if !emscripten {
+            for l in &mb.listeners {
+                let mut tmp = String::new();
+                render_dts_listener(&mut tmp, mb, l, &inner);
+                w.raw(tmp);
+            }
+        }
         // The module object carries the interface class itself, so statics,
         // factories, and `new` are reachable as `api.kv.Store...`.
         for i in &mb.interfaces {
@@ -1755,6 +1769,55 @@ fn render_dts_module_interface(
             w.raw(tmp);
         }
     });
+    out.push_str(&w.finish());
+}
+
+/// Emit the TypeScript declarations for one listener's register/unregister
+/// pair. The callback parameter types come from the referenced callback
+/// typedef; the subscription id is a plain `number` (the loader keys
+/// subscriptions by its own context id, so the producer's `uint64_t` id never
+/// reaches the public surface).
+fn render_dts_listener(out: &mut String, mb: &ModuleBinding, l: &ListenerBinding, indent: &str) {
+    let Some(cb) = mb.callback(&l.event_callback) else {
+        // Validation guarantees the referenced callback exists in-module.
+        unreachable!("listener '{}' references unknown callback", l.name);
+    };
+    let register_name = format!("register_{}", l.name).to_lower_camel_case();
+    let unregister_name = format!("unregister_{}", l.name).to_lower_camel_case();
+    let cb_params: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", js_param_name(p), ts_type_for(&p.ty)))
+        .collect();
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    let register_doc = match &l.doc {
+        Some(d) => format!(
+            "{}\n\n@returns A subscription id for `{unregister_name}()`.",
+            d.trim()
+        ),
+        None => format!(
+            "Register a listener for the `{}` callback.\n\n@returns A \
+             subscription id for `{unregister_name}()`.",
+            cb.name
+        ),
+    };
+    let mut doc = String::new();
+    emit_doc(&mut doc, &Some(register_doc), indent);
+    w.raw(doc);
+    w.line(format!(
+        "{register_name}(callback: ({}) => void): number;",
+        cb_params.join(", ")
+    ));
+    let mut doc = String::new();
+    emit_doc(
+        &mut doc,
+        &Some(format!(
+            "Unregister a listener previously registered with `{register_name}()`."
+        )),
+        indent,
+    );
+    w.raw(doc);
+    w.line(format!("{unregister_name}(id: number): void;"));
     out.push_str(&w.finish());
 }
 
@@ -2093,6 +2156,14 @@ fn render_wasm_js_stub(
             .iter()
             .flat_map(ModuleBinding::callables)
             .any(|f| f.is_async);
+    // Listeners get real dispatch only in the standard loader; Emscripten
+    // mode emits throwing stubs, so no trampolines or registry there either.
+    let listener_cbs: Vec<&CallbackBinding> = if emscripten {
+        Vec::new()
+    } else {
+        collect_listener_callbacks(model)
+    };
+    let has_listeners = !listener_cbs.is_empty();
     // Opaque-object wrappers (structs and rich/algebraic enums) construct via a
     // fallible `*_new`/`*_create` that threads an `out_err`, so they need the
     // error helpers even in a module that declares no free functions.
@@ -2103,7 +2174,15 @@ fn render_wasm_js_stub(
     let needs_err = has_functions || has_opaque;
     // Error messages always cross as C strings, so anything needing the error
     // helpers also needs the string-read helpers regardless of declared types.
-    let needs_strings = needs_err || api_deep_any(api, &|t| is_string_type(t));
+    // Listener callback arguments arrive as borrowed C strings read through
+    // the same helper, so their parameter types count too.
+    let needs_strings = needs_err
+        || api_deep_any(api, &|t| is_string_type(t))
+        || listener_cbs.iter().any(|cb| {
+            cb.params
+                .iter()
+                .any(|p| typeref_deep_any(&p.ty, &is_string_type))
+        });
     let needs_bytes = api_deep_any(api, &|t| {
         matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes)
     });
@@ -2121,15 +2200,21 @@ fn render_wasm_js_stub(
         TypeRef::Iterator(inner) => is_string_type(inner),
         _ => false,
     });
-    // Async list/map results arrive borrowed: their string elements are read
-    // without freeing, through a separate helper.
-    let needs_borrowed_str_array = has_async
+    // Async list/map results and listener callback arguments arrive borrowed:
+    // their string elements are read without freeing, through a separate
+    // helper.
+    let needs_borrowed_str_array = (has_async
         && model
             .modules
             .iter()
             .flat_map(ModuleBinding::callables)
             .filter(|f| f.is_async)
-            .any(|f| async_ret_has_string_buffers(f.ret.as_ref()));
+            .any(|f| async_ret_has_string_buffers(f.ret.as_ref())))
+        || listener_cbs.iter().any(|cb| {
+            cb.params
+                .iter()
+                .any(|p| async_ret_has_string_buffers(Some(&p.ty)))
+        });
     // Any iterator-returning callable pulls in the shared lazy-iterator
     // wrapper class.
     let has_iterators = model
@@ -2345,7 +2430,7 @@ fn render_wasm_js_stub(
         out.push_str("}\n\n");
     }
 
-    if has_async {
+    if has_async || has_listeners {
         out.push_str("function _registerTrampoline(table, paramTypes, handler) {\n");
         out.push_str("  const idx = table.grow(1);\n");
         out.push_str("  table.set(idx, new WebAssembly.Function(\n");
@@ -2502,10 +2587,13 @@ fn render_wasm_js_stub(
             out.push_str("  const wasm = instance.exports;\n\n");
         }
 
+        if has_async || has_listeners {
+            out.push_str("  const _table = wasm.__indirect_function_table;\n\n");
+        }
+
         if has_async {
             out.push_str("  let _nextCtxId = 1;\n");
-            out.push_str("  const _asyncContexts = new Map();\n");
-            out.push_str("  const _table = wasm.__indirect_function_table;\n\n");
+            out.push_str("  const _asyncContexts = new Map();\n\n");
             out.push_str("  function _asyncHandler(ctxId, errPtr, ...results) {\n");
             out.push_str("    const ctx = _asyncContexts.get(ctxId);\n");
             out.push_str("    if (!ctx) return;\n");
@@ -2536,6 +2624,18 @@ fn render_wasm_js_stub(
                     "  const _cbPtr_{sig_key} = _registerTrampoline(_table, [{}], _asyncHandler);\n",
                     params_js.join(", ")
                 ));
+            }
+            out.push('\n');
+        }
+
+        if has_listeners {
+            out.push_str("  // Listener subscriptions, keyed by the context id the loader\n");
+            out.push_str("  // threads through the C ABI's void* context slot. Each entry\n");
+            out.push_str("  // holds the JS callback and the producer's subscription id.\n");
+            out.push_str("  let _nextLsnId = 1;\n");
+            out.push_str("  const _listeners = new Map();\n\n");
+            for cb in &listener_cbs {
+                emit_js_listener_trampoline(&mut out, cb, "  ");
             }
             out.push('\n');
         }
@@ -2605,7 +2705,11 @@ fn render_js_module_object(
         }
         for l in &mb.listeners {
             let mut tmp = String::new();
-            emit_js_listener_stub(&mut tmp, l, &inner);
+            if emscripten {
+                emit_js_listener_stub(&mut tmp, l, &inner);
+            } else {
+                emit_js_listener_api(&mut tmp, l, &inner);
+            }
             w.raw(tmp);
         }
         // The interface class itself is exposed on the module object, so
@@ -2684,24 +2788,273 @@ fn emit_js_async_stub(out: &mut String, f: &FnBinding, decl: JsDecl, indent: &st
     out.push_str(&w.finish());
 }
 
-/// Listeners are unsupported on wasm (see `WasmGenerator::capabilities`);
-/// generation only reaches here when `allow_unsupported` is set. Each
-/// register/unregister entry point becomes an explicit stub that throws at
-/// call time, so the gap is impossible to miss from JS even though the
-/// `.d.ts` deliberately omits the pair (a compile-time error for TS users).
+/// Listeners are unsupported in Emscripten mode: their trampolines rely on
+/// `WebAssembly.Function` and a growable `__indirect_function_table`, exactly
+/// like the async machinery. Each register/unregister entry point becomes an
+/// explicit stub that throws at call time, so the gap is impossible to miss
+/// from JS even though the `.d.ts` deliberately omits the pair (a
+/// compile-time error for TS users).
 fn emit_js_listener_stub(out: &mut String, l: &ListenerBinding, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     for op in ["register", "unregister"] {
         let name = format!("{op}_{}", l.name).to_lower_camel_case();
         w.block(format!("{name}() {{"), "},", |w| {
             w.line(format!(
-                "throw new Error(\"weaveffi: listener '{}' is not supported by the wasm \
-                 target (single-threaded wasm has no producer thread to deliver events); use a \
-                 native target for listeners\");",
+                "throw new Error(\"weaveffi: listener '{}' is not supported in \
+                 Emscripten mode; use the wasm32-unknown-unknown loader or a native \
+                 target\");",
                 l.name
             ));
         });
     }
+    out.push_str(&w.finish());
+}
+
+/// Every callback typedef referenced by at least one listener, deduplicated
+/// by `c_fn_type` in declaration order. Each gets one long-lived trampoline
+/// in the wasm function table, shared by all of its subscriptions (the
+/// per-subscription context id disambiguates), so register/unregister churn
+/// never grows the table.
+fn collect_listener_callbacks(model: &BindingModel) -> Vec<&CallbackBinding> {
+    let mut cbs: Vec<&CallbackBinding> = Vec::new();
+    for m in &model.modules {
+        for l in &m.listeners {
+            let Some(cb) = m.callback(&l.event_callback) else {
+                // Validation guarantees the referenced callback exists
+                // in-module.
+                unreachable!("listener '{}' references unknown callback", l.name);
+            };
+            if !cbs.iter().any(|c| c.c_fn_type == cb.c_fn_type) {
+                cbs.push(cb);
+            }
+        }
+    }
+    cbs
+}
+
+/// The wasm value type of one C ABI slot: pointers and 32-bit-or-smaller
+/// scalars are `i32` on wasm32, 64-bit integers and handles widen to `i64`,
+/// and floats keep their width.
+fn cb_slot_wasm_type(ty: &CType) -> &'static str {
+    match ty {
+        CType::Int64 | CType::Uint64 | CType::Handle => "i64",
+        CType::Float => "f32",
+        CType::Double => "f64",
+        _ => "i32",
+    }
+}
+
+/// The JS-side name of the long-lived trampoline registered for one callback
+/// typedef. `c_fn_type` is a C identifier, so it is a valid JS identifier
+/// suffix.
+fn js_listener_tramp_name(c_fn_type: &str) -> String {
+    format!("_lsnPtr_{c_fn_type}")
+}
+
+/// Emit `const {target} = ...;` decoding one callback argument from its raw
+/// wasm slot values into the idiomatic JS value the subscriber sees.
+///
+/// The producer owns every argument for the duration of the dispatch (the
+/// `emit_*` helper frees lowered payloads after the last subscriber returns),
+/// so this is the borrowing side of the marshalling table: strings and byte
+/// buffers are copied out of linear memory and never freed here, and opaque
+/// pointers (records, rich enums, interfaces) are wrapped without taking
+/// ownership.
+fn emit_cb_param_decode(
+    out: &mut String,
+    indent: &str,
+    ty: &TypeRef,
+    slots: &[String],
+    target: &str,
+) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    let a = &slots[0];
+    // Optional aggregates share the plain aggregate decoding: the readers
+    // decode a null base to an empty aggregate (matching the async path).
+    let ty = match ty {
+        TypeRef::Optional(inner)
+            if matches!(
+                inner.as_ref(),
+                TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _)
+            ) =>
+        {
+            inner.as_ref()
+        }
+        other => other,
+    };
+    match ty {
+        TypeRef::Bool => {
+            w.line(format!("const {target} = {a} !== 0;"));
+        }
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle
+        | TypeRef::Enum(_) => {
+            w.line(format!("const {target} = {a};"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!("const {target} = _readCStr(wasm, {a});"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let b = &slots[1];
+            w.line(format!(
+                "const {target} = ({a} === 0 || {b} === 0) ? new Uint8Array(0) : new Uint8Array(wasm.memory.buffer, {a}, {b}).slice();"
+            ));
+        }
+        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
+            let cls = local_type_name(name);
+            w.line(format!("const {target} = new {cls}(wasm, {a});"));
+        }
+        TypeRef::Interface(name) => {
+            let cls = local_type_name(name);
+            w.line(format!("const {target} = {cls}._wrap({a});"));
+        }
+        TypeRef::List(inner) => {
+            let mut tmp = String::new();
+            emit_read_list_into(
+                &mut tmp,
+                indent,
+                inner,
+                a,
+                &slots[1],
+                target,
+                ElemOwnership::Borrowed,
+            );
+            w.raw(tmp);
+        }
+        TypeRef::Map(k, v) => {
+            let mut tmp = String::new();
+            emit_read_map_into(
+                &mut tmp,
+                indent,
+                k,
+                v,
+                a,
+                &slots[1],
+                &slots[2],
+                target,
+                ElemOwnership::Borrowed,
+            );
+            w.raw(tmp);
+        }
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+                w.line(format!("const {target} = _readCStr(wasm, {a});"));
+            }
+            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
+                let cls = local_type_name(name);
+                w.line(format!(
+                    "const {target} = {a} === 0 ? null : new {cls}(wasm, {a});"
+                ));
+            }
+            TypeRef::Interface(name) => {
+                let cls = local_type_name(name);
+                w.line(format!(
+                    "const {target} = {a} === 0 ? null : {cls}._wrap({a});"
+                ));
+            }
+            scalar => {
+                // Boxed optional scalar: the box is borrowed, so dereference
+                // without freeing.
+                let read =
+                    wasm_read_scalar_elem(scalar, "new DataView(wasm.memory.buffer)", a, "0")
+                        .replace(&format!("{a} + 0 * {}", wasm_stride(scalar)), a);
+                w.line(format!("const {target} = {a} === 0 ? null : {read};"));
+            }
+        },
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+    out.push_str(&w.finish());
+}
+
+/// Emit the long-lived trampoline for one callback typedef at `indent`
+/// (loader scope). The trampoline's wasm signature mirrors the callback's ABI
+/// slots (the trailing `void* context` slot carries the subscription's
+/// context id); it looks up the subscription, decodes each argument per the
+/// borrowing contract, and invokes the JS callback synchronously.
+fn emit_js_listener_trampoline(out: &mut String, cb: &CallbackBinding, indent: &str) {
+    let tramp = js_listener_tramp_name(&cb.c_fn_type);
+    let param_types: Vec<String> = cb
+        .abi_params
+        .iter()
+        .map(|p| format!("'{}'", cb_slot_wasm_type(&p.ty)))
+        .collect();
+    // Positional slot names: one per ABI slot, with the trailing context slot
+    // named _ctx.
+    let mut slot_names: Vec<String> = (0..cb.abi_params.len() - 1)
+        .map(|i| format!("a{i}"))
+        .collect();
+    slot_names.push("_ctx".to_string());
+
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    w.block(
+        format!(
+            "const {tramp} = _registerTrampoline(_table, [{}], ({}) => {{",
+            param_types.join(", "),
+            slot_names.join(", ")
+        ),
+        "});",
+        |w| {
+            w.line("const _l = _listeners.get(_ctx);");
+            w.line("if (_l === undefined) return;");
+            let inner = w.indent_str();
+            let mut slot_idx = 0usize;
+            let mut call_args: Vec<String> = Vec::new();
+            for (i, p) in cb.params.iter().enumerate() {
+                let n = p.abi.len();
+                let slots = &slot_names[slot_idx..slot_idx + n];
+                slot_idx += n;
+                let target = format!("_p{i}");
+                let mut tmp = String::new();
+                emit_cb_param_decode(&mut tmp, &inner, &p.ty, slots, &target);
+                w.raw(tmp);
+                call_args.push(target);
+            }
+            w.line(format!("_l.callback({});", call_args.join(", ")));
+        },
+    );
+    out.push_str(&w.finish());
+}
+
+/// Emit one listener's register/unregister pair as module-object members.
+///
+/// `register` allocates a context id, hands the shared trampoline and that id
+/// to the producer's `register_*` symbol, and returns the context id as the
+/// consumer-facing subscription id (a plain number; the producer's `uint64_t`
+/// id stays internal so the public surface avoids `BigInt`). `unregister`
+/// releases both sides and is a no-op for an unknown id.
+fn emit_js_listener_api(out: &mut String, l: &ListenerBinding, indent: &str) {
+    let tramp = js_listener_tramp_name(&l.callback_c_fn_type);
+    let register_name = format!("register_{}", l.name).to_lower_camel_case();
+    let unregister_name = format!("unregister_{}", l.name).to_lower_camel_case();
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    let mut doc = String::new();
+    emit_doc(&mut doc, &l.doc, indent);
+    w.raw(doc);
+    w.block(format!("{register_name}(callback) {{"), "},", |w| {
+        w.line("const _id = _nextLsnId++;");
+        w.line(format!(
+            "const _rid = wasm.{}({tramp}, _id);",
+            l.register_symbol
+        ));
+        w.line("_listeners.set(_id, { callback, rid: _rid });");
+        w.line("return _id;");
+    });
+    w.block(format!("{unregister_name}(id) {{"), "},", |w| {
+        w.line("const _l = _listeners.get(id);");
+        w.line("if (_l === undefined) return;");
+        w.line("_listeners.delete(id);");
+        w.line(format!("wasm.{}(_l.rid);", l.unregister_symbol));
+    });
     out.push_str(&w.finish());
 }
 
@@ -3734,8 +4087,9 @@ mod tests {
         }])
     }
 
-    /// An API with a callback + listener, which the wasm target declares
-    /// unsupported.
+    /// An API with a callback + listener, delivered synchronously through a
+    /// long-lived function-table trampoline in the standard loader (and
+    /// stubbed in Emscripten mode).
     fn listener_api() -> Api {
         make_api(vec![Module {
             name: "events".into(),
@@ -3779,29 +4133,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_declare_callbacks_and_listeners_unsupported() {
+    fn capabilities_declare_full_support() {
         let caps = LanguageBackend::capabilities(&WasmGenerator);
-        assert!(caps.async_functions);
-        assert!(caps.iterators);
-        assert!(!caps.callbacks);
-        assert!(!caps.listeners);
+        assert_eq!(caps, TargetCapabilities::full());
     }
 
     #[test]
-    fn allow_unsupported_flag_flows_from_config() {
-        assert!(!LanguageBackend::allows_unsupported(
-            &WasmGenerator,
-            &WasmConfig::default()
-        ));
-        let cfg = WasmConfig {
-            allow_unsupported: true,
-            ..WasmConfig::default()
-        };
-        assert!(LanguageBackend::allows_unsupported(&WasmGenerator, &cfg));
-    }
-
-    #[test]
-    fn listeners_emit_throwing_stubs_in_js() {
+    fn listeners_emit_register_unregister_in_js() {
         let js = js_stub_for(
             &listener_api(),
             DEFAULT_MODULE_NAME,
@@ -3810,16 +4148,35 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        assert!(js.contains("registerMessageListener() {"), "{js}");
-        assert!(js.contains("unregisterMessageListener() {"), "{js}");
+        // One long-lived trampoline per callback typedef, in the function
+        // table, decoding the borrowed string argument without freeing it.
         assert!(
-            js.contains("listener 'message_listener' is not supported by the wasm target"),
+            js.contains(
+                "const _lsnPtr_weaveffi_events_OnMessage_fn = _registerTrampoline(_table, ['i32', 'i32'],"
+            ),
             "{js}"
         );
+        assert!(js.contains("const _p0 = _readCStr(wasm, a0);"), "{js}");
+        assert!(js.contains("_l.callback(_p0);"), "{js}");
+        // Register hands the trampoline and a context id to the producer and
+        // returns the numeric context id; unregister releases both sides.
+        assert!(js.contains("registerMessageListener(callback) {"), "{js}");
+        assert!(
+            js.contains(
+                "wasm.weaveffi_events_register_message_listener(_lsnPtr_weaveffi_events_OnMessage_fn, _id)"
+            ),
+            "{js}"
+        );
+        assert!(js.contains("unregisterMessageListener(id) {"), "{js}");
+        assert!(
+            js.contains("wasm.weaveffi_events_unregister_message_listener(_l.rid);"),
+            "{js}"
+        );
+        assert!(!js.contains("is not supported"), "{js}");
     }
 
     #[test]
-    fn listeners_omitted_from_dts() {
+    fn listeners_declared_in_dts() {
         let api = listener_api();
         let dts = dts_for(
             &api,
@@ -3828,23 +4185,76 @@ mod tests {
             "weaveffi_wasm.d.ts",
             false,
         );
-        assert!(!dts.contains("register_message_listener"), "{dts}");
+        assert!(
+            dts.contains("registerMessageListener(callback: (message: string) => void): number;"),
+            "{dts}"
+        );
+        assert!(
+            dts.contains("unregisterMessageListener(id: number): void;"),
+            "{dts}"
+        );
         assert!(dts.contains("send(text: string)"), "{dts}");
     }
 
     #[test]
-    fn readme_documents_unsupported_features() {
+    fn readme_documents_listeners() {
         let readme = readme_for(&listener_api(), "weaveffi", "weaveffi.yml", false);
-        assert!(readme.contains("## Unsupported Features"), "{readme}");
-        assert!(readme.contains("events.message_listener"), "{readme}");
-        assert!(readme.contains("events.OnMessage"), "{readme}");
-        assert!(readme.contains("throw on call"), "{readme}");
+        assert!(readme.contains("### Callbacks and Listeners"), "{readme}");
+        assert!(readme.contains("synchronous"), "{readme}");
+        assert!(readme.contains("subscription id"), "{readme}");
+        assert!(!readme.contains("## Unsupported Features"), "{readme}");
     }
 
     #[test]
-    fn supported_only_api_has_no_unsupported_section() {
+    fn listener_free_api_has_no_listener_section() {
         let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
-        assert!(!readme.contains("## Unsupported Features"));
+        assert!(!readme.contains("### Callbacks and Listeners"));
+    }
+
+    #[test]
+    fn listeners_emit_throwing_stubs_in_emscripten_mode() {
+        let js = js_stub_for(
+            &listener_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+            true,
+        );
+        assert!(js.contains("registerMessageListener() {"), "{js}");
+        assert!(js.contains("unregisterMessageListener() {"), "{js}");
+        assert!(
+            js.contains("listener 'message_listener' is not supported in Emscripten mode"),
+            "{js}"
+        );
+        assert!(
+            !js.contains("_lsnPtr_") && !js.contains("_listeners"),
+            "no listener machinery in Emscripten mode: {js}"
+        );
+    }
+
+    #[test]
+    fn listeners_omitted_from_dts_in_emscripten_mode() {
+        let api = listener_api();
+        let dts = dts_for(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+            true,
+        );
+        assert!(!dts.contains("registerMessageListener"), "{dts}");
+        assert!(dts.contains("send(text: string)"), "{dts}");
+    }
+
+    #[test]
+    fn readme_documents_listener_gap_in_emscripten_mode() {
+        let readme = readme_for(&listener_api(), "weaveffi", "weaveffi.yml", true);
+        assert!(readme.contains("## Callbacks and Listeners"), "{readme}");
+        assert!(
+            readme.contains("not supported in Emscripten mode"),
+            "{readme}"
+        );
     }
 
     #[test]

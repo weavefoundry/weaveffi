@@ -41,6 +41,12 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 
 `iter<T>` functions return a **lazy JS iterator** (typed `IterableIterator<T>`): each `next()` issues exactly one producer call, so iteration streams in constant memory. The producer handle is destroyed exactly once, on exhaustion or via `return()` when iteration stops early (a `for...of` loop calls `return()` automatically on `break` or `throw`). Abandoning an iterator without exhausting or closing it leaks the handle.
 
+### Callbacks and Listeners
+
+Each listener surfaces as a `register.../unregister...` pair. `register` takes a plain JS function and returns a numeric subscription id; `unregister` takes that id and stops delivery. Delivery is **synchronous and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events fire only while a call into the module is on the stack (for example, a producer function that emits during its own execution). A producer that emits from a spawned thread cannot run on this target at all.
+
+Callback arguments are **borrowed for the duration of the callback**: strings and byte buffers are copied into JS values before your function runs, but struct, rich-enum, and interface arguments wrap producer-owned memory. Read what you need inside the callback and do not retain the wrapper or call `free()` on it.
+
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
@@ -57,19 +63,6 @@ Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
 for producer panics and marshalling failures.
-
-## Unsupported Features
-
-This IDL uses features the wasm target does not support (generated because
-`allow_unsupported` is set). Single-threaded `wasm32-unknown-unknown` has no
-producer thread to deliver events from, so:
-
-- **callbacks**: kv.OnEvict
-- **listeners**: kv.eviction_listener
-
-The TypeScript declarations omit these entry points; the JS module exposes
-explicit stubs that throw on call. Use a native target (node, python, …) when
-you need them.
 
 ## API Reference
 

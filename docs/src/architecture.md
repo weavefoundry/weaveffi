@@ -263,15 +263,20 @@ references are all **first-class**. They pass validation and every
 generator handles them. Do not re-add validator rejections for these
 features.
 
-The one exception is per-target capability gating: each generator
-declares a `TargetCapabilities` (async, callbacks, listeners,
+Per-target capability gating still exists as a mechanism: each
+generator declares a `TargetCapabilities` (async, callbacks, listeners,
 iterators), and the orchestrator fails generation (listing the
 offending IDL definitions) when a selected target cannot deliver a
-used feature. Today only Wasm declares gaps (callbacks and listeners);
-its `allow_unsupported = true` config opts into generating the rest of
-the surface with explicit throwing stubs in place of the unsupported
-entry points. Capability failures must stay loud: never skip a
-definition silently.
+used feature. Today every shipped target declares full support, so the
+gate only fires if a future target (or a new gated feature) introduces
+a gap; a partial target's `allow_unsupported = true` config would opt
+into generating the rest of the surface with explicit throwing stubs in
+place of the unsupported entry points. The Wasm generator's Emscripten
+mode is the one place stubs still appear: async functions, callbacks,
+and listeners become explicit throwing stubs there (and are omitted
+from the TypeScript declarations) because Emscripten modules do not
+portably expose the trampoline machinery. Capability failures and mode
+gaps must stay loud: never skip a definition silently.
 
 ## Generator configuration resolution
 

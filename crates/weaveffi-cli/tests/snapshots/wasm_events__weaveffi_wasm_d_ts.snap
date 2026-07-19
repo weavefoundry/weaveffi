@@ -29,6 +29,14 @@ export interface WeaveffiWasmModule {
      * @throws {WeaveFFIError} if the native call fails
      */
     getMessages(): IterableIterator<string>;
+    /**
+     * Register a listener for the `OnMessage` callback.
+     *
+     * @returns A subscription id for `unregisterMessageListener()`.
+     */
+    registerMessageListener(callback: (message: string) => void): number;
+    /** Unregister a listener previously registered with `registerMessageListener()`. */
+    unregisterMessageListener(id: number): void;
   };
 }
 

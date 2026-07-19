@@ -67,8 +67,8 @@ pub trait Generator: Send + Sync {
     fn capabilities(&self) -> TargetCapabilities;
 
     /// Whether the user explicitly opted in to generating this target even
-    /// though the API uses features the target does not support (for example
-    /// `generators.wasm.allow_unsupported: true`). When `true` the
+    /// though the API uses features the target does not support (via an
+    /// `allow_unsupported: true` flag in the target's config). When `true` the
     /// orchestrator downgrades the capability failure to a loud warning and
     /// the generator must emit an explicit unsupported surface (throwing
     /// stubs, documentation) rather than silently omitting the feature.
