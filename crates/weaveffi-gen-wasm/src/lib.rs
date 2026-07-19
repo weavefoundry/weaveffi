@@ -15,8 +15,8 @@ use std::fmt::Write as _;
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::abi::CType;
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
     emit_doc as common_emit_doc, walk_modules, walk_modules_with_path, DocCommentStyle,
@@ -2860,7 +2860,13 @@ fn js_listener_tramp_name(c_fn_type: &str) -> String {
 /// buffers are copied out of linear memory and never freed here, and opaque
 /// pointers (records, rich enums, interfaces) are wrapped without taking
 /// ownership.
-fn emit_cb_param_decode(out: &mut String, indent: &str, ty: &TypeRef, slots: &[String], target: &str) {
+fn emit_cb_param_decode(
+    out: &mut String,
+    indent: &str,
+    ty: &TypeRef,
+    slots: &[String],
+    target: &str,
+) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let a = &slots[0];
     // Optional aggregates share the plain aggregate decoding: the readers
@@ -2958,8 +2964,9 @@ fn emit_cb_param_decode(out: &mut String, indent: &str, ty: &TypeRef, slots: &[S
             scalar => {
                 // Boxed optional scalar: the box is borrowed, so dereference
                 // without freeing.
-                let read = wasm_read_scalar_elem(scalar, "new DataView(wasm.memory.buffer)", a, "0")
-                    .replace(&format!("{a} + 0 * {}", wasm_stride(scalar)), a);
+                let read =
+                    wasm_read_scalar_elem(scalar, "new DataView(wasm.memory.buffer)", a, "0")
+                        .replace(&format!("{a} + 0 * {}", wasm_stride(scalar)), a);
                 w.line(format!("const {target} = {a} === 0 ? null : {read};"));
             }
         },
