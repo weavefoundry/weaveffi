@@ -93,8 +93,8 @@ fn generated_output_has_no_stub_markers() {
 
     // Case-insensitive marker list. Bare "not supported" is deliberately
     // absent: an explicit, permanently declared unsupported-feature surface
-    // (e.g. wasm listeners behind `allow_unsupported`, which throw "is not
-    // supported by the wasm target") is the *correct* loud behavior. The
+    // (e.g. wasm async/listener stubs in Emscripten mode, which throw "is
+    // not supported in Emscripten mode") is the *correct* loud behavior. The
     // "yet" in "not yet supported" is what distinguishes capability drift: a
     // target that declares a feature `true` (so the gate lets generation
     // through) but then emits a runtime-throwing TODO stub for it. That is

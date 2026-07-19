@@ -157,6 +157,15 @@ class _WeaveFFIIterator {
   }
 }
 
+function _registerTrampoline(table, paramTypes, handler) {
+  const idx = table.grow(1);
+  table.set(idx, new WebAssembly.Function(
+    { parameters: paramTypes, results: [] },
+    handler
+  ));
+  return idx;
+}
+
 /**
  * Load a WeaveFFI Wasm module from the given URL.
  *
@@ -192,6 +201,21 @@ export async function loadWeaveffiWasm(url) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const wasm = instance.exports;
 
+  const _table = wasm.__indirect_function_table;
+
+  // Listener subscriptions, keyed by the context id the loader
+  // threads through the C ABI's void* context slot. Each entry
+  // holds the JS callback and the producer's subscription id.
+  let _nextLsnId = 1;
+  const _listeners = new Map();
+
+  const _lsnPtr_weaveffi_events_OnMessage_fn = _registerTrampoline(_table, ['i32', 'i32'], (a0, _ctx) => {
+    const _l = _listeners.get(_ctx);
+    if (_l === undefined) return;
+    const _p0 = _readCStr(wasm, a0);
+    _l.callback(_p0);
+  });
+
   return {
     _raw: wasm,
     events: {
@@ -213,11 +237,17 @@ export async function loadWeaveffiWasm(url) {
           (it) => wasm.weaveffi_events_GetMessagesIterator_destroy(it),
           _checkErr, (w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true)));
       },
-      registerMessageListener() {
-        throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      registerMessageListener(callback) {
+        const _id = _nextLsnId++;
+        const _rid = wasm.weaveffi_events_register_message_listener(_lsnPtr_weaveffi_events_OnMessage_fn, _id);
+        _listeners.set(_id, { callback, rid: _rid });
+        return _id;
       },
-      unregisterMessageListener() {
-        throw new Error("weaveffi: listener 'message_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      unregisterMessageListener(id) {
+        const _l = _listeners.get(id);
+        if (_l === undefined) return;
+        _listeners.delete(id);
+        wasm.weaveffi_events_unregister_message_listener(_l.rid);
       },
     },
   };

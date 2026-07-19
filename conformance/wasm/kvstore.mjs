@@ -11,8 +11,9 @@
 // list getter (Entry.tags), the map getter (Entry.metadata over parallel
 // key/value arrays), a lazy iterator-backed string stream (listKeys), the
 // fluent builder + static create factory, the kv.stats submodule taking the
-// interface as a parameter, and the async, i64-returning compact via the
-// callback trampoline.
+// interface as a parameter, the async, i64-returning compact via the
+// callback trampoline, and the eviction listener via the long-lived
+// function-table trampoline (synchronous, same-thread delivery).
 //
 // Inputs come from the harness:
 //   WV_WASM: path to the compiled kvstore.wasm
@@ -142,13 +143,21 @@ expect(typeof reclaimed === 'bigint', 'compact -> BigInt');
 store.clear();
 expect(store.count() === 0n, 'count == 0 after clear');
 
-// The unsupported listener surface exists as explicit throwing stubs.
-expect(typeof api.kv.registerEvictionListener === 'function', 'listener stub exists');
-let listenerThrew = false;
-try { api.kv.registerEvictionListener(() => {}); } catch (e) {
-  listenerThrew = String(e.message).includes('not supported by the wasm target');
-}
-expect(listenerThrew, 'listener stub throws');
+// Eviction listener: delete fires emit_eviction_listener synchronously (wasm
+// delivery is same-thread; the callback runs inside the delete call).
+const evicted = [];
+const evictionSub = api.kv.registerEvictionListener((key) => evicted.push(key));
+expect(typeof evictionSub === 'number' && evictionSub > 0, 'eviction listener id positive');
+expect(store.put('doomed', new Uint8Array([1]), EntryKind.Volatile, null) === true, 'put doomed');
+expect(store.delete('doomed') === true, 'delete doomed -> true');
+expect(
+  evicted.length === 1 && evicted[0] === 'doomed',
+  `eviction listener fired synchronously (got ${JSON.stringify(evicted)})`
+);
+api.kv.unregisterEvictionListener(evictionSub);
+expect(store.put('doomed2', new Uint8Array([1]), EntryKind.Volatile, null) === true, 'put doomed2');
+expect(store.delete('doomed2') === true, 'delete doomed2 -> true');
+expect(evicted.length === 1, `no delivery after unregister (got ${JSON.stringify(evicted)})`);
 
 // Disposal: free() releases the handle via the destroy symbol exactly once.
 store.free();

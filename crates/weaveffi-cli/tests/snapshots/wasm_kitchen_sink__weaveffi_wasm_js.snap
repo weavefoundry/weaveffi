@@ -604,9 +604,10 @@ export async function loadWeaveffiWasm(url) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const wasm = instance.exports;
 
+  const _table = wasm.__indirect_function_table;
+
   let _nextCtxId = 1;
   const _asyncContexts = new Map();
-  const _table = wasm.__indirect_function_table;
 
   function _asyncHandler(ctxId, errPtr, ...results) {
     const ctx = _asyncContexts.get(ctxId);
@@ -621,6 +622,20 @@ export async function loadWeaveffiWasm(url) {
   }
 
   const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], _asyncHandler);
+
+  // Listener subscriptions, keyed by the context id the loader
+  // threads through the C ABI's void* context slot. Each entry
+  // holds the JS callback and the producer's subscription id.
+  let _nextLsnId = 1;
+  const _listeners = new Map();
+
+  const _lsnPtr_weaveffi_kitchen_OnReady_fn = _registerTrampoline(_table, ['i32', 'i32', 'i32'], (a0, a1, _ctx) => {
+    const _l = _listeners.get(_ctx);
+    if (_l === undefined) return;
+    const _p0 = a0;
+    const _p1 = _readCStr(wasm, a1);
+    _l.callback(_p0, _p1);
+  });
 
   // A pocket-sized interface exercising the object surface
   class Gadget {
@@ -874,11 +889,18 @@ export async function loadWeaveffiWasm(url) {
         _freeErr(wasm, _err);
         return _r;
       },
-      registerReadyListener() {
-        throw new Error("weaveffi: listener 'ready_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      /** Subscribe to OnReady events */
+      registerReadyListener(callback) {
+        const _id = _nextLsnId++;
+        const _rid = wasm.weaveffi_kitchen_register_ready_listener(_lsnPtr_weaveffi_kitchen_OnReady_fn, _id);
+        _listeners.set(_id, { callback, rid: _rid });
+        return _id;
       },
-      unregisterReadyListener() {
-        throw new Error("weaveffi: listener 'ready_listener' is not supported by the wasm target (single-threaded wasm has no producer thread to deliver events); use a native target for listeners");
+      unregisterReadyListener(id) {
+        const _l = _listeners.get(id);
+        if (_l === undefined) return;
+        _listeners.delete(id);
+        wasm.weaveffi_kitchen_unregister_ready_listener(_l.rid);
       },
       Gadget: Gadget,
       Item: {

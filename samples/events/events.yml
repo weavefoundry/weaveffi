@@ -26,9 +26,3 @@ modules:
         doc: Return an iterator over all sent messages
         params: []
         return: "iter<string>"
-generators:
-  # The wasm target cannot deliver producer-initiated callbacks/listeners
-  # (single-threaded, no producer thread); opt in to generating the rest of
-  # the surface; message_listener becomes an explicit throwing stub.
-  wasm:
-    allow_unsupported: true

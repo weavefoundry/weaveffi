@@ -126,11 +126,6 @@ modules:
             return: Stats
             throws: true
 generators:
-  # The wasm target cannot deliver producer-initiated callbacks/listeners
-  # (single-threaded, no producer thread); opt in to generating the rest of
-  # the surface; the eviction listener becomes an explicit throwing stub.
-  wasm:
-    allow_unsupported: true
   ruby:
     module_name: Kvstore
   dotnet:

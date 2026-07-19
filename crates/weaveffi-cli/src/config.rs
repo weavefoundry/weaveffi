@@ -501,21 +501,16 @@ mod tests {
         use std::collections::BTreeMap;
         use weaveffi_core::capabilities::TargetCapabilities;
 
-        // Only wasm is partial: the browser sandbox cannot deliver
-        // producer-initiated callbacks/listeners. Every other target is full.
-        let wasm = TargetCapabilities {
-            async_functions: true,
-            callbacks: false,
-            listeners: false,
-            iterators: true,
-        };
+        // Every target is full. Wasm delivers callbacks/listeners
+        // synchronously through function-table trampolines in its standard
+        // loader (Emscripten mode stubs them, mirroring its async stubs).
         let expected: &[(&str, TargetCapabilities)] = &[
             ("c", TargetCapabilities::full()),
             ("cpp", TargetCapabilities::full()),
             ("swift", TargetCapabilities::full()),
             ("android", TargetCapabilities::full()),
             ("node", TargetCapabilities::full()),
-            ("wasm", wasm),
+            ("wasm", TargetCapabilities::full()),
             ("python", TargetCapabilities::full()),
             ("dotnet", TargetCapabilities::full()),
             ("dart", TargetCapabilities::full()),

@@ -232,9 +232,10 @@ export async function loadWeaveffiWasm(url) {
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const wasm = instance.exports;
 
+  const _table = wasm.__indirect_function_table;
+
   let _nextCtxId = 1;
   const _asyncContexts = new Map();
-  const _table = wasm.__indirect_function_table;
 
   function _asyncHandler(ctxId, errPtr, ...results) {
     const ctx = _asyncContexts.get(ctxId);

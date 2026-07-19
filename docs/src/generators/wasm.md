@@ -12,9 +12,10 @@ linear memory. TypeScript declarations describe the whole surface.
 C and C++ producers compiled with Emscripten are supported through a
 dedicated loader variant; see [Emscripten mode](#emscripten-mode).
 
-Because a `wasm32-unknown-unknown` module is single-threaded and has no
-producer thread, **callbacks and listeners are not supported**; see
-[Capabilities and `allow_unsupported`](#capabilities-and-allow_unsupported).
+Callbacks and listeners are supported with **synchronous, same-thread
+delivery**: a `wasm32-unknown-unknown` module is single-threaded, so
+events fire only while a call into the module is on the stack; see
+[Callbacks and listeners](#callbacks-and-listeners).
 
 ## What gets generated
 
@@ -418,33 +419,84 @@ checker and throws the typed `KvError` subclasses; a non-throwing one
 like `getMessages` throws the generic `WeaveFFIError` only for
 producer bugs. The TypeScript declaration is `IterableIterator<T>`.
 
-## Capabilities and `allow_unsupported`
+## Callbacks and listeners
 
-The Wasm generator declares callbacks and listeners as unsupported in
-its `TargetCapabilities`. If your IDL uses them, `weaveffi generate`
-fails with an error listing the offending definitions rather than
-silently skipping them.
+Each listener surfaces on its module namespace as a
+`register.../unregister...` pair. `register` takes a plain JavaScript
+function and returns a numeric subscription id; `unregister` takes that
+id and stops delivery. From the `events` sample:
 
-To generate the rest of the surface anyway, opt in explicitly:
+```js
+const received = [];
+const sub = api.events.registerMessageListener((message) => received.push(message));
 
-```toml
-# weaveffi.toml
-[wasm]
-allow_unsupported = true
+api.events.sendMessage('alpha'); // emit_message_listener fires synchronously
+console.log(received);           // ['alpha']
+
+api.events.unregisterMessageListener(sub);
 ```
 
-or inline in the IDL:
+Under the hood the loader reuses the async machinery: it installs one
+long-lived trampoline per callback typedef in the module's
+`__indirect_function_table` (via `WebAssembly.Function`, the same
+[JS Type Reflection API](https://github.com/WebAssembly/js-types)
+dependency async functions have) and hands the trampoline's table index
+plus a per-subscription context id to the producer's `register_*`
+symbol. When the producer's `emit_*` helper fires, the trampoline looks
+up the subscription by context id, decodes each argument, and invokes
+the JavaScript callback:
 
-```yaml
-generators:
-  wasm:
-    allow_unsupported: true
+```js
+let _nextLsnId = 1;
+const _listeners = new Map();
+
+const _lsnPtr_weaveffi_events_OnMessage_fn = _registerTrampoline(_table, ['i32', 'i32'], (a0, _ctx) => {
+  const _l = _listeners.get(_ctx);
+  if (_l === undefined) return;
+  const _p0 = _readCStr(wasm, a0);
+  _l.callback(_p0);
+});
+
+// On the module object:
+registerMessageListener(callback) {
+  const _id = _nextLsnId++;
+  const _rid = wasm.weaveffi_events_register_message_listener(_lsnPtr_weaveffi_events_OnMessage_fn, _id);
+  _listeners.set(_id, { callback, rid: _rid });
+  return _id;
+},
+unregisterMessageListener(id) {
+  const _l = _listeners.get(id);
+  if (_l === undefined) return;
+  _listeners.delete(id);
+  wasm.weaveffi_events_unregister_message_listener(_l.rid);
+},
 ```
 
-With the opt-in, unsupported entry points are generated as **explicit
-throwing stubs** (calling `registerMessageListener` throws an
-`Error` explaining that listeners need a native target), so the gap is
-visible at the call site instead of failing silently.
+One trampoline serves every subscription to callbacks of the same
+typedef (the context id disambiguates), so register/unregister churn
+never grows the function table. The producer's `uint64_t` subscription
+id stays internal to the loader; the public surface deals only in plain
+numbers.
+
+Two semantic points to keep in mind:
+
+- **Delivery is synchronous and same-thread.** The target is
+  single-threaded, so `emit_*` can only run while a call into the
+  module is on the stack, and your callback runs before that call
+  returns. This is not a limitation of the bindings: a producer that
+  emits from a spawned thread cannot run on `wasm32-unknown-unknown`
+  at all (`std::thread::spawn` fails there).
+- **Callback arguments are borrowed.** The producer owns every argument
+  for the duration of the dispatch. Strings and byte buffers are copied
+  into JavaScript values before your callback runs, but struct,
+  rich-enum, and interface arguments wrap producer-owned memory: read
+  what you need inside the callback and do not retain the wrapper or
+  call `free()` on it.
+
+In [Emscripten mode](#emscripten-mode) callbacks and listeners are not
+supported; each register/unregister entry point becomes an explicit
+throwing stub and is omitted from the TypeScript declarations, exactly
+like async functions in that mode.
 
 ## Emscripten mode
 
@@ -525,13 +577,13 @@ writes linear memory through `Module['HEAPU8']`.
 
 ### Limitations
 
-Async functions are not supported in Emscripten mode. The trampoline
-registration in the standard loader relies on `WebAssembly.Function`
-and a growable `__indirect_function_table`, neither of which an
-Emscripten module exposes portably. Each async entry point becomes an
-explicit stub that throws at call time and is omitted from the
-TypeScript declarations. Callbacks and listeners stay unsupported
-exactly as in the standard mode.
+Async functions, callbacks, and listeners are not supported in
+Emscripten mode. The trampoline registration in the standard loader
+relies on `WebAssembly.Function` and a growable
+`__indirect_function_table`, neither of which an Emscripten module
+exposes portably. Each async, register, and unregister entry point
+becomes an explicit stub that throws at call time and is omitted from
+the TypeScript declarations.
 
 ## Build instructions
 
@@ -573,7 +625,7 @@ Serve it over HTTP and load it with the generated helper:
 
 - **`WebAssembly.Function is not a constructor`**: the runtime lacks
   JS Type Reflection. Use a current Chrome/Firefox/Node/Deno, or avoid
-  async IDL functions for this target.
+  async functions, callbacks, and listeners for this target.
 - **`LinkError: import object field 'env' is not a Function`**: the
   loader instantiates with an empty imports object. If your Rust crate
   imports host functions, extend `loadWeaveffiWasm` to pass them in.
@@ -582,6 +634,10 @@ Serve it over HTTP and load it with the generated helper:
 - **An async call never settles**: the producer must invoke the
   completion callback on the same thread; `std::thread::spawn` does not
   exist on `wasm32-unknown-unknown`.
+- **A registered listener never fires**: delivery is synchronous, so
+  events arrive only while a call into the module is on the stack. The
+  producer must `emit_*` during one of your calls; there is no
+  background delivery on this target.
 - **Out-of-memory after many `_raw` calls**: every pointer returned
   from the module must be deallocated; the typed wrappers do this for
   you, raw calls do not.

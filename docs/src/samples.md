@@ -38,9 +38,9 @@ real-world pattern for a new generator.
 - A deprecated method (`legacy_put`)
 - A nested sub-module (`kv.stats`) with its own struct (`Stats`) and a function
   that takes a cross-module `Store` parameter
-- Inline `generators:` overrides for `wasm.allow_unsupported`,
-  `swift.module_name`, `cpp.namespace`, `dotnet.namespace`,
-  `dart.package_name`, `go.module_path`, and `ruby.module_name`
+- Inline `generators:` overrides for `swift.module_name`,
+  `cpp.namespace`, `dotnet.namespace`, `dart.package_name`,
+  `go.module_path`, and `ruby.module_name`
 
 **Build, generate bindings, and run the C ABI tests:**
 
