@@ -1,3 +1,13 @@
+## [0.18.0](https://github.com/weavefoundry/weaveffi/compare/v0.17.0...v0.18.0) (2026-08-26)
+
+### ⚠ BREAKING CHANGES
+
+* serialize compound values by value across the C ABI (#33)
+
+### Features
+
+* serialize compound values by value across the C ABI ([#33](https://github.com/weavefoundry/weaveffi/issues/33)) ([9fcba85](https://github.com/weavefoundry/weaveffi/commit/9fcba8547022bdf73d47f5db1e2c507a148346f1))
+
 ## [0.17.0](https://github.com/weavefoundry/weaveffi/compare/v0.16.0...v0.17.0) (2026-07-19)
 
 ### ⚠ BREAKING CHANGES
