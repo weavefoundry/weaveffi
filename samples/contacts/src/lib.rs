@@ -136,6 +136,7 @@ pub mod contacts {
 weaveffi::export_runtime!();
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::contacts::{ContactBook, ContactType, ContactsError};
 
@@ -212,19 +213,28 @@ mod tests {
     }
 
     // A direct exercise of the generated C ABI thunks: construct a book
-    // through the interface constructor, drive its methods (including the
-    // typed error path), read a field getter, and destroy every object.
+    // through the interface constructor (interfaces still cross as opaque
+    // pointers with `_new`/`_destroy`), drive its methods (including the
+    // typed error path), and decode the buffered `Contact` returns. The
+    // optional email parameter and the record results cross as value buffers.
     #[test]
     fn ffi_surface_smoke() {
         use super::contacts::{
             weaveffi_contacts_ContactBook_add, weaveffi_contacts_ContactBook_count,
             weaveffi_contacts_ContactBook_destroy, weaveffi_contacts_ContactBook_get,
-            weaveffi_contacts_ContactBook_new, weaveffi_contacts_ContactBook_remove,
-            weaveffi_contacts_Contact_destroy, weaveffi_contacts_Contact_get_first_name,
-            weaveffi_contacts_Contact_get_id, ContactType,
+            weaveffi_contacts_ContactBook_new, weaveffi_contacts_ContactBook_remove, Contact,
+            ContactType,
         };
         use std::ffi::CString;
-        use weaveffi::abi::{self, c_ptr_to_string, free_string, weaveffi_error};
+        use weaveffi::abi::{self, weaveffi_error};
+
+        fn decode_and_free(ptr: *const u8, len: usize) -> Contact {
+            assert!(!ptr.is_null());
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let contact = abi::decode_value::<Contact>(bytes).expect("well-formed Contact buffer");
+            abi::free_bytes(ptr as *mut u8, len);
+            contact
+        }
 
         let mut err = weaveffi_error::default();
         let book = weaveffi_contacts_ContactBook_new(&mut err);
@@ -233,51 +243,62 @@ mod tests {
 
         let first = CString::new("Zoe").unwrap();
         let last = CString::new("Quinn").unwrap();
-        let added = weaveffi_contacts_ContactBook_add(
+        let email = abi::encode_value(&Some("zoe@example.com".to_string()));
+        let mut added_len: usize = 0;
+        let added_ptr = weaveffi_contacts_ContactBook_add(
             book,
             first.as_ptr(),
             last.as_ptr(),
-            std::ptr::null(),
+            email.as_ptr(),
+            email.len(),
             ContactType::Work as i32,
+            &mut added_len,
             &mut err,
         );
         assert_eq!(err.code, 0);
-        assert!(!added.is_null());
-        let id = weaveffi_contacts_Contact_get_id(added);
-        assert!(id > 0);
+        let added = decode_and_free(added_ptr, added_len);
+        assert!(added.id > 0);
+        assert_eq!(added.first_name, "Zoe");
+        assert_eq!(added.email.as_deref(), Some("zoe@example.com"));
 
         // An empty first name reports the InvalidName domain code.
         let empty = CString::new("").unwrap();
+        let no_email = abi::encode_value(&None::<String>);
+        let mut rejected_len: usize = 0;
         let rejected = weaveffi_contacts_ContactBook_add(
             book,
             empty.as_ptr(),
             last.as_ptr(),
-            std::ptr::null(),
+            no_email.as_ptr(),
+            no_email.len(),
             ContactType::Work as i32,
+            &mut rejected_len,
             &mut err,
         );
         assert!(rejected.is_null());
         assert_eq!(err.code, 1);
         abi::error_clear(&mut err);
 
-        let fetched = weaveffi_contacts_ContactBook_get(book, id, &mut err);
+        let mut fetched_len: usize = 0;
+        let fetched_ptr =
+            weaveffi_contacts_ContactBook_get(book, added.id, &mut fetched_len, &mut err);
         assert_eq!(err.code, 0);
-        assert!(!fetched.is_null());
-        let fname = weaveffi_contacts_Contact_get_first_name(fetched);
-        assert_eq!(c_ptr_to_string(fname).unwrap(), "Zoe");
-        free_string(fname);
+        let fetched = decode_and_free(fetched_ptr, fetched_len);
+        assert_eq!(fetched.first_name, "Zoe");
+        assert_eq!(fetched.contact_type, ContactType::Work);
 
         assert_eq!(weaveffi_contacts_ContactBook_count(book, &mut err), 1);
-        assert!(weaveffi_contacts_ContactBook_remove(book, id, &mut err));
+        assert!(weaveffi_contacts_ContactBook_remove(
+            book, added.id, &mut err
+        ));
 
         // A missing id reports the NotFound domain code.
-        let missing = weaveffi_contacts_ContactBook_get(book, id, &mut err);
+        let mut missing_len: usize = 0;
+        let missing = weaveffi_contacts_ContactBook_get(book, added.id, &mut missing_len, &mut err);
         assert!(missing.is_null());
         assert_eq!(err.code, 2);
         abi::error_clear(&mut err);
 
-        weaveffi_contacts_Contact_destroy(added);
-        weaveffi_contacts_Contact_destroy(fetched);
         weaveffi_contacts_ContactBook_destroy(book);
     }
 }

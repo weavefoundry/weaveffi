@@ -144,8 +144,13 @@ pub struct FnBinding {
     pub shape: CallShape,
 }
 
-/// A struct field, retained with its getter symbol and lowered return.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A field of a record, a rich-enum variant, or an error code's payload.
+///
+/// Records and rich enums are value types: they declare no C symbols of their
+/// own and cross the ABI serialized inside a value buffer, so a field is just
+/// its name, type, and (for records) optional default. Field declaration
+/// order **is** the wire order.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldBinding {
     /// The field name as written in the IDL.
     pub name: String,
@@ -153,62 +158,35 @@ pub struct FieldBinding {
     pub doc: Option<String>,
     /// The idiomatic IR type of the field.
     pub ty: TypeRef,
-    /// `{c_tag}_get_{field}`. Receiver is an implicit `const {c_tag}* ptr`; any
-    /// `out_*` slots are in [`getter_out_params`](Self::getter_out_params).
-    pub getter_symbol: String,
-    /// The C return type of the getter.
-    pub getter_ret: CType,
-    /// Trailing `out_*` slots of the getter (e.g. `size_t* out_len` for bytes).
-    pub getter_out_params: Vec<AbiParam>,
-    /// The ABI slots this field expands into when passed *in* (struct create,
-    /// builder setter).
-    pub value_params: Vec<AbiParam>,
+    /// Default value used when the field is omitted at construction, kept as
+    /// the raw IDL value. Only records carry defaults; variant and error
+    /// payload fields leave this `None`.
+    pub default: Option<serde_yaml::Value>,
 }
 
-/// The fluent builder lowered for a struct that opted in with `builder: true`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuilderBinding {
-    /// `{c_tag}Builder`.
-    pub builder_tag: String,
-    /// `{c_tag}_Builder_new`.
-    pub new_symbol: String,
-    /// `{c_tag}_Builder_build` (carries a trailing `out_err`).
-    pub build_symbol: String,
-    /// `{c_tag}_Builder_destroy`.
-    pub destroy_symbol: String,
-    /// One `(field_name, setter_symbol)` per field; the value slots are the
-    /// field's [`FieldBinding::value_params`].
-    pub setters: Vec<(String, String)>,
-}
-
-/// A struct, fully lowered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A struct (record), fully lowered: a plain value type generators emit as a
+/// native data class plus buffer read/write functions. No C symbols exist for
+/// a record; instances cross the ABI serialized in value buffers.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructBinding {
     /// The struct name as written in the IDL.
     pub name: String,
     /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
-    /// `{prefix}_{module_path}_{name}`, the opaque tag.
-    pub c_tag: String,
-    /// The struct's fields, each with its getter symbol and lowered slots.
+    /// The fields in declaration (and wire) order.
     pub fields: Vec<FieldBinding>,
-    /// `{c_tag}_create(<field slots>, error* out_err) -> {c_tag}*`.
-    pub create: AbiFn,
-    /// `{c_tag}_destroy`.
-    pub destroy_symbol: String,
-    /// Present when `builder: true`.
-    pub builder: Option<BuilderBinding>,
 }
 
 /// An enum, fully lowered.
 ///
-/// A *C-style* enum (every variant a bare discriminant) carries only
-/// [`variants`](Self::variants) and crosses the ABI by value as an integer. An
-/// *algebraic* (sum-type) enum, at least one variant with associated data,
-/// additionally carries [`rich`](Self::rich) and crosses the ABI as an opaque
-/// object pointer (tag getter + per-variant constructors and field getters +
-/// destructor), exactly like a struct.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A *C-style* enum (every variant a bare discriminant) crosses the ABI by
+/// value as an integer. An *algebraic* (rich) enum, at least one variant with
+/// associated data, is a value type exactly like a struct: it crosses the ABI
+/// serialized in a value buffer as an `i32` tag followed by the active
+/// variant's fields in declaration order. Either way, the C header still
+/// emits the discriminant constants ([`EnumVariantBinding::c_const`]) so C
+/// consumers can switch on the value or tag.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EnumBinding {
     /// The enum name as written in the IDL.
     pub name: String,
@@ -216,65 +194,35 @@ pub struct EnumBinding {
     pub doc: Option<String>,
     /// `{prefix}_{module_path}_{name}`.
     pub c_tag: String,
-    /// Every variant's discriminant name/value, in declaration order. Present
-    /// for both kinds (the discriminant of a rich enum is its tag value).
+    /// Every variant, in declaration order.
     pub variants: Vec<EnumVariantBinding>,
-    /// `Some` iff this is a rich (algebraic) enum.
-    pub rich: Option<RichEnumBinding>,
+    /// `true` when this is a rich (algebraic) sum-type enum: at least one
+    /// variant carries fields, and values cross the ABI as buffers.
+    pub rich: bool,
 }
 
 impl EnumBinding {
     /// `true` when this is a rich (algebraic) sum-type enum.
     pub fn is_rich(&self) -> bool {
-        self.rich.is_some()
+        self.rich
     }
 }
 
-/// A single enum variant with its precomputed C constant name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A single enum variant with its precomputed C constant name and any
+/// associated data.
+#[derive(Debug, Clone, PartialEq)]
 pub struct EnumVariantBinding {
     /// The variant name as written in the IDL.
     pub name: String,
-    /// The variant's integer discriminant.
+    /// The variant's integer discriminant. Doubles as the buffer tag for a
+    /// rich enum.
     pub value: i32,
     /// Optional doc comment carried from the IDL.
     pub doc: Option<String>,
     /// `{enum_c_tag}_{variant}`.
     pub c_const: String,
-}
-
-/// The opaque-object surface of a rich (algebraic) enum: how its tag is read,
-/// how each variant is constructed and projected, and how the object is freed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RichEnumBinding {
-    /// `int32_t {tag_symbol}(const {c_tag}* self)`: returns the active
-    /// variant's discriminant (matching the per-variant
-    /// [`c_const`](EnumVariantBinding::c_const) values).
-    pub tag_symbol: String,
-    /// `void {destroy_symbol}({c_tag}* self)`.
-    pub destroy_symbol: String,
-    /// Per-variant constructors and field getters, in declaration order
-    /// (parallel to [`EnumBinding::variants`]).
-    pub variants: Vec<RichVariantBinding>,
-}
-
-/// One variant of a rich enum: its constructor and the getters for its
-/// associated data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RichVariantBinding {
-    /// The variant name as written in the IDL.
-    pub name: String,
-    /// Optional doc comment carried from the IDL.
-    pub doc: Option<String>,
-    /// The variant's discriminant value (matches the tag getter's result).
-    pub value: i32,
-    /// `{enum_c_tag}_{variant}`, the discriminant constant.
-    pub c_const: String,
-    /// `{c_tag}_{variant}_new(<field slots>, error* out_err) -> {c_tag}*`.
-    /// A unit variant's constructor takes only `out_err`.
-    pub create: AbiFn,
-    /// Associated data. Each field's getter is `{c_tag}_{variant}_get_{field}`
-    /// with an implicit leading `const {c_tag}* self`; empty for a unit variant.
+    /// Associated data in declaration (and wire) order; empty for a unit
+    /// variant or a C-style enum.
     pub fields: Vec<FieldBinding>,
 }
 
@@ -336,7 +284,7 @@ pub struct InterfaceBinding {
 }
 
 /// One error code of a module's error domain, with its C constant name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ErrorCodeBinding {
     /// The code name exactly as written in the IDL (e.g. `KEY_NOT_FOUND`).
     pub name: String,
@@ -348,6 +296,11 @@ pub struct ErrorCodeBinding {
     pub doc: Option<String>,
     /// `{domain_c_tag}_{name}`, the C enum constant.
     pub c_const: String,
+    /// Structured payload fields this code carries, in declaration (and wire)
+    /// order. When non-empty, a matching error's `payload_ptr`/`payload_len`
+    /// slots hold these fields serialized in the value-buffer format; empty
+    /// means the payload slots are null.
+    pub fields: Vec<FieldBinding>,
 }
 
 /// The error domain in effect for a module: its own `errors:` block, or the
@@ -357,7 +310,7 @@ pub struct ErrorCodeBinding {
 /// Backends emit one error type per *declaring* module
 /// ([`declared_here`](Self::declared_here) is `true`) and reference the
 /// ancestor's type from inheriting submodules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ErrorBinding {
     /// The domain name as written in the IDL (e.g. `KvError`).
     pub name: String,
@@ -378,7 +331,7 @@ pub struct ErrorBinding {
 }
 
 /// One module, flattened with its underscore-joined symbol path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModuleBinding {
     /// The module name (its final path segment).
     pub name: String,
@@ -444,7 +397,7 @@ impl ModuleBinding {
 }
 
 /// The whole API, normalized and lowered for code generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BindingModel {
     /// The C symbol prefix every emitted name is built from.
     pub prefix: String,
@@ -507,11 +460,7 @@ fn lower_module(
         .iter()
         .map(|e| lower_enum(e, &path, prefix))
         .collect();
-    let structs = module
-        .structs
-        .iter()
-        .map(|s| lower_struct(s, &path, prefix))
-        .collect();
+    let structs = module.structs.iter().map(lower_struct).collect();
     let interfaces = module
         .interfaces
         .iter()
@@ -573,8 +522,19 @@ fn lower_error_domain(domain: &ErrorDomain, path: &str, prefix: &str) -> ErrorBi
                 message: c.message.clone(),
                 doc: c.doc.clone(),
                 c_const: format!("{c_tag}_{}", c.name),
+                fields: c.fields.iter().map(lower_field).collect(),
             })
             .collect(),
+    }
+}
+
+/// Lower one field of a record, variant payload, or error payload.
+fn lower_field(f: &weaveffi_ir::ir::StructField) -> FieldBinding {
+    FieldBinding {
+        name: f.name.clone(),
+        doc: f.doc.clone(),
+        ty: f.ty.clone(),
+        default: f.default.clone(),
     }
 }
 
@@ -658,127 +618,24 @@ fn lower_enum(e: &EnumDef, path: &str, prefix: &str) -> EnumBinding {
             value: v.value,
             doc: v.doc.clone(),
             c_const: format!("{c_tag}_{}", v.name),
+            fields: v.fields.iter().map(lower_field).collect(),
         })
         .collect();
-
-    // A rich (algebraic) enum gains an opaque-object surface mirroring a
-    // struct: a tag getter, a destructor, and per-variant constructors and
-    // field getters. The variant name namespaces the per-variant symbols.
-    let rich = e.is_rich().then(|| {
-        let variants = e
-            .variants
-            .iter()
-            .map(|v| {
-                let fields: Vec<FieldBinding> = v
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        let r = lower_return(&f.ty, path);
-                        FieldBinding {
-                            name: f.name.clone(),
-                            doc: f.doc.clone(),
-                            ty: f.ty.clone(),
-                            getter_symbol: format!("{c_tag}_{}_get_{}", v.name, f.name),
-                            getter_ret: r.ret,
-                            getter_out_params: r.out_params,
-                            value_params: lower_param(&f.name, &f.ty, path, false),
-                        }
-                    })
-                    .collect();
-                let mut create_params: Vec<AbiParam> = v
-                    .fields
-                    .iter()
-                    .flat_map(|f| lower_param(&f.name, &f.ty, path, false))
-                    .collect();
-                create_params.push(error_out_param());
-                let create = AbiFn {
-                    symbol: format!("{c_tag}_{}_new", v.name),
-                    params: create_params,
-                    ret: CType::ptr(CType::Named(format!("{path}_{}", e.name))),
-                };
-                RichVariantBinding {
-                    name: v.name.clone(),
-                    doc: v.doc.clone(),
-                    value: v.value,
-                    c_const: format!("{c_tag}_{}", v.name),
-                    create,
-                    fields,
-                }
-            })
-            .collect();
-        RichEnumBinding {
-            tag_symbol: format!("{c_tag}_tag"),
-            destroy_symbol: format!("{c_tag}_destroy"),
-            variants,
-        }
-    });
 
     EnumBinding {
         name: e.name.clone(),
         doc: e.doc.clone(),
         c_tag,
         variants,
-        rich,
+        rich: e.is_rich(),
     }
 }
 
-fn lower_struct(s: &StructDef, path: &str, prefix: &str) -> StructBinding {
-    let c_tag = format!("{prefix}_{path}_{}", s.name);
-
-    let fields: Vec<FieldBinding> = s
-        .fields
-        .iter()
-        .map(|f| {
-            let r = lower_return(&f.ty, path);
-            FieldBinding {
-                name: f.name.clone(),
-                doc: f.doc.clone(),
-                ty: f.ty.clone(),
-                getter_symbol: format!("{c_tag}_get_{}", f.name),
-                getter_ret: r.ret,
-                getter_out_params: r.out_params,
-                value_params: lower_param(&f.name, &f.ty, path, false),
-            }
-        })
-        .collect();
-
-    // create: each field lowered as an input parameter, then out_err.
-    let mut create_params: Vec<AbiParam> = s
-        .fields
-        .iter()
-        .flat_map(|f| lower_param(&f.name, &f.ty, path, false))
-        .collect();
-    create_params.push(error_out_param());
-    let create = AbiFn {
-        symbol: format!("{c_tag}_create"),
-        params: create_params,
-        ret: CType::ptr(CType::Named(format!("{path}_{}", s.name))),
-    };
-
-    let builder = s.builder.then(|| {
-        let builder_tag = format!("{c_tag}Builder");
-        let setters = s
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), format!("{c_tag}_Builder_set_{}", f.name)))
-            .collect();
-        BuilderBinding {
-            builder_tag,
-            new_symbol: format!("{c_tag}_Builder_new"),
-            build_symbol: format!("{c_tag}_Builder_build"),
-            destroy_symbol: format!("{c_tag}_Builder_destroy"),
-            setters,
-        }
-    });
-
+fn lower_struct(s: &StructDef) -> StructBinding {
     StructBinding {
         name: s.name.clone(),
         doc: s.doc.clone(),
-        c_tag: c_tag.clone(),
-        fields,
-        create,
-        destroy_symbol: format!("{c_tag}_destroy"),
-        builder,
+        fields: s.fields.iter().map(lower_field).collect(),
     }
 }
 
@@ -982,7 +839,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -1101,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_create_getters_and_builder() {
+    fn struct_is_a_value_type_schema() {
         let m = Module {
             interfaces: vec![],
             structs: vec![StructDef {
@@ -1121,23 +978,53 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: true,
             }],
             ..module("contacts")
         };
         let model = BindingModel::build(&api(vec![m]), "weaveffi");
         let s = &model.modules[0].structs[0];
-        assert_eq!(s.c_tag, "weaveffi_contacts_Contact");
-        assert_eq!(s.create.symbol, "weaveffi_contacts_Contact_create");
-        assert_eq!(s.destroy_symbol, "weaveffi_contacts_Contact_destroy");
-        assert_eq!(
-            s.fields[0].getter_symbol,
-            "weaveffi_contacts_Contact_get_name"
-        );
-        let b = s.builder.as_ref().unwrap();
-        assert_eq!(b.builder_tag, "weaveffi_contacts_ContactBuilder");
-        assert_eq!(b.new_symbol, "weaveffi_contacts_Contact_Builder_new");
-        assert_eq!(b.setters[0].1, "weaveffi_contacts_Contact_Builder_set_name");
+        // Records are value types: no C symbols, just the field schema in
+        // declaration (wire) order.
+        assert_eq!(s.name, "Contact");
+        assert_eq!(s.fields.len(), 2);
+        assert_eq!(s.fields[0].name, "name");
+        assert_eq!(s.fields[0].ty, TypeRef::StringUtf8);
+        assert_eq!(s.fields[1].name, "age");
+        assert_eq!(s.fields[1].ty, TypeRef::I32);
+    }
+
+    #[test]
+    fn record_params_and_returns_lower_to_buffers() {
+        let m = Module {
+            functions: vec![func(
+                "save",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
+            )],
+            ..module("contacts")
+        };
+        let model = BindingModel::build(&api(vec![m]), "weaveffi");
+        let f = &model.modules[0].functions[0];
+        match &f.shape {
+            CallShape::Sync(abi) => {
+                let rendered: Vec<String> = abi
+                    .params
+                    .iter()
+                    .map(|p| format!("{} {}", p.ty.render_c("weaveffi"), p.name))
+                    .collect();
+                assert_eq!(
+                    rendered,
+                    [
+                        "const uint8_t* contact_ptr",
+                        "size_t contact_len",
+                        "size_t* out_len",
+                        "weaveffi_error* out_err"
+                    ]
+                );
+                assert_eq!(abi.ret.render_c("weaveffi"), "const uint8_t*");
+            }
+            _ => panic!("expected sync"),
+        }
     }
 
     #[test]

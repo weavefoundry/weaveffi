@@ -38,8 +38,8 @@ sealed class CalcException(code: Int, message: String) : WeaveFFIException(code,
     class DivisionByZero(message: String = "division by zero") : CalcException(1, message)
 
     companion object {
-        /** Map a raw `CalcError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
-        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+        /** Map a raw `CalcError` code and payload to the typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        @JvmStatic fun fromCode(code: Int, message: String, payload: ByteArray?): WeaveFFIException = when (code) {
             1 -> DivisionByZero(message)
             else -> WeaveFFIException(code, message)
         }

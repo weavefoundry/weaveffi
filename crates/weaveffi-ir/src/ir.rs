@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.5.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.6.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -52,7 +52,7 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.5.0`).
+    /// IR schema version this document targets (for example `0.6.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Package identity used to name, version, and describe every generated
@@ -351,13 +351,14 @@ pub enum TypeRef {
     /// [`Interface`](Self::Interface); after a successful validate-and-resolve
     /// no `Named` reference remains, and generators may treat one as a bug.
     Named(String),
-    /// A user record (struct). Crosses the C ABI as an opaque object pointer:
-    /// borrowed as a parameter, owned (and eventually destroyed) as a return.
+    /// A user record (struct): a plain value type. Crosses the C ABI by value
+    /// as a serialized buffer (`ptr` + `len`), borrowed for a call as a
+    /// parameter and owned (freed with `weaveffi_free_bytes`) as a return.
     Record(String),
     /// An algebraic (rich) enum: a sum type with at least one payload-carrying
-    /// variant. Crosses the C ABI as an opaque object pointer exactly like a
-    /// [`Record`](Self::Record); its declaration additionally lowers a tag
-    /// getter and per-variant constructors and field getters.
+    /// variant. A value type that crosses the C ABI as a serialized buffer
+    /// (an `i32` tag followed by the active variant's fields), exactly like a
+    /// [`Record`](Self::Record).
     RichEnum(String),
     /// A C-style integer enum (no variant payloads). Lowers by value.
     Enum(String),
@@ -410,7 +411,15 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     }
     if s.starts_with('[') && s.ends_with(']') {
         let inner = &s[1..s.len() - 1];
-        return parse_type_ref(inner).map(|t| TypeRef::List(Box::new(t)));
+        return parse_type_ref(inner).map(|t| match t {
+            // `[u8]` canonicalizes to `bytes`: the two encode identically
+            // inside value buffers (u32 count + raw bytes), and `bytes` is
+            // what Rust producers declare (`Vec<u8>`), so canonicalizing here
+            // keeps the top-level ABI slots consistent between an IDL-driven
+            // consumer and a macro-driven producer.
+            TypeRef::U8 => TypeRef::Bytes,
+            t => TypeRef::List(Box::new(t)),
+        });
     }
     if s.starts_with('{') && s.ends_with('}') {
         let inner = &s[1..s.len() - 1];
@@ -475,10 +484,11 @@ impl TypeRef {
         }
     }
 
-    /// `true` when this reference lowers across the C ABI as an opaque object
-    /// pointer to a user-declared data type: a [`Record`](Self::Record) or a
-    /// [`RichEnum`](Self::RichEnum). Interfaces also cross as opaque pointers
-    /// but carry a distinct ownership convention, so they are excluded.
+    /// `true` when this reference names a user-declared data type that
+    /// crosses the C ABI by value as a serialized buffer: a
+    /// [`Record`](Self::Record) or a [`RichEnum`](Self::RichEnum). Interfaces
+    /// are excluded because they cross as opaque object pointers with a
+    /// distinct ownership convention.
     pub fn is_object_ref(&self) -> bool {
         matches!(self, TypeRef::Record(_) | TypeRef::RichEnum(_))
     }
@@ -635,12 +645,8 @@ pub struct StructDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
     /// The fields in declaration order; order is preserved in the generated
-    /// type and its constructors.
+    /// type, its constructors, and its serialized buffer encoding.
     pub fields: Vec<StructField>,
-    /// Whether to also emit a builder API for constructing the struct field by
-    /// field, alongside the all-fields constructor. Defaults to `false`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub builder: bool,
 }
 
 /// A named field of a [`StructDef`], or the payload of an algebraic
@@ -667,7 +673,8 @@ pub struct StructField {
 
 /// A module's error domain: the named set of error codes its fallible functions
 /// can report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// `Eq` is omitted because a code's payload fields hold `serde_yaml::Value`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorDomain {
     /// Error domain name, used to name the generated error type (for example
     /// `ContactErrors`).
@@ -677,7 +684,8 @@ pub struct ErrorDomain {
 }
 
 /// A single named error within an [`ErrorDomain`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// `Eq` is omitted because a payload field's `default` may hold `serde_yaml::Value` (an `f64`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorCode {
     /// Error code name, lowered to a variant or constant on the generated error
     /// type (for example `not_found`).
@@ -690,6 +698,12 @@ pub struct ErrorCode {
     /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Structured payload fields this error carries beyond its code and
+    /// message, serialized across the ABI in the error's payload buffer.
+    /// Empty for a plain code. Payload fields reuse [`StructField`] but
+    /// ignore the `default` slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<StructField>,
 }
 
 #[cfg(test)]
@@ -699,7 +713,7 @@ mod tests {
     #[test]
     fn struct_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: geometry
     functions: []
@@ -730,7 +744,7 @@ modules:
     #[test]
     fn struct_def_round_trip_json() {
         let json = r#"{
-            "version": "0.5.0",
+            "version": "0.6.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -753,7 +767,7 @@ modules:
     #[test]
     fn structs_default_to_empty() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -765,7 +779,7 @@ modules:
     #[test]
     fn package_block_round_trips_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 package:
   name: kvstore
   version: 1.2.0
@@ -804,7 +818,7 @@ modules:
     #[test]
     fn package_is_optional() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -819,7 +833,7 @@ modules:
     #[test]
     fn package_minimal_requires_name_and_version() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 package:
   name: tiny
   version: 0.0.1
@@ -865,7 +879,7 @@ modules: []
     #[test]
     fn enum_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: graphics
     functions: []
@@ -901,7 +915,7 @@ modules:
     #[test]
     fn enum_def_round_trip_json() {
         let json = r#"{
-            "version": "0.5.0",
+            "version": "0.6.0",
             "modules": [{
                 "name": "status",
                 "functions": [],
@@ -925,7 +939,7 @@ modules:
     #[test]
     fn enums_default_to_empty() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -1018,7 +1032,6 @@ modules:
                     default: None,
                 },
             ],
-            builder: false,
         };
         assert_eq!(s, s.clone());
     }
@@ -1078,6 +1091,21 @@ modules:
         assert_eq!(
             parse_type_ref("[Contact]"),
             Ok(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
+        );
+    }
+
+    #[test]
+    fn parse_type_ref_u8_list_canonicalizes_to_bytes() {
+        assert_eq!(parse_type_ref("[u8]"), Ok(TypeRef::Bytes));
+        assert_eq!(
+            parse_type_ref("[u8]?"),
+            Ok(TypeRef::Optional(Box::new(TypeRef::Bytes)))
+        );
+        // Only the direct element position canonicalizes; nested u8 lists
+        // keep their list shape.
+        assert_eq!(
+            parse_type_ref("[[u8]]"),
+            Ok(TypeRef::List(Box::new(TypeRef::Bytes)))
         );
     }
 
@@ -1160,7 +1188,7 @@ modules:
     #[test]
     fn typeref_optional_yaml_deser() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     functions:
@@ -1183,7 +1211,7 @@ modules:
     #[test]
     fn typeref_list_yaml_deser() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     functions:
@@ -1276,7 +1304,7 @@ modules:
     #[test]
     fn typeref_map_yaml_deser() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     functions:
@@ -1425,7 +1453,7 @@ modules:
     #[test]
     fn typeref_borrowed_yaml_deser() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: io
     functions:
@@ -1454,7 +1482,7 @@ modules:
     #[test]
     fn generators_field_parses_from_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -1475,7 +1503,7 @@ generators:
     #[test]
     fn generators_defaults_to_none() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -1496,7 +1524,7 @@ modules:
     #[test]
     fn callback_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: events
     functions: []
@@ -1521,7 +1549,7 @@ modules:
     #[test]
     fn listener_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: events
     functions: []
@@ -1545,7 +1573,7 @@ modules:
     #[test]
     fn callbacks_and_listeners_default_to_empty() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -1585,66 +1613,62 @@ modules:
     }
 
     #[test]
-    fn builder_defaults_to_false() {
+    fn error_code_fields_default_to_empty() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
-  - name: contacts
+  - name: kv
     functions: []
-    structs:
-      - name: Contact
-        fields:
-          - name: name
-            type: string
+    errors:
+      name: KvError
+      codes:
+        - name: NOT_FOUND
+          code: 1
+          message: "key not found"
 "#;
         let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(!api.modules[0].structs[0].builder);
+        let code = &api.modules[0].errors.as_ref().unwrap().codes[0];
+        assert!(code.fields.is_empty());
+        // Absent payload fields must not appear in the canonical serialization.
+        let out = serde_yaml::to_string(&api).unwrap();
+        assert!(!out.contains("fields:"));
     }
 
     #[test]
-    fn builder_true_round_trip() {
+    fn error_code_payload_fields_round_trip() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
-  - name: contacts
+  - name: kv
     functions: []
-    structs:
-      - name: Contact
-        fields:
-          - name: name
-            type: string
-        builder: true
+    errors:
+      name: KvError
+      codes:
+        - name: QUOTA_EXCEEDED
+          code: 2
+          message: "quota exceeded"
+          fields:
+            - name: used
+              type: u64
+            - name: limit
+              type: u64
 "#;
         let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].structs[0].builder);
+        let code = &api.modules[0].errors.as_ref().unwrap().codes[0];
+        assert_eq!(code.fields.len(), 2);
+        assert_eq!(code.fields[0].name, "used");
+        assert_eq!(code.fields[0].ty, TypeRef::U64);
+        assert_eq!(code.fields[1].name, "limit");
 
         let json = serde_json::to_string(&api).unwrap();
         let back: Api = serde_json::from_str(&json).unwrap();
-        assert!(back.modules[0].structs[0].builder);
-    }
-
-    #[test]
-    fn builder_false_explicit() {
-        let json = r#"{
-            "version": "0.5.0",
-            "modules": [{
-                "name": "geo",
-                "functions": [],
-                "structs": [{
-                    "name": "Point",
-                    "fields": [{"name": "x", "type": "f64"}],
-                    "builder": false
-                }]
-            }]
-        }"#;
-        let api: Api = serde_json::from_str(json).unwrap();
-        assert!(!api.modules[0].structs[0].builder);
+        assert_eq!(back, api);
     }
 
     #[test]
     fn param_mutable_defaults_to_false() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: io
     functions:
@@ -1660,7 +1684,7 @@ modules:
     #[test]
     fn param_mutable_true_round_trip() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: io
     functions:
@@ -1681,7 +1705,7 @@ modules:
     #[test]
     fn param_mutable_false_explicit() {
         let json = r#"{
-            "version": "0.5.0",
+            "version": "0.6.0",
             "modules": [{
                 "name": "io",
                 "functions": [{
@@ -1697,7 +1721,7 @@ modules:
     #[test]
     fn deprecated_and_since_default_to_none() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions:
@@ -1713,7 +1737,7 @@ modules:
     #[test]
     fn deprecated_and_since_round_trip() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions:
@@ -1737,7 +1761,7 @@ modules:
     #[test]
     fn struct_field_default_value_round_trip() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     functions: []
@@ -1765,7 +1789,7 @@ modules:
         // default must serialize without emitting those fields, so the
         // canonical IDL produced by `weaveffi format`/`extract` stays terse.
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "calc".into(),
                 functions: vec![Function {
@@ -1869,7 +1893,7 @@ modules:
     #[test]
     fn interface_round_trip_yaml() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: kv
     interfaces:
@@ -1922,7 +1946,7 @@ modules:
     #[test]
     fn interfaces_default_to_empty() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions: []
@@ -1934,7 +1958,7 @@ modules:
     #[test]
     fn throws_defaults_to_false_and_round_trips() {
         let yaml = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: kv
     functions:

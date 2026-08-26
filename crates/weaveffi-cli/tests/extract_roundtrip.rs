@@ -3,7 +3,7 @@
 //! `roundtrip_kitchen_sink` proves the extractor recovers the same shape
 //! as the original kitchen-sink IDL when run on the hand-annotated Rust
 //! file at `crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`,
-//! including the 0.5.0 surface: the `Gadget` interface, the `KitchenErrors`
+//! including the 0.6.0 surface: the `Gadget` interface, the `KitchenErrors`
 //! domain, and per-function `throws`. Lossy fields (struct field defaults,
 //! iterator returns, standalone `since` without `#[deprecated]`, callback
 //! param docs, error-code `doc:` separate from `message:`) are documented
@@ -183,14 +183,9 @@ fn roundtrip_kitchen_sink() {
         assert_eq!(a.doc, b.doc, "variant {} doc mismatch", b.name);
     }
 
-    // Builder struct
+    // Record struct
     let item_orig = struct_by_name(kitchen_orig, "Item");
     let item_ex = struct_by_name(kitchen_ex, "Item");
-    assert!(
-        item_ex.builder,
-        "Item builder flag should round-trip via #[weaveffi_builder]"
-    );
-    assert_eq!(item_ex.builder, item_orig.builder);
     assert_eq!(item_ex.doc, item_orig.doc);
     assert_eq!(item_ex.fields.len(), item_orig.fields.len());
     for (a, b) in item_ex.fields.iter().zip(item_orig.fields.iter()) {

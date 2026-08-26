@@ -27,11 +27,9 @@ export declare class InvalidName extends TaskError {
 }
 
 export interface TaskResult {
-  readonly id: bigint;
-  readonly value: string;
-  readonly success: boolean;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  id: bigint;
+  value: string;
+  success: boolean;
 }
 
 export interface WeaveffiWasmModule {

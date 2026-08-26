@@ -1,6 +1,6 @@
 # WeaveFFI
 
-[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.5.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
+[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.6.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
 WeaveFFI generates type-safe bindings for 11 languages for any native library
 that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or anything
@@ -29,7 +29,7 @@ declares. An interface is a real object with methods; an error domain plus
 `throws: true` gives its fallible members typed errors:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: kv
     errors:
@@ -231,7 +231,7 @@ versus UniFFI, cbindgen, diplomat, SWIG, and autocxx, plus an honest
 
 | Target | Output directory | What you get |
 |--------|------------------|--------------|
-| **C** | `c/` | `weaveffi.h` header with struct typedefs, function prototypes, and the shared `weaveffi_error` type |
+| **C** | `c/` | `weaveffi.h` header with interface typedefs, function prototypes, and the shared `weaveffi_error` type |
 | **C++** | `cpp/` | RAII header (`weaveffi.hpp`) with move semantics, `std::optional`/`std::vector`/`std::unordered_map` wrappers, exception-based errors, and a `CMakeLists.txt` |
 | **Swift** | `swift/` | SwiftPM package wrapping the C ABI with `throws`, `async/await`, and `Codable`-friendly types |
 | **Android** | `android/` | Kotlin JNI wrapper, C shim, and a Gradle project skeleton |
@@ -260,7 +260,7 @@ Verify the install:
 
 ```bash
 weaveffi --version
-weaveffi schema-version    # prints 0.5.0
+weaveffi schema-version    # prints 0.6.0
 ```
 
 ## CLI reference
@@ -277,7 +277,7 @@ weaveffi schema-version    # prints 0.5.0
 | `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
 | `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
-| `weaveffi schema-version` | Print the current IR schema version (`0.5.0`) |
+| `weaveffi schema-version` | Print the current IR schema version (`0.6.0`) |
 | `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
 | `weaveffi completions <shell>` | Print shell completion scripts (`bash`, `zsh`, `fish`, `powershell`, `elvish`) |
 
@@ -285,7 +285,7 @@ Reference the JSON Schema from your IDL for editor autocompletion:
 
 ```yaml
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.5.0"
+version: "0.6.0"
 modules: ...
 ```
 

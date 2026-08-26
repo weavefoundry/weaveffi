@@ -10,51 +10,26 @@ use super::ValidationError;
 use std::collections::{BTreeMap, BTreeSet};
 use weaveffi_ir::ir::{ErrorDomain, Function, InterfaceDef, Module, Param, TypeRef};
 
-/// The marshalable kernel for callback parameters. Callback arguments cross
-/// the boundary *into* the foreign language without an FFI round-trip, so
-/// every target must be able to deep-copy them in a C trampoline: scalars,
-/// bool, enums, string, bytes, handles, structs (borrowed), optionals of
-/// those, lists of scalars/strings, and maps of scalars/strings.
+/// Whether a type may appear as a callback parameter. Callback arguments
+/// cross the boundary *into* the foreign language, either as a direct slot
+/// (scalars, strings, bytes, handles) or as a borrowed serialized buffer
+/// (records, rich enums, optionals, lists, maps), so nearly everything is
+/// marshalable. The exceptions: iterators have no callback protocol, and a
+/// borrowed view can appear only as the parameter's own type (a buffer
+/// cannot hold a borrow). Interfaces are rejected separately.
 fn callback_param_type_supported(ty: &TypeRef) -> bool {
-    fn leaf(ty: &TypeRef) -> bool {
-        matches!(
-            ty,
-            TypeRef::I8
-                | TypeRef::I16
-                | TypeRef::I32
-                | TypeRef::U8
-                | TypeRef::U16
-                | TypeRef::U32
-                | TypeRef::I64
-                | TypeRef::U64
-                | TypeRef::F32
-                | TypeRef::F64
-                | TypeRef::Bool
-                | TypeRef::Enum(_)
-                | TypeRef::StringUtf8
-                | TypeRef::BorrowedStr
-                | TypeRef::Handle
-                | TypeRef::TypedHandle(_)
-                | TypeRef::Named(_)
-                | TypeRef::Record(_)
-                | TypeRef::RichEnum(_)
-                | TypeRef::Bytes
-                | TypeRef::BorrowedBytes
-        )
+    if contains_iterator(ty) {
+        return false;
     }
     match ty {
-        t if leaf(t) => true,
-        TypeRef::Optional(inner) => leaf(inner),
-        TypeRef::List(inner) => scalar_element(inner),
-        TypeRef::Map(k, v) => scalar_element(k) && scalar_element(v),
-        _ => false,
+        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => true,
+        _ => contains_borrowed(ty).is_none(),
     }
 }
 
-/// The single-slot *by-value-ish* element kernel: types that lower to one C
-/// array slot with no auxiliary length and no ownership transfer beyond a
-/// deep copy. These are the only shapes allowed as map keys/values and as
-/// list elements inside callback parameters.
+/// The types allowed as map keys: scalars, bool, enums, and strings. Every
+/// target language must be able to use the key in its native dictionary
+/// idiom, so composites, optionals, bytes, and handles are rejected.
 fn scalar_element(ty: &TypeRef) -> bool {
     matches!(
         ty,
@@ -73,21 +48,6 @@ fn scalar_element(ty: &TypeRef) -> bool {
             | TypeRef::StringUtf8
             | TypeRef::BorrowedStr
     )
-}
-
-/// The single-slot element kernel for lists and iterators: everything in
-/// [`scalar_element`] plus handles and struct pointers, which also occupy
-/// exactly one array slot.
-fn slot_element(ty: &TypeRef) -> bool {
-    scalar_element(ty)
-        || matches!(
-            ty,
-            TypeRef::Handle
-                | TypeRef::TypedHandle(_)
-                | TypeRef::Named(_)
-                | TypeRef::Record(_)
-                | TypeRef::RichEnum(_)
-        )
 }
 
 const RESERVED: &[&str] = &[
@@ -277,17 +237,10 @@ pub(super) fn validate_module(
             });
         }
         if s.fields.is_empty() {
-            if s.builder {
-                errors.push(ValidationError::BuilderStructEmpty {
-                    module: module.name.clone(),
-                    name: s.name.clone(),
-                });
-            } else {
-                errors.push(ValidationError::EmptyStruct {
-                    module: module.name.clone(),
-                    name: s.name.clone(),
-                });
-            }
+            errors.push(ValidationError::EmptyStruct {
+                module: module.name.clone(),
+                name: s.name.clone(),
+            });
         }
         let mut field_names = BTreeSet::new();
         for f in &s.fields {
@@ -371,9 +324,12 @@ pub(super) fn validate_module(
         interfaces: &interface_names,
     };
 
-    for s in &module.structs {
-        for f in &s.fields {
-            let location = || format!("field '{}' of struct '{}'", f.name, s.name);
+    // A field of a record, a rich-enum variant, or an error payload is
+    // serialized inside a value buffer, so it obeys the buffered positional
+    // rules: no borrowed views, no iterators, no interfaces, and every
+    // reference must resolve.
+    let mut check_buffered_field =
+        |f: &weaveffi_ir::ir::StructField, location: &dyn Fn() -> String| {
             if let Some(ty) = contains_borrowed(&f.ty) {
                 errors.push(ValidationError::BorrowedTypeInInvalidPosition {
                     ty: ty.to_string(),
@@ -386,32 +342,32 @@ pub(super) fn validate_module(
                 });
             }
             validate_type_ref(&f.ty, &ctx, errors);
-            check_element_shapes(&f.ty, location, errors);
             check_interface_positions(&f.ty, &ctx, false, location, errors);
+        };
+    for s in &module.structs {
+        for f in &s.fields {
+            let location = || format!("field '{}' of struct '{}'", f.name, s.name);
+            check_buffered_field(f, &location);
         }
     }
-    // Rich-enum variant fields carry associated data and lower exactly like
-    // struct fields (by value across the C ABI), so they obey the same
-    // positional rules: no borrowed views, no iterators, no interfaces, and
-    // only ABI-representable element shapes.
     for e in &module.enums {
         for v in &e.variants {
             for f in &v.fields {
                 let location = || format!("field '{}' of variant '{}::{}'", f.name, e.name, v.name);
-                if let Some(ty) = contains_borrowed(&f.ty) {
-                    errors.push(ValidationError::BorrowedTypeInInvalidPosition {
-                        ty: ty.to_string(),
-                        location: location(),
-                    });
-                }
-                if contains_iterator(&f.ty) {
-                    errors.push(ValidationError::IteratorInInvalidPosition {
-                        location: location(),
-                    });
-                }
-                validate_type_ref(&f.ty, &ctx, errors);
-                check_element_shapes(&f.ty, location, errors);
-                check_interface_positions(&f.ty, &ctx, false, location, errors);
+                check_buffered_field(f, &location);
+            }
+        }
+    }
+    if let Some(domain) = &module.errors {
+        for c in &domain.codes {
+            for f in &c.fields {
+                let location = || {
+                    format!(
+                        "payload field '{}' of error code '{}::{}'",
+                        f.name, domain.name, c.name
+                    )
+                };
+                check_buffered_field(f, &location);
             }
         }
     }
@@ -595,8 +551,36 @@ fn validate_callable_types(
                 location: location(),
             });
         }
+        // A borrowed view is valid only as the parameter's own type; inside a
+        // composite it would end up serialized in a value buffer, which
+        // cannot hold a borrow.
+        if !matches!(p.ty, TypeRef::BorrowedStr | TypeRef::BorrowedBytes) {
+            if let Some(ty) = contains_borrowed(&p.ty) {
+                errors.push(ValidationError::BorrowedTypeInInvalidPosition {
+                    ty: ty.to_string(),
+                    location: location(),
+                });
+            }
+        }
+        // `mutable: true` needs a write-back lowering, which only the string
+        // and bytes pointer shapes have. Buffered types are borrowed
+        // serialized copies; mutating the copy could never reach the caller.
+        if p.mutable
+            && !matches!(
+                p.ty,
+                TypeRef::StringUtf8
+                    | TypeRef::Bytes
+                    | TypeRef::BorrowedStr
+                    | TypeRef::BorrowedBytes
+            )
+        {
+            errors.push(ValidationError::MutableParamUnsupported {
+                function: format!("{module_name}::{display_name}"),
+                param: p.name.clone(),
+                ty: format!("{:?}", p.ty),
+            });
+        }
         validate_type_ref(&p.ty, ctx, errors);
-        check_element_shapes(&p.ty, location, errors);
         check_interface_positions(&p.ty, ctx, true, location, errors);
     }
     if let Some(ret) = &f.returns {
@@ -618,7 +602,6 @@ fn validate_callable_types(
             });
         }
         validate_type_ref(ret, ctx, errors);
-        check_element_shapes(ret, location, errors);
         check_interface_positions(ret, ctx, true, location, errors);
     }
 }
@@ -641,59 +624,6 @@ impl TypeCtx<'_> {
     fn is_interface(&self, name: &str) -> bool {
         let bare = name.rsplit('.').next().unwrap_or(name);
         self.interfaces.contains(bare)
-    }
-}
-
-/// The element shapes the C ABI can faithfully represent. Lists, maps, and
-/// iterators lower to flat arrays (`T* + len`, parallel key/value arrays, or
-/// a one-slot `next` out-param), so their element types must themselves be
-/// single C slots. Composite elements (lists of lists, optional scalars in
-/// lists, bytes elements needing a second length slot, ...) silently flatten
-/// in `element_ctype` and would generate wrong code in every backend; reject
-/// them up front. Returns the first offending element type, if any.
-fn unsupported_element_shape(ty: &TypeRef) -> Option<&TypeRef> {
-    match ty {
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => match inner.as_ref() {
-            t if slot_element(t) => None,
-            // NULL entries in a pointer array express "none", so optional
-            // structs/handles stay representable inside lists.
-            TypeRef::Optional(o)
-                if matches!(
-                    o.as_ref(),
-                    TypeRef::Named(_)
-                        | TypeRef::Record(_)
-                        | TypeRef::RichEnum(_)
-                        | TypeRef::TypedHandle(_)
-                ) =>
-            {
-                None
-            }
-            other => Some(other),
-        },
-        TypeRef::Map(k, v) => {
-            if !scalar_element(k) {
-                Some(k)
-            } else if !scalar_element(v) {
-                Some(v)
-            } else {
-                None
-            }
-        }
-        TypeRef::Optional(inner) => unsupported_element_shape(inner),
-        _ => None,
-    }
-}
-
-fn check_element_shapes(
-    ty: &TypeRef,
-    location: impl Fn() -> String,
-    errors: &mut Vec<ValidationError>,
-) {
-    if let Some(bad) = unsupported_element_shape(ty) {
-        errors.push(ValidationError::UnsupportedElementType {
-            location: location(),
-            ty: format!("{bad:?}"),
-        });
     }
 }
 
@@ -822,15 +752,15 @@ fn validate_type_ref(ty: &TypeRef, ctx: &TypeCtx<'_>, errors: &mut Vec<Validatio
             validate_type_ref(inner, ctx, errors);
         }
         TypeRef::Map(k, v) => {
-            let bad_key = match k.as_ref() {
-                TypeRef::Named(name) | TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-                    Some(format!("struct {name}"))
-                }
-                TypeRef::List(_) => Some("list".to_string()),
-                TypeRef::Map(_, _) => Some("map".to_string()),
-                _ => None,
-            };
-            if let Some(key_type) = bad_key {
+            if !scalar_element(k) {
+                let key_type = match k.as_ref() {
+                    TypeRef::Named(name) | TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+                        format!("struct {name}")
+                    }
+                    TypeRef::List(_) => "list".to_string(),
+                    TypeRef::Map(_, _) => "map".to_string(),
+                    other => format!("{other:?}"),
+                };
                 errors.push(ValidationError::InvalidMapKey { key_type });
             }
             validate_type_ref(k, ctx, errors);

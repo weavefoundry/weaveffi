@@ -1,4 +1,4 @@
-version: "0.5.0"
+version: "0.6.0"
 package:
   name: kvstore
   version: "1.0.0"
@@ -13,7 +13,6 @@ modules:
     structs:
       - name: Entry
         doc: A single key-value entry persisted in the store
-        builder: true
         fields:
           - { name: id, type: i64, doc: Stable monotonic identifier assigned on insert }
           - { name: key, type: string, doc: UTF-8 lookup key }

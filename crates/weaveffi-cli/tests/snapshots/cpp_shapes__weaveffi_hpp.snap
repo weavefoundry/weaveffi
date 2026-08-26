@@ -15,6 +15,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
+#include <variant>
+#include <cstring>
+#include <utility>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -46,7 +49,16 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+/* Error slot written by every fallible call. `payload_ptr`/`payload_len`
+   hold the matched error code's fields serialized in the WeaveFFI value
+   buffer format (null when the code declares no fields); both the message
+   and the payload are released by weaveffi_error_clear. */
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
+} weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
@@ -80,54 +92,15 @@ typedef enum {
 } weaveffi_shapes_Shape_Tag;
 /** A plain C-style enum (no payloads) */
 typedef enum { weaveffi_shapes_Channel_Red = 0, weaveffi_shapes_Channel_Green = 1, weaveffi_shapes_Channel_Blue = 2 } weaveffi_shapes_Channel;
-typedef struct weaveffi_shapes_Shape weaveffi_shapes_Shape;
-typedef struct weaveffi_shapes_Numerics weaveffi_shapes_Numerics;
-
-/** An algebraic shape (sum type with associated data) */
-WEAVEFFI_API int32_t weaveffi_shapes_Shape_tag(const weaveffi_shapes_Shape* self);
-/** The empty shape (a unit variant) */
-WEAVEFFI_API weaveffi_shapes_Shape* weaveffi_shapes_Shape_Empty_new(weaveffi_error* out_err);
-/** A circle with a radius */
-WEAVEFFI_API weaveffi_shapes_Shape* weaveffi_shapes_Shape_Circle_new(double radius, weaveffi_error* out_err);
-/** Radius in points */
-WEAVEFFI_API double weaveffi_shapes_Shape_Circle_get_radius(const weaveffi_shapes_Shape* self);
-/** An axis-aligned rectangle */
-WEAVEFFI_API weaveffi_shapes_Shape* weaveffi_shapes_Shape_Rectangle_new(float width, float height, weaveffi_error* out_err);
-WEAVEFFI_API float weaveffi_shapes_Shape_Rectangle_get_width(const weaveffi_shapes_Shape* self);
-WEAVEFFI_API float weaveffi_shapes_Shape_Rectangle_get_height(const weaveffi_shapes_Shape* self);
-/** An integer-bounded shape (exercises narrow + wide ints) */
-WEAVEFFI_API weaveffi_shapes_Shape* weaveffi_shapes_Shape_Bounded_new(int16_t min, int16_t max, uint64_t weight, weaveffi_error* out_err);
-WEAVEFFI_API int16_t weaveffi_shapes_Shape_Bounded_get_min(const weaveffi_shapes_Shape* self);
-WEAVEFFI_API int16_t weaveffi_shapes_Shape_Bounded_get_max(const weaveffi_shapes_Shape* self);
-WEAVEFFI_API uint64_t weaveffi_shapes_Shape_Bounded_get_weight(const weaveffi_shapes_Shape* self);
-/** A labeled shape with a small count */
-WEAVEFFI_API weaveffi_shapes_Shape* weaveffi_shapes_Shape_Labeled_new(const char* label, uint8_t count, weaveffi_error* out_err);
-WEAVEFFI_API const char* weaveffi_shapes_Shape_Labeled_get_label(const weaveffi_shapes_Shape* self);
-WEAVEFFI_API uint8_t weaveffi_shapes_Shape_Labeled_get_count(const weaveffi_shapes_Shape* self);
-WEAVEFFI_API void weaveffi_shapes_Shape_destroy(weaveffi_shapes_Shape* self);
-
-/** One field per supported numeric primitive */
-WEAVEFFI_API weaveffi_shapes_Numerics* weaveffi_shapes_Numerics_create(int8_t a, int16_t b, int32_t c, int64_t d, uint8_t e, uint16_t f, uint32_t g, uint64_t h, float i, double j, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_shapes_Numerics_destroy(weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API int8_t weaveffi_shapes_Numerics_get_a(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API int16_t weaveffi_shapes_Numerics_get_b(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API int32_t weaveffi_shapes_Numerics_get_c(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API int64_t weaveffi_shapes_Numerics_get_d(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API uint8_t weaveffi_shapes_Numerics_get_e(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API uint16_t weaveffi_shapes_Numerics_get_f(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API uint32_t weaveffi_shapes_Numerics_get_g(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API uint64_t weaveffi_shapes_Numerics_get_h(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API float weaveffi_shapes_Numerics_get_i(const weaveffi_shapes_Numerics* ptr);
-WEAVEFFI_API double weaveffi_shapes_Numerics_get_j(const weaveffi_shapes_Numerics* ptr);
 
 /** Render a shape to a string */
-WEAVEFFI_API const char* weaveffi_shapes_describe(const weaveffi_shapes_Shape* shape, weaveffi_error* out_err);
+WEAVEFFI_API const char* weaveffi_shapes_describe(const uint8_t* shape_ptr, size_t shape_len, weaveffi_error* out_err);
 /** Scale a shape by a factor, returning a new shape */
-WEAVEFFI_API weaveffi_shapes_Shape* weaveffi_shapes_scale(const weaveffi_shapes_Shape* shape, double factor, weaveffi_error* out_err);
+WEAVEFFI_API const uint8_t* weaveffi_shapes_scale(const uint8_t* shape_ptr, size_t shape_len, double factor, size_t* out_len, weaveffi_error* out_err);
 /** Sum a list of bytes into a wide integer (numerics smoke) */
-WEAVEFFI_API uint64_t weaveffi_shapes_sum_bytes(const uint8_t* values, size_t values_len, weaveffi_error* out_err);
+WEAVEFFI_API uint64_t weaveffi_shapes_sum_bytes(const uint8_t* values_ptr, size_t values_len, weaveffi_error* out_err);
 /** Build a Numerics struct from every numeric primitive */
-WEAVEFFI_API weaveffi_shapes_Numerics* weaveffi_shapes_make_numerics(int8_t a, int16_t b, int32_t c, int64_t d, uint8_t e, uint16_t f, uint32_t g, uint64_t h, float i, double j, weaveffi_error* out_err);
+WEAVEFFI_API const uint8_t* weaveffi_shapes_make_numerics(int8_t a, int16_t b, int32_t c, int64_t d, uint8_t e, uint16_t f, uint32_t g, uint64_t h, float i, double j, size_t* out_len, weaveffi_error* out_err);
 
 } // extern "C"
 
@@ -160,6 +133,180 @@ inline std::exception_ptr make_error(int32_t code, const std::string& msg) {
 
 } // namespace detail
 
+namespace detail {
+
+/**
+ * Serializes values into the WeaveFFI value-buffer wire format: little-endian,
+ * packed with no alignment, lengths and element counts as u32.
+ */
+class BufferWriter {
+    std::vector<uint8_t> buf_;
+
+    template <typename T>
+    void append_le(T v) {
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
+        }
+    }
+
+public:
+    /** Pointer to the encoded bytes. */
+    const uint8_t* data() const { return buf_.data(); }
+
+    /** Number of encoded bytes. */
+    size_t size() const { return buf_.size(); }
+
+    void write_bool(bool v) { buf_.push_back(v ? 1 : 0); }
+    void write_i8(int8_t v) { buf_.push_back(static_cast<uint8_t>(v)); }
+    void write_u8(uint8_t v) { buf_.push_back(v); }
+    void write_i16(int16_t v) { append_le(static_cast<uint16_t>(v)); }
+    void write_u16(uint16_t v) { append_le(v); }
+    void write_i32(int32_t v) { append_le(static_cast<uint32_t>(v)); }
+    void write_u32(uint32_t v) { append_le(v); }
+    void write_i64(int64_t v) { append_le(static_cast<uint64_t>(v)); }
+    void write_u64(uint64_t v) { append_le(v); }
+
+    void write_f32(float v) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_le(bits);
+    }
+
+    void write_f64(double v) {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_le(bits);
+    }
+
+    /** Writes a string, byte-buffer, or collection length as a u32. */
+    void write_len(size_t n) { append_le(static_cast<uint32_t>(n)); }
+
+    void write_string(const std::string& v) {
+        write_len(v.size());
+        buf_.insert(buf_.end(), v.begin(), v.end());
+    }
+
+    void write_bytes(const std::vector<uint8_t>& v) {
+        write_len(v.size());
+        buf_.insert(buf_.end(), v.begin(), v.end());
+    }
+
+    /** Writes an optional's presence flag: 0 absent, 1 present. */
+    void write_option_flag(bool present) { buf_.push_back(present ? 1 : 0); }
+};
+
+/**
+ * Decodes values from the WeaveFFI value-buffer wire format. A malformed
+ * buffer is a producer/consumer contract violation (both sides are generated
+ * from one IDL), so every decode failure throws the generic WeaveFFIError,
+ * the same channel as a producer panic.
+ */
+class BufferReader {
+    const uint8_t* data_;
+    size_t len_;
+    size_t pos_;
+
+    [[noreturn]] static void fail(const char* what) {
+        throw WeaveFFIError(-2, std::string("malformed WeaveFFI value buffer: ") + what);
+    }
+
+    void require(size_t n, const char* what) const {
+        if (len_ - pos_ < n) fail(what);
+    }
+
+    template <typename T>
+    T read_le(const char* what) {
+        require(sizeof(T), what);
+        uint64_t v = 0;
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            v |= static_cast<uint64_t>(data_[pos_ + i]) << (8 * i);
+        }
+        pos_ += sizeof(T);
+        return static_cast<T>(v);
+    }
+
+public:
+    BufferReader(const uint8_t* data, size_t len) : data_(data), len_(len), pos_(0) {}
+
+    /** Bytes not yet consumed. */
+    size_t remaining() const { return len_ - pos_; }
+
+    bool read_bool() {
+        uint8_t b = read_le<uint8_t>("bool");
+        if (b > 1) fail("bool byte out of range");
+        return b != 0;
+    }
+
+    int8_t read_i8() { return read_le<int8_t>("i8"); }
+    uint8_t read_u8() { return read_le<uint8_t>("u8"); }
+    int16_t read_i16() { return read_le<int16_t>("i16"); }
+    uint16_t read_u16() { return read_le<uint16_t>("u16"); }
+    int32_t read_i32() { return read_le<int32_t>("i32"); }
+    uint32_t read_u32() { return read_le<uint32_t>("u32"); }
+    int64_t read_i64() { return read_le<int64_t>("i64"); }
+    uint64_t read_u64() { return read_le<uint64_t>("u64"); }
+
+    float read_f32() {
+        uint32_t bits = read_le<uint32_t>("f32");
+        float v = 0;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+
+    double read_f64() {
+        uint64_t bits = read_le<uint64_t>("f64");
+        double v = 0;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+
+    /** Reads a length prefix, rejecting one larger than the bytes remaining. */
+    size_t read_len() {
+        uint32_t n = read_le<uint32_t>("length");
+        if (static_cast<size_t>(n) > remaining()) fail("length prefix exceeds remaining buffer");
+        return static_cast<size_t>(n);
+    }
+
+    std::string read_string() {
+        size_t n = read_len();
+        std::string v(reinterpret_cast<const char*>(data_) + pos_, n);
+        pos_ += n;
+        return v;
+    }
+
+    std::vector<uint8_t> read_bytes() {
+        size_t n = read_len();
+        std::vector<uint8_t> v(data_ + pos_, data_ + pos_ + n);
+        pos_ += n;
+        return v;
+    }
+
+    bool read_option_flag() {
+        uint8_t b = read_le<uint8_t>("option flag");
+        if (b > 1) fail("option flag byte out of range");
+        return b != 0;
+    }
+
+    /** Rejects unconsumed bytes after decoding a complete value. */
+    void expect_end() const {
+        if (pos_ != len_) fail("trailing bytes after value");
+    }
+};
+
+/** Releases a producer-allocated buffer with weaveffi_free_bytes on scope exit. */
+struct BufferGuard {
+    /** The producer-allocated buffer, or null when the call reported an error. */
+    const uint8_t* ptr;
+    /** The buffer length in bytes. */
+    size_t len;
+
+    ~BufferGuard() {
+        if (ptr != nullptr) weaveffi_free_bytes(const_cast<uint8_t*>(ptr), len);
+    }
+};
+
+} // namespace detail
+
 /** A plain C-style enum (no payloads) */
 enum class Channel : int32_t {
     Red = 0,
@@ -168,105 +315,22 @@ enum class Channel : int32_t {
 };
 
 /** One field per supported numeric primitive */
-class Numerics {
-    void* handle_;
-
-public:
-    explicit Numerics(void* h) : handle_(h) {}
-
-    ~Numerics() {
-        if (handle_) weaveffi_shapes_Numerics_destroy(static_cast<weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    Numerics(const Numerics&) = delete;
-    Numerics& operator=(const Numerics&) = delete;
-
-    Numerics(Numerics&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Numerics& operator=(Numerics&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_shapes_Numerics_destroy(static_cast<weaveffi_shapes_Numerics*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    void* handle() const { return handle_; }
-
-    int8_t a() const {
-        return weaveffi_shapes_Numerics_get_a(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    int16_t b() const {
-        return weaveffi_shapes_Numerics_get_b(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    int32_t c() const {
-        return weaveffi_shapes_Numerics_get_c(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    int64_t d() const {
-        return weaveffi_shapes_Numerics_get_d(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    uint8_t e() const {
-        return weaveffi_shapes_Numerics_get_e(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    uint16_t f() const {
-        return weaveffi_shapes_Numerics_get_f(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    uint32_t g() const {
-        return weaveffi_shapes_Numerics_get_g(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    uint64_t h() const {
-        return weaveffi_shapes_Numerics_get_h(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    float i() const {
-        return weaveffi_shapes_Numerics_get_i(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
-    double j() const {
-        return weaveffi_shapes_Numerics_get_j(static_cast<const weaveffi_shapes_Numerics*>(handle_));
-    }
-
+struct Numerics {
+    int8_t a;
+    int16_t b;
+    int32_t c;
+    int64_t d;
+    uint8_t e;
+    uint16_t f;
+    uint32_t g;
+    uint64_t h;
+    float i;
+    double j;
 };
 
 /** An algebraic shape (sum type with associated data) */
-class Shape {
-    void* handle_;
-
-public:
-    explicit Shape(void* h) : handle_(h) {}
-
-    ~Shape() {
-        if (handle_) weaveffi_shapes_Shape_destroy(static_cast<weaveffi_shapes_Shape*>(handle_));
-    }
-
-    Shape(const Shape&) = delete;
-    Shape& operator=(const Shape&) = delete;
-
-    Shape(Shape&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Shape& operator=(Shape&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_shapes_Shape_destroy(static_cast<weaveffi_shapes_Shape*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    void* handle() const { return handle_; }
-
+struct Shape {
+    /** Discriminant identifying the active variant of `Shape`. */
     enum class Tag : int32_t {
         Empty = 0,
         Circle = 1,
@@ -275,94 +339,168 @@ public:
         Labeled = 4
     };
 
-    Tag tag() const {
-        return static_cast<Tag>(weaveffi_shapes_Shape_tag(static_cast<const weaveffi_shapes_Shape*>(handle_)));
-    }
-
     /** The empty shape (a unit variant) */
-    static Shape Empty() {
-        weaveffi_error err{};
-        auto* result = weaveffi_shapes_Shape_Empty_new(&err);
-        detail::check(err);
-        return Shape(result);
-    }
+    struct Empty {
+    };
 
     /** A circle with a radius */
-    static Shape Circle(double radius) {
-        weaveffi_error err{};
-        auto* result = weaveffi_shapes_Shape_Circle_new(radius, &err);
-        detail::check(err);
-        return Shape(result);
-    }
+    struct Circle {
+        /** Radius in points */
+        double radius;
+    };
 
     /** An axis-aligned rectangle */
-    static Shape Rectangle(float width, float height) {
-        weaveffi_error err{};
-        auto* result = weaveffi_shapes_Shape_Rectangle_new(width, height, &err);
-        detail::check(err);
-        return Shape(result);
-    }
+    struct Rectangle {
+        float width;
+        float height;
+    };
 
     /** An integer-bounded shape (exercises narrow + wide ints) */
-    static Shape Bounded(int16_t min, int16_t max, uint64_t weight) {
-        weaveffi_error err{};
-        auto* result = weaveffi_shapes_Shape_Bounded_new(min, max, weight, &err);
-        detail::check(err);
-        return Shape(result);
-    }
+    struct Bounded {
+        int16_t min;
+        int16_t max;
+        uint64_t weight;
+    };
 
     /** A labeled shape with a small count */
-    static Shape Labeled(const std::string& label, uint8_t count) {
-        weaveffi_error err{};
-        auto* result = weaveffi_shapes_Shape_Labeled_new(label.c_str(), count, &err);
-        detail::check(err);
-        return Shape(result);
-    }
+    struct Labeled {
+        std::string label;
+        uint8_t count;
+    };
 
-    /** Radius in points */
-    double circle_radius() const {
-        return weaveffi_shapes_Shape_Circle_get_radius(static_cast<const weaveffi_shapes_Shape*>(handle_));
-    }
+    /** The active variant's payload. */
+    std::variant<Empty, Circle, Rectangle, Bounded, Labeled> value;
 
-    float rectangle_width() const {
-        return weaveffi_shapes_Shape_Rectangle_get_width(static_cast<const weaveffi_shapes_Shape*>(handle_));
+    /** The tag of the active variant. */
+    Tag tag() const {
+        static constexpr Tag tags[] = {
+            Tag::Empty,
+            Tag::Circle,
+            Tag::Rectangle,
+            Tag::Bounded,
+            Tag::Labeled
+        };
+        return tags[value.index()];
     }
-
-    float rectangle_height() const {
-        return weaveffi_shapes_Shape_Rectangle_get_height(static_cast<const weaveffi_shapes_Shape*>(handle_));
-    }
-
-    int16_t bounded_min() const {
-        return weaveffi_shapes_Shape_Bounded_get_min(static_cast<const weaveffi_shapes_Shape*>(handle_));
-    }
-
-    int16_t bounded_max() const {
-        return weaveffi_shapes_Shape_Bounded_get_max(static_cast<const weaveffi_shapes_Shape*>(handle_));
-    }
-
-    uint64_t bounded_weight() const {
-        return weaveffi_shapes_Shape_Bounded_get_weight(static_cast<const weaveffi_shapes_Shape*>(handle_));
-    }
-
-    std::string labeled_label() const {
-        const char* raw = weaveffi_shapes_Shape_Labeled_get_label(static_cast<const weaveffi_shapes_Shape*>(handle_));
-        std::string ret(raw);
-        weaveffi_free_string(raw);
-        return ret;
-    }
-
-    uint8_t labeled_count() const {
-        return weaveffi_shapes_Shape_Labeled_get_count(static_cast<const weaveffi_shapes_Shape*>(handle_));
-    }
-
 };
+
+namespace detail {
+
+/** Encodes a `Numerics` in the WeaveFFI value-buffer format. */
+inline void write_Numerics(BufferWriter& w, const Numerics& v) {
+    w.write_i8(v.a);
+    w.write_i16(v.b);
+    w.write_i32(v.c);
+    w.write_i64(v.d);
+    w.write_u8(v.e);
+    w.write_u16(v.f);
+    w.write_u32(v.g);
+    w.write_u64(v.h);
+    w.write_f32(v.i);
+    w.write_f64(v.j);
+}
+
+/** Decodes a `Numerics` from the WeaveFFI value-buffer format. */
+inline Numerics read_Numerics(BufferReader& r) {
+    Numerics out{};
+    out.a = r.read_i8();
+    out.b = r.read_i16();
+    out.c = r.read_i32();
+    out.d = r.read_i64();
+    out.e = r.read_u8();
+    out.f = r.read_u16();
+    out.g = r.read_u32();
+    out.h = r.read_u64();
+    out.i = r.read_f32();
+    out.j = r.read_f64();
+    return out;
+}
+
+/** Encodes a `Shape` in the WeaveFFI value-buffer format. */
+inline void write_Shape(BufferWriter& w, const Shape& v) {
+    switch (v.value.index()) {
+    case 0: {
+        w.write_i32(0);
+        break;
+    }
+    case 1: {
+        w.write_i32(1);
+        const Shape::Circle& p = std::get<1>(v.value);
+        w.write_f64(p.radius);
+        break;
+    }
+    case 2: {
+        w.write_i32(2);
+        const Shape::Rectangle& p = std::get<2>(v.value);
+        w.write_f32(p.width);
+        w.write_f32(p.height);
+        break;
+    }
+    case 3: {
+        w.write_i32(3);
+        const Shape::Bounded& p = std::get<3>(v.value);
+        w.write_i16(p.min);
+        w.write_i16(p.max);
+        w.write_u64(p.weight);
+        break;
+    }
+    case 4: {
+        w.write_i32(4);
+        const Shape::Labeled& p = std::get<4>(v.value);
+        w.write_string(p.label);
+        w.write_u8(p.count);
+        break;
+    }
+    }
+}
+
+/** Decodes a `Shape` from the WeaveFFI value-buffer format. */
+inline Shape read_Shape(BufferReader& r) {
+    int32_t tag = r.read_i32();
+    switch (tag) {
+    case 0: {
+        return Shape{Shape::Empty{}};
+    }
+    case 1: {
+        Shape::Circle p{};
+        p.radius = r.read_f64();
+        return Shape{std::move(p)};
+    }
+    case 2: {
+        Shape::Rectangle p{};
+        p.width = r.read_f32();
+        p.height = r.read_f32();
+        return Shape{std::move(p)};
+    }
+    case 3: {
+        Shape::Bounded p{};
+        p.min = r.read_i16();
+        p.max = r.read_i16();
+        p.weight = r.read_u64();
+        return Shape{std::move(p)};
+    }
+    case 4: {
+        Shape::Labeled p{};
+        p.label = r.read_string();
+        p.count = r.read_u8();
+        return Shape{std::move(p)};
+    }
+    default:
+        break;
+    }
+    throw WeaveFFIError(-2, "malformed WeaveFFI value buffer: unknown Shape tag");
+}
+
+} // namespace detail
 
 namespace shapes {
 
 /** Render a shape to a string */
 inline std::string describe(const Shape& shape) {
+    detail::BufferWriter shape_buf;
+    detail::write_Shape(shape_buf, shape);
     weaveffi_error err{};
-    auto result = weaveffi_shapes_describe(static_cast<const weaveffi_shapes_Shape*>(shape.handle()), &err);
+    auto result = weaveffi_shapes_describe(shape_buf.data(), shape_buf.size(), &err);
     detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
@@ -371,10 +509,17 @@ inline std::string describe(const Shape& shape) {
 
 /** Scale a shape by a factor, returning a new shape */
 inline Shape scale(const Shape& shape, double factor) {
+    detail::BufferWriter shape_buf;
+    detail::write_Shape(shape_buf, shape);
+    size_t out_len = 0;
     weaveffi_error err{};
-    auto result = weaveffi_shapes_scale(static_cast<const weaveffi_shapes_Shape*>(shape.handle()), factor, &err);
+    auto result = weaveffi_shapes_scale(shape_buf.data(), shape_buf.size(), factor, &out_len, &err);
     detail::check(err);
-    return Shape(result);
+    detail::BufferGuard result_guard{result, out_len};
+    detail::BufferReader result_r(result, out_len);
+    Shape ret = detail::read_Shape(result_r);
+    result_r.expect_end();
+    return ret;
 }
 
 /** Sum a list of bytes into a wide integer (numerics smoke) */
@@ -387,10 +532,15 @@ inline uint64_t sum_bytes(const std::vector<uint8_t>& values) {
 
 /** Build a Numerics struct from every numeric primitive */
 inline Numerics make_numerics(int8_t a, int16_t b, int32_t c, int64_t d, uint8_t e, uint16_t f, uint32_t g, uint64_t h, float i, double j) {
+    size_t out_len = 0;
     weaveffi_error err{};
-    auto result = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, &err);
+    auto result = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, &out_len, &err);
     detail::check(err);
-    return Numerics(result);
+    detail::BufferGuard result_guard{result, out_len};
+    detail::BufferReader result_r(result, out_len);
+    Numerics ret = detail::read_Numerics(result_r);
+    result_r.expect_end();
+    return ret;
 }
 
 } // namespace shapes

@@ -10,8 +10,8 @@
 //!
 //! The emission is split by surface: [`sync`] for synchronous callables,
 //! [`async_fns`] for `async fn` launchers, [`iterators`] for `iter<T>` trios,
-//! [`records`] for record create/getters/builders, [`enums`] for C-style and
-//! rich (algebraic) enums, [`interfaces`] for opaque-object destructors, and
+//! [`records`] and [`enums`] for the generated `BufferValue` serialization
+//! impls of value types, [`interfaces`] for opaque-object destructors, and
 //! [`callbacks`] for callback typedefs and listener registries. [`helpers`]
 //! and [`marshal`] hold the shared slot rendering and lift/lower machinery.
 
@@ -60,11 +60,12 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
     //    `#[weaveffi::module]` is expanded in isolation, so a reference to a type
     //    declared in a *sibling* top-level module (e.g. `orders` using a
     //    `products::Product`) must not be rejected as an unknown type here. A
-    //    cross-module struct still crosses the ABI as an opaque pointer, and the
-    //    emitted thunk names the producer's real Rust type, so the symbol and
-    //    calling convention match the header regardless. Whole-API rule checks
-    //    remain enforced by the CLI's `validate`/`extract`/`generate`, and the
-    //    Rust compiler rejects any genuinely undefined type in the thunks.
+    //    cross-module struct still crosses the ABI as a value buffer, and the
+    //    emitted thunk decodes into the producer's real Rust type, so the symbol
+    //    and calling convention match the header regardless. Whole-API rule
+    //    checks remain enforced by the CLI's `validate`/`extract`/`generate`,
+    //    and the Rust compiler rejects any genuinely undefined type in the
+    //    thunks.
     let module_ir = weaveffi_bridge::module_from_item_mod(item_mod)?;
     let mut api = Api {
         version: CURRENT_SCHEMA_VERSION.to_string(),
@@ -100,12 +101,11 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
 /// the macro expands each `#[weaveffi::module]` in isolation, so a reference
 /// to a type declared in a sibling top-level module stays `Named` here (the
 /// CLI, which sees the whole API, always resolves it). Such a reference
-/// crosses the ABI as an opaque object pointer regardless of whether the
-/// sibling declares a record or a rich enum - the two share the pointer ABI
-/// (see `TypeRef::is_object_ref`) - so `Record` marshalling is correct for
-/// both, and the frozen core's ABI lowering would otherwise panic on a
-/// leftover `Named`. A genuinely undefined type still fails: rustc rejects
-/// the thunk that names it.
+/// crosses the ABI as a value buffer regardless of whether the sibling
+/// declares a record or a rich enum - both are buffered value types - so
+/// `Record` marshalling is correct for both, and the core's ABI lowering
+/// would otherwise panic on a leftover `Named`. A genuinely undefined type
+/// still fails: rustc rejects the thunk that names it.
 fn resolve_sibling_named_refs(api: &mut Api) {
     fn walk_type(ty: &mut TypeRef) {
         match ty {
@@ -244,7 +244,6 @@ fn render_symbols(
     mod_ident: &syn::Ident,
 ) -> syn::Result<TokenStream> {
     let mut fns: HashMap<String, &syn::ItemFn> = HashMap::new();
-    let mut structs: HashMap<String, &syn::ItemStruct> = HashMap::new();
     let mut enums: HashMap<String, &syn::ItemEnum> = HashMap::new();
     // Interface member signatures, keyed by `(type name, fn name)` across all
     // inherent `impl` blocks of the type.
@@ -253,9 +252,6 @@ fn render_symbols(
         match item {
             syn::Item::Fn(f) => {
                 fns.insert(f.sig.ident.to_string(), f);
-            }
-            syn::Item::Struct(s) => {
-                structs.insert(s.ident.to_string(), s);
             }
             syn::Item::Enum(e) => {
                 enums.insert(e.ident.to_string(), e);
@@ -309,7 +305,7 @@ fn render_symbols(
         generated.extend(enums::gen_enum(e, enums.get(&e.name).copied())?);
     }
     for s in &mb.structs {
-        generated.extend(records::gen_record(s, structs.get(&s.name).copied())?);
+        generated.extend(records::gen_record(s)?);
     }
     for c in &mb.callbacks {
         generated.extend(callbacks::gen_callback_type(c)?);
@@ -352,21 +348,69 @@ fn impl_type_name(item_impl: &syn::ItemImpl) -> Option<String> {
 }
 
 /// Generate the [`ErrorReport`](weaveffi_abi::ErrorReport) implementation for
-/// a module's `#[weaveffi::error]` enum, mapping each unit variant to its
-/// declared code and default message. This is what routes `Err(Domain::Case)`
+/// a module's `#[weaveffi::error]` enum, mapping each variant to its declared
+/// code and default message, and serializing a payload variant's fields into
+/// the error's value-buffer payload. This is what routes `Err(Domain::Case)`
 /// from a throwing producer function to the matching C error constant.
 fn gen_error_report(eb: &ErrorBinding) -> TokenStream {
     let ty = ident(&eb.name);
-    let code_arms = eb.codes.iter().map(|c| {
+    // A payload-carrying variant matches with `{ .. }`; a unit variant by name.
+    let pattern = |c: &weaveffi_core::model::ErrorCodeBinding| {
         let v = ident(&c.name);
+        if c.fields.is_empty() {
+            quote!(Self::#v)
+        } else {
+            quote!(Self::#v { .. })
+        }
+    };
+    let code_arms = eb.codes.iter().map(|c| {
+        let pat = pattern(c);
         let value = c.value;
-        quote!(Self::#v => #value,)
+        quote!(#pat => #value,)
     });
     let msg_arms = eb.codes.iter().map(|c| {
-        let v = ident(&c.name);
+        let pat = pattern(c);
         let msg = &c.message;
-        quote!(Self::#v => #msg.to_string(),)
+        quote!(#pat => #msg.to_string(),)
     });
+    let payload_arms: Vec<TokenStream> = eb
+        .codes
+        .iter()
+        .filter(|c| !c.fields.is_empty())
+        .map(|c| {
+            let v = ident(&c.name);
+            let bindings: Vec<syn::Ident> = c.fields.iter().map(|f| ident(&f.name)).collect();
+            let writes: Vec<TokenStream> = c
+                .fields
+                .iter()
+                .zip(&bindings)
+                .map(|(f, b)| marshal::field_write_stmt_ref(f, b))
+                .collect();
+            // The shared field-write helpers name the writer `__wv_w` and
+            // expect it to be a `&mut BufferWriter`, matching the generated
+            // `write_value` methods, so bind a reborrowable alias.
+            quote! {
+                Self::#v { #(#bindings),* } => {
+                    let mut __wv_buf = ::weaveffi::abi::BufferWriter::new();
+                    let __wv_w = &mut __wv_buf;
+                    #(#writes)*
+                    __wv_buf.finish()
+                }
+            }
+        })
+        .collect();
+    let payload_fn = if payload_arms.is_empty() {
+        TokenStream::new()
+    } else {
+        quote! {
+            fn payload(&self) -> ::std::vec::Vec<u8> {
+                match self {
+                    #(#payload_arms)*
+                    _ => ::std::vec::Vec::new(),
+                }
+            }
+        }
+    };
     quote! {
         impl ::weaveffi::abi::ErrorReport for #ty {
             fn code(&self) -> i32 {
@@ -379,6 +423,7 @@ fn gen_error_report(eb: &ErrorBinding) -> TokenStream {
                     #(#msg_arms)*
                 }
             }
+            #payload_fn
         }
     }
 }

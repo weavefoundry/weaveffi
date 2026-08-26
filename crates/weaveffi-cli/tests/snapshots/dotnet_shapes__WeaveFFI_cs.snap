@@ -28,13 +28,28 @@ namespace WeaveFFI
     {
         public int Code;
         public IntPtr Message;
+        public IntPtr PayloadPtr;
+        public UIntPtr PayloadLen;
+
+        internal static byte[]? CopyPayload(WeaveFFIError err)
+        {
+            if (err.PayloadPtr == IntPtr.Zero || (int)err.PayloadLen == 0)
+            {
+                return null;
+            }
+            var payload = new byte[(int)err.PayloadLen];
+            Marshal.Copy(err.PayloadPtr, payload, 0, (int)err.PayloadLen);
+            return payload;
+        }
 
         internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveFFIException(err.Code, msg);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw new WeaveFFIException(code, msg);
             }
         }
     }
@@ -57,172 +72,409 @@ namespace WeaveFFI
         }
     }
 
-    /// <summary>An algebraic shape (sum type with associated data)</summary>
-    public class Shape : IDisposable
+    /// <summary>Serializes values into the WeaveFFI value-buffer wire
+    /// format (little-endian, packed).</summary>
+    internal sealed class WeaveFFIBufferWriter
     {
-        private IntPtr _handle;
-        private bool _disposed;
+        private byte[] _buf = new byte[64];
+        private int _len;
 
-        internal Shape(IntPtr handle)
+        private void Ensure(int extra)
         {
-            _handle = handle;
+            if (_len + extra <= _buf.Length)
+            {
+                return;
+            }
+            var size = _buf.Length * 2;
+            while (size < _len + extra)
+            {
+                size *= 2;
+            }
+            Array.Resize(ref _buf, size);
         }
 
-        internal IntPtr Handle => _handle;
-
-        public enum Tag
+        internal void WriteBool(bool v)
         {
-            /// <summary>The empty shape (a unit variant)</summary>
-            Empty = 0,
-            /// <summary>A circle with a radius</summary>
-            Circle = 1,
-            /// <summary>An axis-aligned rectangle</summary>
-            Rectangle = 2,
-            /// <summary>An integer-bounded shape (exercises narrow + wide ints)</summary>
-            Bounded = 3,
-            /// <summary>A labeled shape with a small count</summary>
-            Labeled = 4,
+            Ensure(1);
+            _buf[_len++] = v ? (byte)1 : (byte)0;
         }
 
-        public Tag GetTag()
+        internal void WriteI8(sbyte v)
         {
-            return (Tag)NativeMethods.weaveffi_shapes_Shape_tag(_handle);
+            Ensure(1);
+            _buf[_len++] = (byte)v;
+        }
+
+        internal void WriteU8(byte v)
+        {
+            Ensure(1);
+            _buf[_len++] = v;
+        }
+
+        internal void WriteU16(ushort v)
+        {
+            Ensure(2);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+        }
+
+        internal void WriteI16(short v)
+        {
+            WriteU16((ushort)v);
+        }
+
+        internal void WriteU32(uint v)
+        {
+            Ensure(4);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+            _buf[_len++] = (byte)(v >> 16);
+            _buf[_len++] = (byte)(v >> 24);
+        }
+
+        internal void WriteI32(int v)
+        {
+            WriteU32((uint)v);
+        }
+
+        internal void WriteU64(ulong v)
+        {
+            WriteU32((uint)v);
+            WriteU32((uint)(v >> 32));
+        }
+
+        internal void WriteI64(long v)
+        {
+            WriteU64((ulong)v);
+        }
+
+        internal void WriteF32(float v)
+        {
+            WriteU32((uint)BitConverter.SingleToInt32Bits(v));
+        }
+
+        internal void WriteF64(double v)
+        {
+            WriteU64((ulong)BitConverter.DoubleToInt64Bits(v));
+        }
+
+        internal void WriteLen(int len)
+        {
+            WriteU32((uint)len);
+        }
+
+        internal void WriteOptionFlag(bool present)
+        {
+            WriteBool(present);
+        }
+
+        internal void WriteString(string v)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(v);
+            WriteLen(bytes.Length);
+            Ensure(bytes.Length);
+            Array.Copy(bytes, 0, _buf, _len, bytes.Length);
+            _len += bytes.Length;
+        }
+
+        internal void WriteBytes(byte[] v)
+        {
+            WriteLen(v.Length);
+            Ensure(v.Length);
+            Array.Copy(v, 0, _buf, _len, v.Length);
+            _len += v.Length;
+        }
+
+        internal byte[] ToArray()
+        {
+            var outBuf = new byte[_len];
+            Array.Copy(_buf, outBuf, _len);
+            return outBuf;
+        }
+    }
+
+    /// <summary>Decodes values from the WeaveFFI value-buffer wire format.
+    /// A malformed buffer indicates a producer/consumer contract violation and
+    /// throws <see cref="InvalidOperationException"/>.</summary>
+    internal sealed class WeaveFFIBufferReader
+    {
+        private static readonly System.Text.Encoding Utf8Strict =
+            new System.Text.UTF8Encoding(false, true);
+
+        private readonly byte[] _data;
+        private int _pos;
+
+        internal WeaveFFIBufferReader(byte[] data)
+        {
+            _data = data;
+        }
+
+        private void Require(int n)
+        {
+            if (_data.Length - _pos < n)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: buffer exhausted");
+            }
+        }
+
+        internal bool ReadBool()
+        {
+            Require(1);
+            var b = _data[_pos++];
+            if (b > 1)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: invalid bool byte");
+            }
+            return b == 1;
+        }
+
+        internal sbyte ReadI8()
+        {
+            Require(1);
+            return (sbyte)_data[_pos++];
+        }
+
+        internal byte ReadU8()
+        {
+            Require(1);
+            return _data[_pos++];
+        }
+
+        internal ushort ReadU16()
+        {
+            Require(2);
+            var v = (ushort)(_data[_pos] | (_data[_pos + 1] << 8));
+            _pos += 2;
+            return v;
+        }
+
+        internal short ReadI16()
+        {
+            return (short)ReadU16();
+        }
+
+        internal uint ReadU32()
+        {
+            Require(4);
+            var v = (uint)_data[_pos]
+                | ((uint)_data[_pos + 1] << 8)
+                | ((uint)_data[_pos + 2] << 16)
+                | ((uint)_data[_pos + 3] << 24);
+            _pos += 4;
+            return v;
+        }
+
+        internal int ReadI32()
+        {
+            return (int)ReadU32();
+        }
+
+        internal ulong ReadU64()
+        {
+            var lo = (ulong)ReadU32();
+            var hi = (ulong)ReadU32();
+            return lo | (hi << 32);
+        }
+
+        internal long ReadI64()
+        {
+            return (long)ReadU64();
+        }
+
+        internal float ReadF32()
+        {
+            return BitConverter.Int32BitsToSingle(ReadI32());
+        }
+
+        internal double ReadF64()
+        {
+            return BitConverter.Int64BitsToDouble(ReadI64());
+        }
+
+        internal int ReadLen()
+        {
+            var len = ReadU32();
+            if (len > (uint)(_data.Length - _pos))
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: length prefix exceeds remaining bytes");
+            }
+            return (int)len;
+        }
+
+        internal bool ReadOptionFlag()
+        {
+            return ReadBool();
+        }
+
+        internal string ReadString()
+        {
+            var len = ReadLen();
+            string s;
+            try
+            {
+                s = Utf8Strict.GetString(_data, _pos, len);
+            }
+            catch (ArgumentException)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: string is not valid UTF-8");
+            }
+            _pos += len;
+            return s;
+        }
+
+        internal byte[] ReadBytes()
+        {
+            var len = ReadLen();
+            var outBuf = new byte[len];
+            Array.Copy(_data, _pos, outBuf, 0, len);
+            _pos += len;
+            return outBuf;
+        }
+
+        internal void ExpectEnd()
+        {
+            if (_pos != _data.Length)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
+            }
+        }
+    }
+
+    /// <summary>An algebraic shape (sum type with associated data)</summary>
+    public abstract class Shape
+    {
+        private Shape()
+        {
         }
 
         /// <summary>The empty shape (a unit variant)</summary>
-        public static Shape Empty()
+        public sealed class Empty : Shape
         {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_Shape_Empty_new(ref err);
-            WeaveFFIError.Check(err);
-            return new Shape(result);
         }
 
         /// <summary>A circle with a radius</summary>
-        public static Shape Circle(double radius)
+        public sealed class Circle : Shape
         {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_Shape_Circle_new(radius, ref err);
-            WeaveFFIError.Check(err);
-            return new Shape(result);
+            /// <summary>Radius in points</summary>
+            public double Radius { get; }
+
+            public Circle(double radius)
+            {
+                Radius = radius;
+            }
         }
 
         /// <summary>An axis-aligned rectangle</summary>
-        public static Shape Rectangle(float width, float height)
+        public sealed class Rectangle : Shape
         {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_Shape_Rectangle_new(width, height, ref err);
-            WeaveFFIError.Check(err);
-            return new Shape(result);
+            public float Width { get; }
+
+            public float Height { get; }
+
+            public Rectangle(float width, float height)
+            {
+                Width = width;
+                Height = height;
+            }
         }
 
         /// <summary>An integer-bounded shape (exercises narrow + wide ints)</summary>
-        public static Shape Bounded(short min, short max, ulong weight)
+        public sealed class Bounded : Shape
         {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_Shape_Bounded_new(min, max, weight, ref err);
-            WeaveFFIError.Check(err);
-            return new Shape(result);
+            public short Min { get; }
+
+            public short Max { get; }
+
+            public ulong Weight { get; }
+
+            public Bounded(short min, short max, ulong weight)
+            {
+                Min = min;
+                Max = max;
+                Weight = weight;
+            }
         }
 
         /// <summary>A labeled shape with a small count</summary>
-        public static Shape Labeled(string label, byte count)
+        public sealed class Labeled : Shape
         {
-            var err = new WeaveFFIError();
-            var labelPtr = Marshal.StringToCoTaskMemUTF8(label);
-            try
+            public string Label { get; }
+
+            public byte Count { get; }
+
+            public Labeled(string label, byte count)
             {
-                var result = NativeMethods.weaveffi_shapes_Shape_Labeled_new(labelPtr, count, ref err);
-                WeaveFFIError.Check(err);
-                return new Shape(result);
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(labelPtr);
+                Label = label;
+                Count = count;
             }
         }
 
-        /// <summary>Radius in points</summary>
-        public double CircleRadius
+        internal void WriteTo(WeaveFFIBufferWriter writer)
         {
-            get
+            switch (this)
             {
-                return NativeMethods.weaveffi_shapes_Shape_Circle_get_radius(_handle);
+                case Empty _:
+                    writer.WriteI32(0);
+                    break;
+                case Circle v:
+                    writer.WriteI32(1);
+                    writer.WriteF64(v.Radius);
+                    break;
+                case Rectangle v:
+                    writer.WriteI32(2);
+                    writer.WriteF32(v.Width);
+                    writer.WriteF32(v.Height);
+                    break;
+                case Bounded v:
+                    writer.WriteI32(3);
+                    writer.WriteI16(v.Min);
+                    writer.WriteI16(v.Max);
+                    writer.WriteU64(v.Weight);
+                    break;
+                case Labeled v:
+                    writer.WriteI32(4);
+                    writer.WriteString(v.Label);
+                    writer.WriteU8(v.Count);
+                    break;
+                default:
+                    throw new InvalidOperationException("unknown Shape variant");
             }
         }
 
-        public float RectangleWidth
+        internal static Shape ReadFrom(WeaveFFIBufferReader reader)
         {
-            get
+            var tag = reader.ReadI32();
+            switch (tag)
             {
-                return NativeMethods.weaveffi_shapes_Shape_Rectangle_get_width(_handle);
+                case 0:
+                    return new Empty();
+                case 1:
+                {
+                    var fRadius = reader.ReadF64();
+                    return new Circle(fRadius);
+                }
+                case 2:
+                {
+                    var fWidth = reader.ReadF32();
+                    var fHeight = reader.ReadF32();
+                    return new Rectangle(fWidth, fHeight);
+                }
+                case 3:
+                {
+                    var fMin = reader.ReadI16();
+                    var fMax = reader.ReadI16();
+                    var fWeight = reader.ReadU64();
+                    return new Bounded(fMin, fMax, fWeight);
+                }
+                case 4:
+                {
+                    var fLabel = reader.ReadString();
+                    var fCount = reader.ReadU8();
+                    return new Labeled(fLabel, fCount);
+                }
+                default:
+                    throw new InvalidOperationException("malformed WeaveFFI value buffer: unknown Shape tag " + tag);
             }
-        }
-
-        public float RectangleHeight
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Shape_Rectangle_get_height(_handle);
-            }
-        }
-
-        public short BoundedMin
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Shape_Bounded_get_min(_handle);
-            }
-        }
-
-        public short BoundedMax
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Shape_Bounded_get_max(_handle);
-            }
-        }
-
-        public ulong BoundedWeight
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Shape_Bounded_get_weight(_handle);
-            }
-        }
-
-        public string LabeledLabel
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_shapes_Shape_Labeled_get_label(_handle);
-                var str = WeaveFFIHelpers.PtrToString(ptr);
-                NativeMethods.weaveffi_free_string(ptr);
-                return str ?? "";
-            }
-        }
-
-        public byte LabeledCount
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Shape_Labeled_get_count(_handle);
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_shapes_Shape_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        ~Shape()
-        {
-            Dispose();
         }
     }
 
@@ -235,111 +487,69 @@ namespace WeaveFFI
     }
 
     /// <summary>One field per supported numeric primitive</summary>
-    public class Numerics : IDisposable
+    public sealed class Numerics
     {
-        private IntPtr _handle;
-        private bool _disposed;
+        public sbyte A { get; }
 
-        internal Numerics(IntPtr handle)
+        public short B { get; }
+
+        public int C { get; }
+
+        public long D { get; }
+
+        public byte E { get; }
+
+        public ushort F { get; }
+
+        public uint G { get; }
+
+        public ulong H { get; }
+
+        public float I { get; }
+
+        public double J { get; }
+
+        public Numerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j)
         {
-            _handle = handle;
+            A = a;
+            B = b;
+            C = c;
+            D = d;
+            E = e;
+            F = f;
+            G = g;
+            H = h;
+            I = i;
+            J = j;
         }
 
-        internal IntPtr Handle => _handle;
-
-        public sbyte A
+        internal void WriteTo(WeaveFFIBufferWriter writer)
         {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_a(_handle);
-            }
+            writer.WriteI8(A);
+            writer.WriteI16(B);
+            writer.WriteI32(C);
+            writer.WriteI64(D);
+            writer.WriteU8(E);
+            writer.WriteU16(F);
+            writer.WriteU32(G);
+            writer.WriteU64(H);
+            writer.WriteF32(I);
+            writer.WriteF64(J);
         }
 
-        public short B
+        internal static Numerics ReadFrom(WeaveFFIBufferReader reader)
         {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_b(_handle);
-            }
-        }
-
-        public int C
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_c(_handle);
-            }
-        }
-
-        public long D
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_d(_handle);
-            }
-        }
-
-        public byte E
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_e(_handle);
-            }
-        }
-
-        public ushort F
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_f(_handle);
-            }
-        }
-
-        public uint G
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_g(_handle);
-            }
-        }
-
-        public ulong H
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_h(_handle);
-            }
-        }
-
-        public float I
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_i(_handle);
-            }
-        }
-
-        public double J
-        {
-            get
-            {
-                return NativeMethods.weaveffi_shapes_Numerics_get_j(_handle);
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_shapes_Numerics_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        ~Numerics()
-        {
-            Dispose();
+            var fA = reader.ReadI8();
+            var fB = reader.ReadI16();
+            var fC = reader.ReadI32();
+            var fD = reader.ReadI64();
+            var fE = reader.ReadU8();
+            var fF = reader.ReadU16();
+            var fG = reader.ReadU32();
+            var fH = reader.ReadU64();
+            var fI = reader.ReadF32();
+            var fJ = reader.ReadF64();
+            return new Numerics(fA, fB, fC, fD, fE, fF, fG, fH, fI, fJ);
         }
     }
 
@@ -353,98 +563,20 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_tag", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_shapes_Shape_tag(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_shapes_Shape_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Empty_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Shape_Empty_new(ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Circle_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Shape_Circle_new(double radius, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Circle_get_radius", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_shapes_Shape_Circle_get_radius(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Rectangle_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Shape_Rectangle_new(float width, float height, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Rectangle_get_width", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern float weaveffi_shapes_Shape_Rectangle_get_width(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Rectangle_get_height", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern float weaveffi_shapes_Shape_Rectangle_get_height(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Bounded_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Shape_Bounded_new(short min, short max, ulong weight, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Bounded_get_min", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern short weaveffi_shapes_Shape_Bounded_get_min(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Bounded_get_max", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern short weaveffi_shapes_Shape_Bounded_get_max(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Bounded_get_weight", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_shapes_Shape_Bounded_get_weight(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Labeled_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Shape_Labeled_new(IntPtr label, byte count, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Labeled_get_label", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Shape_Labeled_get_label(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Labeled_get_count", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern byte weaveffi_shapes_Shape_Labeled_get_count(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_Numerics_create(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_shapes_Numerics_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_a", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern sbyte weaveffi_shapes_Numerics_get_a(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_b", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern short weaveffi_shapes_Numerics_get_b(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_c", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_shapes_Numerics_get_c(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_d", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_shapes_Numerics_get_d(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_e", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern byte weaveffi_shapes_Numerics_get_e(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_f", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ushort weaveffi_shapes_Numerics_get_f(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_g", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern uint weaveffi_shapes_Numerics_get_g(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_h", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_shapes_Numerics_get_h(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_i", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern float weaveffi_shapes_Numerics_get_i(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_shapes_Numerics_get_j", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_shapes_Numerics_get_j(IntPtr ptr);
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_describe", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_describe(IntPtr shape, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shapes_describe(IntPtr shape_ptr, UIntPtr shape_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_scale", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_scale(IntPtr shape, double factor, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shapes_scale(IntPtr shape_ptr, UIntPtr shape_len, double factor, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_sum_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_shapes_sum_bytes(IntPtr values, UIntPtr values_len, ref WeaveFFIError err);
+        internal static extern ulong weaveffi_shapes_sum_bytes(IntPtr values_ptr, UIntPtr values_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_make_numerics", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_make_numerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shapes_make_numerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j, out UIntPtr out_len, ref WeaveFFIError err);
 
     }
 
@@ -454,32 +586,58 @@ namespace WeaveFFI
         public static string Describe(Shape shape)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_describe(shape.Handle, ref err);
-            WeaveFFIError.Check(err);
-            var str = Marshal.PtrToStringUTF8(result);
-            NativeMethods.weaveffi_free_string(result);
-            return str;
+            var shapeWriter = new WeaveFFIBufferWriter();
+            shape.WriteTo(shapeWriter);
+            var shapeBuf = shapeWriter.ToArray();
+            var shapePin = GCHandle.Alloc(shapeBuf, GCHandleType.Pinned);
+            try
+            {
+                var result = NativeMethods.weaveffi_shapes_describe(shapePin.AddrOfPinnedObject(), (UIntPtr)shapeBuf.Length, ref err);
+                WeaveFFIError.Check(err);
+                var str = Marshal.PtrToStringUTF8(result);
+                NativeMethods.weaveffi_free_string(result);
+                return str ?? "";
+            }
+            finally
+            {
+                shapePin.Free();
+            }
         }
 
         /// <summary>Scale a shape by a factor, returning a new shape</summary>
         public static Shape Scale(Shape shape, double factor)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_scale(shape.Handle, factor, ref err);
-            WeaveFFIError.Check(err);
-            return new Shape(result);
+            var shapeWriter = new WeaveFFIBufferWriter();
+            shape.WriteTo(shapeWriter);
+            var shapeBuf = shapeWriter.ToArray();
+            var shapePin = GCHandle.Alloc(shapeBuf, GCHandleType.Pinned);
+            try
+            {
+                var result = NativeMethods.weaveffi_shapes_scale(shapePin.AddrOfPinnedObject(), (UIntPtr)shapeBuf.Length, factor, out var outLen, ref err);
+                WeaveFFIError.Check(err);
+                var resultBuf = new byte[(int)outLen];
+                if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+                NativeMethods.weaveffi_free_bytes(result, outLen);
+                var valueReader = new WeaveFFIBufferReader(resultBuf);
+                var value = Shape.ReadFrom(valueReader);
+                valueReader.ExpectEnd();
+                return value;
+            }
+            finally
+            {
+                shapePin.Free();
+            }
         }
 
         /// <summary>Sum a list of bytes into a wide integer (numerics smoke)</summary>
         public static ulong SumBytes(byte[] values)
         {
             var err = new WeaveFFIError();
-            var valuesArr = new byte[values.Length];
-            for (var valuesIt = 0; valuesIt < values.Length; valuesIt++) valuesArr[valuesIt] = values[valuesIt];
-            var valuesPin = GCHandle.Alloc(valuesArr, GCHandleType.Pinned);
+            var valuesPin = GCHandle.Alloc(values, GCHandleType.Pinned);
             try
             {
-                var result = NativeMethods.weaveffi_shapes_sum_bytes(values.Length == 0 ? IntPtr.Zero : valuesPin.AddrOfPinnedObject(), (UIntPtr)values.Length, ref err);
+                var result = NativeMethods.weaveffi_shapes_sum_bytes(valuesPin.AddrOfPinnedObject(), (UIntPtr)values.Length, ref err);
                 WeaveFFIError.Check(err);
                 return result;
             }
@@ -493,9 +651,15 @@ namespace WeaveFFI
         public static Numerics MakeNumerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, ref err);
+            var result = NativeMethods.weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, out var outLen, ref err);
             WeaveFFIError.Check(err);
-            return new Numerics(result);
+            var resultBuf = new byte[(int)outLen];
+            if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+            NativeMethods.weaveffi_free_bytes(result, outLen);
+            var valueReader = new WeaveFFIBufferReader(resultBuf);
+            var value = Numerics.ReadFrom(valueReader);
+            valueReader.ExpectEnd();
+            return value;
         }
 
     }

@@ -50,7 +50,16 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+/* Error slot written by every fallible call. `payload_ptr`/`payload_len`
+   hold the matched error code's fields serialized in the WeaveFFI value
+   buffer format (null when the code declares no fields); both the message
+   and the payload are released by weaveffi_error_clear. */
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
+} weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);

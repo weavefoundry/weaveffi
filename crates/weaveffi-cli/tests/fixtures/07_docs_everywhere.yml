@@ -1,4 +1,4 @@
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: docs
     enums:
@@ -17,7 +17,6 @@ modules:
           Represents a single document tracked by the system.
 
           Documents are persisted to disk and exposed via the public API.
-        builder: true
         fields:
           - { name: id, type: i64, doc: Stable opaque identifier }
           - { name: title, type: string, doc: Human-readable title shown in lists }

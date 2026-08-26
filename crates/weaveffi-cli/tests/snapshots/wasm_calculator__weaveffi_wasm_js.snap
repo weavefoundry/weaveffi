@@ -9,12 +9,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Handles   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
-//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
+//   Buffered  -> records, rich enums, optionals, lists, and maps cross
+//                as one value buffer: i32 pointer + i32 length
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
  * thrown directly for unknown codes, marshalling failures, and producer
@@ -45,10 +46,10 @@ const _CALC_ERROR_CODES = Object.freeze({
 
 // Build the CalcError subclass matching `code`, or a generic
 // WeaveFFIError for codes outside the domain (panics, marshalling).
-function _calcErrorFrom(code, message) {
+function _calcErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
   const _cls = _CALC_ERROR_CODES[code];
-  if (!_cls) return new WeaveFFIError(code, message);
-  return message ? new _cls(message) : new _cls();
+  const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
+  return _e;
 }
 
 const _enc = new TextEncoder();
@@ -82,10 +83,11 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Allocate a zeroed {i32 code, i32 message} error slot.
+// Allocate a zeroed 16-byte error slot:
+// { i32 code, char* message, uint8_t* payload_ptr, size_t payload_len }.
 function _allocErr(wasm) {
-  const ptr = wasm.weaveffi_alloc(8);
-  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  const ptr = wasm.weaveffi_alloc(16);
+  new Uint8Array(wasm.memory.buffer, ptr, 16).fill(0);
   return ptr;
 }
 
@@ -100,14 +102,14 @@ function _checkErr(wasm, errPtr) {
     const msgPtr = dv.getUint32(errPtr + 4, true);
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
+    wasm.weaveffi_dealloc(errPtr, 16);
     throw new WeaveFFIError(code, msg);
   }
 }
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
-  wasm.weaveffi_dealloc(errPtr, 8);
+  wasm.weaveffi_dealloc(errPtr, 16);
 }
 
 // Throw the `CalcError` domain error (and free the slot) if the error slot
@@ -116,11 +118,11 @@ function _checkCalcError(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = dv.getUint32(errPtr + 4, true);
-    const msg = _readCStr(wasm, msgPtr) || '';
+    const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+    const _e = _calcErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
-    throw _calcErrorFrom(code, msg);
+    wasm.weaveffi_dealloc(errPtr, 16);
+    throw _e;
   }
 }
 
@@ -139,9 +141,8 @@ function _checkCalcError(wasm, errPtr) {
  * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct: returns a wrapper instance exposing field getters.
- * const person = api.contacts.create();
- * console.log(person.name);
+ * // Record: plain objects in and out (serialized automatically).
+ * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant

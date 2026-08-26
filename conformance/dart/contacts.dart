@@ -3,10 +3,11 @@
 // Binds through the generated `package:weaveffi` wrapper and drives the
 // ContactBook interface surface: the unnamed factory constructor, instance
 // methods passing the object pointer (add/get/list/remove/count), enum
-// marshalling, opaque-handle structs with getters, optional strings (null
-// email), list-of-struct returns, boolean returns, and the typed
-// ContactsException hierarchy (InvalidNameException = 1, NotFoundException
-// = 2) raised by throwing methods.
+// marshalling, the Contact record decoded from a value buffer into a plain
+// Dart value class, optional strings (null email), list-of-record returns,
+// boolean returns, and the typed ContactsException hierarchy
+// (InvalidNameException = 1, NotFoundException = 2) raised by throwing
+// methods.
 
 import 'package:__PKG__/__LIB__.dart' as wv;
 

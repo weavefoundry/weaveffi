@@ -125,17 +125,17 @@ mod tests {
     use std::time::Duration;
     use weaveffi::abi::{self, weaveffi_error};
 
-    type TaskCbMsg = (i32, *mut TaskResult);
-    /// Batch completions carry the adopted element pointers as addresses: the
-    /// pointer-array buffer itself is borrowed for the callback's duration
-    /// (the launcher frees it after the callback returns), so the callback
-    /// copies the element pointers out before returning.
-    type BatchCbMsg = (bool, Vec<usize>);
+    type TaskCbMsg = (i32, Option<TaskResult>);
+    type BatchCbMsg = (bool, Vec<TaskResult>);
 
+    /// A buffered async result arrives as a borrowed `(ptr, len)` value
+    /// buffer the launcher frees after the callback returns, so the callback
+    /// decodes it before sending.
     extern "C" fn task_callback(
         context: *mut c_void,
         err: *mut weaveffi_error,
-        result: *mut TaskResult,
+        result_ptr: *const u8,
+        result_len: usize,
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<TaskCbMsg>) };
         let code = if err.is_null() {
@@ -143,38 +143,38 @@ mod tests {
         } else {
             unsafe { (*err).code }
         };
+        let result = if result_ptr.is_null() {
+            None
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(result_ptr, result_len) };
+            Some(abi::decode_value::<TaskResult>(bytes).expect("well-formed TaskResult buffer"))
+        };
         let _ = tx.send((code, result));
     }
 
     extern "C" fn batch_callback(
         context: *mut c_void,
         err: *mut weaveffi_error,
-        results: *mut *mut TaskResult,
+        results_ptr: *const u8,
         results_len: usize,
     ) {
         let tx = unsafe { &*(context as *const mpsc::Sender<BatchCbMsg>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
-        // Copy the borrowed pointer array before returning; the element
-        // objects themselves are adopted (owned by this callback's consumer).
-        let elems: Vec<usize> = (0..results_len)
-            .map(|i| unsafe { *results.add(i) } as usize)
-            .collect();
-        let _ = tx.send((had_error, elems));
+        // Decode the borrowed value buffer before returning; the launcher
+        // frees it once the callback completes.
+        let results = if results_ptr.is_null() {
+            Vec::new()
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(results_ptr, results_len) };
+            abi::decode_value::<Vec<TaskResult>>(bytes).expect("well-formed batch buffer")
+        };
+        let _ = tx.send((had_error, results));
     }
 
     extern "C" fn n_tasks_callback(context: *mut c_void, err: *mut weaveffi_error, result: i32) {
         let tx = unsafe { &*(context as *const mpsc::Sender<(bool, i32)>) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
         let _ = tx.send((had_error, result));
-    }
-
-    /// Destroy the adopted `[TaskResult]` elements. The launcher already
-    /// freed the borrowed pointer-array buffer after the callback returned;
-    /// only the element objects were adopted by the consumer.
-    fn free_results(results: &[usize]) {
-        for &addr in results {
-            weaveffi_tasks_TaskResult_destroy(addr as *mut TaskResult);
-        }
     }
 
     /// Intentionally leak a callback-context box.
@@ -202,14 +202,11 @@ mod tests {
         let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
         assert_eq!(code, 0);
-        assert!(!result.is_null());
 
-        let r = unsafe { &*result };
+        let r = result.expect("success path passes a result buffer");
         assert!(r.id > 0);
         assert!(r.success);
         assert!(r.value.contains("test-task"));
-
-        weaveffi_tasks_TaskResult_destroy(result);
     }
 
     #[test]
@@ -225,24 +222,25 @@ mod tests {
         let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
         assert_eq!(code, 1, "TaskError::InvalidName's declared code");
-        assert!(result.is_null(), "error path passes a null result");
+        assert!(result.is_none(), "error path passes a null result buffer");
     }
 
     #[test]
     fn run_batch_processes_sequentially() {
         let (tx, rx) = mpsc::channel::<BatchCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
-        let names: Vec<CString> = vec![
-            CString::new("task-a").unwrap(),
-            CString::new("task-b").unwrap(),
-            CString::new("task-c").unwrap(),
-        ];
-        let name_ptrs: Vec<*const std::os::raw::c_char> =
-            names.iter().map(|n| n.as_ptr()).collect();
+        // The list-of-strings parameter is buffered: encode `Vec<String>`
+        // and pass the (ptr, len) pair. The launcher copies the bytes before
+        // returning, so the local buffer only needs to outlive the call.
+        let names = abi::encode_value(&vec![
+            "task-a".to_string(),
+            "task-b".to_string(),
+            "task-c".to_string(),
+        ]);
 
         weaveffi_tasks_run_batch_async(
-            name_ptrs.as_ptr(),
-            name_ptrs.len(),
+            names.as_ptr(),
+            names.len(),
             batch_callback,
             tx_ptr as *mut c_void,
         );
@@ -252,18 +250,13 @@ mod tests {
         assert!(!had_error);
         assert_eq!(results.len(), 3);
 
-        for &addr in &results {
-            let r = unsafe { &*(addr as *const TaskResult) };
+        for r in &results {
             assert!(r.id > 0);
             assert!(r.success);
         }
 
-        let r0 = unsafe { &*(results[0] as *const TaskResult) };
-        assert!(r0.value.contains("task-a"));
-        let r2 = unsafe { &*(results[2] as *const TaskResult) };
-        assert!(r2.value.contains("task-c"));
-
-        free_results(&results);
+        assert!(results[0].value.contains("task-a"));
+        assert!(results[2].value.contains("task-c"));
     }
 
     #[test]
@@ -271,7 +264,13 @@ mod tests {
         let (tx, rx) = mpsc::channel::<BatchCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
 
-        weaveffi_tasks_run_batch_async(std::ptr::null(), 0, batch_callback, tx_ptr as *mut c_void);
+        let names = abi::encode_value(&Vec::<String>::new());
+        weaveffi_tasks_run_batch_async(
+            names.as_ptr(),
+            names.len(),
+            batch_callback,
+            tx_ptr as *mut c_void,
+        );
 
         let (had_error, results) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
@@ -288,35 +287,31 @@ mod tests {
     }
 
     #[test]
-    fn task_result_getters() {
-        let mut err = weaveffi_error::default();
-        let value = CString::new("hello").unwrap();
-        let result = weaveffi_tasks_TaskResult_create(42, value.as_ptr(), true, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!result.is_null());
-
-        assert_eq!(weaveffi_tasks_TaskResult_get_id(result), 42);
-        assert!(weaveffi_tasks_TaskResult_get_success(result));
-
-        let got = weaveffi_tasks_TaskResult_get_value(result);
-        assert_eq!(abi::c_ptr_to_string(got).unwrap(), "hello");
-        abi::free_string(got);
-
-        weaveffi_tasks_TaskResult_destroy(result);
+    fn task_result_buffer_round_trip() {
+        // `TaskResult` crosses the ABI as a value buffer; the macro
+        // implements `BufferValue`, so every field round-trips.
+        let result = TaskResult {
+            id: 42,
+            value: "hello".to_string(),
+            success: true,
+        };
+        let bytes = abi::encode_value(&result);
+        let back = abi::decode_value::<TaskResult>(&bytes).unwrap();
+        assert_eq!(back.id, 42);
+        assert_eq!(back.value, "hello");
+        assert!(back.success);
     }
 
     #[test]
-    fn task_result_success_false() {
-        let mut err = weaveffi_error::default();
-        let value = CString::new("fail").unwrap();
-        let result = weaveffi_tasks_TaskResult_create(1, value.as_ptr(), false, &mut err);
-        assert!(!weaveffi_tasks_TaskResult_get_success(result));
-        weaveffi_tasks_TaskResult_destroy(result);
-    }
-
-    #[test]
-    fn destroy_null_task_result_is_safe() {
-        weaveffi_tasks_TaskResult_destroy(std::ptr::null_mut());
+    fn task_result_round_trips_success_false() {
+        let result = TaskResult {
+            id: 1,
+            value: "fail".to_string(),
+            success: false,
+        };
+        let bytes = abi::encode_value(&result);
+        let back = abi::decode_value::<TaskResult>(&bytes).unwrap();
+        assert!(!back.success);
     }
 
     #[test]

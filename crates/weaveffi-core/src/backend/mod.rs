@@ -500,7 +500,7 @@ mod tests {
 
     fn api() -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "math".into(),
                 functions: vec![

@@ -11,12 +11,13 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        @JvmStatic external fun createOrder(items: LongArray): Long
-        @JvmStatic private external fun getOrderJni(id: Long): Long
-        @JvmStatic fun getOrder(id: Long): Order = Order(getOrderJni(id))
+        @JvmStatic private external fun createOrderJni(items: ByteArray): Long
+        @JvmStatic fun createOrder(items: List<OrderItem>): Long = createOrderJni(weaveEncode { w -> w.writeList(items) { v0 -> packOrderItem(w, v0) } })
+        @JvmStatic private external fun getOrderJni(id: Long): ByteArray
+        @JvmStatic fun getOrder(id: Long): Order = weaveDecode(getOrderJni(id)) { r -> unpackOrder(r) }
         @JvmStatic external fun cancelOrder(id: Long): Boolean
-        @JvmStatic private external fun addProductToOrderJni(orderId: Long, product: Long): Boolean
-        @JvmStatic fun addProductToOrder(orderId: Long, product: Product): Boolean = addProductToOrderJni(orderId, product.handle)
+        @JvmStatic private external fun addProductToOrderJni(orderId: Long, product: ByteArray): Boolean
+        @JvmStatic fun addProductToOrder(orderId: Long, product: Product): Boolean = addProductToOrderJni(orderId, weaveEncode { w -> packProduct(w, product) })
     }
 }
 
@@ -31,40 +32,25 @@ enum class Category(val value: Int) {
     }
 }
 
-class Product internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
+data class Product(val id: Long, val name: String, val description: String?, val price: Double, val category: Category, val tags: List<String>)
 
-        @JvmStatic external fun nativeCreate(id: Long, name: String, description: String?, price: Double, category: Int, tags: Array<String>): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetId(handle: Long): Long
-        @JvmStatic external fun nativeGetName(handle: Long): String
-        @JvmStatic external fun nativeGetDescription(handle: Long): String?
-        @JvmStatic external fun nativeGetPrice(handle: Long): Double
-        @JvmStatic external fun nativeGetCategory(handle: Long): Int
-        @JvmStatic external fun nativeGetTags(handle: Long): Array<String>
-
-        fun create(id: Long, name: String, description: String?, price: Double, category: Int, tags: Array<String>): Product = Product(nativeCreate(id, name, description, price, category, tags))
-    }
-
-    val id: Long get() = nativeGetId(handle)
-    val name: String get() = nativeGetName(handle)
-    val description: String? get() = nativeGetDescription(handle)
-    val price: Double get() = nativeGetPrice(handle)
-    val category: Category get() = Category.fromValue(nativeGetCategory(handle))
-    val tags: Array<String> get() = nativeGetTags(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
+internal fun packProduct(w: WeaveBufferWriter, v: Product) {
+    w.writeI64(v.id)
+    w.writeString(v.name)
+    w.writeOptional(v.description) { v0 -> w.writeString(v0) }
+    w.writeF64(v.price)
+    w.writeI32(v.category.value)
+    w.writeList(v.tags) { v0 -> w.writeString(v0) }
 }
+
+internal fun unpackProduct(r: WeaveBufferReader): Product = Product(
+    r.readI64(),
+    r.readString(),
+    r.readOptional { r.readString() },
+    r.readF64(),
+    Category.fromValue(r.readI32()),
+    r.readList { r.readString() },
+)
 
 /** A product catalog owning its products */
 class Catalog internal constructor(internal var handle: Long) : java.io.Closeable {
@@ -72,9 +58,9 @@ class Catalog internal constructor(internal var handle: Long) : java.io.Closeabl
         init { System.loadLibrary("weaveffi") }
 
         @JvmStatic private external fun nativeNew(): Long
-        @JvmStatic private external fun nativeAddProduct(selfHandle: Long, name: String, price: Double, category: Int): Long
-        @JvmStatic private external fun nativeGetProduct(selfHandle: Long, id: Long): Long
-        @JvmStatic private external fun nativeSearch(selfHandle: Long, category: Int): LongArray
+        @JvmStatic private external fun nativeAddProduct(selfHandle: Long, name: String, price: Double, category: Int): ByteArray
+        @JvmStatic private external fun nativeGetProduct(selfHandle: Long, id: Long): ByteArray
+        @JvmStatic private external fun nativeSearch(selfHandle: Long, category: Int): ByteArray
         @JvmStatic private external fun nativeUpdatePrice(selfHandle: Long, id: Long, price: Double): Boolean
         @JvmStatic private external fun nativeRemove(selfHandle: Long, id: Long): Boolean
         @JvmStatic private external fun nativeDestroy(handle: Long)
@@ -82,11 +68,11 @@ class Catalog internal constructor(internal var handle: Long) : java.io.Closeabl
         operator fun invoke(): Catalog = Catalog(nativeNew())
     }
 
-    fun addProduct(name: String, price: Double, category: Category): Product = Product(nativeAddProduct(handle, name, price, category.value))
+    fun addProduct(name: String, price: Double, category: Category): Product = weaveDecode(nativeAddProduct(handle, name, price, category.value)) { r -> unpackProduct(r) }
 
-    fun getProduct(id: Long): Product = Product(nativeGetProduct(handle, id))
+    fun getProduct(id: Long): Product = weaveDecode(nativeGetProduct(handle, id)) { r -> unpackProduct(r) }
 
-    fun search(category: Category): LongArray = nativeSearch(handle, category.value)
+    fun search(category: Category): List<Product> = weaveDecode(nativeSearch(handle, category.value)) { r -> r.readList { unpackProduct(r) } }
 
     fun updatePrice(id: Long, price: Double): Boolean = nativeUpdatePrice(handle, id, price)
 
@@ -104,65 +90,35 @@ class Catalog internal constructor(internal var handle: Long) : java.io.Closeabl
     }
 }
 
-class OrderItem internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
+data class OrderItem(val product_id: Long, val quantity: Int, val unit_price: Double)
 
-        @JvmStatic external fun nativeCreate(product_id: Long, quantity: Int, unit_price: Double): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetProductId(handle: Long): Long
-        @JvmStatic external fun nativeGetQuantity(handle: Long): Int
-        @JvmStatic external fun nativeGetUnitPrice(handle: Long): Double
-
-        fun create(product_id: Long, quantity: Int, unit_price: Double): OrderItem = OrderItem(nativeCreate(product_id, quantity, unit_price))
-    }
-
-    val product_id: Long get() = nativeGetProductId(handle)
-    val quantity: Int get() = nativeGetQuantity(handle)
-    val unit_price: Double get() = nativeGetUnitPrice(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
+internal fun packOrderItem(w: WeaveBufferWriter, v: OrderItem) {
+    w.writeI64(v.product_id)
+    w.writeI32(v.quantity)
+    w.writeF64(v.unit_price)
 }
 
-class Order internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
+internal fun unpackOrderItem(r: WeaveBufferReader): OrderItem = OrderItem(
+    r.readI64(),
+    r.readI32(),
+    r.readF64(),
+)
 
-        @JvmStatic external fun nativeCreate(id: Long, items: LongArray, total: Double, status: String): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetId(handle: Long): Long
-        @JvmStatic external fun nativeGetItems(handle: Long): LongArray
-        @JvmStatic external fun nativeGetTotal(handle: Long): Double
-        @JvmStatic external fun nativeGetStatus(handle: Long): String
+data class Order(val id: Long, val items: List<OrderItem>, val total: Double, val status: String)
 
-        fun create(id: Long, items: LongArray, total: Double, status: String): Order = Order(nativeCreate(id, items, total, status))
-    }
-
-    val id: Long get() = nativeGetId(handle)
-    val items: LongArray get() = nativeGetItems(handle)
-    val total: Double get() = nativeGetTotal(handle)
-    val status: String get() = nativeGetStatus(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
+internal fun packOrder(w: WeaveBufferWriter, v: Order) {
+    w.writeI64(v.id)
+    w.writeList(v.items) { v0 -> packOrderItem(w, v0) }
+    w.writeF64(v.total)
+    w.writeString(v.status)
 }
+
+internal fun unpackOrder(r: WeaveBufferReader): Order = Order(
+    r.readI64(),
+    r.readList { unpackOrderItem(r) },
+    r.readF64(),
+    r.readString(),
+)
 
 /** Generic WeaveFFI failure: panics, marshalling errors, and unknown codes. */
 open class WeaveFFIException(val code: Int, message: String) : Exception(message)
@@ -173,8 +129,8 @@ sealed class ProductsException(code: Int, message: String) : WeaveFFIException(c
     class ProductNotFound(message: String = "product not found") : ProductsException(2, message)
 
     companion object {
-        /** Map a raw `ProductsError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
-        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+        /** Map a raw `ProductsError` code and payload to the typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        @JvmStatic fun fromCode(code: Int, message: String, payload: ByteArray?): WeaveFFIException = when (code) {
             1 -> InvalidPrice(message)
             2 -> ProductNotFound(message)
             else -> WeaveFFIException(code, message)
@@ -188,13 +144,158 @@ sealed class OrdersException(code: Int, message: String) : WeaveFFIException(cod
     class EmptyOrder(message: String = "order must contain at least one item") : OrdersException(2, message)
 
     companion object {
-        /** Map a raw `OrdersError` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
-        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+        /** Map a raw `OrdersError` code and payload to the typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        @JvmStatic fun fromCode(code: Int, message: String, payload: ByteArray?): WeaveFFIException = when (code) {
             1 -> OrderNotFound(message)
             2 -> EmptyOrder(message)
             else -> WeaveFFIException(code, message)
         }
     }
+}
+
+/** Growable little-endian writer implementing the WeaveFFI value-buffer wire format. */
+internal class WeaveBufferWriter {
+    private var buf = ByteArray(32)
+    private var len = 0
+
+    private fun reserve(extra: Int) {
+        if (len + extra <= buf.size) return
+        var cap = buf.size * 2
+        while (cap < len + extra) cap *= 2
+        buf = buf.copyOf(cap)
+    }
+
+    fun toByteArray(): ByteArray = buf.copyOf(len)
+
+    fun writeBool(v: Boolean) { reserve(1); buf[len++] = if (v) 1 else 0 }
+    fun writeI8(v: Byte) { reserve(1); buf[len++] = v }
+    fun writeI16(v: Short) {
+        reserve(2)
+        val b = v.toInt()
+        buf[len++] = (b and 0xFF).toByte()
+        buf[len++] = ((b shr 8) and 0xFF).toByte()
+    }
+    fun writeI32(v: Int) {
+        reserve(4)
+        buf[len++] = (v and 0xFF).toByte()
+        buf[len++] = ((v shr 8) and 0xFF).toByte()
+        buf[len++] = ((v shr 16) and 0xFF).toByte()
+        buf[len++] = ((v shr 24) and 0xFF).toByte()
+    }
+    fun writeU32(v: Long) = writeI32(v.toInt())
+    fun writeI64(v: Long) {
+        writeI32(v.toInt())
+        writeI32((v ushr 32).toInt())
+    }
+    fun writeF32(v: Float) = writeI32(v.toRawBits())
+    fun writeF64(v: Double) = writeI64(v.toRawBits())
+    fun writeString(v: String) = writeBytes(v.toByteArray(Charsets.UTF_8))
+    fun writeBytes(v: ByteArray) {
+        writeI32(v.size)
+        reserve(v.size)
+        v.copyInto(buf, len)
+        len += v.size
+    }
+    fun <T> writeOptional(v: T?, write: (T) -> Unit) {
+        if (v == null) writeBool(false) else { writeBool(true); write(v) }
+    }
+    fun <T> writeList(v: List<T>, write: (T) -> Unit) {
+        writeI32(v.size)
+        for (e in v) write(e)
+    }
+    fun <K, V> writeMap(v: Map<K, V>, writeKey: (K) -> Unit, writeValue: (V) -> Unit) {
+        writeI32(v.size)
+        for ((k, e) in v) { writeKey(k); writeValue(e) }
+    }
+}
+
+/** Validating little-endian reader for the WeaveFFI value-buffer wire format. */
+internal class WeaveBufferReader(private val buf: ByteArray) {
+    private var pos = 0
+
+    private fun malformed(detail: String): Nothing =
+        throw WeaveFFIException(-2, "malformed WeaveFFI value buffer: " + detail)
+
+    private fun take(n: Int): Int {
+        if (n > buf.size - pos) malformed("truncated buffer")
+        val at = pos
+        pos += n
+        return at
+    }
+
+    fun readBool(): Boolean = when (buf[take(1)].toInt()) {
+        0 -> false
+        1 -> true
+        else -> malformed("invalid bool byte")
+    }
+    fun readI8(): Byte = buf[take(1)]
+    fun readI16(): Short {
+        val at = take(2)
+        return ((buf[at].toInt() and 0xFF) or ((buf[at + 1].toInt() and 0xFF) shl 8)).toShort()
+    }
+    fun readI32(): Int {
+        val at = take(4)
+        return (buf[at].toInt() and 0xFF) or
+            ((buf[at + 1].toInt() and 0xFF) shl 8) or
+            ((buf[at + 2].toInt() and 0xFF) shl 16) or
+            ((buf[at + 3].toInt() and 0xFF) shl 24)
+    }
+    fun readU32(): Long = readI32().toLong() and 0xFFFFFFFFL
+    fun readI64(): Long {
+        val lo = readI32().toLong() and 0xFFFFFFFFL
+        val hi = readI32().toLong()
+        return lo or (hi shl 32)
+    }
+    fun readF32(): Float = Float.fromBits(readI32())
+    fun readF64(): Double = Double.fromBits(readI64())
+    private fun readLen(): Int {
+        val n = readI32()
+        if (n < 0 || n > buf.size - pos) malformed("length prefix exceeds remaining bytes")
+        return n
+    }
+    fun readString(): String {
+        val n = readLen()
+        val at = take(n)
+        return try {
+            Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(buf, at, n)).toString()
+        } catch (e: java.nio.charset.CharacterCodingException) {
+            malformed("string is not valid UTF-8")
+        }
+    }
+    fun readBytes(): ByteArray {
+        val n = readLen()
+        val at = take(n)
+        return buf.copyOfRange(at, at + n)
+    }
+    fun <T> readOptional(read: () -> T): T? = if (readBool()) read() else null
+    fun <T> readList(read: () -> T): List<T> {
+        val n = readLen()
+        val out = ArrayList<T>(n)
+        repeat(n) { out.add(read()) }
+        return out
+    }
+    fun <K, V> readMap(readKey: () -> K, readValue: () -> V): Map<K, V> {
+        val n = readLen()
+        val out = LinkedHashMap<K, V>()
+        repeat(n) { out[readKey()] = readValue() }
+        return out
+    }
+    fun expectEnd() {
+        if (pos != buf.size) malformed("trailing bytes after value")
+    }
+}
+
+internal fun weaveEncode(write: (WeaveBufferWriter) -> Unit): ByteArray {
+    val w = WeaveBufferWriter()
+    write(w)
+    return w.toByteArray()
+}
+
+internal fun <T> weaveDecode(bytes: ByteArray, read: (WeaveBufferReader) -> T): T {
+    val r = WeaveBufferReader(bytes)
+    val v = read(r)
+    r.expectEnd()
+    return v
 }
 
 // END WeaveFFI.kt

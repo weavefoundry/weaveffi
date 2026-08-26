@@ -37,6 +37,8 @@ void weaveffi_error_clear(weaveffi_error* err) {
     if (err) {
         err->code = 0;
         err->message = 0;
+        err->payload_ptr = 0;
+        err->payload_len = 0;
     }
 }
 

@@ -36,6 +36,29 @@ fn lift_async_input(
 ) -> syn::Result<(TokenStream, TokenStream, TokenStream)> {
     let name = ident(&pb.name);
     let none = TokenStream::new();
+    // A buffered parameter arrives as a borrowed value buffer the caller may
+    // free as soon as the launcher returns: copy the raw bytes on the
+    // caller's thread, decode on the worker thread (inside its catch_unwind,
+    // so a malformed buffer is delivered through the callback's `err` with
+    // the panic code rather than unwinding across the C boundary).
+    if weaveffi_core::abi::is_buffered(&pb.ty) {
+        let ptr = ident(&format!("{}_ptr", pb.name));
+        let len = ident(&format!("{}_len", pb.name));
+        let panic_msg = format!("{}: malformed WeaveFFI value buffer", pb.name);
+        return Ok((
+            quote! {
+                let #name: ::std::vec::Vec<u8> = if #ptr.is_null() {
+                    ::std::vec::Vec::new()
+                } else {
+                    unsafe { ::std::slice::from_raw_parts(#ptr, #len) }.to_vec()
+                };
+            },
+            quote! {
+                let #name = ::weaveffi::abi::decode_value(&#name).expect(#panic_msg);
+            },
+            quote!(#name),
+        ));
+    }
     Ok(match &pb.ty {
         ty if is_copy(ty) && !matches!(ty, TypeRef::Enum(_)) => (none.clone(), none, quote!(#name)),
         // A typed handle is an opaque pointer, which is not `Send`. Carry it
@@ -62,20 +85,6 @@ fn lift_async_input(
             none,
             quote!(&#name),
         ),
-        TypeRef::Optional(inner)
-            if matches!(**inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
-        {
-            (
-                quote!(let #name = ::weaveffi::abi::lift_opt_string(#name);),
-                none,
-                quote!(#name),
-            )
-        }
-        TypeRef::Optional(inner) if is_copy(inner) => (
-            quote!(let #name = unsafe { ::weaveffi::abi::lift_opt_scalar(#name) };),
-            none,
-            quote!(#name),
-        ),
         TypeRef::Bytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
             let len = ident(&format!("{}_len", pb.name));
@@ -94,19 +103,6 @@ fn lift_async_input(
                 quote!(&#name),
             )
         }
-        TypeRef::List(inner) => {
-            let len = ident(&format!("{}_len", pb.name));
-            let pre = match &**inner {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    quote!(let #name = unsafe { ::weaveffi::abi::lift_string_vec(#name, #len) };)
-                }
-                t if is_copy(t) => {
-                    quote!(let #name = unsafe { ::weaveffi::abi::lift_scalar_vec(#name, #len) };)
-                }
-                _ => return Err(unsupported(&pb.name, "async list element type")),
-            };
-            (pre, none, quote!(#name))
-        }
         _ => return Err(unsupported(&pb.name, "async parameter type")),
     })
 }
@@ -117,16 +113,25 @@ fn lift_async_input(
 ///
 /// The postamble runs *after* the callback returns and releases every buffer
 /// the callback merely borrowed, per the plan's async contract
-/// ([`weaveffi_core::plan::AsyncProtocol`]): strings, boxed optional scalars,
-/// and list buffers are producer-owned and freed here (the consumer copies
-/// inside the callback); owned-object results (records, rich enums, and
-/// object *elements* of a list) transfer ownership to the consumer and are
-/// not freed. `bytes` and `map<K,V>` results are not yet supported.
+/// ([`weaveffi_core::plan::AsyncProtocol`]): strings and value buffers are
+/// producer-owned and freed here (the consumer copies or decodes inside the
+/// callback); an owned interface result transfers ownership to the consumer
+/// and is not freed. `bytes` results are not yet supported.
 fn async_result_args(
     ty: &TypeRef,
     value: TokenStream,
 ) -> syn::Result<(TokenStream, Vec<TokenStream>, TokenStream)> {
     let none = TokenStream::new();
+    // A buffered result crosses as a borrowed `(ptr, len)` pair the consumer
+    // decodes inside the callback; the encoding drops when the local `Vec`
+    // goes out of scope after the callback returns.
+    if weaveffi_core::abi::is_buffered(ty) {
+        return Ok((
+            quote!(let __wv_res_buf = ::weaveffi::abi::encode_value(&(#value));),
+            vec![quote!(__wv_res_buf.as_ptr()), quote!(__wv_res_buf.len())],
+            none,
+        ));
+    }
     Ok(match ty {
         t if is_copy(t) && !matches!(t, TypeRef::Enum(_)) => (none.clone(), vec![value], none),
         TypeRef::Enum(_) => (none.clone(), vec![quote!((#value) as i32)], none),
@@ -137,92 +142,11 @@ fn async_result_args(
         ),
         // An owned-object result: the callback adopts the pointer (the plan's
         // `result_adopt`) and the consumer eventually calls `_destroy`.
-        TypeRef::Record(_) | TypeRef::RichEnum(_) => (
+        TypeRef::Interface(_) => (
             none.clone(),
             vec![quote!(::std::boxed::Box::into_raw(::std::boxed::Box::new(#value)))],
             none,
         ),
-        TypeRef::Optional(inner)
-            if matches!(**inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
-        {
-            (
-                quote!(let __wv_res = ::weaveffi::abi::lower_opt_string(#value);),
-                vec![quote!(__wv_res)],
-                quote!(::weaveffi::abi::free_string(__wv_res);),
-            )
-        }
-        TypeRef::Optional(inner) if is_copy(inner) => (
-            quote!(let __wv_res = ::weaveffi::abi::lower_opt_scalar(#value);),
-            vec![quote!(__wv_res)],
-            quote! {
-                if !__wv_res.is_null() {
-                    unsafe { drop(::std::boxed::Box::from_raw(__wv_res)) };
-                }
-            },
-        ),
-        TypeRef::Optional(inner)
-            if matches!(**inner, TypeRef::Record(_) | TypeRef::RichEnum(_)) =>
-        {
-            (
-                none.clone(),
-                vec![quote! {
-                    match #value {
-                        ::std::option::Option::Some(__v) =>
-                            ::std::boxed::Box::into_raw(::std::boxed::Box::new(__v)),
-                        ::std::option::Option::None => ::std::ptr::null_mut(),
-                    }
-                }],
-                none,
-            )
-        }
-        TypeRef::List(inner) => {
-            // Free each borrowed string element before the buffer; object
-            // elements were adopted by the consumer and stay alive.
-            let (base, elem_post) = match &**inner {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
-                    quote!(unsafe { ::weaveffi::abi::lower_string_vec(__wv_list, &mut __wv_len) }),
-                    quote! {
-                        for __i in 0..__wv_len {
-                            ::weaveffi::abi::free_string(unsafe { *__wv_base.add(__i) });
-                        }
-                    },
-                ),
-                t if is_copy(t) => (
-                    quote!(unsafe { ::weaveffi::abi::lower_scalar_vec(__wv_list, &mut __wv_len) }),
-                    none.clone(),
-                ),
-                TypeRef::Record(_) | TypeRef::RichEnum(_) => (
-                    quote! {
-                        unsafe {
-                            ::weaveffi::abi::lower_ptr_vec(
-                                __wv_list.into_iter()
-                                    .map(|__e| ::std::boxed::Box::into_raw(::std::boxed::Box::new(__e)))
-                                    .collect::<::std::vec::Vec<_>>(),
-                                &mut __wv_len,
-                            )
-                        }
-                    },
-                    none.clone(),
-                ),
-                _ => return Err(unsupported("async return", "list element type")),
-            };
-            let pre = quote! {
-                let __wv_list = #value;
-                let mut __wv_len: usize = 0;
-                let __wv_base = #base;
-            };
-            let post = quote! {
-                if !__wv_base.is_null() {
-                    #elem_post
-                    unsafe {
-                        drop(::std::boxed::Box::from_raw(
-                            ::std::ptr::slice_from_raw_parts_mut(__wv_base, __wv_len),
-                        ))
-                    };
-                }
-            };
-            (pre, vec![quote!(__wv_base), quote!(__wv_len)], post)
-        }
         _ => return Err(unsupported("async return", "result type")),
     })
 }
@@ -342,10 +266,11 @@ pub(crate) fn gen_async_function(
                 ::std::result::Result::Ok(#bind) => { #success_call }
                 ::std::result::Result::Err(__wv_err) => {
                     let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
-                    ::weaveffi::abi::error_set(
+                    ::weaveffi::abi::error_set_with_payload(
                         &mut __wv_e,
                         ::weaveffi::abi::ErrorReport::code(&__wv_err),
                         &::weaveffi::abi::ErrorReport::message(&__wv_err),
+                        ::weaveffi::abi::ErrorReport::payload(&__wv_err),
                     );
                     #fail_call
                 }

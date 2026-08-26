@@ -25,37 +25,51 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
 }
 
 static void throw_weaveffi_products_ProductsError(JNIEnv* env, weaveffi_error* err) {
-    const char* name = NULL;
-    switch (err->code) {
-    case 1: name = "com/weaveffi/ProductsException$InvalidPrice"; break;
-    case 2: name = "com/weaveffi/ProductsException$ProductNotFound"; break;
-    default: break;
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/ProductsException");
+    jmethodID fromCode = exClass ? (*env)->GetStaticMethodID(env, exClass, "fromCode", "(ILjava/lang/String;[B)Lcom/weaveffi/WeaveFFIException;") : NULL;
+    if (fromCode == NULL) {
+        (*env)->ExceptionClear(env);
+        throw_weaveffi_error(env, err);
+        return;
     }
-    if (name == NULL) { throw_weaveffi_error(env, err); return; }
-    jclass exClass = (*env)->FindClass(env, name);
-    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
+    const char* msg = err->message ? err->message : "WeaveFFI error";
+    jstring jmsg = (*env)->NewStringUTF(env, msg);
+    jbyteArray jpayload = NULL;
+    if (err->payload_ptr != NULL) {
+        jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
+        if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
+    }
+    jthrowable ex = (jthrowable)(*env)->CallStaticObjectMethod(env, exClass, fromCode, (jint)err->code, jmsg, jpayload);
+    if (ex != NULL && !(*env)->ExceptionCheck(env)) { (*env)->Throw(env, ex); }
     weaveffi_error_clear(err);
 }
 
 static void throw_weaveffi_orders_OrdersError(JNIEnv* env, weaveffi_error* err) {
-    const char* name = NULL;
-    switch (err->code) {
-    case 1: name = "com/weaveffi/OrdersException$OrderNotFound"; break;
-    case 2: name = "com/weaveffi/OrdersException$EmptyOrder"; break;
-    default: break;
+    jclass exClass = (*env)->FindClass(env, "com/weaveffi/OrdersException");
+    jmethodID fromCode = exClass ? (*env)->GetStaticMethodID(env, exClass, "fromCode", "(ILjava/lang/String;[B)Lcom/weaveffi/WeaveFFIException;") : NULL;
+    if (fromCode == NULL) {
+        (*env)->ExceptionClear(env);
+        throw_weaveffi_error(env, err);
+        return;
     }
-    if (name == NULL) { throw_weaveffi_error(env, err); return; }
-    jclass exClass = (*env)->FindClass(env, name);
-    if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : "WeaveFFI error"); }
+    const char* msg = err->message ? err->message : "WeaveFFI error";
+    jstring jmsg = (*env)->NewStringUTF(env, msg);
+    jbyteArray jpayload = NULL;
+    if (err->payload_ptr != NULL) {
+        jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
+        if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
+    }
+    jthrowable ex = (jthrowable)(*env)->CallStaticObjectMethod(env, exClass, fromCode, (jint)err->code, jmsg, jpayload);
+    if (ex != NULL && !(*env)->ExceptionCheck(env)) { (*env)->Throw(env, ex); }
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_createOrder(JNIEnv* env, jclass clazz, jlongArray items) {
-    weaveffi_error err = {0, NULL};
-    jlong* items_elems = (*env)->GetLongArrayElements(env, items, NULL);
+JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_createOrderJni(JNIEnv* env, jclass clazz, jbyteArray items) {
+    weaveffi_error err = {0, NULL, NULL, 0};
+    jbyte* items_elems = (*env)->GetByteArrayElements(env, items, NULL);
     jsize items_len = (*env)->GetArrayLength(env, items);
-    int64_t rv = weaveffi_orders_create_order((const void*)items_elems, (size_t)items_len, &err);
-    (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
+    int64_t rv = weaveffi_orders_create_order((const uint8_t*)items_elems, (size_t)items_len, &err);
+    (*env)->ReleaseByteArrayElements(env, items, items_elems, JNI_ABORT);
     if (err.code != 0) {
         throw_weaveffi_orders_OrdersError(env, &err);
         return 0;
@@ -63,18 +77,22 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_createOrder(JNIEnv* env, jcla
     return (jlong) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getOrderJni(JNIEnv* env, jclass clazz, jlong id) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_orders_Order* rv = weaveffi_orders_get_order((int64_t)id, &err);
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_getOrderJni(JNIEnv* env, jclass clazz, jlong id) {
+    weaveffi_error err = {0, NULL, NULL, 0};
+    size_t out_len = 0;
+    const uint8_t* rv = weaveffi_orders_get_order((int64_t)id, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_orders_OrdersError(env, &err);
-        return 0;
+        return NULL;
     }
-    return (jlong)(intptr_t)rv;
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);
+    if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }
+    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);
+    return out;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_cancelOrder(JNIEnv* env, jclass clazz, jlong id) {
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     bool rv = weaveffi_orders_cancel_order((int64_t)id, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
@@ -83,9 +101,12 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_cancelOrder(JNIEnv* env, j
     return rv ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_addProductToOrderJni(JNIEnv* env, jclass clazz, jlong order_id, jlong product) {
-    weaveffi_error err = {0, NULL};
-    bool rv = weaveffi_orders_add_product_to_order((int64_t)order_id, (const weaveffi_products_Product*)(intptr_t)product, &err);
+JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_addProductToOrderJni(JNIEnv* env, jclass clazz, jlong order_id, jbyteArray product) {
+    weaveffi_error err = {0, NULL, NULL, 0};
+    jbyte* product_elems = (*env)->GetByteArrayElements(env, product, NULL);
+    jsize product_len = (*env)->GetArrayLength(env, product);
+    bool rv = weaveffi_orders_add_product_to_order((int64_t)order_id, (const uint8_t*)product_elems, (size_t)product_len, &err);
+    (*env)->ReleaseByteArrayElements(env, product, product_elems, JNI_ABORT);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return JNI_FALSE;
@@ -93,88 +114,8 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_WeaveFFI_addProductToOrderJni(JNIEn
     return rv ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Product_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jstring name, jstring description, jdouble price, jint category, jobjectArray tags) {
-    weaveffi_error err = {0, NULL};
-    const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
-    const char* description_chars = NULL;
-    if (description != NULL) {
-        description_chars = (*env)->GetStringUTFChars(env, description, NULL);
-    }
-    jsize tags_len = (*env)->GetArrayLength(env, tags);
-    const char** tags_elems = (const char**)malloc((size_t)tags_len * sizeof(const char*));
-    jstring* tags_jstrs = (jstring*)malloc((size_t)tags_len * sizeof(jstring));
-    for (jsize tags_i = 0; tags_i < tags_len; tags_i++) {
-        tags_jstrs[tags_i] = (jstring)(*env)->GetObjectArrayElement(env, tags, tags_i);
-        tags_elems[tags_i] = (*env)->GetStringUTFChars(env, tags_jstrs[tags_i], NULL);
-    }
-    weaveffi_products_Product* rv = weaveffi_products_Product_create((int64_t)id, name_chars, description_chars, (double)price, (int32_t)category, (const char* const*)tags_elems, (size_t)tags_len, &err);
-    (*env)->ReleaseStringUTFChars(env, name, name_chars);
-    if (description != NULL) { (*env)->ReleaseStringUTFChars(env, description, description_chars); }
-    for (jsize tags_ri = 0; tags_ri < tags_len; tags_ri++) {
-        (*env)->ReleaseStringUTFChars(env, tags_jstrs[tags_ri], tags_elems[tags_ri]);
-    }
-    free((void*)tags_elems);
-    free(tags_jstrs);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_Product_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
-    weaveffi_products_Product_destroy((weaveffi_products_Product*)(intptr_t)handle);
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Product_nativeGetId(JNIEnv* env, jclass clazz, jlong handle) {
-    int64_t rv = weaveffi_products_Product_get_id((const weaveffi_products_Product*)(intptr_t)handle);
-    return (jlong)rv;
-}
-
-JNIEXPORT jstring JNICALL Java_com_weaveffi_Product_nativeGetName(JNIEnv* env, jclass clazz, jlong handle) {
-    const char* rv = weaveffi_products_Product_get_name((const weaveffi_products_Product*)(intptr_t)handle);
-    jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, "");
-    weaveffi_free_string(rv);
-    return jout;
-}
-
-JNIEXPORT jstring JNICALL Java_com_weaveffi_Product_nativeGetDescription(JNIEnv* env, jclass clazz, jlong handle) {
-    const char* rv = weaveffi_products_Product_get_description((const weaveffi_products_Product*)(intptr_t)handle);
-    if (rv == NULL) { return NULL; }
-    jstring jout = (*env)->NewStringUTF(env, rv);
-    weaveffi_free_string(rv);
-    return jout;
-}
-
-JNIEXPORT jdouble JNICALL Java_com_weaveffi_Product_nativeGetPrice(JNIEnv* env, jclass clazz, jlong handle) {
-    double rv = weaveffi_products_Product_get_price((const weaveffi_products_Product*)(intptr_t)handle);
-    return (jdouble)rv;
-}
-
-JNIEXPORT jint JNICALL Java_com_weaveffi_Product_nativeGetCategory(JNIEnv* env, jclass clazz, jlong handle) {
-    int32_t rv = weaveffi_products_Product_get_category((const weaveffi_products_Product*)(intptr_t)handle);
-    return (jint)rv;
-}
-
-JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_Product_nativeGetTags(JNIEnv* env, jclass clazz, jlong handle) {
-    size_t out_len = 0;
-    const char** rv = (const char**)weaveffi_products_Product_get_tags((const weaveffi_products_Product*)(intptr_t)handle, &out_len);
-    jclass scls = (*env)->FindClass(env, "java/lang/String");
-    jobjectArray jout = (*env)->NewObjectArray(env, (jsize)out_len, scls, NULL);
-    if (jout && rv) {
-        for (size_t i = 0; i < out_len; i++) {
-            jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, "");
-            (*env)->SetObjectArrayElement(env, jout, (jsize)i, s);
-            (*env)->DeleteLocalRef(env, s);
-            weaveffi_free_string(rv[i]);
-        }
-    }
-    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(const char*));
-    return jout;
-}
-
 JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeNew(JNIEnv* env, jclass clazz) {
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     void* rv = weaveffi_products_Catalog_new(&err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
@@ -183,47 +124,52 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeNew(JNIEnv* env, jclass 
     return (jlong)(intptr_t) rv;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeAddProduct(JNIEnv* env, jclass clazz, jlong selfHandle, jstring name, jdouble price, jint category) {
-    weaveffi_error err = {0, NULL};
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_Catalog_nativeAddProduct(JNIEnv* env, jclass clazz, jlong selfHandle, jstring name, jdouble price, jint category) {
+    weaveffi_error err = {0, NULL, NULL, 0};
     const char* name_chars = (*env)->GetStringUTFChars(env, name, NULL);
-    weaveffi_products_Product* rv = weaveffi_products_Catalog_add_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, name_chars, (double)price, (int32_t)category, &err);
+    size_t out_len = 0;
+    const uint8_t* rv = weaveffi_products_Catalog_add_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, name_chars, (double)price, (int32_t)category, &out_len, &err);
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
     if (err.code != 0) {
         throw_weaveffi_products_ProductsError(env, &err);
-        return 0;
+        return NULL;
     }
-    return (jlong)(intptr_t)rv;
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);
+    if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }
+    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);
+    return out;
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Catalog_nativeGetProduct(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_products_Product* rv = weaveffi_products_Catalog_get_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, &err);
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_Catalog_nativeGetProduct(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id) {
+    weaveffi_error err = {0, NULL, NULL, 0};
+    size_t out_len = 0;
+    const uint8_t* rv = weaveffi_products_Catalog_get_product((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_products_ProductsError(env, &err);
-        return 0;
+        return NULL;
     }
-    return (jlong)(intptr_t)rv;
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);
+    if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }
+    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);
+    return out;
 }
 
-JNIEXPORT jlongArray JNICALL Java_com_weaveffi_Catalog_nativeSearch(JNIEnv* env, jclass clazz, jlong selfHandle, jint category) {
-    weaveffi_error err = {0, NULL};
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_Catalog_nativeSearch(JNIEnv* env, jclass clazz, jlong selfHandle, jint category) {
+    weaveffi_error err = {0, NULL, NULL, 0};
     size_t out_len = 0;
-    void* const* rv = (void* const*)weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int32_t)category, &out_len, &err);
+    const uint8_t* rv = weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int32_t)category, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
         return NULL;
     }
-    jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);
-    for (jsize _li = 0; result && rv && _li < (jsize)out_len; _li++) {
-        jlong _lv = (jlong)(intptr_t)rv[_li];
-        (*env)->SetLongArrayRegion(env, result, _li, 1, &_lv);
-    }
-    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));
-    return result;
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);
+    if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }
+    weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);
+    return out;
 }
 
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_Catalog_nativeUpdatePrice(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id, jdouble price) {
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     bool rv = weaveffi_products_Catalog_update_price((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, (double)price, &err);
     if (err.code != 0) {
         throw_weaveffi_products_ProductsError(env, &err);
@@ -233,7 +179,7 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_Catalog_nativeUpdatePrice(JNIEnv* e
 }
 
 JNIEXPORT jboolean JNICALL Java_com_weaveffi_Catalog_nativeRemove(JNIEnv* env, jclass clazz, jlong selfHandle, jlong id) {
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     bool rv = weaveffi_products_Catalog_remove((const weaveffi_products_Catalog*)(intptr_t)selfHandle, (int64_t)id, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
@@ -244,83 +190,6 @@ JNIEXPORT jboolean JNICALL Java_com_weaveffi_Catalog_nativeRemove(JNIEnv* env, j
 
 JNIEXPORT void JNICALL Java_com_weaveffi_Catalog_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
     weaveffi_products_Catalog_destroy((weaveffi_products_Catalog*)(intptr_t)handle);
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_OrderItem_nativeCreate(JNIEnv* env, jclass clazz, jlong product_id, jint quantity, jdouble unit_price) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_orders_OrderItem* rv = weaveffi_orders_OrderItem_create((int64_t)product_id, (int32_t)quantity, (double)unit_price, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_OrderItem_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
-    weaveffi_orders_OrderItem_destroy((weaveffi_orders_OrderItem*)(intptr_t)handle);
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_OrderItem_nativeGetProductId(JNIEnv* env, jclass clazz, jlong handle) {
-    int64_t rv = weaveffi_orders_OrderItem_get_product_id((const weaveffi_orders_OrderItem*)(intptr_t)handle);
-    return (jlong)rv;
-}
-
-JNIEXPORT jint JNICALL Java_com_weaveffi_OrderItem_nativeGetQuantity(JNIEnv* env, jclass clazz, jlong handle) {
-    int32_t rv = weaveffi_orders_OrderItem_get_quantity((const weaveffi_orders_OrderItem*)(intptr_t)handle);
-    return (jint)rv;
-}
-
-JNIEXPORT jdouble JNICALL Java_com_weaveffi_OrderItem_nativeGetUnitPrice(JNIEnv* env, jclass clazz, jlong handle) {
-    double rv = weaveffi_orders_OrderItem_get_unit_price((const weaveffi_orders_OrderItem*)(intptr_t)handle);
-    return (jdouble)rv;
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Order_nativeCreate(JNIEnv* env, jclass clazz, jlong id, jlongArray items, jdouble total, jstring status) {
-    weaveffi_error err = {0, NULL};
-    jlong* items_elems = (*env)->GetLongArrayElements(env, items, NULL);
-    jsize items_len = (*env)->GetArrayLength(env, items);
-    const char* status_chars = (*env)->GetStringUTFChars(env, status, NULL);
-    weaveffi_orders_Order* rv = weaveffi_orders_Order_create((int64_t)id, (const void*)items_elems, (size_t)items_len, (double)total, status_chars, &err);
-    (*env)->ReleaseLongArrayElements(env, items, items_elems, 0);
-    (*env)->ReleaseStringUTFChars(env, status, status_chars);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_Order_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
-    weaveffi_orders_Order_destroy((weaveffi_orders_Order*)(intptr_t)handle);
-}
-
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Order_nativeGetId(JNIEnv* env, jclass clazz, jlong handle) {
-    int64_t rv = weaveffi_orders_Order_get_id((const weaveffi_orders_Order*)(intptr_t)handle);
-    return (jlong)rv;
-}
-
-JNIEXPORT jlongArray JNICALL Java_com_weaveffi_Order_nativeGetItems(JNIEnv* env, jclass clazz, jlong handle) {
-    size_t out_len = 0;
-    void* const* rv = (void* const*)weaveffi_orders_Order_get_items((const weaveffi_orders_Order*)(intptr_t)handle, &out_len);
-    jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);
-    for (jsize i = 0; jout && rv && i < (jsize)out_len; i++) {
-        jlong lv = (jlong)(intptr_t)rv[i];
-        (*env)->SetLongArrayRegion(env, jout, i, 1, &lv);
-    }
-    weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));
-    return jout;
-}
-
-JNIEXPORT jdouble JNICALL Java_com_weaveffi_Order_nativeGetTotal(JNIEnv* env, jclass clazz, jlong handle) {
-    double rv = weaveffi_orders_Order_get_total((const weaveffi_orders_Order*)(intptr_t)handle);
-    return (jdouble)rv;
-}
-
-JNIEXPORT jstring JNICALL Java_com_weaveffi_Order_nativeGetStatus(JNIEnv* env, jclass clazz, jlong handle) {
-    const char* rv = weaveffi_orders_Order_get_status((const weaveffi_orders_Order*)(intptr_t)handle);
-    jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, "");
-    weaveffi_free_string(rv);
-    return jout;
 }
 
 

@@ -15,6 +15,7 @@ weaveffi-ir = { path = "../weaveffi-ir", version = "0.17.0" }
 camino = { workspace = true }
 heck = { workspace = true }
 serde = { workspace = true }
+serde_yaml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

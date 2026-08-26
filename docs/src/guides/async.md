@@ -43,7 +43,7 @@ Avoid async for:
 ### 1. Declare the function in the IDL
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: net
     errors:
@@ -121,12 +121,12 @@ pub extern "C" fn weaveffi_net_fetch_data_async(
 The async launcher symbol always carries the `_async` suffix
 (`weaveffi_net_fetch_data_async`), keeping the name free for a possible
 synchronous variant. Note who frees the result: buffer results
-(strings, byte arrays, lists, boxed optional scalars) are owned by the
+(strings, bytes, and the serialized value buffers of buffered results
+such as records, rich enums, lists, and maps) are owned by the
 producer, which releases them after the callback returns; the
-macro-generated launchers do exactly this. Owned-object results
-(records, rich enums, interfaces) are the exception: the callback
-receives ownership of the pointer. See
-[Result ownership and threading](#result-ownership-and-threading).
+macro-generated launchers do exactly this. Owned interface results are
+the exception: the callback receives ownership of the object pointer.
+See [Result ownership and threading](#result-ownership-and-threading).
 
 ### 3. Call it from each target
 
@@ -247,15 +247,16 @@ The completion contract has three clauses, stated once in
    `TaskCompletionSource`, a Go channel) exactly once and then
    releases the registration.
 2. **Borrowed results.** Result buffers passed to the callback
-   (strings, bytes, arrays, boxed optional scalars) are owned by the
-   producer and valid **only for the callback's duration**: the
-   wrapper deep-copies them before the callback returns and must not
-   free them. The producer releases them after the callback returns;
-   the macro-generated launchers do this for you. Owned-object results
-   (records, rich enums, and interfaces, including optionals of them)
-   are the exception: the callback receives ownership and adopts the
-   pointer into the wrapper's disposal idiom, which eventually calls
-   the type's `_destroy` symbol.
+   (strings, bytes, and buffered results delivered as a
+   `(const uint8_t* result_ptr, size_t result_len)` pair holding the
+   serialized value buffer) are owned by the producer and valid **only
+   for the callback's duration**: the wrapper copies or decodes them
+   before the callback returns and must not free them. The producer
+   releases them after the callback returns; the macro-generated
+   launchers do this for you. Owned interface results (including
+   `Interface?`) are the exception: the callback receives ownership and
+   adopts the pointer into the wrapper's disposal idiom, which
+   eventually calls the type's `_destroy` symbol.
 3. **Foreign-thread delivery.** The callback runs on an arbitrary
    producer thread, so the wrapper hops back to its native scheduler
    before touching consumer state (Python's
@@ -353,7 +354,7 @@ For every async-capable target:
   producer-owned and freed as soon as the callback returns. Copy the
   data inside the callback; a stashed pointer dangles.
 - **Freeing a borrowed result inside the callback**: strings, bytes,
-  and array buffers belong to the producer, which frees them itself.
-  Freeing them in the callback double-frees. The only pointers the
-  callback owns are object results (records, rich enums, interfaces),
-  which it must eventually `_destroy` exactly once.
+  and serialized value buffers belong to the producer, which frees
+  them itself. Freeing them in the callback double-frees. The only
+  pointers the callback owns are interface results, which it must
+  eventually `_destroy` exactly once.

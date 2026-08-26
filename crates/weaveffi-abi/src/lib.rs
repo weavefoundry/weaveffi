@@ -8,14 +8,14 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod arena;
+pub mod buffer;
 pub mod convert;
 mod macros;
 
-pub use convert::{
-    lift_byte_slice, lift_bytes, lift_opt_scalar, lift_opt_string, lift_ptr_vec, lift_scalar_vec,
-    lift_string_vec, lower_bytes, lower_opt_scalar, lower_opt_string, lower_ptr_vec,
-    lower_scalar_vec, lower_string_vec, write_map_out,
+pub use buffer::{
+    decode_value, encode_value, BufferDecodeError, BufferReader, BufferValue, BufferWriter,
 };
+pub use convert::{lift_byte_slice, lift_bytes, lower_bytes};
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -31,8 +31,11 @@ pub type weaveffi_handle_t = u64;
 ///
 /// - `message` is a NUL-terminated UTF-8 C string allocated by Rust and must be
 ///   released by calling `weaveffi_error_clear` or `weaveffi_free_string`.
-/// - This struct must not be copied while it owns a message pointer, as that
-///   would lead to double-free on clear.
+/// - `payload_ptr`, when non-null, is a Rust-allocated value buffer of
+///   `payload_len` bytes (the matched error code's fields serialized in the
+///   [`buffer`] format), released by `weaveffi_error_clear`.
+/// - This struct must not be copied while it owns a message or payload
+///   pointer, as that would lead to double-free on clear.
 #[repr(C)]
 #[derive(Debug)]
 pub struct weaveffi_error {
@@ -41,6 +44,12 @@ pub struct weaveffi_error {
     /// Owned, NUL-terminated UTF-8 message describing the failure, or null when
     /// [`code`](Self::code) is `0`. Freed by `weaveffi_error_clear`.
     pub message: *const c_char,
+    /// Owned value buffer holding the matched error code's payload fields
+    /// serialized in the [`buffer`] format, or null when the code declares no
+    /// fields. Freed by `weaveffi_error_clear`.
+    pub payload_ptr: *const u8,
+    /// Byte length of [`payload_ptr`](Self::payload_ptr); `0` when null.
+    pub payload_len: usize,
 }
 
 impl Default for weaveffi_error {
@@ -48,26 +57,40 @@ impl Default for weaveffi_error {
         Self {
             code: 0,
             message: ptr::null(),
+            payload_ptr: ptr::null(),
+            payload_len: 0,
         }
     }
 }
 
-/// Set the error to OK (code = 0) and free any prior message.
+/// Release any owned message and payload on `err`, leaving both null. Does not
+/// touch the code.
+fn release_error_allocations(err: &mut weaveffi_error) {
+    if !err.message.is_null() {
+        // SAFETY: message was allocated via `CString::into_raw` in this module
+        unsafe { drop(CString::from_raw(err.message as *mut c_char)) };
+        err.message = ptr::null();
+    }
+    if !err.payload_ptr.is_null() {
+        free_bytes(err.payload_ptr as *mut u8, err.payload_len);
+        err.payload_ptr = ptr::null();
+    }
+    err.payload_len = 0;
+}
+
+/// Set the error to OK (code = 0) and free any prior message and payload.
 pub fn error_set_ok(out_err: *mut weaveffi_error) {
     if out_err.is_null() {
         return;
     }
     // SAFETY: pointer checked for null above
     let err = unsafe { &mut *out_err };
-    if !err.message.is_null() {
-        // SAFETY: message was allocated via `CString::into_raw` in this module
-        unsafe { drop(CString::from_raw(err.message as *mut c_char)) };
-    }
+    release_error_allocations(err);
     err.code = 0;
-    err.message = ptr::null();
 }
 
-/// Populate an error with the given code and message (copying message).
+/// Populate an error with the given code and message (copying message),
+/// clearing any prior payload.
 // `CString::new` is infallible here because interior NUL bytes are stripped
 // from `message` immediately below, so there is no reachable panic to document.
 #[allow(clippy::missing_panics_doc)]
@@ -77,14 +100,34 @@ pub fn error_set(out_err: *mut weaveffi_error, code: i32, message: &str) {
     }
     // SAFETY: pointer checked for null above
     let err = unsafe { &mut *out_err };
-    if !err.message.is_null() {
-        // SAFETY: message was allocated via `CString::into_raw` in this module
-        unsafe { drop(CString::from_raw(err.message as *mut c_char)) };
-    }
+    release_error_allocations(err);
     err.code = code;
     let owned_message = message.replace('\0', "");
     let cstr = CString::new(owned_message).expect("CString::new sanitized input");
     err.message = cstr.into_raw();
+}
+
+/// Populate an error with a code, message, and an owned payload buffer (the
+/// matched error code's fields serialized in the [`buffer`] format).
+///
+/// An empty `payload` leaves the payload slots null, matching a code that
+/// declares no fields.
+pub fn error_set_with_payload(
+    out_err: *mut weaveffi_error,
+    code: i32,
+    message: &str,
+    payload: Vec<u8>,
+) {
+    error_set(out_err, code, message);
+    if out_err.is_null() || payload.is_empty() {
+        return;
+    }
+    // SAFETY: `out_err` checked for null above.
+    let err = unsafe { &mut *out_err };
+    let mut len = 0usize;
+    // SAFETY: `&mut len` is a writable usize.
+    err.payload_ptr = unsafe { convert::lower_bytes(payload, &mut len) };
+    err.payload_len = len;
 }
 
 /// Maps a producer error onto the ABI's `(code, message)` pair.
@@ -134,6 +177,14 @@ pub trait ErrorReport {
 
     /// The human-readable message written to [`weaveffi_error::message`].
     fn message(&self) -> String;
+
+    /// The serialized payload fields written to
+    /// [`weaveffi_error::payload_ptr`], or an empty vector for a code with no
+    /// fields. The `#[weaveffi::error]` expansion overrides this for variants
+    /// that carry data; the default reports no payload.
+    fn payload(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 impl<E: std::fmt::Display> ErrorReport for E {
@@ -145,8 +196,8 @@ impl<E: std::fmt::Display> ErrorReport for E {
 /// Convenience adapter: map a `Result<T, E>` to `Option<T>` by writing into `out_err`.
 ///
 /// `Err(e)` is reported through [`ErrorReport`], so the generic `-1` code is
-/// used for [`Display`](std::fmt::Display) errors and the domain code for types
-/// that implement [`ErrorReport`] directly.
+/// used for [`Display`](std::fmt::Display) errors and the domain code (plus
+/// any payload) for types that implement [`ErrorReport`] directly.
 pub fn result_to_out_err<T, E: ErrorReport>(
     result: Result<T, E>,
     out_err: *mut weaveffi_error,
@@ -157,7 +208,7 @@ pub fn result_to_out_err<T, E: ErrorReport>(
             Some(value)
         }
         Err(e) => {
-            error_set(out_err, e.code(), &e.message());
+            error_set_with_payload(out_err, e.code(), &e.message(), e.payload());
             None
         }
     }

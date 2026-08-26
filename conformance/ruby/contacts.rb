@@ -1,12 +1,13 @@
 # frozen_string_literal: true
 # Conformance consumer: contacts sample, Ruby target.
 #
-# Drives the 0.5.0 interface surface: ContactBook is a generated Ruby class
-# wrapping the owned C object (released through FFI::AutoPointer), `new` maps
-# to initialize, and methods pass the handle as the leading C argument.
-# Throwing methods raise the typed ContactsError subclasses (InvalidName=1,
-# NotFound=2); non-throwing methods keep the generic WeaveFFI::Error for
-# panics only. The cdylib is selected via WEAVEFFI_LIBRARY.
+# Drives the 0.6.0 value-type surface: Contact is a plain Ruby value class
+# decoded from the value buffer the producer returns (the optional email is
+# nil-able and the list return is a native Array), while ContactBook stays an
+# owned interface handle released through FFI::AutoPointer. Throwing methods
+# raise the typed ContactsError subclasses (InvalidName=1, NotFound=2);
+# non-throwing methods keep the generic WeaveFFI::Error for panics only. The
+# cdylib is selected via WEAVEFFI_LIBRARY.
 
 $LOAD_PATH.unshift(File.join(ENV.fetch("WV_RB"), "lib"))
 require "contacts"
@@ -18,11 +19,15 @@ end
 book = WeaveFFI::ContactBook.new
 
 alice = book.add("Alice", "Smith", "alice@example.com", WeaveFFI::ContactType::WORK)
+expect(alice.is_a?(WeaveFFI::Contact), "add returns a Contact value")
 expect(alice.id.positive?, "alice id positive")
 expect(alice.first_name == "Alice", "first_name")
 expect(alice.last_name == "Smith", "last_name")
 expect(alice.email == "alice@example.com", "email")
 expect(alice.contact_type == WeaveFFI::ContactType::WORK, "contact_type")
+
+# get decodes a fresh snapshot; value classes compare structurally.
+expect(book.get(alice.id) == alice, "get snapshot equals added contact")
 
 # Optional string: a missing email round-trips as nil.
 bob = book.add("Bob", "Jones", nil, WeaveFFI::ContactType::PERSONAL)
@@ -30,6 +35,7 @@ expect(book.get(bob.id).email.nil?, "bob email nil")
 
 expect(book.count == 2, "count == 2")
 everyone = book.list
+expect(everyone.is_a?(Array), "list returns a native Array")
 expect(everyone.length == 2, "list length == 2")
 expect(everyone.map(&:first_name).sort == %w[Alice Bob], "list names")
 

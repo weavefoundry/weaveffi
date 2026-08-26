@@ -42,13 +42,13 @@ named `events` produces `lib/events.rb` and `events.gemspec`;
 | `string`     | `String`           | `:string` (param) / `:pointer` (return) |
 | `bytes`      | `String` (binary)  | `:pointer` + `:size_t`         |
 | `handle`     | `Integer`          | `:uint64`                      |
-| `Struct`     | `StructName`       | `:pointer`                     |
+| `Struct`     | `StructName` (plain class) | value buffer (`:pointer` + `:size_t`) |
 | `Interface`  | `InterfaceName`    | `:pointer`                     |
 | `Enum` (plain) | `Integer`        | `:int32`                       |
-| `Enum` (rich)  | `EnumName`       | `:pointer`                     |
-| `T?`         | `T` or `nil`       | `:pointer` for scalars; same pointer for strings/structs |
-| `[T]`        | `Array`            | `:pointer` + `:size_t`         |
-| `{K: V}`     | `Hash`             | key/value pointer arrays + `:size_t` |
+| `Enum` (rich)  | `EnumName` (nested variant classes) | value buffer (`:pointer` + `:size_t`) |
+| `T?`         | `T` or `nil`       | value buffer; `Interface?` stays a nullable `:pointer` |
+| `[T]`        | `Array`            | value buffer (`:pointer` + `:size_t`) |
+| `{K: V}`     | `Hash`             | value buffer (`:pointer` + `:size_t`) |
 | `iter<T>`    | `Enumerator` (lazy) | `:pointer` iterator handle    |
 
 Booleans cross as `:int32` (`0`/`1`); the wrapper converts both
@@ -57,7 +57,7 @@ directions.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -128,40 +128,37 @@ module ContactType
 end
 ```
 
-Structs become classes wrapping an `FFI::AutoPointer` so the C
-destructor is called when Ruby garbage-collects the wrapper:
+Structs become plain Ruby value classes: one `attr_reader` per field, a
+keyword-argument initializer, and structural equality. They hold no
+native pointer and declare no C symbols:
 
 ```ruby
-class ContactPtr < FFI::AutoPointer
-  def self.release(ptr)
-    WeaveFFI.weaveffi_contacts_Contact_destroy(ptr)
-  end
-end
-
+# A contact record
 class Contact
-  attr_reader :handle
+  attr_reader :id
+  attr_reader :first_name
+  attr_reader :email
+  attr_reader :contact_type
 
-  def initialize(handle)
-    @handle = ContactPtr.new(handle)
+  def initialize(id:, first_name:, email:, contact_type:)
+    @id = id
+    @first_name = first_name
+    @email = email
+    @contact_type = contact_type
   end
 
-  def first_name
-    result = WeaveFFI.weaveffi_contacts_Contact_get_first_name(@handle)
-    return '' if result.null?
-    str = result.read_string
-    WeaveFFI.weaveffi_free_string(result)
-    str
-  end
-
-  def email
-    result = WeaveFFI.weaveffi_contacts_Contact_get_email(@handle)
-    return nil if result.null?
-    str = result.read_string
-    WeaveFFI.weaveffi_free_string(result)
-    str
+  # Structural equality over every field.
+  def ==(other)
+    # ...
   end
 end
 ```
+
+A `Contact` crosses the ABI serialized in the
+[value-buffer format](../reference/value-buffers.md) as a single
+pointer-plus-length pair; the module carries private
+`_wv_write_contact`/`_wv_read_contact` codec helpers over a small buffer
+writer and reader.
 
 Functions are snake_case class methods on the module, with the IDL
 module prefix stripped by default (a `kv.open_store` function surfaces
@@ -172,18 +169,25 @@ Ruby generator config (or under `[global]`) to keep prefixed names:
 ```ruby
 def self.create_contact(first_name, email, contact_type)
   err = ErrorStruct.new
+  # Optionals are buffered: pack the argument into a value buffer that
+  # the producer borrows for the duration of the call.
+  email_buf = ... # generated pack code writes the optional into a binary String
   result = weaveffi_contacts_create_contact(
-    first_name, email, contact_type, err)
+    first_name, email_buf, email_buf.bytesize, contact_type, err)
   check_error!(err)
   result
 end
 
 def self.get_contact(id)
   err = ErrorStruct.new
-  result = weaveffi_contacts_get_contact(id, err)
+  out_len = FFI::MemoryPointer.new(:size_t)
+  result = weaveffi_contacts_get_contact(id, out_len, err)
   check_error!(err)
-  raise Error.new(-1, 'null pointer') if result.null?
-  Contact.new(result)
+  # Decode the returned value buffer, then release it.
+  len = out_len.read(:size_t)
+  value = _wv_read_contact(WvBufferReader.new(result.read_string(len)))
+  weaveffi_free_bytes(result, len)
+  value
 end
 ```
 
@@ -191,7 +195,10 @@ The shared error machinery:
 
 ```ruby
 class ErrorStruct < FFI::Struct
-  layout :code, :int32, :message, :pointer
+  layout :code, :int32,
+         :message, :pointer,
+         :payload_ptr, :pointer,
+         :payload_len, :size_t
 end
 
 class Error < StandardError
@@ -261,6 +268,11 @@ classes: their wrappers call `check_kv_error!`, so you can rescue
 `Kvstore::KvError::KeyNotFound` for one code or `Kvstore::KvError` for
 the whole domain. A callable without `throws` uses the generic
 `check_error!`, which raises `Error` only if the producer misbehaves.
+
+An error code that declares payload `fields:` carries them serialized
+in the error's payload buffer (`payload_ptr`/`payload_len` on
+`ErrorStruct`); the domain factory decodes them into attributes on the
+raised error object before `weaveffi_error_clear` releases the buffer.
 
 ## Interfaces
 
@@ -351,99 +363,77 @@ store.destroy
 
 A rich (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style `Enum` crosses as a bare `:int32` discriminant; a
-rich enum instead lowers to an **opaque object handle**, so the
-generator emits a wrapper class with the same ownership model as a
-struct wrapper, an `FFI::AutoPointer` (`ShapePtr`) that calls the C
-`_destroy` on garbage collection.
+rich enum instead becomes a plain class hierarchy: a base class with a
+`tag` reader plus one nested subclass per variant carrying that
+variant's fields as attributes, each pinning its `TAG` constant. Rich
+enums declare no C symbols; values cross the ABI serialized in value
+buffers as an `i32` tag followed by the active variant's fields.
 
 For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
-count: u8 }`, the generated class carries one discriminant constant per
-variant, a `tag` reader, a `self.<variant>` factory per variant, and a
-field reader per payload:
+count: u8 }`, the generator emits:
 
 ```ruby
-class ShapePtr < FFI::AutoPointer
-  def self.release(ptr)
-    WeaveFFI.weaveffi_shapes_Shape_destroy(ptr)
-  end
-end
-
 # An algebraic shape (sum type with associated data)
 class Shape
-  attr_reader :handle
-
-  def initialize(handle)
-    @handle = ShapePtr.new(handle)
+  # The active variant's integer tag.
+  def tag
+    self.class::TAG
   end
 
-  # Variant discriminants returned by #tag
-  EMPTY = 0
-  CIRCLE = 1
-  RECTANGLE = 2
-  LABELED = 3
-
-  def tag
-    WeaveFFI.weaveffi_shapes_Shape_tag(@handle)
+  # The empty shape
+  class Empty < Shape
+    TAG = 0
   end
 
   # A circle with a radius
-  def self.circle(radius)
-    err = WeaveFFI::ErrorStruct.new
-    result = WeaveFFI.weaveffi_shapes_Shape_Circle_new(radius, err)
-    WeaveFFI.check_error!(err)
-    new(result)
+  class Circle < Shape
+    TAG = 1
+
+    # Radius in points
+    attr_reader :radius
+
+    def initialize(radius:)
+      @radius = radius
+    end
   end
 
   # A labeled shape with a small count
-  def self.labeled(label, count)
-    err = WeaveFFI::ErrorStruct.new
-    result = WeaveFFI.weaveffi_shapes_Shape_Labeled_new(label, count, err)
-    WeaveFFI.check_error!(err)
-    new(result)
-  end
+  class Labeled < Shape
+    TAG = 3
 
-  # Radius in points
-  def circle_radius
-    WeaveFFI.weaveffi_shapes_Shape_Circle_get_radius(@handle)
-  end
+    attr_reader :label
+    attr_reader :count
 
-  def labeled_count
-    WeaveFFI.weaveffi_shapes_Shape_Labeled_get_count(@handle)
+    def initialize(label:, count:)
+      @label = label
+      @count = count
+    end
   end
 end
 ```
 
-The remaining surface follows the same pattern: factories
-`Shape.empty`, `Shape.circle`, `Shape.rectangle`, and `Shape.labeled`;
-readers `circle_radius`, `rectangle_width`, `rectangle_height`,
-`labeled_label`, and `labeled_count`. Each maps to a
-`weaveffi_shapes_Shape_<Variant>_new` /
-`weaveffi_shapes_Shape_<Variant>_get_<field>` symbol, and
-`weaveffi_shapes_Shape_tag` returns the discriminant.
-
-Construct a couple of variants, read the tag and a field, then pass the
-wrapper to a module function:
+Construct variants directly and branch with `case`/`when` on the class:
 
 ```ruby
 require 'weaveffi'
 
-circle = WeaveFFI::Shape.circle(2.0)
-labeled = WeaveFFI::Shape.labeled('unit', 3)
+circle = WeaveFFI::Shape::Circle.new(radius: 2.0)
+labeled = WeaveFFI::Shape::Labeled.new(label: 'unit', count: 3)
 
-if circle.tag == WeaveFFI::Shape::CIRCLE
-  puts circle.circle_radius          # 2.0
+case circle
+when WeaveFFI::Shape::Circle
+  puts circle.radius                 # 2.0
 end
-puts labeled.labeled_count           # 3
+puts labeled.count                   # 3
 
-puts WeaveFFI.describe(circle)       # render via the C ABI
-bigger = WeaveFFI.scale(circle, 3.0) # returns a new Shape
+puts WeaveFFI.describe(circle)       # packs the buffer via the C ABI
+bigger = WeaveFFI.scale(circle, 3.0) # returns a new Shape value
 ```
 
-**Ownership:** the `ShapePtr` `FFI::AutoPointer` calls
-`weaveffi_shapes_Shape_destroy` when Ruby garbage-collects the wrapper;
-call `#destroy` for deterministic cleanup. The `Shape` returned by
-`WeaveFFI.scale` is managed the same way.
+Values are plain Ruby data; there's no native handle and nothing to
+destroy. The private `_wv_write_shape`/`_wv_read_shape` codec helpers
+write and read the tagged wire format.
 
 ## Build instructions
 
@@ -493,15 +483,15 @@ gem_name = "my_bindings"
 - **Bytes:** an `FFI::MemoryPointer` is allocated for inputs; outputs
   are copied with `read_string(len)` and the returned buffer is
   released with `weaveffi_free_bytes`.
-- **Structs and interfaces:** wrappers hold an `FFI::AutoPointer`
-  whose `release` callback invokes the C `_destroy` function on GC.
-  Use the explicit `destroy` method for deterministic cleanup.
-- **Lists and maps:** elements are copied into a Ruby `Array` or
-  `Hash`; string elements are freed individually with
-  `weaveffi_free_string`, then the backing pointer buffers are freed
-  with `weaveffi_free_bytes`.
-- **Boxed optional scalars:** an absent value is `nil`; a present one
-  is dereferenced and the box is freed with `weaveffi_free_bytes`.
+- **Interfaces:** wrappers hold an `FFI::AutoPointer` whose `release`
+  callback invokes the C `_destroy` function on GC. Use the explicit
+  `destroy` method for deterministic cleanup.
+- **Buffered values (structs, rich enums, optionals, lists, maps):**
+  parameters are packed into a binary `String` value buffer that the
+  producer borrows for the duration of the call; returns are copied
+  into Ruby memory with `read_string(len)`, released with
+  `weaveffi_free_bytes`, and decoded with the `_wv_read_*` helper.
+  Nothing to destroy afterward.
 
 ## Async support
 
@@ -519,15 +509,15 @@ raised object is the typed class:
 def self.run_task(name)
   queue = Queue.new
   callback = FFI::Function.new(
-    :void, [:pointer, :pointer, :pointer]
-  ) do |_context, err_ptr, result|
+    :void, [:pointer, :pointer, :pointer, :size_t]
+  ) do |_context, err_ptr, result_ptr, result_len|
     err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
     if err && err[:code] != 0
       # ... read code/message, weaveffi_error_clear ...
       queue << task_error_from(code, msg)
     else
-      # ... null-pointer guard ...
-      queue << TaskResult.new(result)
+      # TaskResult is a record: decode the borrowed value buffer.
+      queue << _wv_read_task_result(WvBufferReader.new(result_ptr.read_string(result_len)))
     end
   end
   weaveffi_tasks_run_task_async(name, callback, FFI::Pointer::NULL)
@@ -550,15 +540,15 @@ The local `callback` reference keeps the `FFI::Function` alive until
 `queue.pop` returns, so the completion callback cannot be collected
 mid-flight.
 
-Result ownership follows the async contract: string, bytes, array,
-map, and boxed optional scalar results are borrowed for the callback's
-duration, so the callback copies them into Ruby values (`read_string`,
-element reads) before it returns and never frees them; the producer
-does after the callback returns. Object results (records, rich enums,
-interfaces, including optional ones) are the exception: the callback
-receives ownership, and the wrapper adopts the pointer into its
-`FFI::AutoPointer` (as `TaskResult.new(result)` does above), so the
-destructor runs on GC or an explicit `destroy`.
+Result ownership follows the async contract: string, bytes, and
+buffered results (records, rich enums, optionals, arrays, and maps,
+arriving as a pointer-plus-length pair) are borrowed for the callback's
+duration, so the callback copies or decodes them into Ruby values
+before it returns and never frees them; the producer does after the
+callback returns. An owned interface result is the exception: the
+callback receives ownership, and the wrapper adopts the pointer into
+its `FFI::AutoPointer`, so the destructor runs on GC or an explicit
+`destroy`.
 
 For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`
@@ -683,8 +673,9 @@ end
 The producer iterator launches on the first pull, so a launch error
 raises then, not when the method returns. Each string element is
 copied with `read_string` and freed with `weaveffi_free_string`;
-record elements are adopted by their `FFI::AutoPointer`-backed
-wrapper. The `ensure` block destroys the handle exactly once, whether
+a buffered element arrives as a value buffer that's decoded with the
+`_wv_read_*` helper and released with `weaveffi_free_bytes`. The
+`ensure` block destroys the handle exactly once, whether
 iteration exhausts, raises, or is abandoned early (Ruby runs `ensure`
 when the enumerator's fiber is torn down, for example after `break`).
 

@@ -29,7 +29,7 @@ evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
 | **Type system**                    |              |            |              |              |          |             |
 | Primitives + `string`              | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
 | `bytes` / byte slices              | ✓            | ✓          | ✓ (raw)      | ✓            | partial  | ✓           |
-| Structs                            | ✓ (opaque + getters) | ✓ (records & objects) | ✓ (`#[repr(C)]`) | ✓ (opaque) | ✓ | ✓ |
+| Structs                            | ✓ (idiomatic value types via value buffers) | ✓ (records & objects) | ✓ (`#[repr(C)]`) | ✓ (opaque) | ✓ | ✓ |
 | Interfaces (objects w/ methods)    | ✓ (constructors, methods, statics, implicit destroy) | ✓ (objects) | ✗ | ✓ (opaque types w/ methods) | ✓ (classes) | ✓ (C++ classes) |
 | Typed error domains                | ✓ (per-module codes, opt-in `throws`, native error types) | ✓ (error enums) | ✗ | partial (`Result`) | ✗ | ✗ |
 | Enums w/ explicit discriminants    | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |

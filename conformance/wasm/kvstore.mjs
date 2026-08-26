@@ -1,19 +1,20 @@
 // Conformance consumer: kvstore sample, Wasm (wasm32-unknown-unknown) target.
 //
 // Drives the generated ESM bindings (loadWeaveffiWasm) against the real producer
-// compiled to wasm. Exercises the 0.5.0 surface end to end: the `Store`
+// compiled to wasm. Exercises the 0.6.0 surface end to end: the `Store`
 // interface class (static `open` factory, instance methods passing the handle
 // as the implicit self argument, the `defaultCapacity` static, and `free()`
 // through the destroy symbol), the per-module typed error domain (`KvError`
 // subclasses with stable codes, thrown by `throws` wrappers), plus every
-// marshalling path the generator emits: NUL-terminated string args, the bytes
-// getter (Entry.value), the optional-scalar getter (Entry.expires_at), the
-// list getter (Entry.tags), the map getter (Entry.metadata over parallel
-// key/value arrays), a lazy iterator-backed string stream (listKeys), the
-// fluent builder + static create factory, the kv.stats submodule taking the
-// interface as a parameter, the async, i64-returning compact via the
-// callback trampoline, and the eviction listener via the long-lived
-// function-table trampoline (synchronous, same-thread delivery).
+// marshalling path the generator emits: NUL-terminated string args, records
+// decoded from value buffers into plain objects (`Entry` with its bytes,
+// optional-scalar, list, and map fields; `Stats` from the kv.stats
+// submodule), buffered optional parameters in (`i64?` TTL, `string?`
+// prefix), a lazy iterator-backed string stream (listKeys), the async,
+// i64-returning compact via the callback trampoline, and the eviction
+// listener via the long-lived function-table trampoline (synchronous,
+// same-thread delivery). Records are value types now: there is no Entry
+// wrapper class, builder, or create factory.
 //
 // Inputs come from the harness:
 //   WV_WASM: path to the compiled kvstore.wasm
@@ -71,6 +72,8 @@ const store = Store.open('/tmp/conformance-kvstore-wasm');
 expect(store instanceof Store, 'open -> instanceof Store');
 expect(store._handle > 0, 'open -> non-null handle');
 
+// The optional TTL parameter is a buffered `i64?`: null omits, a value
+// encodes the flag byte plus payload.
 const payload = new Uint8Array([1, 2, 3]);
 expect(store.put('alpha', payload, EntryKind.Persistent, null) === true, 'put alpha (no ttl)');
 expect(store.put('beta', payload, EntryKind.Volatile, 3600) === true, 'put beta (with ttl)');
@@ -81,17 +84,20 @@ expect(store.count() === 2n, 'count == 2');
 // Static method on the interface class.
 expect(Store.defaultCapacity() === 1000000n, 'Store.defaultCapacity == 1_000_000');
 
-// Iterator-backed list-of-string return, drained eagerly into an array.
+// Iterator-backed string stream, drained eagerly into an array. The
+// optional prefix is a buffered `string?`.
 const keys = [...store.listKeys(null)].sort();
 expect(keys.length === 2 && keys[0] === 'alpha' && keys[1] === 'beta', 'listKeys values');
 const filtered = [...store.listKeys('al')];
 expect(filtered.length === 1 && filtered[0] === 'alpha', 'listKeys prefix filter');
 
-// Struct return + getters over every complex field type.
+// get -> buffered `Entry?` decoded into a plain object covering every
+// complex field type: bytes, optional scalar, list, and map.
 const alpha = store.get('alpha');
 expect(alpha && alpha.key === 'alpha', 'get alpha.key');
 expect(alpha.id > 0n, 'alpha.id positive (i64)');
 expect(alpha.value instanceof Uint8Array && alpha.value.length === 3 && alpha.value[0] === 1 && alpha.value[2] === 3, 'alpha.value bytes');
+expect(alpha.created_at > 0n, 'alpha.created_at positive (i64)');
 expect(alpha.expires_at === null, 'alpha.expires_at null (optional scalar absent)');
 expect(Array.isArray(alpha.tags) && alpha.tags.length === 0, 'alpha.tags empty list');
 expect(alpha.metadata && typeof alpha.metadata === 'object' && Object.keys(alpha.metadata).length === 0, 'alpha.metadata empty map');
@@ -112,32 +118,20 @@ expect(store.legacyPut('legacy', new Uint8Array([7])) === true, 'legacyPut inser
 expect(store.delete('legacy') === true, 'delete existing -> true');
 expect(store.delete('legacy') === false, 'delete missing -> false');
 
-// Submodule function taking the interface as a borrowed parameter.
+// Submodule function taking the interface as a borrowed parameter; the
+// Stats record decodes into a plain object of BigInt fields.
 const st = api.kv.stats.getStats(store);
 expect(st.total_entries === 2n, 'stats.total_entries == 2');
 expect(st.total_bytes === 6n, 'stats.total_bytes == 6');
+expect(st.expired_entries === 0n, 'stats.expired_entries == 0');
 
-// Builder: round-trips list + map + bytes + optional scalar through C arrays.
-const built = api.kv.Entry.builder()
-  .id(7).key('built').value(new Uint8Array([9, 9])).created_at(123)
-  .expires_at(456).tags(['x', 'y']).metadata({ a: '1', b: '2' }).build();
-expect(built.key === 'built', 'built.key');
-expect(built.id === 7n, 'built.id (i64)');
-expect(built.value.length === 2 && built.value[1] === 9, 'built.value bytes');
-expect(built.expires_at === 456n, 'built.expires_at present');
-expect(JSON.stringify(built.tags) === JSON.stringify(['x', 'y']), 'built.tags list round-trip');
-expect(built.metadata.a === '1' && built.metadata.b === '2', 'built.metadata map round-trip');
-
-// Static create factory with the same complex inputs; optional omitted via null.
-const created = api.kv.Entry.create(11, 'made', new Uint8Array([5]), 100, null, ['t'], { k: 'v' });
-expect(created.key === 'made', 'created.key');
-expect(created.expires_at === null, 'created.expires_at null');
-expect(created.tags.length === 1 && created.tags[0] === 't', 'created.tags');
-expect(created.metadata.k === 'v', 'created.metadata');
-
-// Async i64 return via the registered callback trampoline.
+// Async i64 return via the registered callback trampoline. The wasm build
+// pins the clock, so a zero TTL is expired immediately and compact
+// deterministically reclaims that entry's 3 value bytes.
+expect(store.put('expired', payload, EntryKind.Volatile, 0) === true, 'put expired (ttl 0)');
 const reclaimed = await store.compact();
-expect(typeof reclaimed === 'bigint', 'compact -> BigInt');
+expect(reclaimed === 3n, `compact reclaimed 3 bytes (got ${reclaimed})`);
+expect(store.count() === 2n, 'count == 2 after compact');
 
 // clear drops every entry.
 store.clear();

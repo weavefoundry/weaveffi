@@ -1,14 +1,13 @@
 // Conformance consumer: shapes sample, Wasm (wasm32-unknown-unknown) target.
 //
 // Drives the generated ESM bindings (loadWeaveffiWasm) against the real producer
-// compiled to wasm, exercising rich (algebraic) enums end to end: the opaque
-// `Shape` wrapper class, its `tag` discriminant reader + `Tag` map, every
-// per-variant static factory (Empty / Circle / Rectangle / Labeled), the
-// namespaced per-variant field getters (camelCase, e.g. circleRadius), and the
-// `free()` cleanup. Also covers the free functions that take and return a rich
-// enum (describe / scale) plus the expanded numerics (f32 fields, u8 field,
-// list<u8> in, u64 out as BigInt). Mirrors conformance/c/shapes.c and
-// conformance/cpp/shapes.cpp.
+// compiled to wasm, exercising rich (algebraic) enums as value types: plain
+// tagged objects ({ tag: 'Circle', radius: 2.5 }) serialized into value
+// buffers at the boundary, with no wrapper class, factories, or free().
+// Covers every variant shape (unit, f64, two f32s, string + u8) through
+// describe (enum in, string out) and scale (enum in and out), the consumer-side
+// rejection of an unknown variant tag, plus the expanded numerics ([u8] in,
+// u64 out as BigInt). Mirrors conformance/c/shapes.c.
 //
 // Inputs come from the harness:
 //   WV_WASM: path to the compiled shapes.wasm
@@ -43,49 +42,50 @@ function approx(a, b, eps) {
 // Plain C-style enum still crosses by value as a frozen discriminant object.
 expect(mod.Channel && mod.Channel.Green === 1, 'plain enum Channel exported');
 
-const Shape = api.shapes.Shape;
-const Tag = Shape.Tag;
-expect(Tag && Tag.Empty === 0 && Tag.Labeled === 3, 'Shape.Tag discriminant map');
-
-// Empty (unit variant): tag only, no payload.
-const empty = Shape.empty();
-expect(empty && empty._handle > 0, 'Shape.empty -> handle');
-expect(empty.tag === Tag.Empty, 'empty.tag === Empty');
-
-// Circle (f64 payload).
-const circle = Shape.circle(2.5);
-expect(circle.tag === Tag.Circle, 'circle.tag === Circle');
-expect(approx(circle.circleRadius, 2.5, 1e-9), 'circle.circleRadius == 2.5');
-
-// Rectangle (two f32 payloads).
-const rect = Shape.rectangle(3.0, 4.0);
-expect(rect.tag === Tag.Rectangle, 'rect.tag === Rectangle');
-expect(approx(rect.rectangleWidth, 3.0, 1e-6), 'rect.rectangleWidth == 3.0');
-expect(approx(rect.rectangleHeight, 4.0, 1e-6), 'rect.rectangleHeight == 4.0');
-
-// Labeled (string + u8 payload).
-const labeled = Shape.labeled('hex', 6);
-expect(labeled.tag === Tag.Labeled, 'labeled.tag === Labeled');
-expect(labeled.labeledLabel === 'hex', 'labeled.labeledLabel == "hex"');
-expect(labeled.labeledCount === 6, 'labeled.labeledCount == 6');
-
-// describe: rich enum in, string out; dispatches on the active variant.
+// describe: rich enum in (a plain tagged object), string out; dispatches on
+// the active variant.
+const circle = { tag: 'Circle', radius: 2.5 };
 expect(api.shapes.describe(circle) === 'circle(r=2.5)', 'describe(circle)');
+expect(api.shapes.describe({ tag: 'Empty' }) === 'empty', 'describe(empty)');
+expect(
+  /rect/.test(api.shapes.describe({ tag: 'Rectangle', width: 3.0, height: 4.0 })),
+  'describe(rectangle)'
+);
+expect(
+  /hex/.test(api.shapes.describe({ tag: 'Labeled', label: 'hex', count: 6 })),
+  'describe(labeled)'
+);
 
-// scale: rich enum in and out.
+// scale: rich enum in and out. The circle's f64 payload round-trips scaled.
 const big = api.shapes.scale(circle, 4.0);
-expect(big.tag === Tag.Circle, 'scaled.tag === Circle');
-expect(approx(big.circleRadius, 10.0, 1e-9), 'scaled.circleRadius == 10.0');
+expect(big.tag === 'Circle', "scaled.tag === 'Circle'");
+expect(approx(big.radius, 10.0, 1e-9), 'scaled.radius == 10.0');
 
-// numerics: list<u8> in, u64 out (BigInt); lowerCamelCase wrapper name.
+// Rectangle: two f32 payloads survive the round trip (scale by 2).
+const rect2 = api.shapes.scale({ tag: 'Rectangle', width: 3.0, height: 4.0 }, 2.0);
+expect(rect2.tag === 'Rectangle', "rect2.tag === 'Rectangle'");
+expect(approx(rect2.width, 6.0, 1e-6), 'rect2.width == 6.0');
+expect(approx(rect2.height, 8.0, 1e-6), 'rect2.height == 8.0');
+
+// Labeled: the string + u8 payload passes through scale unchanged.
+const labeled2 = api.shapes.scale({ tag: 'Labeled', label: 'hex', count: 6 }, 9.0);
+expect(labeled2.tag === 'Labeled', "labeled2.tag === 'Labeled'");
+expect(labeled2.label === 'hex', "labeled2.label == 'hex'");
+expect(labeled2.count === 6, 'labeled2.count == 6');
+
+// Empty: a unit variant is tag-only in both directions.
+const empty2 = api.shapes.scale({ tag: 'Empty' }, 3.0);
+expect(empty2.tag === 'Empty', "empty2.tag === 'Empty'");
+
+// An unknown variant tag is a consumer-side marshalling failure, rejected
+// before anything crosses the boundary.
+let tagErr = null;
+try { api.shapes.describe({ tag: 'Pentagon' }); } catch (e) { tagErr = e; }
+expect(tagErr instanceof mod.WeaveFFIError, 'unknown tag -> WeaveFFIError');
+
+// numerics: [u8] in (canonicalized to bytes), u64 out (BigInt);
+// lowerCamelCase wrapper name.
 expect(api.shapes.sumBytes([250, 250, 250, 250]) === 1000n, 'sumBytes == 1000n');
-
-// Cleanup: release every producer-owned handle exactly once.
-big.free();
-labeled.free();
-rect.free();
-circle.free();
-empty.free();
 
 if (failures === 0) {
   console.log('wasm/shapes: OK');

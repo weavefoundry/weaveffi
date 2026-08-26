@@ -44,7 +44,7 @@ via `CString::into_raw`. The consumer must free them with
 `weaveffi_free_string`.
 
 ```c
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 const char* echoed = weaveffi_calculator_echo("hello", &err);
 if (err.code) {
     fprintf(stderr, "%s\n", err.message);
@@ -82,31 +82,38 @@ process_data(buf, out_len);
 weaveffi_free_bytes((uint8_t*)buf, out_len);
 ```
 
-### Lists, maps, and boxed optionals
+### Buffered values: records, rich enums, optionals, lists, and maps
 
-Composite returns owe two levels of release: one per element, then one
-for the buffer itself.
+Records, rich enums, optionals (except `Interface?`), lists, and maps
+cross the boundary by value as one serialized
+[value buffer](../reference/value-buffers.md) each, no matter how deeply
+they nest, so their ownership rules are exactly the byte-buffer rules:
 
-- **Lists** (`[T]`) return `T* + out_len`. Free each element per its
-  element plan (below), then release the array buffer with
-  `weaveffi_free_bytes(ptr, len * sizeof(T))`.
-- **Maps** (`{K:V}`) return parallel `out_keys` / `out_values` /
-  `out_len` buffers. Free each key and each value per its element plan,
-  then release both parallel arrays with `weaveffi_free_bytes`.
-- **Optional scalars** (`i32?`, `f64?`, ...) return a boxed pointer
-  (`T*`, null meaning none). Dereference the value, then release the
-  box with `weaveffi_free_bytes(ptr, sizeof(T))`. Optional pointer
-  returns (`string?`, `Contact?`) reuse the inner type's plan; a null
-  return simply means there is nothing to free.
+- **As a parameter**, the caller owns the encoding, keeps it alive for
+  the duration of the call, and frees (or reuses) it afterward; the
+  callee never frees it.
+- **As a return**, the producer allocates the encoding and hands it back
+  as a `const uint8_t*` return value plus a `size_t* out_len`
+  out-parameter. The consumer decodes it, then releases it with a single
+  `weaveffi_free_bytes(ptr, len)`. There are no per-element frees: the
+  strings, nested records, and inner collections all live inside the one
+  buffer.
 
-The per-element plan is:
+```c
+size_t out_len = 0;
+const uint8_t* buf = weaveffi_contacts_load(42, &out_len, &err);
+if (err.code) {
+    weaveffi_error_clear(&err);
+    return 1;
+}
 
-| Element type                  | Release owed per element             |
-|-------------------------------|--------------------------------------|
-| Scalar, `bool`, C-style enum, handle | nothing (by value)            |
-| `string`                      | `weaveffi_free_string`               |
-| Record or rich enum           | the type's `_destroy` symbol (the consumer owns each element) |
-| Optional of the above         | the inner plan; skip null slots      |
+/* decode the record's fields out of buf ... */
+weaveffi_free_bytes((uint8_t*)buf, out_len);
+```
+
+Generated wrappers hide the encoding entirely: they pack and unpack the
+buffer into an idiomatic value type (a data class, struct, or sealed
+class hierarchy) and free the returned buffer for you.
 
 ### Iterator elements
 
@@ -115,9 +122,10 @@ buffer, so there is nothing to free on launch. Ownership flows per
 step:
 
 - Each `_next` call writes an element the consumer now owns. After
-  copying it, free it per the element plan above (`weaveffi_free_string`
-  for strings, `_destroy` for record or rich-enum elements, nothing for
-  by-value elements).
+  copying or decoding it, free it per its type: `weaveffi_free_string`
+  for strings, `weaveffi_free_bytes` for bytes and for buffered
+  elements (records, rich enums, composites), nothing for by-value
+  elements.
 - The handle is released with the iterator's own `_destroy` symbol,
   exactly once: eagerly on exhaustion, and from the wrapper's disposal
   idiom (RAII destructor, finalizer, `close()`, generator cleanup) when
@@ -134,28 +142,25 @@ receives an owned value and owes the matching release call after
 copying it.
 
 **Async results invert the buffer rule.** The buffers passed to an
-async completion callback (strings, bytes, arrays, boxed optional
-scalars) are borrowed: they stay owned by the producer, are valid only
-for the callback's duration, and are freed by the producer after the
-callback returns. The consumer copies inside the callback and must not
-free them. Owned-object results (records, rich enums, and interfaces,
-including optionals of them) are the exception in both directions: the
+async completion callback (strings, bytes, and the serialized value
+buffers of buffered results) are borrowed: they stay owned by the
+producer, are valid only for the callback's duration, and are freed by
+the producer after the callback returns. The consumer copies or decodes
+inside the callback and must not free them. Owned interface results
+(including `Interface?`) are the exception in both directions: the
 callback receives ownership, adopts the pointer, and eventually calls
-`_destroy`, exactly as a synchronous object return would. See
+`_destroy`, exactly as a synchronous interface return would. See
 [Result ownership and threading](async.md#result-ownership-and-threading).
 
-### Struct and interface lifecycle
+### Interface lifecycle
 
-Structs and interface objects are opaque on the consumer side. The
-lifecycle is:
+Interface objects are opaque on the consumer side. The lifecycle is:
 
-1. `*_create` (structs) or a declared constructor such as `*_open`
-   (interfaces) allocates and returns a pointer; the consumer owns it.
+1. A declared constructor such as `*_open` allocates and returns a
+   pointer; the consumer owns it.
 2. `*_destroy` frees the object. Call exactly once.
-3. `*_get_<field>` getters read struct fields, and interface methods
-   take the receiver as their leading argument. Primitive getters
-   (`i32`, `f64`, `bool`) return values directly. String/bytes getters
-   return **new owned copies** that must be freed.
+3. Methods take the receiver as their leading argument and borrow it
+   for the duration of the call.
 
 Functions that take an interface or `handle<T>` parameter always
 **borrow** it: the producer must never free a receiver it is passed,
@@ -167,39 +172,26 @@ an ordinary function causes a double-free as soon as the wrapper is
 garbage collected.
 
 ```c
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 
-weaveffi_contacts_Contact* contact = weaveffi_contacts_Contact_create(
-    1, "Alice", "Smith", "alice@example.com",
-    weaveffi_contacts_ContactType_Personal,
-    &err);
+weaveffi_kv_Store* store = weaveffi_kv_Store_open("/tmp/db", &err);
 if (err.code) {
     weaveffi_error_clear(&err);
     return 1;
 }
 
-int64_t id = weaveffi_contacts_Contact_get_id(contact);
-const char* name = weaveffi_contacts_Contact_get_first_name(contact);
-weaveffi_free_string(name);
+int64_t n = weaveffi_kv_Store_count(store, &err);
 
-weaveffi_contacts_Contact_destroy(contact);
+weaveffi_kv_Store_destroy(store);
 ```
 
-The generated Swift wrapper invokes `_destroy` from `deinit` and frees
-returned strings with `defer`:
+The generated Swift wrapper invokes `_destroy` from `deinit`:
 
 ```swift
-public class Contact {
+public class Store {
     let ptr: OpaquePointer
     init(ptr: OpaquePointer) { self.ptr = ptr }
-    deinit { weaveffi_contacts_Contact_destroy(ptr) }
-
-    public var first_name: String {
-        let raw = weaveffi_contacts_Contact_get_first_name(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
+    deinit { weaveffi_kv_Store_destroy(ptr) }
 }
 ```
 
@@ -210,7 +202,7 @@ failure Rust writes a non-zero `code` and a Rust-allocated `message`.
 Clearing the error frees the message:
 
 ```c
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 
 int32_t result = weaveffi_calculator_div(10, 0, &err);
 if (err.code) {
@@ -255,17 +247,14 @@ queue.sync {
 |--------------------|-----------|----------------------------|--------------------------------------|
 | Returned string    | Rust      | `weaveffi_free_string`     | Every `const char*` return           |
 | Returned bytes     | Rust      | `weaveffi_free_bytes`      | Pass both pointer and length         |
-| Returned list      | Rust      | element plan, then `weaveffi_free_bytes` | Free each element first, then the buffer (`len * sizeof(T)`) |
-| Returned map       | Rust      | element plans, then `weaveffi_free_bytes` twice | Keys and values first, then both parallel arrays |
-| Boxed optional scalar | Rust   | `weaveffi_free_bytes`      | `sizeof(T)`; null means none, nothing to free |
-| Struct instance    | Rust      | `*_destroy`                | Call exactly once                    |
+| Returned buffered value (record, rich enum, optional, list, map) | Rust | `weaveffi_free_bytes` | One serialized buffer; decode, then free once with `out_len` |
+| Buffered parameter | Caller    | none owed to Rust          | Borrowed for the call; the caller keeps ownership |
 | Interface instance | Rust      | `*_destroy`                | Call exactly once; methods borrow    |
-| String from getter | Rust      | `weaveffi_free_string`     | Getter returns an owned copy         |
 | Iterator handle    | Rust      | the iterator's `_destroy`  | Exactly once: on exhaustion or abandonment |
-| Iterator element   | Rust      | element plan               | Each `_next` yields a consumer-owned element |
-| Async result buffer | Rust     | none (borrowed)            | Producer frees after the callback returns; copy inside it |
-| Async object result | Rust     | `*_destroy`                | Callback adopts ownership            |
-| Error message      | Rust      | `weaveffi_error_clear`     | Clears code and frees message; idempotent |
+| Iterator element   | Rust      | `weaveffi_free_string` / `weaveffi_free_bytes` / nothing | Each `_next` yields a consumer-owned element |
+| Async result buffer | Rust     | none (borrowed)            | Producer frees after the callback returns; copy or decode inside it |
+| Async interface result | Rust  | `*_destroy`                | Callback adopts ownership            |
+| Error message and payload | Rust | `weaveffi_error_clear`   | Clears code, frees message and payload; idempotent |
 
 ## Pitfalls
 
@@ -277,19 +266,19 @@ queue.sync {
   has already done so).
 - **Wrong length to `weaveffi_free_bytes`**: always free with the
   exact length the C ABI returned in `out_len`.
-- **Forgetting to clear error structs**: `err.message` is
-  Rust-allocated; failing to call `weaveffi_error_clear` after a
-  non-zero code leaks that string.
+- **Forgetting to clear error structs**: `err.message` and
+  `err.payload_ptr` are Rust-allocated; failing to call
+  `weaveffi_error_clear` after a non-zero code leaks them.
 - **Calling FFI from multiple threads without synchronisation**: the
   default contract is single-threaded; synchronise externally if you
   need parallelism.
 - **Manually freeing pointers passed in as borrowed parameters**:
   borrowed inputs (`&str`, `&[u8]`, `const T*`) are owned by the
   caller and must not be passed to `weaveffi_free_*`.
-- **Freeing only the buffer of a list of strings or objects**: a
-  returned `[string]` or `[Contact]` owes one release per element
-  *before* the buffer release; skipping the element pass leaks every
-  entry.
+- **Freeing pieces of a returned buffer**: a returned `[string]` or
+  `[Contact]` is one serialized buffer; the strings and records you
+  decode out of it are copies. Free the buffer once with
+  `weaveffi_free_bytes(ptr, out_len)` and nothing else.
 - **Freeing an async result buffer**: buffers passed to a completion
   callback are producer-owned and freed by the producer after the
   callback returns. Copy inside the callback; freeing there

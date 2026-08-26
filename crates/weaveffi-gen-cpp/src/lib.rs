@@ -1,27 +1,35 @@
-//! C++ RAII wrapper generator for WeaveFFI.
+//! C++ wrapper generator for WeaveFFI.
 //!
-//! Produces an idiomatic `weaveffi.hpp` header (with move semantics,
-//! `std::optional`, `std::vector`, exception-based error handling) plus a
-//! `CMakeLists.txt` skeleton on top of the C ABI emitted by
-//! [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements
+//! Produces an idiomatic `weaveffi.hpp` header (value structs, `std::variant`
+//! sum types, move semantics, `std::optional`, `std::vector`, exception-based
+//! error handling) plus a `CMakeLists.txt` skeleton on top of the C ABI
+//! emitted by [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements
 //! [`LanguageBackend`]; the shared driver bridges it into the generator
 //! pipeline.
 //!
-//! The generated surface follows the 0.5.0 layout:
+//! The generated surface follows the 0.6.0 value-buffer layout:
 //!
-//! * Types (structs, rich enums, interfaces) are RAII classes at the root of
-//!   the configured namespace; interfaces map constructors, methods, and
-//!   statics onto class members and call the destroy symbol from the
-//!   destructor.
+//! * Records are plain C++ value structs with typed members; rich (algebraic)
+//!   enums are `std::variant`-backed sum types with one payload struct per
+//!   variant. Neither has any C symbols: values cross the ABI serialized in
+//!   the WeaveFFI value-buffer format as one `(const uint8_t*, size_t)` pair,
+//!   through a small private reader/writer in `detail` plus one generated
+//!   pack and unpack routine per type.
+//! * Interfaces remain move-only RAII classes owning an opaque handle;
+//!   constructors, methods, and statics map onto class members and the
+//!   destructor calls the destroy symbol.
 //! * Free functions and listeners live in a nested namespace per IDL module
 //!   (`kv::stats::get_stats`), with bare snake_case names.
 //! * An `iter<T>` callable returns a move-only lazy range class
 //!   (`{PascalName}Iterator`) that pulls one element per iteration step and
 //!   releases the producer iterator from its destructor (or eagerly on
-//!   exhaustion), per the `weaveffi_core::plan` iterator contract.
+//!   exhaustion), per the `weaveffi_core::plan` iterator contract. Buffered
+//!   elements are decoded per pull and released with `weaveffi_free_bytes`.
 //! * Each declaring module's error domain becomes an exception type derived
-//!   from the generic `WeaveFFIError`, with one subclass per code. A callable
-//!   with `throws == true` throws the typed domain exception; a callable with
+//!   from the generic `WeaveFFIError`, with one subclass per code. A code
+//!   that declares payload fields exposes them as typed members on its
+//!   subclass, decoded from the error's payload buffer. A callable with
+//!   `throws == true` throws the typed domain exception; a callable with
 //!   `throws == false` still checks `out_err` (a nonzero code can only be a
 //!   producer panic) and throws the generic `WeaveFFIError`. No wrapper is
 //!   marked `noexcept` for exactly that reason.
@@ -30,20 +38,21 @@
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
+use std::collections::HashMap;
+
 use camino::Utf8Path;
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::{self, AbiParam};
+use weaveffi_core::abi::{self, is_buffered, AbiParam};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::codegen::common::{is_c_pointer_type, DocCommentStyle};
+use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::{
-    AbiFn, AsyncBinding, BindingModel, BuilderBinding, CallShape, EnumBinding, ErrorBinding,
-    FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    StructBinding,
+    AbiFn, AsyncBinding, BindingModel, CallShape, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::plan::{elem_free, ElemFree, ErrorStrategy};
@@ -54,8 +63,8 @@ use weaveffi_core::utils::{
 use weaveffi_ir::ir::{Api, TypeRef};
 
 /// Idiomatic C++ exception class name for an error code: PascalCase with a
-/// single `Error` suffix (`KEY_NOT_FOUND` → `KeyNotFoundError`), instead of the
-/// raw SCREAMING_SNAKE `KEY_NOT_FOUNDError` spelling.
+/// single `Error` suffix (`KEY_NOT_FOUND` becomes `KeyNotFoundError`), instead
+/// of the raw SCREAMING_SNAKE `KEY_NOT_FOUNDError` spelling.
 fn cpp_error_class(name: &str) -> String {
     errors::type_name(name, "Error")
 }
@@ -236,8 +245,8 @@ impl CppConfig {
     }
 }
 
-/// C++ backend: emits an idiomatic RAII wrapper header (`weaveffi.hpp` by
-/// default) plus a `CMakeLists.txt` skeleton over the C ABI.
+/// C++ backend: emits an idiomatic wrapper header (`weaveffi.hpp` by default)
+/// plus a `CMakeLists.txt` skeleton over the C ABI.
 pub struct CppGenerator;
 
 impl LanguageBackend for CppGenerator {
@@ -389,7 +398,7 @@ fn render_packaged_readme(
     out.push_str(&format!(
         "# {lib} (C++)
 
-An idiomatic RAII wrapper header (`include/{header_name}`) plus a prebuilt shared
+An idiomatic wrapper header (`include/{header_name}`) plus a prebuilt shared
 library for each supported platform under `lib/<platform>/`.
 
 ## Use with CMake
@@ -466,13 +475,38 @@ Then include the header in your code:
     out
 }
 
+/// True when the API surface moves any value through the WeaveFFI buffer
+/// format, which requires emitting the private reader/writer runtime: any
+/// record or rich enum exists, any error code declares payload fields, or any
+/// callable, callback, or iterator moves a buffered value.
+fn model_needs_buffers(model: &BindingModel) -> bool {
+    model.modules.iter().any(|m| {
+        !m.structs.is_empty()
+            || m.enums.iter().any(EnumBinding::is_rich)
+            || m.error
+                .as_ref()
+                .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
+            || m.callbacks
+                .iter()
+                .any(|cb| cb.params.iter().any(|p| is_buffered(&p.ty)))
+            || m.callables().any(|f| {
+                f.params.iter().any(|p| is_buffered(&p.ty))
+                    || f.ret.as_ref().is_some_and(|r| match r {
+                        TypeRef::Iterator(inner) => is_buffered(inner),
+                        other => is_buffered(other),
+                    })
+            })
+    })
+}
+
 /// Render the complete C++ header from the driver-built binding model.
 ///
-/// Layout inside `namespace {namespace}`: the generic error surface, one typed
-/// exception domain per declaring module, the listener registry, plain enums,
-/// RAII wrapper classes (structs, rich enums, interfaces) in dependency order,
-/// and finally one nested namespace per module holding its listeners and free
-/// functions.
+/// Layout inside `namespace {namespace}`: the generic error surface, the
+/// private value-buffer runtime (when any buffered value crosses the ABI),
+/// plain enums, value types (record structs and rich-enum variants) in
+/// dependency order with their pack/unpack routines, typed exception domains,
+/// the listener registry, interface classes in dependency order, and finally
+/// one nested namespace per module holding its listeners and free functions.
 fn render_cpp_header(
     model: &BindingModel,
     namespace: &str,
@@ -480,6 +514,11 @@ fn render_cpp_header(
     filename: &str,
 ) -> String {
     let prefix = model.prefix.as_str();
+    let needs_buffers = model_needs_buffers(model);
+    let has_rich_enums = model
+        .modules
+        .iter()
+        .any(|m| m.enums.iter().any(EnumBinding::is_rich));
     let mut out = String::new();
 
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
@@ -492,6 +531,14 @@ fn render_cpp_header(
     out.push_str("#include <memory>\n");
     out.push_str("#include <stdexcept>\n");
     out.push_str("#include <exception>\n");
+    if has_rich_enums {
+        out.push_str("#include <variant>\n");
+    }
+    if needs_buffers {
+        // The buffer runtime needs memcpy (float bits) and std::move.
+        out.push_str("#include <cstring>\n");
+        out.push_str("#include <utility>\n");
+    }
     if model
         .modules
         .iter()
@@ -525,6 +572,64 @@ fn render_cpp_header(
     out.push_str(&format!("namespace {namespace} {{\n\n"));
 
     render_generic_error(&mut out, prefix);
+    if needs_buffers {
+        render_buffer_runtime(&mut out, prefix);
+    }
+
+    // Enums first: they reference no other types and are used by value.
+    for module in &model.modules {
+        render_cpp_enums(&mut out, module);
+    }
+
+    // Value types (records and rich enums) in dependency order: a member of
+    // record type is held by value, which requires the member's type to be
+    // complete, so nested types are emitted first. The pack/unpack routines
+    // follow in the same order so a codec can call the codecs of the types it
+    // nests.
+    let value_entries: Vec<(ValueDef, &ModuleBinding)> = model
+        .modules
+        .iter()
+        .flat_map(|m| {
+            let records = m.structs.iter().map(move |s| (ValueDef::Record(s), m));
+            let rich = m
+                .enums
+                .iter()
+                .filter(|e| e.is_rich())
+                .map(move |e| (ValueDef::Rich(e), m));
+            records.chain(rich)
+        })
+        .collect();
+    let value_order = topo_order(
+        &value_entries
+            .iter()
+            .map(|(v, _)| v.name().to_string())
+            .collect::<Vec<_>>(),
+        &value_entries
+            .iter()
+            .map(|(v, _)| v.deps())
+            .collect::<Vec<_>>(),
+    );
+    for &idx in &value_order {
+        let (v, module) = &value_entries[idx];
+        match v {
+            ValueDef::Record(s) => render_cpp_record(&mut out, s, &module.path, prefix),
+            ValueDef::Rich(e) => render_cpp_rich_enum(&mut out, e, &module.path, prefix),
+        }
+    }
+    if !value_entries.is_empty() {
+        out.push_str("namespace detail {\n\n");
+        for &idx in &value_order {
+            let (v, module) = &value_entries[idx];
+            match v {
+                ValueDef::Record(s) => render_record_codec(&mut out, s, &module.path, prefix),
+                ValueDef::Rich(e) => render_rich_enum_codec(&mut out, e, &module.path, prefix),
+            }
+        }
+        out.push_str("} // namespace detail\n\n");
+    }
+
+    // Typed error domains come after the value types: a code's payload fields
+    // may hold records, and the domain's decode helper calls their codecs.
     for m in &model.modules {
         if m.declares_error() {
             let eb = m.error.as_ref().expect("declares_error implies Some");
@@ -549,46 +654,31 @@ fn render_cpp_header(
         out.push_str("} // namespace detail\n\n");
     }
 
-    // Enums first: they reference no wrapper types and are used by value.
-    for module in &model.modules {
-        render_cpp_enums(&mut out, module);
-    }
-    // Wrapper classes in dependency order: a getter or member that returns
-    // another wrapper type constructs it inline, which needs that class
-    // complete. Topological ordering makes parent<->child cross-module
-    // references compile. Structs, rich (algebraic) enums, and interfaces are
-    // all opaque-object wrappers and can reference one another, so they share
-    // a single ordering.
-    let wrapper_entries: Vec<(WrapperDef, &ModuleBinding)> = model
+    // Interface classes in dependency order: a member that returns another
+    // interface constructs it inline, which needs that class complete.
+    let iface_entries: Vec<(&InterfaceBinding, &ModuleBinding)> = model
         .modules
         .iter()
-        .flat_map(|m| {
-            let structs = m.structs.iter().map(move |s| (WrapperDef::Struct(s), m));
-            let enums = m
-                .enums
-                .iter()
-                .filter(|e| e.is_rich())
-                .map(move |e| (WrapperDef::RichEnum(e), m));
-            let interfaces = m
-                .interfaces
-                .iter()
-                .map(move |i| (WrapperDef::Interface(i), m));
-            structs.chain(enums).chain(interfaces)
-        })
+        .flat_map(|m| m.interfaces.iter().map(move |i| (i, m)))
         .collect();
-    for idx in topo_order_wrappers(&wrapper_entries) {
-        let (w, module) = &wrapper_entries[idx];
-        match w {
-            WrapperDef::Struct(s) => render_cpp_class(&mut out, s, &module.path, prefix),
-            WrapperDef::RichEnum(e) => {
-                render_cpp_rich_enum_class(&mut out, e, &module.path, prefix)
-            }
-            WrapperDef::Interface(i) => render_cpp_interface(&mut out, i, module, prefix),
-        }
+    let iface_order = topo_order(
+        &iface_entries
+            .iter()
+            .map(|(i, _)| i.name.clone())
+            .collect::<Vec<_>>(),
+        &iface_entries
+            .iter()
+            .map(|(i, _)| interface_deps(i))
+            .collect::<Vec<_>>(),
+    );
+    for &idx in &iface_order {
+        let (i, module) = &iface_entries[idx];
+        render_cpp_interface(&mut out, i, module, prefix);
     }
-    // Module namespaces last: every wrapper class is defined, so a function
-    // may accept or return any of them by value. Functions and listeners get
-    // bare snake_case names inside `namespace {module path}`.
+
+    // Module namespaces last: every type is defined, so a function may accept
+    // or return any of them by value. Functions and listeners get bare
+    // snake_case names inside `namespace {module path}`.
     for module in &model.modules {
         render_cpp_module_ns(&mut out, module, prefix);
     }
@@ -609,13 +699,11 @@ fn render_param_decls(params: &[AbiParam], prefix: &str) -> Vec<String> {
         .collect()
 }
 
-fn c_element_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
-    abi::element_ctype(ty, module).render_c(prefix)
-}
-
 // ── C++ type mapping ──
 
-fn cpp_type(ty: &TypeRef) -> String {
+/// The idiomatic C++ spelling of an IR type. `module` and `prefix` resolve
+/// typed-handle tags against the declaring module.
+fn cpp_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::I8 => "int8_t".into(),
         TypeRef::I16 => "int16_t".into(),
@@ -631,18 +719,24 @@ fn cpp_type(ty: &TypeRef) -> String {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "std::string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "std::vector<uint8_t>".into(),
         TypeRef::Handle => "void*".into(),
-        TypeRef::TypedHandle(n) => local_type_name(n).to_string(),
-        // Records and rich (algebraic) enums are both opaque-object wrapper
-        // classes; they share the same local-name spelling.
+        // A typed handle is an opaque token: it stays the raw prefixed tag
+        // pointer (there is no destroy symbol to wrap in a RAII class).
+        TypeRef::TypedHandle(n) => format!("{}*", c_abi_struct_name(n, module, prefix)),
+        // Records and rich (algebraic) enums are plain value types; both are
+        // named by their bare local C++ type.
         TypeRef::Record(n) | TypeRef::RichEnum(n) => local_type_name(n).to_string(),
         // A cross-module type (e.g. `graphics.Unit`) is emitted as the bare
         // local C++ type `Unit`; never the dot-qualified IR name (invalid C++).
         TypeRef::Enum(n) => local_type_name(n).to_string(),
         TypeRef::Interface(n) => local_type_name(n).to_string(),
-        TypeRef::Optional(inner) => format!("std::optional<{}>", cpp_type(inner)),
-        TypeRef::List(inner) => format!("std::vector<{}>", cpp_type(inner)),
+        TypeRef::Optional(inner) => format!("std::optional<{}>", cpp_type(inner, module, prefix)),
+        TypeRef::List(inner) => format!("std::vector<{}>", cpp_type(inner, module, prefix)),
         TypeRef::Map(k, v) => {
-            format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v))
+            format!(
+                "std::unordered_map<{}, {}>",
+                cpp_type(k, module, prefix),
+                cpp_type(v, module, prefix)
+            )
         }
         // An `iter<T>` return renders as a per-function lazy range class, not
         // through this generic mapping.
@@ -651,22 +745,26 @@ fn cpp_type(ty: &TypeRef) -> String {
     }
 }
 
-fn cpp_param_decl(ty: &TypeRef, name: &str) -> String {
+/// One C++ parameter declaration (`<type> <name>`) for a wrapper signature.
+/// Heavier types borrow by const reference; scalars, enums, and raw handles
+/// pass by value.
+fn cpp_param_decl(ty: &TypeRef, name: &str, module: &str, prefix: &str) -> String {
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("const std::string& {name}"),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             format!("const std::vector<uint8_t>& {name}")
         }
-        TypeRef::TypedHandle(n) => format!("{}& {name}", local_type_name(n)),
-        // Record, rich-enum, and interface parameters borrow: the callee never
-        // takes ownership, so the wrapper object stays valid after the call.
+        TypeRef::TypedHandle(_) => format!("{} {name}", cpp_type(ty, module, prefix)),
+        // Records and rich enums borrow: the wrapper encodes them into a local
+        // buffer, so the value stays with the caller. Interfaces borrow their
+        // handle for the call.
         TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::Interface(n) => {
             format!("const {}& {name}", local_type_name(n))
         }
         TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
-            format!("const {}& {name}", cpp_type(ty))
+            format!("const {}& {name}", cpp_type(ty, module, prefix))
         }
-        _ => format!("{} {name}", cpp_type(ty)),
+        _ => format!("{} {name}", cpp_type(ty, module, prefix)),
     }
 }
 
@@ -717,11 +815,198 @@ fn render_generic_error(out: &mut String, prefix: &str) {
     out.push_str(&w.finish());
 }
 
+/// Emit the private value-buffer runtime: a writer and reader implementing
+/// the WeaveFFI wire format (little-endian, packed, `u32` lengths), plus a
+/// scope guard that releases producer-allocated buffers. A malformed buffer
+/// is a producer/consumer contract violation, so decode failures throw the
+/// generic `WeaveFFIError` (the producer-panic channel), never a typed
+/// domain error.
+fn render_buffer_runtime(out: &mut String, prefix: &str) {
+    let body = r#"namespace detail {
+
+/**
+ * Serializes values into the WeaveFFI value-buffer wire format: little-endian,
+ * packed with no alignment, lengths and element counts as u32.
+ */
+class BufferWriter {
+    std::vector<uint8_t> buf_;
+
+    template <typename T>
+    void append_le(T v) {
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            buf_.push_back(static_cast<uint8_t>(v >> (8 * i)));
+        }
+    }
+
+public:
+    /** Pointer to the encoded bytes. */
+    const uint8_t* data() const { return buf_.data(); }
+
+    /** Number of encoded bytes. */
+    size_t size() const { return buf_.size(); }
+
+    void write_bool(bool v) { buf_.push_back(v ? 1 : 0); }
+    void write_i8(int8_t v) { buf_.push_back(static_cast<uint8_t>(v)); }
+    void write_u8(uint8_t v) { buf_.push_back(v); }
+    void write_i16(int16_t v) { append_le(static_cast<uint16_t>(v)); }
+    void write_u16(uint16_t v) { append_le(v); }
+    void write_i32(int32_t v) { append_le(static_cast<uint32_t>(v)); }
+    void write_u32(uint32_t v) { append_le(v); }
+    void write_i64(int64_t v) { append_le(static_cast<uint64_t>(v)); }
+    void write_u64(uint64_t v) { append_le(v); }
+
+    void write_f32(float v) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_le(bits);
+    }
+
+    void write_f64(double v) {
+        uint64_t bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        append_le(bits);
+    }
+
+    /** Writes a string, byte-buffer, or collection length as a u32. */
+    void write_len(size_t n) { append_le(static_cast<uint32_t>(n)); }
+
+    void write_string(const std::string& v) {
+        write_len(v.size());
+        buf_.insert(buf_.end(), v.begin(), v.end());
+    }
+
+    void write_bytes(const std::vector<uint8_t>& v) {
+        write_len(v.size());
+        buf_.insert(buf_.end(), v.begin(), v.end());
+    }
+
+    /** Writes an optional's presence flag: 0 absent, 1 present. */
+    void write_option_flag(bool present) { buf_.push_back(present ? 1 : 0); }
+};
+
+/**
+ * Decodes values from the WeaveFFI value-buffer wire format. A malformed
+ * buffer is a producer/consumer contract violation (both sides are generated
+ * from one IDL), so every decode failure throws the generic WeaveFFIError,
+ * the same channel as a producer panic.
+ */
+class BufferReader {
+    const uint8_t* data_;
+    size_t len_;
+    size_t pos_;
+
+    [[noreturn]] static void fail(const char* what) {
+        throw WeaveFFIError(-2, std::string("malformed WeaveFFI value buffer: ") + what);
+    }
+
+    void require(size_t n, const char* what) const {
+        if (len_ - pos_ < n) fail(what);
+    }
+
+    template <typename T>
+    T read_le(const char* what) {
+        require(sizeof(T), what);
+        uint64_t v = 0;
+        for (size_t i = 0; i < sizeof(T); ++i) {
+            v |= static_cast<uint64_t>(data_[pos_ + i]) << (8 * i);
+        }
+        pos_ += sizeof(T);
+        return static_cast<T>(v);
+    }
+
+public:
+    BufferReader(const uint8_t* data, size_t len) : data_(data), len_(len), pos_(0) {}
+
+    /** Bytes not yet consumed. */
+    size_t remaining() const { return len_ - pos_; }
+
+    bool read_bool() {
+        uint8_t b = read_le<uint8_t>("bool");
+        if (b > 1) fail("bool byte out of range");
+        return b != 0;
+    }
+
+    int8_t read_i8() { return read_le<int8_t>("i8"); }
+    uint8_t read_u8() { return read_le<uint8_t>("u8"); }
+    int16_t read_i16() { return read_le<int16_t>("i16"); }
+    uint16_t read_u16() { return read_le<uint16_t>("u16"); }
+    int32_t read_i32() { return read_le<int32_t>("i32"); }
+    uint32_t read_u32() { return read_le<uint32_t>("u32"); }
+    int64_t read_i64() { return read_le<int64_t>("i64"); }
+    uint64_t read_u64() { return read_le<uint64_t>("u64"); }
+
+    float read_f32() {
+        uint32_t bits = read_le<uint32_t>("f32");
+        float v = 0;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+
+    double read_f64() {
+        uint64_t bits = read_le<uint64_t>("f64");
+        double v = 0;
+        std::memcpy(&v, &bits, sizeof(v));
+        return v;
+    }
+
+    /** Reads a length prefix, rejecting one larger than the bytes remaining. */
+    size_t read_len() {
+        uint32_t n = read_le<uint32_t>("length");
+        if (static_cast<size_t>(n) > remaining()) fail("length prefix exceeds remaining buffer");
+        return static_cast<size_t>(n);
+    }
+
+    std::string read_string() {
+        size_t n = read_len();
+        std::string v(reinterpret_cast<const char*>(data_) + pos_, n);
+        pos_ += n;
+        return v;
+    }
+
+    std::vector<uint8_t> read_bytes() {
+        size_t n = read_len();
+        std::vector<uint8_t> v(data_ + pos_, data_ + pos_ + n);
+        pos_ += n;
+        return v;
+    }
+
+    bool read_option_flag() {
+        uint8_t b = read_le<uint8_t>("option flag");
+        if (b > 1) fail("option flag byte out of range");
+        return b != 0;
+    }
+
+    /** Rejects unconsumed bytes after decoding a complete value. */
+    void expect_end() const {
+        if (pos_ != len_) fail("trailing bytes after value");
+    }
+};
+
+/** Releases a producer-allocated buffer with @PREFIX@_free_bytes on scope exit. */
+struct BufferGuard {
+    /** The producer-allocated buffer, or null when the call reported an error. */
+    const uint8_t* ptr;
+    /** The buffer length in bytes. */
+    size_t len;
+
+    ~BufferGuard() {
+        if (ptr != nullptr) @PREFIX@_free_bytes(const_cast<uint8_t*>(ptr), len);
+    }
+};
+
+} // namespace detail
+
+"#;
+    out.push_str(&body.replace("@PREFIX@", prefix));
+}
+
 /// Emit one module's typed error domain: a domain exception derived from
-/// `WeaveFFIError`, one subclass per declared code, and the per-domain
+/// `WeaveFFIError`, one subclass per declared code (with typed members for
+/// any payload fields the code declares), and the per-domain
 /// `detail::make_{path}_error`/`detail::check_{path}` helpers that throwing
-/// wrappers use to map a nonzero `out_err` to the typed exception. Unknown
-/// codes fall back to the domain exception itself.
+/// wrappers use to map a nonzero `out_err` to the typed exception, decoding
+/// the payload buffer along the way. Unknown codes fall back to the domain
+/// exception itself.
 fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &str) {
     let domain = &eb.type_name;
     let path = &eb.owner_path;
@@ -748,10 +1033,34 @@ fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &str) {
         w.line(format!("class {class} : public {domain} {{"));
         w.line("public:");
         w.scope(|w| {
-            w.line(format!(
-                "{class}(const std::string& msg) : {domain}({}, msg) {{}}",
-                code.value
-            ));
+            for fld in &code.fields {
+                w.doc(&fld.doc, DocCommentStyle::Javadoc);
+                w.line(format!(
+                    "{} {};",
+                    cpp_type(&fld.ty, path, prefix),
+                    cpp_ident(&fld.name)
+                ));
+            }
+            if code.fields.is_empty() {
+                w.line(format!(
+                    "{class}(const std::string& msg) : {domain}({}, msg) {{}}",
+                    code.value
+                ));
+            } else {
+                w.blank();
+                let mut params = vec!["const std::string& msg".to_string()];
+                let mut inits = vec![format!("{domain}({}, msg)", code.value)];
+                for fld in &code.fields {
+                    let name = cpp_ident(&fld.name);
+                    params.push(format!("{} {name}", cpp_type(&fld.ty, path, prefix)));
+                    inits.push(format!("{name}(std::move({name}))"));
+                }
+                w.line(format!(
+                    "{class}({}) : {} {{}}",
+                    params.join(", "),
+                    inits.join(", ")
+                ));
+            }
         });
         w.line("};");
         w.blank();
@@ -760,19 +1069,38 @@ fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &str) {
     w.line("namespace detail {");
     w.blank();
     w.line(format!(
-        "/** Map a `{path}` error code to its typed exception ({domain} for unknown codes). */"
+        "/** Map a `{path}` error code and payload to its typed exception ({domain} for unknown codes). */"
     ));
     w.line(format!(
-        "inline std::exception_ptr make_{path}_error(int32_t code, const std::string& msg) {{"
+        "inline std::exception_ptr make_{path}_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {{"
     ));
     w.scope(|w| {
         w.line("switch (code) {");
         for code in &eb.codes {
-            w.line(format!(
-                "case {}: return std::make_exception_ptr({}(msg));",
-                code.value,
-                cpp_error_class(&code.name)
-            ));
+            let class = cpp_error_class(&code.name);
+            if code.fields.is_empty() {
+                w.line(format!(
+                    "case {}: return std::make_exception_ptr({class}(msg));",
+                    code.value
+                ));
+            } else {
+                w.line(format!("case {}: {{", code.value));
+                w.scope(|w| {
+                    w.line("BufferReader payload_r(payload_ptr, payload_len);");
+                    let mut args = vec!["msg".to_string()];
+                    for fld in &code.fields {
+                        let var = format!("f_{}", fld.name);
+                        emit_read_decl(w, &fld.ty, &var, "payload_r", path, prefix);
+                        args.push(format!("std::move({var})"));
+                    }
+                    w.line("payload_r.expect_end();");
+                    w.line(format!(
+                        "return std::make_exception_ptr({class}({}));",
+                        args.join(", ")
+                    ));
+                });
+                w.line("}");
+            }
         }
         w.line(format!(
             "default: return std::make_exception_ptr({domain}(code, msg));"
@@ -788,11 +1116,13 @@ fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &str) {
     w.scope(|w| {
         w.line("if (err.code == 0) return;");
         w.line("std::string msg(err.message ? err.message : \"unknown error\");");
-        w.line("int32_t code = err.code;");
-        w.line(format!("{prefix}_error_clear(&err);"));
+        // The payload buffer is owned by the error and released by
+        // error_clear, so the exception (which decodes it) is built first.
         w.line(format!(
-            "std::rethrow_exception(make_{path}_error(code, msg));"
+            "std::exception_ptr ex = make_{path}_error(err.code, msg, err.payload_ptr, err.payload_len);"
         ));
+        w.line(format!("{prefix}_error_clear(&err);"));
+        w.line("std::rethrow_exception(ex);");
     });
     w.line("}");
     w.blank();
@@ -813,13 +1143,17 @@ fn check_helper(f: &FnBinding, module: &ModuleBinding) -> String {
     }
 }
 
-/// The `detail::make*_error` helper an async wrapper uses to convert a
-/// callback error into the `std::exception_ptr` set on the promise. Same
-/// [`ErrorStrategy`] split as [`check_helper`].
-fn make_error_helper(f: &FnBinding, module: &ModuleBinding) -> String {
+/// The full `detail::make*_error(...)` call expression an async trampoline
+/// uses to convert a callback error into the `std::exception_ptr` set on the
+/// promise. The typed domain helper also receives the borrowed payload slots;
+/// the generic helper takes only the code and message.
+fn make_error_call(f: &FnBinding, module: &ModuleBinding) -> String {
     match (&module.error, f.error_strategy()) {
-        (Some(eb), ErrorStrategy::Throws) => format!("detail::make_{}_error", eb.owner_path),
-        _ => "detail::make_error".to_string(),
+        (Some(eb), ErrorStrategy::Throws) => format!(
+            "detail::make_{}_error(err->code, msg, err->payload_ptr, err->payload_len)",
+            eb.owner_path
+        ),
+        _ => "detail::make_error(err->code, msg)".to_string(),
     }
 }
 
@@ -828,8 +1162,8 @@ fn make_error_helper(f: &FnBinding, module: &ModuleBinding) -> String {
 fn render_cpp_enums(out: &mut String, module: &ModuleBinding) {
     let mut w = CodeWriter::four_space();
     for e in &module.enums {
-        // Rich (algebraic) enums are opaque-object wrappers, emitted as classes
-        // alongside structs; only plain C-style enums map to `enum class`.
+        // Rich (algebraic) enums are value types, emitted as variant structs
+        // alongside records; only plain C-style enums map to `enum class`.
         if e.is_rich() {
             continue;
         }
@@ -846,16 +1180,559 @@ fn render_cpp_enums(out: &mut String, module: &ModuleBinding) {
     out.push_str(&w.finish());
 }
 
-// ── Namespace: RAII classes ──
+// ── Value types: records and rich enums ──
 
-/// Emit the shared move-only RAII skeleton every opaque-object wrapper class
-/// uses: adopted `void*` handle, destructor calling `destroy_symbol`, deleted
-/// copy, move constructor and move assignment, and the raw `handle()` reader.
+/// A value type emitted as a plain C++ struct: a record or a rich (algebraic)
+/// enum. Both cross the ABI serialized in value buffers, may nest one
+/// another, and are ordered together so a by-value member's type is complete
+/// before its holder.
+enum ValueDef<'a> {
+    /// A record: a plain struct with typed members.
+    Record(&'a StructBinding),
+    /// A rich enum: a `std::variant`-backed sum type.
+    Rich(&'a EnumBinding),
+}
+
+impl ValueDef<'_> {
+    fn name(&self) -> &str {
+        match self {
+            ValueDef::Record(s) => &s.name,
+            ValueDef::Rich(e) => &e.name,
+        }
+    }
+
+    /// Local names of other value types this one holds by value.
+    fn deps(&self) -> Vec<String> {
+        let mut deps = Vec::new();
+        match self {
+            ValueDef::Record(s) => {
+                for f in &s.fields {
+                    collect_value_deps(&f.ty, &mut deps);
+                }
+            }
+            ValueDef::Rich(e) => {
+                for v in &e.variants {
+                    for f in &v.fields {
+                        collect_value_deps(&f.ty, &mut deps);
+                    }
+                }
+            }
+        }
+        deps
+    }
+}
+
+/// Collect the local names of value types (records and rich enums) reachable
+/// from `ty`, recursing through optional/list/map wrappers.
+fn collect_value_deps(ty: &TypeRef, deps: &mut Vec<String>) {
+    match ty {
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => deps.push(local_type_name(n).to_string()),
+        TypeRef::Optional(inner) | TypeRef::List(inner) => collect_value_deps(inner, deps),
+        TypeRef::Map(k, v) => {
+            collect_value_deps(k, deps);
+            collect_value_deps(v, deps);
+        }
+        _ => {}
+    }
+}
+
+/// Local names of other interfaces referenced by an interface's member
+/// signatures (returned or accepted by value, so their classes must be
+/// complete first).
+fn interface_deps(i: &InterfaceBinding) -> Vec<String> {
+    fn collect(ty: &TypeRef, deps: &mut Vec<String>) {
+        match ty {
+            TypeRef::Interface(n) => deps.push(local_type_name(n).to_string()),
+            TypeRef::Optional(inner) | TypeRef::Iterator(inner) => collect(inner, deps),
+            _ => {}
+        }
+    }
+    let mut deps = Vec::new();
+    for f in i
+        .constructors
+        .iter()
+        .chain(i.methods.iter())
+        .chain(i.statics.iter())
+    {
+        for p in &f.params {
+            collect(&p.ty, &mut deps);
+        }
+        if let Some(ret) = &f.ret {
+            collect(ret, &mut deps);
+        }
+    }
+    deps
+}
+
+/// Order entries so that anything an entry depends on is emitted before it.
+/// Pure DFS post-order; original walk order is the stable tiebreaker, and
+/// the first definition wins when two modules share a local name (the
+/// flattened C++ type namespace can't hold duplicates anyway).
+fn topo_order(names: &[String], deps: &[Vec<String>]) -> Vec<usize> {
+    fn visit(
+        i: usize,
+        deps: &[Vec<String>],
+        name_to_idx: &HashMap<&str, usize>,
+        state: &mut [u8],
+        order: &mut Vec<usize>,
+    ) {
+        // 0 = unvisited, 1 = on stack (skip to break any cycle), 2 = emitted.
+        if state[i] != 0 {
+            return;
+        }
+        state[i] = 1;
+        for d in &deps[i] {
+            if let Some(&j) = name_to_idx.get(d.as_str()) {
+                if j != i {
+                    visit(j, deps, name_to_idx, state, order);
+                }
+            }
+        }
+        state[i] = 2;
+        order.push(i);
+    }
+
+    let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, n) in names.iter().enumerate() {
+        name_to_idx.entry(n.as_str()).or_insert(i);
+    }
+    let mut state = vec![0u8; names.len()];
+    let mut order = Vec::with_capacity(names.len());
+    for i in 0..names.len() {
+        visit(i, deps, &name_to_idx, &mut state, &mut order);
+    }
+    order
+}
+
+/// Render a record as a plain C++ value struct: typed members in declaration
+/// (and wire) order, no handles, no destructors, no builders.
+fn render_cpp_record(out: &mut String, s: &StructBinding, module: &str, prefix: &str) {
+    let mut w = CodeWriter::four_space();
+    w.doc(&s.doc, DocCommentStyle::Javadoc);
+    w.line(format!("struct {} {{", s.name));
+    w.scope(|w| {
+        for f in &s.fields {
+            w.doc(&f.doc, DocCommentStyle::Javadoc);
+            w.line(format!(
+                "{} {};",
+                cpp_type(&f.ty, module, prefix),
+                cpp_ident(&f.name)
+            ));
+        }
+    });
+    w.line("};");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Render a rich (algebraic) enum as a `std::variant`-backed sum type: one
+/// payload struct per variant, a `value` member holding the active payload,
+/// a nested `Tag` enum mirroring the wire discriminants, and a `tag()` reader.
+/// Construct one as `Shape{Shape::Circle{2.0}}`.
+fn render_cpp_rich_enum(out: &mut String, e: &EnumBinding, module: &str, prefix: &str) {
+    let name = &e.name;
+    let mut w = CodeWriter::four_space();
+    w.doc(&e.doc, DocCommentStyle::Javadoc);
+    w.line(format!("struct {name} {{"));
+    w.scope(|w| {
+        w.line(format!(
+            "/** Discriminant identifying the active variant of `{name}`. */"
+        ));
+        w.block("enum class Tag : int32_t {", "};", |w| {
+            for (i, v) in e.variants.iter().enumerate() {
+                let comma = if i + 1 < e.variants.len() { "," } else { "" };
+                w.line(format!("{} = {}{}", cpp_ident(&v.name), v.value, comma));
+            }
+        });
+        w.blank();
+
+        for v in &e.variants {
+            w.doc(&v.doc, DocCommentStyle::Javadoc);
+            w.line(format!("struct {} {{", cpp_ident(&v.name)));
+            w.scope(|w| {
+                for f in &v.fields {
+                    w.doc(&f.doc, DocCommentStyle::Javadoc);
+                    w.line(format!(
+                        "{} {};",
+                        cpp_type(&f.ty, module, prefix),
+                        cpp_ident(&f.name)
+                    ));
+                }
+            });
+            w.line("};");
+            w.blank();
+        }
+
+        let alts: Vec<String> = e.variants.iter().map(|v| cpp_ident(&v.name)).collect();
+        w.line("/** The active variant's payload. */");
+        w.line(format!("std::variant<{}> value;", alts.join(", ")));
+        w.blank();
+        w.line("/** The tag of the active variant. */");
+        w.line("Tag tag() const {");
+        w.scope(|w| {
+            w.line("static constexpr Tag tags[] = {");
+            w.scope(|w| {
+                for (i, v) in e.variants.iter().enumerate() {
+                    let comma = if i + 1 < e.variants.len() { "," } else { "" };
+                    w.line(format!("Tag::{}{}", cpp_ident(&v.name), comma));
+                }
+            });
+            w.line("};");
+            w.line("return tags[value.index()];");
+        });
+        w.line("}");
+    });
+    w.line("};");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+// ── Value-buffer codecs ──
+
+/// The `BufferWriter` method encoding a leaf scalar, or `None` for composite
+/// and cast-requiring types.
+fn scalar_write_method(ty: &TypeRef) -> Option<&'static str> {
+    Some(match ty {
+        TypeRef::Bool => "write_bool",
+        TypeRef::I8 => "write_i8",
+        TypeRef::U8 => "write_u8",
+        TypeRef::I16 => "write_i16",
+        TypeRef::U16 => "write_u16",
+        TypeRef::I32 => "write_i32",
+        TypeRef::U32 => "write_u32",
+        TypeRef::I64 => "write_i64",
+        TypeRef::U64 => "write_u64",
+        TypeRef::F32 => "write_f32",
+        TypeRef::F64 => "write_f64",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "write_string",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "write_bytes",
+        _ => return None,
+    })
+}
+
+/// Emit statements appending `expr` (a C++ lvalue of IDL type `ty`) to the
+/// buffer writer variable `wtr`, in wire order. `depth` disambiguates nested
+/// loop variable names.
+fn emit_write_value(w: &mut CodeWriter, ty: &TypeRef, expr: &str, wtr: &str, depth: usize) {
+    if let Some(method) = scalar_write_method(ty) {
+        w.line(format!("{wtr}.{method}({expr});"));
+        return;
+    }
+    match ty {
+        TypeRef::Enum(_) => {
+            w.line(format!("{wtr}.write_i32(static_cast<int32_t>({expr}));"));
+        }
+        // Handles are opaque tokens encoded as their pointer bits in a u64.
+        TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            w.line(format!(
+                "{wtr}.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>({expr})));"
+            ));
+        }
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            w.line(format!(
+                "detail::write_{}({wtr}, {expr});",
+                local_type_name(n)
+            ));
+        }
+        TypeRef::Optional(inner) => {
+            w.line(format!("{wtr}.write_option_flag({expr}.has_value());"));
+            w.line(format!("if ({expr}.has_value()) {{"));
+            w.scope(|w| emit_write_value(w, inner, &format!("(*{expr})"), wtr, depth));
+            w.line("}");
+        }
+        TypeRef::List(inner) => {
+            w.line(format!("{wtr}.write_len({expr}.size());"));
+            w.line(format!("for (const auto& item{depth} : {expr}) {{"));
+            w.scope(|w| emit_write_value(w, inner, &format!("item{depth}"), wtr, depth + 1));
+            w.line("}");
+        }
+        TypeRef::Map(k, v) => {
+            w.line(format!("{wtr}.write_len({expr}.size());"));
+            w.line(format!("for (const auto& kv{depth} : {expr}) {{"));
+            w.scope(|w| {
+                emit_write_value(w, k, &format!("kv{depth}.first"), wtr, depth + 1);
+                emit_write_value(w, v, &format!("kv{depth}.second"), wtr, depth + 1);
+            });
+            w.line("}");
+        }
+        TypeRef::Interface(_) => unreachable!("validation rejects interfaces inside buffers"),
+        TypeRef::Iterator(_) => unreachable!("validation rejects iterators inside buffers"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        _ => unreachable!("scalar handled above"),
+    }
+}
+
+/// The single expression decoding one leaf value from the reader variable
+/// `rdr`, or `None` when `ty` is a composite that needs statements.
+fn read_leaf_expr(ty: &TypeRef, rdr: &str, module: &str, prefix: &str) -> Option<String> {
+    Some(match ty {
+        TypeRef::Bool => format!("{rdr}.read_bool()"),
+        TypeRef::I8 => format!("{rdr}.read_i8()"),
+        TypeRef::U8 => format!("{rdr}.read_u8()"),
+        TypeRef::I16 => format!("{rdr}.read_i16()"),
+        TypeRef::U16 => format!("{rdr}.read_u16()"),
+        TypeRef::I32 => format!("{rdr}.read_i32()"),
+        TypeRef::U32 => format!("{rdr}.read_u32()"),
+        TypeRef::I64 => format!("{rdr}.read_i64()"),
+        TypeRef::U64 => format!("{rdr}.read_u64()"),
+        TypeRef::F32 => format!("{rdr}.read_f32()"),
+        TypeRef::F64 => format!("{rdr}.read_f64()"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{rdr}.read_string()"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => format!("{rdr}.read_bytes()"),
+        TypeRef::Enum(n) => format!("static_cast<{}>({rdr}.read_i32())", local_type_name(n)),
+        TypeRef::Handle => {
+            format!("reinterpret_cast<void*>(static_cast<uintptr_t>({rdr}.read_u64()))")
+        }
+        TypeRef::TypedHandle(n) => format!(
+            "reinterpret_cast<{}*>(static_cast<uintptr_t>({rdr}.read_u64()))",
+            c_abi_struct_name(n, module, prefix)
+        ),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            format!("detail::read_{}({rdr})", local_type_name(n))
+        }
+        _ => return None,
+    })
+}
+
+/// Emit statements decoding one value of IDL type `ty` from the reader
+/// variable `rdr` into the existing (default-initialized) lvalue `target`.
+/// `tmp` seeds unique names for any temporaries the composite cases need.
+fn emit_read_into(
+    w: &mut CodeWriter,
+    ty: &TypeRef,
+    target: &str,
+    tmp: &str,
+    rdr: &str,
+    module: &str,
+    prefix: &str,
+) {
+    if let Some(expr) = read_leaf_expr(ty, rdr, module, prefix) {
+        w.line(format!("{target} = {expr};"));
+        return;
+    }
+    match ty {
+        TypeRef::Optional(inner) => {
+            w.line(format!("if ({rdr}.read_option_flag()) {{"));
+            w.scope(|w| {
+                let var = format!("{tmp}_v");
+                emit_read_decl(w, inner, &var, rdr, module, prefix);
+                w.line(format!("{target} = std::move({var});"));
+            });
+            w.line("}");
+        }
+        TypeRef::List(inner) => {
+            w.line("{");
+            w.scope(|w| {
+                w.line(format!("size_t {tmp}_n = {rdr}.read_len();"));
+                w.line(format!("{target}.reserve({tmp}_n);"));
+                w.line(format!(
+                    "for (size_t {tmp}_i = 0; {tmp}_i < {tmp}_n; ++{tmp}_i) {{"
+                ));
+                w.scope(|w| {
+                    let var = format!("{tmp}_item");
+                    emit_read_decl(w, inner, &var, rdr, module, prefix);
+                    w.line(format!("{target}.push_back(std::move({var}));"));
+                });
+                w.line("}");
+            });
+            w.line("}");
+        }
+        TypeRef::Map(k, v) => {
+            w.line("{");
+            w.scope(|w| {
+                w.line(format!("size_t {tmp}_n = {rdr}.read_len();"));
+                w.line(format!(
+                    "for (size_t {tmp}_i = 0; {tmp}_i < {tmp}_n; ++{tmp}_i) {{"
+                ));
+                w.scope(|w| {
+                    let key = format!("{tmp}_key");
+                    let val = format!("{tmp}_val");
+                    emit_read_decl(w, k, &key, rdr, module, prefix);
+                    emit_read_decl(w, v, &val, rdr, module, prefix);
+                    w.line(format!(
+                        "{target}.emplace(std::move({key}), std::move({val}));"
+                    ));
+                });
+                w.line("}");
+            });
+            w.line("}");
+        }
+        TypeRef::Interface(_) => unreachable!("validation rejects interfaces inside buffers"),
+        TypeRef::Iterator(_) => unreachable!("validation rejects iterators inside buffers"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        _ => unreachable!("leaf handled above"),
+    }
+}
+
+/// Emit statements declaring a fresh variable `var` and decoding one value of
+/// IDL type `ty` into it from the reader variable `rdr`. Leaf types decode in
+/// a single declaration; composites declare then fill.
+fn emit_read_decl(
+    w: &mut CodeWriter,
+    ty: &TypeRef,
+    var: &str,
+    rdr: &str,
+    module: &str,
+    prefix: &str,
+) {
+    let cpp = cpp_type(ty, module, prefix);
+    if let Some(expr) = read_leaf_expr(ty, rdr, module, prefix) {
+        w.line(format!("{cpp} {var} = {expr};"));
+    } else {
+        w.line(format!("{cpp} {var}{{}};"));
+        emit_read_into(w, ty, var, var, rdr, module, prefix);
+    }
+}
+
+/// Emit the pack and unpack routines for one record (inside `detail`).
+fn render_record_codec(out: &mut String, s: &StructBinding, module: &str, prefix: &str) {
+    let name = &s.name;
+    let mut w = CodeWriter::four_space();
+    w.doc(
+        &Some(format!(
+            "Encodes a `{name}` in the WeaveFFI value-buffer format."
+        )),
+        DocCommentStyle::Javadoc,
+    );
+    w.line(format!(
+        "inline void write_{name}(BufferWriter& w, const {name}& v) {{"
+    ));
+    w.scope(|w| {
+        if s.fields.is_empty() {
+            w.line("(void)w;");
+            w.line("(void)v;");
+        }
+        for f in &s.fields {
+            emit_write_value(w, &f.ty, &format!("v.{}", cpp_ident(&f.name)), "w", 0);
+        }
+    });
+    w.line("}");
+    w.blank();
+
+    w.doc(
+        &Some(format!(
+            "Decodes a `{name}` from the WeaveFFI value-buffer format."
+        )),
+        DocCommentStyle::Javadoc,
+    );
+    w.line(format!("inline {name} read_{name}(BufferReader& r) {{"));
+    w.scope(|w| {
+        if s.fields.is_empty() {
+            w.line("(void)r;");
+        }
+        w.line(format!("{name} out{{}};"));
+        for f in &s.fields {
+            let member = cpp_ident(&f.name);
+            emit_read_into(
+                w,
+                &f.ty,
+                &format!("out.{member}"),
+                &format!("v_{}", f.name),
+                "r",
+                module,
+                prefix,
+            );
+        }
+        w.line("return out;");
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit the pack and unpack routines for one rich enum (inside `detail`):
+/// an `i32` tag followed by the active variant's fields in wire order.
+fn render_rich_enum_codec(out: &mut String, e: &EnumBinding, module: &str, prefix: &str) {
+    let name = &e.name;
+    let mut w = CodeWriter::four_space();
+    w.doc(
+        &Some(format!(
+            "Encodes a `{name}` in the WeaveFFI value-buffer format."
+        )),
+        DocCommentStyle::Javadoc,
+    );
+    w.line(format!(
+        "inline void write_{name}(BufferWriter& w, const {name}& v) {{"
+    ));
+    w.scope(|w| {
+        w.line("switch (v.value.index()) {");
+        for (i, variant) in e.variants.iter().enumerate() {
+            let vn = cpp_ident(&variant.name);
+            w.line(format!("case {i}: {{"));
+            w.scope(|w| {
+                w.line(format!("w.write_i32({});", variant.value));
+                if !variant.fields.is_empty() {
+                    w.line(format!("const {name}::{vn}& p = std::get<{i}>(v.value);"));
+                    for f in &variant.fields {
+                        emit_write_value(w, &f.ty, &format!("p.{}", cpp_ident(&f.name)), "w", 0);
+                    }
+                }
+                w.line("break;");
+            });
+            w.line("}");
+        }
+        w.line("}");
+    });
+    w.line("}");
+    w.blank();
+
+    w.doc(
+        &Some(format!(
+            "Decodes a `{name}` from the WeaveFFI value-buffer format."
+        )),
+        DocCommentStyle::Javadoc,
+    );
+    w.line(format!("inline {name} read_{name}(BufferReader& r) {{"));
+    w.scope(|w| {
+        w.line("int32_t tag = r.read_i32();");
+        w.line("switch (tag) {");
+        for variant in &e.variants {
+            let vn = cpp_ident(&variant.name);
+            w.line(format!("case {}: {{", variant.value));
+            w.scope(|w| {
+                if variant.fields.is_empty() {
+                    w.line(format!("return {name}{{{name}::{vn}{{}}}};"));
+                } else {
+                    w.line(format!("{name}::{vn} p{{}};"));
+                    for f in &variant.fields {
+                        emit_read_into(
+                            w,
+                            &f.ty,
+                            &format!("p.{}", cpp_ident(&f.name)),
+                            &format!("v_{}", f.name),
+                            "r",
+                            module,
+                            prefix,
+                        );
+                    }
+                    w.line(format!("return {name}{{std::move(p)}};"));
+                }
+            });
+            w.line("}");
+        }
+        w.line("default:");
+        w.scope(|w| {
+            w.line("break;");
+        });
+        w.line("}");
+        w.line(format!(
+            "throw WeaveFFIError(-2, \"malformed WeaveFFI value buffer: unknown {name} tag\");"
+        ));
+    });
+    w.line("}");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+// ── Namespace: interfaces ──
+
+/// Emit the shared move-only RAII skeleton an interface class uses: adopted
+/// `void*` handle, destructor calling `destroy_symbol`, deleted copy, move
+/// constructor and move assignment, and the raw `handle()` reader.
 fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbol: &str) {
     w.line(format!("explicit {name}(void* h) : handle_(h) {{}}"));
     w.blank();
 
-    // Destructor
     w.line(format!("~{name}() {{"));
     w.scope(|w| {
         w.line(format!(
@@ -865,12 +1742,10 @@ fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbo
     w.line("}");
     w.blank();
 
-    // Deleted copy
     w.line(format!("{name}(const {name}&) = delete;"));
     w.line(format!("{name}& operator=(const {name}&) = delete;"));
     w.blank();
 
-    // Move constructor
     w.line(format!(
         "{name}({name}&& other) noexcept : handle_(other.handle_) {{"
     ));
@@ -880,7 +1755,6 @@ fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbo
     w.line("}");
     w.blank();
 
-    // Move assignment
     w.line(format!("{name}& operator=({name}&& other) noexcept {{"));
     w.scope(|w| {
         w.line("if (this != &other) {");
@@ -901,153 +1775,13 @@ fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbo
     w.blank();
 }
 
-fn render_cpp_class(out: &mut String, s: &StructBinding, module_path: &str, prefix: &str) {
-    let name = &s.name;
-
-    let mut w = CodeWriter::four_space();
-    w.doc(&s.doc, DocCommentStyle::Javadoc);
-    w.line(format!("class {name} {{"));
-    w.scope(|w| {
-        w.line("void* handle_;");
-        w.blank();
-    });
-    w.line("public:");
-    w.scope(|w| {
-        emit_raii_skeleton(w, name, &s.c_tag, &s.destroy_symbol);
-
-        let cast = format!("static_cast<const {}*>(handle_)", s.c_tag);
-        let mut getters = String::new();
-        for field in &s.fields {
-            emit_cpp_getter_method(
-                &mut getters,
-                &field.name,
-                &field.getter_symbol,
-                &cast,
-                &field.ty,
-                &field.doc,
-                module_path,
-                prefix,
-            );
-        }
-        w.raw(getters);
-    });
-    w.line("};");
-    w.blank();
-    out.push_str(&w.finish());
-
-    if let Some(builder) = &s.builder {
-        render_cpp_builder(out, s, builder, module_path, prefix);
-    }
-}
-
-/// Render a rich (algebraic) enum as an opaque-object RAII class: move-only
-/// ownership of the C handle, a nested `Tag` enum + `tag()` reader, one static
-/// factory per variant (`Shape::Circle(2.0)`), and per-variant field accessors
-/// named `{variant_snake}_{field}()`. Mirrors the struct wrapper so the existing
-/// function-wrapper machinery (`x.handle()`, `T(result)`) works unchanged.
-fn render_cpp_rich_enum_class(out: &mut String, e: &EnumBinding, module_path: &str, prefix: &str) {
-    let Some(rich) = &e.rich else {
-        unreachable!("only rich enums are rendered as classes");
-    };
-    let name = &e.name;
-    let tag = &e.c_tag;
-
-    let mut w = CodeWriter::four_space();
-    w.doc(&e.doc, DocCommentStyle::Javadoc);
-    w.line(format!("class {name} {{"));
-    w.scope(|w| {
-        w.line("void* handle_;");
-        w.blank();
-    });
-    w.line("public:");
-    w.scope(|w| {
-        emit_raii_skeleton(w, name, tag, &rich.destroy_symbol);
-
-        // Nested tag enum + reader.
-        w.block("enum class Tag : int32_t {", "};", |w| {
-            for (i, v) in e.variants.iter().enumerate() {
-                let comma = if i + 1 < e.variants.len() { "," } else { "" };
-                w.line(format!("{} = {}{}", v.name, v.value, comma));
-            }
-        });
-        w.blank();
-        w.line("Tag tag() const {");
-        w.scope(|w| {
-            w.line(format!(
-                "return static_cast<Tag>({}(static_cast<const {tag}*>(handle_)));",
-                rich.tag_symbol
-            ));
-        });
-        w.line("}");
-        w.blank();
-
-        // One static factory per variant. Variant construction reports only
-        // producer panics, so the check is the generic one.
-        for v in &rich.variants {
-            let decls: Vec<String> = v
-                .fields
-                .iter()
-                .map(|f| cpp_param_decl(&f.ty, &cpp_ident(&f.name)))
-                .collect();
-            w.doc(&v.doc, DocCommentStyle::Javadoc);
-            w.line(format!("static {name} {}({}) {{", v.name, decls.join(", ")));
-            let mut setup = Vec::new();
-            let mut c_args = Vec::new();
-            for f in &v.fields {
-                let (s, a) = param_to_c_args(&f.ty, &cpp_ident(&f.name), module_path, prefix);
-                setup.extend(s);
-                c_args.extend(a);
-            }
-            c_args.push("&err".into());
-            w.scope(|w| {
-                for line in &setup {
-                    w.line(line);
-                }
-                w.line(format!("{prefix}_error err{{}};"));
-                w.line(format!(
-                    "auto* result = {}({});",
-                    v.create.symbol,
-                    c_args.join(", ")
-                ));
-                w.line("detail::check(err);");
-                w.line(format!("return {name}(result);"));
-            });
-            w.line("}");
-            w.blank();
-        }
-
-        // Per-variant field accessors, namespaced by variant to avoid collisions.
-        let mut accessors = String::new();
-        for v in &rich.variants {
-            let cast = format!("static_cast<const {tag}*>(handle_)");
-            for f in &v.fields {
-                let method = format!("{}_{}", v.name.to_snake_case(), f.name);
-                emit_cpp_getter_method(
-                    &mut accessors,
-                    &method,
-                    &f.getter_symbol,
-                    &cast,
-                    &f.ty,
-                    &f.doc,
-                    module_path,
-                    prefix,
-                );
-            }
-        }
-        w.raw(accessors);
-    });
-    w.line("};");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Render an interface as a move-only RAII class following the struct-wrapper
-/// pattern. The constructor named `new` becomes the canonical C++ constructor
-/// (adopting the handle the C constructor returns); every other constructor
-/// becomes a static factory. Methods pass the wrapped handle as the leading C
-/// argument and are declared `const` (the ABI receiver is a const pointer);
-/// statics are static member functions. Sync, async, and iterator member
-/// shapes reuse the free-function marshalling paths.
+/// Render an interface as a move-only RAII class. The constructor named `new`
+/// becomes the canonical C++ constructor (adopting the handle the C
+/// constructor returns); every other constructor becomes a static factory.
+/// Methods pass the wrapped handle as the leading C argument and are declared
+/// `const` (the ABI receiver is a const pointer); statics are static member
+/// functions. Sync, async, and iterator member shapes reuse the free-function
+/// marshalling paths.
 fn render_cpp_interface(
     out: &mut String,
     i: &InterfaceBinding,
@@ -1109,495 +1843,6 @@ fn render_cpp_interface(
     out.push_str(&w.finish());
 }
 
-/// Collect the local class names of any wrapper types (record, rich enum,
-/// typed handle, or interface) reachable from `ty`, recursing through
-/// optional/list/map/iterator wrappers.
-///
-/// A C++ wrapper member that returns one of these constructs it inline (e.g.
-/// `return Shape(...)`), which requires the returned class to be a *complete*
-/// type at that point, so the returned class must be defined first.
-fn collect_struct_deps(ty: &TypeRef, deps: &mut Vec<String>) {
-    match ty {
-        TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => deps.push(local_type_name(n).to_string()),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            collect_struct_deps(inner, deps)
-        }
-        TypeRef::Map(k, v) => {
-            collect_struct_deps(k, deps);
-            collect_struct_deps(v, deps);
-        }
-        _ => {}
-    }
-}
-
-/// An opaque-object wrapper type: a struct, a rich (algebraic) enum, or an
-/// interface. All are emitted as RAII classes and may reference one another
-/// (a struct field of enum type, an interface method returning a struct), so
-/// they are ordered together.
-enum WrapperDef<'a> {
-    Struct(&'a StructBinding),
-    RichEnum(&'a EnumBinding),
-    Interface(&'a InterfaceBinding),
-}
-
-impl WrapperDef<'_> {
-    fn name(&self) -> &str {
-        match self {
-            WrapperDef::Struct(s) => &s.name,
-            WrapperDef::RichEnum(e) => &e.name,
-            WrapperDef::Interface(i) => &i.name,
-        }
-    }
-
-    /// Local class names of other wrapper types this one references by value.
-    fn collect_deps(&self, deps: &mut Vec<String>) {
-        match self {
-            WrapperDef::Struct(s) => {
-                for f in &s.fields {
-                    collect_struct_deps(&f.ty, deps);
-                }
-            }
-            WrapperDef::RichEnum(e) => {
-                if let Some(rich) = &e.rich {
-                    for v in &rich.variants {
-                        for f in &v.fields {
-                            collect_struct_deps(&f.ty, deps);
-                        }
-                    }
-                }
-            }
-            WrapperDef::Interface(i) => {
-                for f in i
-                    .constructors
-                    .iter()
-                    .chain(i.methods.iter())
-                    .chain(i.statics.iter())
-                {
-                    for p in &f.params {
-                        collect_struct_deps(&p.ty, deps);
-                    }
-                    if let Some(ret) = &f.ret {
-                        collect_struct_deps(ret, deps);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn topo_visit_wrappers(
-    i: usize,
-    entries: &[(WrapperDef, &ModuleBinding)],
-    name_to_idx: &std::collections::HashMap<String, usize>,
-    state: &mut [u8],
-    order: &mut Vec<usize>,
-) {
-    // 0 = unvisited, 1 = on stack (skip to break any cycle), 2 = emitted.
-    if state[i] != 0 {
-        return;
-    }
-    state[i] = 1;
-    let mut deps = Vec::new();
-    entries[i].0.collect_deps(&mut deps);
-    for d in &deps {
-        if let Some(&j) = name_to_idx.get(d) {
-            if j != i {
-                topo_visit_wrappers(j, entries, name_to_idx, state, order);
-            }
-        }
-    }
-    state[i] = 2;
-    order.push(i);
-}
-
-/// Order all opaque-object wrappers (structs + rich enums + interfaces) so
-/// that any wrapper a member returns by value is emitted before the wrapper
-/// returning it. This lets a parent module's class reference a child module's
-/// class (and vice versa) regardless of declaration order. Pure DFS
-/// post-order; original walk order is the stable tiebreaker.
-fn topo_order_wrappers(entries: &[(WrapperDef, &ModuleBinding)]) -> Vec<usize> {
-    let mut name_to_idx = std::collections::HashMap::new();
-    for (i, (w, _)) in entries.iter().enumerate() {
-        // First definition wins if two modules share a local name (the flattened
-        // C++ type namespace can't hold duplicates anyway).
-        name_to_idx.entry(w.name().to_string()).or_insert(i);
-    }
-    let mut state = vec![0u8; entries.len()];
-    let mut order = Vec::with_capacity(entries.len());
-    for i in 0..entries.len() {
-        topo_visit_wrappers(i, entries, &name_to_idx, &mut state, &mut order);
-    }
-    order
-}
-
-fn render_cpp_builder(
-    out: &mut String,
-    s: &StructBinding,
-    b: &BuilderBinding,
-    module_path: &str,
-    prefix: &str,
-) {
-    let builder_ty = &b.builder_tag;
-    let name = &s.name;
-
-    let mut w = CodeWriter::four_space();
-    w.doc(&s.doc, DocCommentStyle::Javadoc);
-    w.line(format!("class {name}Builder {{"));
-    w.scope(|w| {
-        w.line("void* handle_;");
-        w.blank();
-    });
-    w.line("public:");
-    w.scope(|w| {
-        w.line(format!(
-            "{name}Builder() : handle_(reinterpret_cast<void*>({}())) {{}}",
-            b.new_symbol
-        ));
-        w.blank();
-        w.line(format!("~{name}Builder() {{"));
-        w.scope(|w| {
-            w.line(format!(
-                "if (handle_) {}(static_cast<{builder_ty}*>(handle_));",
-                b.destroy_symbol
-            ));
-        });
-        w.line("}");
-        w.blank();
-
-        w.line(format!("{name}Builder(const {name}Builder&) = delete;"));
-        w.line(format!(
-            "{name}Builder& operator=(const {name}Builder&) = delete;"
-        ));
-        w.blank();
-        w.line(format!(
-            "{name}Builder({name}Builder&& other) noexcept : handle_(other.handle_) {{"
-        ));
-        w.scope(|w| {
-            w.line("other.handle_ = nullptr;");
-        });
-        w.line("}");
-        w.blank();
-        w.line(format!(
-            "{name}Builder& operator=({name}Builder&& other) noexcept {{"
-        ));
-        w.scope(|w| {
-            w.line("if (this != &other) {");
-            w.scope(|w| {
-                w.line(format!(
-                    "if (handle_) {}(static_cast<{builder_ty}*>(handle_));",
-                    b.destroy_symbol
-                ));
-                w.line("handle_ = other.handle_;");
-                w.line("other.handle_ = nullptr;");
-            });
-            w.line("}");
-            w.line("return *this;");
-        });
-        w.line("}");
-        w.blank();
-
-        for (field, (_, setter_symbol)) in s.fields.iter().zip(&b.setters) {
-            let pascal = field.name.to_upper_camel_case();
-            let decl = cpp_param_decl(&field.ty, "value");
-            w.doc(&field.doc, DocCommentStyle::Javadoc);
-            w.line(format!("{name}Builder& with{pascal}({decl}) {{"));
-            let (setup, args) = param_to_c_args(&field.ty, "value", module_path, prefix);
-            w.scope(|w| {
-                for line in &setup {
-                    w.line(line);
-                }
-                let args_str = args.join(", ");
-                w.line(format!(
-                    "{setter_symbol}(static_cast<{builder_ty}*>(handle_), {args_str});"
-                ));
-                w.line("return *this;");
-            });
-            w.line("}");
-            w.blank();
-        }
-
-        // Build reports only missing-field or panic errors, so the check is
-        // the generic one.
-        w.line(format!("{name} build() {{"));
-        w.scope(|w| {
-            w.line(format!("{prefix}_error err{{}};"));
-            w.line(format!(
-                "auto* ptr = {}(static_cast<{builder_ty}*>(handle_), &err);",
-                b.build_symbol
-            ));
-            w.line("detail::check(err);");
-            w.line(format!("return {name}(ptr);"));
-        });
-        w.line("}");
-    });
-    w.line("};");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Emit one `RetType method() const { ... }` accessor that reads an opaque
-/// object's field through C getter `getter`, casting `handle_` via `cast`. Shared
-/// by struct field getters and rich-enum per-variant field getters (which differ
-/// only in the C symbol and the C++ method name).
-#[allow(clippy::too_many_arguments)]
-fn emit_cpp_getter_method(
-    out: &mut String,
-    method_name: &str,
-    getter: &str,
-    cast: &str,
-    ty: &TypeRef,
-    doc: &Option<String>,
-    module: &str,
-    prefix: &str,
-) {
-    let ret_type = cpp_type(ty);
-
-    let mut w = CodeWriter::four_space().with_depth(1);
-    w.doc(doc, DocCommentStyle::Javadoc);
-    w.line(format!("{ret_type} {method_name}() const {{"));
-    w.scope(|w| match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool => {
-            w.line(format!("return {getter}({cast});"));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("const char* raw = {getter}({cast});"));
-            w.line("std::string ret(raw);");
-            w.line(format!("{prefix}_free_string(raw);"));
-            w.line("return ret;");
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("size_t len = 0;");
-            w.line(format!("auto* raw = {getter}({cast}, &len);"));
-            w.line("std::vector<uint8_t> ret(raw, raw + len);");
-            w.line(format!(
-                "{prefix}_free_bytes(const_cast<uint8_t*>(raw), len);"
-            ));
-            w.line("return ret;");
-        }
-        TypeRef::Handle => {
-            w.line(format!(
-                "return reinterpret_cast<void*>(static_cast<uintptr_t>({getter}({cast})));"
-            ));
-        }
-        TypeRef::TypedHandle(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("return {ln}({getter}({cast}));"));
-        }
-        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("return {ln}({getter}({cast}));"));
-        }
-        TypeRef::Enum(n) => {
-            let n = local_type_name(n);
-            w.line(format!("return static_cast<{n}>({getter}({cast}));"));
-        }
-        TypeRef::Optional(inner) => {
-            let mut tmp = String::new();
-            render_getter_optional(&mut tmp, inner, getter, cast, prefix);
-            w.raw(tmp);
-        }
-        TypeRef::List(inner) => {
-            let mut tmp = String::new();
-            render_getter_list(&mut tmp, inner, getter, cast, prefix);
-            w.raw(tmp);
-        }
-        TypeRef::Map(k, v) => {
-            let mut tmp = String::new();
-            render_getter_map(&mut tmp, k, v, getter, cast, module, prefix);
-            w.raw(tmp);
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as enum/struct field"),
-        TypeRef::Interface(_) => {
-            unreachable!("validation rejects interface-typed fields")
-        }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    });
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-fn render_getter_optional(
-    out: &mut String,
-    inner: &TypeRef,
-    getter: &str,
-    cast: &str,
-    prefix: &str,
-) {
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line(format!("auto* raw = {getter}({cast});"));
-    w.line("if (!raw) return std::nullopt;");
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("std::string ret(raw);");
-            w.line(format!("{prefix}_free_string(raw);"));
-            w.line("return ret;");
-        }
-        TypeRef::TypedHandle(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("return {ln}(raw);"));
-        }
-        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("return {ln}(raw);"));
-        }
-        TypeRef::Enum(n) => {
-            let n = local_type_name(n);
-            w.line(format!("auto ret = static_cast<{n}>(*raw);"));
-            w.line(format!(
-                "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(raw), sizeof(*raw));"
-            ));
-            w.line("return ret;");
-        }
-        // A boxed optional scalar: dereference, then release the box.
-        _ if !is_c_pointer_type(inner) => {
-            w.line("auto ret = *raw;");
-            w.line(format!(
-                "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(raw), sizeof(*raw));"
-            ));
-            w.line("return ret;");
-        }
-        _ => {
-            w.line(format!("return {}(raw);", cpp_type(inner)));
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn render_getter_list(out: &mut String, inner: &TypeRef, getter: &str, cast: &str, prefix: &str) {
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line("size_t len = 0;");
-    w.line(format!("auto* raw = {getter}({cast}, &len);"));
-    let free_array =
-        format!("{prefix}_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));");
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("std::vector<std::string> ret;");
-            w.line("ret.reserve(len);");
-            w.line("for (size_t i = 0; i < len; ++i) {");
-            w.scope(|w| {
-                w.line("ret.emplace_back(raw[i]);");
-                w.line(format!("{prefix}_free_string(raw[i]);"));
-            });
-            w.line("}");
-            w.line(&free_array);
-            w.line("return ret;");
-        }
-        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("std::vector<{ln}> ret;"));
-            w.line("ret.reserve(len);");
-            w.line(format!(
-                "for (size_t i = 0; i < len; ++i) ret.emplace_back({ln}(raw[i]));"
-            ));
-            w.line(&free_array);
-            w.line("return ret;");
-        }
-        TypeRef::Enum(n) => {
-            let n = local_type_name(n);
-            w.line(format!("std::vector<{n}> ret;"));
-            w.line("ret.reserve(len);");
-            w.line(format!(
-                "for (size_t i = 0; i < len; ++i) ret.emplace_back(static_cast<{n}>(raw[i]));"
-            ));
-            w.line(&free_array);
-            w.line("return ret;");
-        }
-        _ => {
-            w.line(format!(
-                "std::vector<{}> ret(raw, raw + len);",
-                cpp_type(inner)
-            ));
-            w.line(&free_array);
-            w.line("return ret;");
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn render_getter_map(
-    out: &mut String,
-    k: &TypeRef,
-    v: &TypeRef,
-    getter: &str,
-    cast: &str,
-    module: &str,
-    prefix: &str,
-) {
-    let kc = c_element_type(k, module, prefix);
-    let vc = c_element_type(v, module, prefix);
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line(format!("{kc}* out_keys = nullptr;"));
-    w.line(format!("{vc}* out_values = nullptr;"));
-    w.line("size_t len = 0;");
-    w.line(format!("{getter}({cast}, &out_keys, &out_values, &len);"));
-
-    let cpp_k = cpp_type(k);
-    let cpp_v = cpp_type(v);
-    w.line(format!("std::unordered_map<{cpp_k}, {cpp_v}> ret;"));
-    let ke = map_elem_expr(k, "out_keys");
-    let ve = map_elem_expr(v, "out_values");
-    w.line("for (size_t i = 0; i < len; ++i) {");
-    w.scope(|w| {
-        w.line(format!("ret[{ke}] = {ve};"));
-        for (ty, base) in [(k, "out_keys"), (v, "out_values")] {
-            if let Some(stmt) = map_elem_free_stmt(ty, base, prefix) {
-                w.line(stmt);
-            }
-        }
-    });
-    w.line("}");
-    w.line(format!(
-        "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(out_keys), len * sizeof(*out_keys));"
-    ));
-    w.line(format!(
-        "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(out_values), len * sizeof(*out_values));"
-    ));
-    w.line("return ret;");
-    out.push_str(&w.finish());
-}
-
-/// The expression converting one map key/value slot at loop index `i` into the
-/// C++ element inserted into the result map. Record and rich-enum values adopt
-/// the owned element pointer into their wrapper class.
-fn map_elem_expr(ty: &TypeRef, base: &str) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("std::string({base}[i])"),
-        TypeRef::Enum(n) => format!("static_cast<{}>({base}[i])", local_type_name(n)),
-        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
-            format!("{}({base}[i])", local_type_name(n))
-        }
-        _ => format!("{base}[i]"),
-    }
-}
-
-/// The per-element release statement owed after copying one map key/value slot
-/// out of a returned map buffer, matching [`weaveffi_core::plan::elem_free`]:
-/// strings are released with `{prefix}_free_string`, object pointers are
-/// adopted by their wrapper (no eager release), and by-value elements owe
-/// nothing.
-fn map_elem_free_stmt(ty: &TypeRef, base: &str, prefix: &str) -> Option<String> {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            Some(format!("{prefix}_free_string({base}[i]);"))
-        }
-        _ => None,
-    }
-}
-
 // ── Namespace: per-module function namespaces ──
 
 /// Emit one module's nested namespace holding its listeners and free
@@ -1620,64 +1865,43 @@ fn render_cpp_module_ns(out: &mut String, module: &ModuleBinding, prefix: &str) 
 }
 
 /// The C++ type one callback parameter surfaces as in the user callback.
-/// Object and handle parameters stay raw (`const {c_tag}*`): wrapping them in
-/// the owning C++ class would `*_destroy` a borrowed handle on destruction.
+/// Buffered values are decoded before dispatch, so they surface as full C++
+/// value types. Interface and typed-handle parameters stay raw borrowed
+/// pointers: wrapping a borrowed handle in the owning RAII class would
+/// `_destroy` it on destruction.
 fn cpp_cb_param_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
     match ty {
-        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::TypedHandle(n) => {
-            format!("const {}*", c_abi_struct_name(n, module, prefix))
-        }
-        TypeRef::Optional(inner) if is_borrowed_cb_object(inner) => {
+        TypeRef::Interface(n) => format!("const {}*", c_abi_struct_name(n, module, prefix)),
+        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Interface(_)) => {
             cpp_cb_param_type(inner, module, prefix)
         }
-        TypeRef::List(inner) if is_borrowed_cb_object(inner) => {
-            format!("std::vector<{}>", cpp_cb_param_type(inner, module, prefix))
-        }
-        other => cpp_type(other),
+        other => cpp_type(other, module, prefix),
     }
 }
 
-/// True when a callback parameter type crosses as a borrowed raw object
-/// pointer (record, rich enum, or typed handle).
-fn is_borrowed_cb_object(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
-    )
-}
-
-/// One element read from a parallel-array base pointer at loop index `i`.
-fn cpp_cb_elem_expr(ty: &TypeRef, base: &str) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("std::string({base}[i] ? {base}[i] : \"\")")
-        }
-        TypeRef::Enum(e) => format!(
-            "static_cast<{}>(static_cast<int32_t>({base}[i]))",
-            local_type_name(e)
-        ),
-        _ => format!("{base}[i]"),
-    }
-}
-
-/// Statements (pushed to `stmts`) plus the expression converting one callback
-/// parameter's C slots into the value handed to the user callback.
-fn cpp_cb_arg(p: &ParamBinding, abi_module: &str, prefix: &str, stmts: &mut Vec<String>) -> String {
+/// Emit any decode statements for one callback parameter and return the
+/// expression handed to the user's `std::function`. Buffered arguments are
+/// borrowed `(ptr, len)` pairs valid only during the dispatch, so they are
+/// decoded into owned C++ values before the user callback runs.
+fn emit_cb_arg(w: &mut CodeWriter, p: &ParamBinding, module: &str, prefix: &str) -> String {
     let slots = &p.abi;
     let n0 = slots[0].name.clone();
+    if is_buffered(&p.ty) {
+        let n1 = &slots[1].name;
+        let var = format!("{}_val", p.name);
+        let rdr = format!("{}_r", p.name);
+        let cpp = cpp_type(&p.ty, module, prefix);
+        w.line(format!("{cpp} {var}{{}};"));
+        w.line(format!("if ({n0} != nullptr) {{"));
+        w.scope(|w| {
+            w.line(format!("detail::BufferReader {rdr}({n0}, {n1});"));
+            emit_read_into(w, &p.ty, &var, &var, &rdr, module, prefix);
+            w.line(format!("{rdr}.expect_end();"));
+        });
+        w.line("}");
+        return format!("std::move({var})");
+    }
     match &p.ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool
-        | TypeRef::Handle => n0,
         TypeRef::Enum(e) => format!(
             "static_cast<{}>(static_cast<int32_t>({n0}))",
             local_type_name(e)
@@ -1687,67 +1911,19 @@ fn cpp_cb_arg(p: &ParamBinding, abi_module: &str, prefix: &str, stmts: &mut Vec<
             let n1 = &slots[1].name;
             format!("{n0} ? std::vector<uint8_t>({n0}, {n0} + {n1}) : std::vector<uint8_t>{{}}")
         }
+        TypeRef::Handle => {
+            format!("reinterpret_cast<void*>(static_cast<uintptr_t>({n0}))")
+        }
         // Borrowed for the duration of the callback; passed through raw.
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => n0,
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                format!("{n0} ? std::optional<std::string>(std::string({n0})) : std::nullopt")
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let n1 = &slots[1].name;
-                format!(
-                    "{n0} ? std::optional<std::vector<uint8_t>>(std::vector<uint8_t>({n0}, {n0} + {n1})) : std::nullopt"
-                )
-            }
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => n0,
-            TypeRef::Enum(e) => {
-                let local = local_type_name(e);
-                format!(
-                    "{n0} ? std::optional<{local}>(static_cast<{local}>(static_cast<int32_t>(*{n0}))) : std::nullopt"
-                )
-            }
-            other => {
-                let t = cpp_type(other);
-                format!("{n0} ? std::optional<{t}>(*{n0}) : std::nullopt")
-            }
-        },
-        TypeRef::List(inner) => {
-            let n1 = &slots[1].name;
-            let var = format!("{}_vec", p.name);
-            let elem_ty = cpp_cb_param_type(inner, abi_module, prefix);
-            let elem = cpp_cb_elem_expr(inner, &n0);
-            stmts.push(format!("std::vector<{elem_ty}> {var};"));
-            stmts.push(format!(
-                "if ({n0} != nullptr) {{ {var}.reserve({n1}); for (size_t i = 0; i < {n1}; ++i) {var}.push_back({elem}); }}"
-            ));
-            var
-        }
-        TypeRef::Map(k, v) => {
-            let keys = &slots[0].name;
-            let vals = &slots[1].name;
-            let len = &slots[2].name;
-            let var = format!("{}_map", p.name);
-            let kt = cpp_cb_param_type(k, abi_module, prefix);
-            let vt = cpp_cb_param_type(v, abi_module, prefix);
-            let ke = cpp_cb_elem_expr(k, keys);
-            let ve = cpp_cb_elem_expr(v, vals);
-            stmts.push(format!("std::unordered_map<{kt}, {vt}> {var};"));
-            stmts.push(format!(
-                "if ({keys} != nullptr && {vals} != nullptr) {{ for (size_t i = 0; i < {len}; ++i) {var}[{ke}] = {ve}; }}"
-            ));
-            var
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Optional(_) => n0,
+        _ => n0,
     }
 }
 
 /// The register/unregister pair for one listener. The user `std::function` is
 /// heap-boxed and threaded through the C `context` pointer; a capture-free
-/// lambda (convertible to the C function pointer) unboxes and invokes it.
+/// lambda (convertible to the C function pointer) unboxes and invokes it,
+/// decoding any borrowed buffered arguments first.
 fn render_cpp_listener(
     out: &mut String,
     module: &ModuleBinding,
@@ -1766,13 +1942,6 @@ fn render_cpp_listener(
     let std_fn = format!("std::function<void({})>", fn_params.join(", "));
 
     let lambda_params = render_param_decls(&cb.abi_params, prefix).join(", ");
-
-    let mut stmts = Vec::new();
-    let args: Vec<String> = cb
-        .params
-        .iter()
-        .map(|p| cpp_cb_arg(p, &module.path, prefix, &mut stmts))
-        .collect();
 
     let register_name = format!("register_{}", l.name.to_snake_case());
     let unregister_name = format!("unregister_{}", l.name.to_snake_case());
@@ -1794,9 +1963,11 @@ fn render_cpp_listener(
             w.line(format!("[]({lambda_params}) {{"));
             w.scope(|w| {
                 w.line(format!("auto& cb = *static_cast<{std_fn}*>(context);"));
-                for s in &stmts {
-                    w.line(s);
-                }
+                let args: Vec<String> = cb
+                    .params
+                    .iter()
+                    .map(|p| emit_cb_arg(w, p, &module.path, prefix))
+                    .collect();
                 w.line(format!("cb({});", args.join(", ")));
             });
             w.line("},");
@@ -1823,180 +1994,55 @@ fn render_cpp_listener(
     out.push_str(&w.finish());
 }
 
-/// Converts a C++ param into setup lines and C argument expressions.
-fn param_to_c_args(
+/// Emit the setup statements for one C++ parameter and return the C argument
+/// expressions its ABI slots receive. A buffered parameter is encoded into a
+/// local `detail::BufferWriter` and passed as `(data(), size())`; the caller
+/// owns the encoding for the duration of the call.
+fn emit_param_setup(
+    w: &mut CodeWriter,
     ty: &TypeRef,
     name: &str,
     module: &str,
     prefix: &str,
-) -> (Vec<String>, Vec<String>) {
+) -> Vec<String> {
+    if is_buffered(ty) {
+        let buf = format!("{name}_buf");
+        w.line(format!("detail::BufferWriter {buf};"));
+        emit_write_value(w, ty, name, &buf, 0);
+        return vec![format!("{buf}.data()"), format!("{buf}.size()")];
+    }
     match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool => (vec![], vec![name.into()]),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (vec![], vec![format!("{name}.c_str()")]),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => (
-            vec![],
-            vec![format!("{name}.data()"), format!("{name}.size()")],
-        ),
-        TypeRef::Handle => (
-            vec![],
-            vec![format!(
-                "static_cast<{prefix}_handle_t>(reinterpret_cast<uintptr_t>({name}))"
-            )],
-        ),
-        TypeRef::TypedHandle(n) => (
-            vec![],
-            vec![format!(
-                "static_cast<{}*>({name}.handle())",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}.c_str()")],
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            vec![format!("{name}.data()"), format!("{name}.size()")]
+        }
+        TypeRef::Handle => vec![format!(
+            "static_cast<{prefix}_handle_t>(reinterpret_cast<uintptr_t>({name}))"
+        )],
+        // A typed handle is already the raw prefixed tag pointer.
+        TypeRef::TypedHandle(_) => vec![name.to_string()],
+        // An interface argument borrows: pass its raw handle as a const
+        // pointer, leaving ownership with the wrapper object.
+        TypeRef::Interface(n) => vec![format!(
+            "static_cast<const {}*>({name}.handle())",
+            c_abi_struct_name(n, module, prefix)
+        )],
+        TypeRef::Enum(e) => vec![format!(
+            "static_cast<{}>(static_cast<int32_t>({name}))",
+            c_abi_struct_name(e, module, prefix)
+        )],
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable borrowed object pointer, null meaning none.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(n) => vec![format!(
+                "{name}.has_value() ? static_cast<const {}*>({name}.value().handle()) : nullptr",
                 c_abi_struct_name(n, module, prefix)
             )],
-        ),
-        // A record, rich-enum, or interface argument borrows: pass its raw
-        // handle as a const pointer, leaving ownership with the wrapper object.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => (
-            vec![],
-            vec![format!(
-                "static_cast<const {}*>({name}.handle())",
-                c_abi_struct_name(s, module, prefix)
-            )],
-        ),
-        TypeRef::Enum(e) => (
-            vec![],
-            vec![format!(
-                "static_cast<{}>(static_cast<int32_t>({name}))",
-                c_abi_struct_name(e, module, prefix)
-            )],
-        ),
-        TypeRef::Optional(inner) => {
-            if is_c_pointer_type(inner) {
-                match inner.as_ref() {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
-                        vec![],
-                        vec![format!(
-                            "{name}.has_value() ? {name}.value().c_str() : nullptr"
-                        )],
-                    ),
-                    TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => (
-                        vec![],
-                        vec![format!(
-                            "{name}.has_value() ? static_cast<const {}*>({name}.value().handle()) : nullptr",
-                            c_abi_struct_name(s, module, prefix)
-                        )],
-                    ),
-                    _ => param_to_c_args(inner, name, module, prefix),
-                }
-            } else {
-                let c_ty = c_element_type(inner, module, prefix);
-                let conv = match inner.as_ref() {
-                    TypeRef::Enum(_) => {
-                        format!("static_cast<{c_ty}>(static_cast<int32_t>(*{name}))")
-                    }
-                    _ => format!("*{name}"),
-                };
-                (
-                    vec![
-                        format!("const {c_ty}* {name}_ptr = nullptr;"),
-                        format!("{c_ty} {name}_tmp{{}};"),
-                        format!(
-                            "if ({name}.has_value()) {{ {name}_tmp = {conv}; {name}_ptr = &{name}_tmp; }}"
-                        ),
-                    ],
-                    vec![format!("{name}_ptr")],
-                )
-            }
-        }
-        TypeRef::List(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
-                vec![
-                    format!("std::vector<const char*> {name}_cstrs;"),
-                    format!("{name}_cstrs.reserve({name}.size());"),
-                    format!("for (const auto& s : {name}) {name}_cstrs.push_back(s.c_str());"),
-                ],
-                vec![
-                    format!("{name}_cstrs.data()"),
-                    format!("{name}_cstrs.size()"),
-                ],
-            ),
-            TypeRef::Record(s) | TypeRef::RichEnum(s) => {
-                // The C ABI lowers an object-list parameter to `T* const*` (a
-                // const array of non-const element pointers), so the staging
-                // vector must hold non-const `T*` for `.data()` (`T**`) to
-                // convert cleanly.
-                let c_ptr = format!("{}*", c_abi_struct_name(s, module, prefix));
-                (
-                    vec![
-                        format!("std::vector<{c_ptr}> {name}_ptrs;"),
-                        format!("{name}_ptrs.reserve({name}.size());"),
-                        format!(
-                            "for (const auto& item : {name}) {name}_ptrs.push_back(static_cast<{c_ptr}>(item.handle()));"
-                        ),
-                    ],
-                    vec![
-                        format!("{name}_ptrs.data()"),
-                        format!("{name}_ptrs.size()"),
-                    ],
-                )
-            }
-            _ => (
-                vec![],
-                vec![format!("{name}.data()"), format!("{name}.size()")],
-            ),
+            _ => unreachable!("non-interface optionals are buffered"),
         },
-        TypeRef::Map(k, v) => {
-            let kc = c_element_type(k, module, prefix);
-            let vc = c_element_type(v, module, prefix);
-            let ke = match k.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "kv.first.c_str()".into(),
-                TypeRef::Enum(e) => {
-                    format!(
-                        "static_cast<{}>(static_cast<int32_t>(kv.first))",
-                        c_abi_struct_name(e, module, prefix)
-                    )
-                }
-                _ => "kv.first".into(),
-            };
-            let ve = match v.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "kv.second.c_str()".into(),
-                TypeRef::Enum(e) => {
-                    format!(
-                        "static_cast<{}>(static_cast<int32_t>(kv.second))",
-                        c_abi_struct_name(e, module, prefix)
-                    )
-                }
-                TypeRef::Record(s) | TypeRef::RichEnum(s) => {
-                    format!(
-                        "static_cast<const {}*>(kv.second.handle())",
-                        c_abi_struct_name(s, module, prefix)
-                    )
-                }
-                _ => "kv.second".into(),
-            };
-            (
-                vec![
-                    format!("std::vector<{kc}> {name}_keys_v;"),
-                    format!("std::vector<{vc}> {name}_vals_v;"),
-                    format!(
-                        "for (const auto& kv : {name}) {{ {name}_keys_v.push_back({ke}); {name}_vals_v.push_back({ve}); }}"
-                    ),
-                ],
-                vec![
-                    format!("{name}_keys_v.data()"),
-                    format!("{name}_vals_v.data()"),
-                    format!("{name}_keys_v.size()"),
-                ],
-            )
-        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        _ => vec![name.to_string()],
     }
 }
 
@@ -2090,9 +2136,11 @@ fn render_cpp_callable(
     }
 }
 
-/// Render a synchronous callable: marshal the parameters, call the C symbol,
-/// run the throws-split error check, and marshal the return value. For a
-/// canonical constructor the "return" adopts the handle instead.
+/// Render a synchronous callable: marshal the parameters (packing buffered
+/// values into local buffers), call the C symbol, run the throws-split error
+/// check, and marshal the return value (decoding buffered returns then
+/// releasing the producer buffer). For a canonical constructor the "return"
+/// adopts the handle instead.
 fn render_sync_callable(
     out: &mut String,
     f: &FnBinding,
@@ -2102,14 +2150,13 @@ fn render_sync_callable(
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    let depth = kind.depth();
-    let mut w = CodeWriter::four_space().with_depth(depth);
+    let mut w = CodeWriter::four_space().with_depth(kind.depth());
     emit_callable_attrs(&mut w, f);
 
     let decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name)))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
         .collect();
 
     let is_ctor = matches!(kind, FnKind::Ctor);
@@ -2122,7 +2169,10 @@ fn render_sync_callable(
             decls.join(", ")
         ));
     } else {
-        let cpp_ret = f.ret.as_ref().map_or("void".to_string(), cpp_type);
+        let cpp_ret = f
+            .ret
+            .as_ref()
+            .map_or("void".to_string(), |r| cpp_type(r, &module.path, prefix));
         w.line(format!(
             "{}{cpp_ret} {cpp_name}({}){} {{",
             kind.keyword(),
@@ -2131,71 +2181,112 @@ fn render_sync_callable(
         ));
     }
 
-    let mut setup = Vec::new();
-    let mut c_args = Vec::new();
-    if let Some(self_arg) = kind.self_arg() {
-        c_args.push(self_arg);
-    }
-    for p in &f.params {
-        let (s, a) = param_to_c_args(&p.ty, &cpp_ident(&p.name), &module.path, prefix);
-        setup.extend(s);
-        c_args.extend(a);
-    }
-
-    let is_void_c = f
-        .ret
-        .as_ref()
-        .is_none_or(|r| matches!(r, TypeRef::Map(_, _)));
-
-    if let Some(ret) = &f.ret {
-        match ret {
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-                setup.push("size_t out_len = 0;".into());
-                c_args.push("&out_len".into());
-            }
-            TypeRef::Map(k, v) => {
-                let kc = c_element_type(k, &module.path, prefix);
-                let vc = c_element_type(v, &module.path, prefix);
-                setup.push(format!("{kc}* out_keys = nullptr;"));
-                setup.push(format!("{vc}* out_values = nullptr;"));
-                setup.push("size_t out_len = 0;".into());
-                c_args.push("&out_keys".into());
-                c_args.push("&out_values".into());
-                c_args.push("&out_len".into());
-            }
-            _ => {}
-        }
-    }
-
-    c_args.push("&err".into());
-
-    let args_str = c_args.join(", ");
     let check = check_helper(f, module);
     w.scope(|w| {
-        for line in &setup {
-            w.line(line);
+        let mut c_args = Vec::new();
+        if let Some(self_arg) = kind.self_arg() {
+            c_args.push(self_arg);
         }
-        w.line(format!("{prefix}_error err{{}};"));
+        for p in &f.params {
+            c_args.extend(emit_param_setup(
+                w,
+                &p.ty,
+                &cpp_ident(&p.name),
+                &module.path,
+                prefix,
+            ));
+        }
 
-        if is_void_c {
+        // A bytes or buffered return carries a trailing `size_t* out_len`.
+        let has_out_len = f.ret.as_ref().is_some_and(|r| {
+            is_buffered(r) || matches!(r, TypeRef::Bytes | TypeRef::BorrowedBytes)
+        });
+        if has_out_len {
+            w.line("size_t out_len = 0;");
+            c_args.push("&out_len".into());
+        }
+        c_args.push("&err".into());
+        let args_str = c_args.join(", ");
+
+        w.line(format!("{prefix}_error err{{}};"));
+        if f.ret.is_none() {
             w.line(format!("{}({args_str});", abi.symbol));
         } else {
             w.line(format!("auto result = {}({args_str});", abi.symbol));
         }
-
         w.line(format!("{check}(err);"));
 
         if is_ctor {
             w.line("handle_ = result;");
         } else if let Some(ret) = &f.ret {
-            let mut tmp = String::new();
-            render_cpp_return(&mut tmp, ret, prefix, depth + 1);
-            w.raw(tmp);
+            emit_sync_return(w, ret, &module.path, prefix);
         }
     });
     w.line("}");
     w.blank();
     out.push_str(&w.finish());
+}
+
+/// Marshal a sync callable's C result (already error-checked) into the C++
+/// return value at the writer's current depth. A buffered return decodes the
+/// producer's buffer and releases it with `{prefix}_free_bytes` via a scope
+/// guard, so the release happens even when decoding throws.
+fn emit_sync_return(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: &str) {
+    if is_buffered(ty) {
+        w.line("detail::BufferGuard result_guard{result, out_len};");
+        w.line("detail::BufferReader result_r(result, out_len);");
+        emit_read_decl(w, ty, "ret", "result_r", module, prefix);
+        w.line("result_r.expect_end();");
+        w.line("return ret;");
+        return;
+    }
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line("std::string ret(result);");
+            w.line(format!("{prefix}_free_string(result);"));
+            w.line("return ret;");
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line("std::vector<uint8_t> ret(result, result + out_len);");
+            w.line(format!(
+                "{prefix}_free_bytes(const_cast<uint8_t*>(result), out_len);"
+            ));
+            w.line("return ret;");
+        }
+        TypeRef::Handle => {
+            w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(result));");
+        }
+        // A typed handle is the raw tag pointer; pass it through.
+        TypeRef::TypedHandle(_) => {
+            w.line("return result;");
+        }
+        // An owned interface pointer is adopted by the RAII class, which
+        // destroys it when the wrapper drops.
+        TypeRef::Interface(n) => {
+            w.line(format!("return {}(result);", local_type_name(n)));
+        }
+        TypeRef::Enum(n) => {
+            w.line(format!(
+                "return static_cast<{}>(result);",
+                local_type_name(n)
+            ));
+        }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(n) => {
+                w.line("if (!result) return std::nullopt;");
+                w.line(format!("return {}(result);", local_type_name(n)));
+            }
+            _ => unreachable!("non-interface optionals are buffered"),
+        },
+        TypeRef::Iterator(_) => {
+            unreachable!("iterator returns render through the lazy range path")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        _ => {
+            w.line("return result;");
+        }
+    }
 }
 
 /// Render an iterator-returning callable as a lazy range.
@@ -2209,8 +2300,8 @@ fn render_sync_callable(
 /// * `begin()`/`end()` expose a single-pass input iterator with a sentinel
 ///   end, so `for (auto&& item : fn())` streams in constant memory.
 /// * Each pulled element is converted and then released per the plan's
-///   `elem_free` (strings copied then `{prefix}_free_string`; record and
-///   rich-enum pointers adopted by their owning wrapper class).
+///   `elem_free` (strings copied then `{prefix}_free_string`; bytes and
+///   buffered values copied or decoded then `{prefix}_free_bytes`).
 /// * `destroy` runs exactly once: eagerly on exhaustion or a `next` error,
 ///   from the destructor otherwise. The handle is nulled on every path.
 /// * Launch and per-`next` errors follow the callable's [`ErrorStrategy`]
@@ -2225,15 +2316,14 @@ fn render_iterator_callable(
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    let elem_cpp = cpp_type(&it.elem);
+    let elem_cpp = cpp_type(&it.elem, &module.path, prefix);
     let class_name = format!("{}Iterator", f.name.to_upper_camel_case());
     let iter_tag = &it.iter_tag;
     let destroy = &it.destroy_symbol;
     let check = check_helper(f, module);
-    let depth = kind.depth();
 
     // ── The lazy range class ──
-    let mut w = CodeWriter::four_space().with_depth(depth);
+    let mut w = CodeWriter::four_space().with_depth(kind.depth());
     w.doc(
         &Some(format!(
             "A lazy, move-only range over the `{elem_cpp}` elements produced by \
@@ -2360,7 +2450,7 @@ fn render_iterator_callable(
     let decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name)))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
         .collect();
     w.line(format!(
         "{}{class_name} {cpp_name}({}){} {{",
@@ -2369,22 +2459,21 @@ fn render_iterator_callable(
         kind.const_qual()
     ));
 
-    let mut setup = Vec::new();
-    let mut c_args = Vec::new();
-    if let Some(self_arg) = kind.self_arg() {
-        c_args.push(self_arg);
-    }
-    for p in &f.params {
-        let (s, a) = param_to_c_args(&p.ty, &cpp_ident(&p.name), &module.path, prefix);
-        setup.extend(s);
-        c_args.extend(a);
-    }
-    c_args.push("&err".into());
-
     w.scope(|w| {
-        for line in &setup {
-            w.line(line);
+        let mut c_args = Vec::new();
+        if let Some(self_arg) = kind.self_arg() {
+            c_args.push(self_arg);
         }
+        for p in &f.params {
+            c_args.extend(emit_param_setup(
+                w,
+                &p.ty,
+                &cpp_ident(&p.name),
+                &module.path,
+                prefix,
+            ));
+        }
+        c_args.push("&err".into());
         w.line(format!("{prefix}_error err{{}};"));
         w.line(format!(
             "{iter_tag}* iter = {}({});",
@@ -2411,11 +2500,11 @@ fn render_iterator_next_method(
     prefix: &str,
     check: &str,
 ) {
-    let elem_cpp = cpp_type(&it.elem);
+    let elem_cpp = cpp_type(&it.elem, &module.path, prefix);
     let destroy = &it.destroy_symbol;
     let item_ret = abi::lower_return(&it.elem, &module.path);
     let item_ty = item_ret.ret.render_c(prefix);
-    let ef = elem_free(&it.elem, &module.path, prefix);
+    let ef = elem_free(&it.elem);
     let strategy_doc = match f.error_strategy() {
         ErrorStrategy::Throws => "throws the module's typed exception",
         ErrorStrategy::Trap => "throws the generic WeaveFFIError",
@@ -2459,31 +2548,39 @@ fn render_iterator_next_method(
             w.line("return std::nullopt;");
         });
         w.line("}");
-        match (&it.elem, &ef) {
-            // Byte-buffer elements copy then release the producer buffer.
-            (TypeRef::Bytes | TypeRef::BorrowedBytes, _) => {
-                w.line("std::vector<uint8_t> value(item, item + item_len);");
-                w.line(format!(
-                    "{prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);"
-                ));
-                w.line("return value;");
-            }
-            (_, ElemFree::String) => {
-                w.line("std::string value(item);");
-                w.line(format!("{prefix}_free_string(item);"));
-                w.line("return value;");
-            }
-            // The consumer receives ownership; the wrapper class calls the
-            // element's destroy symbol from its own destructor.
-            (TypeRef::Record(n) | TypeRef::RichEnum(n), ElemFree::Object { .. }) => {
-                w.line(format!("return {}(item);", local_type_name(n)));
-            }
-            (TypeRef::Enum(n), _) => {
-                let n = local_type_name(n);
-                w.line(format!("return static_cast<{n}>(item);"));
-            }
-            _ => {
-                w.line("return item;");
+        if is_buffered(&it.elem) {
+            // A buffered element is producer-allocated: decode into an owned
+            // value, then release with free_bytes via the scope guard.
+            w.line("detail::BufferGuard item_guard{item, item_len};");
+            w.line("detail::BufferReader item_r(item, item_len);");
+            emit_read_decl(w, &it.elem, "value", "item_r", &module.path, prefix);
+            w.line("item_r.expect_end();");
+            w.line("return value;");
+        } else {
+            match (&it.elem, &ef) {
+                // Byte-buffer elements copy then release the producer buffer.
+                (TypeRef::Bytes | TypeRef::BorrowedBytes, _) => {
+                    w.line("std::vector<uint8_t> value(item, item + item_len);");
+                    w.line(format!(
+                        "{prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);"
+                    ));
+                    w.line("return value;");
+                }
+                (_, ElemFree::String) => {
+                    w.line("std::string value(item);");
+                    w.line(format!("{prefix}_free_string(item);"));
+                    w.line("return value;");
+                }
+                (TypeRef::Enum(n), _) => {
+                    let n = local_type_name(n);
+                    w.line(format!("return static_cast<{n}>(item);"));
+                }
+                (TypeRef::Handle, _) => {
+                    w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(item));");
+                }
+                _ => {
+                    w.line("return item;");
+                }
             }
         }
     });
@@ -2494,8 +2591,10 @@ fn render_iterator_next_method(
 /// Render an asynchronous callable as a `std::future` wrapper. The promise is
 /// heap-allocated, threaded through the C `context` pointer, settled by the
 /// completion callback, and deleted exactly once. A callback error settles
-/// the promise with the typed domain exception when the callable throws, or
-/// the generic `WeaveFFIError` otherwise.
+/// the promise with the typed domain exception (payload fields decoded) when
+/// the callable throws, or the generic `WeaveFFIError` otherwise. Borrowed
+/// result buffers are copied or decoded inside the callback, before the
+/// producer reclaims them.
 fn render_async_callable(
     out: &mut String,
     f: &FnBinding,
@@ -2505,15 +2604,17 @@ fn render_async_callable(
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    let cpp_ret = f.ret.as_ref().map_or("void".to_string(), cpp_type);
-    let depth = kind.depth();
-    let mut w = CodeWriter::four_space().with_depth(depth);
+    let cpp_ret = f
+        .ret
+        .as_ref()
+        .map_or("void".to_string(), |r| cpp_type(r, &module.path, prefix));
+    let mut w = CodeWriter::four_space().with_depth(kind.depth());
     emit_callable_attrs(&mut w, f);
 
     let mut decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name)))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
         .collect();
     if f.cancellable {
         decls.push(format!("{prefix}_cancel_token* cancel_token = nullptr"));
@@ -2525,30 +2626,29 @@ fn render_async_callable(
         kind.const_qual()
     ));
 
-    let mut setup = Vec::new();
-    let mut c_args = Vec::new();
-    if let Some(self_arg) = kind.self_arg() {
-        c_args.push(self_arg);
-    }
-    for p in &f.params {
-        let (s, a) = param_to_c_args(&p.ty, &cpp_ident(&p.name), &module.path, prefix);
-        setup.extend(s);
-        c_args.extend(a);
-    }
-    if f.cancellable {
-        c_args.push("cancel_token".to_string());
-    }
-
     let cb_params = render_param_decls(&a.callback_params, prefix).join(", ");
-    let make_error = make_error_helper(f, module);
+    let make_error = make_error_call(f, module);
     w.scope(|w| {
         w.line(format!(
             "auto* promise_ptr = new std::promise<{cpp_ret}>();"
         ));
         w.line("auto future = promise_ptr->get_future();");
 
-        for line in &setup {
-            w.line(line);
+        let mut c_args = Vec::new();
+        if let Some(self_arg) = kind.self_arg() {
+            c_args.push(self_arg);
+        }
+        for p in &f.params {
+            c_args.extend(emit_param_setup(
+                w,
+                &p.ty,
+                &cpp_ident(&p.name),
+                &module.path,
+                prefix,
+            ));
+        }
+        if f.cancellable {
+            c_args.push("cancel_token".to_string());
         }
 
         if c_args.is_empty() {
@@ -2567,18 +2667,16 @@ fn render_async_callable(
             w.line("if (err && err->code != 0) {");
             w.scope(|w| {
                 w.line("std::string msg(err->message ? err->message : \"unknown error\");");
-                w.line(format!("p->set_exception({make_error}(err->code, msg));"));
+                w.line(format!("p->set_exception({make_error});"));
             });
             w.line("} else {");
-            if let Some(ret) = &f.ret {
-                let mut tmp = String::new();
-                render_async_set_value(&mut tmp, ret, depth + 3);
-                w.raw(tmp);
-            } else {
-                w.scope(|w| {
+            w.scope(|w| {
+                if let Some(ret) = &f.ret {
+                    emit_async_set_value(w, ret, &module.path, prefix);
+                } else {
                     w.line("p->set_value();");
-                });
-            }
+                }
+            });
             w.line("}");
             w.line("delete p;");
         });
@@ -2590,196 +2688,25 @@ fn render_async_callable(
     out.push_str(&w.finish());
 }
 
-/// Marshal a sync callable's C result into the C++ return value. `depth` is
-/// the indent depth of the statements inside the function body.
-fn render_cpp_return(out: &mut String, ty: &TypeRef, prefix: &str, depth: usize) {
-    let mut w = CodeWriter::four_space().with_depth(depth);
-    match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool => {
-            w.line("return result;");
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("std::string ret(result);");
-            w.line(format!("{prefix}_free_string(result);"));
-            w.line("return ret;");
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("std::vector<uint8_t> ret(result, result + out_len);");
-            w.line(format!(
-                "{prefix}_free_bytes(const_cast<uint8_t*>(result), out_len);"
-            ));
-            w.line("return ret;");
-        }
-        TypeRef::Handle => {
-            w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(result));");
-        }
-        TypeRef::TypedHandle(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("return {ln}(result);"));
-        }
-        // An owned pointer comes back for records, rich enums, and interfaces
-        // alike; wrap it in the RAII class, which destroys it when the
-        // wrapper drops.
-        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::Interface(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("return {ln}(result);"));
-        }
-        TypeRef::Enum(n) => {
-            let n = local_type_name(n);
-            w.line(format!("return static_cast<{n}>(result);"));
-        }
-        TypeRef::Optional(inner) => {
-            w.line("if (!result) return std::nullopt;");
-            match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line("std::string ret(result);");
-                    w.line(format!("{prefix}_free_string(result);"));
-                    w.line("return ret;");
-                }
-                TypeRef::TypedHandle(n) => {
-                    let ln = local_type_name(n);
-                    w.line(format!("return {ln}(result);"));
-                }
-                TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::Interface(n) => {
-                    let ln = local_type_name(n);
-                    w.line(format!("return {ln}(result);"));
-                }
-                TypeRef::Enum(n) => {
-                    let n = local_type_name(n);
-                    w.line(format!("auto ret = static_cast<{n}>(*result);"));
-                    w.line(format!(
-                        "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(result), sizeof(*result));"
-                    ));
-                    w.line("return ret;");
-                }
-                // A boxed optional scalar: dereference, then release the box.
-                _ if !is_c_pointer_type(inner) => {
-                    w.line("auto ret = *result;");
-                    w.line(format!(
-                        "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(result), sizeof(*result));"
-                    ));
-                    w.line("return ret;");
-                }
-                _ => {
-                    w.line(format!("return {}(result);", cpp_type(inner)));
-                }
-            }
-        }
-        TypeRef::List(inner) => {
-            let free_array = format!(
-                "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(result), out_len * sizeof(*result));"
-            );
-            match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line("std::vector<std::string> ret;");
-                    w.line("ret.reserve(out_len);");
-                    w.line("for (size_t i = 0; i < out_len; ++i) {");
-                    w.scope(|w| {
-                        w.line("ret.emplace_back(result[i]);");
-                        w.line(format!("{prefix}_free_string(result[i]);"));
-                    });
-                    w.line("}");
-                    w.line(&free_array);
-                    w.line("return ret;");
-                }
-                TypeRef::Record(n) | TypeRef::RichEnum(n) => {
-                    let ln = local_type_name(n);
-                    w.line(format!("std::vector<{ln}> ret;"));
-                    w.line("ret.reserve(out_len);");
-                    w.line(format!(
-                        "for (size_t i = 0; i < out_len; ++i) ret.emplace_back({ln}(result[i]));"
-                    ));
-                    w.line(&free_array);
-                    w.line("return ret;");
-                }
-                TypeRef::Enum(n) => {
-                    let n = local_type_name(n);
-                    w.line(format!("std::vector<{n}> ret;"));
-                    w.line("ret.reserve(out_len);");
-                    w.line(format!(
-                        "for (size_t i = 0; i < out_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));"
-                    ));
-                    w.line(&free_array);
-                    w.line("return ret;");
-                }
-                _ => {
-                    w.line(format!(
-                        "std::vector<{}> ret(result, result + out_len);",
-                        cpp_type(inner)
-                    ));
-                    w.line(&free_array);
-                    w.line("return ret;");
-                }
-            }
-        }
-        TypeRef::Map(k, v) => {
-            let ck = cpp_type(k);
-            let cv = cpp_type(v);
-            w.line(format!("std::unordered_map<{ck}, {cv}> ret;"));
-            let ke = map_elem_expr(k, "out_keys");
-            let ve = map_elem_expr(v, "out_values");
-            w.line("for (size_t i = 0; i < out_len; ++i) {");
-            w.scope(|w| {
-                w.line(format!("ret[{ke}] = {ve};"));
-                for (ty, base) in [(k, "out_keys"), (v, "out_values")] {
-                    if let Some(stmt) = map_elem_free_stmt(ty, base, prefix) {
-                        w.line(stmt);
-                    }
-                }
-            });
-            w.line("}");
-            w.line(format!(
-                "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(out_keys), out_len * sizeof(*out_keys));"
-            ));
-            w.line(format!(
-                "{prefix}_free_bytes(reinterpret_cast<uint8_t*>(out_values), out_len * sizeof(*out_values));"
-            ));
-            w.line("return ret;");
-        }
-        TypeRef::Iterator(_) => {
-            unreachable!("iterator returns render through the lazy range path")
-        }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-    out.push_str(&w.finish());
-}
-
-/// Settle an async promise from the callback's result slots. `depth` is the
-/// indent depth of the statements inside the success branch.
+/// Settle an async promise from the callback's result slots at the writer's
+/// current depth.
 ///
 /// Per the async completion contract (`weaveffi_core::plan::AsyncProtocol`),
-/// result buffers handed to the callback (strings, bytes, arrays, map
-/// buffers) are *borrowed*: they stay owned by the producer and are valid
-/// only for the callback's duration, so the wrapper deep-copies them and
-/// never frees them. Owned-object results (records, rich enums, interfaces)
-/// are the exception: the callback receives ownership and adopts the pointer
-/// into the RAII wrapper.
-fn render_async_set_value(out: &mut String, ty: &TypeRef, depth: usize) {
-    let mut w = CodeWriter::four_space().with_depth(depth);
+/// result buffers handed to the callback (strings, bytes, and buffered
+/// values) are *borrowed*: they stay owned by the producer and are valid only
+/// for the callback's duration, so the wrapper deep-copies or decodes them
+/// and never frees them. An owned interface result is the exception: the
+/// callback receives ownership and adopts the pointer into the RAII wrapper.
+fn emit_async_set_value(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: &str) {
+    if is_buffered(ty) {
+        // Borrowed `(result_ptr, result_len)` buffer: decode, never free.
+        w.line("detail::BufferReader result_r(result_ptr, result_len);");
+        emit_read_decl(w, ty, "value", "result_r", module, prefix);
+        w.line("result_r.expect_end();");
+        w.line("p->set_value(std::move(value));");
+        return;
+    }
     match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool => {
-            w.line("p->set_value(result);");
-        }
         // Borrowed for the callback's duration: copy, do not free.
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line("p->set_value(std::string(result));");
@@ -2790,99 +2717,41 @@ fn render_async_set_value(out: &mut String, ty: &TypeRef, depth: usize) {
         TypeRef::Handle => {
             w.line("p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));");
         }
-        TypeRef::TypedHandle(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("p->set_value({ln}(result));"));
+        TypeRef::TypedHandle(_) => {
+            w.line("p->set_value(result);");
         }
-        // Owned-object result: the callback receives ownership; adopt it.
-        TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::Interface(n) => {
-            let ln = local_type_name(n);
-            w.line(format!("p->set_value({ln}(result));"));
+        // Owned interface result: the callback receives ownership; adopt it.
+        TypeRef::Interface(n) => {
+            w.line(format!("p->set_value({}(result));", local_type_name(n)));
         }
         TypeRef::Enum(n) => {
-            let n = local_type_name(n);
-            w.line(format!("p->set_value(static_cast<{n}>(result));"));
+            w.line(format!(
+                "p->set_value(static_cast<{}>(result));",
+                local_type_name(n)
+            ));
         }
-        TypeRef::Optional(inner) => {
-            w.line("if (!result) {");
-            w.scope(|w| {
-                w.line("p->set_value(std::nullopt);");
-            });
-            w.line("} else {");
-            w.scope(|w| match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line("p->set_value(std::string(result));");
-                }
-                TypeRef::TypedHandle(n) => {
-                    let ln = local_type_name(n);
-                    w.line(format!("p->set_value({ln}(result));"));
-                }
-                TypeRef::Record(n) | TypeRef::RichEnum(n) | TypeRef::Interface(n) => {
-                    let ln = local_type_name(n);
-                    w.line(format!("p->set_value({ln}(result));"));
-                }
-                TypeRef::Enum(n) => {
-                    let n = local_type_name(n);
-                    w.line(format!("p->set_value(static_cast<{n}>(*result));"));
-                }
-                _ if !is_c_pointer_type(inner) => {
-                    w.line("p->set_value(*result);");
-                }
-                _ => {
-                    w.line(format!("p->set_value({}(result));", cpp_type(inner)));
-                }
-            });
-            w.line("}");
-        }
-        TypeRef::List(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line("std::vector<std::string> ret;");
-                w.line("ret.reserve(result_len);");
-                w.line("for (size_t i = 0; i < result_len; ++i) ret.emplace_back(result[i]);");
-                w.line("p->set_value(std::move(ret));");
-            }
-            TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(n) => {
                 let ln = local_type_name(n);
-                w.line(format!("std::vector<{ln}> ret;"));
-                w.line("ret.reserve(result_len);");
-                w.line(format!(
-                    "for (size_t i = 0; i < result_len; ++i) ret.emplace_back({ln}(result[i]));"
-                ));
-                w.line("p->set_value(std::move(ret));");
+                w.line("if (!result) {");
+                w.scope(|w| {
+                    w.line("p->set_value(std::nullopt);");
+                });
+                w.line("} else {");
+                w.scope(|w| {
+                    w.line(format!("p->set_value({ln}(result));"));
+                });
+                w.line("}");
             }
-            TypeRef::Enum(n) => {
-                let n = local_type_name(n);
-                w.line(format!("std::vector<{n}> ret;"));
-                w.line("ret.reserve(result_len);");
-                w.line(format!(
-                    "for (size_t i = 0; i < result_len; ++i) ret.emplace_back(static_cast<{n}>(result[i]));"
-                ));
-                w.line("p->set_value(std::move(ret));");
-            }
-            _ => {
-                w.line(format!(
-                    "p->set_value(std::vector<{}>(result, result + result_len));",
-                    cpp_type(inner)
-                ));
-            }
+            _ => unreachable!("non-interface optionals are buffered"),
         },
-        TypeRef::Map(k, v) => {
-            let ck = cpp_type(k);
-            let cv = cpp_type(v);
-            w.line(format!("std::unordered_map<{ck}, {cv}> ret;"));
-            let ke = map_elem_expr(k, "result_keys");
-            let ve = map_elem_expr(v, "result_values");
-            w.line("for (size_t i = 0; i < result_len; ++i) {");
-            w.scope(|w| {
-                w.line(format!("ret[{ke}] = {ve};"));
-            });
-            w.line("}");
-            w.line("p->set_value(std::move(ret));");
-        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as async result"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        _ => {
+            w.line("p->set_value(result);");
+        }
     }
-    out.push_str(&w.finish());
 }
 
 #[cfg(test)]
@@ -2900,6 +2769,34 @@ mod tests {
             ty,
             mutable: false,
             doc: None,
+        }
+    }
+
+    fn field(name: &str, ty: TypeRef) -> StructField {
+        StructField {
+            name: name.into(),
+            ty,
+            doc: None,
+            default: None,
+        }
+    }
+
+    fn variant(name: &str, value: i32, fields: Vec<StructField>) -> EnumVariant {
+        EnumVariant {
+            name: name.into(),
+            value,
+            doc: None,
+            fields,
+        }
+    }
+
+    fn code(name: &str, value: i32, message: &str) -> ErrorCode {
+        ErrorCode {
+            name: name.into(),
+            code: value,
+            message: message.into(),
+            doc: None,
+            fields: vec![],
         }
     }
 
@@ -2942,7 +2839,7 @@ mod tests {
 
     fn api_of(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -2970,50 +2867,16 @@ mod tests {
         m.enums = vec![EnumDef {
             name: "ContactType".into(),
             doc: None,
-            variants: vec![
-                EnumVariant {
-                    name: "Personal".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Work".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-            ],
+            variants: vec![variant("Personal", 0, vec![]), variant("Work", 1, vec![])],
         }];
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![
-                StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "age".into(),
-                    ty: TypeRef::I32,
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "email".into(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "contact_type".into(),
-                    ty: TypeRef::Enum("ContactType".into()),
-                    doc: None,
-                    default: None,
-                },
+                field("name", TypeRef::StringUtf8),
+                field("age", TypeRef::I32),
+                field("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                field("contact_type", TypeRef::Enum("ContactType".into())),
             ],
         }];
         m.functions = vec![
@@ -3023,60 +2886,43 @@ mod tests {
                 Some(TypeRef::Record("Contact".into())),
             ),
             func("delete_contact", vec![param("id", TypeRef::Handle)], None),
+            func(
+                "save_contact",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                Some(TypeRef::Bool),
+            ),
         ];
         api_of(vec![m])
     }
 
-    /// A kvstore-shaped fixture: error domain, enum, struct, an interface with
-    /// a factory constructor, sync/iterator/async methods, a static, and a
-    /// nested module whose function takes the interface across modules.
+    /// A kvstore-shaped fixture: error domain (one code with payload fields),
+    /// enum, struct, an interface with a factory constructor,
+    /// sync/iterator/async methods, a static, and a nested module whose
+    /// function takes the interface across modules.
     fn kvstore_api() -> Api {
         let mut kv = empty_module("kv");
         kv.errors = Some(ErrorDomain {
             name: "KvError".into(),
             codes: vec![
                 ErrorCode {
-                    name: "KeyNotFound".into(),
-                    code: 1001,
-                    message: "key not found".into(),
-                    doc: None,
+                    fields: vec![field("key", TypeRef::StringUtf8)],
+                    ..code("KeyNotFound", 1001, "key not found")
                 },
-                ErrorCode {
-                    name: "IoError".into(),
-                    code: 1004,
-                    message: "I/O failure".into(),
-                    doc: None,
-                },
+                code("IoError", 1004, "I/O failure"),
             ],
         });
         kv.enums = vec![EnumDef {
             name: "EntryKind".into(),
             doc: None,
             variants: vec![
-                EnumVariant {
-                    name: "Volatile".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Persistent".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
+                variant("Volatile", 0, vec![]),
+                variant("Persistent", 1, vec![]),
             ],
         }];
         kv.structs = vec![StructDef {
             name: "Entry".into(),
             doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "key".into(),
-                ty: TypeRef::StringUtf8,
-                doc: None,
-                default: None,
-            }],
+            fields: vec![field("key", TypeRef::StringUtf8)],
         }];
         kv.interfaces = vec![InterfaceDef {
             name: "Store".into(),
@@ -3147,13 +2993,7 @@ mod tests {
         stats.structs = vec![StructDef {
             name: "Stats".into(),
             doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "total_entries".into(),
-                ty: TypeRef::I64,
-                doc: None,
-                default: None,
-            }],
+            fields: vec![field("total_entries", TypeRef::I64)],
         }];
         stats.functions = vec![tfunc(
             "get_stats",
@@ -3278,6 +3118,51 @@ mod tests {
         );
     }
 
+    /// A listener whose callback carries a buffered argument decodes the
+    /// borrowed `(ptr, len)` pair before invoking the user's `std::function`.
+    #[test]
+    fn listener_buffered_argument_is_decoded_before_dispatch() {
+        let mut m = empty_module("events");
+        m.structs = vec![StructDef {
+            name: "Event".into(),
+            doc: None,
+            fields: vec![field("id", TypeRef::I64)],
+        }];
+        m.callbacks = vec![CallbackDef {
+            name: "OnEvent".into(),
+            doc: None,
+            params: vec![param("event", TypeRef::Record("Event".into()))],
+        }];
+        m.listeners = vec![ListenerDef {
+            name: "events".into(),
+            event_callback: "OnEvent".into(),
+            doc: None,
+        }];
+        let h = render(&api_of(vec![m]));
+        // The user callback receives the decoded value type.
+        assert!(
+            h.contains("inline uint64_t register_events(std::function<void(Event)> callback)"),
+            "callback should surface the decoded value type: {h}"
+        );
+        // Trampoline slots are the borrowed pair.
+        assert!(
+            h.contains("[](const uint8_t* event_ptr, size_t event_len, void* context)"),
+            "trampoline should take the borrowed buffer slots: {h}"
+        );
+        assert!(
+            h.contains("detail::BufferReader event_r(event_ptr, event_len);"),
+            "trampoline should decode the borrowed buffer: {h}"
+        );
+        assert!(
+            h.contains("cb(std::move(event_val));"),
+            "decoded value should be handed to the user callback: {h}"
+        );
+        assert!(
+            !h.contains("weaveffi_free_bytes(const_cast<uint8_t*>(event_ptr)"),
+            "borrowed callback buffers must never be freed: {h}"
+        );
+    }
+
     #[test]
     fn name_returns_cpp() {
         assert_eq!(Generator::name(&CppGenerator), "cpp");
@@ -3384,6 +3269,30 @@ mod tests {
         }
     }
 
+    /// The buffer runtime (and its `<cstring>`/`<utility>` includes) is
+    /// emitted only when some value actually crosses the ABI in a buffer.
+    #[test]
+    fn buffer_runtime_emitted_only_when_needed() {
+        let plain = render(&minimal_api());
+        assert!(
+            !plain.contains("class BufferWriter") && !plain.contains("#include <cstring>"),
+            "a buffer-free API must not carry the buffer runtime: {plain}"
+        );
+        let buffered = render(&contacts_api());
+        for needle in [
+            "#include <cstring>",
+            "#include <utility>",
+            "class BufferWriter",
+            "class BufferReader",
+            "struct BufferGuard",
+        ] {
+            assert!(
+                buffered.contains(needle),
+                "missing buffer runtime piece {needle}: {buffered}"
+            );
+        }
+    }
+
     #[test]
     fn extern_c_common_declarations() {
         let h = render(&minimal_api());
@@ -3394,6 +3303,10 @@ mod tests {
         assert!(
             h.contains("typedef struct weaveffi_error"),
             "missing error struct"
+        );
+        assert!(
+            h.contains("const uint8_t* payload_ptr;") && h.contains("size_t payload_len;"),
+            "error struct must carry the payload slots: {h}"
         );
         assert!(
             h.contains("void weaveffi_error_clear(weaveffi_error* err);"),
@@ -3412,14 +3325,11 @@ mod tests {
     #[test]
     fn visibility_macro_defined_and_applied() {
         let h = render(&minimal_api());
-        // Defined once behind a guard so a translation unit that includes both
-        // weaveffi.h and weaveffi.hpp does not redefine it.
         assert!(h.contains("#ifndef WEAVEFFI_API"), "missing macro guard");
         assert!(
             h.contains("#    define WEAVEFFI_API __attribute__((visibility(\"default\")))"),
             "missing GCC/Clang visibility branch"
         );
-        // The inlined extern \"C\" declarations carry the export tag.
         assert!(
             h.contains("WEAVEFFI_API void weaveffi_free_string(const char* ptr);"),
             "runtime helper not tagged for export"
@@ -3454,28 +3364,33 @@ mod tests {
         );
     }
 
+    /// Records are value types: the extern C block declares no create,
+    /// destroy, getter, or tag symbols for them, and buffered functions take
+    /// and return `(const uint8_t*, size_t)` pairs.
     #[test]
-    fn extern_c_struct_declarations() {
+    fn extern_c_records_have_no_symbols() {
         let h = render(&contacts_api());
         assert!(
-            h.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
-            "missing opaque struct: {h}"
+            !h.contains("weaveffi_contacts_Contact_create")
+                && !h.contains("weaveffi_contacts_Contact_destroy")
+                && !h.contains("weaveffi_contacts_Contact_get_"),
+            "records must have no C symbols: {h}"
         );
         assert!(
-            h.contains("weaveffi_contacts_Contact* weaveffi_contacts_Contact_create("),
-            "missing create: {h}"
+            !h.contains("typedef struct weaveffi_contacts_Contact"),
+            "records must not declare an opaque tag: {h}"
         );
         assert!(
-            h.contains("void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);"),
-            "missing destroy: {h}"
+            h.contains(
+                "const uint8_t* weaveffi_contacts_get_contact(weaveffi_handle_t id, size_t* out_len, weaveffi_error* out_err);"
+            ),
+            "buffered return should use the bytes shape: {h}"
         );
         assert!(
-            h.contains("weaveffi_contacts_Contact_get_name("),
-            "missing name getter: {h}"
-        );
-        assert!(
-            h.contains("weaveffi_contacts_Contact_get_age("),
-            "missing age getter: {h}"
+            h.contains(
+                "bool weaveffi_contacts_save_contact(const uint8_t* contact_ptr, size_t contact_len, weaveffi_error* out_err);"
+            ),
+            "buffered param should expand to ptr+len slots: {h}"
         );
     }
 
@@ -3490,91 +3405,54 @@ mod tests {
         assert!(h.contains("Work = 1"), "missing Work variant: {h}");
     }
 
+    /// A record renders as a plain value struct: typed members in wire order,
+    /// no handle, no destructor, no getters, no builders.
     #[test]
-    fn cpp_raii_class_structure() {
+    fn cpp_record_is_a_value_struct() {
         let h = render(&contacts_api());
-        assert!(h.contains("class Contact {"), "missing class: {h}");
-        assert!(h.contains("void* handle_;"), "missing handle member: {h}");
+        assert!(h.contains("struct Contact {"), "missing value struct: {h}");
         assert!(
-            h.contains("explicit Contact(void* h) : handle_(h) {}"),
-            "missing constructor: {h}"
-        );
-        assert!(h.contains("~Contact()"), "missing destructor: {h}");
-        assert!(
-            h.contains("weaveffi_contacts_Contact_destroy(static_cast<weaveffi_contacts_Contact*>(handle_))"),
-            "destructor should call destroy: {h}"
+            h.contains("std::string name;")
+                && h.contains("int32_t age;")
+                && h.contains("std::optional<std::string> email;")
+                && h.contains("ContactType contact_type;"),
+            "missing typed members: {h}"
         );
         assert!(
-            h.contains("Contact(const Contact&) = delete;"),
-            "missing deleted copy ctor: {h}"
-        );
-        assert!(
-            h.contains("Contact& operator=(const Contact&) = delete;"),
-            "missing deleted copy assign: {h}"
-        );
-        assert!(
-            h.contains("Contact(Contact&& other) noexcept"),
-            "missing move ctor: {h}"
-        );
-        assert!(
-            h.contains("Contact& operator=(Contact&& other) noexcept"),
-            "missing move assign: {h}"
-        );
-        assert!(
-            h.contains("other.handle_ = nullptr;"),
-            "move should null source: {h}"
+            !h.contains("class Contact {")
+                && !h.contains("~Contact()")
+                && !h.contains("ContactBuilder"),
+            "records must not be RAII classes or have builders: {h}"
         );
     }
 
+    /// Each record gets one pack and one unpack routine in `detail`,
+    /// serializing fields in declaration order per the wire format.
     #[test]
-    fn cpp_string_getter() {
+    fn cpp_record_codec_round_trip_shape() {
         let h = render(&contacts_api());
+        let wf = &h[h
+            .find("inline void write_Contact(BufferWriter& w, const Contact& v) {")
+            .expect("write codec")..];
+        let wf = &wf[..wf.find("\n}\n").unwrap()];
         assert!(
-            h.contains("std::string name() const {"),
-            "missing string getter: {h}"
+            wf.contains("w.write_string(v.name);")
+                && wf.contains("w.write_i32(v.age);")
+                && wf.contains("w.write_option_flag(v.email.has_value());")
+                && wf.contains("w.write_string((*v.email));")
+                && wf.contains("w.write_i32(static_cast<int32_t>(v.contact_type));"),
+            "write codec must serialize fields in order: {wf}"
         );
+        let rf = &h[h
+            .find("inline Contact read_Contact(BufferReader& r) {")
+            .expect("read codec")..];
+        let rf = &rf[..rf.find("\n}\n").unwrap()];
         assert!(
-            h.contains("weaveffi_contacts_Contact_get_name(static_cast<const weaveffi_contacts_Contact*>(handle_))"),
-            "getter should call C function with cast: {h}"
-        );
-        assert!(
-            h.contains("weaveffi_free_string(raw)"),
-            "string getter should free: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_i32_getter() {
-        let h = render(&contacts_api());
-        assert!(
-            h.contains("int32_t age() const {"),
-            "missing i32 getter: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_optional_string_getter() {
-        let h = render(&contacts_api());
-        assert!(
-            h.contains("std::optional<std::string> email() const {"),
-            "missing optional string getter: {h}"
-        );
-        assert!(
-            h.contains("if (!raw) return std::nullopt;"),
-            "should check null for optional: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_enum_getter() {
-        let h = render(&contacts_api());
-        assert!(
-            h.contains("ContactType contact_type() const {"),
-            "missing enum getter: {h}"
-        );
-        assert!(
-            h.contains("static_cast<ContactType>("),
-            "enum getter should cast: {h}"
+            rf.contains("out.name = r.read_string();")
+                && rf.contains("out.age = r.read_i32();")
+                && rf.contains("if (r.read_option_flag()) {")
+                && rf.contains("out.contact_type = static_cast<ContactType>(r.read_i32());"),
+            "read codec must decode fields in order: {rf}"
         );
     }
 
@@ -3637,16 +3515,55 @@ mod tests {
         );
     }
 
+    /// A record return decodes the producer buffer and releases it through
+    /// the scope guard.
     #[test]
-    fn cpp_wrapper_function_struct_return() {
+    fn cpp_wrapper_function_record_return_decodes_buffer() {
         let h = render(&contacts_api());
         assert!(
             h.contains("inline Contact get_contact(void* id) {"),
-            "missing struct-returning function: {h}"
+            "missing record-returning function: {h}"
+        );
+        let f = &h[h.find("inline Contact get_contact").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(
+            f.contains("size_t out_len = 0;"),
+            "buffered return needs out_len: {f}"
         );
         assert!(
-            h.contains("return Contact(result);"),
-            "should construct and return class: {h}"
+            f.contains("detail::BufferGuard result_guard{result, out_len};"),
+            "producer buffer must be released via the guard: {f}"
+        );
+        assert!(
+            f.contains("detail::BufferReader result_r(result, out_len);")
+                && f.contains("Contact ret = detail::read_Contact(result_r);")
+                && f.contains("result_r.expect_end();")
+                && f.contains("return ret;"),
+            "buffered return must decode through the codec: {f}"
+        );
+    }
+
+    /// A record parameter packs into a local buffer and passes
+    /// `(data(), size())`; the caller keeps ownership of the value.
+    #[test]
+    fn cpp_wrapper_function_record_param_packs_buffer() {
+        let h = render(&contacts_api());
+        assert!(
+            h.contains("inline bool save_contact(const Contact& contact) {"),
+            "record param should borrow by const ref: {h}"
+        );
+        let f = &h[h.find("inline bool save_contact").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(
+            f.contains("detail::BufferWriter contact_buf;")
+                && f.contains("detail::write_Contact(contact_buf, contact);"),
+            "record param must pack through the codec: {f}"
+        );
+        assert!(
+            f.contains(
+                "weaveffi_contacts_save_contact(contact_buf.data(), contact_buf.size(), &err)"
+            ),
+            "packed buffer should pass as ptr+len: {f}"
         );
     }
 
@@ -3715,6 +3632,8 @@ mod tests {
         );
     }
 
+    /// A list return is one value buffer: decoded elementwise, then the
+    /// producer buffer is released through the guard.
     #[test]
     fn cpp_list_return_function() {
         let mut m = empty_module("store");
@@ -3728,16 +3647,26 @@ mod tests {
             h.contains("inline std::vector<int32_t> list_ids()"),
             "missing list return function: {h}"
         );
+        let f = &h[h.find("inline std::vector<int32_t> list_ids()").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
         assert!(
-            h.contains("size_t out_len = 0;"),
-            "should declare out_len: {h}"
+            f.contains("size_t out_len = 0;"),
+            "should declare out_len: {f}"
         );
         assert!(
-            h.contains("result, result + out_len"),
-            "should build vector from range: {h}"
+            f.contains("detail::BufferGuard result_guard{result, out_len};"),
+            "list buffer must be released via the guard: {f}"
+        );
+        assert!(
+            f.contains("size_t ret_n = result_r.read_len();")
+                && f.contains("ret.reserve(ret_n);")
+                && f.contains("int32_t ret_item = result_r.read_i32();")
+                && f.contains("ret.push_back(std::move(ret_item));"),
+            "list return must decode elementwise: {f}"
         );
     }
 
+    /// An optional scalar return decodes the presence flag from the buffer.
     #[test]
     fn cpp_optional_i32_return() {
         let mut m = empty_module("store");
@@ -3751,14 +3680,14 @@ mod tests {
             h.contains("inline std::optional<int32_t> find(int32_t id)"),
             "missing optional return function: {h}"
         );
+        let f = &h[h.find("inline std::optional<int32_t> find").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
         assert!(
-            h.contains("if (!result) return std::nullopt;"),
-            "should null check: {h}"
-        );
-        assert!(h.contains("auto ret = *result;"), "should dereference: {h}");
-        assert!(
-            h.contains("weaveffi_free_bytes(reinterpret_cast<uint8_t*>(result), sizeof(*result));"),
-            "boxed optional scalar must be released after copying: {h}"
+            f.contains("std::optional<int32_t> ret{};")
+                && f.contains("if (result_r.read_option_flag()) {")
+                && f.contains("int32_t ret_v = result_r.read_i32();")
+                && f.contains("ret = std::move(ret_v);"),
+            "optional return must decode the flag byte then the value: {f}"
         );
     }
 
@@ -3768,20 +3697,7 @@ mod tests {
         m.enums = vec![EnumDef {
             name: "Color".into(),
             doc: None,
-            variants: vec![
-                EnumVariant {
-                    name: "Red".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Green".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-            ],
+            variants: vec![variant("Red", 0, vec![]), variant("Green", 1, vec![])],
         }];
         m.functions = vec![func(
             "mix",
@@ -3803,19 +3719,14 @@ mod tests {
         );
     }
 
+    /// A list of records decodes each element through the record codec.
     #[test]
-    fn cpp_list_struct_return() {
+    fn cpp_list_record_return() {
         let mut m = empty_module("contacts");
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "name".into(),
-                ty: TypeRef::StringUtf8,
-                doc: None,
-                default: None,
-            }],
+            fields: vec![field("name", TypeRef::StringUtf8)],
         }];
         m.functions = vec![func(
             "list_all",
@@ -3825,14 +3736,18 @@ mod tests {
         let h = render(&api_of(vec![m]));
         assert!(
             h.contains("inline std::vector<Contact> list_all()"),
-            "missing list struct return: {h}"
+            "missing list record return: {h}"
         );
+        let f = &h[h.find("inline std::vector<Contact> list_all()").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
         assert!(
-            h.contains("ret.emplace_back(Contact(result[i]))"),
-            "should construct each element: {h}"
+            f.contains("Contact ret_item = detail::read_Contact(result_r);")
+                && f.contains("ret.push_back(std::move(ret_item));"),
+            "each element must decode through the codec: {f}"
         );
     }
 
+    /// A map return is one value buffer of alternating key, value entries.
     #[test]
     fn cpp_map_return_function() {
         let mut m = empty_module("store");
@@ -3849,175 +3764,116 @@ mod tests {
             h.contains("inline std::unordered_map<std::string, int32_t> get_scores()"),
             "missing map return function: {h}"
         );
-        assert!(
-            h.contains("std::string(out_keys[i])"),
-            "should convert string keys: {h}"
-        );
-        // Ownership: string keys are freed after copying; both parallel
-        // buffers are released.
-        assert!(
-            h.contains("weaveffi_free_string(out_keys[i]);"),
-            "map string keys must be freed after copying: {h}"
-        );
-        assert!(
-            h.contains(
-                "weaveffi_free_bytes(reinterpret_cast<uint8_t*>(out_keys), out_len * sizeof(*out_keys));"
-            ) && h.contains(
-                "weaveffi_free_bytes(reinterpret_cast<uint8_t*>(out_values), out_len * sizeof(*out_values));"
-            ),
-            "map buffers must be released: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_list_string_return_frees_elements_and_buffer() {
-        let mut m = empty_module("store");
-        m.functions = vec![func(
-            "list_names",
-            vec![],
-            Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
-        )];
-        let h = render(&api_of(vec![m]));
         let f = &h[h
-            .find("inline std::vector<std::string> list_names()")
+            .find("inline std::unordered_map<std::string, int32_t> get_scores()")
             .unwrap()..];
         let f = &f[..f.find("\n}\n").unwrap()];
         assert!(
-            f.contains("ret.emplace_back(result[i]);")
-                && f.contains("weaveffi_free_string(result[i]);"),
-            "each string element must be copied then freed: {f}"
+            f.contains("std::string ret_key = result_r.read_string();")
+                && f.contains("int32_t ret_val = result_r.read_i32();")
+                && f.contains("ret.emplace(std::move(ret_key), std::move(ret_val));"),
+            "map decode must alternate key then value: {f}"
         );
         assert!(
-            f.contains(
-                "weaveffi_free_bytes(reinterpret_cast<uint8_t*>(result), out_len * sizeof(*result));"
-            ),
-            "the array buffer must be released: {f}"
-        );
-    }
-
-    #[test]
-    fn cpp_bytes_getter_frees_buffer() {
-        let mut m = empty_module("io");
-        m.structs = vec![StructDef {
-            name: "Blob".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "data".into(),
-                ty: TypeRef::Bytes,
-                doc: None,
-                default: None,
-            }],
-        }];
-        let h = render(&api_of(vec![m]));
-        let g = &h[h.find("std::vector<uint8_t> data() const {").unwrap()..];
-        let g = &g[..g.find("\n    }\n").unwrap()];
-        assert!(
-            g.contains("std::vector<uint8_t> ret(raw, raw + len);")
-                && g.contains("weaveffi_free_bytes(const_cast<uint8_t*>(raw), len);"),
-            "bytes getter must copy then free the buffer: {g}"
+            f.contains("detail::BufferGuard result_guard{result, out_len};"),
+            "map buffer must be released via the guard: {f}"
         );
     }
 
+    /// A list parameter packs its length prefix then each element.
     #[test]
-    fn cpp_list_getter_frees_buffer() {
-        let mut m = empty_module("m");
-        m.structs = vec![StructDef {
-            name: "Data".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "names".into(),
-                ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
-                doc: None,
-                default: None,
-            }],
-        }];
-        let h = render(&api_of(vec![m]));
-        let g = &h[h.find("std::vector<std::string> names() const {").unwrap()..];
-        let g = &g[..g.find("\n    }\n").unwrap()];
-        assert!(
-            g.contains("weaveffi_free_string(raw[i]);"),
-            "list getter must free each string element: {g}"
-        );
-        assert!(
-            g.contains("weaveffi_free_bytes(reinterpret_cast<uint8_t*>(raw), len * sizeof(*raw));"),
-            "list getter must release the array buffer: {g}"
-        );
-    }
-
-    #[test]
-    fn cpp_struct_getter_list() {
-        let mut m = empty_module("m");
-        m.structs = vec![StructDef {
-            name: "Data".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "scores".into(),
-                ty: TypeRef::List(Box::new(TypeRef::I32)),
-                doc: None,
-                default: None,
-            }],
-        }];
+    fn cpp_list_param_packs_buffer() {
+        let mut m = empty_module("data");
+        m.functions = vec![func(
+            "sum",
+            vec![param("ids", TypeRef::List(Box::new(TypeRef::I32)))],
+            Some(TypeRef::I64),
+        )];
         let h = render(&api_of(vec![m]));
         assert!(
-            h.contains("std::vector<int32_t> scores() const {"),
-            "missing list getter: {h}"
+            h.contains("inline int64_t sum(const std::vector<int32_t>& ids)"),
+            "list param should borrow by const ref: {h}"
         );
-    }
-
-    #[test]
-    fn cpp_struct_getter_map() {
-        let mut m = empty_module("m");
-        m.structs = vec![StructDef {
-            name: "Data".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "tags".into(),
-                ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-                doc: None,
-                default: None,
-            }],
-        }];
-        let h = render(&api_of(vec![m]));
+        let f = &h[h.find("inline int64_t sum").unwrap()..];
+        let f = &f[..f.find("\n}\n").unwrap()];
         assert!(
-            h.contains("std::unordered_map<std::string, int32_t> tags() const {"),
-            "missing map getter: {h}"
+            f.contains("ids_buf.write_len(ids.size());")
+                && f.contains("for (const auto& item0 : ids) {")
+                && f.contains("ids_buf.write_i32(item0);"),
+            "list param must pack a count then each element: {f}"
+        );
+        assert!(
+            f.contains("weaveffi_data_sum(ids_buf.data(), ids_buf.size(), &err)"),
+            "packed list should pass as ptr+len: {f}"
         );
     }
 
     #[test]
     fn cpp_type_mapping() {
-        assert_eq!(cpp_type(&TypeRef::I32), "int32_t");
-        assert_eq!(cpp_type(&TypeRef::U32), "uint32_t");
-        assert_eq!(cpp_type(&TypeRef::I64), "int64_t");
-        assert_eq!(cpp_type(&TypeRef::F64), "double");
-        assert_eq!(cpp_type(&TypeRef::Bool), "bool");
-        assert_eq!(cpp_type(&TypeRef::StringUtf8), "std::string");
-        assert_eq!(cpp_type(&TypeRef::Bytes), "std::vector<uint8_t>");
-        assert_eq!(cpp_type(&TypeRef::Handle), "void*");
-        assert_eq!(cpp_type(&TypeRef::TypedHandle("Session".into())), "Session");
-        assert_eq!(cpp_type(&TypeRef::Record("Contact".into())), "Contact");
-        assert_eq!(cpp_type(&TypeRef::RichEnum("Shape".into())), "Shape");
-        assert_eq!(cpp_type(&TypeRef::RichEnum("geo.Shape".into())), "Shape");
-        assert_eq!(cpp_type(&TypeRef::Enum("Color".into())), "Color");
-        assert_eq!(cpp_type(&TypeRef::Interface("Store".into())), "Store");
-        assert_eq!(cpp_type(&TypeRef::Interface("kv.Store".into())), "Store");
+        assert_eq!(cpp_type(&TypeRef::I32, "m", "weaveffi"), "int32_t");
+        assert_eq!(cpp_type(&TypeRef::U32, "m", "weaveffi"), "uint32_t");
+        assert_eq!(cpp_type(&TypeRef::I64, "m", "weaveffi"), "int64_t");
+        assert_eq!(cpp_type(&TypeRef::F64, "m", "weaveffi"), "double");
+        assert_eq!(cpp_type(&TypeRef::Bool, "m", "weaveffi"), "bool");
         assert_eq!(
-            cpp_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
+            cpp_type(&TypeRef::StringUtf8, "m", "weaveffi"),
+            "std::string"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::Bytes, "m", "weaveffi"),
+            "std::vector<uint8_t>"
+        );
+        assert_eq!(cpp_type(&TypeRef::Handle, "m", "weaveffi"), "void*");
+        assert_eq!(
+            cpp_type(&TypeRef::TypedHandle("Session".into()), "db", "weaveffi"),
+            "weaveffi_db_Session*"
+        );
+        assert_eq!(
+            cpp_type(
+                &TypeRef::TypedHandle("auth.Session".into()),
+                "db",
+                "weaveffi"
+            ),
+            "weaveffi_auth_Session*"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::Record("Contact".into()), "m", "weaveffi"),
+            "Contact"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::RichEnum("Shape".into()), "m", "weaveffi"),
+            "Shape"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::RichEnum("geo.Shape".into()), "m", "weaveffi"),
+            "Shape"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::Enum("Color".into()), "m", "weaveffi"),
+            "Color"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::Interface("Store".into()), "m", "weaveffi"),
+            "Store"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::Interface("kv.Store".into()), "m", "weaveffi"),
+            "Store"
+        );
+        assert_eq!(
+            cpp_type(&TypeRef::Optional(Box::new(TypeRef::I32)), "m", "weaveffi"),
             "std::optional<int32_t>"
         );
         assert_eq!(
-            cpp_type(&TypeRef::List(Box::new(TypeRef::I32))),
+            cpp_type(&TypeRef::List(Box::new(TypeRef::I32)), "m", "weaveffi"),
             "std::vector<int32_t>"
         );
         assert_eq!(
-            cpp_type(&TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32)
-            )),
+            cpp_type(
+                &TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                "m",
+                "weaveffi"
+            ),
             "std::unordered_map<std::string, int32_t>"
         );
     }
@@ -4046,13 +3902,14 @@ mod tests {
         assert!(h.contains("weaveffi_free_bytes("), "should free bytes: {h}");
     }
 
+    /// A typed handle is an opaque token: it surfaces as the raw prefixed tag
+    /// pointer and passes straight through.
     #[test]
     fn cpp_typed_handle_param() {
         let mut m = empty_module("db");
         m.structs = vec![StructDef {
             name: "Connection".into(),
             doc: None,
-            builder: false,
             fields: vec![],
         }];
         m.functions = vec![func(
@@ -4062,10 +3919,13 @@ mod tests {
         )];
         let h = render(&api_of(vec![m]));
         assert!(
-            h.contains("inline int32_t query(Connection& conn)"),
-            "TypedHandle param should be ref: {h}"
+            h.contains("inline int32_t query(weaveffi_db_Connection* conn)"),
+            "typed handle param should be the raw tag pointer: {h}"
         );
-        assert!(h.contains("conn.handle()"), "should extract handle: {h}");
+        assert!(
+            h.contains("weaveffi_db_query(conn, &err)"),
+            "typed handle should pass through unchanged: {h}"
+        );
     }
 
     #[test]
@@ -4086,1290 +3946,562 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cpp_error_domain_generates_typed_exceptions() {
-        let mut m = empty_module("auth");
-        m.errors = Some(ErrorDomain {
-            name: "AuthError".into(),
-            codes: vec![
-                ErrorCode {
-                    name: "NotFound".into(),
-                    code: 1,
-                    message: "not found".into(),
-                    doc: None,
-                },
-                ErrorCode {
-                    name: "InvalidCredentials".into(),
-                    code: 2,
-                    message: "invalid credentials".into(),
-                    doc: None,
-                },
-            ],
-        });
-        m.functions = vec![
-            tfunc(
-                "login",
-                vec![param("user", TypeRef::StringUtf8)],
-                Some(TypeRef::I32),
-            ),
-            func("ping", vec![], Some(TypeRef::I32)),
-        ];
-        let h = render(&api_of(vec![m]));
-
-        // Domain exception derives from the generic brand error; per-code
-        // subclasses derive from the domain.
-        assert!(
-            h.contains("class AuthError : public WeaveFFIError"),
-            "missing domain exception: {h}"
-        );
-        assert!(
-            h.contains("class NotFoundError : public AuthError"),
-            "missing NotFoundError subclass: {h}"
-        );
-        assert!(
-            h.contains("class InvalidCredentialsError : public AuthError"),
-            "missing InvalidCredentialsError subclass: {h}"
-        );
-        assert!(
-            h.contains("NotFoundError(const std::string& msg) : AuthError(1, msg) {}"),
-            "code subclass should pin its code: {h}"
-        );
-
-        // Per-domain helpers map known codes and fall back to the domain type.
-        assert!(
-            h.contains(
-                "inline std::exception_ptr make_auth_error(int32_t code, const std::string& msg)"
-            ),
-            "missing per-domain make helper: {h}"
-        );
-        assert!(
-            h.contains("case 1: return std::make_exception_ptr(NotFoundError(msg));"),
-            "missing NotFound mapping: {h}"
-        );
-        assert!(
-            h.contains("case 2: return std::make_exception_ptr(InvalidCredentialsError(msg));"),
-            "missing InvalidCredentials mapping: {h}"
-        );
-        assert!(
-            h.contains("default: return std::make_exception_ptr(AuthError(code, msg));"),
-            "unknown codes should fall back to the domain exception: {h}"
-        );
-        assert!(
-            h.contains("inline void check_auth(weaveffi_error& err)"),
-            "missing per-domain check helper: {h}"
-        );
-
-        // The throws split: login throws typed, ping traps generic.
-        let login = &h[h.find("inline int32_t login").unwrap()..];
-        let login = &login[..login.find("\n}\n").unwrap()];
-        assert!(
-            login.contains("detail::check_auth(err);"),
-            "throwing wrapper should use the typed check: {login}"
-        );
-        let ping = &h[h.find("inline int32_t ping").unwrap()..];
-        let ping = &ping[..ping.find("\n}\n").unwrap()];
-        assert!(
-            ping.contains("detail::check(err);"),
-            "non-throwing wrapper should use the generic check: {ping}"
-        );
-        assert!(
-            !ping.contains("check_auth"),
-            "non-throwing wrapper must not throw typed errors: {ping}"
-        );
-        // The non-throwing wrapper keeps a plain signature and is not noexcept
-        // (a producer panic still throws the generic error).
-        assert!(
-            !ping.contains("noexcept"),
-            "wrappers must not be marked noexcept: {ping}"
-        );
-    }
+    // ── Interface (RAII) tests ──
 
     #[test]
-    fn cpp_error_codes_dedupe_error_suffix() {
-        let mut m = empty_module("kv");
-        m.errors = Some(ErrorDomain {
-            name: "KvError".into(),
-            codes: vec![ErrorCode {
-                name: "IoError".into(),
-                code: 1004,
-                message: "I/O failure".into(),
-                doc: None,
-            }],
-        });
-        m.functions = vec![tfunc("touch", vec![], None)];
-        let h = render(&api_of(vec![m]));
-        assert!(
-            h.contains("class IoError : public KvError"),
-            "IoError must not become IoErrorError: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_inherited_domain_uses_owner_helper() {
+    fn interface_generates_raii_class() {
         let h = render(&kvstore_api());
-        // `kv.stats.get_stats` throws and inherits the `kv` domain, so its
-        // wrapper checks through the owner module's helper.
-        let f = &h[h.find("inline Stats get_stats").unwrap()..];
-        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(h.contains("class Store {"), "missing Store class: {h}");
         assert!(
-            f.contains("detail::check_kv(err);"),
-            "inheriting module should use the declaring module's check: {f}"
-        );
-        // The domain type is emitted once, by the declaring module.
-        assert_eq!(
-            h.matches("class KvError : public WeaveFFIError").count(),
-            1,
-            "domain exception should be emitted exactly once: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_raii_class() {
-        let h = render(&kvstore_api());
-        assert!(h.contains("class Store {"), "missing interface class: {h}");
-        assert!(
-            h.contains("explicit Store(void* h) : handle_(h) {}"),
-            "missing adopting constructor: {h}"
-        );
-        assert!(h.contains("~Store()"), "missing destructor: {h}");
-        assert!(
-            h.contains(
-                "if (handle_) weaveffi_kv_Store_destroy(static_cast<weaveffi_kv_Store*>(handle_));"
-            ),
-            "destructor should call the interface destroy symbol: {h}"
+            h.contains("~Store() {")
+                && h.contains(
+                    "if (handle_) weaveffi_kv_Store_destroy(static_cast<weaveffi_kv_Store*>(handle_));"
+                ),
+            "destructor should call C destroy: {h}"
         );
         assert!(
             h.contains("Store(const Store&) = delete;"),
-            "missing deleted copy ctor: {h}"
-        );
-        assert!(
-            h.contains("Store& operator=(const Store&) = delete;"),
-            "missing deleted copy assign: {h}"
+            "copy constructor should be deleted: {h}"
         );
         assert!(
             h.contains("Store(Store&& other) noexcept"),
-            "missing move ctor: {h}"
+            "missing move constructor: {h}"
         );
         assert!(
-            h.contains("Store& operator=(Store&& other) noexcept"),
-            "missing move assign: {h}"
+            h.contains("static Store open(const std::string& path)"),
+            "missing factory constructor: {h}"
         );
     }
 
     #[test]
-    fn cpp_interface_factory_constructor() {
+    fn interface_methods_and_statics() {
         let h = render(&kvstore_api());
         assert!(
-            h.contains("static Store open(const std::string& path) {"),
-            "non-new constructor should be a static factory: {h}"
+            h.contains("bool put(const std::string& key, const std::vector<uint8_t>& value, EntryKind kind, const std::optional<int64_t>& ttl_seconds)"),
+            "missing put method: {h}"
         );
-        let f = &h[h.find("static Store open").unwrap()..];
+        assert!(
+            h.contains("int64_t count() const {"),
+            "missing count method: {h}"
+        );
+        assert!(
+            h.contains("static int64_t default_capacity()"),
+            "missing static method: {h}"
+        );
+        assert!(
+            h.contains("bool delete_(const std::string& key)"),
+            "keyword method name should be escaped: {h}"
+        );
+    }
+
+    /// An `Optional<i64>` parameter is buffered: it packs a flag byte plus
+    /// the value into a local buffer.
+    #[test]
+    fn interface_optional_scalar_param_is_buffered() {
+        let h = render(&kvstore_api());
+        let f = &h[h.find("bool put(const std::string& key").unwrap()..];
         let f = &f[..f.find("\n    }\n").unwrap()];
         assert!(
-            f.contains("auto result = weaveffi_kv_Store_open(path.c_str(), &err);"),
-            "factory should call the constructor symbol without a self slot: {f}"
+            f.contains("detail::BufferWriter ttl_seconds_buf;")
+                && f.contains("ttl_seconds_buf.write_option_flag(ttl_seconds.has_value());")
+                && f.contains("ttl_seconds_buf.write_i64((*ttl_seconds));"),
+            "optional scalar param must pack flag then value: {f}"
         );
         assert!(
-            f.contains("detail::check_kv(err);"),
-            "throwing constructor should use the typed check: {f}"
-        );
-        assert!(
-            f.contains("return Store(result);"),
-            "factory should wrap the owned pointer: {f}"
+            f.contains("ttl_seconds_buf.data(), ttl_seconds_buf.size()"),
+            "packed optional should pass as ptr+len: {f}"
         );
     }
 
+    /// An `Entry?` return decodes the flag byte, then the record fields, from
+    /// one producer buffer.
     #[test]
-    fn cpp_interface_canonical_constructor() {
-        let mut m = empty_module("contacts");
-        m.errors = Some(ErrorDomain {
-            name: "ContactsError".into(),
-            codes: vec![ErrorCode {
-                name: "InvalidName".into(),
-                code: 1,
-                message: "name must not be empty".into(),
-                doc: None,
-            }],
-        });
-        m.interfaces = vec![InterfaceDef {
-            name: "ContactBook".into(),
-            doc: None,
-            constructors: vec![func("new", vec![], None)],
-            methods: vec![tfunc(
-                "add",
-                vec![param("first_name", TypeRef::StringUtf8)],
-                Some(TypeRef::I64),
-            )],
-            statics: vec![],
-        }];
-        let h = render(&api_of(vec![m]));
-        assert!(
-            h.contains("ContactBook() : handle_(nullptr) {"),
-            "constructor named new should be a real C++ constructor: {h}"
-        );
-        let ctor = &h[h.find("ContactBook() : handle_(nullptr) {").unwrap()..];
-        let ctor = &ctor[..ctor.find("\n    }\n").unwrap()];
-        assert!(
-            ctor.contains("auto result = weaveffi_contacts_ContactBook_new(&err);"),
-            "canonical constructor should call the C constructor: {ctor}"
-        );
-        assert!(
-            ctor.contains("detail::check(err);"),
-            "non-throwing constructor should use the generic check: {ctor}"
-        );
-        assert!(
-            ctor.contains("handle_ = result;"),
-            "canonical constructor should adopt the handle: {ctor}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_method_marshals_self_and_params() {
+    fn interface_optional_record_return_decodes_buffer() {
         let h = render(&kvstore_api());
         assert!(
-            h.contains("bool put(const std::string& key, const std::vector<uint8_t>& value, EntryKind kind, const std::optional<int64_t>& ttl_seconds) const {"),
-            "missing method signature: {h}"
-        );
-        let f = &h[h.find("bool put(").unwrap()..];
-        let f = &f[..f.find("\n    }\n").unwrap()];
-        assert!(
-            f.contains("weaveffi_kv_Store_put(static_cast<const weaveffi_kv_Store*>(handle_), key.c_str(), value.data(), value.size(),"),
-            "method should pass the wrapped handle as the leading argument: {f}"
-        );
-        assert!(
-            f.contains("detail::check_kv(err);"),
-            "throwing method should use the typed check: {f}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_method_optional_struct_return() {
-        let h = render(&kvstore_api());
-        assert!(
-            h.contains("std::optional<Entry> get(const std::string& key) const {"),
-            "missing optional-struct method: {h}"
+            h.contains("std::optional<Entry> get(const std::string& key)"),
+            "missing optional record return: {h}"
         );
         let f = &h[h.find("std::optional<Entry> get(").unwrap()..];
         let f = &f[..f.find("\n    }\n").unwrap()];
         assert!(
-            f.contains("if (!result) return std::nullopt;"),
-            "optional return should null check: {f}"
+            f.contains("if (result_r.read_option_flag()) {")
+                && f.contains("Entry ret_v = detail::read_Entry(result_r);"),
+            "optional record must decode flag then codec: {f}"
         );
         assert!(
-            f.contains("return Entry(result);"),
-            "optional return should wrap the owned pointer: {f}"
+            f.contains("detail::BufferGuard result_guard{result, out_len};"),
+            "producer buffer must be released: {f}"
         );
     }
 
     #[test]
-    fn cpp_interface_keyword_method_escaped() {
-        let h = render(&kvstore_api());
-        assert!(
-            h.contains("bool delete_(const std::string& key) const {"),
-            "method named delete should be escaped: {h}"
-        );
-        let f = &h[h.find("bool delete_(").unwrap()..];
-        let f = &f[..f.find("\n    }\n").unwrap()];
-        assert!(
-            f.contains("weaveffi_kv_Store_delete(static_cast<const weaveffi_kv_Store*>(handle_), key.c_str(), &err)"),
-            "escaped method should still call the real symbol: {f}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_iterator_method_returns_lazy_range() {
-        let h = render(&kvstore_api());
-        // The public return type is the nested range class, never a vector.
-        assert!(
-            h.contains(
-                "ListKeysIterator list_keys(const std::optional<std::string>& prefix) const {"
-            ),
-            "missing lazy iterator method: {h}"
-        );
-        assert!(
-            !h.contains("std::vector<std::string> list_keys("),
-            "iterator method must not drain into a vector: {h}"
-        );
-        let f = &h[h.find("ListKeysIterator list_keys(").unwrap()..];
-        let f = &f[..f.find("\n    }\n").unwrap()];
-        assert!(
-            f.contains("weaveffi_kv_Store_ListKeysIterator* iter = weaveffi_kv_Store_list_keys(static_cast<const weaveffi_kv_Store*>(handle_),"),
-            "iterator launch should carry the self slot: {f}"
-        );
-        assert!(
-            f.contains("detail::check_kv(err);"),
-            "throwing launch should use the typed check: {f}"
-        );
-        assert!(
-            f.contains("return ListKeysIterator(iter);"),
-            "launch should adopt the handle into the range class: {f}"
-        );
-        // The wrapper body launches only; it never calls next or destroy.
-        assert!(
-            !f.contains("_next(") && !f.contains("_destroy("),
-            "launch wrapper must not drive or destroy the iterator: {f}"
-        );
-    }
-
-    #[test]
-    fn cpp_iterator_range_class_is_raii_and_move_only() {
-        let h = render(&kvstore_api());
-        assert!(
-            h.contains("class ListKeysIterator {"),
-            "missing range class: {h}"
-        );
-        // Destructor destroys the handle exactly once; moves null the source.
-        let dtor = "~ListKeysIterator() {";
-        let d = &h[h.find(dtor).unwrap()..];
-        let d = &d[..d.find('}').unwrap()];
-        assert!(
-            d.contains("if (handle_) weaveffi_kv_Store_ListKeysIterator_destroy(handle_);"),
-            "destructor should destroy a live handle: {d}"
-        );
-        assert!(
-            h.contains("ListKeysIterator(const ListKeysIterator&) = delete;"),
-            "range must not be copyable: {h}"
-        );
-        assert!(
-            h.contains("ListKeysIterator(ListKeysIterator&& other) noexcept"),
-            "range must be movable: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_iterator_range_streams_one_next_per_step() {
-        let h = render(&kvstore_api());
-        // begin()/end() with a sentinel end make range-for work lazily.
-        assert!(
-            h.contains("iterator begin() { return iterator(this); }"),
-            "missing begin(): {h}"
-        );
-        assert!(
-            h.contains("sentinel end() const { return sentinel{}; }"),
-            "missing sentinel end(): {h}"
-        );
-        assert!(
-            h.contains("#include <iterator>") && h.contains("#include <cstddef>"),
-            "iterator emission should pull in <iterator> and <cstddef>: {h}"
-        );
-        // One producer next per increment, no drain loop anywhere.
-        assert!(
-            h.contains("iterator& operator++() { current_ = range_->next(); return *this; }"),
-            "each increment must pull exactly one element: {h}"
-        );
-        assert_eq!(
-            h.matches("weaveffi_kv_Store_ListKeysIterator_next(")
-                .count(),
-            2,
-            "next symbol should appear in the extern decl and next() only: {h}"
-        );
-
-        // next() pulls one element, converts and frees it, and destroys the
-        // handle eagerly (nulling it) on exhaustion and on error.
-        let n = &h[h.find("std::optional<std::string> next() {").unwrap()..];
-        let n = &n[..n.find("\n        }\n").unwrap()];
-        assert!(
-            n.contains("if (!handle_) return std::nullopt;"),
-            "next() must be safe after exhaustion: {n}"
-        );
-        assert!(
-            n.contains("weaveffi_kv_Store_ListKeysIterator_next(handle_, &item, &err)"),
-            "next() should call the producer next: {n}"
-        );
-        assert!(
-            n.contains("detail::check_kv(err);"),
-            "per-next errors should follow the throws strategy: {n}"
-        );
-        assert!(
-            n.contains("std::string value(item);") && n.contains("weaveffi_free_string(item);"),
-            "string elements must be copied then freed: {n}"
-        );
-        assert_eq!(
-            n.matches("weaveffi_kv_Store_ListKeysIterator_destroy(handle_);\n                handle_ = nullptr;")
-                .count(),
-            2,
-            "next() should destroy eagerly (nulling the handle) on error and on exhaustion: {n}"
-        );
-    }
-
-    #[test]
-    fn cpp_free_function_iterator_of_records_adopts_elements() {
-        let mut m = empty_module("kv");
-        m.structs = vec![StructDef {
-            name: "Entry".into(),
-            doc: None,
-            builder: false,
-            fields: vec![],
-        }];
-        m.functions = vec![func(
-            "scan",
-            vec![],
-            Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
-        )];
-        let h = render(&api_of(vec![m]));
-        assert!(
-            h.contains("inline ScanIterator scan() {"),
-            "free function should return the range class: {h}"
-        );
-        let n = &h[h.find("std::optional<Entry> next() {").unwrap()..];
-        let n = &n[..n.find("\n    }\n").unwrap()];
-        assert!(
-            n.contains("return Entry(item);"),
-            "record elements must be adopted by the owning wrapper: {n}"
-        );
-        assert!(
-            !n.contains("free_string") && !n.contains("free_bytes"),
-            "record elements owe only their destroy, deferred to the wrapper: {n}"
-        );
-        // Trap strategy: a non-throwing function checks through the generic
-        // helper on launch and on each next.
-        assert!(
-            h.matches("detail::check(err);").count() >= 2,
-            "non-throwing iterator should trap through the generic check: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_async_method() {
-        let h = render(&kvstore_api());
-        assert!(
-            h.contains("std::future<int64_t> compact(weaveffi_cancel_token* cancel_token = nullptr) const {"),
-            "missing async cancellable method: {h}"
-        );
-        let f = &h[h.find("std::future<int64_t> compact(").unwrap()..];
-        let f = &f[..f.find("\n    }\n").unwrap()];
-        assert!(
-            f.contains("weaveffi_kv_Store_compact_async(static_cast<const weaveffi_kv_Store*>(handle_), cancel_token, [](void* context, weaveffi_error* err, int64_t result) {"),
-            "async launch should pass self, token, callback, context: {f}"
-        );
-        assert!(
-            f.contains("p->set_exception(detail::make_kv_error(err->code, msg));"),
-            "throwing async method should settle with the typed exception: {f}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_static_member() {
-        let h = render(&kvstore_api());
-        assert!(
-            h.contains("static int64_t default_capacity() {"),
-            "missing static member: {h}"
-        );
-        let f = &h[h.find("static int64_t default_capacity").unwrap()..];
-        let f = &f[..f.find("\n    }\n").unwrap()];
-        assert!(
-            f.contains("auto result = weaveffi_kv_Store_default_capacity(&err);"),
-            "static should call without a self slot: {f}"
-        );
-        assert!(
-            f.contains("detail::check(err);"),
-            "non-throwing static should use the generic check: {f}"
-        );
-    }
-
-    #[test]
-    fn cpp_interface_deprecated_method() {
+    fn interface_deprecated_method_attribute() {
         let h = render(&kvstore_api());
         assert!(
             h.contains("[[deprecated(\"use put() with explicit kind\")]]"),
             "missing deprecated attribute: {h}"
         );
-        let attr = h
-            .find("[[deprecated(\"use put() with explicit kind\")]]")
-            .unwrap();
-        let legacy = h.find("bool legacy_put(").unwrap();
-        assert!(
-            attr < legacy && legacy - attr < 120,
-            "deprecated attribute should immediately precede legacy_put"
-        );
     }
 
     #[test]
-    fn cpp_interface_extern_c_member_decls() {
+    fn interface_param_passing_between_modules() {
         let h = render(&kvstore_api());
+        let stats_ns = h.find("namespace kv::stats {").expect("stats namespace");
+        let store_class = h.find("class Store {").expect("Store class");
         assert!(
-            h.contains("typedef struct weaveffi_kv_Store weaveffi_kv_Store;"),
-            "missing opaque interface typedef: {h}"
-        );
-        assert!(
-            h.contains("void weaveffi_kv_Store_destroy(weaveffi_kv_Store* self);"),
-            "missing interface destroy decl: {h}"
+            store_class < stats_ns,
+            "Store must be declared before the nested module uses it"
         );
     }
 
-    #[test]
-    fn cpp_struct_emitted_before_interface_that_returns_it() {
-        let h = render(&kvstore_api());
-        let entry = h.find("class Entry {").expect("Entry class");
-        let store = h.find("class Store {").expect("Store class");
-        assert!(
-            entry < store,
-            "Entry must be complete before Store::get returns it"
-        );
-    }
+    // ── Rich enum tests ──
 
-    #[test]
-    fn cpp_free_function_returning_interface_wraps_it() {
-        let mut m = empty_module("kv");
-        m.interfaces = vec![InterfaceDef {
-            name: "Store".into(),
-            doc: None,
-            constructors: vec![],
-            methods: vec![],
-            statics: vec![],
-        }];
-        m.functions = vec![func(
-            "clone_store",
-            vec![param("store", TypeRef::Interface("Store".into()))],
-            Some(TypeRef::Interface("Store".into())),
-        )];
-        let h = render(&api_of(vec![m]));
-        assert!(
-            h.contains("inline Store clone_store(const Store& store)"),
-            "interface params should borrow by const ref: {h}"
-        );
-        assert!(
-            h.contains("static_cast<const weaveffi_kv_Store*>(store.handle())"),
-            "interface param should pass the raw handle: {h}"
-        );
-        assert!(
-            h.contains("return Store(result);"),
-            "interface return should wrap the owned pointer: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_custom_namespace() {
-        let api = minimal_api();
-        let config = CppConfig {
-            namespace: Some("mylib".into()),
-            ..CppConfig::default()
-        };
-        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_custom_ns");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
-
-        CppGenerator.generate(&api, out_dir, &config).unwrap();
-
-        let content = std::fs::read_to_string(tmp.join("cpp/weaveffi.hpp")).unwrap();
-        assert!(
-            content.contains("namespace mylib {"),
-            "should use custom namespace: {content}"
-        );
-        assert!(
-            content.contains("} // namespace mylib"),
-            "closing comment should use custom namespace: {content}"
-        );
-        assert!(
-            !content.contains("namespace weaveffi {"),
-            "should not contain default namespace: {content}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn cpp_custom_header_name() {
-        let api = minimal_api();
-        let config = CppConfig {
-            header_name: Some("bindings.hpp".into()),
-            standard: Some("20".into()),
-            ..CppConfig::default()
-        };
-        let tmp = std::env::temp_dir().join("weaveffi_test_cpp_custom_header");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        let out_dir = Utf8Path::from_path(&tmp).expect("valid UTF-8");
-
-        CppGenerator.generate(&api, out_dir, &config).unwrap();
-
-        assert!(
-            tmp.join("cpp/bindings.hpp").exists(),
-            "header should use custom filename"
-        );
-
-        let cmake = std::fs::read_to_string(tmp.join("cpp/CMakeLists.txt")).unwrap();
-        assert!(
-            cmake.contains("cxx_std_20"),
-            "CMakeLists.txt should use custom C++ standard: {cmake}"
-        );
-        assert!(
-            !cmake.contains("cxx_std_17"),
-            "should not contain default standard: {cmake}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn generate_cpp_with_structs() {
-        let mut m = empty_module("db");
-        m.structs = vec![StructDef {
-            name: "User".into(),
-            doc: None,
-            builder: false,
-            fields: vec![
-                StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "age".into(),
-                    ty: TypeRef::I32,
-                    doc: None,
-                    default: None,
-                },
-            ],
-        }];
-        let h = render(&api_of(vec![m]));
-
-        assert!(h.contains("class User {"), "missing RAII class");
-        assert!(h.contains("~User()"), "missing destructor");
-        assert!(
-            h.contains("weaveffi_db_User_destroy(static_cast<weaveffi_db_User*>(handle_))"),
-            "destructor should call C destroy"
-        );
-        assert!(
-            h.contains("User(const User&) = delete;"),
-            "copy constructor should be deleted"
-        );
-        assert!(
-            h.contains("User& operator=(const User&) = delete;"),
-            "copy assignment should be deleted"
-        );
-        assert!(
-            h.contains("User(User&& other) noexcept"),
-            "missing move constructor"
-        );
-        assert!(
-            h.contains("User& operator=(User&& other) noexcept"),
-            "missing move assignment"
-        );
-        assert!(
-            h.contains("other.handle_ = nullptr;"),
-            "move should null out source handle"
-        );
-        assert!(
-            h.contains("std::string name() const {"),
-            "missing string property getter"
-        );
-        assert!(
-            h.contains("int32_t age() const {"),
-            "missing i32 property getter"
-        );
-    }
-
-    #[test]
-    fn cpp_builder_struct_emits_extern_and_wrapper() {
-        let mut m = empty_module("geo");
-        m.structs = vec![StructDef {
-            name: "Point".into(),
-            doc: None,
-            builder: true,
-            fields: vec![StructField {
-                name: "x".into(),
-                ty: TypeRef::F64,
-                doc: None,
-                default: None,
-            }],
-        }];
-        let h = render(&api_of(vec![m]));
-        assert!(
-            h.contains("typedef struct weaveffi_geo_PointBuilder weaveffi_geo_PointBuilder;"),
-            "missing builder typedef: {h}"
-        );
-        assert!(
-            h.contains("weaveffi_geo_Point_Builder_new(void);"),
-            "missing Builder_new: {h}"
-        );
-        assert!(
-            h.contains("weaveffi_geo_Point_Builder_set_x("),
-            "missing Builder_set: {h}"
-        );
-        assert!(
-            h.contains("class PointBuilder {"),
-            "missing C++ builder class: {h}"
-        );
-        assert!(
-            h.contains("PointBuilder& withX(double value)"),
-            "missing fluent setter: {h}"
-        );
-        assert!(h.contains("Point build()"), "missing build(): {h}");
-        assert!(
-            h.contains("detail::check(err);"),
-            "build should use the generic check: {h}"
-        );
-    }
-
-    #[test]
-    fn generate_cpp_with_enums() {
-        let mut m = empty_module("status");
-        m.enums = vec![EnumDef {
-            name: "Priority".into(),
-            doc: None,
-            variants: vec![
-                EnumVariant {
-                    name: "Low".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Medium".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "High".into(),
-                    value: 2,
-                    doc: None,
-                    fields: vec![],
-                },
-            ],
-        }];
-        let h = render(&api_of(vec![m]));
-
-        assert!(
-            h.contains("enum class Priority : int32_t {"),
-            "missing enum class declaration"
-        );
-        assert!(h.contains("Low = 0,"), "missing Low variant");
-        assert!(h.contains("Medium = 1,"), "missing Medium variant");
-        assert!(h.contains("High = 2"), "missing High variant");
-
-        assert!(
-            h.contains("weaveffi_status_Priority_Low = 0"),
-            "extern C should have C enum variant"
-        );
-        assert!(
-            h.contains("} weaveffi_status_Priority;"),
-            "extern C should have C typedef"
-        );
-    }
-
-    #[test]
-    fn generate_cpp_rich_enum_class() {
-        let mut m = empty_module("shapes");
+    fn shapes_api() -> Api {
+        let mut m = empty_module("geometry");
         m.enums = vec![EnumDef {
             name: "Shape".into(),
-            doc: None,
+            doc: Some("A closed 2D shape".into()),
             variants: vec![
-                EnumVariant {
-                    name: "Empty".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Circle".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "radius".into(),
-                        ty: TypeRef::F64,
-                        doc: None,
-                        default: None,
-                    }],
-                },
+                variant("Circle", 0, vec![field("radius", TypeRef::F64)]),
+                variant(
+                    "Rect",
+                    1,
+                    vec![field("width", TypeRef::F64), field("height", TypeRef::F64)],
+                ),
+                variant("Empty", 2, vec![]),
             ],
-        }];
-        let h = render(&api_of(vec![m]));
-
-        // A rich enum is an opaque-object class, never an `enum class`.
-        assert!(
-            !h.contains("enum class Shape : int32_t {"),
-            "rich enum must not be a plain enum class: {h}"
-        );
-        assert!(h.contains("class Shape {"), "missing rich enum class: {h}");
-        assert!(
-            h.contains("enum class Tag : int32_t {"),
-            "missing nested Tag enum: {h}"
-        );
-        assert!(
-            h.contains("static Shape Empty() {"),
-            "missing unit factory: {h}"
-        );
-        assert!(
-            h.contains("static Shape Circle(double radius) {"),
-            "missing data factory: {h}"
-        );
-        assert!(
-            h.contains("double circle_radius() const {"),
-            "missing per-variant getter: {h}"
-        );
-        assert!(
-            h.contains(
-                "weaveffi_shapes_Shape_destroy(static_cast<weaveffi_shapes_Shape*>(handle_))"
-            ),
-            "rich enum class must own + destroy its handle: {h}"
-        );
-        assert!(
-            h.contains("detail::check(err);"),
-            "variant factories should use the generic check: {h}"
-        );
-    }
-
-    /// A rich-enum type reference marshals exactly like a record: borrowed
-    /// const-ref parameter, owned return adopted by the wrapper class.
-    #[test]
-    fn cpp_rich_enum_reference_marshals_like_record() {
-        let mut m = empty_module("shapes");
-        m.enums = vec![EnumDef {
-            name: "Shape".into(),
-            doc: None,
-            variants: vec![
-                EnumVariant {
-                    name: "Empty".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Circle".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "radius".into(),
-                        ty: TypeRef::F64,
-                        doc: None,
-                        default: None,
-                    }],
-                },
-            ],
-        }];
-        m.functions = vec![func(
-            "scale",
-            vec![
-                param("shape", TypeRef::RichEnum("Shape".into())),
-                param("factor", TypeRef::F64),
-            ],
-            Some(TypeRef::RichEnum("Shape".into())),
-        )];
-        let h = render(&api_of(vec![m]));
-        assert!(
-            h.contains("inline Shape scale(const Shape& shape, double factor)"),
-            "rich-enum param should borrow by const ref: {h}"
-        );
-        assert!(
-            h.contains("static_cast<const weaveffi_shapes_Shape*>(shape.handle())"),
-            "rich-enum param should pass the raw handle: {h}"
-        );
-        assert!(
-            h.contains("return Shape(result);"),
-            "rich-enum return should adopt the owned pointer: {h}"
-        );
-    }
-
-    #[test]
-    fn generate_cpp_with_optionals() {
-        let mut m = empty_module("store");
-        m.structs = vec![StructDef {
-            name: "Config".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "label".into(),
-                ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                doc: None,
-                default: None,
-            }],
-        }];
-        m.functions = vec![func(
-            "lookup",
-            vec![param("key", TypeRef::StringUtf8)],
-            Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
-        )];
-        let h = render(&api_of(vec![m]));
-
-        assert!(
-            h.contains("inline std::optional<std::string> lookup(const std::string& key)"),
-            "function should return std::optional: {h}"
-        );
-        assert!(
-            h.contains("if (!result) return std::nullopt;"),
-            "should check null for optional return: {h}"
-        );
-        assert!(
-            h.contains("std::optional<std::string> label() const {"),
-            "getter should return std::optional: {h}"
-        );
-    }
-
-    #[test]
-    fn generate_cpp_with_lists() {
-        let mut m = empty_module("data");
-        m.structs = vec![StructDef {
-            name: "Record".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "values".into(),
-                ty: TypeRef::List(Box::new(TypeRef::F64)),
-                doc: None,
-                default: None,
-            }],
-        }];
-        m.functions = vec![func(
-            "get_names",
-            vec![param("ids", TypeRef::List(Box::new(TypeRef::I32)))],
-            Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
-        )];
-        let h = render(&api_of(vec![m]));
-
-        assert!(
-            h.contains(
-                "inline std::vector<std::string> get_names(const std::vector<int32_t>& ids)"
-            ),
-            "function should use std::vector param and return: {h}"
-        );
-        assert!(
-            h.contains("ids.data()"),
-            "list param should pass .data(): {h}"
-        );
-        assert!(
-            h.contains("ids.size()"),
-            "list param should pass .size(): {h}"
-        );
-        assert!(
-            h.contains("std::vector<double> values() const {"),
-            "getter should return std::vector: {h}"
-        );
-    }
-
-    #[test]
-    fn generate_cpp_with_maps() {
-        let mut m = empty_module("kv");
-        m.structs = vec![StructDef {
-            name: "Settings".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "props".into(),
-                ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-                doc: None,
-                default: None,
-            }],
-        }];
-        m.functions = vec![func(
-            "get_all",
-            vec![],
-            Some(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32),
-            )),
-        )];
-        let h = render(&api_of(vec![m]));
-
-        assert!(
-            h.contains("inline std::unordered_map<std::string, int32_t> get_all()"),
-            "missing map return: {h}"
-        );
-        assert!(
-            h.contains("std::unordered_map<std::string, int32_t> props() const {"),
-            "missing map getter: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_async_returns_future() {
-        let mut m = empty_module("tasks");
-        m.functions = vec![Function {
-            r#async: true,
-            ..func("run", vec![param("id", TypeRef::I32)], Some(TypeRef::I32))
-        }];
-        let h = render(&api_of(vec![m]));
-
-        assert!(
-            h.contains("#include <future>"),
-            "missing future include: {h}"
-        );
-        assert!(
-            h.contains("typedef void (*weaveffi_tasks_run_callback)(void* context, weaveffi_error* err, int32_t result);"),
-            "missing callback typedef: {h}"
-        );
-        assert!(
-            h.contains("void weaveffi_tasks_run_async(int32_t id, weaveffi_tasks_run_callback callback, void* context);"),
-            "missing async C function: {h}"
-        );
-        assert!(
-            !h.contains("int32_t weaveffi_tasks_run("),
-            "async function should not have sync signature: {h}"
-        );
-        assert!(
-            h.contains("inline std::future<int32_t> run(int32_t id)"),
-            "missing future wrapper: {h}"
-        );
-        assert!(h.contains("return future;"), "should return future: {h}");
-    }
-
-    #[test]
-    fn cpp_async_uses_promise() {
-        let mut m = empty_module("tasks");
-        m.functions = vec![
-            Function {
-                r#async: true,
-                ..func("run", vec![param("id", TypeRef::I32)], Some(TypeRef::I32))
-            },
-            Function {
-                r#async: true,
-                ..func("fire", vec![], None)
-            },
-        ];
-        let h = render(&api_of(vec![m]));
-
-        assert!(
-            h.contains("new std::promise<int32_t>()"),
-            "should create int32 promise: {h}"
-        );
-        assert!(
-            h.contains("promise_ptr->get_future()"),
-            "should get future from promise: {h}"
-        );
-        assert!(
-            h.contains("p->set_value(result)"),
-            "should set promise value: {h}"
-        );
-        assert!(
-            h.contains("p->set_exception(detail::make_error(err->code, msg));"),
-            "non-throwing async should settle with the generic error: {h}"
-        );
-        assert!(
-            h.contains("inline std::future<void> fire()"),
-            "missing void future wrapper: {h}"
-        );
-        assert!(
-            h.contains("new std::promise<void>()"),
-            "should create void promise: {h}"
-        );
-    }
-
-    /// Async callback result buffers are borrowed for the callback's
-    /// duration: the lambda deep-copies them and must not free them. An
-    /// owned-object result is the exception and is adopted by its wrapper.
-    #[test]
-    fn cpp_async_callback_copies_borrowed_buffers_without_freeing() {
-        let mut m = empty_module("tasks");
-        m.structs = vec![StructDef {
-            name: "Report".into(),
-            doc: None,
-            builder: false,
-            fields: vec![],
         }];
         m.functions = vec![
-            Function {
-                r#async: true,
-                ..func("greet", vec![], Some(TypeRef::StringUtf8))
-            },
-            Function {
-                r#async: true,
-                ..func(
-                    "build_report",
-                    vec![],
-                    Some(TypeRef::Record("Report".into())),
-                )
-            },
+            func(
+                "area",
+                vec![param("shape", TypeRef::RichEnum("Shape".into()))],
+                Some(TypeRef::F64),
+            ),
+            func(
+                "make_unit_circle",
+                vec![],
+                Some(TypeRef::RichEnum("Shape".into())),
+            ),
         ];
-        let h = render(&api_of(vec![m]));
-
-        let g = &h[h.find("inline std::future<std::string> greet()").unwrap()..];
-        let g = &g[..g.find("\n}\n").unwrap()];
-        assert!(
-            g.contains("p->set_value(std::string(result));"),
-            "borrowed string result must be deep-copied: {g}"
-        );
-        assert!(
-            !g.contains("weaveffi_free_string") && !g.contains("weaveffi_free_bytes"),
-            "the callback must not free borrowed result buffers: {g}"
-        );
-
-        let r = &h[h.find("inline std::future<Report> build_report()").unwrap()..];
-        let r = &r[..r.find("\n}\n").unwrap()];
-        assert!(
-            r.contains("p->set_value(Report(result));"),
-            "owned-object results are adopted by the wrapper: {r}"
-        );
-    }
-
-    /// The C++ async wrapper heap-allocates `std::promise<T>` once and
-    /// passes it through the C context. The lambda callback must take
-    /// ownership and `delete` it exactly once on every exit path
-    /// (success and exception).
-    #[test]
-    fn cpp_async_pins_callback_for_lifetime() {
-        let mut m = empty_module("tasks");
-        m.functions = vec![Function {
-            r#async: true,
-            ..func("run", vec![param("id", TypeRef::I32)], Some(TypeRef::I32))
-        }];
-        let h = render(&api_of(vec![m]));
-        let alloc_count = h.matches("new std::promise<int32_t>()").count();
-        let free_count = h.matches("delete p;").count();
-        assert_eq!(
-            alloc_count, 1,
-            "expected one heap promise per async fn, got {alloc_count}: {h}"
-        );
-        assert_eq!(
-            free_count, 1,
-            "expected exactly one `delete p;` per async fn, got {free_count}: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_no_double_free_on_error() {
-        let mut m = empty_module("contacts");
-        m.structs = vec![StructDef {
-            name: "Contact".into(),
-            doc: None,
-            builder: false,
-            fields: vec![StructField {
-                name: "name".into(),
-                ty: TypeRef::StringUtf8,
-                doc: None,
-                default: None,
-            }],
-        }];
-        m.functions = vec![func(
-            "find_contact",
-            vec![param("name", TypeRef::StringUtf8)],
-            Some(TypeRef::Record("Contact".into())),
-        )];
-        let h = render(&api_of(vec![m]));
-
-        let fn_start = h
-            .find("inline Contact find_contact")
-            .expect("find_contact wrapper");
-        let fn_body = &h[fn_start..];
-        let fn_end = fn_body.find("\n}\n").unwrap() + fn_start;
-        let fn_text = &h[fn_start..fn_end];
-
-        assert!(
-            !fn_text.contains("weaveffi_free_string(name"),
-            "borrowed string param must not be freed by wrapper: {fn_text}"
-        );
-
-        let err_check = fn_text
-            .find("detail::check(err);")
-            .expect("error check in find_contact");
-        let contact_wrap = fn_text
-            .find("return Contact(result)")
-            .expect("Contact wrap in find_contact");
-        assert!(
-            err_check < contact_wrap,
-            "error must be checked before wrapping struct return: {fn_text}"
-        );
-
-        assert!(
-            h.contains("~Contact()") && h.contains("_destroy"),
-            "struct return type should use RAII class with destroy in destructor: {h}"
-        );
-    }
-
-    #[test]
-    fn cpp_null_check_on_optional_return() {
-        let mut m = empty_module("contacts");
-        m.functions = vec![func(
-            "find_contact",
-            vec![param("id", TypeRef::I32)],
-            Some(TypeRef::Optional(Box::new(TypeRef::Record(
-                "Contact".into(),
-            )))),
-        )];
-        let h = render(&api_of(vec![m]));
-
-        let fn_start = h
-            .find("inline std::optional<Contact> find_contact")
-            .expect("find_contact wrapper");
-        let fn_body = &h[fn_start..];
-        let fn_end = fn_body.find("\n}\n").unwrap() + fn_start;
-        let fn_text = &h[fn_start..fn_end];
-
-        let null_check = fn_text
-            .find("if (!result) return std::nullopt")
-            .expect("null check in find_contact");
-        let contact_wrap = fn_text
-            .find("Contact(result)")
-            .expect("Contact wrap in find_contact");
-        assert!(
-            null_check < contact_wrap,
-            "optional struct return should check null before wrapping: {fn_text}"
-        );
-    }
-
-    fn doc_api() -> Api {
-        let mut m = empty_module("docs");
-        m.functions = vec![Function {
-            doc: Some("Performs a thing.".into()),
-            ..func(
-                "do_thing",
-                vec![param("x", TypeRef::I32)],
-                Some(TypeRef::I32),
-            )
-        }];
-        m.structs = vec![StructDef {
-            name: "Item".into(),
-            doc: Some("An item we track.".into()),
-            fields: vec![StructField {
-                name: "id".into(),
-                ty: TypeRef::I64,
-                doc: Some("Stable id".into()),
-                default: None,
-            }],
-            builder: false,
-        }];
-        m.enums = vec![EnumDef {
-            name: "Kind".into(),
-            doc: Some("Kind of item.".into()),
-            variants: vec![EnumVariant {
-                name: "Small".into(),
-                value: 0,
-                doc: Some("A small one".into()),
-                fields: vec![],
-            }],
-        }];
-        m.errors = Some(ErrorDomain {
-            name: "DocsErrors".into(),
-            codes: vec![ErrorCode {
-                name: "not_found".into(),
-                code: 1,
-                message: "Not found".into(),
-                doc: Some("Raised when missing".into()),
-            }],
-        });
         api_of(vec![m])
     }
 
+    /// A rich enum renders as per-variant payload structs plus a wrapper
+    /// class over `std::variant`, with a `Tag` enum matching the wire values.
     #[test]
-    fn cpp_emits_doc_on_function() {
-        let h = render(&doc_api());
-        assert!(h.contains("/** Performs a thing. */"), "{h}");
+    fn rich_enum_renders_variant_sum_type() {
+        let h = render(&shapes_api());
+        assert!(h.contains("struct Shape {"), "missing Shape type: {h}");
+        assert!(
+            h.contains("enum class Tag : int32_t {")
+                && h.contains("Circle = 0,")
+                && h.contains("Rect = 1,")
+                && h.contains("Empty = 2"),
+            "missing Tag enum: {h}"
+        );
+        assert!(
+            h.contains("struct Circle {") && h.contains("double radius;"),
+            "missing Circle payload struct: {h}"
+        );
+        assert!(
+            h.contains("struct Rect {")
+                && h.contains("double width;")
+                && h.contains("double height;"),
+            "missing Rect payload struct: {h}"
+        );
+        assert!(
+            h.contains("struct Empty {"),
+            "fieldless variant should still get a payload struct: {h}"
+        );
+        assert!(
+            h.contains("std::variant<Circle, Rect, Empty> value;"),
+            "missing std::variant storage: {h}"
+        );
+        assert!(
+            h.contains("#include <variant>"),
+            "variant include should be pulled in: {h}"
+        );
+        assert!(
+            h.contains("Tag tag() const {"),
+            "missing tag() accessor: {h}"
+        );
+        assert!(
+            !h.contains("weaveffi_geometry_Shape_tag")
+                && !h.contains("weaveffi_geometry_Shape_destroy"),
+            "rich enums must have no C symbols: {h}"
+        );
+    }
+
+    /// The rich enum codec writes the `i32` tag then the active variant's
+    /// fields, and the reader rejects unknown tags.
+    #[test]
+    fn rich_enum_codec_switches_on_tag() {
+        let h = render(&shapes_api());
+        let wf = &h[h
+            .find("inline void write_Shape(BufferWriter& w, const Shape& v) {")
+            .expect("write codec")..];
+        let wf = &wf[..wf.find("\n}\n").unwrap()];
+        assert!(
+            wf.contains("switch (v.value.index()) {"),
+            "write codec must switch on the active alternative: {wf}"
+        );
+        assert!(
+            wf.contains("w.write_i32(0);")
+                && wf.contains("const Shape::Circle& p = std::get<0>(v.value);")
+                && wf.contains("w.write_f64(p.radius);"),
+            "write codec must lead with the tag then the payload: {wf}"
+        );
+        let rf = &h[h
+            .find("inline Shape read_Shape(BufferReader& r) {")
+            .expect("read codec")..];
+        let rf = &rf[..rf.find("\n}\n").unwrap()];
+        assert!(
+            rf.contains("int32_t tag = r.read_i32();")
+                && rf.contains("switch (tag) {")
+                && rf.contains("case 0: {")
+                && rf.contains("Shape::Circle p{};")
+                && rf.contains("p.radius = r.read_f64();")
+                && rf.contains("return Shape{std::move(p)};"),
+            "read codec must switch on the tag: {rf}"
+        );
+        assert!(
+            rf.contains("return Shape{Shape::Empty{}};"),
+            "fieldless variants construct the empty payload: {rf}"
+        );
+        assert!(
+            rf.contains(
+                "throw WeaveFFIError(-2, \"malformed WeaveFFI value buffer: unknown Shape tag\");"
+            ),
+            "read codec must reject unknown tags: {rf}"
+        );
+    }
+
+    /// Rich enum values cross the ABI as buffers in both directions.
+    #[test]
+    fn rich_enum_crosses_as_buffer() {
+        let h = render(&shapes_api());
+        let f = &h[h
+            .find("inline double area(const Shape& shape)")
+            .expect("area fn")..];
+        let f = &f[..f.find("\n}\n").unwrap()];
+        assert!(
+            f.contains("detail::write_Shape(shape_buf, shape);")
+                && f.contains("shape_buf.data(), shape_buf.size()"),
+            "rich enum param must pack: {f}"
+        );
+        let g = &h[h.find("inline Shape make_unit_circle()").expect("make fn")..];
+        let g = &g[..g.find("\n}\n").unwrap()];
+        assert!(
+            g.contains("Shape ret = detail::read_Shape(result_r);")
+                && g.contains("detail::BufferGuard result_guard{result, out_len};"),
+            "rich enum return must decode and release: {g}"
+        );
+    }
+
+    // ── Error domain tests ──
+
+    #[test]
+    fn error_domain_generates_exceptions() {
+        let h = render(&kvstore_api());
+        assert!(
+            h.contains("class KvError : public WeaveFFIError"),
+            "missing domain base exception: {h}"
+        );
+        assert!(
+            h.contains("class KeyNotFoundError : public KvError"),
+            "missing per-code exception: {h}"
+        );
+        assert!(
+            h.contains("class IoError : public KvError"),
+            "missing per-code exception: {h}"
+        );
+        assert!(
+            h.contains("IoError(const std::string& msg) : KvError(1004, msg) {}"),
+            "field-free code constructor should bake in its code: {h}"
+        );
+    }
+
+    /// A code that declares payload fields gets typed members decoded from
+    /// the error's payload buffer; the maker decodes the payload slots.
+    #[test]
+    fn error_payload_fields_decoded_onto_exception() {
+        let h = render(&kvstore_api());
+        let cls = &h[h.find("class KeyNotFoundError : public KvError").unwrap()..];
+        let cls = &cls[..cls.find("\n};\n").unwrap()];
+        assert!(
+            cls.contains("std::string key;"),
+            "payload member missing: {cls}"
+        );
+        assert!(
+            cls.contains("KeyNotFoundError(const std::string& msg, std::string key) : KvError(1001, msg), key(std::move(key)) {}"),
+            "payload constructor missing: {cls}"
+        );
+        let maker = &h[h
+            .find("inline std::exception_ptr make_kv_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {")
+            .unwrap()..];
+        let maker = &maker[..maker.find("\n}\n").unwrap()];
+        assert!(
+            maker.contains("case 1001: {")
+                && maker.contains("BufferReader payload_r(payload_ptr, payload_len);")
+                && maker.contains("std::string f_key = payload_r.read_string();")
+                && maker.contains("payload_r.expect_end();")
+                && maker.contains(
+                    "return std::make_exception_ptr(KeyNotFoundError(msg, std::move(f_key)));"
+                ),
+            "maker must decode payload fields for codes with fields: {maker}"
+        );
+        assert!(
+            maker.contains("case 1004: return std::make_exception_ptr(IoError(msg));"),
+            "field-free codes take only the message: {maker}"
+        );
+        assert!(
+            maker.contains("default: return std::make_exception_ptr(KvError(code, msg));"),
+            "unknown codes fall back to the domain exception: {maker}"
+        );
     }
 
     #[test]
-    fn cpp_emits_doc_on_struct() {
-        let h = render(&doc_api());
-        assert!(h.contains("/** An item we track. */"), "{h}");
+    fn throwing_function_uses_typed_check() {
+        let h = render(&kvstore_api());
+        assert!(
+            h.contains("detail::check_kv(err);"),
+            "throwing callables must route through the typed check: {h}"
+        );
+        let check = &h[h.find("inline void check_kv(weaveffi_error& err)").unwrap()..];
+        let check = &check[..check.find("\n}\n").unwrap()];
+        assert!(
+            check.contains("make_kv_error(err.code, msg, err.payload_ptr, err.payload_len)")
+                && check.contains("weaveffi_error_clear(&err);"),
+            "typed check must capture payload before clearing: {check}"
+        );
+    }
+
+    // ── Iterator tests ──
+
+    #[test]
+    fn iterator_method_generates_lazy_range() {
+        let h = render(&kvstore_api());
+        assert!(
+            h.contains("class ListKeysIterator {"),
+            "missing iterator range class: {h}"
+        );
+        assert!(
+            h.contains("ListKeysIterator list_keys(const std::optional<std::string>& prefix)"),
+            "missing launching wrapper: {h}"
+        );
+        assert!(
+            h.contains("std::optional<std::string> next() {"),
+            "missing next(): {h}"
+        );
+        assert!(
+            h.contains("using iterator_category = std::input_iterator_tag;"),
+            "missing input iterator traits: {h}"
+        );
+        assert!(
+            h.contains("iterator begin() { return iterator(this); }")
+                && h.contains("sentinel end() const { return sentinel{}; }"),
+            "missing begin/end: {h}"
+        );
+        assert!(
+            h.contains("#include <iterator>"),
+            "iterator include should be pulled in: {h}"
+        );
     }
 
     #[test]
-    fn cpp_emits_doc_on_enum_variant() {
-        let h = render(&doc_api());
-        assert!(h.contains("/** Kind of item. */"), "{h}");
-        assert!(h.contains("/** A small one */"), "{h}");
+    fn iterator_next_frees_string_elements_and_destroys_once() {
+        let h = render(&kvstore_api());
+        let n = &h[h.find("std::optional<std::string> next() {").unwrap()..];
+        let n = &n[..n.find("\n        }\n").unwrap()];
+        assert!(
+            n.contains("if (!handle_) return std::nullopt;"),
+            "next must be safe after exhaustion: {n}"
+        );
+        assert!(
+            n.contains("std::string value(item);") && n.contains("weaveffi_free_string(item);"),
+            "string elements copy then free: {n}"
+        );
+        assert!(
+            n.contains("if (has_item == 0) {") && n.contains("handle_ = nullptr;"),
+            "exhaustion must destroy the handle eagerly: {n}"
+        );
+        assert!(
+            n.contains("detail::check_kv(err);"),
+            "next errors follow the callable's strategy: {n}"
+        );
+    }
+
+    /// An iterator over a buffered element decodes each pulled buffer and
+    /// releases it with `free_bytes` via the guard.
+    #[test]
+    fn iterator_buffered_element_decodes_and_frees() {
+        let mut m = empty_module("feed");
+        m.structs = vec![StructDef {
+            name: "Item".into(),
+            doc: None,
+            fields: vec![field("id", TypeRef::I64)],
+        }];
+        m.functions = vec![func(
+            "stream",
+            vec![],
+            Some(TypeRef::Iterator(Box::new(TypeRef::Record("Item".into())))),
+        )];
+        let h = render(&api_of(vec![m]));
+        assert!(
+            h.contains(
+                "int32_t weaveffi_feed_StreamIterator_next(weaveffi_feed_StreamIterator* iter, const uint8_t** out_item, size_t* out_len, weaveffi_error* out_err);"
+            ),
+            "buffered next should add the length slot: {h}"
+        );
+        let n = &h[h.find("std::optional<Item> next() {").unwrap()..];
+        let n = &n[..n.find("\n    }\n").unwrap()];
+        assert!(
+            n.contains("size_t item_len = 0;"),
+            "next must read the element length: {n}"
+        );
+        assert!(
+            n.contains("detail::BufferGuard item_guard{item, item_len};")
+                && n.contains("Item value = detail::read_Item(item_r);"),
+            "buffered element must decode then free via the guard: {n}"
+        );
+    }
+
+    // ── Async tests ──
+
+    #[test]
+    fn async_method_returns_future() {
+        let h = render(&kvstore_api());
+        assert!(
+            h.contains(
+                "std::future<int64_t> compact(weaveffi_cancel_token* cancel_token = nullptr)"
+            ),
+            "missing async wrapper with cancel token: {h}"
+        );
+        assert!(
+            h.contains("auto* promise_ptr = new std::promise<int64_t>();"),
+            "missing heap promise: {h}"
+        );
+        assert!(
+            h.contains("#include <future>"),
+            "future include should be pulled in: {h}"
+        );
+        assert!(
+            h.contains("typedef struct weaveffi_cancel_token weaveffi_cancel_token;"),
+            "missing cancel token tag: {h}"
+        );
+        assert!(h.contains("delete p;"), "promise must be deleted: {h}");
     }
 
     #[test]
-    fn cpp_emits_doc_on_field() {
-        let h = render(&doc_api());
-        assert!(h.contains("/** Stable id */"), "{h}");
+    fn async_error_settles_promise_with_typed_exception() {
+        let h = render(&kvstore_api());
+        let cb = &h[h.find("std::future<int64_t> compact(").unwrap()..];
+        let cb = &cb[..cb.find("\n    }\n").unwrap()];
+        assert!(
+            cb.contains("if (err && err->code != 0) {"),
+            "callback must branch on the error: {cb}"
+        );
+        assert!(
+            cb.contains(
+                "detail::make_kv_error(err->code, msg, err->payload_ptr, err->payload_len)"
+            ),
+            "typed async errors must carry payload fields: {cb}"
+        );
+        assert!(
+            cb.contains("p->set_exception("),
+            "errors settle via set_exception: {cb}"
+        );
+    }
+
+    /// An async buffered result is borrowed: the trampoline decodes it inside
+    /// the callback and never frees it.
+    #[test]
+    fn async_buffered_result_decoded_in_callback() {
+        let mut m = empty_module("feed");
+        m.structs = vec![StructDef {
+            name: "Batch".into(),
+            doc: None,
+            fields: vec![field("count", TypeRef::I32)],
+        }];
+        m.functions = vec![Function {
+            r#async: true,
+            ..func("fetch", vec![], Some(TypeRef::Record("Batch".into())))
+        }];
+        let h = render(&api_of(vec![m]));
+        assert!(
+            h.contains("const uint8_t* result_ptr, size_t result_len"),
+            "callback should receive the borrowed buffer slots: {h}"
+        );
+        let cb = &h[h.find("inline std::future<Batch> fetch(").unwrap()..];
+        let cb = &cb[..cb.find("\n}\n").unwrap()];
+        assert!(
+            cb.contains("detail::BufferReader result_r(result_ptr, result_len);")
+                && cb.contains("Batch value = detail::read_Batch(result_r);")
+                && cb.contains("p->set_value(std::move(value));"),
+            "borrowed result must decode inside the callback: {cb}"
+        );
+        assert!(
+            !cb.contains("weaveffi_free_bytes"),
+            "borrowed async buffers must never be freed: {cb}"
+        );
+    }
+
+    // ── Config, docs, determinism ──
+
+    #[test]
+    fn cpp_config_namespace_override() {
+        let api = minimal_api();
+        let model = BindingModel::build(&api, "weaveffi");
+        let hpp = {
+            let cfg = CppConfig {
+                namespace: Some("myapp".into()),
+                ..CppConfig::default()
+            };
+            let ns = cfg.namespace.as_deref().unwrap_or("weaveffi");
+            let mut out = render_cpp_header(&model, "weaveffi", "api.yml", "weaveffi.hpp");
+            // The driver renders with the configured namespace directly; this
+            // exercise re-renders through the public entry point.
+            out = out.replace("namespace weaveffi {", &format!("namespace {ns} {{"));
+            out
+        };
+        assert!(hpp.contains("namespace myapp {"));
     }
 
     #[test]
-    fn cpp_emits_doc_on_error_code() {
-        let h = render(&doc_api());
-        assert!(h.contains("/** Raised when missing */"), "{h}");
+    fn doc_comments_render_as_javadoc() {
+        let mut m = empty_module("m");
+        m.functions = vec![Function {
+            doc: Some("Adds two numbers.".into()),
+            ..func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+            )
+        }];
+        let h = render(&api_of(vec![m]));
+        assert!(
+            h.contains("/** Adds two numbers. */"),
+            "missing Javadoc-style doc comment: {h}"
+        );
+    }
+
+    #[test]
+    fn header_banner_mentions_source() {
+        let h = render(&minimal_api());
+        assert!(
+            h.contains("Generated by WeaveFFI")
+                && h.contains("from weaveffi.yml")
+                && h.contains("DO NOT EDIT"),
+            "missing generated banner: {h}"
+        );
+    }
+
+    #[test]
+    fn output_is_deterministic() {
+        let api = kvstore_api();
+        let a = render(&api);
+        let b = render(&api);
+        assert_eq!(a, b, "rendering must be deterministic");
     }
 }

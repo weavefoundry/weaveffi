@@ -21,8 +21,8 @@ if (process.env.WEAVEFFI_ADDON) {
 }
 
 // Re-export every native binding, then layer the idiomatic wrappers
-// (error classes, interface and rich-enum classes, function wrappers)
-// on top.
+// (error classes, interface classes, buffer pack/unpack, function
+// wrappers) on top.
 const wv = {};
 for (const _name of Object.getOwnPropertyNames(addon)) {
   wv[_name] = addon[_name];
@@ -41,7 +41,7 @@ function __generic(code, message) {
   return new WeaveFFIError(code, message);
 }
 function __rebrand(e, map) {
-  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+  return e && typeof e.code === 'number' ? map(e.code, e.message, e.payload) : e;
 }
 function __invoke(fn, args, map) {
   try {
@@ -54,6 +54,142 @@ function __invokeAsync(fn, args, map) {
   return fn.apply(null, args).catch((e) => {
     throw __rebrand(e, map);
   });
+}
+
+// --- Private value-buffer runtime (WeaveFFI wire format) --------------------
+// Little-endian, packed, no alignment. Decoders reject truncated buffers,
+// invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
+const __utf8 = new TextDecoder('utf-8', { fatal: true });
+function __bufferError(what) {
+  return new WeaveFFIError(-2, 'malformed value buffer: ' + what);
+}
+class __Writer {
+  constructor() {
+    this._buf = Buffer.alloc(256);
+    this._len = 0;
+  }
+  _reserve(n) {
+    if (this._len + n <= this._buf.length) return;
+    let cap = this._buf.length;
+    while (cap < this._len + n) cap *= 2;
+    const grown = Buffer.alloc(cap);
+    this._buf.copy(grown, 0, 0, this._len);
+    this._buf = grown;
+  }
+  bool(v) { this._reserve(1); this._buf[this._len++] = v ? 1 : 0; }
+  i8(v) { this._reserve(1); this._buf.writeInt8(v, this._len); this._len += 1; }
+  u8(v) { this._reserve(1); this._buf.writeUInt8(v, this._len); this._len += 1; }
+  i16(v) { this._reserve(2); this._buf.writeInt16LE(v, this._len); this._len += 2; }
+  u16(v) { this._reserve(2); this._buf.writeUInt16LE(v, this._len); this._len += 2; }
+  i32(v) { this._reserve(4); this._buf.writeInt32LE(v, this._len); this._len += 4; }
+  u32(v) { this._reserve(4); this._buf.writeUInt32LE(v, this._len); this._len += 4; }
+  i64(v) { this._reserve(8); this._buf.writeBigInt64LE(BigInt(v), this._len); this._len += 8; }
+  u64(v) { this._reserve(8); this._buf.writeBigUInt64LE(BigInt(v), this._len); this._len += 8; }
+  f32(v) { this._reserve(4); this._buf.writeFloatLE(v, this._len); this._len += 4; }
+  f64(v) { this._reserve(8); this._buf.writeDoubleLE(v, this._len); this._len += 8; }
+  str(v) {
+    const b = Buffer.from(String(v), 'utf8');
+    this.u32(b.length);
+    this._reserve(b.length);
+    b.copy(this._buf, this._len);
+    this._len += b.length;
+  }
+  bytes(v) {
+    this.u32(v.length);
+    this._reserve(v.length);
+    this._buf.set(v, this._len);
+    this._len += v.length;
+  }
+  finish() { return this._buf.subarray(0, this._len); }
+}
+class __Reader {
+  constructor(buf) {
+    this._buf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    this._pos = 0;
+  }
+  _take(n, what) {
+    if (this._pos + n > this._buf.length) throw __bufferError(what);
+    const at = this._pos;
+    this._pos += n;
+    return at;
+  }
+  bool() {
+    const b = this._buf[this._take(1, 'bool')];
+    if (b > 1) throw __bufferError('bool byte out of range');
+    return b === 1;
+  }
+  i8() { return this._buf.readInt8(this._take(1, 'i8')); }
+  u8() { return this._buf.readUInt8(this._take(1, 'u8')); }
+  i16() { return this._buf.readInt16LE(this._take(2, 'i16')); }
+  u16() { return this._buf.readUInt16LE(this._take(2, 'u16')); }
+  i32() { return this._buf.readInt32LE(this._take(4, 'i32')); }
+  u32() { return this._buf.readUInt32LE(this._take(4, 'u32')); }
+  i64() { return this._buf.readBigInt64LE(this._take(8, 'i64')); }
+  u64() { return this._buf.readBigUInt64LE(this._take(8, 'u64')); }
+  f32() { return this._buf.readFloatLE(this._take(4, 'f32')); }
+  f64() { return this._buf.readDoubleLE(this._take(8, 'f64')); }
+  len() {
+    const n = this.u32();
+    if (n > this._buf.length - this._pos) throw __bufferError('length prefix exceeds remaining bytes');
+    return n;
+  }
+  str() {
+    const n = this.len();
+    const at = this._take(n, 'string bytes');
+    try {
+      return __utf8.decode(this._buf.subarray(at, at + n));
+    } catch (e) {
+      throw __bufferError('string is not valid UTF-8');
+    }
+  }
+  bytes() {
+    const n = this.len();
+    const at = this._take(n, 'byte buffer');
+    return Buffer.from(this._buf.subarray(at, at + n));
+  }
+  end() {
+    if (this._pos !== this._buf.length) throw __bufferError('trailing bytes after value');
+  }
+}
+function __encode(f, v) { const w = new __Writer(); f(w, v); return w.finish(); }
+function __decode(f, b) { const r = new __Reader(b); const v = f(r); r.end(); return v; }
+function __wOpt(w, v, f) { if (v === null || v === undefined) { w.bool(false); } else { w.bool(true); f(w, v); } }
+function __rOpt(r, f) { return r.bool() ? f(r) : null; }
+function __wList(w, v, f) { w.u32(v.length); for (const e of v) f(w, e); }
+function __rList(r, f) {
+  const n = r.len();
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(f(r));
+  return out;
+}
+function __wMap(w, v, kf, vf) {
+  const keys = Object.keys(v);
+  w.u32(keys.length);
+  for (const k of keys) { kf(w, k); vf(w, v[k]); }
+}
+function __rMap(r, kf, vf) {
+  const n = r.len();
+  const out = {};
+  for (let i = 0; i < n; i++) {
+    const k = kf(r);
+    out[k] = vf(r);
+  }
+  return out;
+}
+
+function __packDocument(w, v) {
+  w.i64(v.id);
+  w.str(v.title);
+  w.i32(v.status);
+  __wList(w, v.tags, (w, v) => w.str(v));
+}
+function __unpackDocument(r) {
+  return {
+    id: Number(r.i64()),
+    title: r.str(),
+    status: r.i32(),
+    tags: __rList(r, (r) => r.str()),
+  };
 }
 
 class DocsErrorsError extends WeaveFFIError {
@@ -80,9 +216,10 @@ class InvalidStatusError extends DocsErrorsError {
 InvalidStatusError.CODE = 2;
 wv.InvalidStatusError = InvalidStatusError;
 const __docsErrorCodes = Object.freeze({ 1: NotFoundError, 2: InvalidStatusError });
-function __docsErrorFrom(code, message) {
+function __docsErrorFrom(code, message, payload) {
   const _cls = __docsErrorCodes[code];
-  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+  const _err = _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+  return _err;
 }
 
 class Notebook {
@@ -91,10 +228,11 @@ class Notebook {
     Notebook._cleanup.register(this, this._handle, this);
   }
   insert(document) {
-    return __invoke(addon.Notebook_insert, [this._handle, document], __generic);
+    return __invoke(addon.Notebook_insert, [this._handle, __encode(__packDocument, document)], __generic);
   }
   find(id) {
-    return __invoke(addon.Notebook_find, [this._handle, id], __docsErrorFrom);
+    const _r = __invoke(addon.Notebook_find, [this._handle, id], __docsErrorFrom);
+    return __decode(__unpackDocument, _r);
   }
   size() {
     return __invoke(addon.Notebook_size, [this._handle], __generic);
@@ -122,10 +260,12 @@ Notebook._cleanup = new FinalizationRegistry((handle) => {
 wv.Notebook = Notebook;
 
 wv.createDocument = function (title, tags) {
-  return __invoke(addon.createDocument, [title, tags], __generic);
+  const _r = __invoke(addon.createDocument, [title, __encode((w, v) => __wList(w, v, (w, v) => w.str(v)), tags)], __generic);
+  return __decode(__unpackDocument, _r);
 };
 wv.getDocument = function (id) {
-  return __invoke(addon.getDocument, [id], __generic);
+  const _r = __invoke(addon.getDocument, [id], __generic);
+  return __decode((r) => __rOpt(r, __unpackDocument), _r);
 };
 wv.publishAsync = function (id) {
   return __invokeAsync(addon.publishAsync, [id], __generic);

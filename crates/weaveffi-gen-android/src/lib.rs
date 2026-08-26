@@ -19,10 +19,11 @@ use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, pascal_case, D
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
     InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::pkg;
+use weaveffi_core::plan::{self, ElemFree};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -263,6 +264,9 @@ add_library(weaveffi SHARED weaveffi_jni.c)
 target_include_directories(weaveffi PRIVATE ../../../../c)
 "#;
 
+/// The idiomatic (public) Kotlin type for an IR type: records and rich enums
+/// surface as their generated value classes, lists and maps as `List`/`Map`,
+/// optionals as nullable types, and handles as raw `Long` tokens.
 fn kotlin_type(t: &TypeRef) -> String {
     match t {
         TypeRef::I8 | TypeRef::U8 => "Byte".to_string(),
@@ -275,36 +279,38 @@ fn kotlin_type(t: &TypeRef) -> String {
         TypeRef::Bool => "Boolean".to_string(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "ByteArray".to_string(),
-        TypeRef::Handle => "Long".to_string(),
-        // A cross-module typed handle (resolved to e.g. `kv.Store`) must name the
-        // bare local Kotlin class `Store`, not the qualified IR name.
-        TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
-        // An interface surfaces as its generated Kotlin wrapper class,
-        // exactly like a typed handle; the JNI layer carries the raw `Long`.
+        // Handles (typed or not) are opaque u64 tokens; both surface as `Long`.
+        TypeRef::Handle | TypeRef::TypedHandle(_) => "Long".to_string(),
+        // An interface surfaces as its generated Kotlin wrapper class; the
+        // JNI layer carries the raw `Long` pointer.
         TypeRef::Interface(name) => local_type_name(name).to_string(),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) => "Long".to_string(),
-        TypeRef::Enum(_) => "Int".to_string(),
+        // Records and rich enums are value types: the generated data class or
+        // sealed class, decoded from the value buffer by the wrapper layer.
+        // Cross-module references (e.g. `geo.Point`) name the bare local
+        // Kotlin class `Point`, never the dot-qualified IR name.
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).to_string(),
+        TypeRef::Enum(name) => local_type_name(name).to_string(),
         TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
-        TypeRef::List(inner) => kotlin_list_type(inner),
+        TypeRef::List(inner) => format!("List<{}>", kotlin_type(inner)),
         TypeRef::Iterator(inner) => format!("Iterator<{}>", kotlin_type(inner)),
         TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
+/// The Kotlin type a value crosses the JNI boundary as: buffered values pack
+/// into a `ByteArray`, enums cross as their raw `Int`, interfaces and
+/// iterator handles as raw `Long`s. Everything else matches [`kotlin_type`].
 fn kotlin_jni_type(t: &TypeRef) -> String {
+    if abi::is_buffered(t) {
+        return "ByteArray".to_string();
+    }
     match t {
-        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => "Long".to_string(),
-        // The JNI layer carries a typed handle or interface as a raw `Long`
-        // even when nullable; the public wrapper re-wraps it into the class.
-        TypeRef::Optional(inner)
-            if matches!(
-                inner.as_ref(),
-                TypeRef::TypedHandle(_) | TypeRef::Interface(_)
-            ) =>
-        {
-            "Long?".to_string()
-        }
+        TypeRef::Enum(_) => "Int".to_string(),
+        TypeRef::Interface(_) => "Long".to_string(),
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // the JNI layer carries the nullable pointer as a boxed `Long?`.
+        TypeRef::Optional(_) => "Long?".to_string(),
         // An iterator crosses JNI as the raw handle returned by the launcher;
         // the public wrapper adopts it into the generated iterator class.
         TypeRef::Iterator(_) => "Long".to_string(),
@@ -312,82 +318,39 @@ fn kotlin_jni_type(t: &TypeRef) -> String {
     }
 }
 
-fn kotlin_list_type(inner: &TypeRef) -> String {
-    match inner {
-        TypeRef::I8 | TypeRef::U8 => "ByteArray".to_string(),
-        TypeRef::I16 | TypeRef::U16 => "ShortArray".to_string(),
-        TypeRef::I32 | TypeRef::Enum(_) => "IntArray".to_string(),
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => "LongArray".to_string(),
-        TypeRef::F32 => "FloatArray".to_string(),
-        TypeRef::F64 => "DoubleArray".to_string(),
-        TypeRef::Bool => "BooleanArray".to_string(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Array<String>".to_string(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "Array<ByteArray>".to_string(),
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {
-            "LongArray".to_string()
-        }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-}
-
-/// The Kotlin parameter types of a listener callback lambda. Trampolines box
-/// arguments on arbitrary producer threads where only bootstrap classes
-/// (`java/lang/*`, `java/util/*`) are loadable, so enums surface as their raw
-/// `Int` value and structs/typed handles as raw `Long` pointers.
+/// The public Kotlin parameter types of a listener callback lambda. Buffered
+/// arguments are decoded by the generated wrapper before the user's lambda
+/// runs, so they surface as their idiomatic value types. Enums stay raw `Int`
+/// and interfaces raw `Long`: trampolines box arguments on arbitrary producer
+/// threads where only bootstrap classes (`java/lang/*`) are loadable.
 fn kotlin_cb_type(t: &TypeRef) -> String {
+    if abi::is_buffered(t) {
+        return kotlin_type(t);
+    }
     match t {
-        TypeRef::I8 | TypeRef::U8 => "Byte".to_string(),
-        TypeRef::I16 | TypeRef::U16 => "Short".to_string(),
-        TypeRef::I32 | TypeRef::Enum(_) => "Int".to_string(),
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "Long".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_) => "Long".to_string(),
-        TypeRef::Interface(_) => "Long".to_string(),
-        TypeRef::F32 => "Float".to_string(),
-        TypeRef::F64 => "Double".to_string(),
-        TypeRef::Bool => "Boolean".to_string(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "ByteArray".to_string(),
-        TypeRef::Optional(inner) => format!("{}?", kotlin_cb_type(inner)),
-        TypeRef::List(inner) => match inner.as_ref() {
-            TypeRef::I8 | TypeRef::U8 => "ByteArray".to_string(),
-            TypeRef::I16 | TypeRef::U16 => "ShortArray".to_string(),
-            TypeRef::I32 | TypeRef::Enum(_) => "IntArray".to_string(),
-            TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => "LongArray".to_string(),
-            TypeRef::F32 => "FloatArray".to_string(),
-            TypeRef::F64 => "DoubleArray".to_string(),
-            TypeRef::Bool => "BooleanArray".to_string(),
-            _ => "Array<String>".to_string(),
-        },
-        TypeRef::Map(k, v) => {
-            format!("Map<{}, {}>", kotlin_cb_box_type(k), kotlin_cb_box_type(v))
-        }
+        TypeRef::Enum(_) => "Int".to_string(),
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => "Long".to_string(),
+        // Only `Interface?` reaches here: a nullable raw pointer.
+        TypeRef::Optional(_) => "Long?".to_string(),
         TypeRef::Iterator(_) => unreachable!("validation rejects iterator callback params"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        other => kotlin_type(other),
     }
 }
 
-/// Boxed Kotlin element types for callback map parameters.
-fn kotlin_cb_box_type(t: &TypeRef) -> String {
-    match t {
-        TypeRef::I8 | TypeRef::U8 => "Byte".to_string(),
-        TypeRef::I16 | TypeRef::U16 => "Short".to_string(),
-        TypeRef::I32 | TypeRef::Enum(_) => "Int".to_string(),
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => "Long".to_string(),
-        TypeRef::F32 => "Float".to_string(),
-        TypeRef::F64 => "Double".to_string(),
-        TypeRef::Bool => "Boolean".to_string(),
-        _ => "String".to_string(),
+/// The Kotlin parameter types of the JNI-facing listener callback lambda the
+/// trampoline invokes: buffered arguments arrive as a raw `ByteArray` copy;
+/// everything else matches [`kotlin_cb_type`].
+fn kotlin_cb_jni_type(t: &TypeRef) -> String {
+    if abi::is_buffered(t) {
+        return "ByteArray".to_string();
     }
+    kotlin_cb_type(t)
 }
 
 fn jni_param_type(t: &TypeRef) -> String {
+    if abi::is_buffered(t) {
+        return "jbyteArray".to_string();
+    }
     match t {
         TypeRef::I8 | TypeRef::U8 => "jbyte".to_string(),
         TypeRef::I16 | TypeRef::U16 => "jshort".to_string(),
@@ -397,45 +360,22 @@ fn jni_param_type(t: &TypeRef) -> String {
         | TypeRef::U64
         | TypeRef::TypedHandle(_)
         | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
         | TypeRef::Interface(_) => "jlong".to_string(),
         TypeRef::F32 => "jfloat".to_string(),
         TypeRef::F64 => "jdouble".to_string(),
         TypeRef::Bool => "jboolean".to_string(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "jstring".to_string(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "jbyteArray".to_string(),
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "jstring".to_string(),
-            TypeRef::Bytes | TypeRef::BorrowedBytes => "jbyteArray".to_string(),
-            _ => "jobject".to_string(),
-        },
-        TypeRef::List(inner) => jni_array_type(inner),
+        // Only `Interface?` reaches here: Kotlin's `Long?` boxes to
+        // `java.lang.Long`, so the slot is a nullable `jobject`.
+        TypeRef::Optional(_) => "jobject".to_string(),
         // An iterator return crosses as the raw handle (`jlong`); it is never
         // a parameter (validation rejects that position).
         TypeRef::Iterator(_) => "jlong".to_string(),
-        TypeRef::Map(_, _) => "jobject".to_string(),
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered types are handled above")
+        }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-}
-
-fn jni_array_type(inner: &TypeRef) -> String {
-    match inner {
-        TypeRef::I8 | TypeRef::U8 => "jbyteArray".to_string(),
-        TypeRef::I16 | TypeRef::U16 => "jshortArray".to_string(),
-        TypeRef::I32 | TypeRef::Enum(_) => "jintArray".to_string(),
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => "jlongArray".to_string(),
-        TypeRef::F32 => "jfloatArray".to_string(),
-        TypeRef::F64 => "jdoubleArray".to_string(),
-        TypeRef::Bool => "jbooleanArray".to_string(),
-        _ => "jobjectArray".to_string(),
     }
 }
 
@@ -446,6 +386,9 @@ fn jni_ret_type(t: Option<&TypeRef>) -> String {
     }
 }
 
+/// The C declaration type for the scalar-shaped returns handled by the
+/// generic fallthrough in `write_return_handling`. Buffered, string, bytes,
+/// optional, iterator, and typed-handle returns have dedicated emitters.
 fn c_type_for_return(t: &TypeRef) -> &'static str {
     match t {
         TypeRef::I8 => "int8_t",
@@ -459,38 +402,39 @@ fn c_type_for_return(t: &TypeRef) -> &'static str {
         TypeRef::F32 => "float",
         TypeRef::F64 => "double",
         TypeRef::Bool => "bool",
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "weaveffi_handle_t",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*",
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*",
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_)
-        | TypeRef::Optional(_)
-        | TypeRef::List(_)
-        | TypeRef::Iterator(_)
-        | TypeRef::Map(_, _) => "void*",
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::Handle => "weaveffi_handle_t",
+        TypeRef::Interface(_) => "void*",
+        other => unreachable!("return type {other:?} is handled by a dedicated emitter"),
     }
 }
 
 fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
+    let Some(t) = t else {
+        return "";
+    };
+    if abi::is_buffered(t) {
+        return "return NULL;";
+    }
     match t {
-        None => "",
-        Some(TypeRef::I8 | TypeRef::U8 | TypeRef::I16 | TypeRef::U16) => "return 0;",
-        Some(TypeRef::I32 | TypeRef::Enum(_)) => "return 0;",
-        Some(
-            TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle,
-        ) => "return 0;",
-        Some(TypeRef::F32) => "return 0.0f;",
-        Some(TypeRef::F64) => "return 0.0;",
-        Some(TypeRef::Bool) => "return JNI_FALSE;",
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => "return NULL;",
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => "return NULL;",
-        Some(TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_)) => "return 0;",
+        TypeRef::I8 | TypeRef::U8 | TypeRef::I16 | TypeRef::U16 => "return 0;",
+        TypeRef::I32 | TypeRef::Enum(_) => "return 0;",
+        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
+            "return 0;"
+        }
+        TypeRef::F32 => "return 0.0f;",
+        TypeRef::F64 => "return 0.0;",
+        TypeRef::Bool => "return JNI_FALSE;",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "return NULL;",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "return NULL;",
+        TypeRef::Interface(_) => "return 0;",
+        // Only `Interface?` reaches here (a nullable boxed `Long`).
+        TypeRef::Optional(_) => "return NULL;",
         // The iterator launcher returns the handle as a `jlong`; 0 = failed.
-        Some(TypeRef::Iterator(_)) => "return 0;",
-        Some(TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _)) => "return NULL;",
-        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
+        TypeRef::Iterator(_) => "return 0;",
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered types are handled above")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -499,30 +443,11 @@ fn jni_cast_for(t: &TypeRef) -> &'static str {
         TypeRef::I8 | TypeRef::U8 => "(jbyte)",
         TypeRef::I16 | TypeRef::U16 => "(jshort)",
         TypeRef::I32 | TypeRef::Enum(_) => "(jint)",
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            "(jlong)"
-        }
+        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "(jlong)",
         TypeRef::F32 => "(jfloat)",
         TypeRef::F64 => "(jdouble)",
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_) => "(jlong)(intptr_t)",
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => "(jlong)(intptr_t)",
         _ => "",
-    }
-}
-
-fn kotlin_public_type(t: &TypeRef) -> String {
-    match t {
-        // Cross-module enums (e.g. `graphics.Unit`) surface as the bare local
-        // Kotlin enum class `Unit`, never the dot-qualified IR name.
-        TypeRef::Enum(name) => local_type_name(name).to_string(),
-        // Records and rich enums surface as their generated Kotlin wrapper
-        // classes, mirroring typed handles; the JNI layer still carries the
-        // raw `Long` pointer.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).to_string(),
-        TypeRef::Optional(inner) => format!("{}?", kotlin_public_type(inner)),
-        // An `iter<T>` surfaces as a lazy `Iterator<T>` over the public
-        // element type; the concrete class is the generated iterator wrapper.
-        TypeRef::Iterator(inner) => format!("Iterator<{}>", kotlin_public_type(inner)),
-        other => kotlin_type(other),
     }
 }
 
@@ -585,49 +510,163 @@ fn kotlin_exception_name(eb: &ErrorBinding) -> String {
     errors::exception_type_name(&eb.name)
 }
 
-/// The Kotlin expression mapping an async error `(code, message)` pair to the
-/// exception the continuation resumes with: the typed domain exception for a
-/// throwing callable, the generic brand exception otherwise.
+/// The Kotlin lambda mapping an async error `(code, message, payload)` triple
+/// to the exception the continuation resumes with: the typed domain exception
+/// (which decodes the payload) for a throwing callable, the generic brand
+/// exception otherwise.
 fn kotlin_error_mapper(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
     match error {
         Some(eb) if f.throws => {
-            format!("{}.fromCode(code, message)", kotlin_exception_name(eb))
+            format!(
+                "{{ code, message, payload -> {}.fromCode(code, message, payload) }}",
+                kotlin_exception_name(eb)
+            )
         }
-        _ => format!("{}(code, message)", errors::EXCEPTION_BRAND),
+        _ => format!(
+            "{{ code, message, _ -> {}(code, message) }}",
+            errors::EXCEPTION_BRAND
+        ),
     }
 }
 
-/// True if `t` is a typed handle, record, rich enum, or interface, or an
-/// optional wrapping one: the return shapes that re-wrap a raw JNI `Long`
-/// into a Kotlin class.
-fn is_class_wrapped_return(t: &TypeRef) -> bool {
-    match t {
-        t if t.is_object_ref() => true,
-        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => true,
-        TypeRef::Optional(inner) => is_class_wrapped_return(inner),
-        _ => false,
-    }
-}
-
-/// True if `t` unwraps to a raw handle (`.handle` / `?.handle`) on the way
-/// into JNI: typed handles, records, rich enums, and interfaces, plus
-/// optionals of them.
-fn is_class_wrapped_param(t: &TypeRef) -> bool {
-    is_class_wrapped_return(t)
-}
-
-/// Whether a function needs the private-`Jni` + public-wrapper split rather than
-/// a bare `external fun`. This is required when any param or the return crosses
-/// the JNI boundary as a *different* type than its public Kotlin type: enums
-/// (`.value`/`fromValue`), typed handles, records, rich enums, and interfaces
-/// (`.handle` / re-wrap into the class), and iterator returns (the raw `Long`
-/// handle is adopted into the generated iterator class).
+/// Whether a function needs the private-`Jni` + public-wrapper split rather
+/// than a bare `external fun`. This is required when any param or the return
+/// crosses the JNI boundary as a *different* type than its public Kotlin
+/// type: buffered values (pack/decode a `ByteArray`), enums
+/// (`.value`/`fromValue`), interfaces (`.handle` / re-wrap into the class),
+/// and iterator returns (the raw `Long` handle is adopted into the generated
+/// iterator class).
 fn needs_wrapper_split(f: &FnBinding) -> bool {
-    f.params
-        .iter()
-        .any(|p| matches!(&p.ty, TypeRef::Enum(_)) || is_class_wrapped_param(&p.ty))
-        || matches!(&f.ret, Some(TypeRef::Enum(_) | TypeRef::Iterator(_)))
-        || f.ret.as_ref().is_some_and(is_class_wrapped_return)
+    fn differs(t: &TypeRef) -> bool {
+        abi::is_buffered(t)
+            || matches!(t, TypeRef::Enum(_) | TypeRef::Interface(_))
+            || matches!(t, TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Interface(_)))
+    }
+    f.params.iter().any(|p| differs(&p.ty))
+        || matches!(&f.ret, Some(TypeRef::Iterator(_)))
+        || f.ret.as_ref().is_some_and(differs)
+}
+
+/// The Kotlin statement writing `expr` (typed as the public Kotlin type of
+/// `t`) into the value-buffer writer named `w`. Optionals, lists, and maps
+/// recurse through the writer's lambda helpers; `depth` uniquifies the lambda
+/// parameter names at each nesting level.
+fn kt_write_expr(t: &TypeRef, w: &str, expr: &str, depth: usize) -> String {
+    match t {
+        TypeRef::Bool => format!("{w}.writeBool({expr})"),
+        TypeRef::I8 | TypeRef::U8 => format!("{w}.writeI8({expr})"),
+        TypeRef::I16 | TypeRef::U16 => format!("{w}.writeI16({expr})"),
+        TypeRef::I32 => format!("{w}.writeI32({expr})"),
+        TypeRef::U32 => format!("{w}.writeU32({expr})"),
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            format!("{w}.writeI64({expr})")
+        }
+        TypeRef::F32 => format!("{w}.writeF32({expr})"),
+        TypeRef::F64 => format!("{w}.writeF64({expr})"),
+        TypeRef::Enum(_) => format!("{w}.writeI32({expr}.value)"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{w}.writeString({expr})"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => format!("{w}.writeBytes({expr})"),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            format!("pack{}({w}, {expr})", local_type_name(name))
+        }
+        TypeRef::Optional(inner) => {
+            let v = format!("v{depth}");
+            format!(
+                "{w}.writeOptional({expr}) {{ {v} -> {} }}",
+                kt_write_expr(inner, w, &v, depth + 1)
+            )
+        }
+        TypeRef::List(inner) => {
+            let v = format!("v{depth}");
+            format!(
+                "{w}.writeList({expr}) {{ {v} -> {} }}",
+                kt_write_expr(inner, w, &v, depth + 1)
+            )
+        }
+        TypeRef::Map(k, v) => {
+            let kv = format!("k{depth}");
+            let vv = format!("v{depth}");
+            format!(
+                "{w}.writeMap({expr}, {{ {kv} -> {} }}, {{ {vv} -> {} }})",
+                kt_write_expr(k, w, &kv, depth + 1),
+                kt_write_expr(v, w, &vv, depth + 1)
+            )
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("validation rejects interfaces and iterators inside buffered values")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// The Kotlin expression reading a value of type `t` from the value-buffer
+/// reader named `r`. The inverse of [`kt_write_expr`].
+fn kt_read_expr(t: &TypeRef, r: &str) -> String {
+    match t {
+        TypeRef::Bool => format!("{r}.readBool()"),
+        TypeRef::I8 | TypeRef::U8 => format!("{r}.readI8()"),
+        TypeRef::I16 | TypeRef::U16 => format!("{r}.readI16()"),
+        TypeRef::I32 => format!("{r}.readI32()"),
+        TypeRef::U32 => format!("{r}.readU32()"),
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            format!("{r}.readI64()")
+        }
+        TypeRef::F32 => format!("{r}.readF32()"),
+        TypeRef::F64 => format!("{r}.readF64()"),
+        TypeRef::Enum(name) => format!("{}.fromValue({r}.readI32())", local_type_name(name)),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{r}.readString()"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => format!("{r}.readBytes()"),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            format!("unpack{}({r})", local_type_name(name))
+        }
+        TypeRef::Optional(inner) => {
+            format!("{r}.readOptional {{ {} }}", kt_read_expr(inner, r))
+        }
+        TypeRef::List(inner) => format!("{r}.readList {{ {} }}", kt_read_expr(inner, r)),
+        TypeRef::Map(k, v) => format!(
+            "{r}.readMap({{ {} }}, {{ {} }})",
+            kt_read_expr(k, r),
+            kt_read_expr(v, r)
+        ),
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("validation rejects interfaces and iterators inside buffered values")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// The Kotlin expression packing the public value `expr` of type `t` into a
+/// freshly encoded `ByteArray`.
+fn kt_encode_expr(t: &TypeRef, expr: &str) -> String {
+    format!("weaveEncode {{ w -> {} }}", kt_write_expr(t, "w", expr, 0))
+}
+
+/// The Kotlin expression decoding the `ByteArray` expression `expr` into the
+/// public value of type `t`, rejecting malformed or trailing bytes.
+fn kt_decode_expr(t: &TypeRef, expr: &str) -> String {
+    format!("weaveDecode({expr}) {{ r -> {} }}", kt_read_expr(t, "r"))
+}
+
+/// Whether any surface in the model moves a value buffer across the boundary,
+/// requiring the private Kotlin writer/reader runtime: records or rich enums
+/// exist, an error code declares payload fields, or a callable, callback, or
+/// iterator element is buffered.
+fn model_uses_buffers(model: &BindingModel) -> bool {
+    model.modules.iter().any(|m| {
+        !m.structs.is_empty()
+            || m.enums.iter().any(EnumBinding::is_rich)
+            || m.error
+                .as_ref()
+                .is_some_and(|e| e.codes.iter().any(|c| !c.fields.is_empty()))
+            || m.callbacks
+                .iter()
+                .any(|cb| cb.params.iter().any(|p| abi::is_buffered(&p.ty)))
+            || m.callables().any(|f| {
+                f.params.iter().any(|p| abi::is_buffered(&p.ty))
+                    || f.ret.as_ref().is_some_and(abi::is_buffered)
+                    || matches!(&f.shape, CallShape::Iterator(it) if abi::is_buffered(&it.elem))
+            })
+    })
 }
 
 /// Render the settable uncaught-exception hook into the `WeaveFFI` companion.
@@ -715,11 +754,48 @@ fn render_kotlin(
                 None => policy.to_string(),
             };
             emit_doc(&mut kotlin, &Some(doc), "        ");
-            let _ = writeln!(
-                kotlin,
-                "        @JvmStatic external fun {register}(callback: ({}) -> Unit): Long",
-                cb_params.join(", ")
-            );
+            // Buffered callback arguments arrive as raw `ByteArray` copies:
+            // the public register wrapper decodes them before the user's
+            // lambda runs, so the JNI-facing external takes a wrapper lambda.
+            let has_buffered = cb.params.iter().any(|p| abi::is_buffered(&p.ty));
+            if has_buffered {
+                let jni_params: Vec<String> = cb
+                    .params
+                    .iter()
+                    .map(|p| kotlin_cb_jni_type(&p.ty))
+                    .collect();
+                let _ = writeln!(
+                    kotlin,
+                    "        @JvmStatic private external fun {register}Jni(callback: ({}) -> Unit): Long",
+                    jni_params.join(", ")
+                );
+                let args: Vec<String> = (0..cb.params.len()).map(|i| format!("a{i}")).collect();
+                let decoded: Vec<String> = cb
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        if abi::is_buffered(&p.ty) {
+                            kt_decode_expr(&p.ty, &format!("a{i}"))
+                        } else {
+                            format!("a{i}")
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(
+                    kotlin,
+                    "        @JvmStatic fun {register}(callback: ({}) -> Unit): Long = {register}Jni {{ {} -> callback({}) }}",
+                    cb_params.join(", "),
+                    args.join(", "),
+                    decoded.join(", ")
+                );
+            } else {
+                let _ = writeln!(
+                    kotlin,
+                    "        @JvmStatic external fun {register}(callback: ({}) -> Unit): Long",
+                    cb_params.join(", ")
+                );
+            }
             let _ = writeln!(
                 kotlin,
                 "        @JvmStatic external fun {unregister}(id: Long)"
@@ -736,9 +812,6 @@ fn render_kotlin(
         }
         for s in &m.structs {
             render_kotlin_struct(&mut kotlin, s);
-            if s.builder.is_some() {
-                render_kotlin_builder(&mut kotlin, s);
-            }
         }
         for i in &m.interfaces {
             render_kotlin_interface(&mut kotlin, i, m.error.as_ref(), c_prefix);
@@ -752,19 +825,179 @@ fn render_kotlin(
         }
     }
     render_kotlin_error_types(&mut kotlin, model);
+    if model_uses_buffers(model) {
+        render_kotlin_buffer_runtime(&mut kotlin);
+    }
     if has_async {
         kotlin.push_str("\ninternal class WeaveContinuation<T>(\n");
         kotlin.push_str("    private val cont: kotlinx.coroutines.CancellableContinuation<T>,\n");
-        kotlin.push_str("    private val mapError: (Int, String) -> Throwable\n");
+        kotlin.push_str("    private val mapError: (Int, String, ByteArray?) -> Throwable\n");
         kotlin.push_str(") {\n");
         kotlin.push_str("    @Suppress(\"UNCHECKED_CAST\")\n");
         kotlin.push_str("    fun onSuccess(result: Any?) { cont.resume(result as T) }\n");
-        kotlin.push_str("    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }\n");
+        kotlin.push_str("    fun onError(code: Int, message: String, payload: ByteArray?) { cont.resumeWithException(mapError(code, message, payload)) }\n");
         kotlin.push_str("}\n");
     }
     kotlin.push('\n');
     kotlin.push_str(&render_trailer(CommentStyle::DoubleSlash, "WeaveFFI.kt"));
     kotlin
+}
+
+/// Emit the private Kotlin value-buffer runtime: a growable little-endian
+/// writer, a validating reader (rejecting truncated buffers, invalid
+/// bool/flag bytes, oversized length prefixes, and trailing bytes), and the
+/// `weaveEncode`/`weaveDecode` entry points the generated wrappers call.
+fn render_kotlin_buffer_runtime(out: &mut String) {
+    let brand = errors::EXCEPTION_BRAND;
+    let _ = write!(
+        out,
+        r#"
+/** Growable little-endian writer implementing the WeaveFFI value-buffer wire format. */
+internal class WeaveBufferWriter {{
+    private var buf = ByteArray(32)
+    private var len = 0
+
+    private fun reserve(extra: Int) {{
+        if (len + extra <= buf.size) return
+        var cap = buf.size * 2
+        while (cap < len + extra) cap *= 2
+        buf = buf.copyOf(cap)
+    }}
+
+    fun toByteArray(): ByteArray = buf.copyOf(len)
+
+    fun writeBool(v: Boolean) {{ reserve(1); buf[len++] = if (v) 1 else 0 }}
+    fun writeI8(v: Byte) {{ reserve(1); buf[len++] = v }}
+    fun writeI16(v: Short) {{
+        reserve(2)
+        val b = v.toInt()
+        buf[len++] = (b and 0xFF).toByte()
+        buf[len++] = ((b shr 8) and 0xFF).toByte()
+    }}
+    fun writeI32(v: Int) {{
+        reserve(4)
+        buf[len++] = (v and 0xFF).toByte()
+        buf[len++] = ((v shr 8) and 0xFF).toByte()
+        buf[len++] = ((v shr 16) and 0xFF).toByte()
+        buf[len++] = ((v shr 24) and 0xFF).toByte()
+    }}
+    fun writeU32(v: Long) = writeI32(v.toInt())
+    fun writeI64(v: Long) {{
+        writeI32(v.toInt())
+        writeI32((v ushr 32).toInt())
+    }}
+    fun writeF32(v: Float) = writeI32(v.toRawBits())
+    fun writeF64(v: Double) = writeI64(v.toRawBits())
+    fun writeString(v: String) = writeBytes(v.toByteArray(Charsets.UTF_8))
+    fun writeBytes(v: ByteArray) {{
+        writeI32(v.size)
+        reserve(v.size)
+        v.copyInto(buf, len)
+        len += v.size
+    }}
+    fun <T> writeOptional(v: T?, write: (T) -> Unit) {{
+        if (v == null) writeBool(false) else {{ writeBool(true); write(v) }}
+    }}
+    fun <T> writeList(v: List<T>, write: (T) -> Unit) {{
+        writeI32(v.size)
+        for (e in v) write(e)
+    }}
+    fun <K, V> writeMap(v: Map<K, V>, writeKey: (K) -> Unit, writeValue: (V) -> Unit) {{
+        writeI32(v.size)
+        for ((k, e) in v) {{ writeKey(k); writeValue(e) }}
+    }}
+}}
+
+/** Validating little-endian reader for the WeaveFFI value-buffer wire format. */
+internal class WeaveBufferReader(private val buf: ByteArray) {{
+    private var pos = 0
+
+    private fun malformed(detail: String): Nothing =
+        throw {brand}(-2, "malformed WeaveFFI value buffer: " + detail)
+
+    private fun take(n: Int): Int {{
+        if (n > buf.size - pos) malformed("truncated buffer")
+        val at = pos
+        pos += n
+        return at
+    }}
+
+    fun readBool(): Boolean = when (buf[take(1)].toInt()) {{
+        0 -> false
+        1 -> true
+        else -> malformed("invalid bool byte")
+    }}
+    fun readI8(): Byte = buf[take(1)]
+    fun readI16(): Short {{
+        val at = take(2)
+        return ((buf[at].toInt() and 0xFF) or ((buf[at + 1].toInt() and 0xFF) shl 8)).toShort()
+    }}
+    fun readI32(): Int {{
+        val at = take(4)
+        return (buf[at].toInt() and 0xFF) or
+            ((buf[at + 1].toInt() and 0xFF) shl 8) or
+            ((buf[at + 2].toInt() and 0xFF) shl 16) or
+            ((buf[at + 3].toInt() and 0xFF) shl 24)
+    }}
+    fun readU32(): Long = readI32().toLong() and 0xFFFFFFFFL
+    fun readI64(): Long {{
+        val lo = readI32().toLong() and 0xFFFFFFFFL
+        val hi = readI32().toLong()
+        return lo or (hi shl 32)
+    }}
+    fun readF32(): Float = Float.fromBits(readI32())
+    fun readF64(): Double = Double.fromBits(readI64())
+    private fun readLen(): Int {{
+        val n = readI32()
+        if (n < 0 || n > buf.size - pos) malformed("length prefix exceeds remaining bytes")
+        return n
+    }}
+    fun readString(): String {{
+        val n = readLen()
+        val at = take(n)
+        return try {{
+            Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(buf, at, n)).toString()
+        }} catch (e: java.nio.charset.CharacterCodingException) {{
+            malformed("string is not valid UTF-8")
+        }}
+    }}
+    fun readBytes(): ByteArray {{
+        val n = readLen()
+        val at = take(n)
+        return buf.copyOfRange(at, at + n)
+    }}
+    fun <T> readOptional(read: () -> T): T? = if (readBool()) read() else null
+    fun <T> readList(read: () -> T): List<T> {{
+        val n = readLen()
+        val out = ArrayList<T>(n)
+        repeat(n) {{ out.add(read()) }}
+        return out
+    }}
+    fun <K, V> readMap(readKey: () -> K, readValue: () -> V): Map<K, V> {{
+        val n = readLen()
+        val out = LinkedHashMap<K, V>()
+        repeat(n) {{ out[readKey()] = readValue() }}
+        return out
+    }}
+    fun expectEnd() {{
+        if (pos != buf.size) malformed("trailing bytes after value")
+    }}
+}}
+
+internal fun weaveEncode(write: (WeaveBufferWriter) -> Unit): ByteArray {{
+    val w = WeaveBufferWriter()
+    write(w)
+    return w.toByteArray()
+}}
+
+internal fun <T> weaveDecode(bytes: ByteArray, read: (WeaveBufferReader) -> T): T {{
+    val r = WeaveBufferReader(bytes)
+    val v = read(r)
+    r.expectEnd()
+    return v
+}}
+"#
+    );
 }
 
 /// Render one free function into the `WeaveFFI` companion: a bare `external
@@ -848,54 +1081,41 @@ fn render_kotlin_free_fn(
 }
 
 /// The Kotlin expression that lowers one public argument for a JNI call:
-/// enums pass `.value`, class-wrapped types (typed handles, structs,
-/// interfaces, and optionals of them) pass the raw `.handle`.
+/// buffered values pack into a `ByteArray`, enums pass `.value`, interfaces
+/// pass the raw `.handle` (nullable via `?.`).
 fn kotlin_unwrap_arg(p: &ParamBinding) -> String {
     let n = lower_camel(&p.name);
+    if abi::is_buffered(&p.ty) {
+        return kt_encode_expr(&p.ty, &n);
+    }
     match &p.ty {
         TypeRef::Enum(_) => format!("{n}.value"),
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            format!("{n}.handle")
-        }
-        TypeRef::Optional(inner)
-            if matches!(
-                inner.as_ref(),
-                TypeRef::TypedHandle(_)
-                    | TypeRef::Record(_)
-                    | TypeRef::RichEnum(_)
-                    | TypeRef::Interface(_)
-            ) =>
-        {
-            format!("{n}?.handle")
-        }
+        TypeRef::Interface(_) => format!("{n}.handle"),
+        // Only `Interface?` reaches here (every other optional is buffered).
+        TypeRef::Optional(_) => format!("{n}?.handle"),
         _ => n,
     }
 }
 
 /// The Kotlin expression re-wrapping a lowered JNI value `expr` into the
 /// public return type, or `None` when the lowered value already is the public
-/// type: enums round-trip through `fromValue`, class-wrapped returns through
-/// the class constructor (nullable via `?.let`).
+/// type: buffered returns decode the `ByteArray`, enums round-trip through
+/// `fromValue`, interfaces through the class constructor (nullable via
+/// `?.let`).
 fn kotlin_wrap_return(ret: Option<&TypeRef>, expr: &str) -> Option<String> {
+    let ret = ret?;
+    if abi::is_buffered(ret) {
+        return Some(kt_decode_expr(ret, expr));
+    }
     match ret {
-        Some(TypeRef::Enum(name)) => Some(format!("{}.fromValue({expr})", local_type_name(name))),
-        Some(
-            TypeRef::TypedHandle(name)
-            | TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::Interface(name),
-        ) => Some(format!("{}({expr})", local_type_name(name))),
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::TypedHandle(name)
-            | TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::Interface(name) => {
+        TypeRef::Enum(name) => Some(format!("{}.fromValue({expr})", local_type_name(name))),
+        TypeRef::Interface(name) => Some(format!("{}({expr})", local_type_name(name))),
+        // Only `Interface?` reaches here (every other optional is buffered).
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(name) => {
                 Some(format!("{expr}?.let {{ {}(it) }}", local_type_name(name)))
             }
-            _ => None,
+            _ => unreachable!("buffered optionals are handled above"),
         },
         _ => None,
     }
@@ -915,12 +1135,12 @@ fn write_kotlin_sync_wrapper(
     let params_sig: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_public_type(&p.ty)))
+        .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_type(&p.ty)))
         .collect();
     let public_ret = f
         .ret
         .as_ref()
-        .map(kotlin_public_type)
+        .map(kotlin_type)
         .unwrap_or_else(|| "Unit".to_string());
     if let Some(msg) = &f.deprecated {
         w.line(format!("@Deprecated(\"{}\")", msg.replace('"', "\\\"")));
@@ -1009,15 +1229,16 @@ fn render_kotlin_async_fun(
     let params_sig: Vec<String> = f
         .params
         .iter()
-        .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_public_type(&p.ty)))
+        .map(|p| format!("{}: {}", lower_camel(&p.name), kotlin_type(&p.ty)))
         .collect();
     let public_ret = f
         .ret
         .as_ref()
-        .map(kotlin_public_type)
+        .map(kotlin_type)
         .unwrap_or_else(|| "Unit".to_string());
     // The continuation resumes with the value the JNI callback boxes (the
-    // lowered type); enum/class returns are re-wrapped after the await.
+    // lowered type); buffered/enum/class returns are re-wrapped after the
+    // await.
     let jni_ret = f
         .ret
         .as_ref()
@@ -1031,9 +1252,7 @@ fn render_kotlin_async_fun(
     if f.cancellable {
         call_args.push("0L".to_string());
     }
-    call_args.push(format!(
-        "WeaveContinuation(cont) {{ code, message -> {error_mapper} }}"
-    ));
+    call_args.push(format!("WeaveContinuation(cont) {error_mapper}"));
     if let Some(msg) = &f.deprecated {
         w.line(format!("@Deprecated(\"{}\")", msg.replace('"', "\\\"")));
     }
@@ -1072,9 +1291,9 @@ fn render_kotlin_async_fun(
 }
 
 fn render_kotlin_enum(out: &mut String, e: &EnumBinding) {
-    // A rich (algebraic) enum crosses the ABI as an opaque object pointer, so it
-    // is emitted as an owned handle-wrapper class (like a struct), never as a
-    // plain `enum class`.
+    // A rich (algebraic) enum is a value type crossing the ABI in a value
+    // buffer, so it is emitted as a sealed class with per-variant subtypes,
+    // never as a plain `enum class`.
     if e.is_rich() {
         render_kotlin_rich_enum(out, e);
         return;
@@ -1103,168 +1322,97 @@ fn render_kotlin_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
-/// Render a rich (algebraic) enum as an owned opaque-object wrapper class,
-/// mirroring [`render_kotlin_struct`]: an `internal var handle: Long` freed once
-/// via `Closeable.close()`/`finalize()`, a `companion object` declaring the
-/// `external` natives plus one idiomatic factory per variant
-/// (`Shape.circle(radius)`), a nested `Tag` discriminant enum + `tag` reader,
-/// and per-variant field getters namespaced by variant (`circleRadius`). The
-/// opaque-object surface (tag/destroy symbols, per-variant constructors and
-/// field getters) is precomputed in the binding model exactly like a struct's,
-/// so functions taking/returning the enum (lowered to an opaque `Struct`
-/// pointer) re-wrap through this same `Shape(handle)` / `shape.handle` contract.
+/// Render a rich (algebraic) enum as a sealed class with one `data class`
+/// per data-carrying variant and one `object` per unit variant, plus the
+/// internal `pack{Name}`/`unpack{Name}` buffer codecs. Values cross the ABI
+/// serialized in value buffers (an `i32` tag followed by the active variant's
+/// fields in declaration order); no C symbols exist for a rich enum.
 fn render_kotlin_rich_enum(out: &mut String, e: &EnumBinding) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
     let name = &e.name;
-
     let mut w = CodeWriter::four_space();
     w.blank();
     writer_doc(&mut w, &e.doc);
-    // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
-    // wrappers in this module can unwrap `shape.handle` and re-wrap a
-    // returned pointer as `Shape(ptr)`; it stays hidden from consumers.
-    w.line(format!(
-        "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
-        name
-    ));
+    w.line(format!("sealed class {name} {{"));
     w.scope(|w| {
-        w.line("companion object {");
-        w.scope(|w| {
-            w.line("init { System.loadLibrary(\"weaveffi\") }");
-            w.blank();
-
-            // tag reader + destructor natives (shared across all variants).
-            w.line("@JvmStatic external fun nativeTag(handle: Long): Int");
-            w.line("@JvmStatic external fun nativeDestroy(handle: Long)");
-
-            // One constructor native per variant; a unit variant takes no value slots.
-            for v in &rich.variants {
-                let create_params: Vec<String> = v
+        for v in &e.variants {
+            writer_doc(w, &v.doc);
+            let vn = pascal_case(&v.name);
+            if v.fields.is_empty() {
+                w.line(format!("object {vn} : {name}()"));
+            } else if v.fields.iter().any(|f| f.doc.is_some()) {
+                w.line(format!("data class {vn}("));
+                w.scope(|w| {
+                    for f in &v.fields {
+                        writer_doc(w, &f.doc);
+                        w.line(format!("val {}: {},", f.name, kotlin_type(&f.ty)));
+                    }
+                });
+                w.line(format!(") : {name}()"));
+            } else {
+                let fields: Vec<String> = v
                     .fields
                     .iter()
-                    .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
+                    .map(|f| format!("val {}: {}", f.name, kotlin_type(&f.ty)))
                     .collect();
-                w.line(format!(
-                    "@JvmStatic external fun nativeNew{}({}): Long",
-                    pascal_case(&v.name),
-                    create_params.join(", ")
-                ));
-            }
-
-            // One getter native per variant field, namespaced by variant to avoid
-            // collisions when two variants share a field name.
-            for v in &rich.variants {
-                for f in &v.fields {
-                    w.line(format!(
-                        "@JvmStatic external fun nativeGet{}{}(handle: Long): {}",
-                        pascal_case(&v.name),
-                        pascal_case(&f.name),
-                        kotlin_type(&f.ty)
-                    ));
-                }
-            }
-
-            w.blank();
-            // Idiomatic per-variant factories (`Shape.circle(2.5)`). Like the struct
-            // `create` factory, these forward the raw native slots directly and wrap the
-            // returned pointer into the owning class.
-            for v in &rich.variants {
-                let factory = lower_camel(&v.name);
-                let create_params: Vec<String> = v
-                    .fields
-                    .iter()
-                    .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
-                    .collect();
-                let param_names: Vec<&str> = v.fields.iter().map(|f| f.name.as_str()).collect();
-                writer_doc(w, &v.doc);
-                w.line(format!(
-                    "fun {}({}): {} = {}(nativeNew{}({}))",
-                    factory,
-                    create_params.join(", "),
-                    name,
-                    name,
-                    pascal_case(&v.name),
-                    param_names.join(", ")
-                ));
-            }
-        });
-        w.line("}");
-        w.blank();
-
-        // Nested discriminant enum (`Shape.Tag.Circle == 1`) + active-tag reader.
-        w.line("enum class Tag(val value: Int) {");
-        w.scope(|w| {
-            for (i, v) in e.variants.iter().enumerate() {
-                writer_doc(w, &v.doc);
-                let comma = if i < e.variants.len() - 1 { "," } else { ";" };
-                w.line(format!("{}({}){}", v.name, v.value, comma));
-            }
-            w.blank();
-            w.line("companion object {");
-            w.scope(|w| {
-                w.line("fun fromValue(value: Int): Tag = entries.first { it.value == value }");
-            });
-            w.line("}");
-        });
-        w.line("}");
-        w.blank();
-        w.line("val tag: Tag get() = Tag.fromValue(nativeTag(handle))");
-        w.blank();
-
-        // Per-variant field getters. The native returns the raw slot; struct/enum
-        // payloads round-trip through their wrapper exactly like a struct field.
-        for v in &rich.variants {
-            let variant_camel = lower_camel(&v.name);
-            for f in &v.fields {
-                let prop = format!("{}{}", variant_camel, pascal_case(&f.name));
-                let native = format!("nativeGet{}{}", pascal_case(&v.name), pascal_case(&f.name));
-                let kt_type = kotlin_getter_type(&f.ty);
-                writer_doc(w, &f.doc);
-                match &f.ty {
-                    TypeRef::Record(sname) | TypeRef::RichEnum(sname) => {
-                        let local = local_type_name(sname);
-                        w.line(format!(
-                            "val {}: {} get() = {}({}(handle))",
-                            prop, kt_type, local, native
-                        ));
-                    }
-                    // The native getter returns the raw `Int` value, so an enum
-                    // payload round-trips through the generated `fromValue` factory.
-                    TypeRef::Enum(_) => {
-                        w.line(format!(
-                            "val {}: {} get() = {}.fromValue({}(handle))",
-                            prop, kt_type, kt_type, native
-                        ));
-                    }
-                    _ => {
-                        w.line(format!(
-                            "val {}: {} get() = {}(handle)",
-                            prop, kt_type, native
-                        ));
-                    }
-                }
+                w.line(format!("data class {vn}({}) : {name}()", fields.join(", ")));
             }
         }
-        w.blank();
+    });
+    w.line("}");
+    out.push_str(&w.finish());
+    render_kotlin_rich_enum_codecs(out, e);
+}
 
-        w.line("override fun close() {");
+/// Render the internal buffer codecs for one rich enum: `pack{Name}` writes
+/// the `i32` tag then the active variant's fields; `unpack{Name}` dispatches
+/// on the tag and rejects unknown values.
+fn render_kotlin_rich_enum_codecs(out: &mut String, e: &EnumBinding) {
+    let name = &e.name;
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    w.line(format!(
+        "internal fun pack{name}(w: WeaveBufferWriter, v: {name}) {{"
+    ));
+    w.scope(|w| {
+        w.line("when (v) {");
         w.scope(|w| {
-            w.line("if (handle != 0L) {");
-            w.scope(|w| {
-                w.line("nativeDestroy(handle)");
-                w.line("handle = 0L");
-            });
-            w.line("}");
+            for v in &e.variants {
+                let vn = pascal_case(&v.name);
+                if v.fields.is_empty() {
+                    w.line(format!("is {name}.{vn} -> w.writeI32({})", v.value));
+                } else {
+                    w.line(format!("is {name}.{vn} -> {{"));
+                    w.scope(|w| {
+                        w.line(format!("w.writeI32({})", v.value));
+                        for f in &v.fields {
+                            w.line(kt_write_expr(&f.ty, "w", &format!("v.{}", f.name), 0));
+                        }
+                    });
+                    w.line("}");
+                }
+            }
         });
         w.line("}");
-        w.blank();
-        w.line("protected fun finalize() {");
-        w.scope(|w| {
-            w.line("close()");
-        });
-        w.line("}");
+    });
+    w.line("}");
+    w.blank();
+    w.line(format!(
+        "internal fun unpack{name}(r: WeaveBufferReader): {name} = when (val tag = r.readI32()) {{"
+    ));
+    w.scope(|w| {
+        for v in &e.variants {
+            let vn = pascal_case(&v.name);
+            if v.fields.is_empty() {
+                w.line(format!("{} -> {name}.{vn}", v.value));
+            } else {
+                let args: Vec<String> = v.fields.iter().map(|f| kt_read_expr(&f.ty, "r")).collect();
+                w.line(format!("{} -> {name}.{vn}({})", v.value, args.join(", ")));
+            }
+        }
+        w.line(format!(
+            "else -> throw {}(-2, \"malformed WeaveFFI value buffer: unknown {name} tag $tag\")",
+            errors::EXCEPTION_BRAND
+        ));
     });
     w.line("}");
     out.push_str(&w.finish());
@@ -1272,8 +1420,10 @@ fn render_kotlin_rich_enum(out: &mut String, e: &EnumBinding) {
 
 /// Render the exception surface: the open generic brand exception plus one
 /// sealed exception class per *declared* error domain, each with a per-code
-/// subclass and a `fromCode` factory mapping raw ABI codes to typed instances
-/// (unknown codes fall back to the generic exception).
+/// subclass and a `fromCode` factory mapping raw ABI codes (and the optional
+/// serialized payload) to typed instances. Codes that declare payload fields
+/// expose them as constructor properties, decoded from the value buffer;
+/// unknown codes fall back to the generic exception.
 fn render_kotlin_error_types(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::four_space();
     w.blank();
@@ -1299,28 +1449,62 @@ fn render_kotlin_error_types(out: &mut String, model: &BindingModel) {
         w.scope(|w| {
             for ec in &eb.codes {
                 writer_doc(w, &ec.doc);
-                w.line(format!(
-                    "class {}(message: String = \"{}\") : {exc}({}, message)",
-                    errors::pascal(&ec.name),
-                    ec.message.replace('"', "\\\""),
-                    ec.value
-                ));
+                let default_msg = ec.message.replace('"', "\\\"");
+                if ec.fields.is_empty() {
+                    w.line(format!(
+                        "class {}(message: String = \"{default_msg}\") : {exc}({}, message)",
+                        errors::pascal(&ec.name),
+                        ec.value
+                    ));
+                } else {
+                    // Payload fields become constructor properties after the
+                    // message, in declaration (and wire) order.
+                    let fields: Vec<String> = ec
+                        .fields
+                        .iter()
+                        .map(|f| format!("val {}: {}", f.name, kotlin_type(&f.ty)))
+                        .collect();
+                    w.line(format!(
+                        "class {}(message: String = \"{default_msg}\", {}) : {exc}({}, message)",
+                        errors::pascal(&ec.name),
+                        fields.join(", "),
+                        ec.value
+                    ));
+                }
             }
             w.blank();
             w.line("companion object {");
             w.scope(|w| {
                 w.line(format!(
-                    "/** Map a raw `{}` code to its typed exception; unknown codes yield the generic [{}]. */",
+                    "/** Map a raw `{}` code and payload to the typed exception; unknown codes yield the generic [{}]. */",
                     eb.name,
                     errors::EXCEPTION_BRAND
                 ));
                 w.line(format!(
-                    "fun fromCode(code: Int, message: String): {} = when (code) {{",
+                    "@JvmStatic fun fromCode(code: Int, message: String, payload: ByteArray?): {} = when (code) {{",
                     errors::EXCEPTION_BRAND
                 ));
                 w.scope(|w| {
                     for ec in &eb.codes {
-                        w.line(format!("{} -> {}(message)", ec.value, errors::pascal(&ec.name)));
+                        let ctor = errors::pascal(&ec.name);
+                        if ec.fields.is_empty() {
+                            w.line(format!("{} -> {ctor}(message)", ec.value));
+                        } else {
+                            // A missing payload violates the contract for a
+                            // code with declared fields; fall back to the
+                            // generic exception rather than fabricate values.
+                            let reads: Vec<String> = ec
+                                .fields
+                                .iter()
+                                .map(|f| kt_read_expr(&f.ty, "r"))
+                                .collect();
+                            w.line(format!(
+                                "{} -> if (payload != null) weaveDecode(payload) {{ r -> {ctor}(message, {}) }} else {}(code, message)",
+                                ec.value,
+                                reads.join(", "),
+                                errors::EXCEPTION_BRAND
+                            ));
+                        }
                     }
                     w.line(format!(
                         "else -> {}(code, message)",
@@ -1432,16 +1616,9 @@ fn render_jni_c(
         }
     }
     for m in &model.modules {
-        // Rich (algebraic) enums cross the ABI as opaque objects, so they emit a
-        // struct-like JNI bridge; plain C-style enums need no native methods.
-        for e in &m.enums {
-            if e.is_rich() {
-                render_jni_rich_enum(&mut jni_c, &m.path, e, &jni_prefix, c_prefix);
-            }
-        }
-        for s in &m.structs {
-            render_jni_struct(&mut jni_c, &m.path, s, &jni_prefix, c_prefix);
-        }
+        // Records and rich enums are value types with no C symbols: their
+        // packing and decoding happens entirely in Kotlin, so no JNI bridge
+        // is emitted for them. Plain C-style enums need no natives either.
         for i in &m.interfaces {
             render_jni_interface(&mut jni_c, m, i, &jni_prefix, c_prefix);
         }
@@ -1522,8 +1699,7 @@ fn render_jni_uncaught_support(out: &mut String, jni_pkg_path: &str) {
 
 /// Emit the generic thrower: constructs the brand exception with the raw
 /// `(code, message)` pair via `NewObject` (so unknown codes keep their numeric
-/// code) and throws it. Every non-throwing callable and every infrastructure
-/// symbol (struct create, rich-enum constructors) dispatches here.
+/// code) and throws it. Every non-throwing callable dispatches here.
 fn render_jni_generic_thrower(out: &mut String, jni_pkg_path: &str) {
     let mut w = CodeWriter::four_space();
     w.line("static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {");
@@ -1547,33 +1723,43 @@ fn render_jni_generic_thrower(out: &mut String, jni_pkg_path: &str) {
     out.push_str(&w.finish());
 }
 
-/// Emit the thrower for one declared error domain: known codes throw the
-/// matching typed subclass (`{Domain}Exception${Code}`); unknown codes fall
-/// back to the generic thrower.
+/// Emit the thrower for one declared error domain: the raw `(code, message)`
+/// pair and the serialized payload (copied to a `jbyteArray`, or `NULL` when
+/// absent) are handed to the sealed exception's static `fromCode` factory,
+/// which decodes payload fields into the typed subclass; unknown codes fall
+/// back to the generic exception inside `fromCode` itself. Both the message
+/// and the payload buffer are released via `weaveffi_error_clear`.
 fn render_jni_domain_thrower(out: &mut String, eb: &ErrorBinding, jni_pkg_path: &str) {
     let exc = kotlin_exception_name(eb);
+    let brand = errors::EXCEPTION_BRAND;
     let mut w = CodeWriter::four_space();
     w.line(format!(
         "static void throw_{}(JNIEnv* env, weaveffi_error* err) {{",
         eb.c_tag
     ));
     w.scope(|w| {
-        w.line("const char* name = NULL;");
-        w.line("switch (err->code) {");
-        for ec in &eb.codes {
-            w.line(format!(
-                "case {}: name = \"{}/{}${}\"; break;",
-                ec.value,
-                jni_pkg_path,
-                exc,
-                errors::pascal(&ec.name)
-            ));
-        }
-        w.line("default: break;");
-        w.line("}");
-        w.line("if (name == NULL) { throw_weaveffi_error(env, err); return; }");
-        w.line("jclass exClass = (*env)->FindClass(env, name);");
-        w.line("if (exClass != NULL) { (*env)->ThrowNew(env, exClass, err->message ? err->message : \"WeaveFFI error\"); }");
+        w.line(format!(
+            "jclass exClass = (*env)->FindClass(env, \"{jni_pkg_path}/{exc}\");"
+        ));
+        w.line(format!(
+            "jmethodID fromCode = exClass ? (*env)->GetStaticMethodID(env, exClass, \"fromCode\", \"(ILjava/lang/String;[B)L{jni_pkg_path}/{brand};\") : NULL;"
+        ));
+        w.block("if (fromCode == NULL) {", "}", |w| {
+            w.line("(*env)->ExceptionClear(env);");
+            w.line("throw_weaveffi_error(env, err);");
+            w.line("return;");
+        });
+        w.line("const char* msg = err->message ? err->message : \"WeaveFFI error\";");
+        w.line("jstring jmsg = (*env)->NewStringUTF(env, msg);");
+        w.line("jbyteArray jpayload = NULL;");
+        w.block("if (err->payload_ptr != NULL) {", "}", |w| {
+            w.line("jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);");
+            w.line("if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }");
+        });
+        w.line("jthrowable ex = (jthrowable)(*env)->CallStaticObjectMethod(env, exClass, fromCode, (jint)err->code, jmsg, jpayload);");
+        // A pending exception from fromCode itself (e.g. a malformed payload
+        // buffer) is left in place; otherwise the mapped exception is thrown.
+        w.line("if (ex != NULL && !(*env)->ExceptionCheck(env)) { (*env)->Throw(env, ex); }");
         w.line("weaveffi_error_clear(err);");
     });
     w.line("}");
@@ -1634,7 +1820,7 @@ fn render_jni_sync_export(
         jni_mangle(jni_method),
         jparams.join(", ")
     );
-    let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL}};");
+    let _ = writeln!(jni_c, "    weaveffi_error err = {{0, NULL, NULL, 0}};");
 
     for p in &f.params {
         write_param_acquire(jni_c, &p.name, &p.ty);
@@ -1660,10 +1846,10 @@ fn render_jni_sync_export(
         return;
     }
 
-    let needs_out_len = matches!(
-        f.ret,
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) | Some(TypeRef::List(_))
-    );
+    // Bytes and buffered returns share the `const uint8_t*` + trailing
+    // `size_t* out_len` shape.
+    let needs_out_len = matches!(f.ret, Some(TypeRef::Bytes | TypeRef::BorrowedBytes))
+        || f.ret.as_ref().is_some_and(abi::is_buffered);
     if needs_out_len {
         let _ = writeln!(jni_c, "    size_t out_len = 0;");
     }
@@ -1778,122 +1964,23 @@ fn render_jni_interface(
     jni_c.push_str(&w.finish());
 }
 
-/// Box one borrowed async list result (`result` + `result_len`) into the JVM
-/// array named `boxed`. Buffers are producer-owned and valid only for the
-/// callback's duration, so every shape copies and nothing is freed.
-fn write_jni_box_list_result(w: &mut CodeWriter, inner: &TypeRef) {
-    let region = |w: &mut CodeWriter,
-                  arr_ty: &str,
-                  new_arr: &str,
-                  set_region: &str,
-                  j_elem: &str| {
-        w.line(format!(
-            "{arr_ty} boxed = (*env)->{new_arr}(env, (jsize)result_len);"
-        ));
-        w.line(format!("if (boxed && result) {{ (*env)->{set_region}(env, boxed, 0, (jsize)result_len, (const {j_elem}*)result); }}"));
-    };
-    match inner {
-        TypeRef::I8 | TypeRef::U8 => {
-            region(
-                w,
-                "jbyteArray",
-                "NewByteArray",
-                "SetByteArrayRegion",
-                "jbyte",
-            );
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            region(
-                w,
-                "jshortArray",
-                "NewShortArray",
-                "SetShortArrayRegion",
-                "jshort",
-            );
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            region(w, "jintArray", "NewIntArray", "SetIntArrayRegion", "jint");
-        }
-        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => {
-            region(
-                w,
-                "jlongArray",
-                "NewLongArray",
-                "SetLongArrayRegion",
-                "jlong",
-            );
-        }
-        // 4-byte `u32` and pointer elements widen one by one into the
-        // `jlongArray` (a region copy would misread the buffer).
-        TypeRef::U32
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_)
-        | TypeRef::Optional(_) => {
-            let widen = if matches!(inner, TypeRef::U32) {
-                "jlong _lv = (jlong)result[_li];"
-            } else {
-                "jlong _lv = (jlong)(intptr_t)result[_li];"
-            };
-            w.line("jlongArray boxed = (*env)->NewLongArray(env, (jsize)result_len);");
-            w.block(
-                "for (jsize _li = 0; boxed && result && _li < (jsize)result_len; _li++) {",
-                "}",
-                |w| {
-                    w.line(widen);
-                    w.line("(*env)->SetLongArrayRegion(env, boxed, _li, 1, &_lv);");
-                },
-            );
-        }
-        TypeRef::F32 => {
-            region(
-                w,
-                "jfloatArray",
-                "NewFloatArray",
-                "SetFloatArrayRegion",
-                "jfloat",
-            );
-        }
-        TypeRef::F64 => {
-            region(
-                w,
-                "jdoubleArray",
-                "NewDoubleArray",
-                "SetDoubleArrayRegion",
-                "jdouble",
-            );
-        }
-        TypeRef::Bool => {
-            region(
-                w,
-                "jbooleanArray",
-                "NewBooleanArray",
-                "SetBooleanArrayRegion",
-                "jboolean",
-            );
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("jclass _str_cls = (*env)->FindClass(env, \"java/lang/String\");");
-            w.line("jobjectArray boxed = (*env)->NewObjectArray(env, (jsize)result_len, _str_cls, NULL);");
-            w.block(
-                "for (jsize _li = 0; boxed && result && _li < (jsize)result_len; _li++) {",
-                "}",
-                |w| {
-                    w.line("jstring _ls = result[_li] ? (*env)->NewStringUTF(env, result[_li]) : (*env)->NewStringUTF(env, \"\");");
-                    w.line("(*env)->SetObjectArrayElement(env, boxed, _li, _ls);");
-                    w.line("(*env)->DeleteLocalRef(env, _ls);");
-                },
-            );
-        }
-        other => {
-            unreachable!("validation rejects list returns with composite element type {other:?}")
-        }
-    }
-}
-
+/// Box one borrowed async result into the JVM local `boxed` for delivery to
+/// the pinned `WeaveContinuation`. Buffered results arrive as a borrowed
+/// `(result_ptr, result_len)` pair, copied into a `jbyteArray` the Kotlin
+/// wrapper decodes; the producer frees the buffer after the callback returns.
 fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
     let mut w = CodeWriter::four_space().with_depth(2);
+    if ret.is_some_and(abi::is_buffered) {
+        w.line("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);");
+        w.line("if (boxed && result_ptr) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result_ptr); }");
+        w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
+        w.line(
+            "jmethodID mid = (*env)->GetMethodID(env, cls, \"onSuccess\", \"(Ljava/lang/Object;)V\");",
+        );
+        w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, boxed);");
+        out.push_str(&w.finish());
+        return;
+    }
     match ret {
         None => {
             w.line("jobject boxed = NULL;");
@@ -1913,19 +2000,17 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(I)Ljava/lang/Integer;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);");
         }
-        Some(
-            TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::Handle
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_),
-        ) => {
+        Some(TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::Handle) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);");
+        }
+        // A typed handle or owned interface result arrives as a pointer slot;
+        // the boxed `Long` carries the pointer bits for the wrapper to adopt.
+        Some(TypeRef::TypedHandle(_) | TypeRef::Interface(_)) => {
+            w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");");
+            w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
+            w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)(intptr_t)result);");
         }
         Some(TypeRef::F64) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Double\");");
@@ -1951,49 +2036,26 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
             w.line("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);");
             w.line("if (boxed && result) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result); }");
         }
-        Some(TypeRef::List(inner)) => {
-            write_jni_box_list_result(&mut w, inner);
-        }
-        Some(TypeRef::Map(k, v)) => {
-            w.line("jclass _hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");");
-            w.line("jobject boxed = (*env)->NewObject(env, _hm_cls, (*env)->GetMethodID(env, _hm_cls, \"<init>\", \"(I)V\"), (jint)result_len);");
-            w.line("jmethodID _hm_put = (*env)->GetMethodID(env, _hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
-            w.block(
-                "for (size_t _mi = 0; result_keys && result_values && _mi < result_len; _mi++) {",
-                "}",
-                |w| {
-                    splice(w, |o| {
-                        write_boxed_scalar(o, k, "_bk", "result_keys[_mi]", "        ")
-                    });
-                    splice(w, |o| {
-                        write_boxed_scalar(o, v, "_bv", "result_values[_mi]", "        ")
-                    });
-                    w.line("(*env)->CallObjectMethod(env, boxed, _hm_put, _bk, _bv);");
-                    w.line("(*env)->DeleteLocalRef(env, _bk);");
-                    w.line("(*env)->DeleteLocalRef(env, _bv);");
-                },
-            );
-        }
-        Some(TypeRef::Optional(inner)) => {
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable owned pointer boxed as `Long`, null crossing as `null`.
+        Some(TypeRef::Optional(_)) => {
             w.line("jobject boxed = NULL;");
-            let src = match inner.as_ref() {
-                TypeRef::StringUtf8
-                | TypeRef::BorrowedStr
-                | TypeRef::TypedHandle(_)
-                | TypeRef::Record(_)
-                | TypeRef::RichEnum(_)
-                | TypeRef::Interface(_) => "result",
-                // A boxed optional scalar is a borrowed `T*`: dereference,
-                // never free.
-                _ => "(*result)",
-            };
             w.block("if (result != NULL) {", "}", |w| {
-                splice(w, |o| write_boxed_scalar(o, inner, "_opt", src, "        "));
+                splice(w, |o| {
+                    write_boxed_scalar(o, &TypeRef::Handle, "_opt", "(intptr_t)result", "        ")
+                });
                 w.line("boxed = _opt;");
             });
         }
-        _ => {
-            w.line("jobject boxed = (jobject)(intptr_t)result;");
+        Some(
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::List(_)
+            | TypeRef::Map(_, _)
+            | TypeRef::Iterator(_)
+            | TypeRef::Named(_),
+        ) => {
+            unreachable!("buffered results are handled above; iterators cannot be async")
         }
     }
     w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
@@ -2057,14 +2119,21 @@ fn render_jni_async_function(
         );
         w.line("if (err != NULL && err->code != 0) {");
         w.scope(|w| {
-            // The raw `(code, message)` pair crosses to Kotlin, where the
-            // continuation's mapper picks the typed or generic exception;
-            // producer threads cannot `FindClass` app classes themselves.
+            // The raw `(code, message, payload)` triple crosses to Kotlin,
+            // where the continuation's mapper picks the typed or generic
+            // exception (decoding payload fields when declared); producer
+            // threads cannot `FindClass` app classes themselves. The payload
+            // buffer is borrowed, so it is copied before the callback returns.
             w.line("const char* msg = err->message ? err->message : \"WeaveFFI error\";");
             w.line("jstring jmsg = (*env)->NewStringUTF(env, msg);");
+            w.line("jbyteArray jpayload = NULL;");
+            w.block("if (err->payload_ptr != NULL) {", "}", |w| {
+                w.line("jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);");
+                w.line("if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }");
+            });
             w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
-            w.line("jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(ILjava/lang/String;)V\");");
-            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg);");
+            w.line("jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(ILjava/lang/String;[B)V\");");
+            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);");
         });
         w.line("} else {");
         w.scope(|w| {
@@ -2158,15 +2227,25 @@ fn render_jni_listener_support(out: &mut String) {
 }
 
 /// Box one C ABI callback argument into a JVM local reference named `var`.
-/// Only bootstrap classes (`java/lang/*`, `java/util/*`) are used: trampolines
-/// run on producer threads whose class loader cannot see app classes.
+/// Buffered arguments arrive as a borrowed `(ptr, len)` pair, valid only for
+/// the dispatch: they are deep-copied into a `jbyteArray` the Kotlin wrapper
+/// decodes. Only bootstrap classes (`java/lang/*`) are used: trampolines run
+/// on producer threads whose class loader cannot see app classes.
 fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
-    let slots = abi::lower_param(&p.name, &p.ty, "", false);
+    let slots = &p.abi;
     let n0 = slots[0].name.clone();
-    let box_leaf = |out: &mut String, ty: &TypeRef, var: &str, src: &str| {
-        write_boxed_scalar(out, ty, var, src, "    ");
-    };
     let mut w = CodeWriter::four_space().with_depth(1);
+    if abi::is_buffered(&p.ty) {
+        let n1 = &slots[1].name;
+        w.line(format!(
+            "jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
+        ));
+        w.line(format!(
+            "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
+        ));
+        out.push_str(&w.finish());
+        return;
+    }
     match &p.ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2181,7 +2260,7 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
         | TypeRef::Bool
         | TypeRef::Enum(_)
         | TypeRef::Handle => {
-            splice(&mut w, |o| box_leaf(o, &p.ty, var, &n0));
+            splice(&mut w, |o| write_boxed_scalar(o, &p.ty, var, &n0, "    "));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!(
@@ -2197,198 +2276,30 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
                 "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
             ));
         }
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
             splice(&mut w, |o| {
-                box_leaf(o, &TypeRef::Handle, var, &format!("(intptr_t){n0}"))
+                write_boxed_scalar(o, &TypeRef::Handle, var, &format!("(intptr_t){n0}"), "    ")
             });
         }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!(
-                    "jobject {var} = {n0} ? (jobject)(*env)->NewStringUTF(env, {n0}) : NULL;"
-                ));
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let n1 = &slots[1].name;
-                w.line(format!("jobject {var} = NULL;"));
-                w.block(format!("if ({n0}) {{"), "}", |w| {
-                    w.line(format!(
-                        "jbyteArray {var}_arr = (*env)->NewByteArray(env, (jsize){n1});"
-                    ));
-                    w.line(format!(
-                        "if ({var}_arr) {{ (*env)->SetByteArrayRegion(env, {var}_arr, 0, (jsize){n1}, (const jbyte*){n0}); }}"
-                    ));
-                    w.line(format!("{var} = (jobject){var}_arr;"));
+        // Only `Interface?` reaches here: a nullable borrowed pointer boxed
+        // as `Long`, null crossing as `null`.
+        TypeRef::Optional(_) => {
+            w.line(format!("jobject {var} = NULL;"));
+            w.block(format!("if ({n0}) {{"), "}", |w| {
+                splice(w, |o| {
+                    write_boxed_scalar(
+                        o,
+                        &TypeRef::Handle,
+                        &format!("{var}_box"),
+                        &format!("(intptr_t){n0}"),
+                        "        ",
+                    )
                 });
-            }
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => {
-                w.line(format!("jobject {var} = NULL;"));
-                w.block(format!("if ({n0}) {{"), "}", |w| {
-                    splice(w, |o| {
-                        write_boxed_scalar(
-                            o,
-                            &TypeRef::Handle,
-                            &format!("{var}_box"),
-                            &format!("(intptr_t){n0}"),
-                            "        ",
-                        )
-                    });
-                    w.line(format!("{var} = {var}_box;"));
-                });
-            }
-            other => {
-                w.line(format!("jobject {var} = NULL;"));
-                w.block(format!("if ({n0}) {{"), "}", |w| {
-                    splice(w, |o| {
-                        write_boxed_scalar(
-                            o,
-                            other,
-                            &format!("{var}_box"),
-                            &format!("(*{n0})"),
-                            "        ",
-                        )
-                    });
-                    w.line(format!("{var} = {var}_box;"));
-                });
-            }
-        },
-        TypeRef::List(inner) => {
-            let n1 = &slots[1].name;
-            match inner.as_ref() {
-                TypeRef::I8 | TypeRef::U8 => {
-                    w.line(format!(
-                        "jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
-                    ));
-                    w.line(format!(
-                        "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
-                    ));
-                }
-                TypeRef::I16 | TypeRef::U16 => {
-                    w.line(format!(
-                        "jshortArray {var} = (*env)->NewShortArray(env, (jsize){n1});"
-                    ));
-                    w.line(format!(
-                        "if ({var} && {n0}) {{ (*env)->SetShortArrayRegion(env, {var}, 0, (jsize){n1}, (const jshort*){n0}); }}"
-                    ));
-                }
-                TypeRef::I32 | TypeRef::Enum(_) => {
-                    w.line(format!(
-                        "jintArray {var} = (*env)->NewIntArray(env, (jsize){n1});"
-                    ));
-                    w.line(format!(
-                        "if ({var} && {n0}) {{ (*env)->SetIntArrayRegion(env, {var}, 0, (jsize){n1}, (const jint*){n0}); }}"
-                    ));
-                }
-                TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-                    w.line(format!(
-                        "jlongArray {var} = (*env)->NewLongArray(env, (jsize){n1});"
-                    ));
-                    w.block(
-                        format!(
-                            "for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
-                        ),
-                        "}",
-                        |w| {
-                            w.line(format!("jlong {var}_tmp = (jlong){n0}[{var}_i];"));
-                            w.line(format!(
-                                "(*env)->SetLongArrayRegion(env, {var}, (jsize){var}_i, 1, &{var}_tmp);"
-                            ));
-                        },
-                    );
-                }
-                TypeRef::F64 => {
-                    w.line(format!(
-                        "jdoubleArray {var} = (*env)->NewDoubleArray(env, (jsize){n1});"
-                    ));
-                    w.line(format!(
-                        "if ({var} && {n0}) {{ (*env)->SetDoubleArrayRegion(env, {var}, 0, (jsize){n1}, (const jdouble*){n0}); }}"
-                    ));
-                }
-                TypeRef::F32 => {
-                    w.line(format!(
-                        "jfloatArray {var} = (*env)->NewFloatArray(env, (jsize){n1});"
-                    ));
-                    w.line(format!(
-                        "if ({var} && {n0}) {{ (*env)->SetFloatArrayRegion(env, {var}, 0, (jsize){n1}, (const jfloat*){n0}); }}"
-                    ));
-                }
-                TypeRef::Bool => {
-                    w.line(format!(
-                        "jbooleanArray {var} = (*env)->NewBooleanArray(env, (jsize){n1});"
-                    ));
-                    w.block(
-                        format!(
-                            "for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
-                        ),
-                        "}",
-                        |w| {
-                            w.line(format!(
-                                "jboolean {var}_tmp = {n0}[{var}_i] ? JNI_TRUE : JNI_FALSE;"
-                            ));
-                            w.line(format!(
-                                "(*env)->SetBooleanArrayRegion(env, {var}, (jsize){var}_i, 1, &{var}_tmp);"
-                            ));
-                        },
-                    );
-                }
-                _ => {
-                    w.line(format!(
-                        "jclass {var}_scls = (*env)->FindClass(env, \"java/lang/String\");"
-                    ));
-                    w.line(format!(
-                        "jobjectArray {var} = (*env)->NewObjectArray(env, (jsize){n1}, {var}_scls, NULL);"
-                    ));
-                    w.block(
-                        format!(
-                            "for (size_t {var}_i = 0; {var} && {n0} && {var}_i < {n1}; {var}_i++) {{"
-                        ),
-                        "}",
-                        |w| {
-                            w.line(format!(
-                                "jstring {var}_s = {n0}[{var}_i] ? (*env)->NewStringUTF(env, {n0}[{var}_i]) : (*env)->NewStringUTF(env, \"\");"
-                            ));
-                            w.line(format!(
-                                "(*env)->SetObjectArrayElement(env, {var}, (jsize){var}_i, {var}_s);"
-                            ));
-                            w.line(format!("(*env)->DeleteLocalRef(env, {var}_s);"));
-                        },
-                    );
-                }
-            }
+                w.line(format!("{var} = {var}_box;"));
+            });
         }
-        TypeRef::Map(k, v) => {
-            let keys = n0;
-            let vals = slots[1].name.clone();
-            let len = slots[2].name.clone();
-            w.line(format!(
-                "jclass {var}_hm = (*env)->FindClass(env, \"java/util/HashMap\");"
-            ));
-            w.line(format!(
-                "jobject {var} = (*env)->NewObject(env, {var}_hm, (*env)->GetMethodID(env, {var}_hm, \"<init>\", \"()V\"));"
-            ));
-            w.line(format!(
-                "jmethodID {var}_put = (*env)->GetMethodID(env, {var}_hm, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");"
-            ));
-            // write_map_box_elem indexes with the literal loop variable `i`.
-            w.block(
-                format!("for (size_t i = 0; {keys} && {vals} && i < {len}; i++) {{"),
-                "}",
-                |w| {
-                    splice(w, |o| write_map_box_elem(o, k, &format!("{var}_k"), &keys));
-                    splice(w, |o| write_map_box_elem(o, v, &format!("{var}_v"), &vals));
-                    w.line(format!(
-                        "(*env)->CallObjectMethod(env, {var}, {var}_put, {var}_k, {var}_v);"
-                    ));
-                    w.line(format!("(*env)->DeleteLocalRef(env, {var}_k);"));
-                    w.line(format!("(*env)->DeleteLocalRef(env, {var}_v);"));
-                },
-            );
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered callback arguments are handled above")
         }
         TypeRef::Iterator(_) => unreachable!("validation rejects iterator callback params"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -2400,13 +2311,13 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
 /// needed, box every C argument, and invoke the pinned Kotlin lambda through
 /// the erased `kotlin.jvm.functions.FunctionN.invoke(Object...)` method.
 fn render_jni_cb_tramp(out: &mut String, cb: &CallbackBinding, c_prefix: &str) {
-    let mut decls: Vec<String> = cb
-        .params
+    // The precomputed ABI slot list already carries the trailing `void*
+    // context` and module-qualified slot types.
+    let decls: Vec<String> = cb
+        .abi_params
         .iter()
-        .flat_map(|p| abi::lower_param(&p.name, &p.ty, "", false))
         .map(|slot| format!("{} {}", slot.ty.render_c(c_prefix), slot.name))
         .collect();
-    decls.push("void* context".into());
     let mut w = CodeWriter::four_space();
     w.line(format!(
         "static void {}_jni_tramp({}) {{",
@@ -2476,11 +2387,16 @@ fn render_jni_listener_fns(
     jni_prefix: &str,
     strip_module_prefix: bool,
 ) {
-    let register_kt = kotlin_fn_name(
+    let mut register_kt = kotlin_fn_name(
         module_path,
         &format!("register_{}", l.name),
         strip_module_prefix,
     );
+    // When the callback has buffered params, the Kotlin external is the
+    // private `{register}Jni` behind the decoding wrapper.
+    if cb.params.iter().any(|p| abi::is_buffered(&p.ty)) {
+        register_kt.push_str("Jni");
+    }
     let unregister_kt = kotlin_fn_name(
         module_path,
         &format!("unregister_{}", l.name),
@@ -2547,6 +2463,20 @@ fn render_jni_listener_fns(
 
 fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
     let mut w = CodeWriter::four_space().with_depth(1);
+    // A buffered parameter crosses as a packed `jbyteArray`: pin the elements
+    // for the borrowed `(ptr, len)` pair the callee decodes and never frees.
+    if abi::is_buffered(ty) {
+        w.line(format!(
+            "jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
+            n = name
+        ));
+        w.line(format!(
+            "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
+            n = name
+        ));
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!(
@@ -2565,107 +2495,10 @@ fn write_param_acquire(out: &mut String, name: &str, ty: &TypeRef) {
                 n = name
             ));
         }
-        TypeRef::Optional(inner) => splice(&mut w, |o| write_optional_acquire(o, name, inner)),
-        TypeRef::List(inner) => splice(&mut w, |o| write_list_acquire(o, name, inner)),
-        TypeRef::Map(k, v) => splice(&mut w, |o| write_map_acquire(o, name, k, v)),
-        _ => {}
-    }
-    out.push_str(&w.finish());
-}
-
-fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("const char* {n}_chars = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "{n}_chars = (*env)->GetStringUTFChars(env, {n}, NULL);",
-                    n = name
-                ));
-            });
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line(format!("jbyte* {n}_elems = NULL;", n = name));
-            w.line(format!("jsize {n}_len = 0;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "{n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_len = (*env)->GetArrayLength(env, {n});",
-                    n = name
-                ));
-            });
-        }
-        TypeRef::I8 | TypeRef::U8 => {
-            w.line(format!("int8_t {n}_val = 0;", n = name));
-            w.line(format!("const int8_t* {n}_ptr = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"byteValue\", \"()B\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_val = (int8_t)(*env)->CallByteMethod(env, {n}, {n}_mid);",
-                    n = name
-                ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
-            });
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            w.line(format!("int16_t {n}_val = 0;", n = name));
-            w.line(format!("const int16_t* {n}_ptr = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"shortValue\", \"()S\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_val = (int16_t)(*env)->CallShortMethod(env, {n}, {n}_mid);",
-                    n = name
-                ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
-            });
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            w.line(format!("int32_t {n}_val = 0;", n = name));
-            w.line(format!("const int32_t* {n}_ptr = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"intValue\", \"()I\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_val = (int32_t)(*env)->CallIntMethod(env, {n}, {n}_mid);",
-                    n = name
-                ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
-            });
-        }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
+        // Only `Interface?` reaches here: unbox the nullable `java.lang.Long`
+        // into the raw pointer value (0 = none).
+        TypeRef::Optional(_) => {
             w.line(format!("int64_t {n}_val = 0;", n = name));
-            w.line(format!("const int64_t* {n}_ptr = NULL;", n = name));
             w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
                 w.line(format!(
                     "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
@@ -2679,520 +2512,7 @@ fn write_optional_acquire(out: &mut String, name: &str, inner: &TypeRef) {
                     "{n}_val = (int64_t)(*env)->CallLongMethod(env, {n}, {n}_mid);",
                     n = name
                 ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
             });
-        }
-        TypeRef::F64 => {
-            w.line(format!("double {n}_val = 0.0;", n = name));
-            w.line(format!("const double* {n}_ptr = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"doubleValue\", \"()D\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_val = (*env)->CallDoubleMethod(env, {n}, {n}_mid);",
-                    n = name
-                ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
-            });
-        }
-        TypeRef::F32 => {
-            w.line(format!("float {n}_val = 0.0f;", n = name));
-            w.line(format!("const float* {n}_ptr = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"floatValue\", \"()F\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_val = (*env)->CallFloatMethod(env, {n}, {n}_mid);",
-                    n = name
-                ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
-            });
-        }
-        TypeRef::Bool => {
-            w.line(format!("bool {n}_val = false;", n = name));
-            w.line(format!("const bool* {n}_ptr = NULL;", n = name));
-            w.block(format!("if ({n} != NULL) {{", n = name), "}", |w| {
-                w.line(format!(
-                    "jclass {n}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "jmethodID {n}_mid = (*env)->GetMethodID(env, {n}_cls, \"booleanValue\", \"()Z\");",
-                    n = name
-                ));
-                w.line(format!(
-                    "{n}_val = (bool)(*env)->CallBooleanMethod(env, {n}, {n}_mid);",
-                    n = name
-                ));
-                w.line(format!("{n}_ptr = &{n}_val;", n = name));
-            });
-        }
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => {}
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-    out.push_str(&w.finish());
-}
-
-fn write_list_acquire(out: &mut String, name: &str, inner: &TypeRef) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    match inner {
-        TypeRef::I8 | TypeRef::U8 => {
-            w.line(format!(
-                "jbyte* {n}_elems = (*env)->GetByteArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            w.line(format!(
-                "jshort* {n}_elems = (*env)->GetShortArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            w.line(format!(
-                "jint* {n}_elems = (*env)->GetIntArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            w.line(format!(
-                "jlong* {n}_elems = (*env)->GetLongArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::F32 => {
-            w.line(format!(
-                "jfloat* {n}_elems = (*env)->GetFloatArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::F64 => {
-            w.line(format!(
-                "jdouble* {n}_elems = (*env)->GetDoubleArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "jboolean* {n}_elems = (*env)->GetBooleanArrayElements(env, {n}, NULL);",
-                n = name
-            ));
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            // Java passes List<String> as String[] (jobjectArray). The C ABI
-            // expects `const char* const*` plus a length. We allocate two
-            // parallel arrays: `_elems` holds the UTF-8 char pointers, and
-            // `_jstrs` keeps the original jstrings around so we can call
-            // ReleaseStringUTFChars for each one in the release path.
-            w.line(format!(
-                "jsize {n}_len = (*env)->GetArrayLength(env, {n});",
-                n = name
-            ));
-            w.line(format!(
-                "const char** {n}_elems = (const char**)malloc((size_t){n}_len * sizeof(const char*));",
-                n = name
-            ));
-            w.line(format!(
-                "jstring* {n}_jstrs = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
-                n = name
-            ));
-            w.block(
-                format!("for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{", n = name),
-                "}",
-                |w| {
-                    w.line(format!(
-                        "{n}_jstrs[{n}_i] = (jstring)(*env)->GetObjectArrayElement(env, {n}, {n}_i);",
-                        n = name
-                    ));
-                    w.line(format!(
-                        "{n}_elems[{n}_i] = (*env)->GetStringUTFChars(env, {n}_jstrs[{n}_i], NULL);",
-                        n = name
-                    ));
-                },
-            );
-        }
-        other => {
-            unreachable!("validation rejects list params with composite element type {other:?}")
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn map_elem_c_type(ty: &TypeRef) -> &'static str {
-    match ty {
-        TypeRef::I8 => "int8_t",
-        TypeRef::U8 => "uint8_t",
-        TypeRef::I16 => "int16_t",
-        TypeRef::U16 => "uint16_t",
-        TypeRef::I32 | TypeRef::Enum(_) => "int32_t",
-        TypeRef::U32 => "uint32_t",
-        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "int64_t",
-        TypeRef::U64 => "uint64_t",
-        TypeRef::F32 => "float",
-        TypeRef::F64 => "double",
-        TypeRef::Bool => "jboolean",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*",
-        _ => "void*",
-    }
-}
-
-fn map_elem_c_call_cast(ty: &TypeRef) -> &'static str {
-    match ty {
-        TypeRef::I8 => "(const int8_t*)",
-        TypeRef::U8 => "(const uint8_t*)",
-        TypeRef::I16 => "(const int16_t*)",
-        TypeRef::U16 => "(const uint16_t*)",
-        TypeRef::I32 | TypeRef::Enum(_) => "(const int32_t*)",
-        TypeRef::U32 => "(const uint32_t*)",
-        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => "(const int64_t*)",
-        TypeRef::U64 => "(const uint64_t*)",
-        TypeRef::F32 => "(const float*)",
-        TypeRef::F64 => "(const double*)",
-        TypeRef::Bool => "(const bool*)",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "(const char* const*)",
-        _ => "(const void*)",
-    }
-}
-
-fn write_map_acquire(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
-    let key_c = map_elem_c_type(key);
-    let val_c = map_elem_c_type(val);
-    let mut w = CodeWriter::four_space().with_depth(1);
-    w.line(format!(
-        "jclass {n}_mc = (*env)->FindClass(env, \"java/util/Map\");",
-        n = name
-    ));
-    w.line(format!(
-        "jsize {n}_len = (jsize)(*env)->CallIntMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"size\", \"()I\"));",
-        n = name
-    ));
-    w.line(format!(
-        "jobject {n}_ks = (*env)->CallObjectMethod(env, {n}, (*env)->GetMethodID(env, {n}_mc, \"keySet\", \"()Ljava/util/Set;\"));",
-        n = name
-    ));
-    w.line(format!(
-        "jclass {n}_sc = (*env)->FindClass(env, \"java/util/Set\");",
-        n = name
-    ));
-    w.line(format!(
-        "jobjectArray {n}_ka = (jobjectArray)(*env)->CallObjectMethod(env, {n}_ks, (*env)->GetMethodID(env, {n}_sc, \"toArray\", \"()[Ljava/lang/Object;\"));",
-        n = name
-    ));
-    w.line(format!(
-        "jmethodID {n}_gm = (*env)->GetMethodID(env, {n}_mc, \"get\", \"(Ljava/lang/Object;)Ljava/lang/Object;\");",
-        n = name
-    ));
-    w.line(format!(
-        "{kc}* {n}_c_keys = ({kc}*)malloc((size_t){n}_len * sizeof({kc}));",
-        kc = key_c,
-        n = name
-    ));
-    w.line(format!(
-        "{vc}* {n}_c_vals = ({vc}*)malloc((size_t){n}_len * sizeof({vc}));",
-        vc = val_c,
-        n = name
-    ));
-    if matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        w.line(format!(
-            "jstring* {n}_jk = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
-            n = name
-        ));
-    }
-    if matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        w.line(format!(
-            "jstring* {n}_jv = (jstring*)malloc((size_t){n}_len * sizeof(jstring));",
-            n = name
-        ));
-    }
-    splice(&mut w, |o| write_map_unbox_setup(o, name, "k", key));
-    splice(&mut w, |o| write_map_unbox_setup(o, name, "v", val));
-    w.block(
-        format!(
-            "for (jsize {n}_i = 0; {n}_i < {n}_len; {n}_i++) {{",
-            n = name
-        ),
-        "}",
-        |w| {
-            w.line(format!(
-                "jobject {n}_ko = (*env)->GetObjectArrayElement(env, {n}_ka, {n}_i);",
-                n = name
-            ));
-            splice(w, |o| {
-                write_map_elem_extract(o, name, "k", "c_keys", key, &format!("{name}_ko"))
-            });
-            w.line(format!(
-                "jobject {n}_vo = (*env)->CallObjectMethod(env, {n}, {n}_gm, {n}_ko);",
-                n = name
-            ));
-            splice(w, |o| {
-                write_map_elem_extract(o, name, "v", "c_vals", val, &format!("{name}_vo"))
-            });
-        },
-    );
-    out.push_str(&w.finish());
-}
-
-fn write_map_unbox_setup(out: &mut String, name: &str, suffix: &str, ty: &TypeRef) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    match ty {
-        TypeRef::I8 | TypeRef::U8 => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Byte\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"byteValue\", \"()B\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Short\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"shortValue\", \"()S\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Integer\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"intValue\", \"()I\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Long\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"longValue\", \"()J\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        TypeRef::F32 => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Float\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"floatValue\", \"()F\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        TypeRef::F64 => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Double\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"doubleValue\", \"()D\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "jclass {n}_{s}c = (*env)->FindClass(env, \"java/lang/Boolean\");",
-                n = name,
-                s = suffix
-            ));
-            w.line(format!(
-                "jmethodID {n}_{s}m = (*env)->GetMethodID(env, {n}_{s}c, \"booleanValue\", \"()Z\");",
-                n = name,
-                s = suffix
-            ));
-        }
-        _ => {}
-    }
-    out.push_str(&w.finish());
-}
-
-fn write_map_elem_extract(
-    out: &mut String,
-    name: &str,
-    suffix: &str,
-    arr: &str,
-    ty: &TypeRef,
-    obj_var: &str,
-) {
-    let mut w = CodeWriter::four_space().with_depth(2);
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "{n}_j{s}[{n}_i] = (jstring){obj};",
-                n = name,
-                s = suffix,
-                obj = obj_var
-            ));
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (*env)->GetStringUTFChars(env, (jstring){obj}, NULL);",
-                n = name,
-                a = arr,
-                obj = obj_var
-            ));
-        }
-        TypeRef::I8 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (int8_t)(*env)->CallByteMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::U8 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (uint8_t)(*env)->CallByteMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::I16 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (int16_t)(*env)->CallShortMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::U16 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (uint16_t)(*env)->CallShortMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (int32_t)(*env)->CallIntMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::U32 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (uint32_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::I64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (int64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::U64 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (uint64_t)(*env)->CallLongMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::F64 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (*env)->CallDoubleMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::F32 => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (*env)->CallFloatMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "{n}_{a}[{n}_i] = (*env)->CallBooleanMethod(env, {obj}, {n}_{s}m);",
-                n = name,
-                a = arr,
-                obj = obj_var,
-                s = suffix
-            ));
         }
         _ => {}
     }
@@ -3206,6 +2526,13 @@ fn build_c_call_args(
     module: &str,
     c_prefix: &str,
 ) {
+    // A buffered parameter crosses as one borrowed `(ptr, len)` pair pinned
+    // from the packed `jbyteArray` by `write_param_acquire`.
+    if abi::is_buffered(ty) {
+        args.push(format!("(const uint8_t*){n}_elems", n = name));
+        args.push(format!("(size_t){n}_len", n = name));
+        return;
+    }
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             args.push(format!("{n}_chars", n = name));
@@ -3228,14 +2555,10 @@ fn build_c_call_args(
         TypeRef::Handle => args.push(format!("(weaveffi_handle_t){}", name)),
         // A typed handle lowers to the owner-qualified C struct pointer (mutable
         // receiver), so the cross-module JNI shim must cast through that pointer
-        // rather than the generic integer handle, mirroring the struct arm below.
+        // rather than the generic integer handle.
         TypeRef::TypedHandle(sname) => {
             let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
             args.push(format!("({}*)(intptr_t){}", c_struct, name));
-        }
-        TypeRef::Record(sname) | TypeRef::RichEnum(sname) => {
-            let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
-            args.push(format!("(const {}*)(intptr_t){}", c_struct, name));
         }
         // An interface argument crosses as a borrowed `const {c_tag}*`: the
         // Kotlin wrapper keeps ownership and only lends the pointer.
@@ -3244,76 +2567,17 @@ fn build_c_call_args(
             args.push(format!("(const {}*)(intptr_t){}", c_struct, name));
         }
         TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                args.push(format!("{n}_chars", n = name));
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                args.push(format!("(const uint8_t*){n}_elems", n = name));
-                args.push(format!("(size_t){n}_len", n = name));
-            }
-            _ => args.push(format!("{}_ptr", name)),
-        },
-        TypeRef::List(inner) => {
-            match inner.as_ref() {
-                TypeRef::I8 => {
-                    args.push(format!("(const int8_t*){n}_elems", n = name));
-                }
-                TypeRef::U8 => {
-                    args.push(format!("(const uint8_t*){n}_elems", n = name));
-                }
-                TypeRef::I16 => {
-                    args.push(format!("(const int16_t*){n}_elems", n = name));
-                }
-                TypeRef::U16 => {
-                    args.push(format!("(const uint16_t*){n}_elems", n = name));
-                }
-                TypeRef::I32 | TypeRef::Enum(_) => {
-                    args.push(format!("(const int32_t*){n}_elems", n = name));
-                }
-                TypeRef::U32 => {
-                    args.push(format!("(const uint32_t*){n}_elems", n = name));
-                }
-                TypeRef::I64 => {
-                    args.push(format!("(const int64_t*){n}_elems", n = name));
-                }
-                TypeRef::U64 => {
-                    args.push(format!("(const uint64_t*){n}_elems", n = name));
-                }
-                TypeRef::F32 => {
-                    args.push(format!("(const float*){n}_elems", n = name));
-                }
-                TypeRef::F64 => {
-                    args.push(format!("(const double*){n}_elems", n = name));
-                }
-                TypeRef::Bool => {
-                    args.push(format!("(const bool*){n}_elems", n = name));
-                }
-                TypeRef::TypedHandle(_)
-                | TypeRef::Handle
-                | TypeRef::Record(_)
-                | TypeRef::RichEnum(_)
-                | TypeRef::Interface(_) => {
-                    // The C ABI for List<Record>/List<Handle> is `T* const*`,
-                    // but the JNI side stores the elements as a `jlong*` of
-                    // opaque handles. The void cast lets the underlying buffer
-                    // pointer flow through; this relies on jlong and pointer
-                    // values being interchangeable on 64-bit Android.
-                    args.push(format!("(const void*){n}_elems", n = name));
-                }
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    args.push(format!("(const char* const*){n}_elems", n = name));
-                }
-                other => unreachable!(
-                    "validation rejects list params with composite element type {other:?}"
-                ),
-            }
-            args.push(format!("(size_t){n}_len", n = name));
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // pass the unboxed nullable pointer value acquired above.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(iname) = inner.as_ref() else {
+                unreachable!("non-interface optionals are buffered")
+            };
+            let c_struct = weaveffi_core::utils::c_abi_struct_name(iname, module, c_prefix);
+            args.push(format!("(const {}*)(intptr_t){}_val", c_struct, name));
         }
-        TypeRef::Map(k, v) => {
-            args.push(format!("{}{n}_c_keys", map_elem_c_call_cast(k), n = name));
-            args.push(format!("{}{n}_c_vals", map_elem_c_call_cast(v), n = name));
-            args.push(format!("(size_t){n}_len", n = name));
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered types are handled above")
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -3353,6 +2617,23 @@ fn write_return_handling(
     // Borrowed JNI parameter resources are released immediately after the C
     // call, *before* the error check, so an error path cannot leak them.
     let mut w = CodeWriter::four_space().with_depth(1);
+    // A buffered return is a producer-allocated `(ptr, len)` pair: copy it
+    // into a `jbyteArray` for the Kotlin wrapper to decode, then free the
+    // producer allocation with `weaveffi_free_bytes`.
+    if abi::is_buffered(ret_type) {
+        w.line(format!(
+            "const uint8_t* rv = {}({});",
+            c_sym, call_with_out_len_err
+        ));
+        splice(&mut w, |o| release_jni_resources(o, params));
+        splice(&mut w, |o| write_error_check(o, returns, thrower));
+        w.line("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);");
+        w.line("if (out && rv) { (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv); }");
+        w.line("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);");
+        w.line("return out;");
+        jni_c.push_str(&w.finish());
+        return;
+    }
     match ret_type {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("const char* rv = {}({});", c_sym, call_with_err));
@@ -3380,19 +2661,10 @@ fn write_return_handling(
             splice(&mut w, |o| write_error_check(o, returns, thrower));
             w.line("return rv ? JNI_TRUE : JNI_FALSE;");
         }
-        // A record or rich enum is returned as an owning pointer to its
-        // opaque tag; the Kotlin wrapper class adopts it (and destroys it).
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-            let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
-            w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("return (jlong)(intptr_t)rv;");
-        }
         // A typed handle lowers to the owner-qualified C struct pointer, so the
         // return variable must be that pointer (not the generic integer handle)
-        // and round-trip through `intptr_t`, mirroring the record arm above. The
-        // untyped `Handle` case stays in the scalar fallthrough below.
+        // and round-trip through `intptr_t`. The untyped `Handle` case stays in
+        // the scalar fallthrough below.
         TypeRef::TypedHandle(name) => {
             let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
             w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
@@ -3400,15 +2672,23 @@ fn write_return_handling(
             splice(&mut w, |o| write_error_check(o, returns, thrower));
             w.line("return (jlong)(intptr_t)rv;");
         }
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // the C function returns a nullable owned pointer, boxed for Kotlin's
+        // `Long?` as a `java.lang.Long` or NULL.
         TypeRef::Optional(inner) => {
-            splice(&mut w, |o| {
-                write_optional_return(o, inner, c_sym, &args_str, returns, params, module, thrower)
-            });
-        }
-        TypeRef::List(inner) => {
-            splice(&mut w, |o| {
-                write_list_return(o, inner, c_sym, &args_str, returns, params, thrower)
-            });
+            let TypeRef::Interface(iname) = inner.as_ref() else {
+                unreachable!("non-interface optionals are buffered")
+            };
+            let c_ty = weaveffi_core::utils::c_abi_struct_name(iname, module, c_prefix);
+            w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
+            splice(&mut w, |o| release_jni_resources(o, params));
+            splice(&mut w, |o| write_error_check(o, returns, thrower));
+            w.line("if (rv == NULL) { return NULL; }");
+            w.line("jclass box_cls = (*env)->FindClass(env, \"java/lang/Long\");");
+            w.line("jmethodID box_mid = (*env)->GetStaticMethodID(env, box_cls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
+            w.line(
+                "return (*env)->CallStaticObjectMethod(env, box_cls, box_mid, (jlong)(intptr_t)rv);",
+            );
         }
         TypeRef::Iterator(_) => {
             // Iterator returns are intercepted in `render_jni_sync_export`
@@ -3419,10 +2699,8 @@ fn write_return_handling(
                 "iterator returns are handled in render_jni_sync_export before write_return_handling"
             );
         }
-        TypeRef::Map(k, v) => {
-            splice(&mut w, |o| {
-                write_map_return(o, k, v, c_sym, &args_str, returns, params, thrower)
-            });
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered types are handled above")
         }
         ret_type => {
             let c_ty = c_type_for_return(ret_type);
@@ -3436,29 +2714,14 @@ fn write_return_handling(
     jni_c.push_str(&w.finish());
 }
 
-/// The C declaration type of an iterator's `out_item` pointee for the element
-/// types we materialize (strings, scalars, struct/handle pointers).
+/// The C declaration type of an iterator's `out_item` pointee, rendered from
+/// the same lowering the C header uses.
 fn iter_item_c_type(elem: &TypeRef, module: &str, c_prefix: &str) -> String {
-    match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".to_string(),
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Interface(name) => {
-            format!(
-                "{}*",
-                weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix)
-            )
-        }
-        // An optional pointer element shares the inner pointer type; NULL
-        // expresses "none".
-        TypeRef::Optional(inner) => iter_item_c_type(inner, module, c_prefix),
-        other => c_type_for_return(other).to_string(),
-    }
+    weaveffi_core::model::iterator_item_ctype(elem, module).render_c(c_prefix)
 }
 
-/// Box one iterator/collection scalar `src` into a JVM reference `var`. Unlike
-/// [`write_map_box_elem`] the source is a plain lvalue (not `arr[i]`).
+/// Box one iterator element scalar `src` (a plain lvalue) into a JVM
+/// reference `var`.
 fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match ty {
@@ -3496,11 +2759,7 @@ fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, inde
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", v = var, s = src));
         }
-        TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Interface(_) => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
@@ -3582,8 +2841,9 @@ fn kotlin_iterator_class_name(it: &IteratorBinding, c_prefix: &str) -> String {
 /// it returns a one-slot `Object[]` holding the boxed element, or `NULL` when
 /// the producer is exhausted (a pending JNI exception distinguishes the error
 /// case). Each element is freed per its `ElemFree` plan: strings are released
-/// with `weaveffi_free_string` after `NewStringUTF`; record and rich-enum
-/// pointers are adopted by the owning Kotlin wrapper class instead.
+/// with `weaveffi_free_string` after `NewStringUTF`; bytes and buffered
+/// elements are copied into a `jbyteArray` and released with
+/// `weaveffi_free_bytes`.
 fn render_jni_iterator_natives(
     out: &mut String,
     it: &IteratorBinding,
@@ -3594,13 +2854,15 @@ fn render_jni_iterator_natives(
 ) {
     let class = kotlin_iterator_class_name(it, c_prefix);
     let item_c = iter_item_c_type(&it.elem, module, c_prefix);
-    // Optional pointer elements box their inner pointer (NULL crosses as 0L,
-    // which the Kotlin wrapper maps back to a null element).
+    let free = plan::elem_free(&it.elem);
+    // Bytes and buffered elements carry a trailing `size_t* out_len` slot.
+    let has_len = it.next.params.iter().any(|p| p.name == "out_len");
+    // Only `Interface?` elements stay a nullable pointer (boxed as 0L for
+    // none); every other optional is buffered.
     let leaf = match &it.elem {
         TypeRef::Optional(inner) => inner.as_ref(),
         other => other,
     };
-    let elem_is_string = matches!(leaf, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
 
     let mut w = CodeWriter::four_space();
     w.line(format!(
@@ -3613,21 +2875,40 @@ fn render_jni_iterator_natives(
             tag = it.iter_tag
         ));
         w.line(format!("{ty} _item = ({ty})0;", ty = item_c));
-        w.line("weaveffi_error err = {0, NULL};");
-        w.line(format!(
-            "int32_t _has = {next}(_iter, &_item, &err);",
-            next = it.next.symbol
-        ));
+        if has_len {
+            w.line("size_t _item_len = 0;");
+        }
+        w.line("weaveffi_error err = {0, NULL, NULL, 0};");
+        let next_call = if has_len {
+            format!(
+                "int32_t _has = {next}(_iter, &_item, &_item_len, &err);",
+                next = it.next.symbol
+            )
+        } else {
+            format!(
+                "int32_t _has = {next}(_iter, &_item, &err);",
+                next = it.next.symbol
+            )
+        };
+        w.line(next_call);
         w.block("if (err.code != 0) {", "}", |w| {
             w.line(format!("{thrower}(env, &err);"));
             w.line("return NULL;");
         });
         w.line("if (_has == 0) { return NULL; }");
-        splice(w, |o| {
-            write_boxed_scalar(o, leaf, "_jitem", "_item", "    ")
-        });
-        if elem_is_string {
-            w.line("weaveffi_free_string(_item);");
+        match free {
+            ElemFree::Bytes => {
+                w.line("jbyteArray _jitem = (*env)->NewByteArray(env, (jsize)_item_len);");
+                w.line("if (_jitem && _item) { (*env)->SetByteArrayRegion(env, _jitem, 0, (jsize)_item_len, (const jbyte*)_item); }");
+                w.line("weaveffi_free_bytes((uint8_t*)_item, _item_len);");
+            }
+            ElemFree::String => {
+                splice(w, |o| write_boxed_scalar(o, leaf, "_jitem", "_item", "    "));
+                w.line("weaveffi_free_string(_item);");
+            }
+            ElemFree::None => {
+                splice(w, |o| write_boxed_scalar(o, leaf, "_jitem", "_item", "    "));
+            }
         }
         w.line("jclass _obj_cls = (*env)->FindClass(env, \"java/lang/Object\");");
         w.line("jobjectArray _slot = (*env)->NewObjectArray(env, 1, _obj_cls, NULL);");
@@ -3655,20 +2936,24 @@ fn render_jni_iterator_natives(
 /// The Kotlin expression converting a boxed element pulled from `nativeNext`
 /// (typed `Any`, spelled `raw`) into the iterator's public element type.
 fn kotlin_iter_elem_convert(elem: &TypeRef) -> String {
+    // A buffered element crosses as a packed `ByteArray`: decode it into the
+    // idiomatic Kotlin value.
+    if abi::is_buffered(elem) {
+        return kt_decode_expr(elem, "(raw as ByteArray)");
+    }
     match elem {
         TypeRef::Enum(name) => format!("{}.fromValue(raw as Int)", local_type_name(name)),
-        TypeRef::TypedHandle(name) | TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-            format!("{}(raw as Long)", local_type_name(name))
+        TypeRef::Interface(name) => format!("{}(raw as Long)", local_type_name(name)),
+        // Only `Interface?` reaches here: 0L crosses for none.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(name) = inner.as_ref() else {
+                unreachable!("non-interface optionals are buffered")
+            };
+            format!(
+                "(raw as Long).takeIf {{ it != 0L }}?.let {{ {}(it) }}",
+                local_type_name(name)
+            )
         }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::TypedHandle(name) | TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-                format!(
-                    "(raw as Long).takeIf {{ it != 0L }}?.let {{ {}(it) }}",
-                    local_type_name(name)
-                )
-            }
-            other => format!("raw as {}?", kotlin_type(other)),
-        },
         other => format!("raw as {}", kotlin_type(other)),
     }
 }
@@ -3684,7 +2969,7 @@ fn render_kotlin_iterator_class(
     c_prefix: &str,
 ) {
     let class = kotlin_iterator_class_name(it, c_prefix);
-    let elem_pub = kotlin_public_type(&it.elem);
+    let elem_pub = kotlin_type(&it.elem);
     let convert = kotlin_iter_elem_convert(&it.elem);
     let mut w = CodeWriter::four_space();
     w.blank();
@@ -3759,500 +3044,6 @@ fn render_kotlin_iterator_class(
     out.push_str(&w.finish());
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_optional_return(
-    out: &mut String,
-    inner: &TypeRef,
-    c_sym: &str,
-    args_str: &str,
-    returns: Option<&TypeRef>,
-    params: &[ParamBinding],
-    _module: &str,
-    thrower: &str,
-) {
-    let call = join_call_args(args_str, "&err");
-    let mut w = CodeWriter::four_space().with_depth(1);
-    // Boxed optional scalars are producer-allocated (`T*`, null = none): the
-    // glue dereferences the value, frees the box with
-    // `weaveffi_free_bytes(ptr, sizeof(T))` per `ReturnFree::BoxedScalar`, and
-    // boxes the value for the JVM.
-    let boxed_scalar =
-        |w: &mut CodeWriter, c_ptr_ty: &str, val_ty: &str, jclass: &str, sig: &str, jcast: &str| {
-            w.line(format!("{c_ptr_ty} rv = ({c_ptr_ty}){}({});", c_sym, call));
-            splice(w, |o| release_jni_resources(o, params));
-            splice(w, |o| write_error_check(o, returns, thrower));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line(format!("{val_ty} rv_val = *rv;"));
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, sizeof(*rv));");
-            w.line(format!(
-                "jclass cls = (*env)->FindClass(env, \"java/lang/{jclass}\");"
-            ));
-            w.line(format!(
-                "jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"{sig}\");"
-            ));
-            w.line(format!(
-                "return (*env)->CallStaticObjectMethod(env, cls, mid, {jcast}rv_val);"
-            ));
-        };
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("const char* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line("jstring result = (*env)->NewStringUTF(env, rv);");
-            w.line("weaveffi_free_string(rv);");
-            w.line("return result;");
-        }
-        TypeRef::I8 | TypeRef::U8 => {
-            boxed_scalar(
-                &mut w,
-                "const int8_t*",
-                "int8_t",
-                "Byte",
-                "(B)Ljava/lang/Byte;",
-                "(jbyte)",
-            );
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            boxed_scalar(
-                &mut w,
-                "const int16_t*",
-                "int16_t",
-                "Short",
-                "(S)Ljava/lang/Short;",
-                "(jshort)",
-            );
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            boxed_scalar(
-                &mut w,
-                "const int32_t*",
-                "int32_t",
-                "Integer",
-                "(I)Ljava/lang/Integer;",
-                "(jint)",
-            );
-        }
-        // An optional record/rich-enum/handle/interface return is a *nullable
-        // owning pointer*: box the pointer value itself (do not dereference it
-        // as an integer); the Kotlin wrapper class adopts it.
-        TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            w.line(format!("const void* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Long\");");
-            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
-            w.line("return (*env)->CallStaticObjectMethod(env, cls, mid, (jlong)(intptr_t)rv);");
-        }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-            boxed_scalar(
-                &mut w,
-                "const int64_t*",
-                "int64_t",
-                "Long",
-                "(J)Ljava/lang/Long;",
-                "(jlong)",
-            );
-        }
-        TypeRef::F32 => {
-            boxed_scalar(
-                &mut w,
-                "const float*",
-                "float",
-                "Float",
-                "(F)Ljava/lang/Float;",
-                "(jfloat)",
-            );
-        }
-        TypeRef::F64 => {
-            boxed_scalar(
-                &mut w,
-                "const double*",
-                "double",
-                "Double",
-                "(D)Ljava/lang/Double;",
-                "(jdouble)",
-            );
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "const bool* rv = (const bool*){}({});",
-                c_sym, call
-            ));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line("bool rv_val = *rv;");
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, sizeof(*rv));");
-            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");");
-            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");");
-            w.line(
-                "return (*env)->CallStaticObjectMethod(env, cls, mid, rv_val ? JNI_TRUE : JNI_FALSE);",
-            );
-        }
-        _ => {
-            w.line(format!("void* rv = {}({});", c_sym, call));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("return (jobject)rv;");
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_list_return(
-    out: &mut String,
-    inner: &TypeRef,
-    c_sym: &str,
-    args_str: &str,
-    returns: Option<&TypeRef>,
-    params: &[ParamBinding],
-    thrower: &str,
-) {
-    let call = join_call_args(args_str, "&out_len, &err");
-    let mut w = CodeWriter::four_space().with_depth(1);
-    // Fixed-width scalar arrays are copied wholesale, then the producer buffer
-    // is released with `weaveffi_free_bytes(ptr, len * sizeof(T))` per
-    // `ReturnFree::Array` (element plan `ElemFree::None`).
-    let region_copy = |w: &mut CodeWriter,
-                       c_elem: &str,
-                       arr_ty: &str,
-                       new_arr: &str,
-                       set_region: &str,
-                       j_elem: &str| {
-        w.line(format!(
-            "const {c_elem}* rv = (const {c_elem}*){}({});",
-            c_sym, call
-        ));
-        splice(w, |o| release_jni_resources(o, params));
-        splice(w, |o| write_error_check(o, returns, thrower));
-        w.line(format!(
-            "{arr_ty} result = (*env)->{new_arr}(env, (jsize)out_len);"
-        ));
-        w.line(format!("if (result && rv) {{ (*env)->{set_region}(env, result, 0, (jsize)out_len, (const {j_elem}*)rv); }}"));
-        w.line(format!(
-            "weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof({c_elem}));"
-        ));
-        w.line("return result;");
-    };
-    match inner {
-        TypeRef::I8 | TypeRef::U8 => {
-            region_copy(
-                &mut w,
-                "int8_t",
-                "jbyteArray",
-                "NewByteArray",
-                "SetByteArrayRegion",
-                "jbyte",
-            );
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            region_copy(
-                &mut w,
-                "int16_t",
-                "jshortArray",
-                "NewShortArray",
-                "SetShortArrayRegion",
-                "jshort",
-            );
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            region_copy(
-                &mut w,
-                "int32_t",
-                "jintArray",
-                "NewIntArray",
-                "SetIntArrayRegion",
-                "jint",
-            );
-        }
-        // A `u32` element is 4 bytes in the C buffer but surfaces as a Kotlin
-        // `Long`, so each element is widened individually (a region copy would
-        // misread the buffer).
-        TypeRef::U32 => {
-            w.line(format!(
-                "const uint32_t* rv = (const uint32_t*){}({});",
-                c_sym, call
-            ));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);");
-            w.block(
-                "for (jsize _li = 0; result && rv && _li < (jsize)out_len; _li++) {",
-                "}",
-                |w| {
-                    w.line("jlong _lv = (jlong)rv[_li];");
-                    w.line("(*env)->SetLongArrayRegion(env, result, _li, 1, &_lv);");
-                },
-            );
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(uint32_t));");
-            w.line("return result;");
-        }
-        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => {
-            region_copy(
-                &mut w,
-                "int64_t",
-                "jlongArray",
-                "NewLongArray",
-                "SetLongArrayRegion",
-                "jlong",
-            );
-        }
-        // Pointer elements (record, rich enum, typed handle, interface, and
-        // optionals of them; NULL = none) are widened one by one so 32-bit
-        // targets keep working; the Kotlin wrapper adopts each element pointer
-        // per `ElemFree::Object`.
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_)
-        | TypeRef::Optional(_) => {
-            w.line(format!(
-                "void* const* rv = (void* const*){}({});",
-                c_sym, call
-            ));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("jlongArray result = (*env)->NewLongArray(env, (jsize)out_len);");
-            w.block(
-                "for (jsize _li = 0; result && rv && _li < (jsize)out_len; _li++) {",
-                "}",
-                |w| {
-                    w.line("jlong _lv = (jlong)(intptr_t)rv[_li];");
-                    w.line("(*env)->SetLongArrayRegion(env, result, _li, 1, &_lv);");
-                },
-            );
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));");
-            w.line("return result;");
-        }
-        TypeRef::F32 => {
-            region_copy(
-                &mut w,
-                "float",
-                "jfloatArray",
-                "NewFloatArray",
-                "SetFloatArrayRegion",
-                "jfloat",
-            );
-        }
-        TypeRef::F64 => {
-            region_copy(
-                &mut w,
-                "double",
-                "jdoubleArray",
-                "NewDoubleArray",
-                "SetDoubleArrayRegion",
-                "jdouble",
-            );
-        }
-        TypeRef::Bool => {
-            region_copy(
-                &mut w,
-                "bool",
-                "jbooleanArray",
-                "NewBooleanArray",
-                "SetBooleanArrayRegion",
-                "jboolean",
-            );
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "const char* const* rv = (const char* const*){}({});",
-                c_sym, call
-            ));
-            splice(&mut w, |o| release_jni_resources(o, params));
-            splice(&mut w, |o| write_error_check(o, returns, thrower));
-            w.line("jclass _str_cls = (*env)->FindClass(env, \"java/lang/String\");");
-            w.line("jobjectArray result = (*env)->NewObjectArray(env, (jsize)out_len, _str_cls, NULL);");
-            w.block(
-                "for (jsize _li = 0; rv != NULL && _li < (jsize)out_len; _li++) {",
-                "}",
-                |w| {
-                    w.line("jstring _ls = rv[_li] ? (*env)->NewStringUTF(env, rv[_li]) : (*env)->NewStringUTF(env, \"\");");
-                    w.line("(*env)->SetObjectArrayElement(env, result, _li, _ls);");
-                    w.line("(*env)->DeleteLocalRef(env, _ls);");
-                    // ElemFree::String: each element is copied, then released.
-                    w.line("weaveffi_free_string(rv[_li]);");
-                },
-            );
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(const char*));");
-            w.line("return result;");
-        }
-        other => {
-            unreachable!("validation rejects list returns with composite element type {other:?}")
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_map_return(
-    out: &mut String,
-    key: &TypeRef,
-    val: &TypeRef,
-    c_sym: &str,
-    args_str: &str,
-    returns: Option<&TypeRef>,
-    params: &[ParamBinding],
-    thrower: &str,
-) {
-    let key_c = map_elem_c_type(key);
-    let val_c = map_elem_c_type(val);
-    let key_is_string = matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
-    let val_is_string = matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
-    let mut w = CodeWriter::four_space().with_depth(1);
-    w.line("size_t out_map_len = 0;");
-    // The map ABI hands back the base of each producer-allocated parallel
-    // array through `K** out_keys` / `V** out_values`, so both locals are
-    // passed by address.
-    w.line(format!("{kc}* out_keys = NULL;", kc = key_c));
-    w.line(format!("{vc}* out_vals = NULL;", vc = val_c));
-    w.line(format!(
-        "{}({});",
-        c_sym,
-        join_call_args(args_str, "&out_keys, &out_vals, &out_map_len, &err")
-    ));
-    splice(&mut w, |o| release_jni_resources(o, params));
-    splice(&mut w, |o| write_error_check(o, returns, thrower));
-    w.line("jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");");
-    w.line("jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_map_len);");
-    w.line("jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
-    w.block(
-        "for (size_t i = 0; out_keys && out_vals && i < out_map_len; i++) {",
-        "}",
-        |w| {
-            splice(w, |o| write_map_box_elem(o, key, "jkey", "out_keys"));
-            splice(w, |o| write_map_box_elem(o, val, "jval", "out_vals"));
-            w.line("(*env)->CallObjectMethod(env, result, hm_put, jkey, jval);");
-            w.line("(*env)->DeleteLocalRef(env, jkey);");
-            w.line("(*env)->DeleteLocalRef(env, jval);");
-            // ElemFree::String: each copied key/value string is released.
-            if key_is_string {
-                w.line("weaveffi_free_string(out_keys[i]);");
-            }
-            if val_is_string {
-                w.line("weaveffi_free_string(out_vals[i]);");
-            }
-        },
-    );
-    // ReturnFree::MapBuffers: both parallel arrays are released after their
-    // elements.
-    w.line(format!(
-        "weaveffi_free_bytes((uint8_t*)(void*)out_keys, out_map_len * sizeof({key_c}));"
-    ));
-    w.line(format!(
-        "weaveffi_free_bytes((uint8_t*)(void*)out_vals, out_map_len * sizeof({val_c}));"
-    ));
-    w.line("return result;");
-    out.push_str(&w.finish());
-}
-
-fn write_map_box_elem(out: &mut String, ty: &TypeRef, var: &str, arr: &str) {
-    let mut w = CodeWriter::four_space().with_depth(2);
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "jstring {v} = (*env)->NewStringUTF(env, {a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::I8 | TypeRef::U8 => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(B)Ljava/lang/Byte;\"), (jbyte){a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(S)Ljava/lang/Short;\"), (jshort){a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Interface(_) => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::F32 => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(F)Ljava/lang/Float;\"), (jfloat){a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::F64 => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
-                v = var
-            ));
-            w.line(format!(
-                "jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\"), {a}[i]);",
-                v = var,
-                a = arr
-            ));
-        }
-        _ => {
-            w.line(format!("jobject {v} = (jobject){a}[i];", v = var, a = arr));
-        }
-    }
-    out.push_str(&w.finish());
-}
-
 fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>, thrower: &str) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.block("if (err.code != 0) {", "}", |w| {
@@ -4273,6 +3064,15 @@ fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>, thrower: &str
 fn release_jni_resources(out: &mut String, params: &[ParamBinding]) {
     let mut w = CodeWriter::four_space().with_depth(1);
     for p in params {
+        // A buffered parameter's pinned encoding is read-only for the callee,
+        // so JNI_ABORT skips the pointless copy-back.
+        if abi::is_buffered(&p.ty) {
+            w.line(format!(
+                "(*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, JNI_ABORT);",
+                n = p.name
+            ));
+            continue;
+        }
         match &p.ty {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 w.line(format!(
@@ -4286,315 +3086,81 @@ fn release_jni_resources(out: &mut String, params: &[ParamBinding]) {
                     n = p.name
                 ));
             }
-            TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line(format!(
-                        "if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
-                        n = p.name
-                    ));
-                }
-                TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                    w.line(format!(
-                        "if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
-                        n = p.name
-                    ));
-                }
-                _ => {}
-            },
-            TypeRef::List(inner) => splice(&mut w, |o| write_list_release(o, &p.name, inner)),
-            TypeRef::Map(k, v) => splice(&mut w, |o| write_map_release(o, &p.name, k, v)),
+            // Only `Interface?` reaches here (an unboxed pointer value with
+            // nothing pinned), and scalars/handles need no release either.
             _ => {}
         }
     }
     out.push_str(&w.finish());
 }
 
-fn write_list_release(out: &mut String, name: &str, inner: &TypeRef) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    match inner {
-        TypeRef::I8 | TypeRef::U8 => {
-            w.line(format!(
-                "(*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            w.line(format!(
-                "(*env)->ReleaseShortArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            w.line(format!(
-                "(*env)->ReleaseIntArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            w.line(format!(
-                "(*env)->ReleaseLongArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::F32 => {
-            w.line(format!(
-                "(*env)->ReleaseFloatArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::F64 => {
-            w.line(format!(
-                "(*env)->ReleaseDoubleArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "(*env)->ReleaseBooleanArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.block(
-                format!(
-                    "for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
-                    n = name
-                ),
-                "}",
-                |w| {
-                    w.line(format!(
-                        "(*env)->ReleaseStringUTFChars(env, {n}_jstrs[{n}_ri], {n}_elems[{n}_ri]);",
-                        n = name
-                    ));
-                },
-            );
-            w.line(format!("free((void*){n}_elems);", n = name));
-            w.line(format!("free({n}_jstrs);", n = name));
-        }
-        other => {
-            unreachable!("validation rejects list params with composite element type {other:?}")
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn write_map_release(out: &mut String, name: &str, key: &TypeRef, val: &TypeRef) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    if matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        w.block(
-            format!(
-                "for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
-                n = name
-            ),
-            "}",
-            |w| {
-                w.line(format!(
-                    "(*env)->ReleaseStringUTFChars(env, {n}_jk[{n}_ri], {n}_c_keys[{n}_ri]);",
-                    n = name
-                ));
-            },
-        );
-        w.line(format!("free({n}_jk);", n = name));
-    }
-    if matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        w.block(
-            format!(
-                "for (jsize {n}_ri = 0; {n}_ri < {n}_len; {n}_ri++) {{",
-                n = name
-            ),
-            "}",
-            |w| {
-                w.line(format!(
-                    "(*env)->ReleaseStringUTFChars(env, {n}_jv[{n}_ri], {n}_c_vals[{n}_ri]);",
-                    n = name
-                ));
-            },
-        );
-        w.line(format!("free({n}_jv);", n = name));
-    }
-    w.line(format!("free((void*){n}_c_keys);", n = name));
-    w.line(format!("free((void*){n}_c_vals);", n = name));
-    out.push_str(&w.finish());
-}
-
-fn kotlin_getter_type(t: &TypeRef) -> String {
-    match t {
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).to_string(),
-        TypeRef::Enum(name) => local_type_name(name).to_string(),
-        other => kotlin_type(other),
-    }
-}
-
+/// Render a record as a plain Kotlin `data class` with typed properties, plus
+/// the internal `pack{Name}`/`unpack{Name}` buffer codecs. Records are value
+/// types crossing the ABI serialized in value buffers (fields in declaration
+/// order); they have no C symbols, native handles, or disposal.
 fn render_kotlin_struct(out: &mut String, s: &StructBinding) {
-    let create_params: Vec<String> = s
-        .fields
-        .iter()
-        .map(|f| format!("{}: {}", f.name, kotlin_type(&f.ty)))
-        .collect();
-    let param_names: Vec<&str> = s.fields.iter().map(|f| f.name.as_str()).collect();
-
     let mut w = CodeWriter::four_space();
     w.blank();
     writer_doc(&mut w, &s.doc);
-    // `handle` is `internal` (not `private`) so the `WeaveFFI` companion
-    // wrappers and builders in this module can unwrap `store.handle`; it
-    // stays hidden from external consumers.
-    w.line(format!(
-        "class {} internal constructor(internal var handle: Long) : java.io.Closeable {{",
-        s.name
-    ));
-    w.scope(|w| {
-        w.line("companion object {");
+    if s.fields.is_empty() {
+        w.line(format!("class {}", s.name));
+    } else if s.fields.iter().any(|f| f.doc.is_some()) {
+        w.line(format!("data class {}(", s.name));
         w.scope(|w| {
-            w.line("init { System.loadLibrary(\"weaveffi\") }");
-            w.blank();
-            w.line(format!(
-                "@JvmStatic external fun nativeCreate({}): Long",
-                create_params.join(", ")
-            ));
-            w.line("@JvmStatic external fun nativeDestroy(handle: Long)");
             for f in &s.fields {
-                let pascal = pascal_case(&f.name);
-                w.line(format!(
-                    "@JvmStatic external fun nativeGet{}(handle: Long): {}",
-                    pascal,
-                    kotlin_type(&f.ty)
-                ));
+                writer_doc(w, &f.doc);
+                w.line(format!("val {}: {},", f.name, kotlin_type(&f.ty)));
             }
-            w.blank();
-            w.line(format!(
-                "fun create({}): {} = {}(nativeCreate({}))",
-                create_params.join(", "),
-                s.name,
-                s.name,
-                param_names.join(", ")
-            ));
         });
-        w.line("}");
-        w.blank();
-
-        for f in &s.fields {
-            let pascal = pascal_case(&f.name);
-            let kt_type = kotlin_getter_type(&f.ty);
-            writer_doc(w, &f.doc);
-            match &f.ty {
-                TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-                    let local = local_type_name(name);
-                    w.line(format!(
-                        "val {}: {} get() = {}(nativeGet{}(handle))",
-                        f.name, kt_type, local, pascal
-                    ));
-                }
-                // The native getter returns the raw `Int` value, so an enum field
-                // must round-trip through the generated `fromValue` factory to yield
-                // the typed enum (the declared `kt_type` is the bare local class).
-                TypeRef::Enum(_) => {
-                    w.line(format!(
-                        "val {}: {} get() = {}.fromValue(nativeGet{}(handle))",
-                        f.name, kt_type, kt_type, pascal
-                    ));
-                }
-                _ => {
-                    w.line(format!(
-                        "val {}: {} get() = nativeGet{}(handle)",
-                        f.name, kt_type, pascal
-                    ));
-                }
-            }
-        }
-        w.blank();
-
-        w.line("override fun close() {");
-        w.scope(|w| {
-            w.line("if (handle != 0L) {");
-            w.scope(|w| {
-                w.line("nativeDestroy(handle)");
-                w.line("handle = 0L");
-            });
-            w.line("}");
-        });
-        w.line("}");
-        w.blank();
-        w.line("protected fun finalize() {");
-        w.scope(|w| {
-            w.line("close()");
-        });
-        w.line("}");
-    });
-    w.line("}");
+        w.line(")");
+    } else {
+        let fields: Vec<String> = s
+            .fields
+            .iter()
+            .map(|f| format!("val {}: {}", f.name, kotlin_type(&f.ty)))
+            .collect();
+        w.line(format!("data class {}({})", s.name, fields.join(", ")));
+    }
     out.push_str(&w.finish());
+    render_kotlin_struct_codecs(out, s);
 }
 
-fn render_kotlin_builder(out: &mut String, s: &StructBinding) {
-    if s.builder.is_none() {
+/// Render the internal buffer codecs for one record: `pack{Name}` writes the
+/// fields in declaration order; `unpack{Name}` reads them back.
+fn render_kotlin_struct_codecs(out: &mut String, s: &StructBinding) {
+    let name = &s.name;
+    let mut w = CodeWriter::four_space();
+    w.blank();
+    if s.fields.is_empty() {
+        w.line(format!(
+            "internal fun pack{name}(w: WeaveBufferWriter, v: {name}) {{}}"
+        ));
+        w.blank();
+        w.line(format!(
+            "internal fun unpack{name}(r: WeaveBufferReader): {name} = {name}()"
+        ));
+        out.push_str(&w.finish());
         return;
     }
-    let mut w = CodeWriter::four_space();
-    w.blank();
-    writer_doc(&mut w, &s.doc);
-    w.line(format!("class {}Builder {{", s.name));
+    w.line(format!(
+        "internal fun pack{name}(w: WeaveBufferWriter, v: {name}) {{"
+    ));
     w.scope(|w| {
         for f in &s.fields {
-            // Optional fields are already nullable; using a single nullable slot lets
-            // "unset" and "explicitly null" both mean "absent" (a legal value), and
-            // avoids a `T??` double-optional that `build()` could never satisfy.
-            let decl_ty = if matches!(&f.ty, TypeRef::Optional(_)) {
-                kotlin_getter_type(&f.ty)
-            } else {
-                format!("{}?", kotlin_getter_type(&f.ty))
-            };
-            w.line(format!("private var {}: {} = null", f.name, decl_ty));
+            w.line(kt_write_expr(&f.ty, "w", &format!("v.{}", f.name), 0));
         }
-        for f in &s.fields {
-            let pascal = pascal_case(&f.name);
-            let kt_getter = kotlin_getter_type(&f.ty);
-            writer_doc(w, &f.doc);
-            w.line(format!(
-                "fun with{}({}: {}): {}Builder {{",
-                pascal, f.name, kt_getter, s.name
-            ));
-            w.scope(|w| {
-                w.line(format!("this.{} = {}", f.name, f.name));
-                w.line("return this");
-            });
-            w.line("}");
-        }
-        w.line(format!("fun build(): {} {{", s.name));
-        w.scope(|w| {
-            if s.fields.is_empty() {
-                w.line(format!("return {}.create()", s.name));
-            } else {
-                w.line(format!("return {}.create(", s.name));
-                let n = s.fields.len();
-                w.scope(|w| {
-                    for (i, f) in s.fields.iter().enumerate() {
-                        // Optional fields pass through as-is (null = absent); required fields
-                        // are asserted present.
-                        let arg = if matches!(&f.ty, TypeRef::Optional(_)) {
-                            f.name.clone()
-                        } else {
-                            format!(
-                                "{} ?: throw IllegalStateException(\"missing field: {}\")",
-                                f.name, f.name
-                            )
-                        };
-                        let suffix = if i + 1 < n { "," } else { "" };
-                        w.line(format!("{}{}", arg, suffix));
-                    }
-                });
-                w.line(")");
-            }
-        });
-        w.line("}");
     });
     w.line("}");
+    w.blank();
+    w.line(format!(
+        "internal fun unpack{name}(r: WeaveBufferReader): {name} = {name}("
+    ));
+    w.scope(|w| {
+        for f in &s.fields {
+            w.line(format!("{},", kt_read_expr(&f.ty, "r")));
+        }
+    });
+    w.line(")");
     out.push_str(&w.finish());
 }
 
@@ -4785,729 +3351,6 @@ fn render_kotlin_interface(
     out.push_str(&w.finish());
 }
 
-fn render_jni_struct(
-    out: &mut String,
-    module_name: &str,
-    s: &StructBinding,
-    jni_prefix: &str,
-    c_prefix: &str,
-) {
-    // The opaque tag is precomputed in the shared model. `module_name`/`c_prefix`
-    // remain in use below for the by-name references to *other* struct types
-    // during field/parameter marshalling.
-    let prefix = &s.c_tag;
-
-    // nativeCreate: shared opaque-object constructor emitter (also used by rich
-    // enums, one constructor per variant).
-    render_jni_object_constructor(
-        out,
-        jni_prefix,
-        &s.name,
-        "nativeCreate",
-        &s.fields,
-        prefix,
-        &s.create.symbol,
-        module_name,
-        c_prefix,
-    );
-
-    // nativeDestroy
-    {
-        let mut w = CodeWriter::four_space();
-        w.line(format!(
-            "JNIEXPORT void JNICALL Java_{}_{}_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {{",
-            jni_prefix,
-            s.name
-        ));
-        w.scope(|w| {
-            w.line(format!(
-                "{}(({}*)(intptr_t)handle);",
-                s.destroy_symbol, prefix
-            ));
-        });
-        w.line("}");
-        w.blank();
-        out.push_str(&w.finish());
-    }
-
-    // nativeGet{Field} for each field: shared opaque-object getter emitter
-    // (also used by rich enums, namespaced per variant).
-    for f in &s.fields {
-        render_jni_object_getter(
-            out,
-            jni_prefix,
-            &s.name,
-            &pascal_case(&f.name),
-            f,
-            prefix,
-            module_name,
-            c_prefix,
-        );
-    }
-}
-
-/// Emit a JNI opaque-object constructor (`Java_<pkg>_<Class>_<method>`) that
-/// acquires each field's JNI args, calls the C ABI `create_symbol`
-/// (`{c_tag}_create` for a struct or `{c_tag}_{Variant}_new` for a rich-enum
-/// variant), checks `out_err`, releases borrowed JNI resources, and returns the
-/// produced pointer as a `jlong`. Shared by structs and rich enums so both
-/// marshal constructor arguments identically.
-#[allow(clippy::too_many_arguments)]
-fn render_jni_object_constructor(
-    out: &mut String,
-    jni_prefix: &str,
-    class_name: &str,
-    method: &str,
-    fields: &[FieldBinding],
-    c_tag: &str,
-    create_symbol: &str,
-    module_name: &str,
-    c_prefix: &str,
-) {
-    let mut jparams: Vec<String> = vec!["JNIEnv* env".into(), "jclass clazz".into()];
-    for f in fields {
-        jparams.push(format!("{} {}", jni_param_type(&f.ty), f.name));
-    }
-    let mut w = CodeWriter::four_space();
-    w.line(format!(
-        "JNIEXPORT jlong JNICALL Java_{}_{}_{}({}) {{",
-        jni_prefix,
-        class_name,
-        method,
-        jparams.join(", ")
-    ));
-    w.scope(|w| {
-        w.line("weaveffi_error err = {0, NULL};");
-
-        for f in fields {
-            splice(w, |o| write_param_acquire(o, &f.name, &f.ty));
-        }
-
-        let mut call_args: Vec<String> = Vec::new();
-        for f in fields {
-            build_c_call_args(&mut call_args, &f.name, &f.ty, module_name, c_prefix);
-        }
-
-        let args_str = call_args.join(", ");
-        w.line(format!(
-            "{}* rv = {}({});",
-            c_tag,
-            create_symbol,
-            join_call_args(&args_str, "&err")
-        ));
-        // Borrowed JNI resources are released before the error check so an
-        // error path cannot leak them.
-        for f in fields {
-            splice(w, |o| release_jni_resources_single(o, &f.name, &f.ty));
-        }
-
-        // Object create/destroy/getter symbols are infrastructure rather than
-        // user callables, so their failures always raise the generic brand
-        // exception.
-        splice(w, |o| {
-            write_error_check(o, Some(&TypeRef::Handle), "throw_weaveffi_error")
-        });
-
-        w.line("return (jlong)(intptr_t)rv;");
-    });
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Emit one JNI opaque-object field getter
-/// (`Java_<pkg>_<Class>_nativeGet<Suffix>`). The receiver is the `jlong` handle;
-/// the body marshals the C getter's result back to the JNI return type. Shared
-/// by structs (`Suffix` = the field's PascalCase) and rich enums (`Suffix` =
-/// `<Variant><Field>`), so both materialize getters identically.
-#[allow(clippy::too_many_arguments)]
-fn render_jni_object_getter(
-    out: &mut String,
-    jni_prefix: &str,
-    class_name: &str,
-    suffix: &str,
-    field: &FieldBinding,
-    c_tag: &str,
-    module_name: &str,
-    c_prefix: &str,
-) {
-    let jret = jni_ret_type(Some(&field.ty));
-    let mut w = CodeWriter::four_space();
-    w.line(format!(
-        "JNIEXPORT {} JNICALL Java_{}_{}_nativeGet{}(JNIEnv* env, jclass clazz, jlong handle) {{",
-        jret, jni_prefix, class_name, suffix
-    ));
-    splice(&mut w, |o| {
-        render_jni_getter_body(
-            o,
-            &field.ty,
-            &field.getter_symbol,
-            c_tag,
-            module_name,
-            c_prefix,
-        )
-    });
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Emit the body of an opaque-object field getter: cast the `jlong` handle to
-/// `const {c_tag}*`, invoke `getter_c`, and marshal its result to the matching
-/// JNI return (string/bytes freed via the runtime, scalars cast, nested
-/// struct/optional/list/map delegated to their specialized emitters).
-fn render_jni_getter_body(
-    out: &mut String,
-    ty: &TypeRef,
-    getter_c: &str,
-    prefix: &str,
-    module_name: &str,
-    c_prefix: &str,
-) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "const char* rv = {}((const {}*)(intptr_t)handle);",
-                getter_c, prefix
-            ));
-            w.line(
-                "jstring jout = rv ? (*env)->NewStringUTF(env, rv) : (*env)->NewStringUTF(env, \"\");",
-            );
-            w.line("weaveffi_free_string(rv);");
-            w.line("return jout;");
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("size_t out_len = 0;");
-            w.line(format!(
-                "const uint8_t* rv = {}((const {}*)(intptr_t)handle, &out_len);",
-                getter_c, prefix
-            ));
-            w.line("jbyteArray jout = (*env)->NewByteArray(env, (jsize)out_len);");
-            w.line(
-                "if (jout && rv) { (*env)->SetByteArrayRegion(env, jout, 0, (jsize)out_len, (const jbyte*)rv); }",
-            );
-            w.line("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);");
-            w.line("return jout;");
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "bool rv = {}((const {}*)(intptr_t)handle);",
-                getter_c, prefix
-            ));
-            w.line("return rv ? JNI_TRUE : JNI_FALSE;");
-        }
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-            let c_struct = weaveffi_core::utils::c_abi_struct_name(name, module_name, c_prefix);
-            w.line(format!(
-                "const {c_struct}* rv = {getter_c}((const {prefix}*)(intptr_t)handle);",
-                c_struct = c_struct,
-                getter_c = getter_c,
-                prefix = prefix
-            ));
-            w.line("return (jlong)(intptr_t)rv;");
-        }
-        TypeRef::Optional(inner) => {
-            splice(&mut w, |o| {
-                write_struct_optional_getter(o, inner, getter_c, prefix)
-            });
-        }
-        TypeRef::List(inner) => {
-            splice(&mut w, |o| {
-                write_struct_list_getter(o, inner, getter_c, prefix)
-            });
-        }
-        TypeRef::Map(k, v) => {
-            splice(&mut w, |o| {
-                write_struct_map_getter(o, k, v, getter_c, prefix)
-            });
-        }
-        other => {
-            let c_ty = c_type_for_return(other);
-            let jcast = jni_cast_for(other);
-            w.line(format!(
-                "{} rv = {}((const {}*)(intptr_t)handle);",
-                c_ty, getter_c, prefix
-            ));
-            w.line(format!("return {}rv;", jcast));
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-/// Render a rich (algebraic) enum's JNI bridge, mirroring [`render_jni_struct`]:
-/// one constructor per variant (`nativeNew<Variant>`), a shared `nativeTag`
-/// discriminant reader and `nativeDestroy`, and per-variant field getters
-/// (`nativeGet<Variant><Field>`). All opaque-object symbols come from the
-/// precomputed [`weaveffi_core::model::RichEnumBinding`], so the marshalling
-/// matches the C ABI the producer implements by construction.
-fn render_jni_rich_enum(
-    out: &mut String,
-    module_name: &str,
-    e: &EnumBinding,
-    jni_prefix: &str,
-    c_prefix: &str,
-) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
-    let c_tag = &e.c_tag;
-    let class_name = &e.name;
-
-    // One constructor per variant (a unit variant takes only `out_err`).
-    for v in &rich.variants {
-        let method = format!("nativeNew{}", pascal_case(&v.name));
-        render_jni_object_constructor(
-            out,
-            jni_prefix,
-            class_name,
-            &method,
-            &v.fields,
-            c_tag,
-            &v.create.symbol,
-            module_name,
-            c_prefix,
-        );
-    }
-
-    // Active-variant discriminant reader.
-    {
-        let mut w = CodeWriter::four_space();
-        w.line(format!(
-            "JNIEXPORT jint JNICALL Java_{}_{}_nativeTag(JNIEnv* env, jclass clazz, jlong handle) {{",
-            jni_prefix, class_name
-        ));
-        w.scope(|w| {
-            w.line(format!(
-                "return (jint){}((const {}*)(intptr_t)handle);",
-                rich.tag_symbol, c_tag
-            ));
-        });
-        w.line("}");
-        w.blank();
-        out.push_str(&w.finish());
-    }
-
-    // Destructor (identical contract to a struct's `nativeDestroy`).
-    {
-        let mut w = CodeWriter::four_space();
-        w.line(format!(
-            "JNIEXPORT void JNICALL Java_{}_{}_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {{",
-            jni_prefix, class_name
-        ));
-        w.scope(|w| {
-            w.line(format!(
-                "{}(({}*)(intptr_t)handle);",
-                rich.destroy_symbol, c_tag
-            ));
-        });
-        w.line("}");
-        w.blank();
-        out.push_str(&w.finish());
-    }
-
-    // Per-variant field getters, namespaced by variant.
-    for v in &rich.variants {
-        for f in &v.fields {
-            let suffix = format!("{}{}", pascal_case(&v.name), pascal_case(&f.name));
-            render_jni_object_getter(
-                out,
-                jni_prefix,
-                class_name,
-                &suffix,
-                f,
-                c_tag,
-                module_name,
-                c_prefix,
-            );
-        }
-    }
-}
-
-fn write_struct_optional_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    // Optional scalar fields come back producer-boxed (`T*`, null = none):
-    // dereference, free the box per `ReturnFree::BoxedScalar`, then box for
-    // the JVM.
-    let boxed_scalar =
-        |w: &mut CodeWriter, c_ptr_ty: &str, val_ty: &str, jclass: &str, sig: &str, jcast: &str| {
-            w.line(format!(
-                "{c_ptr_ty} rv = ({c_ptr_ty}){}((const {}*)(intptr_t)handle);",
-                getter_c, prefix
-            ));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line(format!("{val_ty} rv_val = *rv;"));
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, sizeof(*rv));");
-            w.line(format!(
-                "jclass cls = (*env)->FindClass(env, \"java/lang/{jclass}\");"
-            ));
-            w.line(format!(
-                "jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"{sig}\");"
-            ));
-            w.line(format!(
-                "return (*env)->CallStaticObjectMethod(env, cls, mid, {jcast}rv_val);"
-            ));
-        };
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "const char* rv = {}((const {}*)(intptr_t)handle);",
-                getter_c, prefix
-            ));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line("jstring jout = (*env)->NewStringUTF(env, rv);");
-            w.line("weaveffi_free_string(rv);");
-            w.line("return jout;");
-        }
-        TypeRef::I8 | TypeRef::U8 => {
-            boxed_scalar(
-                &mut w,
-                "const int8_t*",
-                "int8_t",
-                "Byte",
-                "(B)Ljava/lang/Byte;",
-                "(jbyte)",
-            );
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            boxed_scalar(
-                &mut w,
-                "const int16_t*",
-                "int16_t",
-                "Short",
-                "(S)Ljava/lang/Short;",
-                "(jshort)",
-            );
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            boxed_scalar(
-                &mut w,
-                "const int32_t*",
-                "int32_t",
-                "Integer",
-                "(I)Ljava/lang/Integer;",
-                "(jint)",
-            );
-        }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
-            boxed_scalar(
-                &mut w,
-                "const int64_t*",
-                "int64_t",
-                "Long",
-                "(J)Ljava/lang/Long;",
-                "(jlong)",
-            );
-        }
-        TypeRef::F32 => {
-            boxed_scalar(
-                &mut w,
-                "const float*",
-                "float",
-                "Float",
-                "(F)Ljava/lang/Float;",
-                "(jfloat)",
-            );
-        }
-        TypeRef::F64 => {
-            boxed_scalar(
-                &mut w,
-                "const double*",
-                "double",
-                "Double",
-                "(D)Ljava/lang/Double;",
-                "(jdouble)",
-            );
-        }
-        TypeRef::Bool => {
-            w.line(format!(
-                "const bool* rv = (const bool*){}((const {}*)(intptr_t)handle);",
-                getter_c, prefix
-            ));
-            w.line("if (rv == NULL) { return NULL; }");
-            w.line("bool rv_val = *rv;");
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, sizeof(*rv));");
-            w.line("jclass cls = (*env)->FindClass(env, \"java/lang/Boolean\");");
-            w.line("jmethodID mid = (*env)->GetStaticMethodID(env, cls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");");
-            w.line(
-                "return (*env)->CallStaticObjectMethod(env, cls, mid, rv_val ? JNI_TRUE : JNI_FALSE);",
-            );
-        }
-        // Optional pointer fields are nullable owning pointers: the Kotlin
-        // wrapper adopts the value, so nothing is freed here.
-        _ => {
-            w.line(format!(
-                "const void* rv = {}((const {}*)(intptr_t)handle);",
-                getter_c, prefix
-            ));
-            w.line("if (!rv) { return 0; }");
-            w.line("return (jlong)(intptr_t)rv;");
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn write_struct_list_getter(out: &mut String, inner: &TypeRef, getter_c: &str, prefix: &str) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    // Fixed-width scalar buffers are copied wholesale, then released with
-    // `weaveffi_free_bytes(ptr, len * sizeof(T))` per `ReturnFree::Array`.
-    let region_copy = |w: &mut CodeWriter,
-                       c_elem: &str,
-                       arr_ty: &str,
-                       new_arr: &str,
-                       set_region: &str,
-                       j_elem: &str| {
-        w.line("size_t out_len = 0;");
-        w.line(format!(
-            "const {c_elem}* rv = (const {c_elem}*){}((const {}*)(intptr_t)handle, &out_len);",
-            getter_c, prefix
-        ));
-        w.line(format!(
-            "{arr_ty} jout = (*env)->{new_arr}(env, (jsize)out_len);"
-        ));
-        w.line(format!("if (jout && rv) {{ (*env)->{set_region}(env, jout, 0, (jsize)out_len, (const {j_elem}*)rv); }}"));
-        w.line(format!(
-            "weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof({c_elem}));"
-        ));
-        w.line("return jout;");
-    };
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("size_t out_len = 0;");
-            w.line(format!(
-                "const char** rv = (const char**){}((const {}*)(intptr_t)handle, &out_len);",
-                getter_c, prefix
-            ));
-            w.line("jclass scls = (*env)->FindClass(env, \"java/lang/String\");");
-            w.line("jobjectArray jout = (*env)->NewObjectArray(env, (jsize)out_len, scls, NULL);");
-            w.block("if (jout && rv) {", "}", |w| {
-                w.block("for (size_t i = 0; i < out_len; i++) {", "}", |w| {
-                    w.line("jstring s = rv[i] ? (*env)->NewStringUTF(env, rv[i]) : (*env)->NewStringUTF(env, \"\");");
-                    w.line("(*env)->SetObjectArrayElement(env, jout, (jsize)i, s);");
-                    w.line("(*env)->DeleteLocalRef(env, s);");
-                    w.line("weaveffi_free_string(rv[i]);");
-                });
-            });
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(const char*));");
-            w.line("return jout;");
-        }
-        TypeRef::I8 | TypeRef::U8 => {
-            region_copy(
-                &mut w,
-                "int8_t",
-                "jbyteArray",
-                "NewByteArray",
-                "SetByteArrayRegion",
-                "jbyte",
-            );
-        }
-        TypeRef::I16 | TypeRef::U16 => {
-            region_copy(
-                &mut w,
-                "int16_t",
-                "jshortArray",
-                "NewShortArray",
-                "SetShortArrayRegion",
-                "jshort",
-            );
-        }
-        TypeRef::I32 | TypeRef::Enum(_) => {
-            region_copy(
-                &mut w,
-                "int32_t",
-                "jintArray",
-                "NewIntArray",
-                "SetIntArrayRegion",
-                "jint",
-            );
-        }
-        // A `u32` element is 4 bytes in the C buffer but surfaces as a Kotlin
-        // `Long`, so each element is widened individually.
-        TypeRef::U32 => {
-            w.line("size_t out_len = 0;");
-            w.line(format!(
-                "const uint32_t* rv = (const uint32_t*){}((const {}*)(intptr_t)handle, &out_len);",
-                getter_c, prefix
-            ));
-            w.line("jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);");
-            w.block(
-                "for (jsize i = 0; jout && rv && i < (jsize)out_len; i++) {",
-                "}",
-                |w| {
-                    w.line("jlong lv = (jlong)rv[i];");
-                    w.line("(*env)->SetLongArrayRegion(env, jout, i, 1, &lv);");
-                },
-            );
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(uint32_t));");
-            w.line("return jout;");
-        }
-        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => {
-            region_copy(
-                &mut w,
-                "int64_t",
-                "jlongArray",
-                "NewLongArray",
-                "SetLongArrayRegion",
-                "jlong",
-            );
-        }
-        // Pointer elements are widened one by one so 32-bit targets keep
-        // working; the Kotlin wrapper adopts each element pointer.
-        TypeRef::TypedHandle(_) | TypeRef::Record(_) | TypeRef::RichEnum(_) => {
-            w.line("size_t out_len = 0;");
-            w.line(format!(
-                "void* const* rv = (void* const*){}((const {}*)(intptr_t)handle, &out_len);",
-                getter_c, prefix
-            ));
-            w.line("jlongArray jout = (*env)->NewLongArray(env, (jsize)out_len);");
-            w.block(
-                "for (jsize i = 0; jout && rv && i < (jsize)out_len; i++) {",
-                "}",
-                |w| {
-                    w.line("jlong lv = (jlong)(intptr_t)rv[i];");
-                    w.line("(*env)->SetLongArrayRegion(env, jout, i, 1, &lv);");
-                },
-            );
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(void*));");
-            w.line("return jout;");
-        }
-        TypeRef::F32 => {
-            region_copy(
-                &mut w,
-                "float",
-                "jfloatArray",
-                "NewFloatArray",
-                "SetFloatArrayRegion",
-                "jfloat",
-            );
-        }
-        TypeRef::F64 => {
-            region_copy(
-                &mut w,
-                "double",
-                "jdoubleArray",
-                "NewDoubleArray",
-                "SetDoubleArrayRegion",
-                "jdouble",
-            );
-        }
-        TypeRef::Bool => {
-            w.line("size_t out_len = 0;");
-            w.line(format!(
-                "const bool* rv = (const bool*){}((const {}*)(intptr_t)handle, &out_len);",
-                getter_c, prefix
-            ));
-            w.line("jbooleanArray jout = (*env)->NewBooleanArray(env, (jsize)out_len);");
-            w.block("if (jout && rv) {", "}", |w| {
-                w.block("for (jsize i = 0; i < (jsize)out_len; i++) {", "}", |w| {
-                    w.line("jboolean val = rv[i] ? JNI_TRUE : JNI_FALSE;");
-                    w.line("(*env)->SetBooleanArrayRegion(env, jout, i, 1, &val);");
-                });
-            });
-            w.line("weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(bool));");
-            w.line("return jout;");
-        }
-        _ => {
-            w.line("size_t out_len = 0;");
-            w.line(format!(
-                "const void* rv = {}((const {}*)(intptr_t)handle, &out_len);",
-                getter_c, prefix
-            ));
-            w.line("(void)rv; (void)out_len;");
-            w.line("return NULL;");
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-/// Materialize a struct map getter into a `java.util.HashMap`. The C surface is
-/// the triple-pointer out-param form
-/// `void get(const T* ptr, K*** out_keys, V*** out_values, size_t* out_len)`.
-fn write_struct_map_getter(
-    out: &mut String,
-    key: &TypeRef,
-    val: &TypeRef,
-    getter_c: &str,
-    prefix: &str,
-) {
-    let key_c = map_elem_c_type(key);
-    let val_c = map_elem_c_type(val);
-    let key_is_string = matches!(key, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
-    let val_is_string = matches!(val, TypeRef::StringUtf8 | TypeRef::BorrowedStr);
-    let mut w = CodeWriter::four_space().with_depth(1);
-    w.line(format!("{kc}* out_keys = NULL;", kc = key_c));
-    w.line(format!("{vc}* out_vals = NULL;", vc = val_c));
-    w.line("size_t out_len = 0;");
-    w.line(format!(
-        "{getter}((const {prefix}*)(intptr_t)handle, &out_keys, &out_vals, &out_len);",
-        getter = getter_c,
-        prefix = prefix
-    ));
-    w.line("jclass hm_cls = (*env)->FindClass(env, \"java/util/HashMap\");");
-    w.line("jobject result = (*env)->NewObject(env, hm_cls, (*env)->GetMethodID(env, hm_cls, \"<init>\", \"(I)V\"), (jint)out_len);");
-    w.line("jmethodID hm_put = (*env)->GetMethodID(env, hm_cls, \"put\", \"(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;\");");
-    w.block("for (size_t i = 0; i < out_len; i++) {", "}", |w| {
-        splice(w, |o| write_map_box_elem(o, key, "jkey", "out_keys"));
-        splice(w, |o| write_map_box_elem(o, val, "jval", "out_vals"));
-        w.line("(*env)->CallObjectMethod(env, result, hm_put, jkey, jval);");
-        w.line("(*env)->DeleteLocalRef(env, jkey);");
-        w.line("(*env)->DeleteLocalRef(env, jval);");
-        if key_is_string {
-            w.line("weaveffi_free_string(out_keys[i]);");
-        }
-        if val_is_string {
-            w.line("weaveffi_free_string(out_vals[i]);");
-        }
-    });
-    // ReturnFree::MapBuffers: both parallel arrays are released after their
-    // elements.
-    w.line(format!(
-        "weaveffi_free_bytes((uint8_t*)(void*)out_keys, out_len * sizeof({key_c}));"
-    ));
-    w.line(format!(
-        "weaveffi_free_bytes((uint8_t*)(void*)out_vals, out_len * sizeof({val_c}));"
-    ));
-    w.line("return result;");
-    out.push_str(&w.finish());
-}
-
-fn release_jni_resources_single(out: &mut String, name: &str, ty: &TypeRef) {
-    let mut w = CodeWriter::four_space().with_depth(1);
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "(*env)->ReleaseStringUTFChars(env, {n}, {n}_chars);",
-                n = name
-            ));
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line(format!(
-                "(*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0);",
-                n = name
-            ));
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!(
-                    "if ({n} != NULL) {{ (*env)->ReleaseStringUTFChars(env, {n}, {n}_chars); }}",
-                    n = name
-                ));
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                w.line(format!(
-                    "if ({n} != NULL && {n}_elems != NULL) {{ (*env)->ReleaseByteArrayElements(env, {n}, {n}_elems, 0); }}",
-                    n = name
-                ));
-            }
-            _ => {}
-        },
-        TypeRef::List(inner) => splice(&mut w, |o| write_list_release(o, name, inner)),
-        TypeRef::Map(k, v) => splice(&mut w, |o| write_map_release(o, name, k, v)),
-        _ => {}
-    }
-    out.push_str(&w.finish());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5519,7 +3362,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".to_string(),
+            version: "0.6.0".to_string(),
             modules,
             generators: None,
             package: None,
@@ -5575,7 +3418,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -5713,18 +3555,21 @@ mod tests {
     // --- Rich (algebraic) enum tests ---
 
     #[test]
-    fn kotlin_rich_enum_is_handle_wrapper_class_not_plain_enum() {
+    fn kotlin_rich_enum_is_sealed_class_not_plain_enum() {
         let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
         assert!(
-            kt.contains(
-                "class Shape internal constructor(internal var handle: Long) : java.io.Closeable {"
-            ),
-            "rich enum must be a Closeable handle-wrapper class: {kt}"
+            kt.contains("sealed class Shape {"),
+            "rich enum must be a sealed class: {kt}"
         );
-        // It must NOT degrade into a plain `enum class Shape(...)`.
+        // It must NOT degrade into a plain `enum class Shape(...)`, and it has
+        // no native handle or disposal surface.
         assert!(
             !kt.contains("enum class Shape("),
             "rich enum must not be emitted as a plain enum class: {kt}"
+        );
+        assert!(
+            !kt.contains("class Shape internal constructor"),
+            "rich enum must not be a handle-wrapper class: {kt}"
         );
         // The plain sibling enum `Channel` is still a normal enum class.
         assert!(
@@ -5734,118 +3579,112 @@ mod tests {
     }
 
     #[test]
-    fn kotlin_rich_enum_native_constructors() {
+    fn kotlin_rich_enum_variant_subtypes() {
         let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
         for expected in [
-            "@JvmStatic external fun nativeNewEmpty(): Long",
-            "@JvmStatic external fun nativeNewCircle(radius: Double): Long",
-            "@JvmStatic external fun nativeNewRectangle(width: Float, height: Float): Long",
-            "@JvmStatic external fun nativeNewLabeled(label: String, count: Byte): Long",
+            "object Empty : Shape()",
+            "data class Circle(val radius: Double) : Shape()",
+            "data class Rectangle(val width: Float, val height: Float) : Shape()",
+            "data class Labeled(val label: String, val count: Byte) : Shape()",
         ] {
-            assert!(kt.contains(expected), "missing `{expected}`: {kt}");
+            assert!(kt.contains(expected), "missing variant `{expected}`: {kt}");
         }
     }
 
     #[test]
-    fn kotlin_rich_enum_variant_factories() {
+    fn kotlin_rich_enum_pack_writes_tag_then_fields() {
         let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
+        assert!(
+            kt.contains("internal fun packShape(w: WeaveBufferWriter, v: Shape) {"),
+            "missing packShape codec: {kt}"
+        );
+        assert!(
+            kt.contains("is Shape.Empty -> w.writeI32(0)"),
+            "unit variant must write only its tag: {kt}"
+        );
+        let circle = kt.split("is Shape.Circle -> {").nth(1).unwrap();
+        assert!(
+            circle.contains("w.writeI32(1)") && circle.contains("w.writeF64(v.radius)"),
+            "Circle must write tag 1 then its f64 field: {kt}"
+        );
+        let labeled = kt.split("is Shape.Labeled -> {").nth(1).unwrap();
+        assert!(
+            labeled.contains("w.writeI32(3)")
+                && labeled.contains("w.writeString(v.label)")
+                && labeled.contains("w.writeI8(v.count)"),
+            "Labeled must write tag 3 then its fields in order: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_rich_enum_unpack_dispatches_on_tag() {
+        let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
+        assert!(
+            kt.contains(
+                "internal fun unpackShape(r: WeaveBufferReader): Shape = when (val tag = r.readI32()) {"
+            ),
+            "missing unpackShape codec: {kt}"
+        );
         for expected in [
-            "fun empty(): Shape = Shape(nativeNewEmpty())",
-            "fun circle(radius: Double): Shape = Shape(nativeNewCircle(radius))",
-            "fun rectangle(width: Float, height: Float): Shape = Shape(nativeNewRectangle(width, height))",
-            "fun labeled(label: String, count: Byte): Shape = Shape(nativeNewLabeled(label, count))",
+            "0 -> Shape.Empty",
+            "1 -> Shape.Circle(r.readF64())",
+            "2 -> Shape.Rectangle(r.readF32(), r.readF32())",
+            "3 -> Shape.Labeled(r.readString(), r.readI8())",
         ] {
-            assert!(kt.contains(expected), "missing factory `{expected}`: {kt}");
+            assert!(
+                kt.contains(expected),
+                "missing unpack arm `{expected}`: {kt}"
+            );
         }
-    }
-
-    #[test]
-    fn kotlin_rich_enum_tag_reader_and_nested_enum() {
-        let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
         assert!(
-            kt.contains("@JvmStatic external fun nativeTag(handle: Long): Int"),
-            "missing nativeTag external: {kt}"
-        );
-        assert!(
-            kt.contains("enum class Tag(val value: Int) {"),
-            "missing nested Tag enum: {kt}"
-        );
-        assert!(kt.contains("Circle(1),"), "missing Circle tag value: {kt}");
-        assert!(
-            kt.contains("Labeled(3);"),
-            "missing Labeled tag value: {kt}"
-        );
-        assert!(
-            kt.contains("val tag: Tag get() = Tag.fromValue(nativeTag(handle))"),
-            "missing tag reader property: {kt}"
+            kt.contains("unknown Shape tag $tag"),
+            "unpack must reject unknown tags: {kt}"
         );
     }
 
     #[test]
-    fn kotlin_rich_enum_field_getters() {
+    fn kotlin_rich_enum_has_no_native_surface() {
         let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
-        for expected in [
-            "@JvmStatic external fun nativeGetCircleRadius(handle: Long): Double",
-            "@JvmStatic external fun nativeGetLabeledLabel(handle: Long): String",
-            "@JvmStatic external fun nativeGetLabeledCount(handle: Long): Byte",
-            "val circleRadius: Double get() = nativeGetCircleRadius(handle)",
-            "val rectangleWidth: Float get() = nativeGetRectangleWidth(handle)",
-            "val rectangleHeight: Float get() = nativeGetRectangleHeight(handle)",
-            "val labeledLabel: String get() = nativeGetLabeledLabel(handle)",
-            "val labeledCount: Byte get() = nativeGetLabeledCount(handle)",
+        for forbidden in [
+            "nativeNewCircle",
+            "nativeTag",
+            "nativeGetCircleRadius",
+            "Shape.nativeDestroy",
         ] {
-            assert!(kt.contains(expected), "missing getter `{expected}`: {kt}");
+            assert!(
+                !kt.contains(forbidden),
+                "rich enums have no C symbols; found `{forbidden}`: {kt}"
+            );
         }
-    }
-
-    #[test]
-    fn kotlin_rich_enum_closeable() {
-        let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
-        let shape_section = kt.split("class Shape internal constructor").nth(1).unwrap();
-        assert!(
-            shape_section.contains("override fun close() {"),
-            "missing close(): {kt}"
-        );
-        assert!(
-            shape_section.contains("nativeDestroy(handle)"),
-            "close must call nativeDestroy: {kt}"
-        );
-        assert!(
-            shape_section.contains("handle = 0L"),
-            "close must zero the handle: {kt}"
-        );
-        assert!(
-            shape_section.contains("protected fun finalize() {"),
-            "missing finalize(): {kt}"
-        );
     }
 
     #[test]
     fn kotlin_rich_enum_function_marshalling() {
         let kt = render_kotlin(&make_shapes_api(), "com.weaveffi", false, "shapes.yml");
-        // A rich enum passed in unwraps to its handle; one returned is re-wrapped.
+        // A rich enum passed in is packed into a ByteArray; one returned is
+        // decoded from the ByteArray the JNI shim copies back.
         assert!(
             kt.contains(
-                "@JvmStatic fun shapesDescribe(shape: Shape): String = shapesDescribeJni(shape.handle)"
+                "@JvmStatic fun shapesDescribe(shape: Shape): String = shapesDescribeJni(weaveEncode { w -> packShape(w, shape) })"
             ),
-            "rich-enum param must marshal via `.handle`: {kt}"
-        );
-        assert!(
-            kt.contains(
-                "@JvmStatic fun shapesScale(shape: Shape, factor: Double): Shape = Shape(shapesScaleJni(shape.handle, factor))"
-            ),
-            "rich-enum return must re-wrap into the class: {kt}"
+            "rich-enum param must marshal via packShape: {kt}"
         );
         assert!(
             kt.contains(
-                "@JvmStatic private external fun shapesScaleJni(shape: Long, factor: Double): Long"
+                "@JvmStatic fun shapesScale(shape: Shape, factor: Double): Shape = weaveDecode(shapesScaleJni(weaveEncode { w -> packShape(w, shape) }, factor)) { r -> unpackShape(r) }"
             ),
-            "JNI launcher must carry the rich enum as a raw Long: {kt}"
+            "rich-enum return must decode via unpackShape: {kt}"
+        );
+        assert!(
+            kt.contains(
+                "@JvmStatic private external fun shapesScaleJni(shape: ByteArray, factor: Double): ByteArray"
+            ),
+            "JNI external must carry the rich enum as a ByteArray: {kt}"
         );
     }
 
     #[test]
-    fn jni_rich_enum_constructors() {
+    fn jni_rich_enum_param_pins_and_releases_buffer() {
         let jni = render_jni_c(
             &make_shapes_api(),
             "com.weaveffi",
@@ -5853,59 +3692,30 @@ mod tests {
             "shapes.yml",
             "weaveffi",
         );
-        assert!(
-            jni.contains("JNIEXPORT jlong JNICALL Java_com_weaveffi_Shape_nativeNewEmpty(JNIEnv* env, jclass clazz) {"),
-            "missing nativeNewEmpty export: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_shapes_Shape_Empty_new(&err)"),
-            "unit-variant constructor must call `_Empty_new(&err)`: {jni}"
-        );
-        assert!(
-            jni.contains("Java_com_weaveffi_Shape_nativeNewCircle(JNIEnv* env, jclass clazz, jdouble radius)"),
-            "missing nativeNewCircle export: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_shapes_Shape_Circle_new((double)radius, &err)"),
-            "Circle constructor must marshal its f64 payload: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_shapes_Shape_Rectangle_new((float)width, (float)height, &err)"),
-            "Rectangle constructor must marshal its two f32 payloads: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_rich_enum_constructor_string_param_acquire_release() {
-        let jni = render_jni_c(
-            &make_shapes_api(),
-            "com.weaveffi",
-            false,
-            "shapes.yml",
-            "weaveffi",
-        );
-        let labeled = jni
-            .split("Java_com_weaveffi_Shape_nativeNewLabeled")
+        let describe = jni
+            .split("Java_com_weaveffi_WeaveFFI_shapesDescribeJni")
             .nth(1)
             .unwrap();
         assert!(
-            labeled
-                .contains("const char* label_chars = (*env)->GetStringUTFChars(env, label, NULL);"),
-            "Labeled constructor must acquire the jstring: {jni}"
+            describe
+                .contains("jbyte* shape_elems = (*env)->GetByteArrayElements(env, shape, NULL);"),
+            "buffered param must pin the ByteArray: {jni}"
         );
         assert!(
-            labeled
-                .contains("weaveffi_shapes_Shape_Labeled_new(label_chars, (uint8_t)count, &err)"),
-            "Labeled constructor must pass chars + u8: {jni}"
+            describe.contains(
+                "weaveffi_shapes_describe((const uint8_t*)shape_elems, (size_t)shape_len, &err)"
+            ),
+            "buffered param must pass borrowed (ptr, len): {jni}"
         );
         assert!(
-            labeled.contains("(*env)->ReleaseStringUTFChars(env, label, label_chars);"),
-            "Labeled constructor must release the jstring: {jni}"
+            describe
+                .contains("(*env)->ReleaseByteArrayElements(env, shape, shape_elems, JNI_ABORT);"),
+            "buffered param must be released without copy-back: {jni}"
         );
     }
 
     #[test]
-    fn jni_rich_enum_constructor_error_check() {
+    fn jni_rich_enum_return_copies_and_frees_buffer() {
         let jni = render_jni_c(
             &make_shapes_api(),
             "com.weaveffi",
@@ -5913,19 +3723,26 @@ mod tests {
             "shapes.yml",
             "weaveffi",
         );
-        let circle = jni
-            .split("Java_com_weaveffi_Shape_nativeNewCircle")
+        let scale = jni
+            .split("Java_com_weaveffi_WeaveFFI_shapesScaleJni")
             .nth(1)
             .unwrap();
         assert!(
-            circle.contains("if (err.code != 0)")
-                && circle.contains("throw_weaveffi_error(env, &err)"),
-            "constructor must surface producer errors: {jni}"
+            scale.contains("const uint8_t* rv = weaveffi_shapes_scale((const uint8_t*)shape_elems, (size_t)shape_len, (double)factor, &out_len, &err);"),
+            "buffered return must thread the out_len slot: {jni}"
+        );
+        assert!(
+            scale.contains("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"),
+            "buffered return must copy into a ByteArray: {jni}"
+        );
+        assert!(
+            scale.contains("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"),
+            "the producer allocation must be freed after copying: {jni}"
         );
     }
 
     #[test]
-    fn jni_rich_enum_tag_and_destroy() {
+    fn jni_rich_enum_has_no_object_bridge() {
         let jni = render_jni_c(
             &make_shapes_api(),
             "com.weaveffi",
@@ -5933,82 +3750,17 @@ mod tests {
             "shapes.yml",
             "weaveffi",
         );
-        assert!(
-            jni.contains("JNIEXPORT jint JNICALL Java_com_weaveffi_Shape_nativeTag(JNIEnv* env, jclass clazz, jlong handle) {"),
-            "missing nativeTag export: {jni}"
-        );
-        assert!(
-            jni.contains("return (jint)weaveffi_shapes_Shape_tag((const weaveffi_shapes_Shape*)(intptr_t)handle);"),
-            "tag reader must call the C ABI tag symbol: {jni}"
-        );
-        assert!(
-            jni.contains("JNIEXPORT void JNICALL Java_com_weaveffi_Shape_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {"),
-            "missing nativeDestroy export: {jni}"
-        );
-        assert!(
-            jni.contains(
-                "weaveffi_shapes_Shape_destroy((weaveffi_shapes_Shape*)(intptr_t)handle);"
-            ),
-            "destroy must call the C ABI destroy symbol: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_rich_enum_field_getters() {
-        let jni = render_jni_c(
-            &make_shapes_api(),
-            "com.weaveffi",
-            false,
-            "shapes.yml",
-            "weaveffi",
-        );
-        assert!(
-            jni.contains("JNIEXPORT jdouble JNICALL Java_com_weaveffi_Shape_nativeGetCircleRadius"),
-            "missing nativeGetCircleRadius export: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_shapes_Shape_Circle_get_radius((const weaveffi_shapes_Shape*)(intptr_t)handle)"),
-            "radius getter must call the namespaced C getter: {jni}"
-        );
-        // String getter materializes and frees the producer-owned string.
-        let label_getter = jni
-            .split("Java_com_weaveffi_Shape_nativeGetLabeledLabel")
-            .nth(1)
-            .unwrap();
-        assert!(
-            label_getter.contains("weaveffi_shapes_Shape_Labeled_get_label((const weaveffi_shapes_Shape*)(intptr_t)handle)"),
-            "label getter must call the namespaced C getter: {jni}"
-        );
-        assert!(
-            label_getter.contains("weaveffi_free_string(rv);"),
-            "label getter must free the producer string: {jni}"
-        );
-        assert!(
-            jni.contains("JNIEXPORT jbyte JNICALL Java_com_weaveffi_Shape_nativeGetLabeledCount")
-                && jni.contains("weaveffi_shapes_Shape_Labeled_get_count((const weaveffi_shapes_Shape*)(intptr_t)handle)"),
-            "missing u8 count getter: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_rich_enum_function_marshalling() {
-        let jni = render_jni_c(
-            &make_shapes_api(),
-            "com.weaveffi",
-            false,
-            "shapes.yml",
-            "weaveffi",
-        );
-        assert!(
-            jni.contains(
-                "weaveffi_shapes_describe((const weaveffi_shapes_Shape*)(intptr_t)shape, &err)"
-            ),
-            "describe must cast the handle to the opaque pointer: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_shapes_Shape* rv = weaveffi_shapes_scale((const weaveffi_shapes_Shape*)(intptr_t)shape, (double)factor, &err);"),
-            "scale must return the opaque pointer for re-wrapping: {jni}"
-        );
+        for forbidden in [
+            "Java_com_weaveffi_Shape_",
+            "weaveffi_shapes_Shape_tag",
+            "weaveffi_shapes_Shape_Circle_new",
+            "weaveffi_shapes_Shape_destroy",
+        ] {
+            assert!(
+                !jni.contains(forbidden),
+                "rich enums have no C symbols; found `{forbidden}`: {jni}"
+            );
+        }
     }
 
     #[test]
@@ -6023,14 +3775,19 @@ mod tests {
             std::fs::read_to_string(out.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
                 .unwrap();
         assert!(
-            kotlin.contains("class Shape internal constructor(internal var handle: Long)"),
-            "rich enum class missing from generated Kotlin file"
+            kotlin.contains("sealed class Shape {"),
+            "rich enum sealed class missing from generated Kotlin file"
+        );
+        assert!(
+            kotlin.contains("internal fun packShape(")
+                && kotlin.contains("internal fun unpackShape("),
+            "rich enum codecs missing from generated Kotlin file"
         );
         let jni = std::fs::read_to_string(out.join("android/src/main/cpp/weaveffi_jni.c")).unwrap();
         assert!(
-            jni.contains("Java_com_weaveffi_Shape_nativeNewCircle")
-                && jni.contains("weaveffi_shapes_Shape_tag("),
-            "rich enum JNI bridge missing from generated JNI file"
+            jni.contains("Java_com_weaveffi_WeaveFFI_scaleJni")
+                && jni.contains("weaveffi_shapes_scale((const uint8_t*)shape_elems"),
+            "buffered rich enum marshalling missing from generated JNI file"
         );
     }
 
@@ -6110,7 +3867,7 @@ mod tests {
     }
 
     #[test]
-    fn list_of_string_return_marshals_object_array() {
+    fn list_of_string_return_is_buffered() {
         let api = make_api(vec![Module {
             name: "m".to_string(),
             functions: vec![Function {
@@ -6134,17 +3891,17 @@ mod tests {
         }]);
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("NewObjectArray"),
-            "string-list return must build a String[]: {jni}"
-        );
-        assert!(
-            !jni.contains("    const void* rv"),
-            "string-list return must not silently return NULL: {jni}"
+            jni.contains("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"),
+            "string-list return crosses as one value buffer: {jni}"
         );
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("fun allNames(): Array<String>"),
-            "kotlin surface must be Array<String>: {kt}"
+            kt.contains("fun allNames(): List<String>"),
+            "kotlin surface must be List<String>: {kt}"
+        );
+        assert!(
+            kt.contains("weaveDecode(allNamesJni()) { r -> r.readList { r.readString() } }"),
+            "the wrapper must decode the buffered list: {kt}"
         );
     }
 
@@ -6175,7 +3932,7 @@ mod tests {
     }
 
     #[test]
-    fn list_string_return_frees_elements_and_buffer() {
+    fn buffered_list_return_frees_producer_buffer() {
         let api = make_fn_api(
             "all_names",
             vec![],
@@ -6184,19 +3941,17 @@ mod tests {
         );
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("weaveffi_free_string(rv[_li]);"),
-            "each copied string element must be freed: {jni}"
+            jni.contains("const uint8_t* rv = weaveffi_m_all_names(&out_len, &err);"),
+            "the buffered return threads the trailing out_len slot: {jni}"
         );
         assert!(
-            jni.contains(
-                "weaveffi_free_bytes((uint8_t*)(void*)rv, out_len * sizeof(const char*));"
-            ),
-            "the array buffer must be freed after its elements: {jni}"
+            jni.contains("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"),
+            "the producer buffer must be freed after copying: {jni}"
         );
     }
 
     #[test]
-    fn boxed_optional_scalar_return_is_freed() {
+    fn optional_scalar_return_is_buffered() {
         let api = make_fn_api(
             "find_age",
             vec![],
@@ -6205,17 +3960,18 @@ mod tests {
         );
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("int64_t rv_val = *rv;"),
-            "the boxed scalar must be dereferenced before freeing: {jni}"
+            jni.contains("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"),
+            "an optional scalar return crosses as one value buffer: {jni}"
         );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            jni.contains("weaveffi_free_bytes((uint8_t*)(void*)rv, sizeof(*rv));"),
-            "the producer-boxed scalar must be freed after dereferencing: {jni}"
+            kt.contains("fun findAge(): Long? = weaveDecode(findAgeJni()) { r -> r.readOptional { r.readI64() } }"),
+            "the wrapper must decode the optional flag byte plus value: {kt}"
         );
     }
 
     #[test]
-    fn map_return_passes_out_buffers_by_address_and_frees() {
+    fn map_return_is_buffered_and_freed() {
         let api = make_fn_api(
             "all_scores",
             vec![],
@@ -6227,17 +3983,17 @@ mod tests {
         );
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("&out_keys, &out_vals, &out_map_len, &err"),
-            "the map ABI takes the out buffers by address: {jni}"
+            jni.contains("const uint8_t* rv = weaveffi_m_all_scores(&out_len, &err);"),
+            "the map return crosses as one value buffer: {jni}"
         );
         assert!(
-            jni.contains("weaveffi_free_string(out_keys[i]);"),
-            "each copied key string must be freed: {jni}"
+            jni.contains("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"),
+            "the producer buffer must be freed after copying: {jni}"
         );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            jni.contains("weaveffi_free_bytes((uint8_t*)(void*)out_keys")
-                && jni.contains("weaveffi_free_bytes((uint8_t*)(void*)out_vals"),
-            "both parallel map buffers must be freed: {jni}"
+            kt.contains("fun allScores(): Map<String, Int> = weaveDecode(allScoresJni()) { r -> r.readMap({ r.readString() }, { r.readI32() }) }"),
+            "the wrapper must decode alternating keys and values: {kt}"
         );
     }
 
@@ -6339,7 +4095,7 @@ mod tests {
     }
 
     #[test]
-    fn iterator_record_elements_are_adopted_not_freed() {
+    fn iterator_record_elements_are_decoded_and_freed() {
         let api = make_api(vec![Module {
             name: "contacts".to_string(),
             functions: vec![Function {
@@ -6359,7 +4115,6 @@ mod tests {
                 name: "Contact".to_string(),
                 doc: None,
                 fields: vec![field("name", TypeRef::StringUtf8)],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6370,8 +4125,8 @@ mod tests {
         }]);
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("return Contact(raw as Long)"),
-            "record elements must be adopted into the owning wrapper class: {kt}"
+            kt.contains("return weaveDecode((raw as ByteArray)) { r -> unpackContact(r) }"),
+            "record elements must be decoded from the buffered ByteArray: {kt}"
         );
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         let next_start = jni
@@ -6383,8 +4138,12 @@ mod tests {
             .expect("nativeNext body must close");
         let next_body = &jni[next_start..next_end];
         assert!(
-            !next_body.contains("_destroy(_item"),
-            "record element pointers are owned by the Kotlin wrapper, not freed in next: {next_body}"
+            next_body.contains("jbyteArray _jitem = (*env)->NewByteArray(env, (jsize)_item_len);"),
+            "buffered elements must be copied into a ByteArray: {next_body}"
+        );
+        assert!(
+            next_body.contains("weaveffi_free_bytes((uint8_t*)_item, _item_len);"),
+            "each buffered element must be freed after copying: {next_body}"
         );
     }
 
@@ -6415,6 +4174,7 @@ mod tests {
                     code: 1,
                     message: "IO failure".to_string(),
                     doc: None,
+                    fields: vec![],
                 }],
             }),
             modules: vec![],
@@ -6534,253 +4294,85 @@ mod tests {
     }
 
     #[test]
-    fn kotlin_struct_class_declaration() {
+    fn kotlin_struct_is_data_class() {
         let api = make_struct_api();
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("class Contact internal constructor(internal var handle: Long) : java.io.Closeable {"),
-            "missing struct class declaration: {kt}"
+            kt.contains("data class Contact(val name: String, val age: Int)"),
+            "missing record data class: {kt}"
+        );
+        assert!(
+            !kt.contains("class Contact internal constructor"),
+            "records must not be handle-wrapper classes: {kt}"
         );
     }
 
     #[test]
-    fn kotlin_struct_companion_native_create() {
+    fn kotlin_struct_codecs_follow_field_order() {
         let api = make_struct_api();
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("@JvmStatic external fun nativeCreate(name: String, age: Int): Long"),
-            "missing nativeCreate: {kt}"
+            kt.contains("internal fun packContact(w: WeaveBufferWriter, v: Contact) {"),
+            "missing packContact codec: {kt}"
+        );
+        let pack = kt.split("internal fun packContact").nth(1).unwrap();
+        let name_at = pack.find("w.writeString(v.name)").expect("name write");
+        let age_at = pack.find("w.writeI32(v.age)").expect("age write");
+        assert!(
+            name_at < age_at,
+            "fields must be written in declaration order: {kt}"
+        );
+        assert!(
+            kt.contains("internal fun unpackContact(r: WeaveBufferReader): Contact = Contact("),
+            "missing unpackContact codec: {kt}"
+        );
+        let unpack = kt.split("internal fun unpackContact").nth(1).unwrap();
+        let name_read = unpack.find("r.readString(),").expect("name read");
+        let age_read = unpack.find("r.readI32(),").expect("age read");
+        assert!(
+            name_read < age_read,
+            "fields must be read in declaration order: {kt}"
         );
     }
 
     #[test]
-    fn kotlin_struct_companion_native_destroy() {
+    fn kotlin_struct_has_no_native_surface() {
         let api = make_struct_api();
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
+        for forbidden in [
+            "nativeCreate",
+            "nativeGetName",
+            "ContactBuilder",
+            "fun create(name: String",
+        ] {
+            assert!(
+                !kt.contains(forbidden),
+                "records have no C symbols or builders; found `{forbidden}`: {kt}"
+            );
+        }
+        let contact_at = kt.find("data class Contact").expect("record class");
+        let brand_at = kt.find("open class WeaveFFIException").expect("brand");
         assert!(
-            kt.contains("@JvmStatic external fun nativeDestroy(handle: Long)"),
-            "missing nativeDestroy: {kt}"
+            !kt[contact_at..brand_at].contains("close()"),
+            "records need no disposal: {kt}"
         );
     }
 
     #[test]
-    fn kotlin_struct_companion_native_getters() {
-        let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(
-            kt.contains("@JvmStatic external fun nativeGetName(handle: Long): String"),
-            "missing nativeGetName: {kt}"
-        );
-        assert!(
-            kt.contains("@JvmStatic external fun nativeGetAge(handle: Long): Int"),
-            "missing nativeGetAge: {kt}"
-        );
-    }
-
-    #[test]
-    fn kotlin_struct_factory_method() {
-        let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(
-            kt.contains(
-                "fun create(name: String, age: Int): Contact = Contact(nativeCreate(name, age))"
-            ),
-            "missing create factory: {kt}"
-        );
-    }
-
-    #[test]
-    fn kotlin_struct_property_getters() {
-        let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(
-            kt.contains("val name: String get() = nativeGetName(handle)"),
-            "missing name property: {kt}"
-        );
-        assert!(
-            kt.contains("val age: Int get() = nativeGetAge(handle)"),
-            "missing age property: {kt}"
-        );
-    }
-
-    #[test]
-    fn kotlin_struct_closeable() {
-        let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(
-            kt.contains("override fun close()"),
-            "missing close method: {kt}"
-        );
-        assert!(
-            kt.contains("nativeDestroy(handle)"),
-            "missing nativeDestroy call in close: {kt}"
-        );
-        assert!(kt.contains("handle = 0L"), "missing handle zeroing: {kt}");
-    }
-
-    #[test]
-    fn kotlin_struct_finalize() {
-        let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(
-            kt.contains("protected fun finalize()"),
-            "missing finalize: {kt}"
-        );
-    }
-
-    #[test]
-    fn kotlin_struct_loads_library() {
-        let api = make_struct_api();
-        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        let struct_section = kt.split("class Contact").nth(1).unwrap();
-        assert!(
-            struct_section.contains("System.loadLibrary(\"weaveffi\")"),
-            "struct companion missing loadLibrary: {kt}"
-        );
-    }
-
-    #[test]
-    fn kotlin_builder_generated() {
-        let api = Api {
-            version: "0.5.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![
-                        StructField {
-                            name: "name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                            default: None,
-                        },
-                        StructField {
-                            name: "age".into(),
-                            ty: TypeRef::I32,
-                            doc: None,
-                            default: None,
-                        },
-                    ],
-                    builder: true,
-                }],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                interfaces: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let out = Utf8Path::from_path(dir.path()).unwrap();
-        AndroidGenerator
-            .generate(&api, out, &AndroidConfig::default())
-            .unwrap();
-        let kotlin =
-            std::fs::read_to_string(out.join("android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"))
-                .unwrap();
-        assert!(
-            kotlin.contains("class ContactBuilder"),
-            "missing builder class: {kotlin}"
-        );
-        assert!(
-            kotlin.contains("fun withName("),
-            "missing withName: {kotlin}"
-        );
-        assert!(kotlin.contains("fun withAge("), "missing withAge: {kotlin}");
-        assert!(kotlin.contains("fun build()"), "missing build: {kotlin}");
-    }
-
-    #[test]
-    fn jni_struct_native_create() {
+    fn jni_struct_has_no_object_bridge() {
         let api = make_struct_api();
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeCreate"),
-            "missing JNI nativeCreate: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_contacts_Contact_create("),
-            "missing C create call: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_struct_native_destroy() {
-        let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeDestroy"),
-            "missing JNI nativeDestroy: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_contacts_Contact_destroy("),
-            "missing C destroy call: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_struct_native_getters() {
-        let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeGetName"),
-            "missing JNI nativeGetName: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_contacts_Contact_get_name("),
-            "missing C get_name call: {jni}"
-        );
-        assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeGetAge"),
-            "missing JNI nativeGetAge: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_contacts_Contact_get_age("),
-            "missing C get_age call: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_struct_string_getter_frees() {
-        let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(
-            jni.contains("weaveffi_free_string(rv)"),
-            "missing free_string in getter: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_struct_create_handles_string_param() {
-        let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(
-            jni.contains("GetStringUTFChars(env, name, NULL)"),
-            "missing string acquisition in create: {jni}"
-        );
-        assert!(
-            jni.contains("ReleaseStringUTFChars(env, name, name_chars)"),
-            "missing string release in create: {jni}"
-        );
-    }
-
-    #[test]
-    fn jni_struct_create_error_check() {
-        let api = make_struct_api();
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        let create_section: &str = jni
-            .split("Java_com_weaveffi_Contact_nativeCreate")
-            .nth(1)
-            .unwrap();
-        assert!(
-            create_section.contains("if (err.code != 0)"),
-            "missing error check in create: {jni}"
-        );
+        for forbidden in [
+            "Java_com_weaveffi_Contact_",
+            "weaveffi_contacts_Contact_create",
+            "weaveffi_contacts_Contact_destroy",
+            "weaveffi_contacts_Contact_get_name",
+        ] {
+            assert!(
+                !jni.contains(forbidden),
+                "records have no C symbols; found `{forbidden}`: {jni}"
+            );
+        }
     }
 
     #[test]
@@ -6797,7 +4389,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6809,18 +4400,16 @@ mod tests {
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("val data: ByteArray get() = nativeGetData(handle)"),
-            "missing bytes property: {kt}"
-        );
-
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(
-            jni.contains("weaveffi_storage_Blob_get_data("),
-            "missing bytes getter C call: {jni}"
+            kt.contains("data class Blob(val data: ByteArray)"),
+            "missing bytes-typed record property: {kt}"
         );
         assert!(
-            jni.contains("weaveffi_free_bytes("),
-            "missing free_bytes in getter: {jni}"
+            kt.contains("w.writeBytes(v.data)"),
+            "bytes field must serialize as a length-prefixed run: {kt}"
+        );
+        assert!(
+            kt.contains("r.readBytes(),"),
+            "bytes field must deserialize via readBytes: {kt}"
         );
     }
 
@@ -6838,7 +4427,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6850,27 +4438,29 @@ mod tests {
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("val start: Point get() = Point(nativeGetStart(handle))"),
-            "missing nested struct property: {kt}"
+            kt.contains("data class Line(val start: Point)"),
+            "missing nested record property: {kt}"
         );
-
-        let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("weaveffi_geo_Line_get_start("),
-            "missing nested struct getter C call: {jni}"
+            kt.contains("packPoint(w, v.start)"),
+            "nested record must serialize inline through its own codec: {kt}"
+        );
+        assert!(
+            kt.contains("unpackPoint(r),"),
+            "nested record must deserialize through its own codec: {kt}"
         );
     }
 
     #[test]
-    fn kotlin_type_for_struct_returns_long() {
-        assert_eq!(kotlin_type(&TypeRef::Record("Contact".into())), "Long");
+    fn kotlin_type_for_struct_returns_name() {
+        assert_eq!(kotlin_type(&TypeRef::Record("Contact".into())), "Contact");
     }
 
     #[test]
-    fn kotlin_getter_type_for_struct_returns_name() {
+    fn kotlin_jni_type_for_struct_is_byte_array() {
         assert_eq!(
-            kotlin_getter_type(&TypeRef::Record("Contact".into())),
-            "Contact"
+            kotlin_jni_type(&TypeRef::Record("Contact".into())),
+            "ByteArray"
         );
     }
 
@@ -6912,14 +4502,22 @@ mod tests {
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("contact: Long"),
-            "missing struct param as Long: {kt}"
+            kt.contains("@JvmStatic private external fun saveJni(contact: ByteArray)"),
+            "the JNI external must take the packed ByteArray: {kt}"
+        );
+        assert!(
+            kt.contains(
+                "fun save(contact: Contact) { saveJni(weaveEncode { w -> packContact(w, contact) }) }"
+            ),
+            "the wrapper must pack the record before crossing: {kt}"
         );
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("(const weaveffi_contacts_Contact*)(intptr_t)contact"),
-            "missing struct param cast: {jni}"
+            jni.contains(
+                "weaveffi_contacts_save((const uint8_t*)contact_elems, (size_t)contact_len, &err)"
+            ),
+            "the buffered param must cross as borrowed (ptr, len): {jni}"
         );
     }
 
@@ -6954,12 +4552,18 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("weaveffi_contacts_Contact* rv"),
-            "missing struct return type: {jni}"
+            jni.contains(
+                "const uint8_t* rv = weaveffi_contacts_create((int32_t)age, &out_len, &err);"
+            ),
+            "buffered record return must thread out_len: {jni}"
         );
         assert!(
-            jni.contains("return (jlong)(intptr_t)rv;"),
-            "missing struct return cast: {jni}"
+            jni.contains("jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);"),
+            "buffered record return must copy into a ByteArray: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"),
+            "the producer allocation must be freed: {jni}"
         );
     }
 
@@ -7024,13 +4628,13 @@ mod tests {
     }
 
     #[test]
-    fn kotlin_type_for_enum_is_int() {
-        assert_eq!(kotlin_type(&TypeRef::Enum("Color".into())), "Int");
+    fn kotlin_type_for_enum_returns_name() {
+        assert_eq!(kotlin_type(&TypeRef::Enum("Color".into())), "Color");
     }
 
     #[test]
-    fn kotlin_getter_type_for_enum_returns_name() {
-        assert_eq!(kotlin_getter_type(&TypeRef::Enum("Color".into())), "Color");
+    fn kotlin_jni_type_for_enum_is_int() {
+        assert_eq!(kotlin_jni_type(&TypeRef::Enum("Color".into())), "Int");
     }
 
     #[test]
@@ -7302,16 +4906,18 @@ mod tests {
         }]);
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
-        assert!(jni.contains("jobject id"), "missing jobject param: {jni}");
         assert!(
-            jni.contains("java/lang/Integer"),
-            "missing Integer class lookup: {jni}"
+            jni.contains("jbyteArray id"),
+            "optional param must cross as a packed jbyteArray: {jni}"
         );
         assert!(
-            jni.contains("intValue"),
-            "missing intValue unbox call: {jni}"
+            jni.contains("weaveffi_store_find((const uint8_t*)id_elems, (size_t)id_len, &err)"),
+            "optional param must pass borrowed (ptr, len): {jni}"
         );
-        assert!(jni.contains("id_ptr"), "missing id_ptr in C call: {jni}");
+        assert!(
+            jni.contains("(*env)->ReleaseByteArrayElements(env, id, id_elems, JNI_ABORT);"),
+            "the pinned encoding must be released without copy-back: {jni}"
+        );
     }
 
     #[test]
@@ -7345,12 +4951,19 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("jstring query"),
-            "missing jstring param: {jni}"
+            jni.contains("jbyteArray query"),
+            "optional string param must cross as a packed jbyteArray: {jni}"
         );
         assert!(
-            jni.contains("if (query != NULL)"),
-            "missing null check for optional string: {jni}"
+            jni.contains(
+                "weaveffi_store_find_name((const uint8_t*)query_elems, (size_t)query_len, &err)"
+            ),
+            "optional string param must pass borrowed (ptr, len): {jni}"
+        );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains("weaveEncode { w -> w.writeOptional(query) { v0 -> w.writeString(v0) } }"),
+            "the wrapper must write the flag byte plus string: {kt}"
         );
     }
 
@@ -7380,20 +4993,17 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("JNIEXPORT jobject JNICALL"),
-            "missing jobject return: {jni}"
+            jni.contains("JNIEXPORT jbyteArray JNICALL"),
+            "optional return must cross as a value buffer: {jni}"
         );
         assert!(
-            jni.contains("if (rv == NULL) { return NULL; }"),
-            "missing NULL check: {jni}"
+            jni.contains("const uint8_t* rv = weaveffi_store_lookup(&out_len, &err);"),
+            "optional return must thread out_len: {jni}"
         );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            jni.contains("java/lang/Integer"),
-            "missing Integer boxing: {jni}"
-        );
-        assert!(
-            jni.contains("valueOf"),
-            "missing valueOf boxing call: {jni}"
+            kt.contains("fun lookup(): Int? = weaveDecode(lookupJni()) { r -> r.readOptional { r.readI32() } }"),
+            "the wrapper must decode the optional value: {kt}"
         );
     }
 
@@ -7423,14 +5033,14 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("JNIEXPORT jstring JNICALL"),
-            "missing jstring return: {jni}"
+            jni.contains("const uint8_t* rv = weaveffi_store_get_name(&out_len, &err);"),
+            "optional string return crosses as a value buffer: {jni}"
         );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            jni.contains("if (rv == NULL) { return NULL; }"),
-            "missing NULL check: {jni}"
+            kt.contains("fun getName(): String? = weaveDecode(getNameJni()) { r -> r.readOptional { r.readString() } }"),
+            "the wrapper must decode the optional string: {kt}"
         );
-        assert!(jni.contains("NewStringUTF"), "missing NewStringUTF: {jni}");
     }
 
     // --- List tests ---
@@ -7439,7 +5049,7 @@ mod tests {
     fn kotlin_type_for_list_int() {
         assert_eq!(
             kotlin_type(&TypeRef::List(Box::new(TypeRef::I32))),
-            "IntArray"
+            "List<Int>"
         );
     }
 
@@ -7447,7 +5057,7 @@ mod tests {
     fn kotlin_type_for_list_string() {
         assert_eq!(
             kotlin_type(&TypeRef::List(Box::new(TypeRef::StringUtf8))),
-            "Array<String>"
+            "List<String>"
         );
     }
 
@@ -7455,7 +5065,7 @@ mod tests {
     fn kotlin_type_for_list_enum() {
         assert_eq!(
             kotlin_type(&TypeRef::List(Box::new(TypeRef::Enum("Color".into())))),
-            "IntArray"
+            "List<Color>"
         );
     }
 
@@ -7489,7 +5099,16 @@ mod tests {
         }]);
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(kt.contains("ids: IntArray"), "missing IntArray param: {kt}");
+        assert!(
+            kt.contains("fun process(ids: List<Int>)"),
+            "the public wrapper takes an idiomatic List<Int>: {kt}"
+        );
+        assert!(
+            kt.contains(
+                "processJni(weaveEncode { w -> w.writeList(ids) { v0 -> w.writeI32(v0) } })"
+            ),
+            "the wrapper must pack the list into a value buffer: {kt}"
+        );
     }
 
     #[test]
@@ -7523,16 +5142,22 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("jintArray ids"),
-            "missing jintArray param: {jni}"
+            jni.contains("jbyteArray ids"),
+            "list param must cross as a packed jbyteArray: {jni}"
         );
         assert!(
-            jni.contains("GetIntArrayElements(env, ids, NULL)"),
-            "missing GetIntArrayElements: {jni}"
+            jni.contains("GetByteArrayElements(env, ids, NULL)"),
+            "missing byte-array pin: {jni}"
         );
         assert!(
-            jni.contains("ReleaseIntArrayElements(env, ids, ids_elems, 0)"),
-            "missing ReleaseIntArrayElements: {jni}"
+            jni.contains("ReleaseByteArrayElements(env, ids, ids_elems, JNI_ABORT)"),
+            "missing byte-array release: {jni}"
+        );
+        assert!(
+            jni.contains(
+                "weaveffi_batch_process((const uint8_t*)ids_elems, (size_t)ids_len, &err)"
+            ),
+            "list param must pass borrowed (ptr, len): {jni}"
         );
     }
 
@@ -7562,15 +5187,18 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("JNIEXPORT jintArray JNICALL"),
-            "missing jintArray return: {jni}"
+            jni.contains("JNIEXPORT jbyteArray JNICALL"),
+            "list return must cross as a value buffer: {jni}"
         );
-        assert!(jni.contains("NewIntArray"), "missing NewIntArray: {jni}");
         assert!(
-            jni.contains("SetIntArrayRegion"),
-            "missing SetIntArrayRegion: {jni}"
+            jni.contains("const uint8_t* rv = weaveffi_batch_get_ids(&out_len, &err);"),
+            "list return must thread out_len: {jni}"
         );
-        assert!(jni.contains("out_len"), "missing out_len: {jni}");
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains("fun getIds(): List<Int> = weaveDecode(getIdsJni()) { r -> r.readList { r.readI32() } }"),
+            "the wrapper must decode the buffered list: {kt}"
+        );
     }
 
     #[test]
@@ -7579,34 +5207,44 @@ mod tests {
     }
 
     #[test]
-    fn jni_param_type_optional_int_is_jobject() {
+    fn jni_param_type_optional_int_is_buffered() {
         assert_eq!(
             jni_param_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
+            "jbyteArray"
+        );
+    }
+
+    #[test]
+    fn jni_param_type_optional_string_is_buffered() {
+        assert_eq!(
+            jni_param_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+            "jbyteArray"
+        );
+    }
+
+    #[test]
+    fn jni_param_type_optional_interface_is_nullable_pointer() {
+        assert_eq!(
+            jni_param_type(&TypeRef::Optional(Box::new(TypeRef::Interface(
+                "Store".into()
+            )))),
             "jobject"
         );
     }
 
     #[test]
-    fn jni_param_type_optional_string_is_jstring() {
-        assert_eq!(
-            jni_param_type(&TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
-            "jstring"
-        );
-    }
-
-    #[test]
-    fn jni_param_type_list_int_is_jintarray() {
+    fn jni_param_type_list_int_is_buffered() {
         assert_eq!(
             jni_param_type(&TypeRef::List(Box::new(TypeRef::I32))),
-            "jintArray"
+            "jbyteArray"
         );
     }
 
     #[test]
-    fn jni_param_type_list_long_is_jlongarray() {
+    fn jni_param_type_list_long_is_buffered() {
         assert_eq!(
             jni_param_type(&TypeRef::List(Box::new(TypeRef::I64))),
-            "jlongArray"
+            "jbyteArray"
         );
     }
 
@@ -7653,7 +5291,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".to_string(),
@@ -7718,55 +5355,41 @@ mod tests {
         );
 
         assert!(
-            kotlin.contains(
-                "class Contact internal constructor(internal var handle: Long) : java.io.Closeable {"
-            ),
-            "missing struct class: {kotlin}"
+            kotlin
+                .contains("data class Contact(val name: String, val email: String, val age: Int)"),
+            "record must be a data class with typed properties: {kotlin}"
+        );
+        assert!(
+            kotlin.contains("internal fun packContact(")
+                && kotlin.contains("internal fun unpackContact("),
+            "record codecs missing: {kotlin}"
+        );
+        assert!(
+            !kotlin.contains("nativeCreate") && !kotlin.contains("nativeGet"),
+            "records must have no native surface: {kotlin}"
         );
         assert!(
             kotlin.contains(
-                "@JvmStatic external fun nativeCreate(name: String, email: String, age: Int): Long"
+                "fun getContact(id: Int): Contact = weaveDecode(getContactJni(id)) { r -> unpackContact(r) }"
             ),
-            "missing nativeCreate: {kotlin}"
-        );
-        assert!(
-            kotlin.contains("val name: String get() = nativeGetName(handle)"),
-            "missing name getter: {kotlin}"
-        );
-        assert!(
-            kotlin.contains("val email: String get() = nativeGetEmail(handle)"),
-            "missing email getter: {kotlin}"
-        );
-        assert!(
-            kotlin.contains("val age: Int get() = nativeGetAge(handle)"),
-            "missing age getter: {kotlin}"
+            "the wrapper must decode the buffered record return: {kotlin}"
         );
 
         let jni = std::fs::read_to_string(tmp.join("android/src/main/cpp/weaveffi_jni.c")).unwrap();
 
         assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeGetName"),
-            "missing JNI nativeGetName: {jni}"
+            jni.contains(
+                "const uint8_t* rv = weaveffi_contacts_get_contact((int32_t)id, &out_len, &err);"
+            ),
+            "buffered record return must thread out_len: {jni}"
         );
         assert!(
-            jni.contains("weaveffi_contacts_Contact_get_name("),
-            "missing C get_name call: {jni}"
+            jni.contains("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"),
+            "the producer allocation must be freed after copying: {jni}"
         );
         assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeGetEmail"),
-            "missing JNI nativeGetEmail: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_contacts_Contact_get_email("),
-            "missing C get_email call: {jni}"
-        );
-        assert!(
-            jni.contains("Java_com_weaveffi_Contact_nativeGetAge"),
-            "missing JNI nativeGetAge: {jni}"
-        );
-        assert!(
-            jni.contains("weaveffi_contacts_Contact_get_age("),
-            "missing C get_age call: {jni}"
+            !jni.contains("weaveffi_contacts_Contact_"),
+            "records must expose no per-field C symbols: {jni}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -7864,24 +5487,27 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("jobject scores"),
-            "missing jobject param: {jni}"
+            jni.contains("jbyteArray scores"),
+            "map param must cross as a packed jbyteArray: {jni}"
         );
         assert!(
-            jni.contains("java/util/Map"),
-            "missing Map class lookup: {jni}"
+            jni.contains("GetByteArrayElements(env, scores, NULL)"),
+            "missing byte-array pin: {jni}"
         );
         assert!(
-            jni.contains("scores_c_keys"),
-            "missing parallel keys array: {jni}"
+            jni.contains(
+                "weaveffi_store_update_scores((const uint8_t*)scores_elems, (size_t)scores_len, &err)"
+            ),
+            "map param must pass borrowed (ptr, len): {jni}"
         );
         assert!(
-            jni.contains("scores_c_vals"),
-            "missing parallel vals array: {jni}"
+            jni.contains("ReleaseByteArrayElements(env, scores, scores_elems, JNI_ABORT)"),
+            "missing byte-array release: {jni}"
         );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            jni.contains("(size_t)scores_len"),
-            "missing length arg: {jni}"
+            kt.contains("weaveEncode { w -> w.writeMap(scores, { k0 -> w.writeString(k0) }, { v0 -> w.writeI32(v0) }) }"),
+            "the wrapper must pack the map before crossing: {kt}"
         );
     }
 
@@ -7958,14 +5584,24 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("JNIEXPORT jobject JNICALL"),
-            "missing jobject return: {jni}"
+            jni.contains("JNIEXPORT jbyteArray JNICALL"),
+            "map return must cross as a value buffer: {jni}"
         );
         assert!(
-            jni.contains("java/util/HashMap"),
-            "missing HashMap construction: {jni}"
+            jni.contains("const uint8_t* rv = weaveffi_store_get_scores(&out_len, &err);"),
+            "map return must thread out_len: {jni}"
         );
-        assert!(jni.contains("out_map_len"), "missing out_map_len: {jni}");
+        assert!(
+            jni.contains("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);"),
+            "the producer allocation must be freed after copying: {jni}"
+        );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains(
+                "fun getScores(): Map<String, Int> = weaveDecode(getScoresJni()) { r -> r.readMap({ r.readString() }, { r.readI32() }) }"
+            ),
+            "the wrapper must decode the buffered map: {kt}"
+        );
     }
 
     #[test]
@@ -8095,12 +5731,14 @@ mod tests {
                         code: 1001,
                         message: "Contact not found".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "InvalidInput".to_string(),
                         code: 1002,
                         message: "Invalid input provided".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -8131,7 +5769,7 @@ mod tests {
         );
         assert!(
             kt.contains(
-                "fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {"
+                "fun fromCode(code: Int, message: String, payload: ByteArray?): WeaveFFIException = when (code) {"
             ),
             "missing fromCode factory: {kt}"
         );
@@ -8142,6 +5780,28 @@ mod tests {
         assert!(
             kt.contains("else -> WeaveFFIException(code, message)"),
             "fromCode must fall back to the generic exception: {kt}"
+        );
+    }
+
+    #[test]
+    fn kotlin_error_payload_fields_decode() {
+        let mut api = make_error_api();
+        api.modules[0].errors.as_mut().unwrap().codes[0].fields = vec![
+            field("contact_id", TypeRef::I64),
+            field("hint", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+        ];
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
+        assert!(
+            kt.contains(
+                "class ContactNotFound(message: String = \"Contact not found\", val contact_id: Long, val hint: String?) : ContactException(1001, message)"
+            ),
+            "payload fields must be constructor properties: {kt}"
+        );
+        assert!(
+            kt.contains(
+                "1001 -> if (payload != null) weaveDecode(payload) { r -> ContactNotFound(message, r.readI64(), r.readOptional { r.readString() }) } else WeaveFFIException(code, message)"
+            ),
+            "fromCode must decode the payload in declaration order: {kt}"
         );
     }
 
@@ -8176,19 +5836,27 @@ mod tests {
         );
         assert!(
             jni.contains(
-                "case 1001: name = \"com/weaveffi/ContactException$ContactNotFound\"; break;"
+                "GetStaticMethodID(env, exClass, \"fromCode\", \"(ILjava/lang/String;[B)Lcom/weaveffi/WeaveFFIException;\")"
             ),
-            "missing case for ContactNotFound: {jni}"
+            "domain thrower must resolve the fromCode factory: {jni}"
+        );
+        assert!(
+            jni.contains("SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr)"),
+            "domain thrower must copy the payload into a jbyteArray: {jni}"
         );
         assert!(
             jni.contains(
-                "case 1002: name = \"com/weaveffi/ContactException$InvalidInput\"; break;"
+                "CallStaticObjectMethod(env, exClass, fromCode, (jint)err->code, jmsg, jpayload)"
             ),
-            "missing case for InvalidInput: {jni}"
+            "domain thrower must dispatch through fromCode: {jni}"
         );
         assert!(
-            jni.contains("if (name == NULL) { throw_weaveffi_error(env, err); return; }"),
-            "unknown codes must fall back to the generic thrower: {jni}"
+            jni.contains("throw_weaveffi_error(env, err);"),
+            "an unresolvable factory must fall back to the generic thrower: {jni}"
+        );
+        assert!(
+            jni.contains("weaveffi_error_clear(err);"),
+            "the thrower must release the message and payload: {jni}"
         );
     }
 
@@ -8346,7 +6014,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -8357,8 +6024,14 @@ mod tests {
         }]);
         let kotlin = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kotlin.contains("LongArray?"),
+            kotlin.contains("data: List<Contact?>?"),
             "should contain deeply nested optional type: {kotlin}"
+        );
+        assert!(
+            kotlin.contains(
+                "w.writeOptional(data) { v0 -> w.writeList(v0) { v1 -> w.writeOptional(v1) { v2 -> packContact(w, v2) } } }"
+            ),
+            "nested optionals must pack recursively: {kotlin}"
         );
     }
 
@@ -8395,7 +6068,7 @@ mod tests {
         }]);
         let kotlin = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kotlin.contains("Map<String, IntArray>"),
+            kotlin.contains("scores: Map<String, List<Int>>"),
             "should contain map of lists type: {kotlin}"
         );
     }
@@ -8432,7 +6105,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -8466,8 +6138,14 @@ mod tests {
         }]);
         let kotlin = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kotlin.contains("Map<Int, Long>"),
+            kotlin.contains("contacts: Map<Color, Contact>"),
             "should contain enum-keyed map type: {kotlin}"
+        );
+        assert!(
+            kotlin.contains(
+                "w.writeMap(contacts, { k0 -> w.writeI32(k0.value) }, { v0 -> packContact(w, v0) })"
+            ),
+            "enum keys pack as their raw value; record values recurse: {kotlin}"
         );
     }
 
@@ -8500,7 +6178,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -8511,8 +6188,8 @@ mod tests {
         }]);
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            kt.contains("contact: Contact"),
-            "TypedHandle should use class type not Long: {kt}"
+            kt.contains("contact: Long"),
+            "TypedHandle is an opaque u64 token surfacing as Long: {kt}"
         );
     }
 
@@ -8545,7 +6222,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -8575,15 +6251,18 @@ mod tests {
         let rest = &jni[start..];
         let end = rest.find("\nJNIEXPORT ").unwrap_or(rest.len());
         let fn_body = &rest[..end];
+        let release_pos = fn_body
+            .find("ReleaseStringUTFChars")
+            .expect("borrowed param released after the call");
         let err_pos = fn_body
             .find("if (err.code != 0)")
             .expect("error check before using return value");
-        let ret_pos = fn_body
-            .find("(jlong)(intptr_t)rv")
-            .expect("struct return as jlong handle");
+        let free_pos = fn_body
+            .find("weaveffi_free_bytes((uint8_t*)rv, (size_t)out_len);")
+            .expect("buffered return freed after copying");
         assert!(
-            err_pos < ret_pos,
-            "err check must precede struct return: {jni}"
+            release_pos < err_pos && err_pos < free_pos,
+            "release, then err check, then copy-and-free; the error path must not free: {jni}"
         );
         assert!(
             fn_body.contains("throw_weaveffi_error"),
@@ -8591,7 +6270,10 @@ mod tests {
         );
 
         let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
-        assert!(kt.contains("class Contact"), "struct class Contact: {kt}");
+        assert!(
+            kt.contains("data class Contact"),
+            "record data class Contact: {kt}"
+        );
     }
 
     #[test]
@@ -8688,7 +6370,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -8700,12 +6381,17 @@ mod tests {
 
         let jni = render_jni_c(&api, "com.weaveffi", true, "weaveffi.yml", "weaveffi");
         assert!(
-            jni.contains("if (rv == NULL)"),
-            "optional struct return needs null check: {jni}"
+            jni.contains(
+                "const uint8_t* rv = weaveffi_contacts_find_contact((int32_t)id, &out_len, &err);"
+            ),
+            "optional record return must cross as a value buffer: {jni}"
         );
+        let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
         assert!(
-            jni.contains("return NULL"),
-            "optional null should return NULL: {jni}"
+            kt.contains(
+                "fun findContact(id: Int): Contact? = weaveDecode(findContactJni(id)) { r -> r.readOptional { unpackContact(r) } }"
+            ),
+            "the wrapper must decode the optional flag byte: {kt}"
         );
     }
 
@@ -8883,7 +6569,6 @@ mod tests {
                     doc: Some("Stable id".into()),
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Kind".into(),
@@ -8905,6 +6590,7 @@ mod tests {
                     code: 1,
                     message: "Not found".into(),
                     doc: Some("Raised when missing".into()),
+                    fields: vec![],
                 }],
             }),
             modules: vec![],
@@ -9079,6 +6765,7 @@ mod tests {
                     code: 100,
                     message: "Key not found".to_string(),
                     doc: None,
+                    fields: vec![],
                 }],
             }),
             modules: vec![],
@@ -9138,7 +6825,7 @@ mod tests {
         );
         assert!(
             kt.contains(
-                "nativeFetchAsync(handle, key, WeaveContinuation(cont) { code, message -> KvException.fromCode(code, message) })"
+                "nativeFetchAsync(handle, key, WeaveContinuation(cont) { code, message, payload -> KvException.fromCode(code, message, payload) })"
             ),
             "async throwing methods must map errors through the typed domain: {kt}"
         );
@@ -9211,7 +6898,8 @@ mod tests {
     /// the conformance harness's expected layout
     /// (`target/conformance-gen/<sample>/{android,c}`). Serves two purposes:
     /// it smoke-tests generation against the real sample surfaces (interfaces,
-    /// typed errors, iterators, listeners, builders, async), and it lets the
+    /// typed errors, iterators, listeners, records, rich enums, async), and it
+    /// lets the
     /// Kotlin conformance lanes run when the full CLI is blocked by other
     /// in-flight generator crates. Skips silently when the samples are not
     /// present (for example in a packaged crate).

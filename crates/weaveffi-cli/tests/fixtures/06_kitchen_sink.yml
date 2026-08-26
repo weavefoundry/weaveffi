@@ -1,4 +1,4 @@
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: shared
     structs:
@@ -23,7 +23,6 @@ modules:
     structs:
       - name: Item
         doc: Kitchen sink struct exercising every field feature
-        builder: true
         fields:
           - { name: id, type: i64, doc: Stable identifier }
           - { name: name, type: string, doc: Display name }

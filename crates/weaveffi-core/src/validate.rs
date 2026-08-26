@@ -423,18 +423,20 @@ pub enum ValidationError {
         /// Position where the iterator type appeared.
         location: String,
     },
-    /// A list, map, or iterator has an element type the C ABI can't flatten.
-    #[error("unsupported element type '{ty}' in {location}")]
+    /// A parameter declares `mutable: true` with a type that has no
+    /// write-back lowering.
+    #[error("parameter '{param}' of '{function}' cannot be mutable: type '{ty}' has no write-back lowering")]
     #[diagnostic(help(
-        "the C ABI lowers lists, maps, and iterators to flat parallel arrays, so element \
-         types must be flat: list/iterator elements may be scalars, bool, enums, strings, \
-         handles, or structs (plus optional structs/handles in lists); map keys and values \
-         may be scalars, bool, enums, or strings"
+        "only string and bytes parameters support mutable: true; buffered types (records, \
+         rich enums, optionals, lists, maps) cross the ABI as borrowed serialized buffers \
+         and cannot be written back"
     ))]
-    UnsupportedElementType {
-        /// Position where the unsupported element type appeared.
-        location: String,
-        /// Offending element type, rendered as it appears in the IDL.
+    MutableParamUnsupported {
+        /// Callable that declares the parameter.
+        function: String,
+        /// Parameter marked mutable.
+        param: String,
+        /// The parameter's type, rendered as it appears in the IDL.
         ty: String,
     },
     /// An async function tries to return an iterator, which has no async ABI.
@@ -448,17 +450,6 @@ pub enum ValidationError {
         module: String,
         /// Async function with the iterator return.
         function: String,
-    },
-    /// A struct marked `builder: true` declares no fields.
-    #[error("builder struct '{name}' in module '{module}' must have at least one field")]
-    #[diagnostic(help(
-        "builder structs must have at least one field; add a field or set builder: false"
-    ))]
-    BuilderStructEmpty {
-        /// Module that contains the struct.
-        module: String,
-        /// Name of the empty builder struct.
-        name: String,
     },
     /// The document declares a schema version this build doesn't support.
     #[error("unsupported schema version '{version}'; supported versions: {supported}")]

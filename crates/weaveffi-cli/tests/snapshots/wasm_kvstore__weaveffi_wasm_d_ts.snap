@@ -50,21 +50,19 @@ export declare class IoError extends KvError {
 /** A single key-value entry persisted in the store */
 export interface Entry {
   /** Stable monotonic identifier assigned on insert */
-  readonly id: bigint;
+  id: bigint;
   /** UTF-8 lookup key */
-  readonly key: string;
+  key: string;
   /** Opaque binary payload */
-  readonly value: Uint8Array;
+  value: Uint8Array;
   /** Unix-timestamp seconds when the entry was created */
-  readonly created_at: bigint;
+  created_at: bigint;
   /** Optional unix-timestamp seconds at which the entry expires */
-  readonly expires_at: bigint | null;
+  expires_at: bigint | null;
   /** Free-form labels attached to the entry */
-  readonly tags: string[];
+  tags: string[];
   /** Arbitrary string-valued metadata pairs */
-  readonly metadata: Record<string, string>;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  metadata: Record<string, string>;
 }
 
 /** Persistence semantics applied to a stored entry */
@@ -138,13 +136,11 @@ export declare class Store {
 /** Aggregate store statistics */
 export interface Stats {
   /** Number of live entries */
-  readonly total_entries: bigint;
+  total_entries: bigint;
   /** Sum of all value byte lengths */
-  readonly total_bytes: bigint;
+  total_bytes: bigint;
   /** Number of entries past their TTL but not yet evicted */
-  readonly expired_entries: bigint;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  expired_entries: bigint;
 }
 
 export interface WeaveffiWasmModule {

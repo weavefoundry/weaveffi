@@ -41,8 +41,9 @@ namespace WeaveFFI
         }
 
         /// <summary>Wraps a raw error slot in the typed exception, falling
-        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
-        internal static WeaveFFIException FromCode(int code, string message)
+        /// back to <see cref="WeaveFFIException"/> for unknown codes. Codes
+        /// declaring payload fields decode them into Data.</summary>
+        internal static WeaveFFIException FromCode(int code, string message, byte[]? payload)
         {
             switch (code)
             {
@@ -65,13 +66,28 @@ namespace WeaveFFI
     {
         public int Code;
         public IntPtr Message;
+        public IntPtr PayloadPtr;
+        public UIntPtr PayloadLen;
+
+        internal static byte[]? CopyPayload(WeaveFFIError err)
+        {
+            if (err.PayloadPtr == IntPtr.Zero || (int)err.PayloadLen == 0)
+            {
+                return null;
+            }
+            var payload = new byte[(int)err.PayloadLen];
+            Marshal.Copy(err.PayloadPtr, payload, 0, (int)err.PayloadLen);
+            return payload;
+        }
 
         internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveFFIException(err.Code, msg);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw new WeaveFFIException(code, msg);
             }
         }
 
@@ -79,8 +95,11 @@ namespace WeaveFFI
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw KvException.FromCode(err.Code, msg);
+                var payload = CopyPayload(err);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw KvException.FromCode(code, msg, payload);
             }
         }
     }
@@ -100,6 +119,274 @@ namespace WeaveFFI
         internal static void FreePtr(IntPtr ptr)
         {
             Marshal.FreeCoTaskMem(ptr);
+        }
+    }
+
+    /// <summary>Serializes values into the WeaveFFI value-buffer wire
+    /// format (little-endian, packed).</summary>
+    internal sealed class WeaveFFIBufferWriter
+    {
+        private byte[] _buf = new byte[64];
+        private int _len;
+
+        private void Ensure(int extra)
+        {
+            if (_len + extra <= _buf.Length)
+            {
+                return;
+            }
+            var size = _buf.Length * 2;
+            while (size < _len + extra)
+            {
+                size *= 2;
+            }
+            Array.Resize(ref _buf, size);
+        }
+
+        internal void WriteBool(bool v)
+        {
+            Ensure(1);
+            _buf[_len++] = v ? (byte)1 : (byte)0;
+        }
+
+        internal void WriteI8(sbyte v)
+        {
+            Ensure(1);
+            _buf[_len++] = (byte)v;
+        }
+
+        internal void WriteU8(byte v)
+        {
+            Ensure(1);
+            _buf[_len++] = v;
+        }
+
+        internal void WriteU16(ushort v)
+        {
+            Ensure(2);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+        }
+
+        internal void WriteI16(short v)
+        {
+            WriteU16((ushort)v);
+        }
+
+        internal void WriteU32(uint v)
+        {
+            Ensure(4);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+            _buf[_len++] = (byte)(v >> 16);
+            _buf[_len++] = (byte)(v >> 24);
+        }
+
+        internal void WriteI32(int v)
+        {
+            WriteU32((uint)v);
+        }
+
+        internal void WriteU64(ulong v)
+        {
+            WriteU32((uint)v);
+            WriteU32((uint)(v >> 32));
+        }
+
+        internal void WriteI64(long v)
+        {
+            WriteU64((ulong)v);
+        }
+
+        internal void WriteF32(float v)
+        {
+            WriteU32((uint)BitConverter.SingleToInt32Bits(v));
+        }
+
+        internal void WriteF64(double v)
+        {
+            WriteU64((ulong)BitConverter.DoubleToInt64Bits(v));
+        }
+
+        internal void WriteLen(int len)
+        {
+            WriteU32((uint)len);
+        }
+
+        internal void WriteOptionFlag(bool present)
+        {
+            WriteBool(present);
+        }
+
+        internal void WriteString(string v)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(v);
+            WriteLen(bytes.Length);
+            Ensure(bytes.Length);
+            Array.Copy(bytes, 0, _buf, _len, bytes.Length);
+            _len += bytes.Length;
+        }
+
+        internal void WriteBytes(byte[] v)
+        {
+            WriteLen(v.Length);
+            Ensure(v.Length);
+            Array.Copy(v, 0, _buf, _len, v.Length);
+            _len += v.Length;
+        }
+
+        internal byte[] ToArray()
+        {
+            var outBuf = new byte[_len];
+            Array.Copy(_buf, outBuf, _len);
+            return outBuf;
+        }
+    }
+
+    /// <summary>Decodes values from the WeaveFFI value-buffer wire format.
+    /// A malformed buffer indicates a producer/consumer contract violation and
+    /// throws <see cref="InvalidOperationException"/>.</summary>
+    internal sealed class WeaveFFIBufferReader
+    {
+        private static readonly System.Text.Encoding Utf8Strict =
+            new System.Text.UTF8Encoding(false, true);
+
+        private readonly byte[] _data;
+        private int _pos;
+
+        internal WeaveFFIBufferReader(byte[] data)
+        {
+            _data = data;
+        }
+
+        private void Require(int n)
+        {
+            if (_data.Length - _pos < n)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: buffer exhausted");
+            }
+        }
+
+        internal bool ReadBool()
+        {
+            Require(1);
+            var b = _data[_pos++];
+            if (b > 1)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: invalid bool byte");
+            }
+            return b == 1;
+        }
+
+        internal sbyte ReadI8()
+        {
+            Require(1);
+            return (sbyte)_data[_pos++];
+        }
+
+        internal byte ReadU8()
+        {
+            Require(1);
+            return _data[_pos++];
+        }
+
+        internal ushort ReadU16()
+        {
+            Require(2);
+            var v = (ushort)(_data[_pos] | (_data[_pos + 1] << 8));
+            _pos += 2;
+            return v;
+        }
+
+        internal short ReadI16()
+        {
+            return (short)ReadU16();
+        }
+
+        internal uint ReadU32()
+        {
+            Require(4);
+            var v = (uint)_data[_pos]
+                | ((uint)_data[_pos + 1] << 8)
+                | ((uint)_data[_pos + 2] << 16)
+                | ((uint)_data[_pos + 3] << 24);
+            _pos += 4;
+            return v;
+        }
+
+        internal int ReadI32()
+        {
+            return (int)ReadU32();
+        }
+
+        internal ulong ReadU64()
+        {
+            var lo = (ulong)ReadU32();
+            var hi = (ulong)ReadU32();
+            return lo | (hi << 32);
+        }
+
+        internal long ReadI64()
+        {
+            return (long)ReadU64();
+        }
+
+        internal float ReadF32()
+        {
+            return BitConverter.Int32BitsToSingle(ReadI32());
+        }
+
+        internal double ReadF64()
+        {
+            return BitConverter.Int64BitsToDouble(ReadI64());
+        }
+
+        internal int ReadLen()
+        {
+            var len = ReadU32();
+            if (len > (uint)(_data.Length - _pos))
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: length prefix exceeds remaining bytes");
+            }
+            return (int)len;
+        }
+
+        internal bool ReadOptionFlag()
+        {
+            return ReadBool();
+        }
+
+        internal string ReadString()
+        {
+            var len = ReadLen();
+            string s;
+            try
+            {
+                s = Utf8Strict.GetString(_data, _pos, len);
+            }
+            catch (ArgumentException)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: string is not valid UTF-8");
+            }
+            _pos += len;
+            return s;
+        }
+
+        internal byte[] ReadBytes()
+        {
+            var len = ReadLen();
+            var outBuf = new byte[len];
+            Array.Copy(_data, _pos, outBuf, 0, len);
+            _pos += len;
+            return outBuf;
+        }
+
+        internal void ExpectEnd()
+        {
+            if (_pos != _data.Length)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
+            }
         }
     }
 
@@ -144,247 +431,96 @@ namespace WeaveFFI
     }
 
     /// <summary>A single key-value entry persisted in the store</summary>
-    public class Entry : IDisposable
+    public sealed class Entry
     {
-        private IntPtr _handle;
-        private bool _disposed;
-
-        internal Entry(IntPtr handle)
-        {
-            _handle = handle;
-        }
-
-        internal IntPtr Handle => _handle;
-
         /// <summary>Stable monotonic identifier assigned on insert</summary>
-        public long Id
-        {
-            get
-            {
-                return NativeMethods.weaveffi_kv_Entry_get_id(_handle);
-            }
-        }
+        public long Id { get; }
 
         /// <summary>UTF-8 lookup key</summary>
-        public string Key
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_kv_Entry_get_key(_handle);
-                var str = WeaveFFIHelpers.PtrToString(ptr);
-                NativeMethods.weaveffi_free_string(ptr);
-                return str ?? "";
-            }
-        }
+        public string Key { get; }
 
         /// <summary>Opaque binary payload</summary>
-        public byte[] Value
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_kv_Entry_get_value(_handle, out var len);
-                if (ptr == IntPtr.Zero) return Array.Empty<byte>();
-                var arr = new byte[(int)len];
-                Marshal.Copy(ptr, arr, 0, (int)len);
-                NativeMethods.weaveffi_free_bytes(ptr, len);
-                return arr;
-            }
-        }
+        public byte[] Value { get; }
 
         /// <summary>Unix-timestamp seconds when the entry was created</summary>
-        public long CreatedAt
-        {
-            get
-            {
-                return NativeMethods.weaveffi_kv_Entry_get_created_at(_handle);
-            }
-        }
+        public long CreatedAt { get; }
 
         /// <summary>Optional unix-timestamp seconds at which the entry expires</summary>
-        public long? ExpiresAt
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_kv_Entry_get_expires_at(_handle);
-                if (ptr == IntPtr.Zero) return null;
-                var value = Marshal.ReadInt64(ptr);
-                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)8);
-                return value;
-            }
-        }
+        public long? ExpiresAt { get; }
 
         /// <summary>Free-form labels attached to the entry</summary>
-        public string[] Tags
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_kv_Entry_get_tags(_handle, out var len);
-                if (ptr == IntPtr.Zero) return Array.Empty<string>();
-                var arr = new string[(int)len];
-                for (int i = 0; i < (int)len; i++)
-                {
-                    var itemPtr = Marshal.ReadIntPtr(ptr, i * IntPtr.Size);
-                    var item = Marshal.PtrToStringUTF8(itemPtr) ?? "";
-                    NativeMethods.weaveffi_free_string(itemPtr);
-                    arr[i] = item;
-                }
-                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
-                return arr;
-            }
-        }
+        public string[] Tags { get; }
 
         /// <summary>Arbitrary string-valued metadata pairs</summary>
-        public Dictionary<string, string> Metadata
+        public Dictionary<string, string> Metadata { get; }
+
+        public Entry(long id, string key, byte[] value, long createdAt, long? expiresAt, string[] tags, Dictionary<string, string> metadata)
         {
-            get
+            Id = id;
+            Key = key;
+            Value = value;
+            CreatedAt = createdAt;
+            ExpiresAt = expiresAt;
+            Tags = tags;
+            Metadata = metadata;
+        }
+
+        internal void WriteTo(WeaveFFIBufferWriter writer)
+        {
+            writer.WriteI64(Id);
+            writer.WriteString(Key);
+            writer.WriteBytes(Value);
+            writer.WriteI64(CreatedAt);
+            if (ExpiresAt != null)
             {
-                NativeMethods.weaveffi_kv_Entry_get_metadata(_handle, out var outKeys, out var outValues, out var outLen);
-                var dict = new Dictionary<string, string>();
-                if (outKeys != IntPtr.Zero && outValues != IntPtr.Zero)
-                {
-                    for (int i = 0; i < (int)outLen; i++)
-                    {
-                        var keyPtr = Marshal.ReadIntPtr(outKeys, i * IntPtr.Size);
-                        var key = Marshal.PtrToStringUTF8(keyPtr) ?? "";
-                        NativeMethods.weaveffi_free_string(keyPtr);
-                        var valuePtr = Marshal.ReadIntPtr(outValues, i * IntPtr.Size);
-                        var value = Marshal.PtrToStringUTF8(valuePtr) ?? "";
-                        NativeMethods.weaveffi_free_string(valuePtr);
-                        dict[key] = value;
-                    }
-                    NativeMethods.weaveffi_free_bytes(outKeys, (UIntPtr)((int)outLen * IntPtr.Size));
-                    NativeMethods.weaveffi_free_bytes(outValues, (UIntPtr)((int)outLen * IntPtr.Size));
-                }
-                return dict;
+                writer.WriteOptionFlag(true);
+                writer.WriteI64(ExpiresAt.Value);
+            }
+            else
+            {
+                writer.WriteOptionFlag(false);
+            }
+            writer.WriteLen(Tags.Length);
+            foreach (var item0 in Tags)
+            {
+                writer.WriteString(item0);
+            }
+            writer.WriteLen(Metadata.Count);
+            foreach (var entry0 in Metadata)
+            {
+                writer.WriteString(entry0.Key);
+                writer.WriteString(entry0.Value);
             }
         }
 
-        public void Dispose()
+        internal static Entry ReadFrom(WeaveFFIBufferReader reader)
         {
-            if (!_disposed)
+            var fId = reader.ReadI64();
+            var fKey = reader.ReadString();
+            var fValue = reader.ReadBytes();
+            var fCreatedAt = reader.ReadI64();
+            long? fExpiresAt = null;
+            if (reader.ReadOptionFlag())
             {
-                NativeMethods.weaveffi_kv_Entry_destroy(_handle);
-                _disposed = true;
+                var fExpiresAtValue = reader.ReadI64();
+                fExpiresAt = fExpiresAtValue;
             }
-            GC.SuppressFinalize(this);
-        }
-
-        ~Entry()
-        {
-            Dispose();
-        }
-    }
-
-    /// <summary>A single key-value entry persisted in the store</summary>
-    public class EntryBuilder
-    {
-        private long _id = 0;
-        private string _key = "";
-        private byte[] _value = Array.Empty<byte>();
-        private long _created_at = 0;
-        private long? _expires_at = null;
-        private string[] _tags = Array.Empty<string>();
-        private Dictionary<string, string> _metadata = new Dictionary<string, string>();
-
-        /// <summary>Stable monotonic identifier assigned on insert</summary>
-        public EntryBuilder WithId(long value)
-        {
-            _id = value;
-            return this;
-        }
-
-        /// <summary>UTF-8 lookup key</summary>
-        public EntryBuilder WithKey(string value)
-        {
-            _key = value;
-            return this;
-        }
-
-        /// <summary>Opaque binary payload</summary>
-        public EntryBuilder WithValue(byte[] value)
-        {
-            _value = value;
-            return this;
-        }
-
-        /// <summary>Unix-timestamp seconds when the entry was created</summary>
-        public EntryBuilder WithCreatedAt(long value)
-        {
-            _created_at = value;
-            return this;
-        }
-
-        /// <summary>Optional unix-timestamp seconds at which the entry expires</summary>
-        public EntryBuilder WithExpiresAt(long? value)
-        {
-            _expires_at = value;
-            return this;
-        }
-
-        /// <summary>Free-form labels attached to the entry</summary>
-        public EntryBuilder WithTags(string[] value)
-        {
-            _tags = value;
-            return this;
-        }
-
-        /// <summary>Arbitrary string-valued metadata pairs</summary>
-        public EntryBuilder WithMetadata(Dictionary<string, string> value)
-        {
-            _metadata = value;
-            return this;
-        }
-
-        public Entry Build()
-        {
-            var err = new WeaveFFIError();
-            var id = _id;
-            var key = _key;
-            var value = _value;
-            var created_at = _created_at;
-            var expires_at = _expires_at;
-            var tags = _tags;
-            var metadata = _metadata;
-            var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
-            var valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
-            var expires_atPtr = IntPtr.Zero;
-            if (expires_at.HasValue)
+            var fTagsCount = reader.ReadLen();
+            var fTags = new string[fTagsCount];
+            for (int i0 = 0; i0 < fTagsCount; i0++)
             {
-                expires_atPtr = Marshal.AllocHGlobal(sizeof(long));
-                Marshal.WriteInt64(expires_atPtr, expires_at.Value);
+                var fTagsItem = reader.ReadString();
+                fTags[i0] = fTagsItem;
             }
-            var tagsArr = new IntPtr[tags.Length];
-            for (var tagsIt = 0; tagsIt < tags.Length; tagsIt++) tagsArr[tagsIt] = Marshal.StringToCoTaskMemUTF8(tags[tagsIt]);
-            var tagsPin = GCHandle.Alloc(tagsArr, GCHandleType.Pinned);
-            var metadataKeysArr = new IntPtr[metadata.Count];
-            var metadataValsArr = new IntPtr[metadata.Count];
-            var metadataI = 0;
-            foreach (var kv in metadata)
+            var fMetadataCount = reader.ReadLen();
+            var fMetadata = new Dictionary<string, string>(fMetadataCount);
+            for (int i0 = 0; i0 < fMetadataCount; i0++)
             {
-                metadataKeysArr[metadataI] = Marshal.StringToCoTaskMemUTF8(kv.Key);
-                metadataValsArr[metadataI] = Marshal.StringToCoTaskMemUTF8(kv.Value);
-                metadataI++;
+                var fMetadataKey = reader.ReadString();
+                var fMetadataVal = reader.ReadString();
+                fMetadata[fMetadataKey] = fMetadataVal;
             }
-            var metadataKeysPin = GCHandle.Alloc(metadataKeysArr, GCHandleType.Pinned);
-            var metadataValsPin = GCHandle.Alloc(metadataValsArr, GCHandleType.Pinned);
-            try
-            {
-                var result = NativeMethods.weaveffi_kv_Entry_create(id, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, created_at, expires_atPtr, tags.Length == 0 ? IntPtr.Zero : tagsPin.AddrOfPinnedObject(), (UIntPtr)tags.Length, metadata.Count == 0 ? IntPtr.Zero : metadataKeysPin.AddrOfPinnedObject(), metadata.Count == 0 ? IntPtr.Zero : metadataValsPin.AddrOfPinnedObject(), (UIntPtr)metadata.Count, ref err);
-                WeaveFFIError.Check(err);
-                return new Entry(result);
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(keyPtr);
-                valuePin.Free();
-                if (expires_atPtr != IntPtr.Zero) Marshal.FreeHGlobal(expires_atPtr);
-                tagsPin.Free();
-                foreach (var tagsP in tagsArr) Marshal.FreeCoTaskMem(tagsP);
-                metadataKeysPin.Free();
-                metadataValsPin.Free();
-                foreach (var metadataKP in metadataKeysArr) Marshal.FreeCoTaskMem(metadataKP);
-                foreach (var metadataVP in metadataValsArr) Marshal.FreeCoTaskMem(metadataVP);
-            }
+            return new Entry(fId, fKey, fValue, fCreatedAt, fExpiresAt, fTags, fMetadata);
         }
     }
 
@@ -426,15 +562,21 @@ namespace WeaveFFI
             var err = new WeaveFFIError();
             var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
             var valuePin = GCHandle.Alloc(value, GCHandleType.Pinned);
-            var ttlSecondsPtr = IntPtr.Zero;
-            if (ttlSeconds.HasValue)
+            var ttlSecondsWriter = new WeaveFFIBufferWriter();
+            if (ttlSeconds != null)
             {
-                ttlSecondsPtr = Marshal.AllocHGlobal(sizeof(long));
-                Marshal.WriteInt64(ttlSecondsPtr, ttlSeconds.Value);
+                ttlSecondsWriter.WriteOptionFlag(true);
+                ttlSecondsWriter.WriteI64(ttlSeconds.Value);
             }
+            else
+            {
+                ttlSecondsWriter.WriteOptionFlag(false);
+            }
+            var ttlSecondsBuf = ttlSecondsWriter.ToArray();
+            var ttlSecondsPin = GCHandle.Alloc(ttlSecondsBuf, GCHandleType.Pinned);
             try
             {
-                var result = NativeMethods.weaveffi_kv_Store_put(_handle, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, (int)kind, ttlSecondsPtr, ref err);
+                var result = NativeMethods.weaveffi_kv_Store_put(_handle, keyPtr, valuePin.AddrOfPinnedObject(), (UIntPtr)value.Length, (int)kind, ttlSecondsPin.AddrOfPinnedObject(), (UIntPtr)ttlSecondsBuf.Length, ref err);
                 WeaveFFIError.CheckKv(err);
                 return result != 0;
             }
@@ -442,7 +584,7 @@ namespace WeaveFFI
             {
                 Marshal.FreeCoTaskMem(keyPtr);
                 valuePin.Free();
-                if (ttlSecondsPtr != IntPtr.Zero) Marshal.FreeHGlobal(ttlSecondsPtr);
+                ttlSecondsPin.Free();
             }
         }
 
@@ -454,9 +596,20 @@ namespace WeaveFFI
             var keyPtr = Marshal.StringToCoTaskMemUTF8(key);
             try
             {
-                var result = NativeMethods.weaveffi_kv_Store_get(_handle, keyPtr, ref err);
+                var result = NativeMethods.weaveffi_kv_Store_get(_handle, keyPtr, out var outLen, ref err);
                 WeaveFFIError.CheckKv(err);
-                return result == IntPtr.Zero ? null : new Entry(result);
+                var resultBuf = new byte[(int)outLen];
+                if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+                NativeMethods.weaveffi_free_bytes(result, outLen);
+                var valueReader = new WeaveFFIBufferReader(resultBuf);
+                Entry? value = null;
+                if (valueReader.ReadOptionFlag())
+                {
+                    var valueValue = Entry.ReadFrom(valueReader);
+                    value = valueValue;
+                }
+                valueReader.ExpectEnd();
+                return value;
             }
             finally
             {
@@ -492,16 +645,27 @@ namespace WeaveFFI
         public IEnumerable<string> ListKeys(string? prefix)
         {
             var err = new WeaveFFIError();
-            var prefixPtr = prefix != null ? Marshal.StringToCoTaskMemUTF8(prefix) : IntPtr.Zero;
+            var prefixWriter = new WeaveFFIBufferWriter();
+            if (prefix != null)
+            {
+                prefixWriter.WriteOptionFlag(true);
+                prefixWriter.WriteString(prefix!);
+            }
+            else
+            {
+                prefixWriter.WriteOptionFlag(false);
+            }
+            var prefixBuf = prefixWriter.ToArray();
+            var prefixPin = GCHandle.Alloc(prefixBuf, GCHandleType.Pinned);
             try
             {
-                var iter = NativeMethods.weaveffi_kv_Store_list_keys(_handle, prefixPtr, ref err);
+                var iter = NativeMethods.weaveffi_kv_Store_list_keys(_handle, prefixPin.AddrOfPinnedObject(), (UIntPtr)prefixBuf.Length, ref err);
                 WeaveFFIError.CheckKv(err);
                 return new WeaveFFIOnceEnumerable<string>(EnumerateListKeys(iter));
             }
             finally
             {
-                if (prefixPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(prefixPtr);
+                prefixPin.Free();
             }
         }
 
@@ -561,7 +725,8 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
-                            tcs.SetException(KvException.FromCode(wErr.Code, msg));
+                            var payload = WeaveFFIError.CopyPayload(wErr);
+                            tcs.SetException(KvException.FromCode(wErr.Code, msg, payload));
                             return;
                         }
                     }
@@ -636,58 +801,37 @@ namespace WeaveFFI
     }
 
     /// <summary>Aggregate store statistics</summary>
-    public class Stats : IDisposable
+    public sealed class Stats
     {
-        private IntPtr _handle;
-        private bool _disposed;
-
-        internal Stats(IntPtr handle)
-        {
-            _handle = handle;
-        }
-
-        internal IntPtr Handle => _handle;
-
         /// <summary>Number of live entries</summary>
-        public long TotalEntries
-        {
-            get
-            {
-                return NativeMethods.weaveffi_kv_stats_Stats_get_total_entries(_handle);
-            }
-        }
+        public long TotalEntries { get; }
 
         /// <summary>Sum of all value byte lengths</summary>
-        public long TotalBytes
-        {
-            get
-            {
-                return NativeMethods.weaveffi_kv_stats_Stats_get_total_bytes(_handle);
-            }
-        }
+        public long TotalBytes { get; }
 
         /// <summary>Number of entries past their TTL but not yet evicted</summary>
-        public long ExpiredEntries
+        public long ExpiredEntries { get; }
+
+        public Stats(long totalEntries, long totalBytes, long expiredEntries)
         {
-            get
-            {
-                return NativeMethods.weaveffi_kv_stats_Stats_get_expired_entries(_handle);
-            }
+            TotalEntries = totalEntries;
+            TotalBytes = totalBytes;
+            ExpiredEntries = expiredEntries;
         }
 
-        public void Dispose()
+        internal void WriteTo(WeaveFFIBufferWriter writer)
         {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_kv_stats_Stats_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
+            writer.WriteI64(TotalEntries);
+            writer.WriteI64(TotalBytes);
+            writer.WriteI64(ExpiredEntries);
         }
 
-        ~Stats()
+        internal static Stats ReadFrom(WeaveFFIBufferReader reader)
         {
-            Dispose();
+            var fTotalEntries = reader.ReadI64();
+            var fTotalBytes = reader.ReadI64();
+            var fExpiredEntries = reader.ReadI64();
+            return new Stats(fTotalEntries, fTotalBytes, fExpiredEntries);
         }
     }
 
@@ -701,32 +845,8 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Entry_create(long id, IntPtr key, IntPtr value_ptr, UIntPtr value_len, long created_at, IntPtr expires_at, IntPtr tags, UIntPtr tags_len, IntPtr metadata_keys, IntPtr metadata_values, UIntPtr metadata_len, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_Entry_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_Entry_get_id(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_key", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Entry_get_key(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_value", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Entry_get_value(IntPtr ptr, out UIntPtr out_len);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_created_at", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_Entry_get_created_at(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_expires_at", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Entry_get_expires_at(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_tags", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Entry_get_tags(IntPtr ptr, out UIntPtr out_len);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_Entry_get_metadata", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_Entry_get_metadata(IntPtr ptr, out IntPtr out_keys, out IntPtr out_values, out UIntPtr out_len);
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kv_Store_destroy(IntPtr self);
@@ -735,16 +855,16 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_kv_Store_open(IntPtr path, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_put", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern byte weaveffi_kv_Store_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, int kind, IntPtr ttl_seconds, ref WeaveFFIError err);
+        internal static extern byte weaveffi_kv_Store_put(IntPtr self, IntPtr key, IntPtr value_ptr, UIntPtr value_len, int kind, IntPtr ttl_seconds_ptr, UIntPtr ttl_seconds_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_get", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Store_get(IntPtr self, IntPtr key, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kv_Store_get(IntPtr self, IntPtr key, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_delete", CallingConvention = CallingConvention.Cdecl)]
         internal static extern byte weaveffi_kv_Store_delete(IntPtr self, IntPtr key, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_list_keys", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_Store_list_keys(IntPtr self, IntPtr prefix, ref WeaveFFIError out_err);
+        internal static extern IntPtr weaveffi_kv_Store_list_keys(IntPtr self, IntPtr prefix_ptr, UIntPtr prefix_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_ListKeysIterator_next", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_kv_Store_ListKeysIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
@@ -779,23 +899,8 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_kv_unregister_eviction_listener", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kv_unregister_eviction_listener(ulong id);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_Stats_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_stats_Stats_create(long total_entries, long total_bytes, long expired_entries, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_Stats_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kv_stats_Stats_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_Stats_get_total_entries", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_stats_Stats_get_total_entries(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_Stats_get_total_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_stats_Stats_get_total_bytes(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_Stats_get_expired_entries", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kv_stats_Stats_get_expired_entries(IntPtr ptr);
-
         [DllImport(LibName, EntryPoint = "weaveffi_kv_stats_get_stats", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kv_stats_get_stats(IntPtr store, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kv_stats_get_stats(IntPtr store, out UIntPtr out_len, ref WeaveFFIError err);
 
     }
 
@@ -843,9 +948,15 @@ namespace WeaveFFI
         public static Stats GetStats(Store store)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kv_stats_get_stats(store.Handle, ref err);
+            var result = NativeMethods.weaveffi_kv_stats_get_stats(store.Handle, out var outLen, ref err);
             WeaveFFIError.CheckKv(err);
-            return new Stats(result);
+            var resultBuf = new byte[(int)outLen];
+            if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+            NativeMethods.weaveffi_free_bytes(result, outLen);
+            var valueReader = new WeaveFFIBufferReader(resultBuf);
+            var value = Stats.ReadFrom(valueReader);
+            valueReader.ExpectEnd();
+            return value;
         }
 
     }

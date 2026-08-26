@@ -19,8 +19,9 @@ surfacing as a typed error. The two interpretations are named once, in
 same pair; see [Throws versus Trap](#throws-versus-trap).
 
 Underneath, every generated symbol still reports through the C-level
-out-error parameter (`weaveffi_error*`) with an integer code and an
-optional message string; the typed surface is built on top of it.
+out-error parameter (`weaveffi_error*`) with an integer code, an
+optional message string, and an optional structured payload; the typed
+surface is built on top of it.
 
 ## When to use
 
@@ -40,7 +41,7 @@ Reach for this guide when:
 ### Declare a domain and opt in with `throws`
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     errors:
@@ -73,6 +74,25 @@ re-cases them into its own idiom.
 The domain is in scope for its module and every module nested inside it,
 so one domain on a parent module can serve a whole subtree. Interface
 constructors and methods opt in with the same `throws: true` flag.
+
+A code may additionally declare structured payload `fields:` (the same
+shape as struct fields). When a matching error is raised, those fields
+travel across the ABI in the error's payload buffer and surface as
+properties on the typed error the consumer catches:
+
+```yaml
+codes:
+  - name: NotFound
+    code: 2
+    message: "contact not found"
+    fields:
+      - { name: id, type: i64 }
+```
+
+See [Structured error payloads](../reference/idl.md#structured-error-payloads)
+for the schema and the
+[Value Buffer Protocol](../reference/value-buffers.md#structured-errors)
+for the wire format.
 
 The validator enforces:
 
@@ -117,6 +137,23 @@ pub mod contacts {
 The macro generates the `ErrorReport` implementation and the C ABI thunks
 that write the matching code and message into `out_err`.
 
+A variant may carry named fields, which become the code's structured
+payload; the macro serializes them into the error's payload buffer in
+declaration order. Field-carrying variants with explicit discriminants
+require a primitive repr on the enum:
+
+```rust
+#[weaveffi::error]
+#[derive(Debug)]
+#[repr(i32)]
+pub enum QuotaError {
+    /// quota exceeded
+    Exceeded { limit: i64, used: i64 } = 3001,
+    /// quota service unavailable
+    Unavailable = 3002,
+}
+```
+
 **If you hand-implement the C ABI** (a non-Rust producer, or Rust without
 the macro), report through the `weaveffi-abi` helpers, preferring the
 codes you declared in the IDL:
@@ -136,17 +173,22 @@ pub extern "C" fn weaveffi_contacts_get_contact(
 
 | Helper                                 | Effect                                              |
 |----------------------------------------|-----------------------------------------------------|
-| `error_set_ok(out_err)`                | Sets `code = 0`, frees any prior message            |
+| `error_set_ok(out_err)`                | Sets `code = 0`, frees any prior message and payload |
 | `error_set(out_err, code, msg)`        | Sets a non-zero code and allocates a message        |
-| `result_to_out_err(result, out_err)`   | Maps `Result<T, E>` through `ErrorReport` (domain code for implementors, generic `-1` for plain `Display` errors) |
+| `error_set_with_payload(out_err, code, msg, payload)` | Like `error_set`, plus an owned payload buffer (the code's fields in value-buffer format) |
+| `result_to_out_err(result, out_err)`   | Maps `Result<T, E>` through `ErrorReport` (domain code, message, and payload for implementors, generic `-1` for plain `Display` errors) |
 | `error_set_panic(out_err, payload)`    | Reports a caught panic with the reserved code `-2`  |
+
+Hand-written `ErrorReport` implementations can override the trait's
+`payload(&self) -> Vec<u8>` method to serialize a code's declared fields;
+the default reports no payload.
 
 ### Handle errors in C
 
 The C surface is the raw out-error struct:
 
 ```c
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 
 const char* contact = weaveffi_contacts_get_contact(id, &err);
 if (err.code) {
@@ -162,7 +204,7 @@ weaveffi_free_string(contact);
 
 The pattern is always:
 
-1. Zero-initialise: `weaveffi_error err = {0, NULL};`.
+1. Zero-initialise: `weaveffi_error err = {0};`.
 2. Call the function with `&err` as the last argument.
 3. Check `err.code`; if non-zero, read `err.message` and call
    `weaveffi_error_clear(&err)`.
@@ -216,6 +258,10 @@ that suffix exceptions rename the domain accordingly (`ContactsError`
 becomes `ContactsException` in Kotlin, .NET, and Dart). A code the
 consumer doesn't recognize (from a newer producer, for example) falls
 back to the generic branded error rather than being dropped.
+
+When a code declares payload `fields:`, each generator decodes the
+error's payload buffer and exposes the fields as properties of the
+raised exception (or returned error value), keyed by the field names.
 
 ### Producer panics
 
@@ -273,7 +319,7 @@ Per target, the two strategies surface as:
 
 | Target   | Throws (`throws: true`)                     | Trap (producer bug)                      |
 |----------|----------------------------------------------|------------------------------------------|
-| C        | `weaveffi_error { code, message }` struct    | same struct (code `-2` or `1`)           |
+| C        | `weaveffi_error { code, message, payload }` struct | same struct (code `-2` or `1`)     |
 | Swift    | `throws`, typed domain enum                  | `fatalError`                             |
 | Python   | `raise`, domain exception subclass           | `raise WeaveFFIError`                    |
 | Kotlin   | `throw`, typed domain exception              | `throw WeaveFFIException`                |
@@ -292,18 +338,20 @@ with `Exception` (Kotlin, .NET, Dart) use `WeaveFFIException`. Per-code
 names are PascalCased from the IDL, and domain type names keep exactly one
 `Error` (or `Exception`) suffix.
 
-| Field     | Type           | Description                                       |
-|-----------|----------------|---------------------------------------------------|
-| `code`    | `int32_t`      | `0` = success, non-zero = error                   |
-| `message` | `const char*`  | `NULL` on success; Rust-allocated string on error |
+| Field         | Type             | Description                                       |
+|---------------|------------------|---------------------------------------------------|
+| `code`        | `int32_t`        | `0` = success, non-zero = error                   |
+| `message`     | `const char*`    | `NULL` on success; Rust-allocated string on error |
+| `payload_ptr` | `const uint8_t*` | `NULL` unless the matched code declares `fields:`; the fields serialized in the value-buffer format |
+| `payload_len` | `size_t`         | Byte length of `payload_ptr`; `0` when null       |
 
-See the [Memory Ownership Guide](memory.md) for the freeing contract
-on `err.message`.
+See the [Memory Ownership Guide](memory.md) for the freeing contract on
+`err.message` and the payload (`weaveffi_error_clear` releases both).
 
 ## Pitfalls
 
-- **Forgetting to call `weaveffi_error_clear`**: the message is
-  Rust-allocated. Skipping the clear leaks the string.
+- **Forgetting to call `weaveffi_error_clear`**: the message and the
+  payload are Rust-allocated. Skipping the clear leaks them.
 - **Reading `err.message` after clearing**: the pointer is invalid as
   soon as `weaveffi_error_clear` returns.
 - **Using `code = 0` or `code = -2` as a domain value**: the validator
@@ -319,7 +367,7 @@ on `err.message`.
   producer bug and traps through the target's programming-error idiom
   (see [Throws versus Trap](#throws-versus-trap)).
 - **Not initialising the struct**: always start with
-  `{0, NULL}` (or the language equivalent). Stale `code` values from
+  `{0}` (or the language equivalent). Stale `code` values from
   earlier calls produce confusing failures.
 - **Ignoring the return value when `code != 0`**: Rust does not
   promise the return value is meaningful on failure. For pointer

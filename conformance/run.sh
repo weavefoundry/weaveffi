@@ -77,8 +77,15 @@ build_producer() {
 }
 
 # Generate all-language bindings for a sample into $GENROOT/<sample>.
+# SKIP_GEN=1 reuses bindings from a previous run, letting concurrent harness
+# invocations (e.g. per-language lanes running in parallel) share one
+# pre-generated tree instead of racing on the rm -rf below.
 generate() {
     local sample=$1 idl=$2
+    if [ -n "${SKIP_GEN:-}" ]; then
+        echo "--- reusing bindings: $sample"
+        return 0
+    fi
     echo "--- generating bindings: $sample"
     # Clean first so files renamed across generator versions (e.g. an old
     # identity-named lib left beside the current one) can't shadow fresh output;

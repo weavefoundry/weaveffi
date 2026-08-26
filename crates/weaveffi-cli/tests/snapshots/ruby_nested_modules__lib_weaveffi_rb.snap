@@ -31,7 +31,9 @@ module WeaveFFI
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
-           :message, :pointer
+           :message, :pointer,
+           :payload_ptr, :pointer,
+           :payload_len, :size_t
   end
 
   class Error < StandardError
@@ -40,6 +42,176 @@ module WeaveFFI
     def initialize(code, message)
       @code = code
       super(message)
+    end
+  end
+
+  # @api private
+  # Appends values in the WeaveFFI value-buffer wire format: little-endian,
+  # packed, no alignment.
+  class WvBufferWriter
+    def initialize
+      @buf = +''.b
+    end
+
+    # The encoded bytes as a binary String.
+    def data
+      @buf
+    end
+
+    def write_bool(v)
+      @buf << (v ? "\x01".b : "\x00".b)
+    end
+
+    def write_flag(v)
+      write_bool(v)
+    end
+
+    def write_i8(v)
+      @buf << [v].pack('c')
+    end
+
+    def write_u8(v)
+      @buf << [v].pack('C')
+    end
+
+    def write_i16(v)
+      @buf << [v].pack('s<')
+    end
+
+    def write_u16(v)
+      @buf << [v].pack('S<')
+    end
+
+    def write_i32(v)
+      @buf << [v].pack('l<')
+    end
+
+    def write_u32(v)
+      @buf << [v].pack('L<')
+    end
+
+    def write_len(v)
+      write_u32(v)
+    end
+
+    def write_i64(v)
+      @buf << [v].pack('q<')
+    end
+
+    def write_u64(v)
+      @buf << [v].pack('Q<')
+    end
+
+    def write_f32(v)
+      @buf << [v].pack('e')
+    end
+
+    def write_f64(v)
+      @buf << [v].pack('E')
+    end
+
+    def write_string(v)
+      b = v.to_s.encode(Encoding::UTF_8).b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+
+    def write_bytes(v)
+      b = v.to_s.b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+  end
+
+  # @api private
+  # Reads values in the WeaveFFI value-buffer wire format, raising Error on
+  # any malformed buffer.
+  class WvBufferReader
+    def initialize(data)
+      @data = data.to_s.b
+      @pos = 0
+    end
+
+    def take(n, what)
+      raise Error.new(-1, "malformed value buffer: #{what}") if @pos + n > @data.bytesize
+      s = @data.byteslice(@pos, n)
+      @pos += n
+      s
+    end
+
+    def read_bool
+      b = take(1, 'bool').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: bool byte out of range') if b > 1
+      b == 1
+    end
+
+    def read_flag
+      b = take(1, 'option flag').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: option flag out of range') if b > 1
+      b == 1
+    end
+
+    def read_i8
+      take(1, 'i8').unpack1('c')
+    end
+
+    def read_u8
+      take(1, 'u8').unpack1('C')
+    end
+
+    def read_i16
+      take(2, 'i16').unpack1('s<')
+    end
+
+    def read_u16
+      take(2, 'u16').unpack1('S<')
+    end
+
+    def read_i32
+      take(4, 'i32').unpack1('l<')
+    end
+
+    def read_u32
+      take(4, 'u32').unpack1('L<')
+    end
+
+    def read_len
+      len = read_u32
+      if len > @data.bytesize - @pos
+        raise Error.new(-1, 'malformed value buffer: length prefix exceeds remaining bytes')
+      end
+      len
+    end
+
+    def read_i64
+      take(8, 'i64').unpack1('q<')
+    end
+
+    def read_u64
+      take(8, 'u64').unpack1('Q<')
+    end
+
+    def read_f32
+      take(4, 'f32').unpack1('e')
+    end
+
+    def read_f64
+      take(8, 'f64').unpack1('E')
+    end
+
+    def read_string
+      s = take(read_len, 'string bytes').force_encoding(Encoding::UTF_8)
+      raise Error.new(-1, 'malformed value buffer: string is not valid UTF-8') unless s.valid_encoding?
+      s
+    end
+
+    def read_bytes
+      take(read_len, 'byte buffer')
+    end
+
+    def expect_end!
+      return if @pos == @data.bytesize
+      raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
@@ -75,9 +247,10 @@ module WeaveFFI
     1 => GraphicsError::OutOfBounds,
   }.freeze
 
-  # Builds the GraphicsError subclass matching `code`, or a generic Error
-  # for codes outside the domain (panics, marshalling).
-  def self.graphics_error_from(code, message)
+  # Builds the GraphicsError subclass matching `code`, decoding any payload
+  # fields the code declares, or a generic Error for codes outside
+  # the domain (panics, marshalling).
+  def self.graphics_error_from(code, message, payload = nil)
     cls = GRAPHICS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
     message.empty? ? cls.new : cls.new(message)
@@ -89,8 +262,10 @@ module WeaveFFI
     code = err[:code]
     msg_ptr = err[:message]
     msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    payload_ptr = err[:payload_ptr]
+    payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
-    raise graphics_error_from(code, msg)
+    raise graphics_error_from(code, msg, payload)
   end
 
   # A measurement unit shared with nested submodules.
@@ -99,177 +274,189 @@ module WeaveFFI
     POINTS = 1
   end
 
-  attach_function :weaveffi_graphics_Canvas_destroy, [:pointer], :void
-  attach_function :weaveffi_graphics_Canvas_get_width, [:pointer], :int32
-  # Reference down into a nested module
-  attach_function :weaveffi_graphics_Canvas_get_root, [:pointer], :pointer
-  # Construct a Canvas.
-  attach_function :weaveffi_graphics_new_canvas, [:int32, :pointer], :pointer
-
-  class CanvasPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_graphics_Canvas_destroy(ptr)
-    end
-  end
-
   # Top-level struct that references a struct defined one level deeper.
   class Canvas
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = CanvasPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def width
-      result = WeaveFFI.weaveffi_graphics_Canvas_get_width(@handle)
-      result
-    end
+    attr_reader :width
 
     # Reference down into a nested module
-    def root
-      result = WeaveFFI.weaveffi_graphics_Canvas_get_root(@handle)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Shape.new(result)
+    attr_reader :root
+
+    def initialize(width:, root:)
+      @width = width
+      @root = root
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Canvas)
+      return false unless width == other.width
+      return false unless root == other.root
+      true
     end
   end
+
+  # @api private
+  # Packs a Canvas into the value-buffer wire format.
+  def self._wv_write_canvas(w, v)
+    w.write_i32(v.width)
+    _wv_write_shape(w, v.root)
+  end
+
+  # @api private
+  # Unpacks a Canvas from the value-buffer wire format.
+  def self._wv_read_canvas(r)
+    _wv_width = r.read_i32
+    _wv_root = _wv_read_shape(r)
+    Canvas.new(width: _wv_width, root: _wv_root)
+  end
+  # Construct a Canvas.
+  attach_function :weaveffi_graphics_new_canvas, [:int32, :pointer, :pointer], :pointer
 
   # Construct a Canvas.
   def self.new_canvas(width)
     err = ErrorStruct.new
-    result = weaveffi_graphics_new_canvas(width, err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_graphics_new_canvas(width, out_len, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Canvas.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_canvas(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # === Module: graphics_shapes ===
 
-  attach_function :weaveffi_graphics_shapes_Shape_destroy, [:pointer], :void
-  attach_function :weaveffi_graphics_shapes_Shape_get_sides, [:pointer], :int32
-  # Reference up to the parent module's enum
-  attach_function :weaveffi_graphics_shapes_Shape_get_unit, [:pointer], :int32
-  # Reference down into a deeper module
-  attach_function :weaveffi_graphics_shapes_Shape_get_detail, [:pointer], :pointer
-  # Construct a Shape.
-  attach_function :weaveffi_graphics_shapes_make_shape, [:int32, :pointer], :pointer
-  # Nested function returning a struct owned by an ancestor module.
-  attach_function :weaveffi_graphics_shapes_describe, [:pointer], :pointer
-
-  class ShapePtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_graphics_shapes_Shape_destroy(ptr)
-    end
-  end
-
   # A struct one level deep that references both an ancestor enum and a deeper struct.
   class Shape
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = ShapePtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def sides
-      result = WeaveFFI.weaveffi_graphics_shapes_Shape_get_sides(@handle)
-      result
-    end
+    attr_reader :sides
 
     # Reference up to the parent module's enum
-    def unit
-      result = WeaveFFI.weaveffi_graphics_shapes_Shape_get_unit(@handle)
-      result
-    end
+    attr_reader :unit
 
     # Reference down into a deeper module
-    def detail
-      result = WeaveFFI.weaveffi_graphics_shapes_Shape_get_detail(@handle)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Detail.new(result)
+    attr_reader :detail
+
+    def initialize(sides:, unit:, detail:)
+      @sides = sides
+      @unit = unit
+      @detail = detail
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Shape)
+      return false unless sides == other.sides
+      return false unless unit == other.unit
+      return false unless detail == other.detail
+      true
     end
   end
+
+  # @api private
+  # Packs a Shape into the value-buffer wire format.
+  def self._wv_write_shape(w, v)
+    w.write_i32(v.sides)
+    w.write_i32(v.unit)
+    _wv_write_detail(w, v.detail)
+  end
+
+  # @api private
+  # Unpacks a Shape from the value-buffer wire format.
+  def self._wv_read_shape(r)
+    _wv_sides = r.read_i32
+    _wv_unit = r.read_i32
+    _wv_detail = _wv_read_detail(r)
+    Shape.new(sides: _wv_sides, unit: _wv_unit, detail: _wv_detail)
+  end
+  # Construct a Shape.
+  attach_function :weaveffi_graphics_shapes_make_shape, [:int32, :pointer, :pointer], :pointer
+  # Nested function returning a struct owned by an ancestor module.
+  attach_function :weaveffi_graphics_shapes_describe, [:pointer, :pointer], :pointer
 
   # Construct a Shape.
   def self.make_shape(sides)
     err = ErrorStruct.new
-    result = weaveffi_graphics_shapes_make_shape(sides, err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_graphics_shapes_make_shape(sides, out_len, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Shape.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_shape(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # Nested function returning a struct owned by an ancestor module.
   def self.describe()
     err = ErrorStruct.new
-    result = weaveffi_graphics_shapes_describe(err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_graphics_shapes_describe(out_len, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Canvas.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_canvas(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # === Module: graphics_shapes_geometry ===
 
-  attach_function :weaveffi_graphics_shapes_geometry_Detail_destroy, [:pointer], :void
-  attach_function :weaveffi_graphics_shapes_geometry_Detail_get_area, [:pointer], :double
-  # Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
-  attach_function :weaveffi_graphics_shapes_geometry_compute, [:pointer, :pointer], :pointer
-
-  class DetailPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_graphics_shapes_geometry_Detail_destroy(ptr)
-    end
-  end
-
   # A struct two levels deep.
   class Detail
-    attr_reader :handle
+    attr_reader :area
 
-    def initialize(handle)
-      @handle = DetailPtr.new(handle)
+    def initialize(area:)
+      @area = area
     end
 
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def area
-      result = WeaveFFI.weaveffi_graphics_shapes_geometry_Detail_get_area(@handle)
-      result
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Detail)
+      return false unless area == other.area
+      true
     end
   end
+
+  # @api private
+  # Packs a Detail into the value-buffer wire format.
+  def self._wv_write_detail(w, v)
+    w.write_f64(v.area)
+  end
+
+  # @api private
+  # Unpacks a Detail from the value-buffer wire format.
+  def self._wv_read_detail(r)
+    _wv_area = r.read_f64
+    Detail.new(area: _wv_area)
+  end
+  # Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
+  attach_function :weaveffi_graphics_shapes_geometry_compute, [:pointer, :size_t, :pointer, :pointer], :pointer
 
   # Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
   def self.compute(shape)
     err = ErrorStruct.new
-    result = weaveffi_graphics_shapes_geometry_compute(shape.handle, err)
+    shape_w = WvBufferWriter.new
+    _wv_write_shape(shape_w, shape)
+    shape_data = shape_w.data
+    shape_buf = FFI::MemoryPointer.new(:uint8, shape_data.bytesize)
+    shape_buf.put_bytes(0, shape_data)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_graphics_shapes_geometry_compute(shape_buf, shape_data.bytesize, out_len, err)
     check_graphics_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Detail.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_detail(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 end
 

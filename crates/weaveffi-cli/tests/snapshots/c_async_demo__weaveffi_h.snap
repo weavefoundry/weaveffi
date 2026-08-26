@@ -44,7 +44,16 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+/* Error slot written by every fallible call. `payload_ptr`/`payload_len`
+   hold the matched error code's fields serialized in the WeaveFFI value
+   buffer format (null when the code declares no fields); both the message
+   and the payload are released by weaveffi_error_clear. */
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
+} weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
@@ -64,30 +73,26 @@ WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token
 WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /*
- * Map convention: Maps are passed as parallel arrays of keys and values.
- * A map parameter {K:V} named "m" expands to:
- *   const K* m_keys, const V* m_values, size_t m_len
- * A map return value expands to out-parameters that receive callee-
- * allocated arrays; the caller passes the address of its own pointers:
- *   K** out_keys, V** out_values, size_t* out_len
+ * Value buffer convention: records, rich enums, lists, maps, and
+ * optionals cross the ABI serialized in the WeaveFFI value buffer
+ * format (little-endian; see the generated bindings or the WeaveFFI
+ * buffer protocol spec for the per-type encoding).
+ * A buffered parameter named "v" expands to a borrowed view:
+ *   const uint8_t* v_ptr, size_t v_len
+ * A buffered return is a producer-allocated buffer returned as
+ * `const uint8_t*` with a trailing `size_t* out_len`; the caller
+ * decodes it and then releases it with weaveffi_free_bytes.
  */
 
 /** Error codes reported by throwing functions in the `tasks` module tree. */
 typedef enum { weaveffi_tasks_TaskError_InvalidName = 1 } weaveffi_tasks_TaskError;
-typedef struct weaveffi_tasks_TaskResult weaveffi_tasks_TaskResult;
-typedef void (*weaveffi_tasks_run_task_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result);
-typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult** result, size_t result_len);
+typedef void (*weaveffi_tasks_run_task_callback)(void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len);
+typedef void (*weaveffi_tasks_run_batch_callback)(void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len);
 typedef void (*weaveffi_tasks_run_n_tasks_callback)(void* context, weaveffi_error* err, int32_t result);
 
 // Module: tasks
-WEAVEFFI_API weaveffi_tasks_TaskResult* weaveffi_tasks_TaskResult_create(int64_t id, const char* value, bool success, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_tasks_TaskResult_destroy(weaveffi_tasks_TaskResult* ptr);
-WEAVEFFI_API int64_t weaveffi_tasks_TaskResult_get_id(const weaveffi_tasks_TaskResult* ptr);
-WEAVEFFI_API const char* weaveffi_tasks_TaskResult_get_value(const weaveffi_tasks_TaskResult* ptr);
-WEAVEFFI_API bool weaveffi_tasks_TaskResult_get_success(const weaveffi_tasks_TaskResult* ptr);
-
 WEAVEFFI_API void weaveffi_tasks_run_task_async(const char* name, weaveffi_tasks_run_task_callback callback, void* context);
-WEAVEFFI_API void weaveffi_tasks_run_batch_async(const char* const* names, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
+WEAVEFFI_API void weaveffi_tasks_run_batch_async(const uint8_t* names_ptr, size_t names_len, weaveffi_tasks_run_batch_callback callback, void* context);
 WEAVEFFI_API bool weaveffi_tasks_cancel_task(int64_t id, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_tasks_run_n_tasks_async(int32_t n, weaveffi_tasks_run_n_tasks_callback callback, void* context);
 WEAVEFFI_API int64_t weaveffi_tasks_active_callbacks(weaveffi_error* out_err);

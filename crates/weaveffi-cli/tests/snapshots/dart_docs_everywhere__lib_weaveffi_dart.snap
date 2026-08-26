@@ -7,9 +7,12 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
+import 'dart:async';
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io' show Platform;
-import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -29,6 +32,9 @@ final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
+  external Pointer<Uint8> payloadPtr;
+  @Size()
+  external int payloadLen;
 }
 
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
@@ -64,6 +70,249 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
+// ── WeaveFFI value-buffer runtime ──
+// Records, rich enums, optionals, lists, maps, and error payloads cross the
+// C ABI serialized in this little-endian, packed format. A malformed buffer
+// is a producer/consumer contract violation, never a typed domain error.
+
+Never _bufferError(String context) =>
+    throw StateError('malformed WeaveFFI value buffer: $context');
+
+// Copies a borrowed native (ptr, len) buffer into Dart-owned memory.
+Uint8List _copyNativeBytes(Pointer<Uint8> ptr, int len) =>
+    ptr == nullptr ? Uint8List(0) : Uint8List.fromList(ptr.asTypedList(len));
+
+// Stages an encoding into native memory for a borrowed (ptr, len) argument;
+// the caller frees the pointer after the call returns.
+Pointer<Uint8> _stageBytes(Uint8List bytes) {
+  final ptr = calloc<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+  if (bytes.isNotEmpty) ptr.asTypedList(bytes.length).setAll(0, bytes);
+  return ptr;
+}
+
+final class _BufferWriter {
+  Uint8List _buf = Uint8List(64);
+  ByteData? _view;
+  int _len = 0;
+
+  ByteData get _data => _view ??= ByteData.sublistView(_buf);
+
+  void _ensure(int extra) {
+    if (_len + extra <= _buf.length) return;
+    var cap = _buf.length * 2;
+    while (cap < _len + extra) {
+      cap *= 2;
+    }
+    final next = Uint8List(cap);
+    next.setRange(0, _len, _buf);
+    _buf = next;
+    _view = null;
+  }
+
+  Uint8List takeBytes() => Uint8List.sublistView(_buf, 0, _len);
+
+  void writeBool(bool v) => writeUint8(v ? 1 : 0);
+
+  void writeOptionFlag(bool present) => writeUint8(present ? 1 : 0);
+
+  void writeInt8(int v) {
+    _ensure(1);
+    _data.setInt8(_len, v);
+    _len += 1;
+  }
+
+  void writeUint8(int v) {
+    _ensure(1);
+    _data.setUint8(_len, v);
+    _len += 1;
+  }
+
+  void writeInt16(int v) {
+    _ensure(2);
+    _data.setInt16(_len, v, Endian.little);
+    _len += 2;
+  }
+
+  void writeUint16(int v) {
+    _ensure(2);
+    _data.setUint16(_len, v, Endian.little);
+    _len += 2;
+  }
+
+  void writeInt32(int v) {
+    _ensure(4);
+    _data.setInt32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeUint32(int v) {
+    _ensure(4);
+    _data.setUint32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeInt64(int v) {
+    _ensure(8);
+    _data.setInt64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeUint64(int v) {
+    _ensure(8);
+    _data.setUint64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeFloat32(double v) {
+    _ensure(4);
+    _data.setFloat32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeFloat64(double v) {
+    _ensure(8);
+    _data.setFloat64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeLength(int v) => writeUint32(v);
+
+  void writeString(String v) {
+    final bytes = utf8.encode(v);
+    writeLength(bytes.length);
+    _ensure(bytes.length);
+    _buf.setRange(_len, _len + bytes.length, bytes);
+    _len += bytes.length;
+  }
+
+  void writeBytes(List<int> v) {
+    writeLength(v.length);
+    _ensure(v.length);
+    _buf.setRange(_len, _len + v.length, v);
+    _len += v.length;
+  }
+}
+
+final class _BufferReader {
+  final Uint8List _buf;
+  final ByteData _data;
+  int _pos = 0;
+
+  _BufferReader(Uint8List buf)
+      : _buf = buf,
+        _data = ByteData.sublistView(buf);
+
+  int get _remaining => _buf.length - _pos;
+
+  void _require(int n, String context) {
+    if (_remaining < n) _bufferError(context);
+  }
+
+  bool readBool() {
+    _require(1, 'bool');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('bool byte out of range');
+    return b == 1;
+  }
+
+  bool readOptionFlag() {
+    _require(1, 'option flag');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('option flag byte out of range');
+    return b == 1;
+  }
+
+  int readInt8() {
+    _require(1, 'i8');
+    return _data.getInt8(_pos++);
+  }
+
+  int readUint8() {
+    _require(1, 'u8');
+    return _buf[_pos++];
+  }
+
+  int readInt16() {
+    _require(2, 'i16');
+    final v = _data.getInt16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readUint16() {
+    _require(2, 'u16');
+    final v = _data.getUint16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readInt32() {
+    _require(4, 'i32');
+    final v = _data.getInt32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readUint32() {
+    _require(4, 'u32');
+    final v = _data.getUint32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readInt64() {
+    _require(8, 'i64');
+    final v = _data.getInt64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readUint64() {
+    _require(8, 'u64');
+    final v = _data.getUint64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  double readFloat32() {
+    _require(4, 'f32');
+    final v = _data.getFloat32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  double readFloat64() {
+    _require(8, 'f64');
+    final v = _data.getFloat64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readLength() {
+    final n = readUint32();
+    if (n > _remaining) _bufferError('length prefix exceeds remaining buffer');
+    return n;
+  }
+
+  String readString() {
+    final n = readLength();
+    final s = utf8.decode(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return s;
+  }
+
+  Uint8List readBytes() {
+    final n = readLength();
+    final b = Uint8List.fromList(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return b;
+  }
+
+  void expectEnd() {
+    if (_remaining != 0) _bufferError('trailing bytes after value');
+  }
+}
+
 // Live listener trampolines by subscription id. Holding the
 // NativeCallable here keeps its native thunk alive until unregistered.
 final Map<int, NativeCallable> _listenerCallables = {};
@@ -83,7 +332,7 @@ class InvalidStatusException extends DocsErrorsException {
   InvalidStatusException([String message = 'Invalid status transition']) : super(2, message);
 }
 
-WeaveFFIException _mapDocsErrorsException(int code, String message) {
+WeaveFFIException _mapDocsErrorsException(int code, String message, Uint8List payload) {
   switch (code) {
     case 1:
       return NotFoundException(message);
@@ -98,8 +347,9 @@ void _checkDocsErrorsException(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
+    final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);
     _weaveffiErrorClear(err);
-    throw _mapDocsErrorsException(code, msg);
+    throw _mapDocsErrorsException(code, msg, payload);
   }
 }
 
@@ -121,153 +371,40 @@ enum Status {
       Status.values.firstWhere((e) => e.value == value);
 }
 
-typedef _NativeWeaveffiDocsDocumentDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiDocsDocumentDestroy = void Function(Pointer<Void>);
-final _weaveffiDocsDocumentDestroy = _lib.lookupFunction<
-    _NativeWeaveffiDocsDocumentDestroy, _DartWeaveffiDocsDocumentDestroy>('weaveffi_docs_Document_destroy');
-
-typedef _NativeWeaveffiDocsDocumentGetId = Int64 Function(Pointer<Void>);
-typedef _DartWeaveffiDocsDocumentGetId = int Function(Pointer<Void>);
-final _weaveffiDocsDocumentGetId = _lib.lookupFunction<
-    _NativeWeaveffiDocsDocumentGetId, _DartWeaveffiDocsDocumentGetId>('weaveffi_docs_Document_get_id');
-
-typedef _NativeWeaveffiDocsDocumentGetTitle = Pointer<Utf8> Function(Pointer<Void>);
-typedef _DartWeaveffiDocsDocumentGetTitle = Pointer<Utf8> Function(Pointer<Void>);
-final _weaveffiDocsDocumentGetTitle = _lib.lookupFunction<
-    _NativeWeaveffiDocsDocumentGetTitle, _DartWeaveffiDocsDocumentGetTitle>('weaveffi_docs_Document_get_title');
-
-typedef _NativeWeaveffiDocsDocumentGetStatus = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiDocsDocumentGetStatus = int Function(Pointer<Void>);
-final _weaveffiDocsDocumentGetStatus = _lib.lookupFunction<
-    _NativeWeaveffiDocsDocumentGetStatus, _DartWeaveffiDocsDocumentGetStatus>('weaveffi_docs_Document_get_status');
-
-typedef _NativeWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<Size>);
-typedef _DartWeaveffiDocsDocumentGetTags = Pointer<Void> Function(Pointer<Void>, Pointer<Size>);
-final _weaveffiDocsDocumentGetTags = _lib.lookupFunction<
-    _NativeWeaveffiDocsDocumentGetTags, _DartWeaveffiDocsDocumentGetTags>('weaveffi_docs_Document_get_tags');
-
 /// Represents a single document tracked by the system.
 ///
 /// Documents are persisted to disk and exposed via the public API.
 class Document {
-  final Pointer<Void> _handle;
-  Document._(this._handle);
-
-  void dispose() {
-    _weaveffiDocsDocumentDestroy(_handle);
-  }
-
   /// Stable opaque identifier
-  int get id {
-    final result = _weaveffiDocsDocumentGetId(_handle);
-    return result;
-  }
-
+  final int id;
   /// Human-readable title shown in lists
-  String get title {
-    final result = _weaveffiDocsDocumentGetTitle(_handle);
-    final value = result.toDartString();
-    _weaveffiFreeString(result);
-    return value;
-  }
-
+  final String title;
   /// Current lifecycle status
-  Status get status {
-    final result = _weaveffiDocsDocumentGetStatus(_handle);
-    return Status.fromValue(result);
-  }
-
+  final Status status;
   /// Free-form tags for grouping
-  List<String> get tags {
-    final outLen = calloc<Size>();
-    try {
-      final result = _weaveffiDocsDocumentGetTags(_handle, outLen);
-      final n = outLen.value;
-      if (result == nullptr) return <String>[];
-      final arr = result.cast<Pointer<Utf8>>();
-      final items = List<String>.generate(n, (i) => arr[i].toDartString());
-      for (var i = 0; i < n; i++) {
-        _weaveffiFreeString(arr[i]);
-      }
-      _weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Utf8>>());
-      return items;
-    } finally {
-      calloc.free(outLen);
-    }
+  final List<String> tags;
+
+  Document({required this.id, required this.title, required this.status, required this.tags});
+}
+
+void _packDocument(_BufferWriter w, Document v) {
+  w.writeInt64(v.id);
+  w.writeString(v.title);
+  w.writeInt32(v.status.value);
+  final t0 = v.tags;
+  w.writeLength(t0.length);
+  for (final t1 in t0) {
+    w.writeString(t1);
   }
 }
 
-typedef _NativeWeaveffiDocsDocumentCreate = Pointer<Void> Function(Int64, Pointer<Utf8>, Int32, Pointer<Pointer<Utf8>>, Size, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiDocsDocumentCreate = Pointer<Void> Function(int, Pointer<Utf8>, int, Pointer<Pointer<Utf8>>, int, Pointer<_WeaveFFIError>);
-final _weaveffiDocsDocumentCreate = _lib.lookupFunction<
-    _NativeWeaveffiDocsDocumentCreate, _DartWeaveffiDocsDocumentCreate>('weaveffi_docs_Document_create');
-
-/// Represents a single document tracked by the system.
-///
-/// Documents are persisted to disk and exposed via the public API.
-class DocumentBuilder {
-  int? _id;
-  String? _title;
-  Status? _status;
-  List<String>? _tags;
-
-  /// Stable opaque identifier
-  DocumentBuilder withId(int value) {
-    _id = value;
-    return this;
-  }
-
-  /// Human-readable title shown in lists
-  DocumentBuilder withTitle(String value) {
-    _title = value;
-    return this;
-  }
-
-  /// Current lifecycle status
-  DocumentBuilder withStatus(Status value) {
-    _status = value;
-    return this;
-  }
-
-  /// Free-form tags for grouping
-  DocumentBuilder withTags(List<String> value) {
-    _tags = value;
-    return this;
-  }
-
-  Document build() {
-    if (_id == null) {
-      throw StateError('missing field: id');
-    }
-    if (_title == null) {
-      throw StateError('missing field: title');
-    }
-    if (_status == null) {
-      throw StateError('missing field: status');
-    }
-    if (_tags == null) {
-      throw StateError('missing field: tags');
-    }
-    final id = _id!;
-    final title = _title!;
-    final status = _status!;
-    final tags = _tags!;
-  final titlePtr = title.toNativeUtf8();
-  final tagsPtr = tags.isEmpty ? nullptr : calloc<Pointer<Utf8>>(tags.length);
-  for (var i = 0; i < tags.length; i++) {
-    tagsPtr[i] = tags[i].toNativeUtf8();
-  }
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiDocsDocumentCreate(id, titlePtr, status.value, tagsPtr, tags.length, err);
-      _checkError(err);
-      return Document._(result);
-    } finally {
-      calloc.free(titlePtr);
-      if (tagsPtr != nullptr) { for (var i = 0; i < tags.length; i++) { calloc.free(tagsPtr[i]); } calloc.free(tagsPtr); }
-      calloc.free(err);
-    }
-  }
+Document _unpackDocument(_BufferReader r) {
+  return Document(
+    id: r.readInt64(),
+    title: r.readString(),
+    status: Status.fromValue(r.readInt32()),
+    tags: List<String>.generate(r.readLength(), (_) => r.readString()),
+  );
 }
 
 typedef _NativeWeaveffiDocsNotebookDestroy = Void Function(Pointer<Void>);
@@ -280,13 +417,13 @@ typedef _DartWeaveffiDocsNotebookNew = Pointer<Void> Function(Pointer<_WeaveFFIE
 final _weaveffiDocsNotebookNew = _lib.lookupFunction<
     _NativeWeaveffiDocsNotebookNew, _DartWeaveffiDocsNotebookNew>('weaveffi_docs_Notebook_new');
 
-typedef _NativeWeaveffiDocsNotebookInsert = Int32 Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiDocsNotebookInsert = int Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiDocsNotebookInsert = Int32 Function(Pointer<Void>, Pointer<Uint8>, Size, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookInsert = int Function(Pointer<Void>, Pointer<Uint8>, int, Pointer<_WeaveFFIError>);
 final _weaveffiDocsNotebookInsert = _lib.lookupFunction<
     _NativeWeaveffiDocsNotebookInsert, _DartWeaveffiDocsNotebookInsert>('weaveffi_docs_Notebook_insert');
 
-typedef _NativeWeaveffiDocsNotebookFind = Pointer<Void> Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiDocsNotebookFind = Pointer<Void> Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiDocsNotebookFind = Pointer<Uint8> Function(Pointer<Void>, Int64, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsNotebookFind = Pointer<Uint8> Function(Pointer<Void>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiDocsNotebookFind = _lib.lookupFunction<
     _NativeWeaveffiDocsNotebookFind, _DartWeaveffiDocsNotebookFind>('weaveffi_docs_Notebook_find');
 
@@ -326,12 +463,17 @@ class Notebook {
 
   /// Add a document, returning its position in the notebook
   int insert(Document document) {
+    final documentWriter = _BufferWriter();
+    _packDocument(documentWriter, document);
+    final documentBuf = documentWriter.takeBytes();
+    final documentPtr = _stageBytes(documentBuf);
     final err = calloc<_WeaveFFIError>();
     try {
-      final result = _weaveffiDocsNotebookInsert(_handle, document._handle, err);
+      final result = _weaveffiDocsNotebookInsert(_handle, documentPtr, documentBuf.length, err);
       _checkError(err);
       return result;
     } finally {
+      calloc.free(documentPtr);
       calloc.free(err);
     }
   }
@@ -340,12 +482,20 @@ class Notebook {
   ///
   /// Throws [DocsErrorsException] on domain errors.
   Document find(int id) {
+    final outLen = calloc<Size>();
     final err = calloc<_WeaveFFIError>();
     try {
-      final result = _weaveffiDocsNotebookFind(_handle, id, err);
+      final result = _weaveffiDocsNotebookFind(_handle, id, outLen, err);
       _checkDocsErrorsException(err);
-      return Document._(result);
+      final n = outLen.value;
+      final data = _copyNativeBytes(result, n);
+      if (result != nullptr) _weaveffiFreeBytes(result, n);
+      final reader = _BufferReader(data);
+      final value = _unpackDocument(reader);
+      reader.expectEnd();
+      return value;
     } finally {
+      calloc.free(outLen);
       calloc.free(err);
     }
   }
@@ -404,8 +554,8 @@ void unregisterSavedListener(int id) {
   _listenerCallables.remove(id)?.close();
 }
 
-typedef _NativeWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>, Size, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiDocsCreateDocument = Pointer<Void> Function(Pointer<Utf8>, Pointer<Pointer<Utf8>>, int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiDocsCreateDocument = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsCreateDocument = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiDocsCreateDocument = _lib.lookupFunction<
     _NativeWeaveffiDocsCreateDocument, _DartWeaveffiDocsCreateDocument>('weaveffi_docs_create_document');
 
@@ -415,36 +565,55 @@ final _weaveffiDocsCreateDocument = _lib.lookupFunction<
 /// it explicitly to make it visible.
 Document createDocument(String title, List<String> tags) {
   final titlePtr = title.toNativeUtf8();
-  final tagsPtr = tags.isEmpty ? nullptr : calloc<Pointer<Utf8>>(tags.length);
-  for (var i = 0; i < tags.length; i++) {
-    tagsPtr[i] = tags[i].toNativeUtf8();
+  final tagsWriter = _BufferWriter();
+  final t0 = tags;
+  tagsWriter.writeLength(t0.length);
+  for (final t1 in t0) {
+    tagsWriter.writeString(t1);
   }
+  final tagsBuf = tagsWriter.takeBytes();
+  final tagsPtr = _stageBytes(tagsBuf);
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiDocsCreateDocument(titlePtr, tagsPtr, tags.length, err);
+    final result = _weaveffiDocsCreateDocument(titlePtr, tagsPtr, tagsBuf.length, outLen, err);
     _checkError(err);
-    return Document._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackDocument(reader);
+    reader.expectEnd();
+    return value;
   } finally {
     calloc.free(titlePtr);
-    if (tagsPtr != nullptr) { for (var i = 0; i < tags.length; i++) { calloc.free(tagsPtr[i]); } calloc.free(tagsPtr); }
+    calloc.free(tagsPtr);
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiDocsGetDocument = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiDocsGetDocument = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiDocsGetDocument = Pointer<Uint8> Function(Int64, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsGetDocument = Pointer<Uint8> Function(int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiDocsGetDocument = _lib.lookupFunction<
     _NativeWeaveffiDocsGetDocument, _DartWeaveffiDocsGetDocument>('weaveffi_docs_get_document');
 
 /// Look up a document by identifier
 Document? getDocument(int id) {
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiDocsGetDocument(id, err);
+    final result = _weaveffiDocsGetDocument(id, outLen, err);
     _checkError(err);
-    if (result == nullptr) return null;
-    return Document._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = (reader.readOptionFlag() ? _unpackDocument(reader) : null);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }

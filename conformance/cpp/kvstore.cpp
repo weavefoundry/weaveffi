@@ -1,16 +1,17 @@
 // Conformance consumer: kvstore sample, C++ target.
 //
-// Drives the generated header-only wrappers for the 0.5.0 interface + typed
-// error surface: `Store` is a move-only RAII interface class constructed via
-// the `Store::open` static factory (destroy runs in the destructor), methods
-// marshal through the wrapped handle, and `Store::default_capacity` is a
-// static member. Throwing wrappers surface the `KvError` domain hierarchy
-// (`KeyNotFoundError`, `IoError`, ...), including from the std::future-backed
-// async `compact`. Also keeps the pre-overhaul coverage: the builder's
-// list/map input marshaling, `Entry::metadata()` triple-pointer out-params,
-// the iterator-backed `list_keys`, the `kv.stats` nested-module wrapper, and
-// the std::function eviction listener. Aborts (non-zero) on any failed
-// assertion.
+// Drives the generated header-only wrappers for the value-type surface +
+// typed error surface: `Store` is a move-only RAII interface class
+// constructed via the `Store::open` static factory (destroy runs in the
+// destructor) and `Store::default_capacity` is a static member, while `Entry`
+// and `Stats` are plain value structs decoded from value buffers (with the
+// optional, list, and map fields riding inside the same buffer). Throwing
+// wrappers surface the `KvError` domain hierarchy (`KeyNotFoundError`,
+// `IoError`, ...), including from the std::future-backed async `compact`.
+// Also keeps the pre-overhaul coverage: list/map fields round-tripping
+// through the generated pack/unpack pair, the iterator-backed `list_keys`,
+// the `kv.stats` nested-module wrapper, and the std::function eviction
+// listener. Aborts (non-zero) on any failed assertion.
 
 #include <cassert>
 #include <cstdio>
@@ -57,11 +58,26 @@ int main() {
     }
     assert(saw_alpha && saw_beta);
 
-    // A present key comes back as an engaged optional.
+    // A present key comes back as an engaged optional holding the decoded
+    // value struct; the optional, list, and map fields decode with it (empty
+    // here: the producer stores no TTL, tags, or metadata on put).
     std::optional<Entry> found = store.get("alpha");
     assert(found.has_value());
-    assert(found->key() == "alpha");
-    assert(found->value() == payload);
+    assert(found->id > 0);
+    assert(found->key == "alpha");
+    assert(found->value == payload);
+    assert(found->created_at > 0);
+    assert(!found->expires_at.has_value());
+    assert(found->tags.empty());
+    assert(found->metadata.empty());
+
+    // A put with a TTL surfaces as a present optional field on read.
+    assert(store.put("ttl", payload, EntryKind::Volatile, 3600));
+    std::optional<Entry> ttl_entry = store.get("ttl");
+    assert(ttl_entry.has_value());
+    assert(ttl_entry->expires_at.has_value());
+    assert(*ttl_entry->expires_at > ttl_entry->created_at);
+    assert(store.delete_("ttl"));
 
     // A missing key throws the per-code subclass; catching the domain base
     // proves the hierarchy (KeyNotFoundError -> KvError -> WeaveFFIError).
@@ -82,48 +98,55 @@ int main() {
     }
     assert(caught_typed);
 
-    // Builder marshals a [string] list and a {string:string} map *in*; the
-    // getters then read them back *out* (the case the ABI redesign fixes).
-    Entry entry = EntryBuilder()
-                      .withId(7)
-                      .withKey("alpha")
-                      .withValue(payload)
-                      .withCreatedAt(1000)
-                      .withExpiresAt(std::nullopt)
-                      .withTags({"hot", "fast"})
-                      .withMetadata({{"source", "test"}, {"env", "prod"}})
-                      .build();
-    assert(entry.id() == 7);
+    // The sample declares no Entry-typed parameter, so drive the generated
+    // pack/unpack pair directly: a [string] list and a {string:string} map
+    // encode *in* and decode back *out* of one value buffer (the coverage the
+    // builder + getters used to give).
+    Entry entry{7,
+                "alpha",
+                payload,
+                1000,
+                std::nullopt,
+                {"hot", "fast"},
+                {{"source", "test"}, {"env", "prod"}}};
+    detail::BufferWriter w;
+    detail::write_Entry(w, entry);
+    detail::BufferReader r(w.data(), w.size());
+    Entry back = detail::read_Entry(r);
+    r.expect_end();
+    assert(back.id == 7);
+    assert(back.key == "alpha");
+    assert(back.value == payload);
+    assert(back.created_at == 1000);
+    assert(!back.expires_at.has_value());
 
-    std::vector<std::string> tags = entry.tags();
-    assert(tags.size() == 2);
+    assert(back.tags.size() == 2);
     bool saw_hot = false, saw_fast = false;
-    for (const auto& t : tags) {
+    for (const auto& t : back.tags) {
         if (t == "hot") saw_hot = true;
         if (t == "fast") saw_fast = true;
     }
     assert(saw_hot && saw_fast);
 
-    std::unordered_map<std::string, std::string> md = entry.metadata();
-    assert(md.size() == 2);
-    assert(md.at("source") == "test");
-    assert(md.at("env") == "prod");
+    assert(back.metadata.size() == 2);
+    assert(back.metadata.at("source") == "test");
+    assert(back.metadata.at("env") == "prod");
 
-    // Empty map round-trips as an empty map (the null-array branch).
-    Entry empty = EntryBuilder()
-                      .withId(8)
-                      .withKey("k")
-                      .withValue(payload)
-                      .withCreatedAt(1)
-                      .withExpiresAt(std::nullopt)
-                      .withTags({})
-                      .withMetadata({})
-                      .build();
-    assert(empty.metadata().empty());
+    // Empty list and map fields round-trip as empty (the zero-count branch).
+    Entry empty{8, "k", payload, 1, std::nullopt, {}, {}};
+    detail::BufferWriter we;
+    detail::write_Entry(we, empty);
+    detail::BufferReader re(we.data(), we.size());
+    Entry empty_back = detail::read_Entry(re);
+    re.expect_end();
+    assert(empty_back.tags.empty());
+    assert(empty_back.metadata.empty());
 
-    // kv.stats nested-module wrapper takes the interface by const reference.
+    // kv.stats nested-module wrapper takes the interface by const reference
+    // and returns the Stats value struct.
     Stats st = kv::stats::get_stats(store);
-    assert(st.total_entries() == 2);
+    assert(st.total_entries == 2);
+    assert(st.total_bytes == 6);
 
     // Eviction listener: delete fires the std::function trampoline
     // synchronously on the calling thread. `delete` is a C++ keyword, so the

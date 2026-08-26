@@ -40,7 +40,7 @@ Describe the API once in a language-neutral IDL. Create `math.yml` with a
 record and a function:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 package:
   name: my-math
   version: "0.1.0"
@@ -104,36 +104,36 @@ generated/
 
 ### C header (`generated/c/weaveffi.h`)
 
-The C generator produces an opaque struct with lifecycle functions and getters,
-plus a module-level function. Functions and constructors take an `out_err`
-parameter for error reporting (destructors and getters don't):
+Records generate no C functions: a `Point` crosses the ABI serialized as
+a [value buffer](reference/value-buffers.md), a single
+`(const uint8_t*, size_t)` pair, and the header opens with a comment
+block spelling out that convention. What remains is one prototype per
+module-level function, each taking an `out_err` parameter for error
+reporting:
 
 ```c
-typedef struct weaveffi_math_Point weaveffi_math_Point;
-
-weaveffi_math_Point* weaveffi_math_Point_create(
-    double x, double y, weaveffi_error* out_err);
-void weaveffi_math_Point_destroy(weaveffi_math_Point* ptr);
-double weaveffi_math_Point_get_x(const weaveffi_math_Point* ptr);
-double weaveffi_math_Point_get_y(const weaveffi_math_Point* ptr);
+/*
+ * Value buffer convention: records, rich enums, lists, maps, and
+ * optionals cross the ABI serialized in the WeaveFFI value buffer
+ * format ...
+ */
 
 int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);
 ```
 
 ### Swift wrapper (`generated/swift/Sources/MyMath/MyMath.swift`)
 
-Structs become classes that own an `OpaquePointer` and free it on `deinit`.
-Module functions are grouped under a Swift enum namespace. Because `add`
-doesn't declare `throws: true`, its Swift wrapper is a plain non-throwing
-function:
+Structs become plain Swift structs with typed properties, packed and
+unpacked from value buffers by the wrapper. Module functions are grouped
+under a Swift enum namespace. Because `add` doesn't declare
+`throws: true`, its Swift wrapper is a plain non-throwing function:
 
 ```swift
-public class Point {
-    let ptr: OpaquePointer
-    deinit { weaveffi_math_Point_destroy(ptr) }
+public struct Point {
+    public var x: Double
+    public var y: Double
 
-    public var x: Double { weaveffi_math_Point_get_x(ptr) }
-    public var y: Double { weaveffi_math_Point_get_y(ptr) }
+    public init(x: Double, y: Double) { ... }
 }
 
 public enum Math {
@@ -181,7 +181,7 @@ crate-type = ["cdylib"]
 ```
 
 Copy `scaffold.rs` into `src/lib.rs` and fill in the bodies. Implementing `add`
-looks like this (struct lifecycle omitted for brevity):
+looks like this:
 
 ```rust
 #![allow(unsafe_code)]

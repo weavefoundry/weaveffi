@@ -70,21 +70,22 @@ class WeaveFFI {
         /**
          * Returns a typed handle
          */
-        @JvmStatic private external fun openTypedHandleJni(): Long
-        @JvmStatic fun openTypedHandle(): Token = Token(openTypedHandleJni())
+        @JvmStatic external fun openTypedHandle(): Long
         /**
          * Optional struct return
          */
-        @JvmStatic private external fun maybeItemJni(id: Long): Long?
-        @JvmStatic fun maybeItem(id: Long): Item? = maybeItemJni(id)?.let { Item(it) }
+        @JvmStatic private external fun maybeItemJni(id: Long): ByteArray
+        @JvmStatic fun maybeItem(id: Long): Item? = weaveDecode(maybeItemJni(id)) { r -> r.readOptional { unpackItem(r) } }
         /**
          * List of structs
          */
-        @JvmStatic external fun listItems(): LongArray
+        @JvmStatic private external fun listItemsJni(): ByteArray
+        @JvmStatic fun listItems(): List<Item> = weaveDecode(listItemsJni()) { r -> r.readList { unpackItem(r) } }
         /**
          * Map return type
          */
-        @JvmStatic external fun getAttrs(): Map<String, Int>
+        @JvmStatic private external fun getAttrsJni(): ByteArray
+        @JvmStatic fun getAttrs(): Map<String, Int> = weaveDecode(getAttrsJni()) { r -> r.readMap({ r.readString() }, { r.readI32() }) }
         /**
          * Iterator return type
          */
@@ -93,21 +94,21 @@ class WeaveFFI {
         /**
          * Returns the shared Token type from another module
          */
-        @JvmStatic private external fun crossModuleTokenJni(): Long
-        @JvmStatic fun crossModuleToken(): Token = Token(crossModuleTokenJni())
+        @JvmStatic private external fun crossModuleTokenJni(): ByteArray
+        @JvmStatic fun crossModuleToken(): Token = weaveDecode(crossModuleTokenJni()) { r -> unpackToken(r) }
         /**
          * Async operation
          */
         @JvmStatic private external fun doAsyncAsync(input: String, callback: Any)
         @JvmStatic suspend fun doAsync(input: String): String = suspendCancellableCoroutine { cont ->
-            doAsyncAsync(input, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
+            doAsyncAsync(input, WeaveContinuation(cont) { code, message, _ -> WeaveFFIException(code, message) })
         }
         /**
          * Cancellable async operation
          */
         @JvmStatic private external fun doCancellableAsync(input: String, cancelToken: Long, callback: Any)
         @JvmStatic suspend fun doCancellable(input: String): String = suspendCancellableCoroutine { cont ->
-            doCancellableAsync(input, 0L, WeaveContinuation(cont) { code, message -> WeaveFFIException(code, message) })
+            doCancellableAsync(input, 0L, WeaveContinuation(cont) { code, message, _ -> WeaveFFIException(code, message) })
         }
         /**
          * Legacy operation kept for compatibility
@@ -126,32 +127,17 @@ class WeaveFFI {
 }
 
 /** A reusable token referenced across modules */
-class Token internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
+data class Token(val id: Long, val label: String)
 
-        @JvmStatic external fun nativeCreate(id: Long, label: String): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetId(handle: Long): Long
-        @JvmStatic external fun nativeGetLabel(handle: Long): String
-
-        fun create(id: Long, label: String): Token = Token(nativeCreate(id, label))
-    }
-
-    val id: Long get() = nativeGetId(handle)
-    val label: String get() = nativeGetLabel(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
+internal fun packToken(w: WeaveBufferWriter, v: Token) {
+    w.writeI64(v.id)
+    w.writeString(v.label)
 }
+
+internal fun unpackToken(r: WeaveBufferReader): Token = Token(
+    r.readI64(),
+    r.readString(),
+)
 
 /** Task priority levels */
 enum class Priority(val value: Int) {
@@ -168,144 +154,56 @@ enum class Priority(val value: Int) {
 }
 
 /** Kitchen sink struct exercising every field feature */
-class Item internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
-
-        @JvmStatic external fun nativeCreate(id: Long, name: String, count: Int, enabled: Boolean, ratio: Double, nick: Long, payload: ByteArray, tags: Array<String>, attrs: Map<String, String>, parent: Long?, token: Long, priority: Int): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetId(handle: Long): Long
-        @JvmStatic external fun nativeGetName(handle: Long): String
-        @JvmStatic external fun nativeGetCount(handle: Long): Int
-        @JvmStatic external fun nativeGetEnabled(handle: Long): Boolean
-        @JvmStatic external fun nativeGetRatio(handle: Long): Double
-        @JvmStatic external fun nativeGetNick(handle: Long): Long
-        @JvmStatic external fun nativeGetPayload(handle: Long): ByteArray
-        @JvmStatic external fun nativeGetTags(handle: Long): Array<String>
-        @JvmStatic external fun nativeGetAttrs(handle: Long): Map<String, String>
-        @JvmStatic external fun nativeGetParent(handle: Long): Long?
-        @JvmStatic external fun nativeGetToken(handle: Long): Long
-        @JvmStatic external fun nativeGetPriority(handle: Long): Int
-
-        fun create(id: Long, name: String, count: Int, enabled: Boolean, ratio: Double, nick: Long, payload: ByteArray, tags: Array<String>, attrs: Map<String, String>, parent: Long?, token: Long, priority: Int): Item = Item(nativeCreate(id, name, count, enabled, ratio, nick, payload, tags, attrs, parent, token, priority))
-    }
-
+data class Item(
     /** Stable identifier */
-    val id: Long get() = nativeGetId(handle)
+    val id: Long,
     /** Display name */
-    val name: String get() = nativeGetName(handle)
+    val name: String,
     /** Initial count */
-    val count: Int get() = nativeGetCount(handle)
+    val count: Int,
     /** Whether the item is enabled */
-    val enabled: Boolean get() = nativeGetEnabled(handle)
+    val enabled: Boolean,
     /** Scaling ratio */
-    val ratio: Double get() = nativeGetRatio(handle)
-    val nick: Long get() = nativeGetNick(handle)
-    val payload: ByteArray get() = nativeGetPayload(handle)
-    val tags: Array<String> get() = nativeGetTags(handle)
-    val attrs: Map<String, String> get() = nativeGetAttrs(handle)
-    val parent: Long? get() = nativeGetParent(handle)
+    val ratio: Double,
+    val nick: Long,
+    val payload: ByteArray,
+    val tags: List<String>,
+    val attrs: Map<String, String>,
+    val parent: Long?,
     /** Cross-module struct reference */
-    val token: Token get() = Token(nativeGetToken(handle))
-    val priority: Priority get() = Priority.fromValue(nativeGetPriority(handle))
+    val token: Token,
+    val priority: Priority,
+)
 
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
+internal fun packItem(w: WeaveBufferWriter, v: Item) {
+    w.writeI64(v.id)
+    w.writeString(v.name)
+    w.writeI32(v.count)
+    w.writeBool(v.enabled)
+    w.writeF64(v.ratio)
+    w.writeU32(v.nick)
+    w.writeBytes(v.payload)
+    w.writeList(v.tags) { v0 -> w.writeString(v0) }
+    w.writeMap(v.attrs, { k0 -> w.writeString(k0) }, { v0 -> w.writeString(v0) })
+    w.writeOptional(v.parent) { v0 -> w.writeI64(v0) }
+    packToken(w, v.token)
+    w.writeI32(v.priority.value)
 }
 
-/** Kitchen sink struct exercising every field feature */
-class ItemBuilder {
-    private var id: Long? = null
-    private var name: String? = null
-    private var count: Int? = null
-    private var enabled: Boolean? = null
-    private var ratio: Double? = null
-    private var nick: Long? = null
-    private var payload: ByteArray? = null
-    private var tags: Array<String>? = null
-    private var attrs: Map<String, String>? = null
-    private var parent: Long? = null
-    private var token: Token? = null
-    private var priority: Priority? = null
-    /** Stable identifier */
-    fun withId(id: Long): ItemBuilder {
-        this.id = id
-        return this
-    }
-    /** Display name */
-    fun withName(name: String): ItemBuilder {
-        this.name = name
-        return this
-    }
-    /** Initial count */
-    fun withCount(count: Int): ItemBuilder {
-        this.count = count
-        return this
-    }
-    /** Whether the item is enabled */
-    fun withEnabled(enabled: Boolean): ItemBuilder {
-        this.enabled = enabled
-        return this
-    }
-    /** Scaling ratio */
-    fun withRatio(ratio: Double): ItemBuilder {
-        this.ratio = ratio
-        return this
-    }
-    fun withNick(nick: Long): ItemBuilder {
-        this.nick = nick
-        return this
-    }
-    fun withPayload(payload: ByteArray): ItemBuilder {
-        this.payload = payload
-        return this
-    }
-    fun withTags(tags: Array<String>): ItemBuilder {
-        this.tags = tags
-        return this
-    }
-    fun withAttrs(attrs: Map<String, String>): ItemBuilder {
-        this.attrs = attrs
-        return this
-    }
-    fun withParent(parent: Long?): ItemBuilder {
-        this.parent = parent
-        return this
-    }
-    /** Cross-module struct reference */
-    fun withToken(token: Token): ItemBuilder {
-        this.token = token
-        return this
-    }
-    fun withPriority(priority: Priority): ItemBuilder {
-        this.priority = priority
-        return this
-    }
-    fun build(): Item {
-        return Item.create(
-            id ?: throw IllegalStateException("missing field: id"),
-            name ?: throw IllegalStateException("missing field: name"),
-            count ?: throw IllegalStateException("missing field: count"),
-            enabled ?: throw IllegalStateException("missing field: enabled"),
-            ratio ?: throw IllegalStateException("missing field: ratio"),
-            nick ?: throw IllegalStateException("missing field: nick"),
-            payload ?: throw IllegalStateException("missing field: payload"),
-            tags ?: throw IllegalStateException("missing field: tags"),
-            attrs ?: throw IllegalStateException("missing field: attrs"),
-            parent,
-            token ?: throw IllegalStateException("missing field: token"),
-            priority ?: throw IllegalStateException("missing field: priority")
-        )
-    }
-}
+internal fun unpackItem(r: WeaveBufferReader): Item = Item(
+    r.readI64(),
+    r.readString(),
+    r.readI32(),
+    r.readBool(),
+    r.readF64(),
+    r.readU32(),
+    r.readBytes(),
+    r.readList { r.readString() },
+    r.readMap({ r.readString() }, { r.readString() }),
+    r.readOptional { r.readI64() },
+    unpackToken(r),
+    Priority.fromValue(r.readI32()),
+)
 
 /** A pocket-sized interface exercising the object surface */
 class Gadget internal constructor(internal var handle: Long) : java.io.Closeable {
@@ -376,7 +274,7 @@ class KitchenStreamItemsIterator internal constructor(private var handle: Long) 
         if (!hasNext()) throw NoSuchElementException()
         val raw = nextSlot!![0]
         nextSlot = null
-        return Item(raw as Long)
+        return weaveDecode((raw as ByteArray)) { r -> unpackItem(r) }
     }
 
     override fun close() {
@@ -407,8 +305,8 @@ sealed class KitchenErrorsException(code: Int, message: String) : WeaveFFIExcept
     class InvalidInput(message: String = "Invalid input") : KitchenErrorsException(2, message)
 
     companion object {
-        /** Map a raw `KitchenErrors` code to its typed exception; unknown codes yield the generic [WeaveFFIException]. */
-        fun fromCode(code: Int, message: String): WeaveFFIException = when (code) {
+        /** Map a raw `KitchenErrors` code and payload to the typed exception; unknown codes yield the generic [WeaveFFIException]. */
+        @JvmStatic fun fromCode(code: Int, message: String, payload: ByteArray?): WeaveFFIException = when (code) {
             1 -> NotFound(message)
             2 -> InvalidInput(message)
             else -> WeaveFFIException(code, message)
@@ -416,13 +314,158 @@ sealed class KitchenErrorsException(code: Int, message: String) : WeaveFFIExcept
     }
 }
 
+/** Growable little-endian writer implementing the WeaveFFI value-buffer wire format. */
+internal class WeaveBufferWriter {
+    private var buf = ByteArray(32)
+    private var len = 0
+
+    private fun reserve(extra: Int) {
+        if (len + extra <= buf.size) return
+        var cap = buf.size * 2
+        while (cap < len + extra) cap *= 2
+        buf = buf.copyOf(cap)
+    }
+
+    fun toByteArray(): ByteArray = buf.copyOf(len)
+
+    fun writeBool(v: Boolean) { reserve(1); buf[len++] = if (v) 1 else 0 }
+    fun writeI8(v: Byte) { reserve(1); buf[len++] = v }
+    fun writeI16(v: Short) {
+        reserve(2)
+        val b = v.toInt()
+        buf[len++] = (b and 0xFF).toByte()
+        buf[len++] = ((b shr 8) and 0xFF).toByte()
+    }
+    fun writeI32(v: Int) {
+        reserve(4)
+        buf[len++] = (v and 0xFF).toByte()
+        buf[len++] = ((v shr 8) and 0xFF).toByte()
+        buf[len++] = ((v shr 16) and 0xFF).toByte()
+        buf[len++] = ((v shr 24) and 0xFF).toByte()
+    }
+    fun writeU32(v: Long) = writeI32(v.toInt())
+    fun writeI64(v: Long) {
+        writeI32(v.toInt())
+        writeI32((v ushr 32).toInt())
+    }
+    fun writeF32(v: Float) = writeI32(v.toRawBits())
+    fun writeF64(v: Double) = writeI64(v.toRawBits())
+    fun writeString(v: String) = writeBytes(v.toByteArray(Charsets.UTF_8))
+    fun writeBytes(v: ByteArray) {
+        writeI32(v.size)
+        reserve(v.size)
+        v.copyInto(buf, len)
+        len += v.size
+    }
+    fun <T> writeOptional(v: T?, write: (T) -> Unit) {
+        if (v == null) writeBool(false) else { writeBool(true); write(v) }
+    }
+    fun <T> writeList(v: List<T>, write: (T) -> Unit) {
+        writeI32(v.size)
+        for (e in v) write(e)
+    }
+    fun <K, V> writeMap(v: Map<K, V>, writeKey: (K) -> Unit, writeValue: (V) -> Unit) {
+        writeI32(v.size)
+        for ((k, e) in v) { writeKey(k); writeValue(e) }
+    }
+}
+
+/** Validating little-endian reader for the WeaveFFI value-buffer wire format. */
+internal class WeaveBufferReader(private val buf: ByteArray) {
+    private var pos = 0
+
+    private fun malformed(detail: String): Nothing =
+        throw WeaveFFIException(-2, "malformed WeaveFFI value buffer: " + detail)
+
+    private fun take(n: Int): Int {
+        if (n > buf.size - pos) malformed("truncated buffer")
+        val at = pos
+        pos += n
+        return at
+    }
+
+    fun readBool(): Boolean = when (buf[take(1)].toInt()) {
+        0 -> false
+        1 -> true
+        else -> malformed("invalid bool byte")
+    }
+    fun readI8(): Byte = buf[take(1)]
+    fun readI16(): Short {
+        val at = take(2)
+        return ((buf[at].toInt() and 0xFF) or ((buf[at + 1].toInt() and 0xFF) shl 8)).toShort()
+    }
+    fun readI32(): Int {
+        val at = take(4)
+        return (buf[at].toInt() and 0xFF) or
+            ((buf[at + 1].toInt() and 0xFF) shl 8) or
+            ((buf[at + 2].toInt() and 0xFF) shl 16) or
+            ((buf[at + 3].toInt() and 0xFF) shl 24)
+    }
+    fun readU32(): Long = readI32().toLong() and 0xFFFFFFFFL
+    fun readI64(): Long {
+        val lo = readI32().toLong() and 0xFFFFFFFFL
+        val hi = readI32().toLong()
+        return lo or (hi shl 32)
+    }
+    fun readF32(): Float = Float.fromBits(readI32())
+    fun readF64(): Double = Double.fromBits(readI64())
+    private fun readLen(): Int {
+        val n = readI32()
+        if (n < 0 || n > buf.size - pos) malformed("length prefix exceeds remaining bytes")
+        return n
+    }
+    fun readString(): String {
+        val n = readLen()
+        val at = take(n)
+        return try {
+            Charsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(buf, at, n)).toString()
+        } catch (e: java.nio.charset.CharacterCodingException) {
+            malformed("string is not valid UTF-8")
+        }
+    }
+    fun readBytes(): ByteArray {
+        val n = readLen()
+        val at = take(n)
+        return buf.copyOfRange(at, at + n)
+    }
+    fun <T> readOptional(read: () -> T): T? = if (readBool()) read() else null
+    fun <T> readList(read: () -> T): List<T> {
+        val n = readLen()
+        val out = ArrayList<T>(n)
+        repeat(n) { out.add(read()) }
+        return out
+    }
+    fun <K, V> readMap(readKey: () -> K, readValue: () -> V): Map<K, V> {
+        val n = readLen()
+        val out = LinkedHashMap<K, V>()
+        repeat(n) { out[readKey()] = readValue() }
+        return out
+    }
+    fun expectEnd() {
+        if (pos != buf.size) malformed("trailing bytes after value")
+    }
+}
+
+internal fun weaveEncode(write: (WeaveBufferWriter) -> Unit): ByteArray {
+    val w = WeaveBufferWriter()
+    write(w)
+    return w.toByteArray()
+}
+
+internal fun <T> weaveDecode(bytes: ByteArray, read: (WeaveBufferReader) -> T): T {
+    val r = WeaveBufferReader(bytes)
+    val v = read(r)
+    r.expectEnd()
+    return v
+}
+
 internal class WeaveContinuation<T>(
     private val cont: kotlinx.coroutines.CancellableContinuation<T>,
-    private val mapError: (Int, String) -> Throwable
+    private val mapError: (Int, String, ByteArray?) -> Throwable
 ) {
     @Suppress("UNCHECKED_CAST")
     fun onSuccess(result: Any?) { cont.resume(result as T) }
-    fun onError(code: Int, message: String) { cont.resumeWithException(mapError(code, message)) }
+    fun onError(code: Int, message: String, payload: ByteArray?) { cont.resumeWithException(mapError(code, message, payload)) }
 }
 
 // END WeaveFFI.kt

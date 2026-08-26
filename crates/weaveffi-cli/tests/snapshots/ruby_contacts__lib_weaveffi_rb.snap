@@ -31,7 +31,9 @@ module WeaveFFI
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
-           :message, :pointer
+           :message, :pointer,
+           :payload_ptr, :pointer,
+           :payload_len, :size_t
   end
 
   class Error < StandardError
@@ -40,6 +42,176 @@ module WeaveFFI
     def initialize(code, message)
       @code = code
       super(message)
+    end
+  end
+
+  # @api private
+  # Appends values in the WeaveFFI value-buffer wire format: little-endian,
+  # packed, no alignment.
+  class WvBufferWriter
+    def initialize
+      @buf = +''.b
+    end
+
+    # The encoded bytes as a binary String.
+    def data
+      @buf
+    end
+
+    def write_bool(v)
+      @buf << (v ? "\x01".b : "\x00".b)
+    end
+
+    def write_flag(v)
+      write_bool(v)
+    end
+
+    def write_i8(v)
+      @buf << [v].pack('c')
+    end
+
+    def write_u8(v)
+      @buf << [v].pack('C')
+    end
+
+    def write_i16(v)
+      @buf << [v].pack('s<')
+    end
+
+    def write_u16(v)
+      @buf << [v].pack('S<')
+    end
+
+    def write_i32(v)
+      @buf << [v].pack('l<')
+    end
+
+    def write_u32(v)
+      @buf << [v].pack('L<')
+    end
+
+    def write_len(v)
+      write_u32(v)
+    end
+
+    def write_i64(v)
+      @buf << [v].pack('q<')
+    end
+
+    def write_u64(v)
+      @buf << [v].pack('Q<')
+    end
+
+    def write_f32(v)
+      @buf << [v].pack('e')
+    end
+
+    def write_f64(v)
+      @buf << [v].pack('E')
+    end
+
+    def write_string(v)
+      b = v.to_s.encode(Encoding::UTF_8).b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+
+    def write_bytes(v)
+      b = v.to_s.b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+  end
+
+  # @api private
+  # Reads values in the WeaveFFI value-buffer wire format, raising Error on
+  # any malformed buffer.
+  class WvBufferReader
+    def initialize(data)
+      @data = data.to_s.b
+      @pos = 0
+    end
+
+    def take(n, what)
+      raise Error.new(-1, "malformed value buffer: #{what}") if @pos + n > @data.bytesize
+      s = @data.byteslice(@pos, n)
+      @pos += n
+      s
+    end
+
+    def read_bool
+      b = take(1, 'bool').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: bool byte out of range') if b > 1
+      b == 1
+    end
+
+    def read_flag
+      b = take(1, 'option flag').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: option flag out of range') if b > 1
+      b == 1
+    end
+
+    def read_i8
+      take(1, 'i8').unpack1('c')
+    end
+
+    def read_u8
+      take(1, 'u8').unpack1('C')
+    end
+
+    def read_i16
+      take(2, 'i16').unpack1('s<')
+    end
+
+    def read_u16
+      take(2, 'u16').unpack1('S<')
+    end
+
+    def read_i32
+      take(4, 'i32').unpack1('l<')
+    end
+
+    def read_u32
+      take(4, 'u32').unpack1('L<')
+    end
+
+    def read_len
+      len = read_u32
+      if len > @data.bytesize - @pos
+        raise Error.new(-1, 'malformed value buffer: length prefix exceeds remaining bytes')
+      end
+      len
+    end
+
+    def read_i64
+      take(8, 'i64').unpack1('q<')
+    end
+
+    def read_u64
+      take(8, 'u64').unpack1('Q<')
+    end
+
+    def read_f32
+      take(4, 'f32').unpack1('e')
+    end
+
+    def read_f64
+      take(8, 'f64').unpack1('E')
+    end
+
+    def read_string
+      s = take(read_len, 'string bytes').force_encoding(Encoding::UTF_8)
+      raise Error.new(-1, 'malformed value buffer: string is not valid UTF-8') unless s.valid_encoding?
+      s
+    end
+
+    def read_bytes
+      take(read_len, 'byte buffer')
+    end
+
+    def expect_end!
+      return if @pos == @data.bytesize
+      raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
@@ -85,9 +257,10 @@ module WeaveFFI
     2 => ContactsError::NotFound,
   }.freeze
 
-  # Builds the ContactsError subclass matching `code`, or a generic Error
-  # for codes outside the domain (panics, marshalling).
-  def self.contacts_error_from(code, message)
+  # Builds the ContactsError subclass matching `code`, decoding any payload
+  # fields the code declares, or a generic Error for codes outside
+  # the domain (panics, marshalling).
+  def self.contacts_error_from(code, message, payload = nil)
     cls = CONTACTS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
     message.empty? ? cls.new : cls.new(message)
@@ -99,8 +272,10 @@ module WeaveFFI
     code = err[:code]
     msg_ptr = err[:message]
     msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    payload_ptr = err[:payload_ptr]
+    payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
-    raise contacts_error_from(code, msg)
+    raise contacts_error_from(code, msg, payload)
   end
 
   module ContactType
@@ -109,78 +284,74 @@ module WeaveFFI
     OTHER = 2
   end
 
-  attach_function :weaveffi_contacts_Contact_destroy, [:pointer], :void
-  attach_function :weaveffi_contacts_Contact_get_id, [:pointer], :int64
-  attach_function :weaveffi_contacts_Contact_get_first_name, [:pointer], :pointer
-  attach_function :weaveffi_contacts_Contact_get_last_name, [:pointer], :pointer
-  attach_function :weaveffi_contacts_Contact_get_email, [:pointer], :pointer
-  attach_function :weaveffi_contacts_Contact_get_contact_type, [:pointer], :int32
+  class Contact
+    attr_reader :id
+
+    attr_reader :first_name
+
+    attr_reader :last_name
+
+    attr_reader :email
+
+    attr_reader :contact_type
+
+    def initialize(id:, first_name:, last_name:, email:, contact_type:)
+      @id = id
+      @first_name = first_name
+      @last_name = last_name
+      @email = email
+      @contact_type = contact_type
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Contact)
+      return false unless id == other.id
+      return false unless first_name == other.first_name
+      return false unless last_name == other.last_name
+      return false unless email == other.email
+      return false unless contact_type == other.contact_type
+      true
+    end
+  end
+
+  # @api private
+  # Packs a Contact into the value-buffer wire format.
+  def self._wv_write_contact(w, v)
+    w.write_i64(v.id)
+    w.write_string(v.first_name)
+    w.write_string(v.last_name)
+    if v.email.nil?
+      w.write_flag(false)
+    else
+      w.write_flag(true)
+      w.write_string(v.email)
+    end
+    w.write_i32(v.contact_type)
+  end
+
+  # @api private
+  # Unpacks a Contact from the value-buffer wire format.
+  def self._wv_read_contact(r)
+    _wv_id = r.read_i64
+    _wv_first_name = r.read_string
+    _wv_last_name = r.read_string
+    if r.read_flag
+      _wv_email = r.read_string
+    else
+      _wv_email = nil
+    end
+    _wv_contact_type = r.read_i32
+    Contact.new(id: _wv_id, first_name: _wv_first_name, last_name: _wv_last_name, email: _wv_email, contact_type: _wv_contact_type)
+  end
 
   attach_function :weaveffi_contacts_ContactBook_destroy, [:pointer], :void
   attach_function :weaveffi_contacts_ContactBook_new, [:pointer], :pointer
-  attach_function :weaveffi_contacts_ContactBook_add, [:pointer, :string, :string, :string, :int32, :pointer], :pointer
-  attach_function :weaveffi_contacts_ContactBook_get, [:pointer, :int64, :pointer], :pointer
+  attach_function :weaveffi_contacts_ContactBook_add, [:pointer, :string, :string, :pointer, :size_t, :int32, :pointer, :pointer], :pointer
+  attach_function :weaveffi_contacts_ContactBook_get, [:pointer, :int64, :pointer, :pointer], :pointer
   attach_function :weaveffi_contacts_ContactBook_list, [:pointer, :pointer, :pointer], :pointer
   attach_function :weaveffi_contacts_ContactBook_remove, [:pointer, :int64, :pointer], :int32
   attach_function :weaveffi_contacts_ContactBook_count, [:pointer, :pointer], :int32
-
-  class ContactPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_contacts_Contact_destroy(ptr)
-    end
-  end
-
-  class Contact
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = ContactPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def id
-      result = WeaveFFI.weaveffi_contacts_Contact_get_id(@handle)
-      result
-    end
-
-    def first_name
-      result = WeaveFFI.weaveffi_contacts_Contact_get_first_name(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    def last_name
-      result = WeaveFFI.weaveffi_contacts_Contact_get_last_name(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    def email
-      result = WeaveFFI.weaveffi_contacts_Contact_get_email(@handle)
-      return nil if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    def contact_type
-      result = WeaveFFI.weaveffi_contacts_Contact_get_contact_type(@handle)
-      result
-    end
-  end
 
   class ContactBookPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -216,18 +387,40 @@ module WeaveFFI
 
     def add(first_name, last_name, email, contact_type)
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_contacts_ContactBook_add(@handle, first_name, last_name, email, contact_type, err)
+      email_w = WvBufferWriter.new
+      if email.nil?
+        email_w.write_flag(false)
+      else
+        email_w.write_flag(true)
+        email_w.write_string(email)
+      end
+      email_data = email_w.data
+      email_buf = FFI::MemoryPointer.new(:uint8, email_data.bytesize)
+      email_buf.put_bytes(0, email_data)
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_contacts_ContactBook_add(@handle, first_name, last_name, email_buf, email_data.bytesize, contact_type, out_len, err)
       WeaveFFI.check_contacts_error!(err)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Contact.new(result)
+      len = out_len.read(:size_t)
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      _wv_value = WeaveFFI._wv_read_contact(_wv_r)
+      _wv_r.expect_end!
+      _wv_value
     end
 
     def get(id)
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_contacts_ContactBook_get(@handle, id, err)
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_contacts_ContactBook_get(@handle, id, out_len, err)
       WeaveFFI.check_contacts_error!(err)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Contact.new(result)
+      len = out_len.read(:size_t)
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      _wv_value = WeaveFFI._wv_read_contact(_wv_r)
+      _wv_r.expect_end!
+      _wv_value
     end
 
     def list()
@@ -235,11 +428,16 @@ module WeaveFFI
       out_len = FFI::MemoryPointer.new(:size_t)
       result = WeaveFFI.weaveffi_contacts_ContactBook_list(@handle, out_len, err)
       WeaveFFI.check_error!(err)
-      return [] if result.null?
       len = out_len.read(:size_t)
-      items = result.read_array_of_pointer(len).map { |p| Contact.new(p) }
-      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-      items
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      _wv_value = Array.new(_wv_r.read_len) do
+        _wv_e0 = WeaveFFI._wv_read_contact(_wv_r)
+        _wv_e0
+      end
+      _wv_r.expect_end!
+      _wv_value
     end
 
     def remove(id)

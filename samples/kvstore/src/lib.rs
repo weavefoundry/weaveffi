@@ -3,8 +3,10 @@
 //! `#[weaveffi::module]` macro: an interface with constructors, methods,
 //! statics, and an implicit destroy symbol, a typed error domain
 //! (`#[weaveffi::error]`), callbacks, listeners, optional/list/map/bytes
-//! record fields, a fluent builder, an iterator return, a cancellable async
-//! method, deprecated and nested-submodule surface, all over the C ABI.
+//! record fields, an iterator return, a cancellable async method, deprecated
+//! and nested-submodule surface, all over the C ABI. Records cross the
+//! boundary as value buffers: each `#[weaveffi::record]` gets a generated
+//! `BufferValue` implementation instead of per-field C accessors.
 //!
 //! `Store` is exported as an interface, so each object owns its rich state
 //! (its entries and the monotonic entry-id counter) directly. Methods take
@@ -58,7 +60,6 @@ pub mod kv {
 
     /// A single key-value entry persisted in the store.
     #[weaveffi::record]
-    #[weaveffi::builder]
     #[derive(Clone, Debug)]
     pub struct Entry {
         /// Stable monotonic identifier assigned on insert.
@@ -321,12 +322,22 @@ weaveffi::export_runtime!();
 mod tests {
     use crate::kv::stats::*;
     use crate::kv::*;
+    use std::collections::BTreeMap;
     use std::ffi::{c_void, CString};
     use std::os::raw::c_char;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Mutex};
     use std::time::Duration;
     use weaveffi::abi::{self, weaveffi_error};
+
+    /// Decode a buffered return and release the producer-owned bytes.
+    fn decode_and_free<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
+        assert!(!ptr.is_null());
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let value = abi::decode_value::<T>(bytes).expect("well-formed value buffer");
+        abi::free_bytes(ptr as *mut u8, len);
+        value
+    }
 
     // The macro-generated eviction-listener registry is process-global, so the
     // tests that register a listener (or fire evictions a listener could
@@ -356,13 +367,17 @@ mod tests {
     fn put_simple(s: *mut Store, k: &str, v: &[u8]) {
         let mut err = new_err();
         let key = CString::new(k).unwrap();
+        // The optional TTL is buffered: encode `Option<i64>` and pass the
+        // borrowed (ptr, len) pair.
+        let ttl = abi::encode_value(&None::<i64>);
         let ok = weaveffi_kv_Store_put(
             s,
             key.as_ptr(),
             v.as_ptr(),
             v.len(),
             EntryKind::Persistent as i32,
-            std::ptr::null(),
+            ttl.as_ptr(),
+            ttl.len(),
             &mut err,
         );
         assert_eq!(err.code, 0);
@@ -430,16 +445,15 @@ mod tests {
 
         let mut err = new_err();
         let key = CString::new("alpha").unwrap();
-        let entry = weaveffi_kv_Store_get(s, key.as_ptr(), &mut err);
+        let mut out_len: usize = 0;
+        let ptr = weaveffi_kv_Store_get(s, key.as_ptr(), &mut out_len, &mut err);
         assert_eq!(err.code, 0);
-        assert!(!entry.is_null());
 
-        let e = unsafe { &*entry };
+        let e = decode_and_free::<Option<Entry>>(ptr, out_len).expect("entry present");
         assert_eq!(e.key, "alpha");
         assert_eq!(e.value, b"hello");
         assert!(e.id > 0);
 
-        weaveffi_kv_Entry_destroy(entry);
         weaveffi_kv_Store_destroy(s);
     }
 
@@ -451,13 +465,15 @@ mod tests {
         let key = CString::new("k").unwrap();
         // An out-of-range `EntryKind` discriminant is rejected by the macro's
         // enum lift with the generic input code (1).
+        let ttl = abi::encode_value(&None::<i64>);
         let ok = weaveffi_kv_Store_put(
             s,
             key.as_ptr(),
             std::ptr::null(),
             0,
             999,
-            std::ptr::null(),
+            ttl.as_ptr(),
+            ttl.len(),
             &mut err,
         );
         assert!(!ok);
@@ -472,7 +488,8 @@ mod tests {
         let s = open();
         let mut err = new_err();
         let k = CString::new("nope").unwrap();
-        let p = weaveffi_kv_Store_get(s, k.as_ptr(), &mut err);
+        let mut out_len: usize = 0;
+        let p = weaveffi_kv_Store_get(s, k.as_ptr(), &mut out_len, &mut err);
         assert!(p.is_null());
         assert_eq!(err.code, 1001, "KvError::KeyNotFound's declared code");
         assert_eq!(abi::c_ptr_to_string(err.message).unwrap(), "key not found");
@@ -486,19 +503,21 @@ mod tests {
         let s = open();
         let mut err = new_err();
         let key = CString::new("ttl").unwrap();
-        let ttl: i64 = -1;
+        let ttl = abi::encode_value(&Some(-1i64));
         let ok = weaveffi_kv_Store_put(
             s,
             key.as_ptr(),
             b"x".as_ptr(),
             1,
             EntryKind::Volatile as i32,
-            &ttl,
+            ttl.as_ptr(),
+            ttl.len(),
             &mut err,
         );
         assert!(ok);
 
-        let entry = weaveffi_kv_Store_get(s, key.as_ptr(), &mut err);
+        let mut out_len: usize = 0;
+        let entry = weaveffi_kv_Store_get(s, key.as_ptr(), &mut out_len, &mut err);
         assert!(entry.is_null());
         assert_eq!(err.code, 1002, "KvError::Expired's declared code");
         abi::error_clear(&mut err);
@@ -527,7 +546,8 @@ mod tests {
         put_simple(s, "gamma", b"3");
 
         let mut err = new_err();
-        let iter = weaveffi_kv_Store_list_keys(s, std::ptr::null(), &mut err);
+        let prefix = abi::encode_value(&None::<String>);
+        let iter = weaveffi_kv_Store_list_keys(s, prefix.as_ptr(), prefix.len(), &mut err);
         assert_eq!(err.code, 0);
         assert!(!iter.is_null());
 
@@ -558,8 +578,8 @@ mod tests {
         put_simple(s, "system.x", b"3");
 
         let mut err = new_err();
-        let prefix = CString::new("user.").unwrap();
-        let iter = weaveffi_kv_Store_list_keys(s, prefix.as_ptr(), &mut err);
+        let prefix = abi::encode_value(&Some("user.".to_string()));
+        let iter = weaveffi_kv_Store_list_keys(s, prefix.as_ptr(), prefix.len(), &mut err);
         let mut got = Vec::new();
         loop {
             let mut item: *const c_char = std::ptr::null();
@@ -610,24 +630,27 @@ mod tests {
         let s = open();
         let mut err = new_err();
         let k = CString::new("dead").unwrap();
-        let ttl: i64 = -1;
+        let expired_ttl = abi::encode_value(&Some(-1i64));
         weaveffi_kv_Store_put(
             s,
             k.as_ptr(),
             b"hello".as_ptr(),
             5,
             EntryKind::Volatile as i32,
-            &ttl,
+            expired_ttl.as_ptr(),
+            expired_ttl.len(),
             &mut err,
         );
         let k2 = CString::new("alive").unwrap();
+        let no_ttl = abi::encode_value(&None::<i64>);
         weaveffi_kv_Store_put(
             s,
             k2.as_ptr(),
             b"x".as_ptr(),
             1,
             EntryKind::Persistent as i32,
-            std::ptr::null(),
+            no_ttl.as_ptr(),
+            no_ttl.len(),
             &mut err,
         );
 
@@ -688,180 +711,78 @@ mod tests {
         put_simple(s, "a", b"hi");
         put_simple(s, "b", b"bye");
         let mut err = new_err();
-        let stats = weaveffi_kv_stats_get_stats(s, &mut err);
+        let mut out_len: usize = 0;
+        let ptr = weaveffi_kv_stats_get_stats(s, &mut out_len, &mut err);
         assert_eq!(err.code, 0);
-        assert!(!stats.is_null());
-        assert_eq!(weaveffi_kv_stats_Stats_get_total_entries(stats), 2);
-        assert_eq!(weaveffi_kv_stats_Stats_get_total_bytes(stats), 5);
-        assert_eq!(weaveffi_kv_stats_Stats_get_expired_entries(stats), 0);
-        weaveffi_kv_stats_Stats_destroy(stats);
+        let stats = decode_and_free::<Stats>(ptr, out_len);
+        assert_eq!(stats.total_entries, 2);
+        assert_eq!(stats.total_bytes, 5);
+        assert_eq!(stats.expired_entries, 0);
         weaveffi_kv_Store_destroy(s);
     }
 
     #[test]
-    fn entry_struct_accessors() {
-        let _g = setup();
-        let mut err = new_err();
-        let key = CString::new("k").unwrap();
-        let tag1 = CString::new("hot").unwrap();
-        let tags: [*const c_char; 1] = [tag1.as_ptr()];
-        let mk = CString::new("source").unwrap();
-        let mv = CString::new("test").unwrap();
-        let mks: [*const c_char; 1] = [mk.as_ptr()];
-        let mvs: [*const c_char; 1] = [mv.as_ptr()];
-        let exp: i64 = 9999;
-        let entry = weaveffi_kv_Entry_create(
-            7,
-            key.as_ptr(),
-            b"abc".as_ptr(),
-            3,
-            123,
-            &exp,
-            tags.as_ptr(),
-            1,
-            mks.as_ptr(),
-            mvs.as_ptr(),
-            1,
-            &mut err,
+    fn entry_buffer_round_trip() {
+        // The `Entry` record crosses the ABI as a value buffer; the macro
+        // implements `BufferValue`, so every field (including the optional,
+        // list, map, and bytes fields) round-trips through encode/decode.
+        let mut metadata = BTreeMap::new();
+        metadata.insert("source".to_string(), "test".to_string());
+        let entry = Entry {
+            id: 7,
+            key: "k".to_string(),
+            value: b"abc".to_vec(),
+            created_at: 123,
+            expires_at: Some(9999),
+            tags: vec!["hot".to_string()],
+            metadata,
+        };
+
+        let bytes = abi::encode_value(&entry);
+        let back = abi::decode_value::<Entry>(&bytes).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.key, "k");
+        assert_eq!(back.value, b"abc");
+        assert_eq!(back.created_at, 123);
+        assert_eq!(back.expires_at, Some(9999));
+        assert_eq!(back.tags, vec!["hot"]);
+        assert_eq!(
+            back.metadata.get("source").map(String::as_str),
+            Some("test")
         );
-        assert_eq!(err.code, 0);
-        assert!(!entry.is_null());
-
-        assert_eq!(weaveffi_kv_Entry_get_id(entry), 7);
-        assert_eq!(weaveffi_kv_Entry_get_created_at(entry), 123);
-
-        let kp = weaveffi_kv_Entry_get_key(entry);
-        assert_eq!(abi::c_ptr_to_string(kp).unwrap(), "k");
-        abi::free_string(kp);
-
-        let mut vlen: usize = 0;
-        let vp = weaveffi_kv_Entry_get_value(entry, &mut vlen);
-        assert_eq!(vlen, 3);
-        let bytes = unsafe { std::slice::from_raw_parts(vp, vlen) }.to_vec();
-        assert_eq!(bytes, b"abc");
-        abi::free_bytes(vp as *mut u8, vlen);
-
-        let exp_ptr = weaveffi_kv_Entry_get_expires_at(entry);
-        assert!(!exp_ptr.is_null());
-        assert_eq!(unsafe { *exp_ptr }, 9999);
-        unsafe { drop(Box::from_raw(exp_ptr)) };
-
-        let mut tlen: usize = 0;
-        let tp = weaveffi_kv_Entry_get_tags(entry, &mut tlen);
-        assert_eq!(tlen, 1);
-        assert!(!tp.is_null());
-        let t0 = unsafe { *tp };
-        assert_eq!(abi::c_ptr_to_string(t0).unwrap(), "hot");
-        abi::free_string(t0);
-        unsafe { drop(Vec::from_raw_parts(tp, tlen, tlen)) };
-
-        let mut mlen: usize = 0;
-        let mut keys_out: *mut *const c_char = std::ptr::null_mut();
-        let mut vals_out: *mut *const c_char = std::ptr::null_mut();
-        weaveffi_kv_Entry_get_metadata(entry, &mut keys_out, &mut vals_out, &mut mlen);
-        assert_eq!(mlen, 1);
-        let keys_arr = keys_out;
-        let vals_arr = vals_out;
-        let k0 = unsafe { *keys_arr };
-        let v0 = unsafe { *vals_arr };
-        assert_eq!(abi::c_ptr_to_string(k0).unwrap(), "source");
-        assert_eq!(abi::c_ptr_to_string(v0).unwrap(), "test");
-        abi::free_string(k0);
-        abi::free_string(v0);
-        unsafe {
-            drop(Vec::from_raw_parts(keys_arr, mlen, mlen));
-            drop(Vec::from_raw_parts(vals_arr, mlen, mlen));
-        }
-
-        weaveffi_kv_Entry_destroy(entry);
     }
 
     #[test]
-    fn entry_get_expires_at_none_returns_null() {
-        let _g = setup();
-        let mut err = new_err();
-        let key = CString::new("x").unwrap();
-        let entry = weaveffi_kv_Entry_create(
-            1,
-            key.as_ptr(),
-            std::ptr::null(),
-            0,
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            &mut err,
-        );
-        assert!(!entry.is_null());
-        assert!(weaveffi_kv_Entry_get_expires_at(entry).is_null());
-        weaveffi_kv_Entry_destroy(entry);
+    fn entry_buffer_round_trips_absent_expiry() {
+        let entry = Entry {
+            id: 1,
+            key: "x".to_string(),
+            value: Vec::new(),
+            created_at: 0,
+            expires_at: None,
+            tags: Vec::new(),
+            metadata: BTreeMap::new(),
+        };
+        let bytes = abi::encode_value(&entry);
+        let back = abi::decode_value::<Entry>(&bytes).unwrap();
+        assert_eq!(back.expires_at, None);
+        assert!(back.value.is_empty());
+        assert!(back.tags.is_empty());
+        assert!(back.metadata.is_empty());
     }
 
     #[test]
-    fn entry_builder_round_trip() {
-        let _g = setup();
-        let b = weaveffi_kv_Entry_Builder_new();
-        assert!(!b.is_null());
-        weaveffi_kv_Entry_Builder_set_id(b, 99);
-        let key = CString::new("built").unwrap();
-        weaveffi_kv_Entry_Builder_set_key(b, key.as_ptr());
-        weaveffi_kv_Entry_Builder_set_value(b, b"data".as_ptr(), 4);
-        weaveffi_kv_Entry_Builder_set_created_at(b, 42);
-        let exp: i64 = 100;
-        weaveffi_kv_Entry_Builder_set_expires_at(b, &exp);
-        let t = CString::new("v1").unwrap();
-        let tags: [*const c_char; 1] = [t.as_ptr()];
-        weaveffi_kv_Entry_Builder_set_tags(b, tags.as_ptr(), 1);
-        let mk = CString::new("env").unwrap();
-        let mv = CString::new("prod").unwrap();
-        let mks: [*const c_char; 1] = [mk.as_ptr()];
-        let mvs: [*const c_char; 1] = [mv.as_ptr()];
-        weaveffi_kv_Entry_Builder_set_metadata(b, mks.as_ptr(), mvs.as_ptr(), 1);
-
-        let mut err = new_err();
-        let entry = weaveffi_kv_Entry_Builder_build(b, &mut err);
-        assert_eq!(err.code, 0);
-        assert!(!entry.is_null());
-        let e = unsafe { &*entry };
-        assert_eq!(e.id, 99);
-        assert_eq!(e.key, "built");
-        assert_eq!(e.value, b"data");
-        assert_eq!(e.created_at, 42);
-        assert_eq!(e.expires_at, Some(100));
-        assert_eq!(e.tags, vec!["v1"]);
-        assert_eq!(e.metadata.get("env").map(String::as_str), Some("prod"));
-
-        weaveffi_kv_Entry_destroy(entry);
-        weaveffi_kv_Entry_Builder_destroy(b);
-    }
-
-    #[test]
-    fn entry_builder_missing_required_field_errors() {
-        let _g = setup();
-        let b = weaveffi_kv_Entry_Builder_new();
-        let mut err = new_err();
-        // No fields set: the generated `build` rejects the first missing
-        // required field with the macro's builder code (-1).
-        let entry = weaveffi_kv_Entry_Builder_build(b, &mut err);
-        assert!(entry.is_null());
-        assert_eq!(err.code, -1);
-        abi::error_clear(&mut err);
-        weaveffi_kv_Entry_Builder_destroy(b);
-    }
-
-    #[test]
-    fn stats_struct_accessors() {
-        let _g = setup();
-        let mut err = new_err();
-        let s = weaveffi_kv_stats_Stats_create(10, 200, 3, &mut err);
-        assert!(!s.is_null());
-        assert_eq!(weaveffi_kv_stats_Stats_get_total_entries(s), 10);
-        assert_eq!(weaveffi_kv_stats_Stats_get_total_bytes(s), 200);
-        assert_eq!(weaveffi_kv_stats_Stats_get_expired_entries(s), 3);
-        weaveffi_kv_stats_Stats_destroy(s);
+    fn stats_buffer_round_trip() {
+        let stats = Stats {
+            total_entries: 10,
+            total_bytes: 200,
+            expired_entries: 3,
+        };
+        let bytes = abi::encode_value(&stats);
+        let back = abi::decode_value::<Stats>(&bytes).unwrap();
+        assert_eq!(back.total_entries, 10);
+        assert_eq!(back.total_bytes, 200);
+        assert_eq!(back.expired_entries, 3);
     }
 
     #[test]
@@ -898,14 +819,15 @@ mod tests {
         let s = open();
         let mut err = new_err();
         let key = CString::new("expiring").unwrap();
-        let ttl: i64 = -1;
+        let ttl = abi::encode_value(&Some(-1i64));
         weaveffi_kv_Store_put(
             s,
             key.as_ptr(),
             b"x".as_ptr(),
             1,
             EntryKind::Volatile as i32,
-            &ttl,
+            ttl.as_ptr(),
+            ttl.len(),
             &mut err,
         );
 
@@ -916,7 +838,8 @@ mod tests {
         }
         let id = weaveffi_kv_register_eviction_listener(on_evict, std::ptr::null_mut());
 
-        let p = weaveffi_kv_Store_get(s, key.as_ptr(), &mut err);
+        let mut out_len: usize = 0;
+        let p = weaveffi_kv_Store_get(s, key.as_ptr(), &mut out_len, &mut err);
         assert!(p.is_null());
         assert_eq!(err.code, 1002);
         assert_eq!(COUNT.load(Ordering::Relaxed), 1);

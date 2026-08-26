@@ -22,7 +22,7 @@ package shape ready to publish.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: greeter
     errors:
@@ -281,8 +281,8 @@ If you published a test version, mark it as deprecated with
 
 - See the [Node generator reference](../generators/node.md) for the
   full type mapping and `types.d.ts` layout.
-- Read [Memory Ownership](../guides/memory.md) for struct lifecycle
-  semantics.
+- Read [Memory Ownership](../guides/memory.md) for buffered value and
+  interface lifetime semantics.
 - Try the [Calculator tutorial](calculator.md) for a simpler
   end-to-end walkthrough or [Python](python.md) for a sibling
   scripting target.

@@ -48,22 +48,6 @@ export interface Document {
   tags: string[];
 }
 /**
- * Represents a single document tracked by the system.
- *
- * Documents are persisted to disk and exposed via the public API.
- */
-export interface DocumentBuilder {
-  /** Stable opaque identifier */
-  withId(value: number): DocumentBuilder;
-  /** Human-readable title shown in lists */
-  withTitle(value: string): DocumentBuilder;
-  /** Current lifecycle status */
-  withStatus(value: Status): DocumentBuilder;
-  /** Free-form tags for grouping */
-  withTags(value: string[]): DocumentBuilder;
-  build(): Document;
-}
-/**
  * Lifecycle status of a document.
  *
  * Used to drive UI badges and filters.

@@ -1,16 +1,17 @@
 # frozen_string_literal: true
 # Conformance consumer: kvstore sample, Ruby target.
 #
-# Full-surface drive of the 0.5.0 wrapper: the Store interface (the open(path)
+# Full-surface drive of the 0.6.0 wrapper: the Store interface (the open(path)
 # factory constructor, sync methods, the iterator-backed list_keys, the
 # blocking compact bridge over the async ABI, the deprecated legacy_put, and
 # the default_capacity static), the typed KvError domain (codes 1001-1004)
-# with per-code subclasses raised by throwing members, the Entry record with
-# bytes / optional-scalar / list / map getters plus the fluent EntryBuilder,
-# the FFI::Function eviction listener (register -> fire on delete ->
-# unregister), and the cross-module `Kvstore.get_stats(store)` (Stats lives in
-# kv.stats; the store passes as a borrowed interface pointer). The cdylib is
-# selected via WEAVEFFI_LIBRARY.
+# with per-code subclasses raised by throwing members, the Entry record as a
+# plain value class decoded from a value buffer (bytes, nil-able optional
+# scalar, native Array/Hash fields, structural equality), the FFI::Function
+# eviction listener (register -> fire on delete -> unregister), and the
+# cross-module `Kvstore.get_stats(store)` (Stats lives in kv.stats; the store
+# passes as a borrowed interface pointer). The cdylib is selected via
+# WEAVEFFI_LIBRARY.
 
 $LOAD_PATH.unshift(File.join(ENV.fetch("WV_RB"), "lib"))
 require "kvstore"
@@ -35,24 +36,31 @@ end
 store = Kvstore::Store.open("/tmp/conformance-kvstore-rb")
 payload = "\x01\x02\x03".b
 
+# put takes a buffered `i64?` TTL: nil and a present value both encode.
 expect(store.put("alpha", payload, Kvstore::EntryKind::PERSISTENT, nil) == true, "put alpha")
 expect(store.put("beta", payload, Kvstore::EntryKind::VOLATILE, 3600) == true, "put beta")
 expect(store.count == 2, "count == 2")
 
-# Iterator-backed list-of-string return, optionally prefix-filtered.
+# Iterator-backed list-of-string return, optionally prefix-filtered (the
+# `string?` prefix is a buffered optional parameter).
 keys = store.list_keys(nil).to_a.sort
 expect(keys == %w[alpha beta], "list_keys values (got #{keys})")
 expect(store.list_keys("al").to_a == %w[alpha], "list_keys prefix filter")
 
-# Optional struct return + getters over every complex field type.
+# Optional record return: get decodes a buffered `Entry?` into a plain value
+# object covering every complex field type.
 alpha = store.get("alpha")
 expect(!alpha.nil?, "get alpha present")
+expect(alpha.is_a?(Kvstore::Entry), "get returns an Entry value")
 expect(alpha.id.positive?, "entry id positive")
 expect(alpha.key == "alpha", "entry key")
 expect(alpha.value == payload, "entry value bytes")
 expect(alpha.expires_at.nil?, "alpha expires_at nil")
 expect(alpha.tags == [], "alpha tags empty")
 expect(alpha.metadata == {}, "alpha metadata empty")
+
+# Repeated gets decode fresh snapshots that compare structurally equal.
+expect(store.get("alpha") == alpha, "second get equals first snapshot")
 
 beta = store.get("beta")
 expect(!beta.expires_at.nil? && beta.expires_at.positive?, "beta expires_at present")
@@ -69,22 +77,29 @@ end
 expect(store.legacy_put("legacy", payload) == true, "legacy_put")
 expect(store.delete("legacy") == true, "delete legacy")
 
-# Builder round-trips non-empty list/map inputs through the C `create`.
-built = Kvstore::EntryBuilder.new
-  .with_id(7)
-  .with_key("built")
-  .with_value(payload)
-  .with_created_at(1000)
-  .with_expires_at(nil)
-  .with_tags(%w[hot fast])
-  .with_metadata("source" => "test", "env" => "prod")
-  .build
+# Entry is a plain value class: keyword construction, non-empty native
+# list/map fields, a nil-able optional, and structural equality.
+built = Kvstore::Entry.new(
+  id: 7,
+  key: "built",
+  value: payload,
+  created_at: 1000,
+  expires_at: nil,
+  tags: %w[hot fast],
+  metadata: { "source" => "test", "env" => "prod" }
+)
 expect(built.tags.sort == %w[fast hot], "built tags (got #{built.tags})")
 expect(built.metadata == { "source" => "test", "env" => "prod" }, "built metadata")
 expect(built.expires_at.nil?, "built expires_at nil")
+same = Kvstore::Entry.new(
+  id: 7, key: "built", value: payload, created_at: 1000,
+  expires_at: nil, tags: %w[hot fast],
+  metadata: { "source" => "test", "env" => "prod" }
+)
+expect(built == same, "entries compare structurally")
 
 # The cross-module call under test: kv.stats.get_stats borrows the kv.Store
-# interface pointer.
+# interface pointer and returns the Stats record as a value.
 stats = Kvstore.get_stats(store)
 expect(stats.total_entries == 2, "total_entries == 2 (got #{stats.total_entries})")
 expect(stats.total_bytes == 6, "total_bytes == 6 (got #{stats.total_bytes})")

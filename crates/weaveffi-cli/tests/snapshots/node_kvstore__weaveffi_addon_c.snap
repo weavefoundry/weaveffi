@@ -10,7 +10,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
-static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message, const uint8_t* payload_ptr, size_t payload_len) {
     napi_value msg;
     napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
     napi_value err;
@@ -18,6 +18,11 @@ static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const ch
     napi_value code_val;
     napi_create_int32(env, code, &code_val);
     napi_set_named_property(env, err, "code", code_val);
+    if (payload_ptr != NULL) {
+        napi_value payload_val;
+        napi_create_buffer_copy(env, payload_len, payload_ptr, NULL, &payload_val);
+        napi_set_named_property(env, err, "payload", payload_val);
+    }
     return err;
 }
 
@@ -45,7 +50,7 @@ static napi_value Napi_weaveffi_kv_Store_open(napi_env env, napi_callback_info i
   weaveffi_kv_Store* result = weaveffi_kv_Store_open(path, &err);
   free(path);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -60,7 +65,7 @@ static napi_value Napi_weaveffi_kv_Store_default_capacity(napi_env env, napi_cal
   weaveffi_error err = {0};
   int64_t result = weaveffi_kv_Store_default_capacity(&err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -84,19 +89,14 @@ static napi_value Napi_weaveffi_kv_Store_put(napi_env env, napi_callback_info in
   napi_get_buffer_info(env, args[2], &value_raw, &value_len);
   int32_t kind;
   napi_get_value_int32(env, args[3], &kind);
-  napi_valuetype ttl_seconds_type;
-  napi_typeof(env, args[4], &ttl_seconds_type);
-  int64_t ttl_seconds_val;
-  const int64_t* ttl_seconds_ptr = NULL;
-  if (ttl_seconds_type != napi_null && ttl_seconds_type != napi_undefined) {
-    napi_get_value_int64(env, args[4], &ttl_seconds_val);
-    ttl_seconds_ptr = &ttl_seconds_val;
-  }
+  void* ttl_seconds_raw;
+  size_t ttl_seconds_len;
+  napi_get_buffer_info(env, args[4], &ttl_seconds_raw, &ttl_seconds_len);
   weaveffi_error err = {0};
-  bool result = weaveffi_kv_Store_put((const weaveffi_kv_Store*)(intptr_t)self_raw, key, (const uint8_t*)value_raw, value_len, (weaveffi_kv_EntryKind)kind, ttl_seconds_ptr, &err);
+  bool result = weaveffi_kv_Store_put((const weaveffi_kv_Store*)(intptr_t)self_raw, key, (const uint8_t*)value_raw, value_len, (weaveffi_kv_EntryKind)kind, (const uint8_t*)ttl_seconds_raw, ttl_seconds_len, &err);
   free(key);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -116,87 +116,17 @@ static napi_value Napi_weaveffi_kv_Store_get(napi_env env, napi_callback_info in
   char* key = (char*)malloc(key_len + 1);
   napi_get_value_string_utf8(env, args[1], key, key_len + 1, &key_len);
   weaveffi_error err = {0};
-  weaveffi_kv_Entry* result = weaveffi_kv_Store_get((const weaveffi_kv_Store*)(intptr_t)self_raw, key, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_kv_Store_get((const weaveffi_kv_Store*)(intptr_t)self_raw, key, &out_len, &err);
   free(key);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  if (result == NULL) {
-    napi_get_null(env, &ret);
-  } else {
-    {
-      weaveffi_kv_Entry* ret_p = (weaveffi_kv_Entry*)result;
-      napi_create_object(env, &ret);
-      napi_value ret_id;
-      napi_create_int64(env, weaveffi_kv_Entry_get_id(ret_p), &ret_id);
-      napi_set_named_property(env, ret, "id", ret_id);
-      napi_value ret_key;
-      {
-        char* ret_key_s = (char*)weaveffi_kv_Entry_get_key(ret_p);
-        napi_create_string_utf8(env, ret_key_s, NAPI_AUTO_LENGTH, &ret_key);
-        weaveffi_free_string(ret_key_s);
-      }
-      napi_set_named_property(env, ret, "key", ret_key);
-      napi_value ret_value;
-      {
-        size_t ret_value_len;
-        const uint8_t* ret_value_data = (const uint8_t*)weaveffi_kv_Entry_get_value(ret_p, &ret_value_len);
-        if (ret_value_data == NULL) { napi_get_null(env, &ret_value); }
-        else { void* ret_value_buf; napi_create_buffer_copy(env, ret_value_len, ret_value_data, &ret_value_buf, &ret_value); weaveffi_free_bytes((uint8_t*)ret_value_data, ret_value_len); }
-      }
-      napi_set_named_property(env, ret, "value", ret_value);
-      napi_value ret_created_at;
-      napi_create_int64(env, weaveffi_kv_Entry_get_created_at(ret_p), &ret_created_at);
-      napi_set_named_property(env, ret, "created_at", ret_created_at);
-      napi_value ret_expires_at;
-      {
-        int64_t* ret_expires_at_p = weaveffi_kv_Entry_get_expires_at(ret_p);
-        if (ret_expires_at_p == NULL) { napi_get_null(env, &ret_expires_at); }
-        else { napi_create_int64(env, *ret_expires_at_p, &ret_expires_at); }
-      }
-      napi_set_named_property(env, ret, "expires_at", ret_expires_at);
-      napi_value ret_tags;
-      {
-        size_t ret_tags_len;
-        const char** ret_tags_arr = weaveffi_kv_Entry_get_tags(ret_p, &ret_tags_len);
-        napi_create_array(env, &ret_tags);
-        if (ret_tags_arr != NULL) {
-          for (size_t ret_tags_i = 0; ret_tags_i < ret_tags_len; ret_tags_i++) {
-            napi_value ret_tags_e;
-            napi_create_string_utf8(env, ret_tags_arr[ret_tags_i], NAPI_AUTO_LENGTH, &ret_tags_e);
-            weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
-            napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
-          }
-          weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
-        }
-      }
-      napi_set_named_property(env, ret, "tags", ret_tags);
-      napi_value ret_metadata;
-      {
-        const char** ret_metadata_keys = NULL;
-        const char** ret_metadata_vals = NULL;
-        size_t ret_metadata_len;
-        weaveffi_kv_Entry_get_metadata(ret_p, &ret_metadata_keys, &ret_metadata_vals, &ret_metadata_len);
-        napi_create_object(env, &ret_metadata);
-        if (ret_metadata_keys != NULL && ret_metadata_vals != NULL) {
-          for (size_t ret_metadata_i = 0; ret_metadata_i < ret_metadata_len; ret_metadata_i++) {
-            napi_value ret_metadata_v;
-            napi_create_string_utf8(env, ret_metadata_vals[ret_metadata_i], NAPI_AUTO_LENGTH, &ret_metadata_v);
-            weaveffi_free_string((char*)(ret_metadata_vals[ret_metadata_i]));
-            napi_set_named_property(env, ret_metadata, ret_metadata_keys[ret_metadata_i], ret_metadata_v);
-            weaveffi_free_string((char*)ret_metadata_keys[ret_metadata_i]);
-          }
-        }
-        weaveffi_free_bytes((uint8_t*)ret_metadata_keys, ret_metadata_len * sizeof(*ret_metadata_keys));
-        weaveffi_free_bytes((uint8_t*)ret_metadata_vals, ret_metadata_len * sizeof(*ret_metadata_vals));
-      }
-      napi_set_named_property(env, ret, "metadata", ret_metadata);
-      weaveffi_kv_Entry_destroy(ret_p);
-    }
-  }
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
@@ -214,7 +144,7 @@ static napi_value Napi_weaveffi_kv_Store_delete(napi_env env, napi_callback_info
   bool result = weaveffi_kv_Store_delete((const weaveffi_kv_Store*)(intptr_t)self_raw, key, &err);
   free(key);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -252,7 +182,7 @@ static napi_value Napi_weaveffi_kv_Store_ListKeysIterator_next(napi_env env, nap
     weaveffi_kv_Store_ListKeysIterator_destroy((weaveffi_kv_Store_ListKeysIterator*)state->iter);
     state->iter = NULL;
     if (iter_err.code != 0) {
-      napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));
+      napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message, iter_err.payload_ptr, iter_err.payload_len));
       weaveffi_error_clear(&iter_err);
       return NULL;
     }
@@ -286,20 +216,13 @@ static napi_value Napi_weaveffi_kv_Store_list_keys(napi_env env, napi_callback_i
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
   int64_t self_raw;
   napi_get_value_int64(env, args[0], &self_raw);
-  napi_valuetype prefix_type;
-  napi_typeof(env, args[1], &prefix_type);
-  char* prefix = NULL;
-  if (prefix_type != napi_null && prefix_type != napi_undefined) {
-    size_t prefix_len;
-    napi_get_value_string_utf8(env, args[1], NULL, 0, &prefix_len);
-    prefix = (char*)malloc(prefix_len + 1);
-    napi_get_value_string_utf8(env, args[1], prefix, prefix_len + 1, &prefix_len);
-  }
+  void* prefix_raw;
+  size_t prefix_len;
+  napi_get_buffer_info(env, args[1], &prefix_raw, &prefix_len);
   weaveffi_error err = {0};
-  void* result = weaveffi_kv_Store_list_keys((const weaveffi_kv_Store*)(intptr_t)self_raw, prefix, &err);
-  free(prefix);
+  void* result = weaveffi_kv_Store_list_keys((const weaveffi_kv_Store*)(intptr_t)self_raw, (const uint8_t*)prefix_raw, prefix_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -319,7 +242,7 @@ static napi_value Napi_weaveffi_kv_Store_count(napi_env env, napi_callback_info 
   weaveffi_error err = {0};
   int64_t result = weaveffi_kv_Store_count((const weaveffi_kv_Store*)(intptr_t)self_raw, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -337,7 +260,7 @@ static napi_value Napi_weaveffi_kv_Store_clear(napi_env env, napi_callback_info 
   weaveffi_error err = {0};
   weaveffi_kv_Store_clear((const weaveffi_kv_Store*)(intptr_t)self_raw, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -351,6 +274,8 @@ typedef struct {
     napi_threadsafe_function tsfn;
     int32_t err_code;
     char* err_msg;
+    uint8_t* err_payload;
+    size_t err_payload_len;
     int64_t result;
 } weaveffi_kv_Store_compact_napi_actx;
 
@@ -359,6 +284,8 @@ static void weaveffi_kv_Store_compact_napi_cb(void* context, weaveffi_error* err
     if (err != NULL && err->code != 0) {
         ctx->err_code = err->code;
         ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+        ctx->err_payload_len = err->payload_len;
+        if (err->payload_ptr != NULL && err->payload_len > 0) { ctx->err_payload = (uint8_t*)malloc(err->payload_len); memcpy(ctx->err_payload, err->payload_ptr, err->payload_len); }
     } else {
         ctx->result = result;
     }
@@ -371,7 +298,7 @@ static void weaveffi_kv_Store_compact_napi_settle(napi_env env, napi_value js_cb
     weaveffi_kv_Store_compact_napi_actx* ctx = (weaveffi_kv_Store_compact_napi_actx*)data;
     if (env != NULL) {
     if (ctx->err_code != 0) {
-        napi_value err_obj = weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg);
+        napi_value err_obj = weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg, ctx->err_payload, ctx->err_payload_len);
         napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
@@ -380,6 +307,7 @@ static void weaveffi_kv_Store_compact_napi_settle(napi_env env, napi_value js_cb
     }
     }
     free(ctx->err_msg);
+    free(ctx->err_payload);
     napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
     free(ctx);
 }
@@ -417,7 +345,7 @@ static napi_value Napi_weaveffi_kv_Store_legacy_put(napi_env env, napi_callback_
   bool result = weaveffi_kv_Store_legacy_put((const weaveffi_kv_Store*)(intptr_t)self_raw, key, (const uint8_t*)value_raw, value_len, &err);
   free(key);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -513,27 +441,16 @@ static napi_value Napi_weaveffi_kv_stats_get_stats(napi_env env, napi_callback_i
   int64_t store_raw;
   napi_get_value_int64(env, args[0], &store_raw);
   weaveffi_error err = {0};
-  weaveffi_kv_stats_Stats* result = weaveffi_kv_stats_get_stats((const weaveffi_kv_Store*)(intptr_t)store_raw, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_kv_stats_get_stats((const weaveffi_kv_Store*)(intptr_t)store_raw, &out_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  {
-    weaveffi_kv_stats_Stats* ret_p = (weaveffi_kv_stats_Stats*)result;
-    napi_create_object(env, &ret);
-    napi_value ret_total_entries;
-    napi_create_int64(env, weaveffi_kv_stats_Stats_get_total_entries(ret_p), &ret_total_entries);
-    napi_set_named_property(env, ret, "total_entries", ret_total_entries);
-    napi_value ret_total_bytes;
-    napi_create_int64(env, weaveffi_kv_stats_Stats_get_total_bytes(ret_p), &ret_total_bytes);
-    napi_set_named_property(env, ret, "total_bytes", ret_total_bytes);
-    napi_value ret_expired_entries;
-    napi_create_int64(env, weaveffi_kv_stats_Stats_get_expired_entries(ret_p), &ret_expired_entries);
-    napi_set_named_property(env, ret, "expired_entries", ret_expired_entries);
-    weaveffi_kv_stats_Stats_destroy(ret_p);
-  }
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 

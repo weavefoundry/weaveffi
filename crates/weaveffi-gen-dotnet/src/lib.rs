@@ -18,9 +18,9 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
-    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    RichVariantBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, EnumVariantBinding, ErrorBinding,
+    FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding,
+    ParamBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
@@ -278,6 +278,12 @@ dotnet pack -c Release
     )
 }
 
+/// The C# type of a `handle<T>` reference: a generated `{T}Handle` wrapper
+/// struct named after the referent's bare local type name.
+fn typed_handle_cs(name: &str) -> String {
+    format!("{}Handle", local_type_name(name))
+}
+
 fn cs_type(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I8 => "sbyte".into(),
@@ -293,11 +299,12 @@ fn cs_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Handle => "ulong".into(),
-        // Cross-module typed handles/enums (e.g. `kv.Store`) must surface as the
-        // bare local class; the qualified IR name is not a C# type here.
-        TypeRef::TypedHandle(name) => local_type_name(name).into(),
+        // Typed handles surface as a generated `{T}Handle` wrapper struct; a
+        // cross-module referent (e.g. `kv.Token`) uses the bare local name.
+        TypeRef::TypedHandle(name) => typed_handle_cs(name),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "byte[]".into(),
-        // Records and rich enums share the opaque-object wrapper class.
+        // Records are plain data classes; rich enums are abstract sum types.
+        // Both are value types decoded from value buffers.
         TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).into(),
         TypeRef::Enum(name) => local_type_name(name).into(),
         TypeRef::Optional(inner) => match inner.as_ref() {
@@ -313,7 +320,7 @@ fn cs_type(ty: &TypeRef) -> String {
             TypeRef::F64 => "double?".into(),
             TypeRef::Bool => "bool?".into(),
             TypeRef::Handle => "ulong?".into(),
-            TypeRef::TypedHandle(name) => format!("{}?", local_type_name(name)),
+            TypeRef::TypedHandle(name) => format!("{}?", typed_handle_cs(name)),
             TypeRef::Enum(name) => format!("{}?", local_type_name(name)),
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string?".into(),
             TypeRef::Record(name) | TypeRef::RichEnum(name) => {
@@ -410,25 +417,327 @@ fn pinvoke_param_list(p: &ParamBinding) -> Vec<String> {
 }
 
 fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
+    let r = abi::lower_return(ty, "");
+    (
+        cs_pinvoke_ctype(&r.ret),
+        r.out_params.iter().map(cs_out_param).collect(),
+    )
+}
+
+/// True when `ty` surfaces as a C# value type, so its optional wrapper is
+/// `Nullable<T>` and a present value is read through `.Value`. Strings, byte
+/// arrays, records, rich enums, interfaces, and collections are reference
+/// types and use plain `null` checks instead.
+fn is_cs_value_type(ty: &TypeRef) -> bool {
+    matches!(
+        ty,
+        TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Handle
+            | TypeRef::Enum(_)
+            | TypeRef::TypedHandle(_)
+    )
+}
+
+/// Emit statements serializing `expr` (a C# expression of the C# type mapped
+/// from `ty`) into the buffer writer named `writer_var`, following the wire
+/// format in `docs/src/reference/value-buffers.md`. Nesting recurses;
+/// `depth` uniquifies loop locals so nested lists and maps never collide.
+fn emit_buffer_write(w: &mut CodeWriter, ty: &TypeRef, expr: &str, writer_var: &str, depth: usize) {
     match ty {
-        // Map returns use an array-base `out IntPtr` convention distinct from
-        // the element-typed out-slots of the shared model.
-        TypeRef::Map(_, _) => (
-            "void".into(),
-            vec![
-                "out IntPtr out_keys".into(),
-                "out IntPtr out_values".into(),
-                "out UIntPtr out_len".into(),
-            ],
-        ),
-        _ => {
-            let r = abi::lower_return(ty, "");
-            (
-                cs_pinvoke_ctype(&r.ret),
-                r.out_params.iter().map(cs_out_param).collect(),
-            )
+        TypeRef::I8 => {
+            w.line(format!("{writer_var}.WriteI8({expr});"));
+        }
+        TypeRef::I16 => {
+            w.line(format!("{writer_var}.WriteI16({expr});"));
+        }
+        TypeRef::I32 => {
+            w.line(format!("{writer_var}.WriteI32({expr});"));
+        }
+        TypeRef::U8 => {
+            w.line(format!("{writer_var}.WriteU8({expr});"));
+        }
+        TypeRef::U16 => {
+            w.line(format!("{writer_var}.WriteU16({expr});"));
+        }
+        TypeRef::U32 => {
+            w.line(format!("{writer_var}.WriteU32({expr});"));
+        }
+        TypeRef::I64 => {
+            w.line(format!("{writer_var}.WriteI64({expr});"));
+        }
+        TypeRef::U64 => {
+            w.line(format!("{writer_var}.WriteU64({expr});"));
+        }
+        TypeRef::F32 => {
+            w.line(format!("{writer_var}.WriteF32({expr});"));
+        }
+        TypeRef::F64 => {
+            w.line(format!("{writer_var}.WriteF64({expr});"));
+        }
+        TypeRef::Bool => {
+            w.line(format!("{writer_var}.WriteBool({expr});"));
+        }
+        TypeRef::Handle => {
+            w.line(format!("{writer_var}.WriteU64({expr});"));
+        }
+        // A typed handle serializes as the raw pointer value widened to u64.
+        TypeRef::TypedHandle(_) => {
+            w.line(format!("{writer_var}.WriteU64((ulong)(long){expr}.Raw);"));
+        }
+        TypeRef::Enum(_) => {
+            w.line(format!("{writer_var}.WriteI32((int){expr});"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!("{writer_var}.WriteString({expr});"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line(format!("{writer_var}.WriteBytes({expr});"));
+        }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) => {
+            w.line(format!("{expr}.WriteTo({writer_var});"));
+        }
+        TypeRef::Optional(inner) => {
+            let value_expr = if is_cs_value_type(inner) {
+                format!("{expr}.Value")
+            } else {
+                format!("{expr}!")
+            };
+            w.line(format!("if ({expr} != null)"));
+            w.block("{", "}", |w| {
+                w.line(format!("{writer_var}.WriteOptionFlag(true);"));
+                emit_buffer_write(w, inner, &value_expr, writer_var, depth);
+            });
+            w.line("else");
+            w.block("{", "}", |w| {
+                w.line(format!("{writer_var}.WriteOptionFlag(false);"));
+            });
+        }
+        TypeRef::List(inner) => {
+            let item = format!("item{depth}");
+            w.line(format!("{writer_var}.WriteLen({expr}.Length);"));
+            w.line(format!("foreach (var {item} in {expr})"));
+            w.block("{", "}", |w| {
+                emit_buffer_write(w, inner, &item, writer_var, depth + 1);
+            });
+        }
+        TypeRef::Map(k, v) => {
+            let entry = format!("entry{depth}");
+            w.line(format!("{writer_var}.WriteLen({expr}.Count);"));
+            w.line(format!("foreach (var {entry} in {expr})"));
+            w.block("{", "}", |w| {
+                emit_buffer_write(w, k, &format!("{entry}.Key"), writer_var, depth + 1);
+                emit_buffer_write(w, v, &format!("{entry}.Value"), writer_var, depth + 1);
+            });
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("interfaces and iterators never appear inside a value buffer")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// Emit statements declaring a local named `var` and decoding a value of `ty`
+/// into it from the buffer reader named `reader_var`, the inverse of
+/// [`emit_buffer_write`]. `depth` uniquifies loop counters across nesting.
+fn emit_buffer_read(w: &mut CodeWriter, ty: &TypeRef, var: &str, reader_var: &str, depth: usize) {
+    match ty {
+        TypeRef::I8 => {
+            w.line(format!("var {var} = {reader_var}.ReadI8();"));
+        }
+        TypeRef::I16 => {
+            w.line(format!("var {var} = {reader_var}.ReadI16();"));
+        }
+        TypeRef::I32 => {
+            w.line(format!("var {var} = {reader_var}.ReadI32();"));
+        }
+        TypeRef::U8 => {
+            w.line(format!("var {var} = {reader_var}.ReadU8();"));
+        }
+        TypeRef::U16 => {
+            w.line(format!("var {var} = {reader_var}.ReadU16();"));
+        }
+        TypeRef::U32 => {
+            w.line(format!("var {var} = {reader_var}.ReadU32();"));
+        }
+        TypeRef::I64 => {
+            w.line(format!("var {var} = {reader_var}.ReadI64();"));
+        }
+        TypeRef::U64 => {
+            w.line(format!("var {var} = {reader_var}.ReadU64();"));
+        }
+        TypeRef::F32 => {
+            w.line(format!("var {var} = {reader_var}.ReadF32();"));
+        }
+        TypeRef::F64 => {
+            w.line(format!("var {var} = {reader_var}.ReadF64();"));
+        }
+        TypeRef::Bool => {
+            w.line(format!("var {var} = {reader_var}.ReadBool();"));
+        }
+        TypeRef::Handle => {
+            w.line(format!("var {var} = {reader_var}.ReadU64();"));
+        }
+        TypeRef::TypedHandle(name) => {
+            let cn = typed_handle_cs(name);
+            w.line(format!(
+                "var {var} = new {cn}((IntPtr)(long){reader_var}.ReadU64());"
+            ));
+        }
+        TypeRef::Enum(name) => {
+            let cn = local_type_name(name);
+            w.line(format!("var {var} = ({cn}){reader_var}.ReadI32();"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!("var {var} = {reader_var}.ReadString();"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line(format!("var {var} = {reader_var}.ReadBytes();"));
+        }
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            let cn = local_type_name(name);
+            w.line(format!("var {var} = {cn}.ReadFrom({reader_var});"));
+        }
+        TypeRef::Optional(inner) => {
+            let cs = cs_type(ty);
+            w.line(format!("{cs} {var} = null;"));
+            w.line(format!("if ({reader_var}.ReadOptionFlag())"));
+            w.block("{", "}", |w| {
+                emit_buffer_read(w, inner, &format!("{var}Value"), reader_var, depth);
+                w.line(format!("{var} = {var}Value;"));
+            });
+        }
+        TypeRef::List(inner) => {
+            let i = format!("i{depth}");
+            let elem = cs_type(inner);
+            w.line(format!("var {var}Count = {reader_var}.ReadLen();"));
+            w.line(format!("var {var} = new {elem}[{var}Count];"));
+            w.line(format!("for (int {i} = 0; {i} < {var}Count; {i}++)"));
+            w.block("{", "}", |w| {
+                emit_buffer_read(w, inner, &format!("{var}Item"), reader_var, depth + 1);
+                w.line(format!("{var}[{i}] = {var}Item;"));
+            });
+        }
+        TypeRef::Map(k, v) => {
+            let i = format!("i{depth}");
+            let k_cs = cs_type(k);
+            let v_cs = cs_type(v);
+            w.line(format!("var {var}Count = {reader_var}.ReadLen();"));
+            w.line(format!(
+                "var {var} = new Dictionary<{k_cs}, {v_cs}>({var}Count);"
+            ));
+            w.line(format!("for (int {i} = 0; {i} < {var}Count; {i}++)"));
+            w.block("{", "}", |w| {
+                emit_buffer_read(w, k, &format!("{var}Key"), reader_var, depth + 1);
+                emit_buffer_read(w, v, &format!("{var}Val"), reader_var, depth + 1);
+                w.line(format!("{var}[{var}Key] = {var}Val;"));
+            });
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("interfaces and iterators never appear inside a value buffer")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// Collect the local referent names of every `handle<T>` used anywhere in
+/// the model (parameters, returns, fields, variant fields, callback
+/// parameters, and error payload fields), so one `{T}Handle` wrapper struct
+/// is emitted per referent. The `BTreeSet` keeps emission order stable.
+fn collect_typed_handles(model: &BindingModel) -> std::collections::BTreeSet<String> {
+    fn visit(ty: &TypeRef, acc: &mut std::collections::BTreeSet<String>) {
+        match ty {
+            TypeRef::TypedHandle(name) => {
+                acc.insert(local_type_name(name).to_string());
+            }
+            TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+                visit(inner, acc);
+            }
+            TypeRef::Map(k, v) => {
+                visit(k, acc);
+                visit(v, acc);
+            }
+            _ => {}
         }
     }
+    let mut acc = std::collections::BTreeSet::new();
+    for m in &model.modules {
+        for f in m.callables() {
+            for p in &f.params {
+                visit(&p.ty, &mut acc);
+            }
+            if let Some(r) = &f.ret {
+                visit(r, &mut acc);
+            }
+        }
+        for cb in &m.callbacks {
+            for p in &cb.params {
+                visit(&p.ty, &mut acc);
+            }
+        }
+        for s in &m.structs {
+            for f in &s.fields {
+                visit(&f.ty, &mut acc);
+            }
+        }
+        for e in &m.enums {
+            for v in &e.variants {
+                for f in &v.fields {
+                    visit(&f.ty, &mut acc);
+                }
+            }
+        }
+        if let Some(eb) = &m.error {
+            for c in &eb.codes {
+                for f in &c.fields {
+                    visit(&f.ty, &mut acc);
+                }
+            }
+        }
+    }
+    acc
+}
+
+/// Render the `{T}Handle` wrapper struct for one typed-handle referent: a
+/// readonly struct over the raw native pointer token. The token is opaque to
+/// the consumer; the producer interprets it.
+fn render_typed_handle_struct(out: &mut String, referent: &str) {
+    let name = typed_handle_cs(referent);
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.line(format!(
+        "/// <summary>A typed native handle referencing a {referent}.</summary>"
+    ));
+    w.line(format!("public readonly struct {name}"));
+    w.block("{", "}", |w| {
+        w.line("internal readonly IntPtr Raw;");
+        w.blank();
+        w.line(format!("internal {name}(IntPtr raw)"));
+        w.block("{", "}", |w| {
+            w.line("Raw = raw;");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit the statements decoding a consumer-side copy of a value buffer
+/// (`byte[]` local named `buf`) into a local named `var` of type `ty`,
+/// validating that the buffer is fully consumed.
+fn emit_buffer_decode(w: &mut CodeWriter, ty: &TypeRef, var: &str, buf: &str) {
+    w.line(format!(
+        "var {var}Reader = new WeaveFFIBufferReader({buf});"
+    ));
+    emit_buffer_read(w, ty, var, &format!("{var}Reader"), 0);
+    w.line(format!("{var}Reader.ExpectEnd();"));
 }
 
 fn xml_escape(s: &str) -> String {
@@ -698,6 +1007,10 @@ fn render_csharp(
     }
     render_error_struct(&mut out, &domains);
     render_helpers_class(&mut out);
+    render_buffer_classes(&mut out);
+    for referent in collect_typed_handles(model) {
+        render_typed_handle_struct(&mut out, &referent);
+    }
     if model
         .modules
         .iter()
@@ -709,8 +1022,9 @@ fn render_csharp(
 
     for m in &model.modules {
         for e in &m.enums {
-            // Rich (algebraic) enums are opaque-object wrappers, emitted as a
-            // class mirroring a struct; only plain C-style enums map to `enum`.
+            // Rich (algebraic) enums are sum types, emitted as an abstract
+            // class with one nested variant class each; only plain C-style
+            // enums map to `enum`.
             if e.is_rich() {
                 render_rich_enum_class(&mut out, e);
             } else {
@@ -719,7 +1033,6 @@ fn render_csharp(
         }
         for s in &m.structs {
             render_struct_class(&mut out, s);
-            render_builder_class(&mut out, s);
         }
         for i in &m.interfaces {
             render_interface_class(&mut out, i, m.error.as_ref());
@@ -796,12 +1109,17 @@ impl<'a> ErrCtx<'a> {
     }
 
     /// The exception expression an async completion callback faults its
-    /// `TaskCompletionSource` with.
+    /// `TaskCompletionSource` with. A domain exception decodes the error's
+    /// structured payload, copied from the borrowed error struct inside the
+    /// callback (the producer releases the original afterward).
     fn async_exception_expr(&self) -> String {
         match self {
             ErrCtx::Generic => "new WeaveFFIException(wErr.Code, msg)".into(),
             ErrCtx::Domain(eb) => {
-                format!("{}.FromCode(wErr.Code, msg)", dotnet_exception_name(eb))
+                format!(
+                    "{}.FromCode(wErr.Code, msg, payload)",
+                    dotnet_exception_name(eb)
+                )
             }
         }
     }
@@ -837,7 +1155,10 @@ fn render_exception_class(out: &mut String) {
 /// One typed exception class per declared error domain, extending the generic
 /// brand exception. Each code surfaces as a `public const int` (PascalCase),
 /// and `FromCode` maps a raw error slot to the typed exception, falling back
-/// to the generic `WeaveFFIException` for unknown codes.
+/// to the generic `WeaveFFIException` for unknown codes. When the matched
+/// code declares payload fields, `FromCode` decodes them from the serialized
+/// payload buffer and exposes each field in the exception's `Data`
+/// dictionary, keyed by the IDL field name.
 fn render_domain_exception(out: &mut String, eb: &ErrorBinding) {
     let exc = dotnet_exception_name(eb);
     let mut w = CodeWriter::four_space().with_depth(1);
@@ -868,19 +1189,40 @@ fn render_domain_exception(out: &mut String, eb: &ErrorBinding) {
         w.line("}");
         w.blank();
         w.line("/// <summary>Wraps a raw error slot in the typed exception, falling");
-        w.line("/// back to <see cref=\"WeaveFFIException\"/> for unknown codes.</summary>");
-        w.line("internal static WeaveFFIException FromCode(int code, string message)");
+        w.line("/// back to <see cref=\"WeaveFFIException\"/> for unknown codes. Codes");
+        w.line("/// declaring payload fields decode them into Data.</summary>");
+        w.line("internal static WeaveFFIException FromCode(int code, string message, byte[]? payload)");
         w.block("{", "}", |w| {
             w.line("switch (code)");
             w.block("{", "}", |w| {
                 for c in &eb.codes {
                     w.line(format!("case {}:", errors::pascal(&c.name)));
-                    w.indent();
-                    w.line(format!(
-                        "return new {exc}(code, string.IsNullOrEmpty(message) ? \"{}\" : message);",
-                        cs_str(&c.message)
-                    ));
-                    w.dedent();
+                    if c.fields.is_empty() {
+                        w.indent();
+                        w.line(format!(
+                            "return new {exc}(code, string.IsNullOrEmpty(message) ? \"{}\" : message);",
+                            cs_str(&c.message)
+                        ));
+                        w.dedent();
+                    } else {
+                        w.block("{", "}", |w| {
+                            w.line(format!(
+                                "var ex = new {exc}(code, string.IsNullOrEmpty(message) ? \"{}\" : message);",
+                                cs_str(&c.message)
+                            ));
+                            w.line("if (payload != null)");
+                            w.block("{", "}", |w| {
+                                w.line("var reader = new WeaveFFIBufferReader(payload);");
+                                for f in &c.fields {
+                                    let var = format!("f{}", f.name.to_upper_camel_case());
+                                    emit_buffer_read(w, &f.ty, &var, "reader", 0);
+                                    w.line(format!("ex.Data[\"{}\"] = {var};", cs_str(&f.name)));
+                                }
+                                w.line("reader.ExpectEnd();");
+                            });
+                            w.line("return ex;");
+                        });
+                    }
                 }
                 w.line("default:");
                 w.indent();
@@ -895,7 +1237,10 @@ fn render_domain_exception(out: &mut String, eb: &ErrorBinding) {
 
 /// The raw error slot plus its check helpers: the generic `Check` (throws
 /// `WeaveFFIException` on any non-zero code) and one `Check{Domain}` variant
-/// per declared domain (throws the typed exception via `FromCode`).
+/// per declared domain (throws the typed exception via `FromCode`). Every
+/// check copies the message (and, for domains, the serialized payload) and
+/// then calls `weaveffi_error_clear`, which frees both producer allocations,
+/// before throwing.
 fn render_error_struct(out: &mut String, domains: &[&ErrorBinding]) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.line("[StructLayout(LayoutKind.Sequential)]");
@@ -903,13 +1248,30 @@ fn render_error_struct(out: &mut String, domains: &[&ErrorBinding]) {
     w.block("{", "}", |w| {
         w.line("public int Code;");
         w.line("public IntPtr Message;");
+        w.line("public IntPtr PayloadPtr;");
+        w.line("public UIntPtr PayloadLen;");
+        w.blank();
+        w.line("internal static byte[]? CopyPayload(WeaveFFIError err)");
+        w.block("{", "}", |w| {
+            w.line("if (err.PayloadPtr == IntPtr.Zero || (int)err.PayloadLen == 0)");
+            w.block("{", "}", |w| {
+                w.line("return null;");
+            });
+            w.line("var payload = new byte[(int)err.PayloadLen];");
+            w.line("Marshal.Copy(err.PayloadPtr, payload, 0, (int)err.PayloadLen);");
+            w.line("return payload;");
+        });
         w.blank();
         w.line("internal static void Check(WeaveFFIError err)");
         w.block("{", "}", |w| {
             w.line("if (err.Code != 0)");
             w.block("{", "}", |w| {
+                // The clear zeroes the slot, so capture code and message
+                // before releasing the producer allocations.
+                w.line("var code = err.Code;");
                 w.line("var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";");
-                w.line("throw new WeaveFFIException(err.Code, msg);");
+                w.line("NativeMethods.weaveffi_error_clear(ref err);");
+                w.line("throw new WeaveFFIException(code, msg);");
             });
         });
         for eb in domains {
@@ -920,8 +1282,11 @@ fn render_error_struct(out: &mut String, domains: &[&ErrorBinding]) {
             w.block("{", "}", |w| {
                 w.line("if (err.Code != 0)");
                 w.block("{", "}", |w| {
+                    w.line("var code = err.Code;");
                     w.line("var msg = Marshal.PtrToStringUTF8(err.Message) ?? \"\";");
-                    w.line(format!("throw {exc}.FromCode(err.Code, msg);"));
+                    w.line("var payload = CopyPayload(err);");
+                    w.line("NativeMethods.weaveffi_error_clear(ref err);");
+                    w.line(format!("throw {exc}.FromCode(code, msg, payload);"));
                 });
             });
         }
@@ -949,6 +1314,288 @@ fn render_helpers_class(out: &mut String) {
             w.line("Marshal.FreeCoTaskMem(ptr);");
         });
     });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// The private buffer writer and reader implementing the WeaveFFI value-buffer
+/// wire format (little-endian, packed, no alignment) over managed byte arrays.
+/// The reader rejects malformed input (truncation, invalid bool or option
+/// flags, oversized length prefixes, trailing bytes) by throwing
+/// `InvalidOperationException`; a malformed buffer is always a producer or
+/// consumer bug, never a recoverable domain error.
+fn render_buffer_classes(out: &mut String) {
+    let mut w = CodeWriter::four_space().with_depth(1);
+    w.block_raw(
+        r#"/// <summary>Serializes values into the WeaveFFI value-buffer wire
+/// format (little-endian, packed).</summary>
+internal sealed class WeaveFFIBufferWriter
+{
+    private byte[] _buf = new byte[64];
+    private int _len;
+
+    private void Ensure(int extra)
+    {
+        if (_len + extra <= _buf.Length)
+        {
+            return;
+        }
+        var size = _buf.Length * 2;
+        while (size < _len + extra)
+        {
+            size *= 2;
+        }
+        Array.Resize(ref _buf, size);
+    }
+
+    internal void WriteBool(bool v)
+    {
+        Ensure(1);
+        _buf[_len++] = v ? (byte)1 : (byte)0;
+    }
+
+    internal void WriteI8(sbyte v)
+    {
+        Ensure(1);
+        _buf[_len++] = (byte)v;
+    }
+
+    internal void WriteU8(byte v)
+    {
+        Ensure(1);
+        _buf[_len++] = v;
+    }
+
+    internal void WriteU16(ushort v)
+    {
+        Ensure(2);
+        _buf[_len++] = (byte)v;
+        _buf[_len++] = (byte)(v >> 8);
+    }
+
+    internal void WriteI16(short v)
+    {
+        WriteU16((ushort)v);
+    }
+
+    internal void WriteU32(uint v)
+    {
+        Ensure(4);
+        _buf[_len++] = (byte)v;
+        _buf[_len++] = (byte)(v >> 8);
+        _buf[_len++] = (byte)(v >> 16);
+        _buf[_len++] = (byte)(v >> 24);
+    }
+
+    internal void WriteI32(int v)
+    {
+        WriteU32((uint)v);
+    }
+
+    internal void WriteU64(ulong v)
+    {
+        WriteU32((uint)v);
+        WriteU32((uint)(v >> 32));
+    }
+
+    internal void WriteI64(long v)
+    {
+        WriteU64((ulong)v);
+    }
+
+    internal void WriteF32(float v)
+    {
+        WriteU32((uint)BitConverter.SingleToInt32Bits(v));
+    }
+
+    internal void WriteF64(double v)
+    {
+        WriteU64((ulong)BitConverter.DoubleToInt64Bits(v));
+    }
+
+    internal void WriteLen(int len)
+    {
+        WriteU32((uint)len);
+    }
+
+    internal void WriteOptionFlag(bool present)
+    {
+        WriteBool(present);
+    }
+
+    internal void WriteString(string v)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetBytes(v);
+        WriteLen(bytes.Length);
+        Ensure(bytes.Length);
+        Array.Copy(bytes, 0, _buf, _len, bytes.Length);
+        _len += bytes.Length;
+    }
+
+    internal void WriteBytes(byte[] v)
+    {
+        WriteLen(v.Length);
+        Ensure(v.Length);
+        Array.Copy(v, 0, _buf, _len, v.Length);
+        _len += v.Length;
+    }
+
+    internal byte[] ToArray()
+    {
+        var outBuf = new byte[_len];
+        Array.Copy(_buf, outBuf, _len);
+        return outBuf;
+    }
+}
+
+/// <summary>Decodes values from the WeaveFFI value-buffer wire format.
+/// A malformed buffer indicates a producer/consumer contract violation and
+/// throws <see cref="InvalidOperationException"/>.</summary>
+internal sealed class WeaveFFIBufferReader
+{
+    private static readonly System.Text.Encoding Utf8Strict =
+        new System.Text.UTF8Encoding(false, true);
+
+    private readonly byte[] _data;
+    private int _pos;
+
+    internal WeaveFFIBufferReader(byte[] data)
+    {
+        _data = data;
+    }
+
+    private void Require(int n)
+    {
+        if (_data.Length - _pos < n)
+        {
+            throw new InvalidOperationException("malformed WeaveFFI value buffer: buffer exhausted");
+        }
+    }
+
+    internal bool ReadBool()
+    {
+        Require(1);
+        var b = _data[_pos++];
+        if (b > 1)
+        {
+            throw new InvalidOperationException("malformed WeaveFFI value buffer: invalid bool byte");
+        }
+        return b == 1;
+    }
+
+    internal sbyte ReadI8()
+    {
+        Require(1);
+        return (sbyte)_data[_pos++];
+    }
+
+    internal byte ReadU8()
+    {
+        Require(1);
+        return _data[_pos++];
+    }
+
+    internal ushort ReadU16()
+    {
+        Require(2);
+        var v = (ushort)(_data[_pos] | (_data[_pos + 1] << 8));
+        _pos += 2;
+        return v;
+    }
+
+    internal short ReadI16()
+    {
+        return (short)ReadU16();
+    }
+
+    internal uint ReadU32()
+    {
+        Require(4);
+        var v = (uint)_data[_pos]
+            | ((uint)_data[_pos + 1] << 8)
+            | ((uint)_data[_pos + 2] << 16)
+            | ((uint)_data[_pos + 3] << 24);
+        _pos += 4;
+        return v;
+    }
+
+    internal int ReadI32()
+    {
+        return (int)ReadU32();
+    }
+
+    internal ulong ReadU64()
+    {
+        var lo = (ulong)ReadU32();
+        var hi = (ulong)ReadU32();
+        return lo | (hi << 32);
+    }
+
+    internal long ReadI64()
+    {
+        return (long)ReadU64();
+    }
+
+    internal float ReadF32()
+    {
+        return BitConverter.Int32BitsToSingle(ReadI32());
+    }
+
+    internal double ReadF64()
+    {
+        return BitConverter.Int64BitsToDouble(ReadI64());
+    }
+
+    internal int ReadLen()
+    {
+        var len = ReadU32();
+        if (len > (uint)(_data.Length - _pos))
+        {
+            throw new InvalidOperationException("malformed WeaveFFI value buffer: length prefix exceeds remaining bytes");
+        }
+        return (int)len;
+    }
+
+    internal bool ReadOptionFlag()
+    {
+        return ReadBool();
+    }
+
+    internal string ReadString()
+    {
+        var len = ReadLen();
+        string s;
+        try
+        {
+            s = Utf8Strict.GetString(_data, _pos, len);
+        }
+        catch (ArgumentException)
+        {
+            throw new InvalidOperationException("malformed WeaveFFI value buffer: string is not valid UTF-8");
+        }
+        _pos += len;
+        return s;
+    }
+
+    internal byte[] ReadBytes()
+    {
+        var len = ReadLen();
+        var outBuf = new byte[len];
+        Array.Copy(_data, _pos, outBuf, 0, len);
+        _pos += len;
+        return outBuf;
+    }
+
+    internal void ExpectEnd()
+    {
+        if (_pos != _data.Length)
+        {
+            throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
+        }
+    }
+}
+"#,
+    );
     w.blank();
     out.push_str(&w.finish());
 }
@@ -1014,42 +1661,90 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
+/// Emit the get-only properties and the positional constructor shared by
+/// record classes and rich-enum variant classes: one PascalCase property per
+/// field plus a public constructor taking every field in declaration order.
+fn render_value_members(w: &mut CodeWriter, class_name: &str, fields: &[FieldBinding]) {
+    for field in fields {
+        writer_doc(w, &field.doc);
+        w.line(format!(
+            "public {} {} {{ get; }}",
+            cs_type(&field.ty),
+            field.name.to_upper_camel_case()
+        ));
+        w.blank();
+    }
+    let params_sig: Vec<String> = fields
+        .iter()
+        .map(|f| {
+            format!(
+                "{} {}",
+                cs_type(&f.ty),
+                safe_cs_name(&f.name.to_lower_camel_case())
+            )
+        })
+        .collect();
+    w.line(format!("public {class_name}({})", params_sig.join(", ")));
+    w.block("{", "}", |w| {
+        for f in fields {
+            w.line(format!(
+                "{} = {};",
+                f.name.to_upper_camel_case(),
+                safe_cs_name(&f.name.to_lower_camel_case())
+            ));
+        }
+    });
+}
+
+/// The `new {Class}(fField1, fField2, ...)` argument list matching the locals
+/// [`emit_buffer_read`] declares for each field in `ReadFrom`.
+fn read_ctor_args(fields: &[FieldBinding]) -> String {
+    fields
+        .iter()
+        .map(|f| format!("f{}", f.name.to_upper_camel_case()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Render a record as a plain sealed data class: typed get-only properties, a
+/// positional constructor, and the internal `WriteTo`/`ReadFrom` pair
+/// implementing the record's value-buffer encoding (fields in declaration
+/// order). Records own no native resources, so there is no handle, `Dispose`,
+/// builder, or getter symbol.
 fn render_struct_class(out: &mut String, s: &StructBinding) {
     let mut w = CodeWriter::four_space().with_depth(1);
     writer_doc(&mut w, &s.doc);
-    w.line(format!("public class {} : IDisposable", s.name));
+    w.line(format!("public sealed class {}", s.name));
     w.line("{");
     w.indent();
-    w.line("private IntPtr _handle;");
-    w.line("private bool _disposed;");
+    render_value_members(&mut w, &s.name, &s.fields);
     w.blank();
-    w.line(format!("internal {}(IntPtr handle)", s.name));
+    w.line("internal void WriteTo(WeaveFFIBufferWriter writer)");
     w.block("{", "}", |w| {
-        w.line("_handle = handle;");
+        for f in &s.fields {
+            emit_buffer_write(w, &f.ty, &f.name.to_upper_camel_case(), "writer", 0);
+        }
     });
     w.blank();
-    w.line("internal IntPtr Handle => _handle;");
-    w.blank();
-
-    for field in &s.fields {
-        let mut tmp = String::new();
-        render_struct_getter(&mut tmp, field);
-        w.raw(tmp);
-    }
-
-    w.line("public void Dispose()");
+    w.line(format!(
+        "internal static {} ReadFrom(WeaveFFIBufferReader reader)",
+        s.name
+    ));
     w.block("{", "}", |w| {
-        w.line("if (!_disposed)");
-        w.block("{", "}", |w| {
-            w.line(format!("NativeMethods.{}(_handle);", s.destroy_symbol));
-            w.line("_disposed = true;");
-        });
-        w.line("GC.SuppressFinalize(this);");
-    });
-    w.blank();
-    w.line(format!("~{}()", s.name));
-    w.block("{", "}", |w| {
-        w.line("Dispose();");
+        for f in &s.fields {
+            emit_buffer_read(
+                w,
+                &f.ty,
+                &format!("f{}", f.name.to_upper_camel_case()),
+                "reader",
+                0,
+            );
+        }
+        w.line(format!(
+            "return new {}({});",
+            s.name,
+            read_ctor_args(&s.fields)
+        ));
     });
     w.dedent();
     w.line("}");
@@ -1057,293 +1752,133 @@ fn render_struct_class(out: &mut String, s: &StructBinding) {
     out.push_str(&w.finish());
 }
 
-/// Render a rich (algebraic) enum as an opaque-object `IDisposable` class,
-/// mirroring the struct wrapper: it owns the `IntPtr` handle and frees it via
-/// the enum's `_destroy` (same Dispose + finalizer, so no double free). Surface:
-/// a nested `enum Tag` + `GetTag()` reader, one static factory per variant
-/// (`Shape.Circle(2.5)`) using the struct/builder error-handling convention,
-/// and per-variant field accessors namespaced as `{Variant}{Field}` properties
-/// that reuse the struct-getter marshalling. A `TypeRef::RichEnum` reference
-/// shares the opaque-pointer handling of `TypeRef::Record`, so functions
-/// taking/returning the enum flow through the record param/return path.
+/// Render a rich (algebraic) enum as an idiomatic sum type: an abstract base
+/// class with a private constructor and one nested sealed class per variant
+/// (`Shape.Circle`), each carrying its fields as typed properties. The base
+/// class hosts the internal `WriteTo`/`ReadFrom` pair implementing the
+/// enum's value-buffer encoding: an `i32` tag followed by the active
+/// variant's fields in declaration order. Rich enums own no native
+/// resources and declare no C symbols.
 fn render_rich_enum_class(out: &mut String, e: &EnumBinding) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
     let name = &e.name;
-
     let mut w = CodeWriter::four_space().with_depth(1);
     writer_doc(&mut w, &e.doc);
-    w.line(format!("public class {name} : IDisposable"));
+    w.line(format!("public abstract class {name}"));
     w.line("{");
     w.indent();
-    w.line("private IntPtr _handle;");
-    w.line("private bool _disposed;");
-    w.blank();
-    w.line(format!("internal {name}(IntPtr handle)"));
-    w.block("{", "}", |w| {
-        w.line("_handle = handle;");
-    });
-    w.blank();
-    w.line("internal IntPtr Handle => _handle;");
-    w.blank();
-
-    // Nested discriminant enum + typed reader. `Tag` is a nested type, so the
-    // reader is `GetTag()` (a `Tag` property would collide with the type name).
-    w.line("public enum Tag");
-    w.block("{", "}", |w| {
-        for v in &e.variants {
-            writer_doc(w, &v.doc);
-            w.line(format!("{} = {},", v.name, v.value));
-        }
-    });
-    w.blank();
-    w.line("public Tag GetTag()");
-    w.block("{", "}", |w| {
-        w.line(format!(
-            "return (Tag)NativeMethods.{}(_handle);",
-            rich.tag_symbol
-        ));
-    });
-    w.blank();
-
-    // One static factory per variant.
-    for v in &rich.variants {
-        let mut tmp = String::new();
-        render_rich_variant_factory(&mut tmp, name, v);
-        w.raw(tmp);
-    }
-
-    // Per-variant field accessors, namespaced by variant to avoid collisions
-    // (`CircleRadius`, `RectangleWidth`, ...). Same marshalling as struct fields.
-    for v in &rich.variants {
-        let variant_prefix = v.name.to_upper_camel_case();
-        for f in &v.fields {
-            let prop_name = format!("{}{}", variant_prefix, f.name.to_upper_camel_case());
-            let mut tmp = String::new();
-            render_field_getter(&mut tmp, &prop_name, f);
-            w.raw(tmp);
-        }
-    }
-
-    w.line("public void Dispose()");
-    w.block("{", "}", |w| {
-        w.line("if (!_disposed)");
-        w.block("{", "}", |w| {
-            w.line(format!("NativeMethods.{}(_handle);", rich.destroy_symbol));
-            w.line("_disposed = true;");
-        });
-        w.line("GC.SuppressFinalize(this);");
-    });
-    w.blank();
-    w.line(format!("~{name}()"));
-    w.block("{", "}", |w| {
-        w.line("Dispose();");
-    });
-    w.dedent();
+    // The private constructor closes the hierarchy: only the nested variant
+    // classes can derive from the base.
+    w.line(format!("private {name}()"));
+    w.line("{");
     w.line("}");
     w.blank();
-    out.push_str(&w.finish());
-}
 
-/// One static factory for a rich-enum variant (`Shape.Circle(double radius)`).
-/// Marshals each payload field through the same helpers as a struct's `create`
-/// (builder `Build()`), invoking `{tag}_{V}_new(<slots>, ref err)` and wrapping
-/// the returned handle. A unit variant takes no parameters.
-fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVariantBinding) {
-    let params: Vec<ParamBinding> = v.fields.iter().map(field_as_param).collect();
-    let params_sig: Vec<String> = params
-        .iter()
-        .map(|p| format!("{} {}", cs_type(&p.ty), safe_cs_name(&p.name)))
-        .collect();
+    for v in &e.variants {
+        let mut vw = CodeWriter::four_space().with_depth(2);
+        render_rich_variant_class(&mut vw, name, v);
+        w.raw(vw.finish());
+    }
 
-    let mut w = CodeWriter::four_space().with_depth(2);
-    writer_doc(&mut w, &v.doc);
+    w.line("internal void WriteTo(WeaveFFIBufferWriter writer)");
+    w.block("{", "}", |w| {
+        w.line("switch (this)");
+        w.block("{", "}", |w| {
+            for v in &e.variants {
+                if v.fields.is_empty() {
+                    w.line(format!("case {} _:", v.name));
+                    w.indent();
+                    w.line(format!("writer.WriteI32({});", v.value));
+                    w.line("break;");
+                    w.dedent();
+                } else {
+                    w.line(format!("case {} v:", v.name));
+                    w.indent();
+                    w.line(format!("writer.WriteI32({});", v.value));
+                    for f in &v.fields {
+                        emit_buffer_write(
+                            w,
+                            &f.ty,
+                            &format!("v.{}", f.name.to_upper_camel_case()),
+                            "writer",
+                            0,
+                        );
+                    }
+                    w.line("break;");
+                    w.dedent();
+                }
+            }
+            w.line("default:");
+            w.indent();
+            w.line(format!(
+                "throw new InvalidOperationException(\"unknown {name} variant\");"
+            ));
+            w.dedent();
+        });
+    });
+    w.blank();
     w.line(format!(
-        "public static {enum_name} {}({})",
-        v.name,
-        params_sig.join(", ")
+        "internal static {name} ReadFrom(WeaveFFIBufferReader reader)"
     ));
-    w.line("{");
-    w.indent();
-    w.line("var err = new WeaveFFIError();");
-
-    let needs_try = params.iter().any(|p| param_needs_marshal(&p.ty));
-    let call_args = build_call_args(&params);
-    let args_part = if call_args.is_empty() {
-        String::new()
-    } else {
-        format!("{call_args}, ")
-    };
-    let call = format!(
-        "var result = NativeMethods.{}({args_part}ref err);",
-        v.create.symbol
-    );
-
-    if needs_try {
-        for p in &params {
-            let mut tmp = String::new();
-            render_marshal_setup(&mut tmp, p, "            ");
-            w.raw(tmp);
-        }
-        w.line("try");
-        w.line("{");
-        w.scope(|w| {
-            w.line(call.clone());
-            w.line("WeaveFFIError.Check(err);");
-            w.line(format!("return new {enum_name}(result);"));
-        });
-        w.line("}");
-        w.line("finally");
-        w.line("{");
-        for p in &params {
-            let mut tmp = String::new();
-            render_marshal_cleanup(&mut tmp, p, "                ");
-            w.raw(tmp);
-        }
-        w.line("}");
-    } else {
-        w.line(call);
-        w.line("WeaveFFIError.Check(err);");
-        w.line(format!("return new {enum_name}(result);"));
-    }
-    w.dedent();
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// The builder slot's storage type and zero-value default. Scalars start at
-/// 0/false/""/empty, collections empty, optionals absent, the same contract
-/// as the other backends, so unset fields lower to valid C arguments.
-fn cs_field_default(ty: &TypeRef) -> (String, String) {
-    let t = cs_type(ty);
-    match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::Handle => (t, "0".into()),
-        TypeRef::F32 | TypeRef::F64 => (t, "0.0".into()),
-        TypeRef::Bool => (t, "false".into()),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (t, "\"\"".into()),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => (t, "Array.Empty<byte>()".into()),
-        TypeRef::List(inner) => {
-            let elem = cs_type(inner);
-            (t, format!("Array.Empty<{elem}>()"))
-        }
-        TypeRef::Map(_, _) => {
-            let init = format!("new {t}()");
-            (t, init)
-        }
-        TypeRef::Optional(_) => (t, "null".into()),
-        TypeRef::Enum(_) => (t, "default".into()),
-        // No synthesizable zero value; the With setter is the only path.
-        _ => (format!("{t}?"), "null".into()),
-    }
-}
-
-/// A synthetic [`ParamBinding`] so builder fields reuse the function-parameter
-/// marshalling helpers (`render_marshal_setup` / `build_call_args` / cleanup).
-fn field_as_param(field: &FieldBinding) -> ParamBinding {
-    ParamBinding {
-        name: field.name.clone(),
-        ty: field.ty.clone(),
-        mutable: false,
-        doc: None,
-        abi: Vec::new(),
-    }
-}
-
-fn render_builder_class(out: &mut String, s: &StructBinding) {
-    if s.builder.is_none() {
-        return;
-    }
-    let builder_name = format!("{}Builder", s.name);
-    let mut w = CodeWriter::four_space().with_depth(1);
-    writer_doc(&mut w, &s.doc);
-    w.line(format!("public class {builder_name}"));
-    w.line("{");
-    w.indent();
-    for field in &s.fields {
-        let (storage, default) = cs_field_default(&field.ty);
-        let fname = safe_cs_name(&field.name);
-        w.line(format!("private {storage} _{fname} = {default};"));
-    }
-    w.blank();
-    for field in &s.fields {
-        let pascal = field.name.to_upper_camel_case();
-        let param_ty = cs_type(&field.ty);
-        let fname = safe_cs_name(&field.name);
-        writer_doc(&mut w, &field.doc);
-        w.line(format!(
-            "public {builder_name} With{pascal}({param_ty} value)"
-        ));
+    w.block("{", "}", |w| {
+        w.line("var tag = reader.ReadI32();");
+        w.line("switch (tag)");
         w.block("{", "}", |w| {
-            w.line(format!("_{fname} = value;"));
-            w.line("return this;");
+            for v in &e.variants {
+                w.line(format!("case {}:", v.value));
+                if v.fields.is_empty() {
+                    w.indent();
+                    w.line(format!("return new {}();", v.name));
+                    w.dedent();
+                } else {
+                    w.block("{", "}", |w| {
+                        for f in &v.fields {
+                            emit_buffer_read(
+                                w,
+                                &f.ty,
+                                &format!("f{}", f.name.to_upper_camel_case()),
+                                "reader",
+                                0,
+                            );
+                        }
+                        w.line(format!(
+                            "return new {}({});",
+                            v.name,
+                            read_ctor_args(&v.fields)
+                        ));
+                    });
+                }
+            }
+            w.line("default:");
+            w.indent();
+            w.line(format!(
+                "throw new InvalidOperationException(\"malformed WeaveFFI value buffer: unknown {name} tag \" + tag);"
+            ));
+            w.dedent();
         });
-        w.blank();
-    }
-    // Build: marshal every field into the struct's C `create` call with the
-    // same lowering used for function parameters, then wrap the handle.
-    w.line(format!("public {} Build()", s.name));
-    w.line("{");
-    w.indent();
-    w.line("var err = new WeaveFFIError();");
-    let params: Vec<ParamBinding> = s.fields.iter().map(field_as_param).collect();
-    for p in &params {
-        let fname = safe_cs_name(&p.name);
-        w.line(format!("var {fname} = _{fname};"));
-    }
-    let needs_try = params.iter().any(|p| param_needs_marshal(&p.ty));
-    let call_args = build_call_args(&params);
-    let args_part = if call_args.is_empty() {
-        String::new()
-    } else {
-        format!("{call_args}, ")
-    };
-    let call = format!(
-        "var result = NativeMethods.{}({args_part}ref err);",
-        s.create.symbol
-    );
-    if needs_try {
-        for p in &params {
-            let mut tmp = String::new();
-            render_marshal_setup(&mut tmp, p, "            ");
-            w.raw(tmp);
-        }
-        w.line("try");
-        w.line("{");
-        w.scope(|w| {
-            w.line(call.clone());
-            w.line("WeaveFFIError.Check(err);");
-            w.line(format!("return new {}(result);", s.name));
-        });
-        w.line("}");
-        w.line("finally");
-        w.line("{");
-        for p in &params {
-            let mut tmp = String::new();
-            render_marshal_cleanup(&mut tmp, p, "                ");
-            w.raw(tmp);
-        }
-        w.line("}");
-    } else {
-        w.line(call);
-        w.line("WeaveFFIError.Check(err);");
-        w.line(format!("return new {}(result);", s.name));
-    }
-    w.dedent();
-    w.line("}");
+    });
     w.dedent();
     w.line("}");
     w.blank();
     out.push_str(&w.finish());
+}
+
+/// One nested sealed variant class of a rich enum: typed get-only properties
+/// and a positional constructor, exactly like a record. A unit variant has an
+/// empty body with the compiler-provided constructor.
+fn render_rich_variant_class(w: &mut CodeWriter, enum_name: &str, v: &EnumVariantBinding) {
+    writer_doc(w, &v.doc);
+    w.line(format!("public sealed class {} : {enum_name}", v.name));
+    if v.fields.is_empty() {
+        w.line("{");
+        w.line("}");
+    } else {
+        w.line("{");
+        w.indent();
+        render_value_members(w, &v.name, &v.fields);
+        w.dedent();
+        w.line("}");
+    }
+    w.blank();
 }
 
 /// A copy of `f` whose parameter names are lowerCamelCase, the C# parameter
@@ -1495,323 +2030,6 @@ fn render_interface_ctor(out: &mut String, i: &InterfaceBinding, f: &FnBinding, 
     out.push_str(&w.finish());
 }
 
-fn render_struct_getter(out: &mut String, field: &FieldBinding) {
-    let prop_name = field.name.to_upper_camel_case();
-    render_field_getter(out, &prop_name, field);
-}
-
-/// Emit a `public {T} {prop_name} { get { ... } }` property reading one C
-/// getter (`field.getter_symbol`) over the implicit `_handle`, applying the
-/// marshal-and-free convention each field type requires. Shared by struct field
-/// getters and rich-enum per-variant accessors (which pass a variant-namespaced
-/// `prop_name`), so both project associated data identically.
-fn render_field_getter(out: &mut String, prop_name: &str, field: &FieldBinding) {
-    let getter_sym = &field.getter_symbol;
-    let cs = cs_type(&field.ty);
-
-    let mut w = CodeWriter::four_space().with_depth(2);
-    writer_doc(&mut w, &field.doc);
-    w.line(format!("public {cs} {prop_name}"));
-    w.line("{");
-    w.indent();
-    w.line("get");
-    w.line("{");
-    w.indent();
-
-    match &field.ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Handle => {
-            w.line(format!("return NativeMethods.{getter_sym}(_handle);"));
-        }
-        TypeRef::TypedHandle(name) => {
-            let cn = local_type_name(name);
-            w.line(format!(
-                "return new {cn}(NativeMethods.{getter_sym}(_handle));"
-            ));
-        }
-        TypeRef::Bool => {
-            w.line(format!("return NativeMethods.{getter_sym}(_handle) != 0;"));
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("var ptr = NativeMethods.{getter_sym}(_handle);"));
-            w.line("var str = WeaveFFIHelpers.PtrToString(ptr);");
-            w.line("NativeMethods.weaveffi_free_string(ptr);");
-            w.line("return str ?? \"\";");
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line(format!(
-                "var ptr = NativeMethods.{getter_sym}(_handle, out var len);"
-            ));
-            w.line("if (ptr == IntPtr.Zero) return Array.Empty<byte>();");
-            w.line("var arr = new byte[(int)len];");
-            w.line("Marshal.Copy(ptr, arr, 0, (int)len);");
-            w.line("NativeMethods.weaveffi_free_bytes(ptr, len);");
-            w.line("return arr;");
-        }
-        TypeRef::Enum(name) => {
-            // A cross-module enum (e.g. `graphics.Unit`) is emitted as the bare
-            // top-level C# type `Unit`; the cast must use that local name, not
-            // the qualified IR name (there is no `graphics` namespace).
-            let cn = local_type_name(name);
-            w.line(format!("return ({cn})NativeMethods.{getter_sym}(_handle);"));
-        }
-        // The getter returns an owned object reference; the wrapper adopts it
-        // and its Dispose() calls the type's destroy symbol.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-            let cn = local_type_name(name);
-            w.line(format!(
-                "return new {cn}(NativeMethods.{getter_sym}(_handle));"
-            ));
-        }
-        TypeRef::Optional(inner)
-            if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes) =>
-        {
-            w.line(format!(
-                "var ptr = NativeMethods.{getter_sym}(_handle, out var len);"
-            ));
-            w.line("if (ptr == IntPtr.Zero) return null;");
-            w.line("var arr = new byte[(int)len];");
-            w.line("Marshal.Copy(ptr, arr, 0, (int)len);");
-            w.line("NativeMethods.weaveffi_free_bytes(ptr, len);");
-            w.line("return arr;");
-        }
-        TypeRef::Optional(inner) => {
-            w.line(format!("var ptr = NativeMethods.{getter_sym}(_handle);"));
-            match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line("var str = WeaveFFIHelpers.PtrToString(ptr);");
-                    w.line("NativeMethods.weaveffi_free_string(ptr);");
-                    w.line("return str;");
-                }
-                // Owned object pointer, adopted by its wrapper.
-                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-                    let cn = local_type_name(name);
-                    w.line(format!("return ptr == IntPtr.Zero ? null : new {cn}(ptr);"));
-                }
-                other => {
-                    // A producer-boxed scalar: dereference, then release the
-                    // box (the `ReturnFree::BoxedScalar` contract).
-                    let Some((read, size)) = boxed_scalar_read(other, "ptr") else {
-                        unreachable!("unsupported optional field type");
-                    };
-                    w.line("if (ptr == IntPtr.Zero) return null;");
-                    w.line(format!("var value = {read};"));
-                    w.line(format!(
-                        "NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr){size});"
-                    ));
-                    w.line("return value;");
-                }
-            }
-        }
-        TypeRef::List(inner) => {
-            w.line(format!(
-                "var ptr = NativeMethods.{getter_sym}(_handle, out var len);"
-            ));
-            let mut tmp = String::new();
-            render_list_unmarshal(&mut tmp, inner, "                ");
-            w.raw(tmp);
-        }
-        TypeRef::Map(k, v) => {
-            w.line(format!(
-                "NativeMethods.{getter_sym}(_handle, out var outKeys, out var outValues, out var outLen);"
-            ));
-            let mut tmp = String::new();
-            render_map_decode(
-                &mut tmp,
-                k,
-                v,
-                "outKeys",
-                "outValues",
-                "outLen",
-                "                ",
-            );
-            w.raw(tmp);
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as struct field"),
-        // The getter returns an owned reference; the wrapper owns and
-        // disposes it like any interface return.
-        TypeRef::Interface(name) => {
-            let cn = local_type_name(name);
-            w.line(format!(
-                "return new {cn}(NativeMethods.{getter_sym}(_handle));"
-            ));
-        }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-
-    w.dedent();
-    w.line("}");
-    w.dedent();
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-fn render_list_unmarshal(out: &mut String, inner: &TypeRef, indent: &str) {
-    render_list_decode(out, inner, "ptr", "len", indent);
-}
-
-/// The C# expression dereferencing one producer-boxed optional scalar of type
-/// `inner` through `ptr`, paired with the box's size in bytes (the argument
-/// to the `weaveffi_free_bytes` release the `ReturnFree::BoxedScalar` plan
-/// requires). Returns `None` for non-scalar inners, which are pointer
-/// optionals and reuse the inner type's return plan.
-fn boxed_scalar_read(inner: &TypeRef, ptr: &str) -> Option<(String, &'static str)> {
-    Some(match inner {
-        TypeRef::I8 => (format!("(sbyte)Marshal.ReadByte({ptr})"), "1"),
-        TypeRef::U8 => (format!("Marshal.ReadByte({ptr})"), "1"),
-        TypeRef::I16 => (format!("Marshal.ReadInt16({ptr})"), "2"),
-        TypeRef::U16 => (format!("(ushort)Marshal.ReadInt16({ptr})"), "2"),
-        TypeRef::I32 => (format!("Marshal.ReadInt32({ptr})"), "4"),
-        TypeRef::U32 => (format!("(uint)Marshal.ReadInt32({ptr})"), "4"),
-        TypeRef::I64 => (format!("Marshal.ReadInt64({ptr})"), "8"),
-        TypeRef::U64 | TypeRef::Handle => (format!("(ulong)Marshal.ReadInt64({ptr})"), "8"),
-        TypeRef::F32 => (
-            format!("BitConverter.Int32BitsToSingle(Marshal.ReadInt32({ptr}))"),
-            "4",
-        ),
-        TypeRef::F64 => (
-            format!("BitConverter.Int64BitsToDouble(Marshal.ReadInt64({ptr}))"),
-            "8",
-        ),
-        // C `bool` is one byte.
-        TypeRef::Bool => (format!("Marshal.ReadByte({ptr}) != 0"), "1"),
-        TypeRef::Enum(name) => (
-            format!("({})Marshal.ReadInt32({ptr})", local_type_name(name)),
-            "4",
-        ),
-        _ => return None,
-    })
-}
-
-/// The size in bytes of one C array slot holding an element of type `ty`, as
-/// a C# expression. Used to release producer-allocated array and map buffers
-/// with `weaveffi_free_bytes(ptr, len * slot_size)`, the `ReturnFree::Array`
-/// and `ReturnFree::MapBuffers` contract.
-fn cs_elem_size(ty: &TypeRef) -> &'static str {
-    match ty {
-        TypeRef::I8 | TypeRef::U8 | TypeRef::Bool => "1",
-        TypeRef::I16 | TypeRef::U16 => "2",
-        TypeRef::I32 | TypeRef::U32 | TypeRef::F32 | TypeRef::Enum(_) => "4",
-        TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => "8",
-        // Optional pointer elements occupy one pointer slot (null = none).
-        TypeRef::Optional(inner) => cs_elem_size(inner),
-        // Strings, records, rich enums, interfaces, and typed handles are all
-        // pointer slots.
-        _ => "IntPtr.Size",
-    }
-}
-
-/// Emit the statements reading element `idx` of the producer-owned buffer
-/// `arr` into a local named `var`, honoring the per-element release contract
-/// (`ElemFree`): string elements are copied and then freed with
-/// `weaveffi_free_string`; record/rich-enum/interface elements are adopted by
-/// their wrapper (whose `Dispose` calls the destroy symbol); by-value
-/// elements copy with nothing to free.
-fn render_owned_element_read(w: &mut CodeWriter, ty: &TypeRef, arr: &str, idx: &str, var: &str) {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!(
-                "var {var}Ptr = Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size);"
-            ));
-            w.line(format!(
-                "var {var} = Marshal.PtrToStringUTF8({var}Ptr) ?? \"\";"
-            ));
-            w.line(format!("NativeMethods.weaveffi_free_string({var}Ptr);"));
-        }
-        _ => {
-            w.line(format!(
-                "var {var} = {};",
-                marshal_read_element(ty, arr, idx)
-            ));
-        }
-    }
-}
-
-/// Emit the `weaveffi_free_bytes` release of a producer-allocated array
-/// buffer of `len` elements of type `elem` based at `base`, after every
-/// element has been copied out (and string elements individually freed).
-fn write_buffer_free(w: &mut CodeWriter, base: &str, len: &str, elem: &TypeRef) {
-    w.line(format!(
-        "NativeMethods.weaveffi_free_bytes({base}, (UIntPtr)((int){len} * {}));",
-        cs_elem_size(elem)
-    ));
-}
-
-/// Decodes a producer-owned C array (`base` + `len`) into a managed `T[]`,
-/// releases the producer's allocations (each string element via
-/// `weaveffi_free_string`, then the array buffer via `weaveffi_free_bytes`),
-/// and returns the copy. Object elements are adopted by their wrappers rather
-/// than freed. Blittable scalars bulk-copy before the buffer release.
-fn render_list_decode(out: &mut String, inner: &TypeRef, base: &str, len: &str, indent: &str) {
-    let elem = cs_type(inner);
-    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    w.line(format!(
-        "if ({base} == IntPtr.Zero) return Array.Empty<{elem}>();"
-    ));
-    w.line(format!("var arr = new {elem}[(int){len}];"));
-    match inner {
-        TypeRef::I32 | TypeRef::I64 | TypeRef::F64 => {
-            w.line(format!("Marshal.Copy({base}, arr, 0, (int){len});"));
-        }
-        _ => {
-            w.line(format!("for (int i = 0; i < (int){len}; i++)"));
-            w.block("{", "}", |w| {
-                render_owned_element_read(w, inner, base, "i", "item");
-                w.line("arr[i] = item;");
-            });
-        }
-    }
-    write_buffer_free(&mut w, base, len, inner);
-    w.line("return arr;");
-    out.push_str(&w.finish());
-}
-
-/// Decodes a producer-owned map return (parallel `keys`/`values` buffers of
-/// `len` entries) into a `Dictionary`, freeing each string key/value after
-/// copying and then releasing both parallel buffers with
-/// `weaveffi_free_bytes` (the `ReturnFree::MapBuffers` contract), and
-/// returns the copy.
-fn render_map_decode(
-    out: &mut String,
-    k: &TypeRef,
-    v: &TypeRef,
-    keys: &str,
-    values: &str,
-    len: &str,
-    indent: &str,
-) {
-    let k_cs = cs_type(k);
-    let v_cs = cs_type(v);
-    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
-    w.line(format!(
-        "if ({keys} != IntPtr.Zero && {values} != IntPtr.Zero)"
-    ));
-    w.block("{", "}", |w| {
-        w.line(format!("for (int i = 0; i < (int){len}; i++)"));
-        w.block("{", "}", |w| {
-            render_owned_element_read(w, k, keys, "i", "key");
-            render_owned_element_read(w, v, values, "i", "value");
-            w.line("dict[key] = value;");
-        });
-        write_buffer_free(w, keys, len, k);
-        write_buffer_free(w, values, len, v);
-    });
-    w.line("return dict;");
-    out.push_str(&w.finish());
-}
-
 fn render_native_methods(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.line("internal static class NativeMethods");
@@ -1825,23 +2043,14 @@ fn render_native_methods(out: &mut String, model: &BindingModel) {
     w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
     w.line("internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);");
     w.blank();
+    w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
+    w.line("internal static extern void weaveffi_error_clear(ref WeaveFFIError err);");
+    w.blank();
     w.dedent();
 
+    // Records and rich enums are value types with no C symbols, so only
+    // interfaces, callbacks, listeners, and functions declare P/Invokes.
     for m in &model.modules {
-        for e in &m.enums {
-            // Plain enums lower by value and need no P/Invoke; rich enums need
-            // the opaque-object symbol set (tag, destroy, per-variant new/get).
-            if e.is_rich() {
-                let mut tmp = String::new();
-                render_rich_enum_pinvoke(&mut tmp, e);
-                w.raw(tmp);
-            }
-        }
-        for s in &m.structs {
-            let mut tmp = String::new();
-            render_struct_pinvoke(&mut tmp, s);
-            w.raw(tmp);
-        }
         for i in &m.interfaces {
             let mut tmp = String::new();
             render_interface_pinvoke(&mut tmp, i);
@@ -1909,124 +2118,6 @@ fn render_listener_pinvoke(out: &mut String, l: &ListenerBinding) {
         "internal static extern void {unregister_sym}(ulong id);"
     ));
     w.blank();
-    out.push_str(&w.finish());
-}
-
-fn render_struct_pinvoke(out: &mut String, s: &StructBinding) {
-    let create_sym = &s.create.symbol;
-    let destroy_sym = &s.destroy_symbol;
-
-    let mut create_params: Vec<String> = s
-        .fields
-        .iter()
-        .flat_map(|f| {
-            let p = ParamBinding {
-                name: f.name.clone(),
-                ty: f.ty.clone(),
-                mutable: false,
-                doc: f.doc.clone(),
-                abi: Vec::new(),
-            };
-            pinvoke_param_list(&p)
-        })
-        .collect();
-    create_params.push("ref WeaveFFIError err".into());
-
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line(format!(
-        "[DllImport(LibName, EntryPoint = \"{create_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-    ));
-    w.line(format!(
-        "internal static extern IntPtr {create_sym}({});",
-        create_params.join(", ")
-    ));
-    w.blank();
-
-    w.line(format!(
-        "[DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-    ));
-    w.line(format!(
-        "internal static extern void {destroy_sym}(IntPtr ptr);"
-    ));
-    w.blank();
-
-    for field in &s.fields {
-        let getter_sym = &field.getter_symbol;
-        let (ret_type, extra_params) = pinvoke_return_info(&field.ty);
-
-        w.line(format!(
-            "[DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-        ));
-        let mut params = vec!["IntPtr ptr".into()];
-        params.extend(extra_params);
-        w.line(format!(
-            "internal static extern {ret_type} {getter_sym}({});",
-            params.join(", ")
-        ));
-        w.blank();
-    }
-    out.push_str(&w.finish());
-}
-
-/// Emit the `[DllImport]` set backing a rich (algebraic) enum, mirroring
-/// `render_struct_pinvoke`: the `_tag` reader, the `_destroy`, and per variant a
-/// `_{V}_new` constructor (field slots + `ref err`, returns the opaque `IntPtr`)
-/// plus a `_{V}_get_{f}` getter per field (return/extra slots lowered exactly
-/// like struct field getters: string -> `IntPtr`, bytes/list add `out UIntPtr`).
-fn render_rich_enum_pinvoke(out: &mut String, e: &EnumBinding) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
-
-    let mut w = CodeWriter::four_space().with_depth(2);
-    let tag_sym = &rich.tag_symbol;
-    w.line(format!(
-        "[DllImport(LibName, EntryPoint = \"{tag_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-    ));
-    w.line(format!("internal static extern int {tag_sym}(IntPtr ptr);"));
-    w.blank();
-
-    let destroy_sym = &rich.destroy_symbol;
-    w.line(format!(
-        "[DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-    ));
-    w.line(format!(
-        "internal static extern void {destroy_sym}(IntPtr ptr);"
-    ));
-    w.blank();
-
-    for v in &rich.variants {
-        let new_sym = &v.create.symbol;
-        let mut new_params: Vec<String> = v
-            .fields
-            .iter()
-            .flat_map(|f| pinvoke_param_list(&field_as_param(f)))
-            .collect();
-        new_params.push("ref WeaveFFIError err".into());
-        w.line(format!(
-            "[DllImport(LibName, EntryPoint = \"{new_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-        ));
-        w.line(format!(
-            "internal static extern IntPtr {new_sym}({});",
-            new_params.join(", ")
-        ));
-        w.blank();
-
-        for f in &v.fields {
-            let getter_sym = &f.getter_symbol;
-            let (ret_type, extra_params) = pinvoke_return_info(&f.ty);
-            w.line(format!(
-                "[DllImport(LibName, EntryPoint = \"{getter_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-            ));
-            let mut params = vec!["IntPtr ptr".into()];
-            params.extend(extra_params);
-            w.line(format!(
-                "internal static extern {ret_type} {getter_sym}({});",
-                params.join(", ")
-            ));
-            w.blank();
-        }
-    }
     out.push_str(&w.finish());
 }
 
@@ -2159,15 +2250,17 @@ fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
     out.push_str(&w.finish());
 }
 
+/// True when an async result crosses the completion callback as a borrowed
+/// `ptr` + `len` pair: bytes and every buffered type (records, rich enums,
+/// lists, maps, and non-interface optionals).
+fn async_result_is_ptr_len(ty: &TypeRef) -> bool {
+    matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes) || abi::is_buffered(ty)
+}
+
 fn async_cb_delegate_result_params(ret: &Option<TypeRef>) -> String {
     match ret {
         None => String::new(),
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)) => {
-            ", IntPtr result, UIntPtr resultLen".into()
-        }
-        Some(TypeRef::Map(_, _)) => {
-            ", IntPtr resultKeys, IntPtr resultValues, UIntPtr resultLen".into()
-        }
+        Some(ty) if async_result_is_ptr_len(ty) => ", IntPtr result, UIntPtr resultLen".into(),
         Some(ty) => format!(", {} result", pinvoke_type(ty)),
     }
 }
@@ -2175,10 +2268,7 @@ fn async_cb_delegate_result_params(ret: &Option<TypeRef>) -> String {
 fn async_cb_lambda_params(ret: &Option<TypeRef>) -> &'static str {
     match ret {
         None => "(context, err)",
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Iterator(_)) => {
-            "(context, err, result, resultLen)"
-        }
-        Some(TypeRef::Map(_, _)) => "(context, err, resultKeys, resultValues, resultLen)",
+        Some(ty) if async_result_is_ptr_len(ty) => "(context, err, result, resultLen)",
         Some(_) => "(context, err, result)",
     }
 }
@@ -2219,10 +2309,24 @@ fn render_async_function_pinvoke(out: &mut String, f: &FnBinding) {
 
 /// Statements (appended to `out`) plus the expression converting one callback
 /// parameter's delegate slots into the value handed to the user callback.
+/// Buffered parameters arrive as a borrowed `ptr` + `len` pair valid only for
+/// the dispatch, so the bytes are copied and decoded before the user's
+/// delegate runs, and never freed here.
 fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -> String {
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = safe_cs_name(&slots[0].name);
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    if abi::is_buffered(&p.ty) {
+        let len = safe_cs_name(&slots[1].name);
+        let arg = format!("arg{idx}");
+        w.line(format!("var {arg}Buf = new byte[(int){len}];"));
+        w.line(format!(
+            "if ({n0} != IntPtr.Zero && (int){len} > 0) Marshal.Copy({n0}, {arg}Buf, 0, (int){len});"
+        ));
+        emit_buffer_decode(&mut w, &p.ty, &arg, &format!("{arg}Buf"));
+        out.push_str(&w.finish());
+        return arg;
+    }
     let expr = match &p.ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2249,117 +2353,26 @@ fn render_cb_arg(out: &mut String, p: &ParamBinding, idx: usize, indent: &str) -
             ));
             arg
         }
+        TypeRef::TypedHandle(name) => {
+            format!("new {}({n0})", typed_handle_cs(name))
+        }
         // Borrowed for the duration of the callback; the consumer must not
         // Dispose() the wrapper.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            format!("new {}({n0})", local_type_name(name))
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                format!("Marshal.PtrToStringUTF8({n0})")
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let len = safe_cs_name(&slots[1].name);
-                let arg = format!("arg{idx}");
-                w.line(format!("byte[]? {arg} = null;"));
-                w.line(format!("if ({n0} != IntPtr.Zero)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{arg} = new byte[(int){len}];"));
-                    w.line(format!(
-                        "if ((int){len} > 0) Marshal.Copy({n0}, {arg}, 0, (int){len});"
-                    ));
-                });
-                arg
-            }
-            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-                let cn = local_type_name(name);
-                format!("{n0} == IntPtr.Zero ? null : new {cn}({n0})")
-            }
-            TypeRef::I32 => format!("{n0} == IntPtr.Zero ? (int?)null : Marshal.ReadInt32({n0})"),
-            TypeRef::U32 => format!(
-                "{n0} == IntPtr.Zero ? (uint?)null : (uint)Marshal.ReadInt32({n0})"
-            ),
-            TypeRef::I64 => {
-                format!("{n0} == IntPtr.Zero ? (long?)null : Marshal.ReadInt64({n0})")
-            }
-            TypeRef::Handle => format!(
-                "{n0} == IntPtr.Zero ? (ulong?)null : (ulong)Marshal.ReadInt64({n0})"
-            ),
-            TypeRef::F64 => format!(
-                "{n0} == IntPtr.Zero ? (double?)null : BitConverter.Int64BitsToDouble(Marshal.ReadInt64({n0}))"
-            ),
-            TypeRef::I8 => {
-                format!("{n0} == IntPtr.Zero ? (sbyte?)null : (sbyte)Marshal.ReadByte({n0})")
-            }
-            TypeRef::U8 => {
-                format!("{n0} == IntPtr.Zero ? (byte?)null : (byte)Marshal.ReadByte({n0})")
-            }
-            TypeRef::I16 => {
-                format!("{n0} == IntPtr.Zero ? (short?)null : Marshal.ReadInt16({n0})")
-            }
-            TypeRef::U16 => format!(
-                "{n0} == IntPtr.Zero ? (ushort?)null : (ushort)Marshal.ReadInt16({n0})"
-            ),
-            TypeRef::U64 => format!(
-                "{n0} == IntPtr.Zero ? (ulong?)null : (ulong)Marshal.ReadInt64({n0})"
-            ),
-            TypeRef::F32 => format!(
-                "{n0} == IntPtr.Zero ? (float?)null : BitConverter.Int32BitsToSingle(Marshal.ReadInt32({n0}))"
-            ),
-            TypeRef::Bool => {
-                format!("{n0} == IntPtr.Zero ? (bool?)null : Marshal.ReadByte({n0}) != 0")
-            }
-            TypeRef::Enum(name) => {
-                let cn = local_type_name(name);
-                format!("{n0} == IntPtr.Zero ? ({cn}?)null : ({cn})Marshal.ReadInt32({n0})")
-            }
-            _ => "default".into(),
-        },
-        TypeRef::List(inner) => {
-            let len = safe_cs_name(&slots[1].name);
-            let arg = format!("arg{idx}");
-            let elem = cs_type(inner);
-            w.line(format!("var {arg} = new {elem}[(int){len}];"));
-            w.line(format!("if ({n0} != IntPtr.Zero)"));
-            w.block("{", "}", |w| {
-                w.line(format!("for (int i = 0; i < (int){len}; i++)"));
-                w.block("{", "}", |w| {
-                    w.line(format!(
-                        "{arg}[i] = {};",
-                        marshal_read_element(inner, &n0, "i")
-                    ));
-                });
-            });
-            arg
-        }
-        TypeRef::Map(k, v) => {
-            let keys = safe_cs_name(&slots[0].name);
-            let vals = safe_cs_name(&slots[1].name);
-            let len = safe_cs_name(&slots[2].name);
-            let arg = format!("arg{idx}");
-            let (k_cs, v_cs) = (cs_type(k), cs_type(v));
-            w.line(format!("var {arg} = new Dictionary<{k_cs}, {v_cs}>();"));
-            w.line(format!(
-                "if ({keys} != IntPtr.Zero && {vals} != IntPtr.Zero)"
-            ));
-            w.block("{", "}", |w| {
-                w.line(format!("for (int i = 0; i < (int){len}; i++)"));
-                w.block("{", "}", |w| {
-                    w.line(format!(
-                        "{arg}[{}] = {};",
-                        marshal_read_element(k, &keys, "i"),
-                        marshal_read_element(v, &vals, "i")
-                    ));
-                });
-            });
-            arg
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
-        // Borrowed for the duration of the callback, like record parameters;
-        // the consumer must not Dispose() the wrapper.
         TypeRef::Interface(name) => {
             format!("new {}({n0})", local_type_name(name))
         }
+        // Only `Interface?` reaches here: every other optional is buffered.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(name) => {
+                let cn = local_type_name(name);
+                format!("{n0} == IntPtr.Zero ? null : new {cn}({n0})")
+            }
+            _ => unreachable!("non-interface optionals are buffered"),
+        },
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered callback parameter handled above")
+        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     };
     out.push_str(&w.finish());
@@ -2508,34 +2521,14 @@ fn render_wrapper_class(out: &mut String, mb: &ModuleBinding, strip_module_prefi
     out.push_str("    }\n\n");
 }
 
+/// True when a parameter needs setup/cleanup statements around the native
+/// call: strings (`CoTaskMem` UTF-8 copies), bytes (pinned arrays), and every
+/// buffered type (encoded into a pinned value buffer).
 fn param_needs_marshal(ty: &TypeRef) -> bool {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            true
-        }
-        TypeRef::List(_) | TypeRef::Map(_, _) => true,
-        TypeRef::Optional(inner) => matches!(
-            inner.as_ref(),
-            TypeRef::StringUtf8
-                | TypeRef::BorrowedStr
-                | TypeRef::Bytes
-                | TypeRef::BorrowedBytes
-                | TypeRef::I8
-                | TypeRef::I16
-                | TypeRef::I32
-                | TypeRef::U8
-                | TypeRef::U16
-                | TypeRef::U32
-                | TypeRef::I64
-                | TypeRef::U64
-                | TypeRef::F32
-                | TypeRef::F64
-                | TypeRef::Bool
-                | TypeRef::Handle
-                | TypeRef::Enum(_)
-        ),
-        _ => false,
-    }
+    matches!(
+        ty,
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes
+    ) || abi::is_buffered(ty)
 }
 
 /// Render one wrapper method (any shape) named `method_name`. `self_expr` is
@@ -2617,10 +2610,20 @@ fn render_wrapper_method(
 }
 
 /// The statements converting one `_next` out-item into the yielded C# value,
-/// freeing any producer-allocated memory along the way. Returns the expression
-/// to `yield return`.
+/// freeing any producer-allocated memory along the way (`ElemFree::String`
+/// via `weaveffi_free_string`, `ElemFree::Bytes` via `weaveffi_free_bytes`
+/// for both bytes and buffered elements). Returns the expression to
+/// `yield return`.
 fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> String {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    if abi::is_buffered(elem) {
+        w.line("var itemBuf = new byte[(int)out_len];");
+        w.line("if (out_item != IntPtr.Zero && (int)out_len > 0) Marshal.Copy(out_item, itemBuf, 0, (int)out_len);");
+        w.line("NativeMethods.weaveffi_free_bytes(out_item, out_len);");
+        emit_buffer_decode(&mut w, elem, "item", "itemBuf");
+        out.push_str(&w.finish());
+        return "item".into();
+    }
     let expr = match elem {
         TypeRef::I8
         | TypeRef::I16
@@ -2646,29 +2649,13 @@ fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> S
             w.line("NativeMethods.weaveffi_free_bytes(out_item, out_len);");
             "item".into()
         }
-        // The consumer owns each yielded wrapper; Dispose() destroys it
-        // (`ElemFree::Object`, adopted rather than freed eagerly).
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Interface(name) => {
-            format!("new {}(out_item)", local_type_name(name))
+        TypeRef::TypedHandle(name) => {
+            format!("new {}(out_item)", typed_handle_cs(name))
         }
-        // A null slot is "none"; a non-null slot is an owned object pointer
-        // adopted exactly like the non-optional case.
-        TypeRef::Optional(inner)
-            if matches!(
-                inner.as_ref(),
-                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_)
-            ) =>
-        {
-            let cn = match inner.as_ref() {
-                TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-                    local_type_name(name)
-                }
-                _ => unreachable!(),
-            };
-            format!("out_item == IntPtr.Zero ? null : new {cn}(out_item)")
+        // The consumer owns each yielded wrapper; Dispose() destroys it
+        // (owned-object elements are adopted rather than freed eagerly).
+        TypeRef::Interface(name) => {
+            format!("new {}(out_item)", local_type_name(name))
         }
         other => unreachable!("unsupported iterator element type {other:?}"),
     };
@@ -2888,7 +2875,14 @@ fn render_async_wrapper_method(
                     w.line("if (wErr.Code != 0)");
                     w.line("{");
                     w.scope(|w| {
+                        // The error struct is borrowed for the callback's
+                        // duration (the producer releases it afterward), so
+                        // the message and payload are copied here and the
+                        // error is never cleared by the consumer.
                         w.line("var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";");
+                        if matches!(err, ErrCtx::Domain(_)) {
+                            w.line("var payload = WeaveFFIError.CopyPayload(wErr);");
+                        }
                         w.line(format!("tcs.SetException({});", err.async_exception_expr()));
                         w.line("return;");
                     });
@@ -2991,15 +2985,25 @@ fn render_async_wrapper_method(
 
 /// Emit the statements resolving the `TaskCompletionSource` from the
 /// completion callback's result slots, honoring the `AsyncProtocol` borrowed
-/// results clause: string, bytes, array, and map buffers (and producer-boxed
-/// optional scalars) are owned by the producer and valid only for the
-/// callback's duration, so they are deep-copied here and never freed.
-/// Owned-object results (records, rich enums, interfaces, typed handles) are
-/// the exception: the callback receives ownership and the wrapper adopts the
-/// pointer, as do object pointers inside a list result (its `ElemFree`
-/// plan).
+/// results clause: string, bytes, and buffered result buffers are owned by
+/// the producer and valid only for the callback's duration, so they are
+/// deep-copied (and buffered results decoded) here and never freed.
+/// Owned-object results (interfaces, typed handles) are the exception: the
+/// callback receives ownership and the wrapper adopts the pointer.
 fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    if let Some(ty) = ret {
+        if abi::is_buffered(ty) {
+            w.line("var resultBuf = new byte[(int)resultLen];");
+            w.line(
+                "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, resultBuf, 0, (int)resultLen);",
+            );
+            emit_buffer_decode(&mut w, ty, "value", "resultBuf");
+            w.line("tcs.SetResult(value);");
+            out.push_str(&w.finish());
+            return;
+        }
+    }
     match ret {
         None => {
             w.line("tcs.SetResult(true);");
@@ -3014,12 +3018,11 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(({cn})result);"));
         }
-        Some(
-            TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::TypedHandle(name)
-            | TypeRef::Interface(name),
-        ) => {
+        Some(TypeRef::TypedHandle(name)) => {
+            let cn = typed_handle_cs(name);
+            w.line(format!("tcs.SetResult(new {cn}(result));"));
+        }
+        Some(TypeRef::Interface(name)) => {
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
@@ -3030,64 +3033,15 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
             );
             w.line("tcs.SetResult(arr);");
         }
-        Some(TypeRef::List(inner)) => {
-            let elem = cs_type(inner);
-            w.line(format!("var arr = new {elem}[(int)resultLen];"));
-            w.line("if (result != IntPtr.Zero)");
-            w.block("{", "}", |w| {
-                w.line("for (int i = 0; i < (int)resultLen; i++)");
-                w.block("{", "}", |w| {
-                    w.line(format!(
-                        "arr[i] = {};",
-                        marshal_read_element(inner, "result", "i")
-                    ));
-                });
-            });
-            w.line("tcs.SetResult(arr);");
-        }
-        Some(TypeRef::Map(k, v)) => {
-            let k_cs = cs_type(k);
-            let v_cs = cs_type(v);
-            w.line(format!("var dict = new Dictionary<{k_cs}, {v_cs}>();"));
-            w.line("if (resultKeys != IntPtr.Zero && resultValues != IntPtr.Zero)");
-            w.block("{", "}", |w| {
-                w.line("for (int i = 0; i < (int)resultLen; i++)");
-                w.block("{", "}", |w| {
-                    w.line(format!(
-                        "dict[{}] = {};",
-                        marshal_read_element(k, "resultKeys", "i"),
-                        marshal_read_element(v, "resultValues", "i")
-                    ));
-                });
-            });
-            w.line("tcs.SetResult(dict);");
-        }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
         Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(
-                    "tcs.SetResult(result == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(result));",
-                );
-            }
-            TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::TypedHandle(name)
-            | TypeRef::Interface(name) => {
+            TypeRef::Interface(name) => {
                 let cn = local_type_name(name);
                 w.line(format!(
                     "tcs.SetResult(result == IntPtr.Zero ? null : new {cn}(result));"
                 ));
             }
-            other => {
-                // A producer-boxed scalar, borrowed like every other result
-                // buffer: dereference the copy, leave the box alone.
-                let Some((read, _)) = boxed_scalar_read(other, "result") else {
-                    unreachable!("unsupported optional async result type");
-                };
-                let cs = cs_type(ret.as_ref().unwrap());
-                w.line(format!(
-                    "tcs.SetResult(result == IntPtr.Zero ? ({cs})null : {read});"
-                ));
-            }
+            _ => unreachable!("non-interface optionals are buffered"),
         },
         // Remaining scalars pass by value in the result slot.
         Some(_) => {
@@ -3097,9 +3051,23 @@ fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str
     out.push_str(&w.finish());
 }
 
+/// Emit the setup statements for one parameter before the native call.
+/// Strings copy to `CoTaskMem` UTF-8; bytes pin the managed array; buffered
+/// parameters encode into a `byte[]` value buffer (`{name}Buf`) and pin it
+/// (`{name}Pin`), which the caller owns for the duration of the call.
 fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
     let name = safe_cs_name(&p.name);
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    if abi::is_buffered(&p.ty) {
+        w.line(format!("var {name}Writer = new WeaveFFIBufferWriter();"));
+        emit_buffer_write(&mut w, &p.ty, &name, &format!("{name}Writer"), 0);
+        w.line(format!("var {name}Buf = {name}Writer.ToArray();"));
+        w.line(format!(
+            "var {name}Pin = GCHandle.Alloc({name}Buf, GCHandleType.Pinned);"
+        ));
+        out.push_str(&w.finish());
+        return;
+    }
     match &p.ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!(
@@ -3111,240 +3079,25 @@ fn render_marshal_setup(out: &mut String, p: &ParamBinding, indent: &str) {
                 "var {name}Pin = GCHandle.Alloc({name}, GCHandleType.Pinned);"
             ));
         }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!(
-                    "var {name}Ptr = {name} != null ? Marshal.StringToCoTaskMemUTF8({name}) : IntPtr.Zero;"
-                ));
-            }
-            // A boxed C `bool` is one byte, matching the pointee the
-            // producer dereferences.
-            TypeRef::Bool => {
-                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
-                w.line(format!("if ({name}.HasValue)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(byte));"));
-                    w.line(format!(
-                        "Marshal.WriteByte({name}Ptr, (byte)({name}.Value ? 1 : 0));"
-                    ));
-                });
-            }
-            TypeRef::I32 | TypeRef::Enum(_) | TypeRef::U32 => {
-                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
-                w.line(format!("if ({name}.HasValue)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(int));"));
-                    let val = match inner.as_ref() {
-                        TypeRef::Enum(_) => format!("(int){name}.Value"),
-                        TypeRef::U32 => format!("(int){name}.Value"),
-                        _ => format!("{name}.Value"),
-                    };
-                    w.line(format!("Marshal.WriteInt32({name}Ptr, {val});"));
-                });
-            }
-            TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::F64 => {
-                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
-                w.line(format!("if ({name}.HasValue)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(long));"));
-                    let val = match inner.as_ref() {
-                        TypeRef::Handle => format!("(long){name}.Value"),
-                        TypeRef::U64 => format!("(long){name}.Value"),
-                        TypeRef::F64 => {
-                            format!("BitConverter.DoubleToInt64Bits({name}.Value)")
-                        }
-                        _ => format!("{name}.Value"),
-                    };
-                    w.line(format!("Marshal.WriteInt64({name}Ptr, {val});"));
-                });
-            }
-            TypeRef::I8 | TypeRef::U8 => {
-                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
-                w.line(format!("if ({name}.HasValue)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(byte));"));
-                    w.line(format!("Marshal.WriteByte({name}Ptr, (byte){name}.Value);"));
-                });
-            }
-            TypeRef::I16 | TypeRef::U16 => {
-                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
-                w.line(format!("if ({name}.HasValue)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(short));"));
-                    w.line(format!(
-                        "Marshal.WriteInt16({name}Ptr, (short){name}.Value);"
-                    ));
-                });
-            }
-            TypeRef::F32 => {
-                w.line(format!("var {name}Ptr = IntPtr.Zero;"));
-                w.line(format!("if ({name}.HasValue)"));
-                w.block("{", "}", |w| {
-                    w.line(format!("{name}Ptr = Marshal.AllocHGlobal(sizeof(float));"));
-                    w.line(format!(
-                        "Marshal.WriteInt32({name}Ptr, BitConverter.SingleToInt32Bits({name}.Value));"
-                    ));
-                });
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                w.line(format!(
-                    "var {name}Pin = {name} != null ? GCHandle.Alloc({name}, GCHandleType.Pinned) : default;"
-                ));
-            }
-            _ => {}
-        },
-        TypeRef::List(elem) => {
-            let mut tmp = String::new();
-            render_array_marshal_setup(&mut tmp, &name, &format!("{name}.Length"), elem, indent);
-            w.raw(tmp);
-        }
-        TypeRef::Map(k, v) => {
-            // Parallel key/value arrays in dictionary iteration order.
-            let (k_arr, k_conv) = cs_elem_array_slot(k, "kv.Key");
-            let (v_arr, v_conv) = cs_elem_array_slot(v, "kv.Value");
-            w.line(format!("var {name}KeysArr = new {k_arr}[{name}.Count];"));
-            w.line(format!("var {name}ValsArr = new {v_arr}[{name}.Count];"));
-            w.line(format!("var {name}I = 0;"));
-            w.line(format!("foreach (var kv in {name})"));
-            w.block("{", "}", |w| {
-                w.line(format!("{name}KeysArr[{name}I] = {k_conv};"));
-                w.line(format!("{name}ValsArr[{name}I] = {v_conv};"));
-                w.line(format!("{name}I++;"));
-            });
-            w.line(format!(
-                "var {name}KeysPin = GCHandle.Alloc({name}KeysArr, GCHandleType.Pinned);"
-            ));
-            w.line(format!(
-                "var {name}ValsPin = GCHandle.Alloc({name}ValsArr, GCHandleType.Pinned);"
-            ));
-        }
         _ => {}
     }
     out.push_str(&w.finish());
 }
 
-/// One pinned native array for a list parameter: `{name}Arr` (the converted
-/// element array) and `{name}Pin` (the pin). String elements become
-/// CoTaskMem-allocated UTF-8 pointers freed in cleanup.
-fn render_array_marshal_setup(
-    out: &mut String,
-    name: &str,
-    len_expr: &str,
-    elem: &TypeRef,
-    indent: &str,
-) {
-    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    match elem {
-        // Blittable element arrays pin in place; no conversion copy needed.
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Handle => {
-            w.line(format!("var {name}Arr = {name};"));
-        }
-        _ => {
-            let (arr_ty, conv) = cs_elem_array_slot(elem, &format!("{name}[{name}It]"));
-            w.line(format!("var {name}Arr = new {arr_ty}[{len_expr}];"));
-            w.line(format!(
-                "for (var {name}It = 0; {name}It < {len_expr}; {name}It++) {name}Arr[{name}It] = {conv};"
-            ));
-        }
-    }
-    w.line(format!(
-        "var {name}Pin = GCHandle.Alloc({name}Arr, GCHandleType.Pinned);"
-    ));
-    out.push_str(&w.finish());
-}
-
-/// The native array slot type and per-element conversion expression for one
-/// list/map element.
-fn cs_elem_array_slot(elem: &TypeRef, expr: &str) -> (String, String) {
-    match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
-            "IntPtr".into(),
-            format!("Marshal.StringToCoTaskMemUTF8({expr})"),
-        ),
-        TypeRef::Enum(_) => ("int".into(), format!("(int){expr}")),
-        // C `bool` array slots are one byte each.
-        TypeRef::Bool => ("byte".into(), format!("(byte)({expr} ? 1 : 0)")),
-        TypeRef::I8 => ("sbyte".into(), expr.into()),
-        TypeRef::I16 => ("short".into(), expr.into()),
-        TypeRef::I32 => ("int".into(), expr.into()),
-        TypeRef::U8 => ("byte".into(), expr.into()),
-        TypeRef::U16 => ("ushort".into(), expr.into()),
-        TypeRef::U32 => ("uint".into(), expr.into()),
-        TypeRef::I64 => ("long".into(), expr.into()),
-        TypeRef::U64 => ("ulong".into(), expr.into()),
-        TypeRef::F32 => ("float".into(), expr.into()),
-        TypeRef::F64 => ("double".into(), expr.into()),
-        TypeRef::Handle => ("ulong".into(), expr.into()),
-        // Validation (`UnsupportedElementType`) rejects other element shapes.
-        _ => ("IntPtr".into(), "IntPtr.Zero".into()),
-    }
-}
-
-/// True when the element conversion CoTaskMem-allocates per element (strings),
-/// requiring a matching per-element free in cleanup.
-fn cs_elem_allocates(elem: &TypeRef) -> bool {
-    matches!(elem, TypeRef::StringUtf8 | TypeRef::BorrowedStr)
-}
-
 fn render_marshal_cleanup(out: &mut String, p: &ParamBinding, indent: &str) {
     let name = safe_cs_name(&p.name);
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    if abi::is_buffered(&p.ty) {
+        w.line(format!("{name}Pin.Free();"));
+        out.push_str(&w.finish());
+        return;
+    }
     match &p.ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("Marshal.FreeCoTaskMem({name}Ptr);"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.line(format!("{name}Pin.Free();"));
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!(
-                    "if ({name}Ptr != IntPtr.Zero) Marshal.FreeCoTaskMem({name}Ptr);"
-                ));
-            }
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool
-            | TypeRef::Handle
-            | TypeRef::Enum(_) => {
-                w.line(format!(
-                    "if ({name}Ptr != IntPtr.Zero) Marshal.FreeHGlobal({name}Ptr);"
-                ));
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                w.line(format!("if ({name} != null) {name}Pin.Free();"));
-            }
-            _ => {}
-        },
-        TypeRef::List(elem) => {
-            w.line(format!("{name}Pin.Free();"));
-            if cs_elem_allocates(elem) {
-                w.line(format!(
-                    "foreach (var {name}P in {name}Arr) Marshal.FreeCoTaskMem({name}P);"
-                ));
-            }
-        }
-        TypeRef::Map(k, v) => {
-            w.line(format!("{name}KeysPin.Free();"));
-            w.line(format!("{name}ValsPin.Free();"));
-            if cs_elem_allocates(k) {
-                w.line(format!(
-                    "foreach (var {name}KP in {name}KeysArr) Marshal.FreeCoTaskMem({name}KP);"
-                ));
-            }
-            if cs_elem_allocates(v) {
-                w.line(format!(
-                    "foreach (var {name}VP in {name}ValsArr) Marshal.FreeCoTaskMem({name}VP);"
-                ));
-            }
         }
         _ => {}
     }
@@ -3372,20 +3125,10 @@ fn render_pinvoke_call_and_return(
     let c_sym = &f.c_base;
     let call_args = full_call_args(f, self_expr);
 
-    if let Some(TypeRef::Map(k, v)) = &f.ret {
-        render_map_return_call(out, c_sym, &call_args, k, v, err, indent);
-        return;
-    }
-
+    // Bytes and buffered returns deliver their length through the trailing
+    // `size_t* out_len` slot.
     let has_out_len = f.ret.as_ref().is_some_and(|r| {
-        matches!(
-            r,
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)
-        ) || matches!(
-            r,
-            TypeRef::Optional(inner)
-                if matches!(inner.as_ref(), TypeRef::Bytes | TypeRef::BorrowedBytes)
-        )
+        matches!(r, TypeRef::Bytes | TypeRef::BorrowedBytes) || abi::is_buffered(r)
     });
 
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
@@ -3421,59 +3164,36 @@ fn build_call_args(params: &[ParamBinding]) -> String {
         .iter()
         .flat_map(|p| {
             let name = safe_cs_name(&p.name);
+            // A buffered parameter passes its pinned value buffer as the
+            // borrowed (ptr, len) pair; the caller owns and frees the pin.
+            if abi::is_buffered(&p.ty) {
+                return vec![
+                    format!("{name}Pin.AddrOfPinnedObject()"),
+                    format!("(UIntPtr){name}Buf.Length"),
+                ];
+            }
             match &p.ty {
                 TypeRef::Bool => vec![format!("(byte)({name} ? 1 : 0)")],
                 TypeRef::Enum(_) => vec![format!("(int){name}")],
                 TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("{name}Ptr")],
-                // Object parameters borrow: pass the handle, ownership
+                // A typed handle passes its raw pointer token by value.
+                TypeRef::TypedHandle(_) => vec![format!("{name}.Raw")],
+                // Interface parameters borrow: pass the handle, ownership
                 // stays with the caller's wrapper.
-                TypeRef::Record(_)
-                | TypeRef::RichEnum(_)
-                | TypeRef::TypedHandle(_)
-                | TypeRef::Interface(_) => {
+                TypeRef::Interface(_) => {
                     vec![format!("{name}.Handle")]
                 }
                 TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
                     format!("{name}Pin.AddrOfPinnedObject()"),
                     format!("(UIntPtr){name}.Length"),
                 ],
+                // Only `Interface?` reaches here: a nullable borrowed pointer.
                 TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Record(_)
-                    | TypeRef::RichEnum(_)
-                    | TypeRef::TypedHandle(_)
-                    | TypeRef::Interface(_) => {
+                    TypeRef::Interface(_) => {
                         vec![format!("{name}?.Handle ?? IntPtr.Zero")]
                     }
-                    TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
-                        format!("{name} != null ? {name}Pin.AddrOfPinnedObject() : IntPtr.Zero"),
-                        format!("{name} != null ? (UIntPtr){name}.Length : UIntPtr.Zero"),
-                    ],
-                    TypeRef::StringUtf8
-                    | TypeRef::BorrowedStr
-                    | TypeRef::I8
-                    | TypeRef::I16
-                    | TypeRef::I32
-                    | TypeRef::U8
-                    | TypeRef::U16
-                    | TypeRef::U32
-                    | TypeRef::I64
-                    | TypeRef::U64
-                    | TypeRef::F32
-                    | TypeRef::F64
-                    | TypeRef::Bool
-                    | TypeRef::Handle
-                    | TypeRef::Enum(_) => vec![format!("{name}Ptr")],
-                    _ => vec![name],
+                    _ => unreachable!("non-interface optionals are buffered"),
                 },
-                TypeRef::List(_) => vec![
-                    format!("{name}.Length == 0 ? IntPtr.Zero : {name}Pin.AddrOfPinnedObject()"),
-                    format!("(UIntPtr){name}.Length"),
-                ],
-                TypeRef::Map(_, _) => vec![
-                    format!("{name}.Count == 0 ? IntPtr.Zero : {name}KeysPin.AddrOfPinnedObject()"),
-                    format!("{name}.Count == 0 ? IntPtr.Zero : {name}ValsPin.AddrOfPinnedObject()"),
-                    format!("(UIntPtr){name}.Count"),
-                ],
                 _ => vec![name],
             }
         })
@@ -3483,6 +3203,19 @@ fn build_call_args(params: &[ParamBinding]) -> String {
 
 fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
+    // A buffered return is a producer-allocated value buffer: copy the bytes,
+    // release them with `weaveffi_free_bytes`, then decode the copy.
+    if abi::is_buffered(ty) {
+        w.line("var resultBuf = new byte[(int)outLen];");
+        w.line(
+            "if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);",
+        );
+        w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
+        emit_buffer_decode(&mut w, ty, "value", "resultBuf");
+        w.line("return value;");
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::Bool => {
             w.line("return result != 0;");
@@ -3490,24 +3223,18 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line("var str = Marshal.PtrToStringUTF8(result);");
             w.line("NativeMethods.weaveffi_free_string(result);");
-            w.line("return str;");
+            w.line("return str ?? \"\";");
         }
         TypeRef::Enum(name) => {
             let cn = local_type_name(name);
             w.line(format!("return ({cn})result;"));
         }
-        // An owned object return (`ReturnFree::OwnedObject`): the wrapper
-        // adopts the pointer and its Dispose() calls the destroy symbol.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-            let cn = local_type_name(name);
-            w.line(format!("return new {cn}(result);"));
-        }
         TypeRef::TypedHandle(name) => {
-            let cn = local_type_name(name);
+            let cn = typed_handle_cs(name);
             w.line(format!("return new {cn}(result);"));
         }
-        // An interface return transfers ownership: wrap the pointer in a new
-        // instance whose Dispose() releases it.
+        // An interface return transfers ownership (`ReturnFree::OwnedObject`):
+        // wrap the pointer in a new instance whose Dispose() releases it.
         TypeRef::Interface(name) => {
             let cn = local_type_name(name);
             w.line(format!("return new {cn}(result);"));
@@ -3519,168 +3246,25 @@ fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
             w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
             w.line("return arr;");
         }
-        TypeRef::Optional(inner) => {
-            out.push_str(&w.finish());
-            render_optional_return_conversion(out, inner, indent);
-            return;
-        }
-        TypeRef::List(inner) => {
-            out.push_str(&w.finish());
-            render_list_return(out, inner, indent);
-            return;
-        }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(name) => {
+                let cn = local_type_name(name);
+                w.line(format!(
+                    "return result == IntPtr.Zero ? null : new {cn}(result);"
+                ));
+            }
+            _ => unreachable!("non-interface optionals are buffered"),
+        },
         TypeRef::Iterator(_) => unreachable!("iterator functions render via CallShape::Iterator"),
-        TypeRef::Map(_, _) => {}
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered return handled above")
+        }
         _ => {
             w.line("return result;");
         }
     }
     out.push_str(&w.finish());
-}
-
-/// Renders an `T?` return: null pointer means none; pointer optionals reuse
-/// the inner type's plan (owned strings and buffers freed after copying,
-/// object pointers adopted); scalar optionals are producer-boxed
-/// (`ReturnFree::BoxedScalar`), so the box is dereferenced and then released
-/// with `weaveffi_free_bytes`.
-fn render_optional_return_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
-    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("var str = Marshal.PtrToStringUTF8(result);");
-            w.line("NativeMethods.weaveffi_free_string(result);");
-            w.line("return str;");
-        }
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Interface(name)
-        | TypeRef::TypedHandle(name) => {
-            let cn = local_type_name(name);
-            w.line(format!(
-                "return result == IntPtr.Zero ? null : new {cn}(result);"
-            ));
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line("var arr = new byte[(int)outLen];");
-            w.line("Marshal.Copy(result, arr, 0, (int)outLen);");
-            w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
-            w.line("return arr;");
-        }
-        other => {
-            let Some((read, size)) = boxed_scalar_read(other, "result") else {
-                unreachable!("unsupported optional return type");
-            };
-            w.line("if (result == IntPtr.Zero) return null;");
-            w.line(format!("var value = {read};"));
-            w.line(format!(
-                "NativeMethods.weaveffi_free_bytes(result, (UIntPtr){size});"
-            ));
-            w.line("return value;");
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn render_list_return(out: &mut String, inner: &TypeRef, indent: &str) {
-    render_list_decode(out, inner, "result", "outLen", indent);
-}
-
-fn render_map_return_call(
-    out: &mut String,
-    c_sym: &str,
-    call_args: &str,
-    k: &TypeRef,
-    v: &TypeRef,
-    err: ErrCtx,
-    indent: &str,
-) {
-    let args_part = if call_args.is_empty() {
-        String::new()
-    } else {
-        format!("{call_args}, ")
-    };
-    let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    w.line(format!(
-        "NativeMethods.{c_sym}({args_part}out var outKeys, out var outValues, out var outLen, ref err);"
-    ));
-    w.line(err.check_stmt());
-    out.push_str(&w.finish());
-    render_map_decode(out, k, v, "outKeys", "outValues", "outLen", indent);
-}
-
-fn marshal_read_element(ty: &TypeRef, arr: &str, idx: &str) -> String {
-    match ty {
-        TypeRef::I8 => format!("(sbyte)Marshal.ReadByte({arr} + {idx} * 1)"),
-        TypeRef::U8 => format!("(byte)Marshal.ReadByte({arr} + {idx} * 1)"),
-        TypeRef::I16 => format!("Marshal.ReadInt16({arr} + {idx} * sizeof(short))"),
-        TypeRef::U16 => {
-            format!("(ushort)Marshal.ReadInt16({arr} + {idx} * sizeof(short))")
-        }
-        TypeRef::I32 => format!("Marshal.ReadInt32({arr} + {idx} * sizeof(int))"),
-        TypeRef::U32 => {
-            format!("(uint)Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
-        }
-        TypeRef::I64 => format!("Marshal.ReadInt64({arr} + {idx} * sizeof(long))"),
-        TypeRef::U64 => {
-            format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
-        }
-        TypeRef::F32 => format!(
-            "BitConverter.Int32BitsToSingle(Marshal.ReadInt32({arr} + {idx} * sizeof(int)))"
-        ),
-        TypeRef::F64 => format!(
-            "BitConverter.Int64BitsToDouble(Marshal.ReadInt64({arr} + {idx} * sizeof(long)))"
-        ),
-        // C `bool` array slots are one byte each.
-        TypeRef::Bool => {
-            format!("Marshal.ReadByte({arr} + {idx} * 1) != 0")
-        }
-        TypeRef::Handle => {
-            format!("(ulong)Marshal.ReadInt64({arr} + {idx} * sizeof(long))")
-        }
-        TypeRef::TypedHandle(name) => {
-            let cn = local_type_name(name);
-            format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!(
-                "Marshal.PtrToStringUTF8(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size)) ?? \"\""
-            )
-        }
-        TypeRef::Enum(name) => {
-            let cn = local_type_name(name);
-            format!("({cn})Marshal.ReadInt32({arr} + {idx} * sizeof(int))")
-        }
-        // Owned object pointer slots, adopted by their wrappers.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::Interface(name) => {
-            let cn = local_type_name(name);
-            format!("new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))")
-        }
-        // An optional pointer element occupies one pointer slot; null = none.
-        // The double read keeps this a single expression.
-        TypeRef::Optional(inner)
-            if matches!(
-                inner.as_ref(),
-                TypeRef::Record(_)
-                    | TypeRef::RichEnum(_)
-                    | TypeRef::Interface(_)
-                    | TypeRef::TypedHandle(_)
-            ) =>
-        {
-            let cn = match inner.as_ref() {
-                TypeRef::Record(name)
-                | TypeRef::RichEnum(name)
-                | TypeRef::Interface(name)
-                | TypeRef::TypedHandle(name) => local_type_name(name),
-                _ => unreachable!(),
-            };
-            format!(
-                "Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size) == IntPtr.Zero ? null : new {cn}(Marshal.ReadIntPtr({arr}, {idx} * IntPtr.Size))"
-            )
-        }
-        other => unreachable!("unsupported element type {other:?}"),
-    }
 }
 
 fn safe_cs_name(name: &str) -> String {
@@ -3793,7 +3377,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -3943,9 +3527,9 @@ mod tests {
     }
 
     #[test]
-    fn dotnet_builder_generated() {
+    fn dotnet_record_is_plain_value_class() {
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![],
@@ -3966,7 +3550,6 @@ mod tests {
                             default: None,
                         },
                     ],
-                    builder: true,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -3991,31 +3574,37 @@ mod tests {
             .collect();
         assert!(!cs_files.is_empty(), "expected .cs files");
         let cs = std::fs::read_to_string(cs_files[0].path()).unwrap();
+        // A record is a plain sealed data class with typed get-only
+        // properties and a positional constructor; builders are gone.
         assert!(
-            cs.contains("class ContactBuilder"),
-            "missing builder class: {cs}"
-        );
-        assert!(cs.contains("WithName("), "missing WithName: {cs}");
-        assert!(cs.contains("WithAge("), "missing WithAge: {cs}");
-        assert!(cs.contains("Build()"), "missing Build: {cs}");
-        // Build is FFI-backed: it calls the C create symbol, checks the
-        // error, and wraps the returned handle. Unset fields default to zero
-        // values rather than throwing.
-        assert!(
-            cs.contains("NativeMethods.weaveffi_contacts_Contact_create("),
-            "missing create call: {cs}"
+            cs.contains("public sealed class Contact"),
+            "missing record class: {cs}"
         );
         assert!(
-            cs.contains("return new Contact(result);"),
-            "missing handle wrap: {cs}"
+            cs.contains("public string Name { get; }") && cs.contains("public int Age { get; }"),
+            "missing typed properties: {cs}"
         );
         assert!(
-            cs.contains("private string _name = \"\";") && cs.contains("private int _age = 0;"),
-            "missing zero defaults: {cs}"
+            cs.contains("public Contact(string name, int age)"),
+            "missing positional constructor: {cs}"
+        );
+        // The value-buffer pack/unpack pair replaces every C symbol.
+        assert!(
+            cs.contains("internal void WriteTo(WeaveFFIBufferWriter writer)")
+                && cs.contains("internal static Contact ReadFrom(WeaveFFIBufferReader reader)"),
+            "missing pack/unpack pair: {cs}"
         );
         assert!(
-            !cs.contains("NotImplementedException"),
-            "stub must be gone: {cs}"
+            cs.contains("writer.WriteString(Name);") && cs.contains("writer.WriteI32(Age);"),
+            "missing field encoding: {cs}"
+        );
+        assert!(
+            !cs.contains("ContactBuilder") && !cs.contains("weaveffi_contacts_Contact_create"),
+            "builder machinery must be gone: {cs}"
+        );
+        assert!(
+            !cs.contains("class Contact : IDisposable"),
+            "records must not be disposable: {cs}"
         );
     }
 
@@ -4320,7 +3909,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_has_idisposable() {
+    fn struct_is_sealed_value_class_with_doc() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -4341,7 +3930,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4360,20 +3948,21 @@ mod tests {
             "WeaveFFI.cs",
         );
         assert!(
-            cs.contains("public class Contact : IDisposable"),
-            "missing IDisposable: {cs}"
+            cs.contains("public sealed class Contact"),
+            "missing sealed value class: {cs}"
         );
         assert!(
-            cs.contains("private IntPtr _handle"),
-            "missing handle field: {cs}"
-        );
-        assert!(
-            cs.contains("internal Contact(IntPtr handle)"),
-            "missing constructor: {cs}"
+            cs.contains("public Contact(string firstName, int age)"),
+            "missing positional constructor: {cs}"
         );
         assert!(
             cs.contains("<summary>A contact record</summary>"),
             "missing doc: {cs}"
+        );
+        // Records hold no native resources: no handle, no IDisposable.
+        assert!(
+            !cs.contains("Contact : IDisposable") && !cs.contains("internal Contact(IntPtr"),
+            "record must not wrap a handle: {cs}"
         );
     }
 
@@ -4411,7 +4000,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4430,40 +4018,45 @@ mod tests {
             "WeaveFFI.cs",
         );
         assert!(
-            cs.contains("public string FirstName"),
-            "missing FirstName: {cs}"
+            cs.contains("public string FirstName { get; }"),
+            "missing FirstName property: {cs}"
         );
         assert!(
-            cs.contains("NativeMethods.weaveffi_contacts_Contact_get_first_name(_handle)"),
-            "missing getter call: {cs}"
+            cs.contains("public int Age { get; }"),
+            "missing Age property: {cs}"
         );
         assert!(
-            cs.contains("WeaveFFIHelpers.PtrToString(ptr)"),
-            "missing UTF8 unmarshal: {cs}"
+            cs.contains("public bool Active { get; }"),
+            "missing Active property: {cs}"
         );
         assert!(
-            cs.contains("weaveffi_free_string(ptr)"),
-            "missing free_string: {cs}"
+            cs.contains("public Role Role { get; }"),
+            "missing Role property: {cs}"
         );
-        assert!(cs.contains("public int Age"), "missing Age: {cs}");
+        // WriteTo serializes each field per the wire format; ReadFrom is the
+        // exact inverse. No getter symbols cross the ABI anymore.
         assert!(
-            cs.contains("NativeMethods.weaveffi_contacts_Contact_get_age(_handle)"),
-            "missing age getter: {cs}"
+            cs.contains("writer.WriteString(FirstName);")
+                && cs.contains("writer.WriteI32(Age);")
+                && cs.contains("writer.WriteBool(Active);")
+                && cs.contains("writer.WriteI32((int)Role);"),
+            "missing field encodings: {cs}"
         );
-        assert!(cs.contains("public bool Active"), "missing Active: {cs}");
         assert!(
-            cs.contains("weaveffi_contacts_Contact_get_active(_handle) != 0"),
-            "missing bool conversion: {cs}"
+            cs.contains("var fFirstName = reader.ReadString();")
+                && cs.contains("var fAge = reader.ReadI32();")
+                && cs.contains("var fActive = reader.ReadBool();")
+                && cs.contains("var fRole = (Role)reader.ReadI32();"),
+            "missing field decodings: {cs}"
         );
-        assert!(cs.contains("public Role Role"), "missing Role: {cs}");
         assert!(
-            cs.contains("(Role)NativeMethods.weaveffi_contacts_Contact_get_role(_handle)"),
-            "missing enum cast: {cs}"
+            !cs.contains("weaveffi_contacts_Contact_get_first_name"),
+            "getter symbols must be gone: {cs}"
         );
     }
 
     #[test]
-    fn struct_has_dispose_and_finalizer() {
+    fn struct_has_no_dispose_or_finalizer() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -4476,7 +4069,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4494,23 +4086,20 @@ mod tests {
             "weaveffi.yml",
             "WeaveFFI.cs",
         );
+        // A record owns no native memory, so nothing to dispose or finalize.
         assert!(
-            cs.contains("public void Dispose()"),
-            "missing Dispose: {cs}"
+            cs.contains("public sealed class Contact"),
+            "missing record class: {cs}"
         );
         assert!(
-            cs.contains("weaveffi_contacts_Contact_destroy(_handle)"),
-            "missing destroy call: {cs}"
+            !cs.contains("weaveffi_contacts_Contact_destroy"),
+            "destroy symbol must be gone: {cs}"
         );
-        assert!(
-            cs.contains("GC.SuppressFinalize(this)"),
-            "missing SuppressFinalize: {cs}"
-        );
-        assert!(cs.contains("~Contact()"), "missing finalizer: {cs}");
+        assert!(!cs.contains("~Contact()"), "finalizer must be gone: {cs}");
     }
 
     #[test]
-    fn struct_pinvoke_declarations() {
+    fn struct_emits_no_pinvoke_declarations() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -4531,7 +4120,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4549,25 +4137,21 @@ mod tests {
             "weaveffi.yml",
             "WeaveFFI.cs",
         );
+        // Records cross the ABI only inside value buffers, so no per-record
+        // P/Invoke declarations exist. The shared runtime imports remain.
         assert!(
-            cs.contains("weaveffi_contacts_Contact_create("),
-            "missing create P/Invoke: {cs}"
+            !cs.contains("weaveffi_contacts_Contact_"),
+            "record symbols must be gone: {cs}"
         );
         assert!(
-            cs.contains("EntryPoint = \"weaveffi_contacts_Contact_create\""),
-            "missing create entry point: {cs}"
+            cs.contains(
+                "internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);"
+            ),
+            "missing free_bytes runtime import: {cs}"
         );
         assert!(
-            cs.contains("weaveffi_contacts_Contact_destroy(IntPtr ptr)"),
-            "missing destroy P/Invoke: {cs}"
-        );
-        assert!(
-            cs.contains("IntPtr weaveffi_contacts_Contact_get_first_name(IntPtr ptr)"),
-            "missing first_name getter P/Invoke: {cs}"
-        );
-        assert!(
-            cs.contains("int weaveffi_contacts_Contact_get_age(IntPtr ptr)"),
-            "missing age getter P/Invoke: {cs}"
+            cs.contains("internal static extern void weaveffi_error_clear(ref WeaveFFIError err);"),
+            "missing error_clear runtime import: {cs}"
         );
     }
 
@@ -4756,7 +4340,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_return_wraps_in_class() {
+    fn struct_return_decodes_value_buffer() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![Function {
@@ -4793,12 +4377,21 @@ mod tests {
             "WeaveFFI.cs",
         );
         assert!(
-            cs.contains("new Contact(result)"),
-            "missing struct wrapping: {cs}"
-        );
-        assert!(
             cs.contains("public static Contact GetContact(ulong id)"),
             "missing method sig: {cs}"
+        );
+        // A record return arrives as a producer-owned value buffer: the
+        // wrapper copies it, frees it, then decodes the copy.
+        assert!(cs.contains("out var outLen"), "missing outLen slot: {cs}");
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "missing buffer release: {cs}"
+        );
+        assert!(
+            cs.contains("var value = Contact.ReadFrom(valueReader);")
+                && cs.contains("valueReader.ExpectEnd();")
+                && cs.contains("return value;"),
+            "missing buffer decode: {cs}"
         );
     }
 
@@ -4839,15 +4432,17 @@ mod tests {
             "missing list return method: {cs}"
         );
         assert!(cs.contains("out var outLen"), "missing outLen: {cs}");
+        // The list crosses as one value buffer, not parallel arrays: the
+        // wrapper copies it, frees it, then decodes count-prefixed elements.
         assert!(
-            cs.contains("Marshal.Copy(result, arr, 0, (int)outLen)"),
-            "missing Marshal.Copy: {cs}"
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "missing value-buffer release: {cs}"
         );
-        // The producer-owned array buffer is released after the copy
-        // (`ReturnFree::Array`): len * sizeof(int32).
         assert!(
-            cs.contains("NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * 4));"),
-            "missing array buffer release: {cs}"
+            cs.contains("var valueCount = valueReader.ReadLen();")
+                && cs.contains("var value = new int[valueCount];")
+                && cs.contains("var valueItem = valueReader.ReadI32();"),
+            "missing list decode loop: {cs}"
         );
     }
 
@@ -4887,28 +4482,27 @@ mod tests {
             cs.contains("public static Dictionary<int, double> GetScores()"),
             "missing map return: {cs}"
         );
-        assert!(cs.contains("out var outKeys"), "missing outKeys: {cs}");
-        assert!(cs.contains("out var outValues"), "missing outValues: {cs}");
+        // Parallel key/value buffers are gone: the map crosses as one value
+        // buffer decoded as count-prefixed alternating pairs.
         assert!(
-            cs.contains("new Dictionary<int, double>()"),
-            "missing dict creation: {cs}"
-        );
-        // Both producer-owned parallel buffers are released after the copy
-        // (`ReturnFree::MapBuffers`): i32 keys and f64 values.
-        assert!(
-            cs.contains("NativeMethods.weaveffi_free_bytes(outKeys, (UIntPtr)((int)outLen * 4));"),
-            "missing key buffer release: {cs}"
+            !cs.contains("out var outKeys") && !cs.contains("out var outValues"),
+            "parallel buffers must be gone: {cs}"
         );
         assert!(
-            cs.contains(
-                "NativeMethods.weaveffi_free_bytes(outValues, (UIntPtr)((int)outLen * 8));"
-            ),
-            "missing value buffer release: {cs}"
+            cs.contains("var value = new Dictionary<int, double>(valueCount);")
+                && cs.contains("var valueKey = valueReader.ReadI32();")
+                && cs.contains("var valueVal = valueReader.ReadF64();")
+                && cs.contains("value[valueKey] = valueVal;"),
+            "missing map decode loop: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "missing value-buffer release: {cs}"
         );
     }
 
     #[test]
-    fn struct_optional_string_getter() {
+    fn struct_optional_string_field() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -4921,7 +4515,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4940,16 +4533,23 @@ mod tests {
             "WeaveFFI.cs",
         );
         assert!(
-            cs.contains("public string? Email"),
-            "missing optional string getter: {cs}"
+            cs.contains("public string? Email { get; }"),
+            "missing optional string property: {cs}"
+        );
+        // The optional encodes as a flag byte plus the value when present,
+        // and decodes back into a nullable local.
+        assert!(
+            cs.contains("if (Email != null)")
+                && cs.contains("writer.WriteOptionFlag(true);")
+                && cs.contains("writer.WriteString(Email!);")
+                && cs.contains("writer.WriteOptionFlag(false);"),
+            "missing optional encode: {cs}"
         );
         assert!(
-            cs.contains("if (ptr == IntPtr.Zero) return null"),
-            "missing null check: {cs}"
-        );
-        assert!(
-            cs.contains("WeaveFFIHelpers.PtrToString(ptr)"),
-            "missing UTF8 unmarshal: {cs}"
+            cs.contains("string? fEmail = null;")
+                && cs.contains("if (reader.ReadOptionFlag())")
+                && cs.contains("var fEmailValue = reader.ReadString();"),
+            "missing optional decode: {cs}"
         );
     }
 
@@ -4998,22 +4598,29 @@ mod tests {
             "weaveffi.yml",
             "WeaveFFI.cs",
         );
+        // Plain strings still cross as C strings.
         assert!(
             cs.contains("StringToCoTaskMemUTF8(name)"),
             "missing name marshal: {cs}"
         );
         assert!(
-            cs.contains("email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero"),
-            "missing optional string marshal: {cs}"
-        );
-        assert!(
             cs.contains("FreeCoTaskMem(namePtr)"),
             "missing name cleanup: {cs}"
         );
+        // The optional string is buffered: flag byte plus value, pinned and
+        // passed as (ptr, len), then unpinned.
         assert!(
-            cs.contains("emailPtr != IntPtr.Zero"),
-            "missing optional cleanup guard: {cs}"
+            cs.contains("var emailWriter = new WeaveFFIBufferWriter();")
+                && cs.contains("if (email != null)")
+                && cs.contains("emailWriter.WriteOptionFlag(true);")
+                && cs.contains("emailWriter.WriteString(email!);"),
+            "missing optional buffer encode: {cs}"
         );
+        assert!(
+            cs.contains("emailPin.AddrOfPinnedObject(), (UIntPtr)emailBuf.Length"),
+            "missing (ptr, len) call args: {cs}"
+        );
+        assert!(cs.contains("emailPin.Free();"), "missing unpin: {cs}");
     }
 
     #[test]
@@ -5069,7 +4676,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             functions: vec![
                 Function {
@@ -5157,19 +4763,19 @@ mod tests {
         assert!(cs.contains("Personal = 0"));
         assert!(cs.contains("Work = 1"));
 
-        assert!(cs.contains("public class Contact : IDisposable"));
-        assert!(cs.contains("private IntPtr _handle"));
-        assert!(cs.contains("weaveffi_contacts_Contact_destroy(_handle)"));
-        assert!(cs.contains("GC.SuppressFinalize(this)"));
-
-        assert!(cs.contains("public long Id"));
-        assert!(cs.contains("public string FirstName"));
-        assert!(cs.contains("public string? Email"));
-
-        assert!(cs.contains("weaveffi_contacts_Contact_create("));
-        assert!(cs.contains("weaveffi_contacts_Contact_destroy(IntPtr ptr)"));
-        assert!(cs.contains("weaveffi_contacts_Contact_get_id(IntPtr ptr)"));
-        assert!(cs.contains("weaveffi_contacts_Contact_get_first_name(IntPtr ptr)"));
+        // The record is a plain value class with typed properties and the
+        // value-buffer pack/unpack pair; no handle or C symbols remain.
+        assert!(cs.contains("public sealed class Contact"));
+        assert!(cs.contains(
+            "public Contact(long id, string firstName, string? email, ContactType contactType)"
+        ));
+        assert!(cs.contains("public long Id { get; }"));
+        assert!(cs.contains("public string FirstName { get; }"));
+        assert!(cs.contains("public string? Email { get; }"));
+        assert!(cs.contains("public ContactType ContactType { get; }"));
+        assert!(cs.contains("internal void WriteTo(WeaveFFIBufferWriter writer)"));
+        assert!(cs.contains("internal static Contact ReadFrom(WeaveFFIBufferReader reader)"));
+        assert!(!cs.contains("weaveffi_contacts_Contact_"));
 
         assert!(cs.contains("weaveffi_contacts_create_contact("));
         assert!(cs.contains("weaveffi_contacts_get_contact("));
@@ -5294,7 +4900,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -5314,70 +4919,56 @@ mod tests {
         );
 
         assert!(
-            cs.contains("public class Person : IDisposable"),
-            "missing IDisposable class: {cs}"
+            cs.contains("public sealed class Person"),
+            "missing sealed value class: {cs}"
         );
         assert!(
             cs.contains("<summary>A person record</summary>"),
             "missing doc summary: {cs}"
         );
         assert!(
-            cs.contains("internal Person(IntPtr handle)"),
-            "missing internal constructor: {cs}"
-        );
-        assert!(
-            cs.contains("internal IntPtr Handle => _handle"),
-            "missing Handle property: {cs}"
+            cs.contains("public Person(string fullName, int age, double score, bool active)"),
+            "missing positional constructor: {cs}"
         );
 
         assert!(
-            cs.contains("public string FullName"),
-            "missing FullName getter: {cs}"
-        );
-        assert!(cs.contains("public int Age"), "missing Age getter: {cs}");
-        assert!(
-            cs.contains("public double Score"),
-            "missing Score getter: {cs}"
+            cs.contains("public string FullName { get; }"),
+            "missing FullName property: {cs}"
         );
         assert!(
-            cs.contains("public bool Active"),
-            "missing Active getter: {cs}"
-        );
-
-        assert!(
-            cs.contains("weaveffi_crm_Person_get_full_name(_handle)"),
-            "missing full_name native call: {cs}"
+            cs.contains("public int Age { get; }"),
+            "missing Age property: {cs}"
         );
         assert!(
-            cs.contains("weaveffi_crm_Person_get_age(_handle)"),
-            "missing age native call: {cs}"
+            cs.contains("public double Score { get; }"),
+            "missing Score property: {cs}"
         );
         assert!(
-            cs.contains("weaveffi_crm_Person_get_active(_handle) != 0"),
-            "missing bool getter conversion: {cs}"
+            cs.contains("public bool Active { get; }"),
+            "missing Active property: {cs}"
         );
 
+        // The pack/unpack pair covers every field in declaration order.
         assert!(
-            cs.contains("public void Dispose()"),
-            "missing Dispose: {cs}"
+            cs.contains("writer.WriteString(FullName);")
+                && cs.contains("writer.WriteI32(Age);")
+                && cs.contains("writer.WriteF64(Score);")
+                && cs.contains("writer.WriteBool(Active);"),
+            "missing field encodings: {cs}"
         );
         assert!(
-            cs.contains("weaveffi_crm_Person_destroy(_handle)"),
-            "missing destroy in Dispose: {cs}"
+            cs.contains("var fFullName = reader.ReadString();")
+                && cs.contains("var fAge = reader.ReadI32();")
+                && cs.contains("var fScore = reader.ReadF64();")
+                && cs.contains("var fActive = reader.ReadBool();")
+                && cs.contains("return new Person(fFullName, fAge, fScore, fActive);"),
+            "missing field decodings: {cs}"
         );
-        assert!(
-            cs.contains("GC.SuppressFinalize(this)"),
-            "missing SuppressFinalize: {cs}"
-        );
-        assert!(cs.contains("~Person()"), "missing finalizer: {cs}");
 
+        // No native lifecycle remains for records.
         assert!(
-            cs.contains("weaveffi_crm_Person_create("),
-            "missing create P/Invoke: {cs}"
-        );
-        assert!(
-            cs.contains("weaveffi_crm_Person_destroy(IntPtr ptr)"),
-            "missing destroy P/Invoke: {cs}"
+            !cs.contains("weaveffi_crm_Person_") && !cs.contains("~Person()"),
+            "record C symbols must be gone: {cs}"
         );
     }
 
@@ -5526,7 +5117,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -5549,50 +5139,62 @@ mod tests {
             cs.contains("public static long? Update(string? label, int? count)"),
             "missing Nullable wrapper sig: {cs}"
         );
+
+        // Optional parameters are buffered: a flag byte plus the value when
+        // present, pinned and passed as (ptr, len).
         assert!(
-            cs.contains("if (result == IntPtr.Zero) return null;"),
-            "missing null check for optional return: {cs}"
+            cs.contains("var labelWriter = new WeaveFFIBufferWriter();")
+                && cs.contains("labelWriter.WriteString(label!);"),
+            "missing optional string param encode: {cs}"
         );
         assert!(
-            cs.contains("Marshal.ReadInt64(result)"),
-            "missing ReadInt64 for optional i64 return: {cs}"
+            cs.contains("var countWriter = new WeaveFFIBufferWriter();")
+                && cs.contains("countWriter.WriteI32(count.Value);"),
+            "missing optional int param encode: {cs}"
         );
 
+        // The optional return decodes from the freed-after-copy value buffer.
         assert!(
-            cs.contains("public string? Nickname"),
-            "missing optional string getter: {cs}"
+            cs.contains("long? value = null;")
+                && cs.contains("if (valueReader.ReadOptionFlag())")
+                && cs.contains("var valueValue = valueReader.ReadI64();"),
+            "missing optional return decode: {cs}"
         );
         assert!(
-            cs.contains("public int? MaxRetries"),
-            "missing optional int getter: {cs}"
-        );
-        assert!(
-            cs.contains("public double? Threshold"),
-            "missing optional f64 getter: {cs}"
-        );
-        assert!(
-            cs.contains("public bool? Enabled"),
-            "missing optional bool getter: {cs}"
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "missing return buffer release: {cs}"
         );
 
+        // Optional record fields become nullable properties with flag-byte
+        // encodings; no boxed-scalar pointers remain.
         assert!(
-            cs.contains("Marshal.ReadByte(ptr) != 0"),
-            "missing optional bool unmarshal: {cs}"
+            cs.contains("public string? Nickname { get; }"),
+            "missing optional string property: {cs}"
         );
         assert!(
-            cs.contains("BitConverter.Int64BitsToDouble(Marshal.ReadInt64(ptr))"),
-            "missing optional f64 unmarshal: {cs}"
-        );
-        // Producer-boxed optional scalars are freed after the dereference
-        // (the `ReturnFree::BoxedScalar` contract), both in field getters
-        // and in optional scalar returns.
-        assert!(
-            cs.contains("NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)1);"),
-            "missing boxed bool release: {cs}"
+            cs.contains("public int? MaxRetries { get; }"),
+            "missing optional int property: {cs}"
         );
         assert!(
-            cs.contains("NativeMethods.weaveffi_free_bytes(result, (UIntPtr)8);"),
-            "missing boxed i64 return release: {cs}"
+            cs.contains("public double? Threshold { get; }"),
+            "missing optional f64 property: {cs}"
+        );
+        assert!(
+            cs.contains("public bool? Enabled { get; }"),
+            "missing optional bool property: {cs}"
+        );
+        assert!(
+            cs.contains("writer.WriteF64(Threshold.Value);")
+                && cs.contains("writer.WriteBool(Enabled.Value);"),
+            "missing optional field encodings: {cs}"
+        );
+        assert!(
+            cs.contains("bool? fEnabled = null;") && cs.contains("double? fThreshold = null;"),
+            "missing optional field decodings: {cs}"
+        );
+        assert!(
+            !cs.contains("Marshal.ReadByte(ptr)"),
+            "boxed-scalar pointers must be gone: {cs}"
         );
     }
 
@@ -5644,7 +5246,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -5679,18 +5280,34 @@ mod tests {
             cs.contains("out var outLen"),
             "missing outLen parameter: {cs}"
         );
+        // Each list decodes from its own value buffer: count prefix, typed
+        // elements, then the producer buffer is released.
         assert!(
-            cs.contains("Marshal.Copy(result, arr, 0, (int)outLen)"),
-            "missing Marshal.Copy for array: {cs}"
+            cs.contains("var value = new int[valueCount];")
+                && cs.contains("var value = new double[valueCount];")
+                && cs.contains("var value = new long[valueCount];"),
+            "missing typed element arrays: {cs}"
         );
         assert!(
-            cs.contains("Array.Empty<int>()"),
-            "missing empty array fallback for int: {cs}"
+            cs.contains("var valueItem = valueReader.ReadI32();")
+                && cs.contains("var valueItem = valueReader.ReadF64();")
+                && cs.contains("var valueItem = valueReader.ReadI64();"),
+            "missing element decodes: {cs}"
+        );
+        assert!(
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "missing value-buffer release: {cs}"
         );
 
+        // A list-typed record field is a plain typed property with a
+        // count-prefixed encoding.
         assert!(
-            cs.contains("public int[] Tags"),
-            "missing list struct getter: {cs}"
+            cs.contains("public int[] Tags { get; }"),
+            "missing list property: {cs}"
+        );
+        assert!(
+            cs.contains("writer.WriteLen(Tags.Length);"),
+            "missing list field encode: {cs}"
         );
     }
 
@@ -5777,7 +5394,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             functions: vec![
                 Function {
@@ -5908,59 +5524,59 @@ mod tests {
             "missing enum doc: {cs}"
         );
 
-        // Struct class with IDisposable
+        // Struct as a plain value class
         assert!(
-            cs.contains("public class Contact : IDisposable"),
-            "missing IDisposable: {cs}"
+            cs.contains("public sealed class Contact"),
+            "missing sealed value class: {cs}"
         );
         assert!(
             cs.contains("<summary>A contact entry</summary>"),
             "missing struct doc: {cs}"
         );
         assert!(
-            cs.contains("internal Contact(IntPtr handle)"),
-            "missing constructor: {cs}"
-        );
-        assert!(cs.contains("~Contact()"), "missing finalizer: {cs}");
-        assert!(
-            cs.contains("weaveffi_contacts_Contact_destroy(_handle)"),
-            "missing destroy: {cs}"
+            !cs.contains("~Contact()") && !cs.contains("weaveffi_contacts_Contact_"),
+            "record lifecycle symbols must be gone: {cs}"
         );
 
-        // Property getters
-        assert!(cs.contains("public ulong Id"), "missing Id getter: {cs}");
+        // Typed properties
         assert!(
-            cs.contains("public string FirstName"),
+            cs.contains("public ulong Id { get; }"),
+            "missing Id property: {cs}"
+        );
+        assert!(
+            cs.contains("public string FirstName { get; }"),
             "missing FirstName: {cs}"
         );
         assert!(
-            cs.contains("public string LastName"),
+            cs.contains("public string LastName { get; }"),
             "missing LastName: {cs}"
         );
         assert!(
-            cs.contains("public string? Email"),
+            cs.contains("public string? Email { get; }"),
             "missing optional Email: {cs}"
         );
-        assert!(cs.contains("public int Age"), "missing Age: {cs}");
-        assert!(cs.contains("public bool Active"), "missing Active: {cs}");
+        assert!(cs.contains("public int Age { get; }"), "missing Age: {cs}");
         assert!(
-            cs.contains("public ContactType ContactType"),
-            "missing ContactType getter: {cs}"
+            cs.contains("public bool Active { get; }"),
+            "missing Active: {cs}"
         );
         assert!(
-            cs.contains("public int[] Scores"),
-            "missing Scores list getter: {cs}"
+            cs.contains("public ContactType ContactType { get; }"),
+            "missing ContactType property: {cs}"
+        );
+        assert!(
+            cs.contains("public int[] Scores { get; }"),
+            "missing Scores list property: {cs}"
+        );
+
+        // Pack/unpack pair
+        assert!(
+            cs.contains("internal void WriteTo(WeaveFFIBufferWriter writer)")
+                && cs.contains("internal static Contact ReadFrom(WeaveFFIBufferReader reader)"),
+            "missing pack/unpack pair: {cs}"
         );
 
         // P/Invoke declarations
-        assert!(
-            cs.contains("weaveffi_contacts_Contact_create("),
-            "missing create P/Invoke: {cs}"
-        );
-        assert!(
-            cs.contains("weaveffi_contacts_Contact_destroy(IntPtr ptr)"),
-            "missing destroy P/Invoke: {cs}"
-        );
         assert!(
             cs.contains("weaveffi_contacts_create_contact("),
             "missing create_contact P/Invoke: {cs}"
@@ -6234,7 +5850,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6334,7 +5949,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -6383,7 +5997,7 @@ mod tests {
     #[test]
     fn dotnet_typed_handle_type() {
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -6411,7 +6025,6 @@ mod tests {
                         doc: None,
                         default: None,
                     }],
-                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -6431,9 +6044,19 @@ mod tests {
             "weaveffi.yml",
             "WeaveFFI.cs",
         );
+        // A typed handle renders as a dedicated readonly wrapper struct, not
+        // a bare ulong and not the record class.
         assert!(
-            cs.contains("Contact contact"),
-            "TypedHandle should use class type not ulong: {cs}"
+            cs.contains("ContactHandle contact"),
+            "TypedHandle should use the wrapper struct: {cs}"
+        );
+        assert!(
+            cs.contains("public readonly struct ContactHandle"),
+            "missing handle wrapper struct: {cs}"
+        );
+        assert!(
+            cs.contains("contact.Raw"),
+            "wrapper should pass the raw pointer: {cs}"
         );
     }
 
@@ -6466,7 +6089,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6496,24 +6118,21 @@ mod tests {
         let check_rel = slice
             .find("WeaveFFIError.Check(err)")
             .expect("WeaveFFIError.Check in FindContact");
-        let ret_rel = slice
-            .find("return new Contact(result)")
-            .expect("return new Contact(result) in FindContact");
+        let free_rel = slice
+            .find("NativeMethods.weaveffi_free_bytes(result, outLen);")
+            .expect("value-buffer release in FindContact");
+        let decode_rel = slice
+            .find("Contact.ReadFrom(valueReader)")
+            .expect("Contact.ReadFrom in FindContact");
         assert!(
-            check_rel < ret_rel,
-            "error must be checked before wrapping result: {cs}"
+            check_rel < free_rel && free_rel < decode_rel,
+            "error must be checked, the buffer freed once, then decoded: {cs}"
         );
+        // The record is a value type: nothing to dispose, so no double-free
+        // hazard on the return path.
         assert!(
-            cs.contains("public class Contact : IDisposable"),
-            "struct return should be disposable: {cs}"
-        );
-        assert!(
-            cs.contains("~Contact()"),
-            "Contact should have finalizer for dispose pattern: {cs}"
-        );
-        assert!(
-            cs.contains("weaveffi_contacts_Contact_destroy"),
-            "Dispose should call native destroy: {cs}"
+            !cs.contains("Contact : IDisposable") && !cs.contains("~Contact()"),
+            "record must not be disposable: {cs}"
         );
     }
 
@@ -6548,7 +6167,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6565,9 +6183,17 @@ mod tests {
             "weaveffi.yml",
             "WeaveFFI.cs",
         );
+        // The optional record decodes from the value buffer: a flag byte
+        // gates the nested record read, and absent means null.
         assert!(
-            cs.contains("result == IntPtr.Zero ? null : new Contact(result)"),
-            "optional struct return should null-check before wrap: {cs}"
+            cs.contains("public static Contact? FindContact(int id)"),
+            "missing nullable wrapper sig: {cs}"
+        );
+        assert!(
+            cs.contains("Contact? value = null;")
+                && cs.contains("if (valueReader.ReadOptionFlag())")
+                && cs.contains("var valueValue = Contact.ReadFrom(valueReader);"),
+            "optional record return should decode via flag byte: {cs}"
         );
     }
 
@@ -6740,7 +6366,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6786,21 +6411,22 @@ mod tests {
             !cs.contains("weaveffi_free_bytes(result"),
             "async bytes result must not be freed by the consumer: {cs}"
         );
-        // Boxed optional scalar result: dereferenced, box left alone.
+        // Buffered optional result: the borrowed buffer is copied and
+        // decoded inside the callback, never freed by the consumer.
         assert!(
-            cs.contains(
-                "tcs.SetResult(result == IntPtr.Zero ? (long?)null : Marshal.ReadInt64(result));"
-            ),
-            "async optional scalar result must dereference the borrowed box: {cs}"
+            cs.contains("Marshal.Copy(result, resultBuf, 0, (int)resultLen);")
+                && cs.contains("long? value = null;")
+                && cs.contains("var valueValue = valueReader.ReadI64();")
+                && cs.contains("tcs.SetResult(value);"),
+            "async optional result must decode the borrowed buffer: {cs}"
         );
     }
 
-    /// Owned-object async results are the exception to the borrowed-results
-    /// rule: the callback receives ownership and the wrapper adopts the
-    /// pointer. List results copy the borrowed buffer, adopting object
-    /// elements and copying string elements without freeing them.
+    /// Record, list, and map async results all arrive as one borrowed
+    /// `(result, resultLen)` value buffer: the callback copies and decodes
+    /// it before completing the task, and never frees it.
     #[test]
-    fn dotnet_async_object_and_list_results() {
+    fn dotnet_async_buffered_results_decoded() {
         let cs = render_csharp(
             &async_api(vec![
                 Some(TypeRef::Record("Contact".into())),
@@ -6817,49 +6443,44 @@ mod tests {
             "weaveffi.yml",
             "WeaveFFI.cs",
         );
-        // Record result adopted by its wrapper.
-        assert!(
-            cs.contains("tcs.SetResult(new Contact(result));"),
-            "async record result must be adopted: {cs}"
-        );
-        // List results decode the two-slot (result, resultLen) pair; string
-        // elements are copied without a consumer-side free, record elements
-        // adopted.
+        // Every buffered result arrives through the (result, resultLen) pair.
         assert!(
             cs.contains("IntPtr result, UIntPtr resultLen"),
-            "async list delegate must carry the length slot: {cs}"
+            "async buffered delegate must carry the length slot: {cs}"
+        );
+        // Record result decoded from the borrowed copy.
+        assert!(
+            cs.contains("var value = Contact.ReadFrom(valueReader);")
+                && cs.contains("tcs.SetResult(value);"),
+            "async record result must decode: {cs}"
+        );
+        // List elements decode in place: strings copy, records recurse.
+        assert!(
+            cs.contains("var valueItem = valueReader.ReadString();"),
+            "async string list elements must decode: {cs}"
         );
         assert!(
-            cs.contains(
-                "arr[i] = Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(result, i * IntPtr.Size)) ?? \"\";"
-            ),
-            "async string list elements must copy: {cs}"
+            cs.contains("var valueItem = Contact.ReadFrom(valueReader);"),
+            "async record list elements must decode: {cs}"
+        );
+        // Map results decode from the same single buffer as alternating
+        // key/value pairs; no parallel buffers remain.
+        assert!(
+            cs.contains("var value = new Dictionary<string, int>(valueCount);")
+                && cs.contains("var valueKey = valueReader.ReadString();")
+                && cs.contains("var valueVal = valueReader.ReadI32();"),
+            "async map result must decode pairs: {cs}"
         );
         assert!(
-            cs.contains("arr[i] = new Contact(Marshal.ReadIntPtr(result, i * IntPtr.Size));"),
-            "async record list elements must be adopted: {cs}"
+            !cs.contains("resultKeys") && !cs.contains("resultValues"),
+            "parallel map buffers must be gone: {cs}"
         );
         // No release calls anywhere in this API: every native buffer here is
         // an async result, borrowed for the callback's duration.
         assert!(
             !cs.contains("NativeMethods.weaveffi_free_string(")
                 && !cs.contains("NativeMethods.weaveffi_free_bytes("),
-            "async list/map buffers are borrowed and must not be freed: {cs}"
-        );
-        // Map results decode the three-slot parallel-buffer form.
-        assert!(
-            cs.contains("IntPtr resultKeys, IntPtr resultValues, UIntPtr resultLen"),
-            "async map delegate must carry both buffers: {cs}"
-        );
-        assert!(
-            cs.contains(
-                "dict[Marshal.PtrToStringUTF8(Marshal.ReadIntPtr(resultKeys, i * IntPtr.Size)) ?? \"\"] = Marshal.ReadInt32(resultValues + i * sizeof(int));"
-            ),
-            "async map entries must copy: {cs}"
-        );
-        assert!(
-            cs.contains("tcs.SetResult(dict);"),
-            "async map result must resolve the task: {cs}"
+            "async result buffers are borrowed and must not be freed: {cs}"
         );
     }
 
@@ -6920,12 +6541,11 @@ mod tests {
         assert!(cs.contains("finally"), "destroy must run in finally: {cs}");
     }
 
-    /// A list-of-strings return frees each element with
-    /// `weaveffi_free_string` after copying, then releases the array buffer
-    /// with `weaveffi_free_bytes` (`ReturnFree::Array` with
-    /// `ElemFree::String`).
+    /// A list-of-strings return arrives as one value buffer: the strings
+    /// decode from the copy and the producer buffer is released exactly once
+    /// with `weaveffi_free_bytes`; no per-element frees remain.
     #[test]
-    fn string_list_return_frees_elements_and_buffer() {
+    fn string_list_return_decodes_and_frees_buffer_once() {
         let api = make_api(vec![simple_module(vec![Function {
             name: "names".into(),
             params: vec![],
@@ -6946,15 +6566,18 @@ mod tests {
             "WeaveFFI.cs",
         );
         assert!(
-            cs.contains("var itemPtr = Marshal.ReadIntPtr(result, i * IntPtr.Size);")
-                && cs.contains("NativeMethods.weaveffi_free_string(itemPtr);"),
-            "string elements must be freed after copying: {cs}"
+            cs.contains("var value = new string[valueCount];")
+                && cs.contains("var valueItem = valueReader.ReadString();"),
+            "string elements must decode from the buffer: {cs}"
         );
         assert!(
-            cs.contains(
-                "NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * IntPtr.Size));"
-            ),
-            "array buffer must be released: {cs}"
+            cs.contains("NativeMethods.weaveffi_free_bytes(result, outLen);"),
+            "value buffer must be released: {cs}"
+        );
+        let names = cs.find("static string[] Names()").expect("Names wrapper");
+        assert!(
+            !cs[names..].contains("weaveffi_free_string("),
+            "no per-element frees may remain in the wrapper: {cs}"
         );
     }
 
@@ -7095,7 +6718,6 @@ mod tests {
                     doc: Some("Stable id".into()),
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Kind".into(),
@@ -7393,7 +7015,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_enum_generates_opaque_wrapper() {
+    fn rich_enum_generates_sum_type() {
         let cs = render_csharp(
             &shapes_api(),
             "Shapes",
@@ -7403,14 +7025,19 @@ mod tests {
             "Shapes.cs",
         );
 
-        // Rich enum becomes an IDisposable opaque-object class, not a C# enum.
+        // Rich enum becomes an abstract sum type, not a C# enum and not a
+        // disposable handle wrapper.
         assert!(
-            cs.contains("public class Shape : IDisposable"),
-            "rich enum must be a class: {cs}"
+            cs.contains("public abstract class Shape"),
+            "rich enum must be an abstract class: {cs}"
         );
         assert!(
             !cs.contains("public enum Shape"),
             "rich enum must not be a plain enum: {cs}"
+        );
+        assert!(
+            !cs.contains("Shape : IDisposable"),
+            "rich enum must not be disposable: {cs}"
         );
         // Plain enum is still a value enum.
         assert!(
@@ -7418,105 +7045,69 @@ mod tests {
             "plain enum must stay an enum: {cs}"
         );
 
-        // Nested discriminant enum + typed reader.
-        assert!(cs.contains("public enum Tag"), "nested Tag enum: {cs}");
+        // One nested sealed class per variant, with typed properties and
+        // positional constructors instead of factories and getters.
         assert!(
-            cs.contains("Empty = 0,") && cs.contains("Labeled = 3,"),
-            "Tag values: {cs}"
+            cs.contains("public sealed class Empty : Shape"),
+            "Empty variant class: {cs}"
         );
         assert!(
-            cs.contains("public Tag GetTag()")
-                && cs.contains("return (Tag)NativeMethods.weaveffi_shapes_Shape_tag(_handle);"),
-            "tag reader: {cs}"
-        );
-
-        // Static factories per variant with the struct error convention.
-        assert!(
-            cs.contains("public static Shape Empty()"),
-            "Empty factory: {cs}"
+            cs.contains("public sealed class Circle : Shape")
+                && cs.contains("public Circle(double radius)")
+                && cs.contains("public double Radius { get; }"),
+            "Circle variant class: {cs}"
         );
         assert!(
-            cs.contains("public static Shape Circle(double radius)"),
-            "Circle factory: {cs}"
+            cs.contains("public sealed class Rectangle : Shape")
+                && cs.contains("public Rectangle(float width, float height)")
+                && cs.contains("public float Width { get; }")
+                && cs.contains("public float Height { get; }"),
+            "Rectangle variant class: {cs}"
         );
         assert!(
-            cs.contains("public static Shape Rectangle(float width, float height)"),
-            "Rectangle factory: {cs}"
-        );
-        assert!(
-            cs.contains("public static Shape Labeled(string label, byte count)"),
-            "Labeled factory: {cs}"
-        );
-        assert!(
-            cs.contains("NativeMethods.weaveffi_shapes_Shape_Circle_new(radius, ref err);")
-                && cs.contains("return new Shape(result);"),
-            "Circle ctor call + wrap: {cs}"
-        );
-        // String payload factory marshals + frees in try/finally.
-        assert!(
-            cs.contains("Marshal.StringToCoTaskMemUTF8(label)")
-                && cs.contains("Marshal.FreeCoTaskMem(labelPtr);"),
-            "Labeled string marshalling: {cs}"
+            cs.contains("public sealed class Labeled : Shape")
+                && cs.contains("public Labeled(string label, byte count)")
+                && cs.contains("public string Label { get; }")
+                && cs.contains("public byte Count { get; }"),
+            "Labeled variant class: {cs}"
         );
 
-        // Per-variant accessors, namespaced by variant.
+        // The pack pair writes the i32 tag then the active variant's fields.
         assert!(
-            cs.contains("public double CircleRadius"),
-            "CircleRadius: {cs}"
+            cs.contains("internal void WriteTo(WeaveFFIBufferWriter writer)")
+                && cs.contains("case Circle v:")
+                && cs.contains("writer.WriteI32(1);")
+                && cs.contains("writer.WriteF64(v.Radius);"),
+            "tag-dispatched encode: {cs}"
         );
         assert!(
-            cs.contains("public float RectangleWidth")
-                && cs.contains("public float RectangleHeight"),
-            "Rectangle accessors: {cs}"
-        );
-        assert!(
-            cs.contains("public string LabeledLabel"),
-            "LabeledLabel: {cs}"
-        );
-        assert!(
-            cs.contains("public byte LabeledCount"),
-            "LabeledCount: {cs}"
-        );
-        // String getter frees the producer-owned buffer.
-        assert!(
-            cs.contains("NativeMethods.weaveffi_free_string(ptr);"),
-            "string getter free: {cs}"
+            cs.contains("internal static Shape ReadFrom(WeaveFFIBufferReader reader)")
+                && cs.contains("var tag = reader.ReadI32();")
+                && cs.contains("return new Empty();")
+                && cs.contains("return new Labeled(fLabel, fCount);"),
+            "tag-dispatched decode: {cs}"
         );
 
-        // Disposal frees via the enum's destroy, with a finalizer (no double free).
+        // Rich enums declare no C symbols at all.
         assert!(
-            cs.contains("NativeMethods.weaveffi_shapes_Shape_destroy(_handle);")
-                && cs.contains("GC.SuppressFinalize(this);")
-                && cs.contains("~Shape()"),
-            "dispose + finalizer: {cs}"
+            !cs.contains("weaveffi_shapes_Shape_"),
+            "rich enum C symbols must be gone: {cs}"
         );
 
-        // P/Invoke declarations for the full symbol set.
-        for sym in [
-            "internal static extern int weaveffi_shapes_Shape_tag(IntPtr ptr);",
-            "internal static extern void weaveffi_shapes_Shape_destroy(IntPtr ptr);",
-            "internal static extern IntPtr weaveffi_shapes_Shape_Empty_new(ref WeaveFFIError err);",
-            "internal static extern IntPtr weaveffi_shapes_Shape_Circle_new(double radius, ref WeaveFFIError err);",
-            "internal static extern IntPtr weaveffi_shapes_Shape_Rectangle_new(float width, float height, ref WeaveFFIError err);",
-            "internal static extern IntPtr weaveffi_shapes_Shape_Labeled_new(IntPtr label, byte count, ref WeaveFFIError err);",
-            "internal static extern double weaveffi_shapes_Shape_Circle_get_radius(IntPtr ptr);",
-            "internal static extern float weaveffi_shapes_Shape_Rectangle_get_width(IntPtr ptr);",
-            "internal static extern byte weaveffi_shapes_Shape_Labeled_get_count(IntPtr ptr);",
-            "internal static extern IntPtr weaveffi_shapes_Shape_Labeled_get_label(IntPtr ptr);",
-        ] {
-            assert!(cs.contains(sym), "missing P/Invoke `{sym}`: {cs}");
-        }
-
-        // Functions taking/returning the enum flow through the struct path:
-        // pass `.Handle`, wrap returns in `new Shape(...)`.
+        // Functions taking the enum pack it into a pinned value buffer and
+        // pass (ptr, len); returns decode from the freed-after-copy buffer.
         assert!(
             cs.contains("public static string ShapesDescribe(Shape shape)")
-                && cs.contains("weaveffi_shapes_describe(shape.Handle, ref err)"),
-            "describe via struct path: {cs}"
+                && cs.contains("shape.WriteTo(shapeWriter);")
+                && cs.contains(
+                    "weaveffi_shapes_describe(shapePin.AddrOfPinnedObject(), (UIntPtr)shapeBuf.Length, ref err)"
+                ),
+            "describe via buffered param: {cs}"
         );
         assert!(
-            cs.contains("public static Shape ShapesScale(Shape shape, double factor)"),
-            "scale via struct path: {cs}"
+            cs.contains("public static Shape ShapesScale(Shape shape, double factor)")
+                && cs.contains("var value = Shape.ReadFrom(valueReader);"),
+            "scale via buffered return: {cs}"
         );
         // Numerics smoke: list<u8> in, u64 out (plain function path).
         assert!(
@@ -7627,12 +7218,29 @@ mod tests {
                         code: 1001,
                         message: "Key not found".into(),
                         doc: None,
+                        // Structured payload: the missing key and the attempt
+                        // count, exercising the payload decode in FromCode.
+                        fields: vec![
+                            StructField {
+                                name: "key".into(),
+                                ty: TypeRef::StringUtf8,
+                                doc: None,
+                                default: None,
+                            },
+                            StructField {
+                                name: "attempts".into(),
+                                ty: TypeRef::I32,
+                                doc: None,
+                                default: None,
+                            },
+                        ],
                     },
                     ErrorCode {
                         name: "IO_ERROR".into(),
                         code: 1004,
                         message: "I/O failure".into(),
                         doc: Some("Underlying storage failed.".into()),
+                        fields: vec![],
                     },
                 ],
             }),
@@ -7673,24 +7281,47 @@ mod tests {
         // the generic exception for unknown codes, with the default message
         // filling an empty slot message.
         assert!(
-            cs.contains("internal static WeaveFFIException FromCode(int code, string message)"),
+            cs.contains(
+                "internal static WeaveFFIException FromCode(int code, string message, byte[]? payload)"
+            ),
             "FromCode factory missing: {cs}"
         );
+        // A code with payload fields decodes them into the exception's Data
+        // dictionary in declaration order.
         assert!(
             cs.contains("case KeyNotFound:")
                 && cs.contains(
-                    "return new KvException(code, string.IsNullOrEmpty(message) ? \"Key not found\" : message);"
+                    "var ex = new KvException(code, string.IsNullOrEmpty(message) ? \"Key not found\" : message);"
                 ),
             "typed mapping missing: {cs}"
+        );
+        assert!(
+            cs.contains("var reader = new WeaveFFIBufferReader(payload);")
+                && cs.contains("var fKey = reader.ReadString();")
+                && cs.contains("ex.Data[\"key\"] = fKey;")
+                && cs.contains("var fAttempts = reader.ReadI32();")
+                && cs.contains("ex.Data[\"attempts\"] = fAttempts;"),
+            "payload field decode missing: {cs}"
+        );
+        // A code without fields maps directly.
+        assert!(
+            cs.contains("case IoError:")
+                && cs.contains(
+                    "return new KvException(code, string.IsNullOrEmpty(message) ? \"I/O failure\" : message);"
+                ),
+            "fieldless mapping missing: {cs}"
         );
         assert!(
             cs.contains("default:") && cs.contains("return new WeaveFFIException(code, message);"),
             "generic fallback missing: {cs}"
         );
-        // The error-check helper gains a per-domain variant.
+        // The error-check helper gains a per-domain variant that copies the
+        // payload, clears the slot, and throws through FromCode.
         assert!(
             cs.contains("internal static void CheckKv(WeaveFFIError err)")
-                && cs.contains("throw KvException.FromCode(err.Code, msg);"),
+                && cs.contains("var payload = CopyPayload(err);")
+                && cs.contains("NativeMethods.weaveffi_error_clear(ref err);")
+                && cs.contains("throw KvException.FromCode(code, msg, payload);"),
             "per-domain check missing: {cs}"
         );
     }
@@ -7863,8 +7494,9 @@ mod tests {
         // Async completion faults the task with the typed exception; the
         // iterator's next-checks are typed as well.
         assert!(
-            cs.contains("tcs.SetException(KvException.FromCode(wErr.Code, msg));"),
-            "async throws must fault with the typed exception: {cs}"
+            cs.contains("var payload = WeaveFFIError.CopyPayload(wErr);")
+                && cs.contains("tcs.SetException(KvException.FromCode(wErr.Code, msg, payload));"),
+            "async throws must fault with the typed exception and payload: {cs}"
         );
         let iter = method_slice(&cs, "private static IEnumerator<string> EnumerateListKeys(");
         assert!(

@@ -32,16 +32,12 @@ class ContactType(IntEnum):
     Other: int
 
 class Contact:
-    @property
-    def id(self) -> int: ...
-    @property
-    def first_name(self) -> str: ...
-    @property
-    def last_name(self) -> str: ...
-    @property
-    def email(self) -> Optional[str]: ...
-    @property
-    def contact_type(self) -> "ContactType": ...
+    id: int
+    first_name: str
+    last_name: str
+    email: Optional[str]
+    contact_type: "ContactType"
+    def __init__(self, id: int, first_name: str, last_name: str, email: Optional[str], contact_type: "ContactType") -> None: ...
 
 # An in-memory address book owning its contacts
 class ContactBook:

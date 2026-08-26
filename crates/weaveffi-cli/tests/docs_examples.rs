@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -75,31 +75,31 @@ fn doc_swift_contains_enum_declaration() {
 }
 
 #[test]
-fn doc_swift_contains_struct_class() {
+fn doc_swift_contains_record_struct() {
     let (_dir, out) = generate_all_for_docs();
     let swift =
         std::fs::read_to_string(out.join("generated/swift/Sources/WeaveFFI/WeaveFFI.swift"))
             .unwrap();
 
     assert!(
-        swift.contains("public class Contact {"),
-        "Swift struct class missing: {swift}"
+        swift.contains("public struct Contact {"),
+        "Swift record struct missing: {swift}"
     );
     assert!(
-        swift.contains("let ptr: OpaquePointer"),
-        "OpaquePointer property missing: {swift}"
+        swift.contains("public var name: String"),
+        "name stored property missing: {swift}"
     );
     assert!(
-        swift.contains("weaveffi_contacts_Contact_destroy(ptr)"),
-        "deinit destroy missing: {swift}"
+        swift.contains("public var email: String?"),
+        "optional stored property missing: {swift}"
     );
     assert!(
-        swift.contains("public var name: String {"),
-        "name getter missing: {swift}"
+        swift.contains("public var age: Int32"),
+        "age stored property missing: {swift}"
     );
     assert!(
-        swift.contains("public var age: Int32 {"),
-        "age getter missing: {swift}"
+        swift.contains("public init(name: String, email: String?, age: Int32)"),
+        "memberwise init missing: {swift}"
     );
 }
 
@@ -121,25 +121,31 @@ fn doc_swift_optional_and_list_returns() {
 }
 
 #[test]
-fn doc_c_header_opaque_struct_and_enum() {
+fn doc_c_header_value_records_and_enum() {
     let (_dir, out) = generate_all_for_docs();
     let header = std::fs::read_to_string(out.join("generated/c/weaveffi.h")).unwrap();
 
+    // Records are value types serialized into buffers: no opaque typedef,
+    // create/destroy pair, or getters. A record return is an owned buffer
+    // handed back as `const uint8_t*` plus `size_t* out_len`.
     assert!(
-        header.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"),
-        "opaque struct typedef missing: {header}"
+        !header.contains("typedef struct weaveffi_contacts_Contact"),
+        "records must not get opaque typedefs: {header}"
     );
     assert!(
         header.contains("weaveffi_contacts_ContactType_Personal = 0"),
         "enum variant missing: {header}"
     );
     assert!(
-        header.contains("void weaveffi_contacts_Contact_destroy("),
-        "destroy prototype missing: {header}"
+        header.contains(
+            "const uint8_t* weaveffi_contacts_create_contact(const char* first_name, \
+             const char* last_name, size_t* out_len, weaveffi_error* out_err);"
+        ),
+        "buffered record return prototype missing: {header}"
     );
     assert!(
-        header.contains("weaveffi_contacts_Contact_get_name("),
-        "getter missing: {header}"
+        header.contains("const uint8_t* id_ptr, size_t id_len"),
+        "buffered optional param slots missing: {header}"
     );
 }
 
@@ -219,8 +225,8 @@ fn doc_android_kotlin_wrapper() {
         "enum class missing: {kt}"
     );
     assert!(
-        kt.contains("class Contact internal constructor(internal var handle: Long)"),
-        "struct class missing: {kt}"
+        kt.contains("data class Contact(val name: String, val email: String?, val age: Int)"),
+        "record data class missing: {kt}"
     );
 }
 
@@ -239,8 +245,8 @@ fn doc_android_jni_shim() {
         "missing JNIEXPORT declarations: {jni}"
     );
     assert!(
-        jni.contains("weaveffi_error err = {0, NULL};"),
-        "missing error init: {jni}"
+        jni.contains("weaveffi_error err = {0, NULL, NULL, 0};"),
+        "missing four-field error init: {jni}"
     );
 }
 
@@ -321,7 +327,7 @@ fn summary_md_all_links_resolve() {
 /// The README quickstart IDL, kept in sync with the `kvstore.yml` snippet in
 /// `README.md` step 2 (trimmed `Store` interface plus `KvError` domain).
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: kv
     errors:
@@ -430,7 +436,7 @@ fn readme_quickstart_generates_c_header() {
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     structs:
@@ -499,9 +505,10 @@ fn getting_started_yaml_generates_all_targets() {
         header.contains("weaveffi_math_add"),
         "C header should contain weaveffi_math_add"
     );
+    // Records are value types: the header carries no per-record C surface.
     assert!(
-        header.contains("weaveffi_math_Point"),
-        "C header should contain weaveffi_math_Point"
+        !header.contains("weaveffi_math_Point"),
+        "C header should not declare a record surface"
     );
 
     let dts = std::fs::read_to_string(gen.join("node/types.d.ts")).unwrap();
@@ -520,8 +527,8 @@ fn getting_started_yaml_generates_all_targets() {
         "scaffold should contain weaveffi_math_add"
     );
     assert!(
-        scaffold.contains("weaveffi_math_Point"),
-        "scaffold should contain weaveffi_math_Point"
+        !scaffold.contains("weaveffi_math_Point"),
+        "scaffold should not emit record stubs"
     );
 }
 
@@ -576,8 +583,8 @@ fn readme_states_value_proposition() {
 fn readme_uses_only_current_schema_version() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("\"0.5.0\""),
-        "README should reference schema version 0.5.0"
+        readme.contains("\"0.6.0\""),
+        "README should reference schema version 0.6.0"
     );
     for old in ["\"0.1.0\"", "\"0.2.0\"", "\"0.3.0\"", "\"0.4.0\""] {
         assert!(

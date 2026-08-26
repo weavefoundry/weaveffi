@@ -7,7 +7,8 @@
 //! module keeps free functions and an in-memory store behind a `Mutex`, and
 //! references `products::Product` across the module boundary. Both modules
 //! declare typed error domains, and the macro generates every `extern "C"`
-//! thunk, getter, and list marshalling. No `unsafe` glue is written by hand.
+//! thunk and the value-buffer marshalling that carries records and lists
+//! across the boundary. No `unsafe` glue is written by hand.
 
 /// Product catalog: the `Product` record, its `Category` enum, and the
 /// `Catalog` interface.
@@ -285,6 +286,7 @@ pub mod orders {
 weaveffi::export_runtime!();
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::orders::{
         add_product_to_order, cancel_order, create_order, get_order, OrderItem, OrdersError,
@@ -441,59 +443,65 @@ mod tests {
 
     // A direct exercise of the generated C ABI thunks. This drives the
     // list-of-record parameter (`create_order`) through the `extern "C"`
-    // boundary, so it covers the `lift_ptr_vec` marshalling the macro emits.
+    // boundary as one encoded value buffer, and decodes the buffered `Order`
+    // return.
     #[test]
     fn ffi_order_surface_smoke() {
-        use super::orders::{
-            weaveffi_orders_OrderItem_create, weaveffi_orders_OrderItem_destroy,
-            weaveffi_orders_Order_destroy, weaveffi_orders_Order_get_total,
-            weaveffi_orders_create_order, weaveffi_orders_get_order,
-        };
+        use super::orders::{weaveffi_orders_create_order, weaveffi_orders_get_order, Order};
         use weaveffi::abi::{self, weaveffi_error};
 
         let _g = orders_guard();
         let mut err = weaveffi_error::default();
 
-        // Build two OrderItem objects through their generated constructor.
-        let a = weaveffi_orders_OrderItem_create(1, 2, 10.0, &mut err);
-        assert_eq!(err.code, 0);
-        let b = weaveffi_orders_OrderItem_create(2, 1, 25.0, &mut err);
-        assert_eq!(err.code, 0);
-
-        // Pass them as the array-of-object-pointers slot create_order expects.
-        let items = [a, b];
-        let id = weaveffi_orders_create_order(items.as_ptr(), items.len(), &mut err);
+        // Encode the item list into the (ptr, len) slot pair the thunk
+        // expects; the buffer is borrowed for the duration of the call.
+        let items = vec![item(1, 2, 10.0), item(2, 1, 25.0)];
+        let items_buf = abi::encode_value(&items);
+        let id = weaveffi_orders_create_order(items_buf.as_ptr(), items_buf.len(), &mut err);
         assert_eq!(err.code, 0);
         assert!(id > 0);
 
-        let order = weaveffi_orders_get_order(id, &mut err);
+        let mut order_len: usize = 0;
+        let order_ptr = weaveffi_orders_get_order(id, &mut order_len, &mut err);
         assert_eq!(err.code, 0);
-        assert!(!order.is_null());
-        assert_eq!(weaveffi_orders_Order_get_total(order), 45.0);
+        assert!(!order_ptr.is_null());
+        let order =
+            abi::decode_value::<Order>(unsafe { std::slice::from_raw_parts(order_ptr, order_len) })
+                .expect("well-formed Order buffer");
+        abi::free_bytes(order_ptr as *mut u8, order_len);
+        assert_eq!(order.total, 45.0);
+        assert_eq!(order.items.len(), 2);
+        assert_eq!(order.status, "pending");
 
         // An empty item list reports the EmptyOrder domain code.
-        let rejected = weaveffi_orders_create_order(std::ptr::null(), 0, &mut err);
+        let empty_buf = abi::encode_value(&Vec::<OrderItem>::new());
+        let rejected = weaveffi_orders_create_order(empty_buf.as_ptr(), empty_buf.len(), &mut err);
         assert_eq!(rejected, 0);
         assert_eq!(err.code, 2);
         abi::error_clear(&mut err);
-
-        weaveffi_orders_Order_destroy(order);
-        weaveffi_orders_OrderItem_destroy(a);
-        weaveffi_orders_OrderItem_destroy(b);
     }
 
     // The interface thunks: construct a catalog, add a product (success and
-    // typed-error paths), and read it back, all through the C ABI.
+    // typed-error paths), and read it back, all through the C ABI. The
+    // catalog itself still crosses as an opaque pointer; the `Product`
+    // results are decoded from value buffers.
     #[test]
     fn ffi_catalog_surface_smoke() {
         use super::products::{
             weaveffi_products_Catalog_add_product, weaveffi_products_Catalog_destroy,
             weaveffi_products_Catalog_get_product, weaveffi_products_Catalog_new,
-            weaveffi_products_Catalog_remove, weaveffi_products_Product_destroy,
-            weaveffi_products_Product_get_id, weaveffi_products_Product_get_price,
+            weaveffi_products_Catalog_remove, Product,
         };
         use std::ffi::CString;
         use weaveffi::abi::{self, weaveffi_error};
+
+        fn decode_and_free(ptr: *const u8, len: usize) -> Product {
+            assert!(!ptr.is_null());
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            let product = abi::decode_value::<Product>(bytes).expect("well-formed Product buffer");
+            abi::free_bytes(ptr as *mut u8, len);
+            product
+        }
 
         let mut err = weaveffi_error::default();
         let catalog = weaveffi_products_Catalog_new(&mut err);
@@ -501,38 +509,45 @@ mod tests {
         assert!(!catalog.is_null());
 
         let name = CString::new("Widget").unwrap();
-        let added = weaveffi_products_Catalog_add_product(
+        let mut added_len: usize = 0;
+        let added_ptr = weaveffi_products_Catalog_add_product(
             catalog,
             name.as_ptr(),
             9.99,
             Category::Electronics as i32,
+            &mut added_len,
             &mut err,
         );
         assert_eq!(err.code, 0);
-        assert!(!added.is_null());
-        let id = weaveffi_products_Product_get_id(added);
+        let added = decode_and_free(added_ptr, added_len);
+        assert!(added.id > 0);
+        assert_eq!(added.name, "Widget");
 
         // A non-positive price reports the InvalidPrice domain code.
+        let mut rejected_len: usize = 0;
         let rejected = weaveffi_products_Catalog_add_product(
             catalog,
             name.as_ptr(),
             0.0,
             Category::Electronics as i32,
+            &mut rejected_len,
             &mut err,
         );
         assert!(rejected.is_null());
         assert_eq!(err.code, 1);
         abi::error_clear(&mut err);
 
-        let fetched = weaveffi_products_Catalog_get_product(catalog, id, &mut err);
+        let mut fetched_len: usize = 0;
+        let fetched_ptr =
+            weaveffi_products_Catalog_get_product(catalog, added.id, &mut fetched_len, &mut err);
         assert_eq!(err.code, 0);
-        assert!(!fetched.is_null());
-        assert_eq!(weaveffi_products_Product_get_price(fetched), 9.99);
+        let fetched = decode_and_free(fetched_ptr, fetched_len);
+        assert_eq!(fetched.price, 9.99);
 
-        assert!(weaveffi_products_Catalog_remove(catalog, id, &mut err));
+        assert!(weaveffi_products_Catalog_remove(
+            catalog, added.id, &mut err
+        ));
 
-        weaveffi_products_Product_destroy(added);
-        weaveffi_products_Product_destroy(fetched);
         weaveffi_products_Catalog_destroy(catalog);
     }
 }

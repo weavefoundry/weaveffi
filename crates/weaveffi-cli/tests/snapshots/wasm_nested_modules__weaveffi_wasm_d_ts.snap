@@ -28,11 +28,9 @@ export declare class OutOfBounds extends GraphicsError {
 
 /** Top-level struct that references a struct defined one level deeper. */
 export interface Canvas {
-  readonly width: number;
+  width: number;
   /** Reference down into a nested module */
-  readonly root: Shape;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  root: Shape;
 }
 
 /** A measurement unit shared with nested submodules. */
@@ -43,20 +41,16 @@ export declare const Unit: Readonly<{
 
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
 export interface Shape {
-  readonly sides: number;
+  sides: number;
   /** Reference up to the parent module's enum */
-  readonly unit: Unit;
+  unit: Unit;
   /** Reference down into a deeper module */
-  readonly detail: Detail;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  detail: Detail;
 }
 
 /** A struct two levels deep. */
 export interface Detail {
-  readonly area: number;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  area: number;
 }
 
 export interface WeaveffiWasmModule {

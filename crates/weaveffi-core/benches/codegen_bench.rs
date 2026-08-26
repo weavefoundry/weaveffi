@@ -8,7 +8,7 @@ use weaveffi_ir::parse::parse_api_str;
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
             functions: vec![
@@ -144,7 +144,6 @@ fn large_api() -> Api {
                             default: None,
                         },
                     ],
-                    builder: false,
                 })
                 .collect();
 
@@ -225,7 +224,7 @@ fn large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules,
         generators: None,
         package: None,

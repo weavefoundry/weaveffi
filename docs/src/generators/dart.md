@@ -34,13 +34,13 @@ required; the generated `.dart` file is ready to import.
 | `string`     | `String`            | `Pointer<Utf8>`        | `Pointer<Utf8>`      |
 | `bytes`      | `List<int>`         | `Pointer<Uint8>`       | `Pointer<Uint8>`     |
 | `handle`     | `int`               | `Int64`                | `int`                |
-| `StructName` | `StructName`        | `Pointer<Void>`        | `Pointer<Void>`      |
+| `StructName` | `StructName` (plain class) | value buffer (`Pointer<Uint8>` + length) | same |
 | `InterfaceName` | `InterfaceName`  | `Pointer<Void>`        | `Pointer<Void>`      |
 | `EnumName` (plain) | `EnumName`    | `Int32`                | `int`                |
-| `EnumName` (rich)  | `EnumName`    | `Pointer<Void>`        | `Pointer<Void>`      |
-| `T?`         | `T?`                | same as inner type     | same as inner type   |
-| `[T]`        | `List<T>`           | `Pointer<Void>`        | `Pointer<Void>`      |
-| `{K: V}`     | `Map<K, V>`         | `Pointer<Void>`        | `Pointer<Void>`      |
+| `EnumName` (rich)  | `EnumName` (sealed class hierarchy) | value buffer (`Pointer<Uint8>` + length) | same |
+| `T?`         | `T?`                | value buffer; `Interface?` stays a nullable pointer | same |
+| `[T]`        | `List<T>`           | value buffer (`Pointer<Uint8>` + length) | same |
+| `{K: V}`     | `Map<K, V>`         | value buffer (`Pointer<Uint8>` + length) | same |
 | `iter<T>`    | `Iterable<T>` (lazy) | `Pointer<Void>`       | `Pointer<Void>`      |
 
 Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
@@ -48,7 +48,7 @@ Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -119,39 +119,34 @@ enum ContactType {
 }
 ```
 
-Structs are wrapped in classes with a `dispose()` method and getter
-methods that call the C accessors:
+Structs are plain Dart value classes: one final typed field per IDL
+field plus a constructor with named arguments. They declare no C
+symbols (no destroy, no getters) and there's nothing to dispose:
 
 ```dart
 /// A contact record
 class Contact {
-  final Pointer<Void> _handle;
-  Contact._(this._handle);
+  final String name;
+  final String? email;
+  final int age;
 
-  void dispose() {
-    _weaveffiContactsContactDestroy(_handle);
-  }
-
-  String get name {
-    final result = _weaveffiContactsContactGetName(_handle);
-    final value = result.toDartString();
-    _weaveffiFreeString(result);
-    return value;
-  }
+  Contact({required this.name, this.email, required this.age});
 }
 ```
 
-String getters copy the returned pointer with `toDartString()` and
-release the producer's allocation with `weaveffi_free_string`.
+A `Contact` crosses the ABI serialized in the
+[value-buffer format](../reference/value-buffers.md) as a single
+pointer-plus-length pair; the library carries a private buffer writer
+and reader plus generated `_packContact`/`_unpackContact` helpers.
 
 Each function emits a native typedef, Dart typedef, lookup, and
 top-level wrapper:
 
 ```dart
-typedef _NativeWeaveffiContactsCreateContact =
-    Int64 Function(Pointer<Utf8>, Pointer<Utf8>, Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiContactsCreateContact =
-    int Function(Pointer<Utf8>, Pointer<Utf8>, int, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiContactsCreateContact = Int64 Function(
+    Pointer<Utf8>, Pointer<Uint8>, Size, Int32, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiContactsCreateContact = int Function(
+    Pointer<Utf8>, Pointer<Uint8>, int, int, Pointer<_WeaveFFIError>);
 final _weaveffiContactsCreateContact = _lib.lookupFunction<
     _NativeWeaveffiContactsCreateContact,
     _DartWeaveffiContactsCreateContact>('weaveffi_contacts_create_contact');
@@ -159,9 +154,12 @@ final _weaveffiContactsCreateContact = _lib.lookupFunction<
 int createContact(String name, String? email, ContactType contactType) {
   final err = calloc<_WeaveFFIError>();
   final namePtr = name.toNativeUtf8();
+  // Optionals are buffered: pack the argument into a value buffer that
+  // the producer borrows for the duration of the call.
+  final emailBuf = /* generated pack routine for String? */;
   try {
     final result = _weaveffiContactsCreateContact(
-        namePtr, email, contactType.value, err);
+        namePtr, emailBuf.ptr, emailBuf.len, contactType.value, err);
     _checkError(err);
     return result;
   } finally {
@@ -217,6 +215,11 @@ with `_checkKvException` (their doc comments read
 without `throws` uses the generic `_checkError`, which throws
 `WeaveFFIException` only if the producer misbehaves.
 
+An error code that declares payload `fields:` carries them serialized
+in the error's payload buffer; the mapper decodes them into typed
+fields on the exception before `weaveffi_error_clear` releases the
+buffer.
+
 ## Interfaces
 
 An `interfaces:` entry becomes a class holding the opaque pointer. A
@@ -270,8 +273,9 @@ class Store {
 ```
 
 Functions elsewhere in the IDL pass the wrapper's handle across the
-boundary (`getStats(store)` returns a new `Stats`). There's no
-finalizer; call `dispose()` when done, ideally in `try`/`finally`:
+boundary (`getStats(store)` returns a `Stats` record decoded from a
+value buffer). There's no finalizer; call `dispose()` when done, ideally
+in `try`/`finally`:
 
 ```dart
 final store = Store.open('/tmp/cache.kv');
@@ -288,101 +292,63 @@ try {
 
 A rich (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style enum surfaces as a Dart `enum` and crosses as an
-`Int32`; a rich enum instead lowers to an **opaque object handle**, so
-the generator emits a wrapper class with the same ownership model as a
-struct wrapper, a `Pointer<Void>` freed by an explicit `dispose()`.
+`Int32`; a rich enum instead becomes an idiomatic sealed class
+hierarchy: a sealed base class plus one subclass per variant named
+`{Enum}{Variant}`, each carrying that variant's fields. Rich enums
+declare no C symbols; values cross the ABI serialized in value buffers
+as an `i32` tag followed by the active variant's fields.
 
 For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
-count: u8 }`, the generator emits a companion `ShapeTag` enum, one
-`factory` per variant, a `tag` getter that maps the discriminant back to
-`ShapeTag`, and a getter per payload field:
+count: u8 }`, the generator emits:
 
 ```dart
 /// An algebraic shape (sum type with associated data)
-enum ShapeTag {
-  empty(0),
-  circle(1),
-  rectangle(2),
-  labeled(3),
-  ;
-  const ShapeTag(this.value);
-  final int value;
-
-  static ShapeTag fromValue(int value) =>
-      ShapeTag.values.firstWhere((e) => e.value == value);
+sealed class Shape {
+  const Shape();
 }
 
-/// An algebraic shape (sum type with associated data)
-class Shape {
-  final Pointer<Void> _handle;
-  Shape._(this._handle);
+/// The empty shape
+class ShapeEmpty extends Shape {}
 
-  void dispose() {
-    _weaveffiShapesShapeDestroy(_handle);
-  }
-
-  ShapeTag get tag =>
-      ShapeTag.fromValue(_weaveffiShapesShapeTag(_handle));
-
-  /// A circle with a radius
-  factory Shape.circle(double radius) {
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiShapesShapeCircleNew(radius, err);
-      _checkError(err);
-      return Shape._(result);
-    } finally {
-      calloc.free(err);
-    }
-  }
-
+/// A circle with a radius
+class ShapeCircle extends Shape {
   /// Radius in points
-  double get circleRadius {
-    final result = _weaveffiShapesShapeCircleGetRadius(_handle);
-    return result;
-  }
+  final double radius;
 
-  int get labeledCount {
-    final result = _weaveffiShapesShapeLabeledGetCount(_handle);
-    return result;
-  }
+  ShapeCircle({required this.radius});
+}
+
+/// A labeled shape with a small count
+class ShapeLabeled extends Shape {
+  final String label;
+  final int count;
+
+  ShapeLabeled({required this.label, required this.count});
 }
 ```
 
-The rest of the surface follows the same shape: factories
-`Shape.empty()`, `Shape.circle(radius)`, `Shape.rectangle(width,
-height)`, and `Shape.labeled(label, count)`; getters `circleRadius`,
-`rectangleWidth`, `rectangleHeight`, `labeledLabel`, and `labeledCount`.
-Each resolves a `weaveffi_shapes_Shape_<Variant>_new` /
-`weaveffi_shapes_Shape_<Variant>_get_<field>` symbol, and
-`weaveffi_shapes_Shape_tag` backs the `tag` getter.
-
-Construct a couple of variants, read the tag and a field, then pass the
-wrapper to a top-level function:
+Construct variants directly and match on the sealed hierarchy with an
+exhaustive `switch`:
 
 ```dart
-final circle = Shape.circle(2.0);
-final labeled = Shape.labeled('unit', 3);
-try {
-  if (circle.tag == ShapeTag.circle) {
-    print(circle.circleRadius);        // 2.0
-  }
-  print(labeled.labeledCount);         // 3
+final circle = ShapeCircle(radius: 2.0);
+final labeled = ShapeLabeled(label: 'unit', count: 3);
 
-  print(describe(circle));             // render via the C ABI
-  final bigger = scale(circle, 3.0);   // returns a new Shape
-  bigger.dispose();
-} finally {
-  circle.dispose();
-  labeled.dispose();
+switch (circle) {
+  case ShapeCircle(:final radius):
+    print(radius);                     // 2.0
+  case _:
+    break;
 }
+
+print(describe(circle));               // packs the buffer via the C ABI
+final bigger = scale(circle, 3.0);     // returns a new Shape value
 ```
 
-**Ownership:** a `Shape` wraps a `Pointer<Void>` that you own; call
-`dispose()` (which invokes `weaveffi_shapes_Shape_destroy`) exactly as
-with struct wrappers. The `Shape` returned by `scale` is a separate
-handle you also dispose.
+Values are plain Dart data: there's no native handle and nothing to
+dispose. The generated `_packShape`/`_unpackShape` helpers write and
+read the tagged wire format.
 
 ## Build instructions
 
@@ -434,30 +400,27 @@ Flutter:
   `toNativeUtf8()`. The wrapper frees the resulting pointer in a
   `finally` block. Returned UTF-8 pointers are copied with
   `toDartString()` and then released with `weaveffi_free_string`.
-- **Bytes, lists, and maps:** returned buffers are copied into Dart
-  collections, then the producer's allocation is released. String
-  elements are freed individually with `weaveffi_free_string` before
-  the backing buffer is freed with `weaveffi_free_bytes`.
-- **Structs and interfaces:** wrappers hold a `Pointer<Void>`. The
-  `dispose()` method calls the corresponding `_destroy` C function.
-  Always wrap usage in `try`/`finally`:
+- **Bytes:** returned buffers are copied into Dart collections, then
+  the producer's allocation is released with `weaveffi_free_bytes`.
+- **Buffered values (structs, rich enums, optionals, lists, maps):**
+  parameters are packed into a value buffer that the producer borrows
+  for the duration of the call; returns are copied into Dart memory,
+  released with `weaveffi_free_bytes`, and decoded with the generated
+  `_unpack*` helper. Nothing to dispose afterward:
 
   ```dart
-  final contact = getContact(id);
-  try {
-    print(contact.name);
-  } finally {
-    contact.dispose();
-  }
+  final contact = getContact(id); // a plain Contact value
+  print(contact.name);
   ```
 
-- **Optionals:** `T?` returns check the native pointer against
-  `nullptr` before wrapping; absent optionals become `null`. A boxed
-  optional scalar is dereferenced, then the box is freed with
-  `weaveffi_free_bytes`.
-- **Iterators:** each yielded element is copied (or, for records,
-  adopted by its wrapper class), and the iterator handle is destroyed
-  exactly once; see [Iterators](#iterators).
+- **Interfaces:** wrappers hold a `Pointer<Void>`. The `dispose()`
+  method calls the corresponding `_destroy` C function; always wrap
+  usage in `try`/`finally`. An absent `Interface?` is a `nullptr` that
+  becomes `null`.
+- **Iterators:** each yielded element is copied (or, for buffered
+  element types, decoded from a value buffer released with
+  `weaveffi_free_bytes`), and the iterator handle is destroyed exactly
+  once; see [Iterators](#iterators).
 
 ## Callbacks and listeners
 
@@ -527,7 +490,8 @@ Future<TaskResult> runTask(String name) {
   final namePtr = name.toNativeUtf8();
   late NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_task> callable;
   callable = NativeCallable<_NativeAsyncCb_weaveffi_tasks_run_task>.listener(
-      (Pointer<Void> context, Pointer<_WeaveFFIError> err, Pointer<Void> result) {
+      (Pointer<Void> context, Pointer<_WeaveFFIError> err,
+          Pointer<Uint8> resultPtr, int resultLen) {
     try {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
@@ -536,7 +500,8 @@ Future<TaskResult> runTask(String name) {
         completer.completeError(_mapTaskException(code, msg));
         return;
       }
-      completer.complete(TaskResult._(result));
+      // TaskResult is a record: decode the borrowed value buffer.
+      completer.complete(_unpackTaskResult(resultPtr, resultLen));
     } catch (e) {
       completer.completeError(e);
     } finally {
@@ -563,13 +528,13 @@ settles. The `dart:async` import is only emitted when the IDL contains
 at least one async function.
 
 Result ownership follows the async contract: the callback borrows
-string, bytes, list, map, and boxed optional scalar results, so the
-callback body deep-copies them into Dart values before it returns and
-never frees them (the producer does, after the callback returns).
-Object results (records, rich enums, interfaces, including optional
-ones) are the exception: the callback receives ownership, and the
-wrapper adopts the pointer, as `TaskResult._(result)` does above; its
-`dispose()` owns the eventual destroy.
+string, bytes, and buffered results (records, rich enums, optionals,
+lists, and maps arrive as a `(resultPtr, resultLen)` pair), so the
+callback body copies or decodes them into Dart values before it returns
+and never frees them (the producer does, after the callback returns).
+An owned interface result is the exception: the callback receives
+ownership and the wrapper adopts the pointer; its `dispose()` owns the
+eventual destroy.
 
 For a callable marked `throws: true`, the completion callback maps an
 error through the domain mapper (`_mapTaskException` above,
@@ -631,8 +596,9 @@ Iterable<String> getMessages() sync* {
 ```
 
 Each yielded string is copied with `toDartString()` and its producer
-allocation released with `weaveffi_free_string`; record elements are
-adopted by their wrapper class instead. The handle lifecycle covers
+allocation released with `weaveffi_free_string`; a buffered element is
+decoded from its value buffer and released with `weaveffi_free_bytes`
+instead. The handle lifecycle covers
 early abandonment: the `finally` block runs when the loop exhausts,
 when a step fails, or when the consumer stops iterating (Dart closes
 the suspended `sync*` frame on `break`). If an iteration is abandoned

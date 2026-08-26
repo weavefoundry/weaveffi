@@ -21,21 +21,21 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
-### Structs
+### Records
 
-Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields. A returned struct handle is owned by the consumer; the JS wrapper's `free()` releases it via the struct's `_destroy` symbol.
+Records are **plain JavaScript objects**. A record crosses the boundary serialized in the WeaveFFI value-buffer format as one pointer + length pair in linear memory; the glue packs and unpacks it automatically, so there are no handles, no accessor functions, and nothing to free.
 
 ### Enums
 
-Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. Rich (algebraic) enums are plain objects tagged by variant name (`{ tag: "Circle", radius: 2 }`) and cross the boundary serialized in a value buffer, exactly like records.
 
 ### Optionals
 
-Optional values use **`0` / `null`** to represent the absent case. Scalar optionals are boxed by pointer (a null pointer signals absence); handle-typed and string optionals pass a null pointer (`0`) directly.
+Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent).
 
-### Lists
+### Lists and Maps
 
-Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+Lists are JS arrays; maps are plain objects (a `Map` instance is also accepted on input). Both cross the boundary serialized in a value buffer as one pointer + length pair, recursing through element types.
 
 ### Iterators
 
@@ -45,13 +45,15 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 
 Each listener surfaces as a `register.../unregister...` pair. `register` takes a plain JS function and returns a numeric subscription id; `unregister` takes that id and stops delivery. Delivery is **synchronous and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events fire only while a call into the module is on the stack (for example, a producer function that emits during its own execution). A producer that emits from a spawned thread cannot run on this target at all.
 
-Callback arguments are **borrowed for the duration of the callback**: strings and byte buffers are copied into JS values before your function runs, but struct, rich-enum, and interface arguments wrap producer-owned memory. Read what you need inside the callback and do not retain the wrapper or call `free()` on it.
+Callback arguments are **borrowed for the duration of the callback**: strings, byte buffers, and buffered values (records, rich enums, optionals, lists, maps) are copied or decoded into JS values before your function runs, and interface arguments wrap producer-owned objects. Read what you need inside the callback and do not retain an interface wrapper or call `free()` on it.
 
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each Wasm function. Your Wasm module must
-export the following functions:
+pointer as the last argument to each Wasm function. The error struct is
+16 bytes on wasm32: `{ i32 code, char* message, uint8_t* payload_ptr,
+size_t payload_len }`. Your Wasm module must export the following
+functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
@@ -62,7 +64,9 @@ export the following functions:
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
-for producer panics and marshalling failures.
+for producer panics and marshalling failures. When the matched error code
+declares payload fields, the wrapper decodes them from the error's value
+buffer and attaches them as properties on the thrown error.
 
 ## API Reference
 
@@ -70,14 +74,14 @@ for producer panics and marshalling failures.
 
 #### Error Domain: `KvError`
 
-Throwing wrappers in this module raise `KvError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+Throwing wrappers in this module raise `KvError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`. Payload fields are decoded from the error's value buffer and attached as properties on the thrown error.
 
-| Class | Code | Default Message |
-|-------|------|-----------------|
-| `KeyNotFound` | `1001` | key not found |
-| `Expired` | `1002` | entry expired |
-| `StoreFull` | `1003` | store has reached capacity |
-| `IoError` | `1004` | I/O failure |
+| Class | Code | Default Message | Payload Fields |
+|-------|------|-----------------|----------------|
+| `KeyNotFound` | `1001` | key not found | (none) |
+| `Expired` | `1002` | entry expired | (none) |
+| `StoreFull` | `1003` | store has reached capacity | (none) |
+| `IoError` | `1004` | I/O failure | (none) |
 
 #### Interfaces
 
@@ -85,65 +89,65 @@ Throwing wrappers in this module raise `KvError` (a `WeaveFFIError` subclass); e
 
 An in-memory key-value store owning its entries; destroying the object releases all of its state
 
-Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+Passed as an **opaque object pointer** (`i32`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
 
 ##### `weaveffi_kv_Store_open`
 
 Open (or create) a store backed by the given filesystem path
 
-`weaveffi_kv_Store_open(path: i32, i32) -> i64`
+`weaveffi_kv_Store_open(path: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `path` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `Store` | `i64` | opaque handle in linear memory |
+| `path` | `string` | `i32` | NUL-terminated C string pointer |
+| _returns_ | `Store` | `i32` | opaque object pointer |
 
 ##### `weaveffi_kv_Store_put`
 
 Insert or replace a value, returning true on success
 
-`weaveffi_kv_Store_put(key: i32, i32, value: i32, i32, kind: i32, ttl_seconds: i32) -> i32`
+`weaveffi_kv_Store_put(key: i32, value: i32, i32, kind: i32, ttl_seconds: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| `key` | `string` | `i32` | NUL-terminated C string pointer |
 | `value` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | `kind` | `EntryKind` | `i32` | variant discriminant |
-| `ttl_seconds` | `i64?` | `i32` | boxed scalar pointer, 0 = absent |
+| `ttl_seconds` | `i64?` | `i32, i32` | value buffer: ptr + len in linear memory |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
 ##### `weaveffi_kv_Store_get`
 
 Look up an entry by key; returns null if missing or expired
 
-`weaveffi_kv_Store_get(key: i32, i32) -> i64`
+`weaveffi_kv_Store_get(key: i32) -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `key` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `Entry?` | `i64` | opaque handle, 0 = absent |
+| `key` | `string` | `i32` | NUL-terminated C string pointer |
+| _returns_ | `Entry?` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 ##### `weaveffi_kv_Store_delete`
 
 Remove the entry for the given key, returning true if it existed
 
-`weaveffi_kv_Store_delete(key: i32, i32) -> i32`
+`weaveffi_kv_Store_delete(key: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| `key` | `string` | `i32` | NUL-terminated C string pointer |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
 ##### `weaveffi_kv_Store_list_keys`
 
 Stream every key, optionally filtered by a prefix
 
-`weaveffi_kv_Store_list_keys(prefix: i32) -> i64`
+`weaveffi_kv_Store_list_keys(prefix: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `prefix` | `string?` | `i32` | nullable pointer, 0 = absent |
-| _returns_ | `iter<string>` | `i64` | opaque iterator handle |
+| `prefix` | `string?` | `i32, i32` | value buffer: ptr + len in linear memory |
+| _returns_ | `iter<string>` | `i32` | opaque iterator handle |
 
 ##### `weaveffi_kv_Store_count`
 
@@ -180,11 +184,11 @@ Legacy single-shot put kept for compatibility
 
 **Deprecated:** use put() with explicit kind
 
-`weaveffi_kv_Store_legacy_put(key: i32, i32, value: i32, i32) -> i32`
+`weaveffi_kv_Store_legacy_put(key: i32, value: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `key` | `string` | `i32, i32` | ptr + len in linear memory |
+| `key` | `string` | `i32` | NUL-terminated C string pointer |
 | `value` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `bool` | `i32` | 0 = false, 1 = true |
 
@@ -208,34 +212,17 @@ Releases the object reference. Called by the wrapper's `free()`.
 
 A single key-value entry persisted in the store
 
-Passed as opaque handle (`i64`).
+A plain JS object, serialized in a value buffer (`i32` ptr + `i32` len) at the boundary. Fields in declaration (wire) order:
 
-| Accessor | Wasm Return |
-|----------|-------------|
-| `weaveffi_kv_Entry_get_id` | `i64` |
-| `weaveffi_kv_Entry_get_key` | `i32, i32` |
-| `weaveffi_kv_Entry_get_value` | `i32, i32` |
-| `weaveffi_kv_Entry_get_created_at` | `i64` |
-| `weaveffi_kv_Entry_get_expires_at` | `i32` |
-| `weaveffi_kv_Entry_get_tags` | `i32, i32` |
-| `weaveffi_kv_Entry_get_metadata` | `i64` |
-
-##### `EntryBuilder`
-
-Builder for `Entry`.
-
-| Function | Args | Return |
-|----------|------|--------|
-| `weaveffi_kv_Entry_Builder_new` | none | `i32` (handle) |
-| `weaveffi_kv_Entry_Builder_set_id` | `i32` handle, `i64` value | none |
-| `weaveffi_kv_Entry_Builder_set_key` | `i32` handle, `i32, i32` value | none |
-| `weaveffi_kv_Entry_Builder_set_value` | `i32` handle, `i32, i32` value | none |
-| `weaveffi_kv_Entry_Builder_set_created_at` | `i32` handle, `i64` value | none |
-| `weaveffi_kv_Entry_Builder_set_expires_at` | `i32` handle, `i32` value | none |
-| `weaveffi_kv_Entry_Builder_set_tags` | `i32` handle, `i32, i32` value | none |
-| `weaveffi_kv_Entry_Builder_set_metadata` | `i32` handle, `i64` value | none |
-| `weaveffi_kv_Entry_Builder_build` | `i32` handle | `i32` (handle) |
-| `weaveffi_kv_Entry_Builder_destroy` | `i32` handle | none |
+| Field | Type |
+|-------|------|
+| `id` | `i64` |
+| `key` | `string` |
+| `value` | `bytes` |
+| `created_at` | `i64` |
+| `expires_at` | `i64?` |
+| `tags` | `[string]` |
+| `metadata` | `{string:string}` |
 
 #### Enums
 

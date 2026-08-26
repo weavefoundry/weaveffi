@@ -28,25 +28,22 @@ class Unit(IntEnum):
 
 # Top-level struct that references a struct defined one level deeper.
 class Canvas:
-    @property
-    def width(self) -> int: ...
+    width: int
     # Reference down into a nested module
-    @property
-    def root(self) -> "Shape": ...
+    root: "Shape"
+    def __init__(self, width: int, root: "Shape") -> None: ...
 
 # Construct a Canvas.
 def new_canvas(width: int) -> "Canvas": ...
 
 # A struct one level deep that references both an ancestor enum and a deeper struct.
 class Shape:
-    @property
-    def sides(self) -> int: ...
+    sides: int
     # Reference up to the parent module's enum
-    @property
-    def unit(self) -> "Unit": ...
+    unit: "Unit"
     # Reference down into a deeper module
-    @property
-    def detail(self) -> "Detail": ...
+    detail: "Detail"
+    def __init__(self, sides: int, unit: "Unit", detail: "Detail") -> None: ...
 
 # Construct a Shape.
 def make_shape(sides: int) -> "Shape": ...
@@ -56,8 +53,8 @@ def describe() -> "Canvas": ...
 
 # A struct two levels deep.
 class Detail:
-    @property
-    def area(self) -> float: ...
+    area: float
+    def __init__(self, area: float) -> None: ...
 
 # Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
 def compute(shape: "Shape") -> "Detail": ...

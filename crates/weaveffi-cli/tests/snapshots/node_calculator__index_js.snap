@@ -21,8 +21,8 @@ if (process.env.WEAVEFFI_ADDON) {
 }
 
 // Re-export every native binding, then layer the idiomatic wrappers
-// (error classes, interface and rich-enum classes, function wrappers)
-// on top.
+// (error classes, interface classes, buffer pack/unpack, function
+// wrappers) on top.
 const wv = {};
 for (const _name of Object.getOwnPropertyNames(addon)) {
   wv[_name] = addon[_name];
@@ -41,7 +41,7 @@ function __generic(code, message) {
   return new WeaveFFIError(code, message);
 }
 function __rebrand(e, map) {
-  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+  return e && typeof e.code === 'number' ? map(e.code, e.message, e.payload) : e;
 }
 function __invoke(fn, args, map) {
   try {
@@ -72,9 +72,10 @@ class DivisionByZeroError extends CalcError {
 DivisionByZeroError.CODE = 1;
 wv.DivisionByZeroError = DivisionByZeroError;
 const __calculatorErrorCodes = Object.freeze({ 1: DivisionByZeroError });
-function __calculatorErrorFrom(code, message) {
+function __calculatorErrorFrom(code, message, payload) {
   const _cls = __calculatorErrorCodes[code];
-  return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+  const _err = _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);
+  return _err;
 }
 
 wv.add = function (a, b) {

@@ -28,14 +28,28 @@ pub(crate) fn gen_callback_type(c: &CallbackBinding) -> syn::Result<TokenStream>
 
 /// Build the four pieces the emit helper needs for one callback parameter: the
 /// Rust parameter it accepts, the lowering preamble, the C call argument(s) it
-/// forwards, and any post-call cleanup. Borrowed inputs (`&str`, `&[u8]`,
-/// `&Record`) are lowered into temporaries that live across every dispatch and
-/// are freed once afterward, mirroring the hand-written events sample.
+/// forwards, and any post-call cleanup. Borrowed inputs (`&str`, `&[u8]`, and
+/// buffered composites taken as `&T`) are lowered into temporaries that live
+/// across every dispatch and are freed once afterward, mirroring the
+/// hand-written events sample.
 fn emit_callback_param(
     pb: &ParamBinding,
 ) -> syn::Result<(TokenStream, TokenStream, Vec<TokenStream>, TokenStream)> {
     let n = ident(&pb.name);
     let none = TokenStream::new();
+    // A buffered payload is borrowed for the dispatch: encode it once into a
+    // local value buffer, hand every subscriber the same `(ptr, len)` view,
+    // and let the encoding drop after the loop.
+    if weaveffi_core::abi::is_buffered(&pb.ty) {
+        let rt = typeref_to_rust(&pb.ty)?;
+        let tmp = ident(&format!("__wv_cb_{}", pb.name));
+        return Ok((
+            quote!(#n: &#rt),
+            quote!(let #tmp = ::weaveffi::abi::encode_value(#n);),
+            vec![quote!(#tmp.as_ptr()), quote!(#tmp.len())],
+            none,
+        ));
+    }
     Ok(match &pb.ty {
         TypeRef::Enum(name) => {
             let et = rust_type_ident(name);
@@ -59,34 +73,12 @@ fn emit_callback_param(
                 quote!(::weaveffi::abi::free_string(#tmp);),
             )
         }
-        TypeRef::Optional(inner)
-            if matches!(**inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
-        {
-            let tmp = ident(&format!("__wv_cb_{}", pb.name));
-            (
-                quote!(#n: ::std::option::Option<&str>),
-                quote!(let #tmp = ::weaveffi::abi::lower_opt_string(#n);),
-                vec![quote!(#tmp)],
-                quote!(if !#tmp.is_null() { ::weaveffi::abi::free_string(#tmp); }),
-            )
-        }
         TypeRef::Bytes | TypeRef::BorrowedBytes => (
             quote!(#n: &[u8]),
             none.clone(),
             vec![quote!(#n.as_ptr()), quote!(#n.len())],
             none,
         ),
-        // A record or rich-enum payload is borrowed for the dispatch: the
-        // producer keeps ownership and the host copies what it needs.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) => {
-            let st = rust_type_ident(s);
-            (
-                quote!(#n: &#st),
-                none.clone(),
-                vec![quote!(#n as *const #st)],
-                none,
-            )
-        }
         _ => return Err(unsupported(&pb.name, "callback parameter type")),
     })
 }

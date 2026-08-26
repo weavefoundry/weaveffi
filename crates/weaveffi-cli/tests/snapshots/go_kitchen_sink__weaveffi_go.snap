@@ -18,9 +18,12 @@ extern void goWv_weaveffi_kitchen_do_cancellable_callback(void* context, weaveff
 import "C"
 
 import (
+	"encoding/binary"
 	"fmt"
 	"iter"
+	"math"
 	"sync"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -47,18 +50,23 @@ func (e *WeaveFFIError) Error() string {
 }
 
 // wvTakeError reads and clears a non-zero C error slot, returning its
-// code and message.
-func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+// code, message, and a copy of its structured payload buffer (nil when
+// the code declares no payload fields).
+func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {
 	code := int32(cErr.code)
 	msg := ""
 	if cErr.message != nil {
 		msg = C.GoString(cErr.message)
 	}
+	var payload []byte
+	if cErr.payload_ptr != nil {
+		payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))
+	}
 	C.weaveffi_error_clear(cErr)
-	return code, msg
+	return code, msg, payload
 }
 
-func wvBrandError(code int32, message string) error {
+func wvBrandError(code int32, message string, _ []byte) error {
 	return &WeaveFFIError{Code: code, Message: message}
 }
 
@@ -67,9 +75,217 @@ func wvBrandError(code int32, message string) error {
 // a producer panic or a marshalling failure.
 func wvTrap(cErr *C.weaveffi_error) {
 	if cErr.code != 0 {
-		code, msg := wvTakeError(cErr)
+		code, msg, _ := wvTakeError(cErr)
 		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
 	}
+}
+
+// wvWriter serializes values into the WeaveFFI value-buffer format:
+// little-endian, packed, u32 length prefixes.
+type wvWriter struct {
+	buf []byte
+}
+
+func (w *wvWriter) writeBool(v bool) {
+	if v {
+		w.buf = append(w.buf, 1)
+	} else {
+		w.buf = append(w.buf, 0)
+	}
+}
+
+func (w *wvWriter) writeI8(v int8) {
+	w.buf = append(w.buf, byte(v))
+}
+
+func (w *wvWriter) writeU8(v uint8) {
+	w.buf = append(w.buf, v)
+}
+
+func (w *wvWriter) writeI16(v int16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, uint16(v))
+}
+
+func (w *wvWriter) writeU16(v uint16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, v)
+}
+
+func (w *wvWriter) writeI32(v int32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(v))
+}
+
+func (w *wvWriter) writeU32(v uint32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
+}
+
+func (w *wvWriter) writeI64(v int64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))
+}
+
+func (w *wvWriter) writeU64(v uint64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, v)
+}
+
+func (w *wvWriter) writeF32(v float32) {
+	w.writeU32(math.Float32bits(v))
+}
+
+func (w *wvWriter) writeF64(v float64) {
+	w.writeU64(math.Float64bits(v))
+}
+
+func (w *wvWriter) writeLen(n int) {
+	if n < 0 || uint64(n) > uint64(^uint32(0)) {
+		panic("weaveffi: value-buffer length exceeds u32 range")
+	}
+	w.writeU32(uint32(n))
+}
+
+func (w *wvWriter) writeString(v string) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeBytes(v []byte) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeOptionFlag(present bool) {
+	w.writeBool(present)
+}
+
+// wvReader decodes values from the WeaveFFI value-buffer format. A
+// malformed buffer is a producer/consumer contract violation, so every
+// read panics (the same channel a trapped producer error uses) instead
+// of returning a typed domain error.
+type wvReader struct {
+	buf []byte
+	pos int
+}
+
+func wvMalformed(context string) {
+	panic("weaveffi: malformed value buffer: " + context)
+}
+
+func (r *wvReader) take(n int, context string) []byte {
+	if n < 0 || len(r.buf)-r.pos < n {
+		wvMalformed(context)
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
+
+func (r *wvReader) readBool() bool {
+	switch r.take(1, "bool")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("bool byte out of range")
+	return false
+}
+
+func (r *wvReader) readI8() int8 {
+	return int8(r.take(1, "i8")[0])
+}
+
+func (r *wvReader) readU8() uint8 {
+	return r.take(1, "u8")[0]
+}
+
+func (r *wvReader) readI16() int16 {
+	return int16(binary.LittleEndian.Uint16(r.take(2, "i16")))
+}
+
+func (r *wvReader) readU16() uint16 {
+	return binary.LittleEndian.Uint16(r.take(2, "u16"))
+}
+
+func (r *wvReader) readI32() int32 {
+	return int32(binary.LittleEndian.Uint32(r.take(4, "i32")))
+}
+
+func (r *wvReader) readU32() uint32 {
+	return binary.LittleEndian.Uint32(r.take(4, "u32"))
+}
+
+func (r *wvReader) readI64() int64 {
+	return int64(binary.LittleEndian.Uint64(r.take(8, "i64")))
+}
+
+func (r *wvReader) readU64() uint64 {
+	return binary.LittleEndian.Uint64(r.take(8, "u64"))
+}
+
+func (r *wvReader) readF32() float32 {
+	return math.Float32frombits(r.readU32())
+}
+
+func (r *wvReader) readF64() float64 {
+	return math.Float64frombits(r.readU64())
+}
+
+func (r *wvReader) readLen() int {
+	n := int(r.readU32())
+	if n > len(r.buf)-r.pos {
+		wvMalformed("length prefix exceeds remaining buffer")
+	}
+	return n
+}
+
+func (r *wvReader) readString() string {
+	b := r.take(r.readLen(), "string bytes")
+	if !utf8.Valid(b) {
+		wvMalformed("string is not valid UTF-8")
+	}
+	return string(b)
+}
+
+func (r *wvReader) readBytes() []byte {
+	b := r.take(r.readLen(), "byte buffer")
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+func (r *wvReader) readOptionFlag() bool {
+	switch r.take(1, "option flag")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("option flag byte out of range")
+	return false
+}
+
+func (r *wvReader) expectEnd() {
+	if r.pos != len(r.buf) {
+		wvMalformed("trailing bytes after value")
+	}
+}
+
+// wvCopyBuffer copies an owned, producer-allocated value buffer into Go
+// memory and releases it with weaveffi_free_bytes.
+func wvCopyBuffer(ptr *C.uint8_t, length C.size_t) []byte {
+	if ptr == nil {
+		return nil
+	}
+	out := C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+	C.weaveffi_free_bytes(ptr, length)
+	return out
+}
+
+// wvBorrowBuffer copies a borrowed value buffer into Go memory. The
+// producer keeps ownership and frees it after the borrowing call returns.
+func wvBorrowBuffer(ptr *C.uint8_t, length C.size_t) []byte {
+	if ptr == nil {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length))
 }
 
 var (
@@ -108,27 +324,30 @@ func wvCallbackDelete(id uint64) {
 	delete(wvCallbacks, id)
 }
 
-// Token: A reusable token referenced across modules
-type Token struct {
+// TokenHandle is a typed handle naming a producer-owned resource. It wraps
+// the opaque C pointer and owes no release call.
+type TokenHandle struct {
 	ptr *C.weaveffi_shared_Token
 }
 
-func (s *Token) Id() int64 {
-	return int64(C.weaveffi_shared_Token_get_id(s.ptr))
+// Token: A reusable token referenced across modules
+type Token struct {
+	Id int64
+	Label string
 }
 
-func (s *Token) Label() string {
-	cStr := C.weaveffi_shared_Token_get_label(s.ptr)
-	goResult := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return goResult
+// wvPackToken appends v to w in the value-buffer wire format.
+func wvPackToken(w *wvWriter, v Token) {
+	w.writeI64(v.Id)
+	w.writeString(v.Label)
 }
 
-func (s *Token) Close() {
-	if s.ptr != nil {
-		C.weaveffi_shared_Token_destroy(s.ptr)
-		s.ptr = nil
-	}
+// wvUnpackToken decodes one Token from r.
+func wvUnpackToken(r *wvReader) Token {
+	var v Token
+	v.Id = r.readI64()
+	v.Label = r.readString()
+	return v
 }
 
 // Ping: Trivial cross-module helper
@@ -163,7 +382,7 @@ const (
 
 // wvMapKitchen converts a non-zero code from the `kitchen` domain into a
 // *KitchenErrorsError, falling back to the generic *WeaveFFIError for unknown codes.
-func wvMapKitchen(code int32, message string) error {
+func wvMapKitchen(code int32, message string, payload []byte) error {
 	switch code {
 	case KitchenErrorsErrorNotFound:
 		if message == "" {
@@ -176,7 +395,7 @@ func wvMapKitchen(code int32, message string) error {
 		}
 		return &KitchenErrorsError{Code: code, Message: message}
 	default:
-		return wvBrandError(code, message)
+		return wvBrandError(code, message, payload)
 	}
 }
 
@@ -194,278 +413,86 @@ const (
 
 // Item: Kitchen sink struct exercising every field feature
 type Item struct {
-	ptr *C.weaveffi_kitchen_Item
+	// Id: Stable identifier
+	Id int64
+	// Name: Display name
+	Name string
+	// Count: Initial count
+	Count int32
+	// Enabled: Whether the item is enabled
+	Enabled bool
+	// Ratio: Scaling ratio
+	Ratio float64
+	Nick uint32
+	Payload []byte
+	Tags []string
+	Attrs map[string]string
+	Parent *int64
+	// Token: Cross-module struct reference
+	Token Token
+	Priority Priority
 }
 
-// Id: Stable identifier
-func (s *Item) Id() int64 {
-	return int64(C.weaveffi_kitchen_Item_get_id(s.ptr))
-}
-
-// Name: Display name
-func (s *Item) Name() string {
-	cStr := C.weaveffi_kitchen_Item_get_name(s.ptr)
-	goResult := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return goResult
-}
-
-// Count: Initial count
-func (s *Item) Count() int32 {
-	return int32(C.weaveffi_kitchen_Item_get_count(s.ptr))
-}
-
-// Enabled: Whether the item is enabled
-func (s *Item) Enabled() bool {
-	return cToBool(C.weaveffi_kitchen_Item_get_enabled(s.ptr))
-}
-
-// Ratio: Scaling ratio
-func (s *Item) Ratio() float64 {
-	return float64(C.weaveffi_kitchen_Item_get_ratio(s.ptr))
-}
-
-func (s *Item) Nick() uint32 {
-	return uint32(C.weaveffi_kitchen_Item_get_nick(s.ptr))
-}
-
-func (s *Item) Payload() []byte {
-	var cOutLen C.size_t
-	result := C.weaveffi_kitchen_Item_get_payload(s.ptr, &cOutLen)
-	if result == nil {
-		return nil
+// wvPackItem appends v to w in the value-buffer wire format.
+func wvPackItem(w *wvWriter, v Item) {
+	w.writeI64(v.Id)
+	w.writeString(v.Name)
+	w.writeI32(v.Count)
+	w.writeBool(v.Enabled)
+	w.writeF64(v.Ratio)
+	w.writeU32(v.Nick)
+	w.writeBytes(v.Payload)
+	w.writeLen(len(v.Tags))
+	for _, eTags0 := range v.Tags {
+		w.writeString(eTags0)
 	}
-	goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))
-	C.weaveffi_free_bytes(result, cOutLen)
-	return goResult
-}
-
-func (s *Item) Tags() []string {
-	var cOutLen C.size_t
-	result := C.weaveffi_kitchen_Item_get_tags(s.ptr, &cOutLen)
-	count := int(cOutLen)
-	goResult := make([]string, count)
-	if count > 0 && result != nil {
-		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
-			goResult[i] = C.GoString(v)
-			C.weaveffi_free_string(v)
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
+	w.writeLen(len(v.Attrs))
+	for kAttrs0, vAttrs0 := range v.Attrs {
+		w.writeString(kAttrs0)
+		w.writeString(vAttrs0)
 	}
-	return goResult
-}
-
-func (s *Item) Attrs() map[string]string {
-	var cMapKeys **C.char
-	var cMapVals **C.char
-	var cOutLen C.size_t
-	C.weaveffi_kitchen_Item_get_attrs(s.ptr, &cMapKeys, &cMapVals, &cOutLen)
-	count := int(cOutLen)
-	goResult := make(map[string]string, count)
-	if count > 0 && cMapKeys != nil && cMapVals != nil {
-		keySlice := unsafe.Slice(cMapKeys, count)
-		valSlice := unsafe.Slice(cMapVals, count)
-		for i := 0; i < count; i++ {
-			goResult[C.GoString(keySlice[i])] = C.GoString(valSlice[i])
-			C.weaveffi_free_string(keySlice[i])
-			C.weaveffi_free_string(valSlice[i])
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))
+	if v.Parent == nil {
+		w.writeOptionFlag(false)
+	} else {
+		w.writeOptionFlag(true)
+		w.writeI64((*v.Parent))
 	}
-	return goResult
+	wvPackToken(w, v.Token)
+	w.writeI32(int32(v.Priority))
 }
 
-func (s *Item) Parent() *int64 {
-	cVal := C.weaveffi_kitchen_Item_get_parent(s.ptr)
-	if cVal == nil {
-		return nil
+// wvUnpackItem decodes one Item from r.
+func wvUnpackItem(r *wvReader) Item {
+	var v Item
+	v.Id = r.readI64()
+	v.Name = r.readString()
+	v.Count = r.readI32()
+	v.Enabled = r.readBool()
+	v.Ratio = r.readF64()
+	v.Nick = r.readU32()
+	v.Payload = r.readBytes()
+	nTags0 := r.readLen()
+	v.Tags = make([]string, nTags0)
+	for iTags0 := range v.Tags {
+		v.Tags[iTags0] = r.readString()
 	}
-	v := int64(*cVal)
-	C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cVal)), C.size_t(unsafe.Sizeof(*cVal)))
-	return &v
-}
-
-// Token: Cross-module struct reference
-func (s *Item) Token() *Token {
-	return &Token{ptr: C.weaveffi_kitchen_Item_get_token(s.ptr)}
-}
-
-func (s *Item) Priority() Priority {
-	return Priority(C.weaveffi_kitchen_Item_get_priority(s.ptr))
-}
-
-func (s *Item) Close() {
-	if s.ptr != nil {
-		C.weaveffi_kitchen_Item_destroy(s.ptr)
-		s.ptr = nil
+	nAttrs0 := r.readLen()
+	v.Attrs = make(map[string]string, nAttrs0)
+	for iAttrs0 := 0; iAttrs0 < nAttrs0; iAttrs0++ {
+		var kAttrs0 string
+		kAttrs0 = r.readString()
+		var vAttrs0 string
+		vAttrs0 = r.readString()
+		v.Attrs[kAttrs0] = vAttrs0
 	}
-}
-
-// ItemBuilder: Kitchen sink struct exercising every field feature
-type ItemBuilder struct {
-	id int64
-	name string
-	count int32
-	enabled bool
-	ratio float64
-	nick uint32
-	payload []byte
-	tags []string
-	attrs map[string]string
-	parent *int64
-	token *Token
-	priority Priority
-}
-
-func NewItemBuilder() *ItemBuilder {
-	return &ItemBuilder{}
-}
-
-// WithId: Stable identifier
-func (b *ItemBuilder) WithId(value int64) *ItemBuilder {
-	b.id = value
-	return b
-}
-
-// WithName: Display name
-func (b *ItemBuilder) WithName(value string) *ItemBuilder {
-	b.name = value
-	return b
-}
-
-// WithCount: Initial count
-func (b *ItemBuilder) WithCount(value int32) *ItemBuilder {
-	b.count = value
-	return b
-}
-
-// WithEnabled: Whether the item is enabled
-func (b *ItemBuilder) WithEnabled(value bool) *ItemBuilder {
-	b.enabled = value
-	return b
-}
-
-// WithRatio: Scaling ratio
-func (b *ItemBuilder) WithRatio(value float64) *ItemBuilder {
-	b.ratio = value
-	return b
-}
-
-func (b *ItemBuilder) WithNick(value uint32) *ItemBuilder {
-	b.nick = value
-	return b
-}
-
-func (b *ItemBuilder) WithPayload(value []byte) *ItemBuilder {
-	b.payload = value
-	return b
-}
-
-func (b *ItemBuilder) WithTags(value []string) *ItemBuilder {
-	b.tags = value
-	return b
-}
-
-func (b *ItemBuilder) WithAttrs(value map[string]string) *ItemBuilder {
-	b.attrs = value
-	return b
-}
-
-func (b *ItemBuilder) WithParent(value *int64) *ItemBuilder {
-	b.parent = value
-	return b
-}
-
-// WithToken: Cross-module struct reference
-func (b *ItemBuilder) WithToken(value *Token) *ItemBuilder {
-	b.token = value
-	return b
-}
-
-func (b *ItemBuilder) WithPriority(value Priority) *ItemBuilder {
-	b.priority = value
-	return b
-}
-
-func (b *ItemBuilder) Build() (*Item, error) {
-	id := b.id
-	name := b.name
-	cName := C.CString(name)
-	defer C.free(unsafe.Pointer(cName))
-	count := b.count
-	enabled := b.enabled
-	ratio := b.ratio
-	nick := b.nick
-	payload := b.payload
-	var cPayloadPtr *C.uint8_t
-	cPayloadLen := C.size_t(len(payload))
-	if len(payload) > 0 {
-		cPayloadPtr = (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+	if r.readOptionFlag() {
+		var oParent0 int64
+		oParent0 = r.readI64()
+		v.Parent = &oParent0
 	}
-	tags := b.tags
-	cTagsLen := C.size_t(len(tags))
-	cTagsArr := make([]*C.char, len(tags))
-	for i, s := range tags {
-		cTagsArr[i] = C.CString(s)
-	}
-	defer func() {
-		for _, p := range cTagsArr {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
-	var cTagsPtr **C.char
-	if len(cTagsArr) > 0 {
-		cTagsPtr = (**C.char)(unsafe.Pointer(&cTagsArr[0]))
-	}
-	attrs := b.attrs
-	cAttrsLen := C.size_t(len(attrs))
-	keysAttrs := make([]string, 0, len(attrs))
-	valsAttrs := make([]string, 0, len(attrs))
-	for mk, mv := range attrs {
-		keysAttrs = append(keysAttrs, mk)
-		valsAttrs = append(valsAttrs, mv)
-	}
-	cAttrsKeysPtrArr := make([]*C.char, len(keysAttrs))
-	for i, s := range keysAttrs {
-		cAttrsKeysPtrArr[i] = C.CString(s)
-	}
-	defer func() {
-		for _, p := range cAttrsKeysPtrArr {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
-	var cAttrsKeysPtr **C.char
-	if len(cAttrsKeysPtrArr) > 0 {
-		cAttrsKeysPtr = (**C.char)(unsafe.Pointer(&cAttrsKeysPtrArr[0]))
-	}
-	cAttrsValsPtrArr := make([]*C.char, len(valsAttrs))
-	for i, s := range valsAttrs {
-		cAttrsValsPtrArr[i] = C.CString(s)
-	}
-	defer func() {
-		for _, p := range cAttrsValsPtrArr {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
-	var cAttrsValsPtr **C.char
-	if len(cAttrsValsPtrArr) > 0 {
-		cAttrsValsPtr = (**C.char)(unsafe.Pointer(&cAttrsValsPtrArr[0]))
-	}
-	parent := b.parent
-	var cParent *C.int64_t
-	if parent != nil {
-		tmp := C.int64_t(*parent)
-		cParent = &tmp
-	}
-	token := b.token
-	priority := b.priority
-	var cErr C.weaveffi_error
-	result := C.weaveffi_kitchen_Item_create(C.int64_t(id), cName, C.int32_t(count), boolToC(enabled), C.double(ratio), C.uint32_t(nick), cPayloadPtr, cPayloadLen, cTagsPtr, cTagsLen, cAttrsKeysPtr, cAttrsValsPtr, cAttrsLen, cParent, token.ptr, C.weaveffi_kitchen_Priority(priority), &cErr)
-	if cErr.code != 0 {
-		return nil, wvBrandError(wvTakeError(&cErr))
-	}
-	return &Item{ptr: result}, nil
+	v.Token = wvUnpackToken(r)
+	v.Priority = Priority(r.readI32())
+	return v
 }
 
 // Gadget: A pocket-sized interface exercising the object surface
@@ -661,63 +688,67 @@ func OpenHandle() int64 {
 }
 
 // OpenTypedHandle: Returns a typed handle
-func OpenTypedHandle() *Token {
+func OpenTypedHandle() *TokenHandle {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_open_typed_handle(&cErr)
 	wvTrap(&cErr)
-	return &Token{ptr: result}
+	return &TokenHandle{ptr: result}
 }
 
 // MaybeItem: Optional struct return
 func MaybeItem(id int64) (*Item, error) {
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_kitchen_maybe_item(C.int64_t(id), &cErr)
+	result := C.weaveffi_kitchen_maybe_item(C.int64_t(id), &cOutLen, &cErr)
 	if cErr.code != 0 {
 		return nil, wvMapKitchen(wvTakeError(&cErr))
 	}
-	if result == nil {
-		return nil, nil
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult *Item
+	if rRes.readOptionFlag() {
+		var oRes0 Item
+		oRes0 = wvUnpackItem(rRes)
+		goResult = &oRes0
 	}
-	return &Item{ptr: result}, nil
+	rRes.expectEnd()
+	return goResult, nil
 }
 
 // ListItems: List of structs
-func ListItems() []*Item {
+func ListItems() []Item {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
 	result := C.weaveffi_kitchen_list_items(&cOutLen, &cErr)
 	wvTrap(&cErr)
-	count := int(cOutLen)
-	goResult := make([]*Item, count)
-	if count > 0 && result != nil {
-		for i, v := range unsafe.Slice((**C.weaveffi_kitchen_Item)(unsafe.Pointer(result)), count) {
-			goResult[i] = &Item{ptr: v}
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult []Item
+	nRes0 := rRes.readLen()
+	goResult = make([]Item, nRes0)
+	for iRes0 := range goResult {
+		goResult[iRes0] = wvUnpackItem(rRes)
 	}
+	rRes.expectEnd()
 	return goResult
 }
 
 // GetAttrs: Map return type
 func GetAttrs() map[string]int32 {
-	var cMapKeys **C.char
-	var cMapVals *C.int32_t
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	C.weaveffi_kitchen_get_attrs(&cMapKeys, &cMapVals, &cOutLen, &cErr)
+	result := C.weaveffi_kitchen_get_attrs(&cOutLen, &cErr)
 	wvTrap(&cErr)
-	count := int(cOutLen)
-	goResult := make(map[string]int32, count)
-	if count > 0 && cMapKeys != nil && cMapVals != nil {
-		keySlice := unsafe.Slice(cMapKeys, count)
-		valSlice := unsafe.Slice(cMapVals, count)
-		for i := 0; i < count; i++ {
-			goResult[C.GoString(keySlice[i])] = int32(valSlice[i])
-			C.weaveffi_free_string(keySlice[i])
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult map[string]int32
+	nRes0 := rRes.readLen()
+	goResult = make(map[string]int32, nRes0)
+	for iRes0 := 0; iRes0 < nRes0; iRes0++ {
+		var kRes0 string
+		kRes0 = rRes.readString()
+		var vRes0 int32
+		vRes0 = rRes.readI32()
+		goResult[kRes0] = vRes0
 	}
+	rRes.expectEnd()
 	return goResult
 }
 
@@ -728,21 +759,25 @@ func GetAttrs() map[string]int32 {
 // early; each range over the sequence launches a fresh producer iterator.
 // A reported error can only be a producer bug and panics with the
 // weaveffi message.
-func StreamItems() iter.Seq[*Item] {
-	return func(yield func(*Item) bool) {
+func StreamItems() iter.Seq[Item] {
+	return func(yield func(Item) bool) {
 		var cErr C.weaveffi_error
 		it := C.weaveffi_kitchen_stream_items(&cErr)
 		wvTrap(&cErr)
 		defer C.weaveffi_kitchen_StreamItemsIterator_destroy(it)
 		for {
-			var outItem *C.weaveffi_kitchen_Item
+			var outItem *C.uint8_t
+			var outLen C.size_t
 			var iterErr C.weaveffi_error
-			ok := C.weaveffi_kitchen_StreamItemsIterator_next(it, &outItem, &iterErr) != 0
+			ok := C.weaveffi_kitchen_StreamItemsIterator_next(it, &outItem, &outLen, &iterErr) != 0
 			wvTrap(&iterErr)
 			if !ok {
 				return
 			}
-			item := &Item{ptr: outItem}
+			rItem := &wvReader{buf: wvCopyBuffer(outItem, outLen)}
+			var item Item
+			item = wvUnpackItem(rItem)
+			rItem.expectEnd()
 			if !yield(item) {
 				return
 			}
@@ -751,11 +786,16 @@ func StreamItems() iter.Seq[*Item] {
 }
 
 // CrossModuleToken: Returns the shared Token type from another module
-func CrossModuleToken() *Token {
+func CrossModuleToken() Token {
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_kitchen_cross_module_token(&cErr)
+	result := C.weaveffi_kitchen_cross_module_token(&cOutLen, &cErr)
 	wvTrap(&cErr)
-	return &Token{ptr: result}
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult Token
+	goResult = wvUnpackToken(rRes)
+	rRes.expectEnd()
+	return goResult
 }
 
 type wvOutcomeKitchenDoAsync struct {

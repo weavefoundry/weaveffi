@@ -9,12 +9,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Handles   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
-//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
+//   Buffered  -> records, rich enums, optionals, lists, and maps cross
+//                as one value buffer: i32 pointer + i32 length
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
  * thrown directly for unknown codes, marshalling failures, and producer
@@ -55,10 +56,10 @@ const _CONTACTS_ERROR_CODES = Object.freeze({
 
 // Build the ContactsError subclass matching `code`, or a generic
 // WeaveFFIError for codes outside the domain (panics, marshalling).
-function _contactsErrorFrom(code, message) {
+function _contactsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
   const _cls = _CONTACTS_ERROR_CODES[code];
-  if (!_cls) return new WeaveFFIError(code, message);
-  return message ? new _cls(message) : new _cls();
+  const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
+  return _e;
 }
 
 const _enc = new TextEncoder();
@@ -92,10 +93,142 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Allocate a zeroed {i32 code, i32 message} error slot.
+// Stage a byte buffer (or an encoded value buffer); returns [ptr, len];
+// release with weaveffi_dealloc(ptr, len).
+function _bytes(wasm, data) {
+  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const ptr = wasm.weaveffi_alloc(u8.length);
+  if (u8.length) new Uint8Array(wasm.memory.buffer, ptr, u8.length).set(u8);
+  return [ptr, u8.length];
+}
+
+// Copy then free a producer-owned byte (or value) buffer.
+function _takeBytes(wasm, ptr, len) {
+  if (ptr === 0 || len === 0) return new Uint8Array(0);
+  const copy = new Uint8Array(wasm.memory.buffer, ptr, len).slice();
+  wasm.weaveffi_free_bytes(ptr, len);
+  return copy;
+}
+
+// Growable little-endian byte writer implementing the WeaveFFI value-buffer
+// wire format: values are packed back to back with no alignment; lengths and
+// counts are u32; strings are u32 byte length + UTF-8 bytes (no NUL).
+class _BufWriter {
+  constructor() {
+    this._u8 = new Uint8Array(64);
+    this._dv = new DataView(this._u8.buffer);
+    this._len = 0;
+  }
+  _need(n) {
+    if (this._len + n <= this._u8.length) return;
+    let cap = this._u8.length * 2;
+    while (cap < this._len + n) cap *= 2;
+    const u8 = new Uint8Array(cap);
+    u8.set(this._u8.subarray(0, this._len));
+    this._u8 = u8;
+    this._dv = new DataView(u8.buffer);
+  }
+  bool(v) { this._need(1); this._dv.setUint8(this._len, v ? 1 : 0); this._len += 1; }
+  i8(v) { this._need(1); this._dv.setInt8(this._len, v); this._len += 1; }
+  u8(v) { this._need(1); this._dv.setUint8(this._len, v); this._len += 1; }
+  i16(v) { this._need(2); this._dv.setInt16(this._len, v, true); this._len += 2; }
+  u16(v) { this._need(2); this._dv.setUint16(this._len, v, true); this._len += 2; }
+  i32(v) { this._need(4); this._dv.setInt32(this._len, v, true); this._len += 4; }
+  u32(v) { this._need(4); this._dv.setUint32(this._len, v, true); this._len += 4; }
+  i64(v) { this._need(8); this._dv.setBigInt64(this._len, BigInt(v), true); this._len += 8; }
+  u64(v) { this._need(8); this._dv.setBigUint64(this._len, BigInt(v), true); this._len += 8; }
+  f32(v) { this._need(4); this._dv.setFloat32(this._len, v, true); this._len += 4; }
+  f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }
+  len(n) { this.u32(n); }
+  flag(present) { this.u8(present ? 1 : 0); }
+  str(v) {
+    const b = _enc.encode(v);
+    this.len(b.length);
+    this._need(b.length);
+    this._u8.set(b, this._len);
+    this._len += b.length;
+  }
+  bytes(v) {
+    const b = v instanceof Uint8Array ? v : new Uint8Array(v);
+    this.len(b.length);
+    this._need(b.length);
+    this._u8.set(b, this._len);
+    this._len += b.length;
+  }
+  finish() { return this._u8.subarray(0, this._len); }
+}
+
+const _bufDec = new TextDecoder('utf-8', { fatal: true });
+
+// Strict little-endian reader for the WeaveFFI value-buffer wire format. A
+// malformed buffer (truncation, invalid bool or flag bytes, an oversized
+// length prefix, invalid UTF-8, trailing bytes) is a producer/consumer
+// contract violation and throws the generic brand error; code -3 marks a
+// consumer-side marshalling failure.
+class _BufReader {
+  constructor(bytes) {
+    this._u8 = bytes;
+    this._dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    this._pos = 0;
+  }
+  _bad(what) {
+    throw new WeaveFFIError(-3, 'malformed value buffer: ' + what);
+  }
+  _take(n, what) {
+    if (this._pos + n > this._u8.length) this._bad('truncated ' + what);
+    const at = this._pos;
+    this._pos += n;
+    return at;
+  }
+  bool() {
+    const b = this._u8[this._take(1, 'bool')];
+    if (b > 1) this._bad('bool byte out of range');
+    return b === 1;
+  }
+  i8() { return this._dv.getInt8(this._take(1, 'i8')); }
+  u8() { return this._u8[this._take(1, 'u8')]; }
+  i16() { return this._dv.getInt16(this._take(2, 'i16'), true); }
+  u16() { return this._dv.getUint16(this._take(2, 'u16'), true); }
+  i32() { return this._dv.getInt32(this._take(4, 'i32'), true); }
+  u32() { return this._dv.getUint32(this._take(4, 'u32'), true); }
+  i64() { return this._dv.getBigInt64(this._take(8, 'i64'), true); }
+  u64() { return this._dv.getBigUint64(this._take(8, 'u64'), true); }
+  f32() { return this._dv.getFloat32(this._take(4, 'f32'), true); }
+  f64() { return this._dv.getFloat64(this._take(8, 'f64'), true); }
+  len() {
+    const n = this.u32();
+    if (n > this._u8.length - this._pos) this._bad('length prefix exceeds remaining buffer');
+    return n;
+  }
+  flag() {
+    const b = this._u8[this._take(1, 'option flag')];
+    if (b > 1) this._bad('option flag byte out of range');
+    return b === 1;
+  }
+  str() {
+    const n = this.len();
+    const at = this._take(n, 'string bytes');
+    try {
+      return _bufDec.decode(this._u8.subarray(at, at + n));
+    } catch (e) {
+      this._bad('string is not valid UTF-8');
+    }
+  }
+  bytes() {
+    const n = this.len();
+    const at = this._take(n, 'byte buffer');
+    return this._u8.subarray(at, at + n).slice();
+  }
+  end() {
+    if (this._pos !== this._u8.length) this._bad('trailing bytes after value');
+  }
+}
+
+// Allocate a zeroed 16-byte error slot:
+// { i32 code, char* message, uint8_t* payload_ptr, size_t payload_len }.
 function _allocErr(wasm) {
-  const ptr = wasm.weaveffi_alloc(8);
-  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  const ptr = wasm.weaveffi_alloc(16);
+  new Uint8Array(wasm.memory.buffer, ptr, 16).fill(0);
   return ptr;
 }
 
@@ -110,14 +243,14 @@ function _checkErr(wasm, errPtr) {
     const msgPtr = dv.getUint32(errPtr + 4, true);
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
+    wasm.weaveffi_dealloc(errPtr, 16);
     throw new WeaveFFIError(code, msg);
   }
 }
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
-  wasm.weaveffi_dealloc(errPtr, 8);
+  wasm.weaveffi_dealloc(errPtr, 16);
 }
 
 // Throw the `ContactsError` domain error (and free the slot) if the error slot
@@ -126,12 +259,37 @@ function _checkContactsError(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = dv.getUint32(errPtr + 4, true);
-    const msg = _readCStr(wasm, msgPtr) || '';
+    const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+    const _e = _contactsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
-    throw _contactsErrorFrom(code, msg);
+    wasm.weaveffi_dealloc(errPtr, 16);
+    throw _e;
   }
+}
+
+// Serialize a `contacts.Contact` record into the value-buffer wire format.
+function _write_contacts_Contact(w, v) {
+  w.i64(v.id);
+  w.str(v.first_name);
+  w.str(v.last_name);
+  if (v.email === null || v.email === undefined) {
+    w.flag(false);
+  } else {
+    w.flag(true);
+    w.str(v.email);
+  }
+  w.i32(v.contact_type);
+}
+
+// Decode a `contacts.Contact` record from the value-buffer wire format.
+function _read_contacts_Contact(r) {
+  const v = {};
+  v.id = r.i64();
+  v.first_name = r.str();
+  v.last_name = r.str();
+  v.email = (r.flag() ? r.str() : null);
+  v.contact_type = r.i32();
+  return v;
 }
 
 export const ContactType = Object.freeze({
@@ -139,58 +297,6 @@ export const ContactType = Object.freeze({
   Work: 1,
   Other: 2,
 });
-
-class Contact {
-  constructor(wasm, handle) {
-    this._wasm = wasm;
-    this._handle = handle;
-  }
-  get id() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_contacts_Contact_get_id(this._handle);
-    return _r;
-  }
-  get first_name() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_contacts_Contact_get_first_name(this._handle);
-    return _takeCStr(wasm, _r);
-  }
-  get last_name() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_contacts_Contact_get_last_name(this._handle);
-    return _takeCStr(wasm, _r);
-  }
-  get email() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_contacts_Contact_get_email(this._handle);
-    return _takeCStr(wasm, _r);
-  }
-  get contact_type() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_contacts_Contact_get_contact_type(this._handle);
-    return _r;
-  }
-  static create(wasm, id, first_name, last_name, email, contact_type) {
-    const [a1_p, a1_s] = _cstr(wasm, first_name);
-    const [a2_p, a2_s] = _cstr(wasm, last_name);
-    let a3_p = 0, a3_s = 0;
-    if (email !== null && email !== undefined) { [a3_p, a3_s] = _cstr(wasm, email); }
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_contacts_Contact_create(BigInt(id), a1_p, a2_p, a3_p, contact_type, _err);
-    wasm.weaveffi_dealloc(a1_p, a1_s);
-    wasm.weaveffi_dealloc(a2_p, a2_s);
-    if (a3_p !== 0) wasm.weaveffi_dealloc(a3_p, a3_s);
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Contact(wasm, _r);
-  }
-  free() {
-    if (this._handle !== 0) {
-      this._wasm.weaveffi_contacts_Contact_destroy(this._handle);
-      this._handle = 0;
-    }
-  }
-}
 
 /**
  * Load a WeaveFFI Wasm module from the given URL.
@@ -207,9 +313,8 @@ class Contact {
  * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct: returns a wrapper instance exposing field getters.
- * const person = api.contacts.create();
- * console.log(person.name);
+ * // Record: plain objects in and out (serialized automatically).
+ * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
@@ -250,23 +355,41 @@ export async function loadWeaveffiWasm(url) {
     add(firstName, lastName, email, contactType) {
       const [a0_p, a0_s] = _cstr(wasm, firstName);
       const [a1_p, a1_s] = _cstr(wasm, lastName);
-      let a2_p = 0, a2_s = 0;
-      if (email !== null && email !== undefined) { [a2_p, a2_s] = _cstr(wasm, email); }
+      const a2_w = new _BufWriter();
+      if (email === null || email === undefined) {
+        a2_w.flag(false);
+      } else {
+        a2_w.flag(true);
+        a2_w.str(email);
+      }
+      const [a2_p, a2_l] = _bytes(wasm, a2_w.finish());
+      const _lp = wasm.weaveffi_alloc(4);
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_contacts_ContactBook_add(this._handle, a0_p, a1_p, a2_p, contactType, _err);
+      const _r = wasm.weaveffi_contacts_ContactBook_add(this._handle, a0_p, a1_p, a2_p, a2_l, contactType, _lp, _err);
       wasm.weaveffi_dealloc(a0_p, a0_s);
       wasm.weaveffi_dealloc(a1_p, a1_s);
-      if (a2_p !== 0) wasm.weaveffi_dealloc(a2_p, a2_s);
+      wasm.weaveffi_dealloc(a2_p, a2_l);
       _checkContactsError(wasm, _err);
       _freeErr(wasm, _err);
-      return new Contact(wasm, _r);
+      const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
+      wasm.weaveffi_dealloc(_lp, 4);
+      const _rd = new _BufReader(_takeBytes(wasm, _r, _len));
+      const _out = _read_contacts_Contact(_rd);
+      _rd.end();
+      return _out;
     }
     get(id) {
+      const _lp = wasm.weaveffi_alloc(4);
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_contacts_ContactBook_get(this._handle, BigInt(id), _err);
+      const _r = wasm.weaveffi_contacts_ContactBook_get(this._handle, BigInt(id), _lp, _err);
       _checkContactsError(wasm, _err);
       _freeErr(wasm, _err);
-      return new Contact(wasm, _r);
+      const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
+      wasm.weaveffi_dealloc(_lp, 4);
+      const _rd = new _BufReader(_takeBytes(wasm, _r, _len));
+      const _out = _read_contacts_Contact(_rd);
+      _rd.end();
+      return _out;
     }
     list() {
       const _lp = wasm.weaveffi_alloc(4);
@@ -274,15 +397,11 @@ export async function loadWeaveffiWasm(url) {
       const _r = wasm.weaveffi_contacts_ContactBook_list(this._handle, _lp, _err);
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
-      const _dv = new DataView(wasm.memory.buffer);
-      const _len = _dv.getUint32(_lp, true);
+      const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
       wasm.weaveffi_dealloc(_lp, 4);
-      const _out = [];
-      {
-        const dv = new DataView(wasm.memory.buffer);
-        for (let i = 0; i < _len; i++) _out.push(new Contact(wasm, dv.getInt32(_r + i * 4, true)));
-      }
-      if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
+      const _rd = new _BufReader(_takeBytes(wasm, _r, _len));
+      const _out = (() => { const _n = _rd.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(_read_contacts_Contact(_rd)); return _arr; })();
+      _rd.end();
       return _out;
     }
     remove(id) {
@@ -305,9 +424,6 @@ export async function loadWeaveffiWasm(url) {
     _raw: wasm,
     contacts: {
       ContactBook: ContactBook,
-      Contact: {
-        create: (...args) => Contact.create(wasm, ...args),
-      },
     },
   };
 }

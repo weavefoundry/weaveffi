@@ -42,26 +42,127 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 /// Typed errors reported by the `graphics` module.
@@ -81,7 +182,7 @@ public enum GraphicsError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapGraphics(code: Int32, message: String) -> Error {
+func mapGraphics(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return GraphicsError.outOfBounds(message: message.isEmpty ? "coordinate out of bounds" : message)
     default: return WeaveFFIError.error(code: code, message: message)
@@ -93,8 +194,9 @@ func checkGraphics(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapGraphics(code: code, message: message)
+        throw mapGraphics(code: code, message: message, payload: payload)
     }
 }
 
@@ -105,105 +207,147 @@ public enum Unit: UInt32 {
 }
 
 /// Top-level struct that references a struct defined one level deeper.
-public class Canvas {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_graphics_Canvas_destroy(ptr)
-    }
-
-    public var width: Int32 {
-        return weaveffi_graphics_Canvas_get_width(ptr)
-    }
-
+public struct Canvas {
+    public var width: Int32
     /// Reference down into a nested module
-    public var root: Shape {
-        return Shape(ptr: weaveffi_graphics_Canvas_get_root(ptr)!)
+    public var root: Shape
+
+    /// Creates a `Canvas` value.
+    public init(width: Int32, root: Shape) {
+        self.width = width
+        self.root = root
     }
+}
+
+/// Serializes a `Canvas` into the value-buffer wire format.
+func wvWriteCanvas(_ value: Canvas, into w: inout WvWriter) {
+    w.writeInt32(value.width)
+    wvWriteShape(value.root, into: &w)
+}
+
+/// Deserializes a `Canvas` from the value-buffer wire format.
+func wvReadCanvas(_ r: inout WvReader) -> Canvas {
+    let v0 = r.readInt32()
+    let v1 = wvReadShape(&r)
+    return Canvas(width: v0, root: v1)
 }
 
 /// A struct one level deep that references both an ancestor enum and a deeper struct.
-public class Shape {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_graphics_shapes_Shape_destroy(ptr)
-    }
-
-    public var sides: Int32 {
-        return weaveffi_graphics_shapes_Shape_get_sides(ptr)
-    }
-
+public struct Shape {
+    public var sides: Int32
     /// Reference up to the parent module's enum
-    public var unit: Unit {
-        return Unit(rawValue: weaveffi_graphics_shapes_Shape_get_unit(ptr).rawValue)!
-    }
-
+    public var unit: Unit
     /// Reference down into a deeper module
-    public var detail: Detail {
-        return Detail(ptr: weaveffi_graphics_shapes_Shape_get_detail(ptr)!)
+    public var detail: Detail
+
+    /// Creates a `Shape` value.
+    public init(sides: Int32, unit: Unit, detail: Detail) {
+        self.sides = sides
+        self.unit = unit
+        self.detail = detail
     }
 }
 
+/// Serializes a `Shape` into the value-buffer wire format.
+func wvWriteShape(_ value: Shape, into w: inout WvWriter) {
+    w.writeInt32(value.sides)
+    w.writeInt32(Int32(bitPattern: value.unit.rawValue))
+    wvWriteDetail(value.detail, into: &w)
+}
+
+/// Deserializes a `Shape` from the value-buffer wire format.
+func wvReadShape(_ r: inout WvReader) -> Shape {
+    let v0 = r.readInt32()
+    let v1 = Unit(rawValue: UInt32(bitPattern: r.readInt32()))!
+    let v2 = wvReadDetail(&r)
+    return Shape(sides: v0, unit: v1, detail: v2)
+}
+
 /// A struct two levels deep.
-public class Detail {
-    let ptr: OpaquePointer
+public struct Detail {
+    public var area: Double
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
+    /// Creates a `Detail` value.
+    public init(area: Double) {
+        self.area = area
     }
+}
 
-    deinit {
-        weaveffi_graphics_shapes_geometry_Detail_destroy(ptr)
-    }
+/// Serializes a `Detail` into the value-buffer wire format.
+func wvWriteDetail(_ value: Detail, into w: inout WvWriter) {
+    w.writeDouble(value.area)
+}
 
-    public var area: Double {
-        return weaveffi_graphics_shapes_geometry_Detail_get_area(ptr)
-    }
+/// Deserializes a `Detail` from the value-buffer wire format.
+func wvReadDetail(_ r: inout WvReader) -> Detail {
+    let v0 = r.readDouble()
+    return Detail(area: v0)
 }
 
 public enum Graphics {
     /// Construct a Canvas.
     public static func newCanvas(width: Int32) -> Canvas {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_graphics_new_canvas(width, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_graphics_new_canvas(width, &outLen, &err)
         trap(&err)
-        guard let rv = rv else { fatalError("-1: null pointer") }
-        return Canvas(ptr: rv)
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadCanvas(&rvReader)
+        rvReader.finish()
+        return v0
     }
     public enum Shapes {
         /// Construct a Shape.
         public static func makeShape(sides: Int32) -> Shape {
-            var err = weaveffi_error(code: 0, message: nil)
-            let rv = weaveffi_graphics_shapes_make_shape(sides, &err)
+            var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+            var outLen: Int = 0
+            let rv = weaveffi_graphics_shapes_make_shape(sides, &outLen, &err)
             trap(&err)
-            guard let rv = rv else { fatalError("-1: null pointer") }
-            return Shape(ptr: rv)
+            guard let rv = rv else { fatalError("-1: null buffer") }
+            let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+            weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+            var rvReader = WvReader(bytes: rvBytes)
+            let v0 = wvReadShape(&rvReader)
+            rvReader.finish()
+            return v0
         }
         /// Nested function returning a struct owned by an ancestor module.
         public static func describe() -> Canvas {
-            var err = weaveffi_error(code: 0, message: nil)
-            let rv = weaveffi_graphics_shapes_describe(&err)
+            var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+            var outLen: Int = 0
+            let rv = weaveffi_graphics_shapes_describe(&outLen, &err)
             trap(&err)
-            guard let rv = rv else { fatalError("-1: null pointer") }
-            return Canvas(ptr: rv)
+            guard let rv = rv else { fatalError("-1: null buffer") }
+            let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+            weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+            var rvReader = WvReader(bytes: rvBytes)
+            let v0 = wvReadCanvas(&rvReader)
+            rvReader.finish()
+            return v0
         }
         public enum Geometry {
             /// Deeper function taking an ancestor-module struct. Throws through the root module's inherited GraphicsError domain.
             public static func compute(shape: Shape) throws -> Detail {
-                var err = weaveffi_error(code: 0, message: nil)
-                let rv = weaveffi_graphics_shapes_geometry_compute(shape.ptr, &err)
+                var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+                var shapeWriter = WvWriter()
+                wvWriteShape(shape, into: &shapeWriter)
+                var outLen: Int = 0
+                let rv: UnsafePointer<UInt8>? = shapeWriter.bytes.withUnsafeBufferPointer { shape_buf in
+                    let shape_ptr = shape_buf.baseAddress
+                    let shape_len = shape_buf.count
+                    return weaveffi_graphics_shapes_geometry_compute(shape_ptr, shape_len, &outLen, &err)
+                }
                 try checkGraphics(&err)
-                guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-                return Detail(ptr: rv)
+                guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+                let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+                weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+                var rvReader = WvReader(bytes: rvBytes)
+                let v0 = wvReadDetail(&rvReader)
+                rvReader.finish()
+                return v0
             }
         }
     }

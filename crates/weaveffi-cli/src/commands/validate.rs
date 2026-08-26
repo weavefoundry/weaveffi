@@ -127,9 +127,8 @@ fn validation_error_code(err: &ValidationError) -> &'static str {
         ValidationError::ListenerCallbackNotFound { .. } => "ListenerCallbackNotFound",
         ValidationError::DuplicateListenerName { .. } => "DuplicateListenerName",
         ValidationError::IteratorInInvalidPosition { .. } => "IteratorInInvalidPosition",
-        ValidationError::UnsupportedElementType { .. } => "UnsupportedElementType",
+        ValidationError::MutableParamUnsupported { .. } => "MutableParamUnsupported",
         ValidationError::AsyncIteratorReturn { .. } => "AsyncIteratorReturn",
-        ValidationError::BuilderStructEmpty { .. } => "BuilderStructEmpty",
         ValidationError::UnsupportedSchemaVersion { .. } => "UnsupportedSchemaVersion",
         ValidationError::DuplicateInterfaceName { .. } => "DuplicateInterfaceName",
         ValidationError::DuplicateInterfaceMember { .. } => "DuplicateInterfaceMember",
@@ -189,8 +188,7 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
         | ValidationError::DuplicateEnumName { module, name }
         | ValidationError::EmptyEnum { module, name }
         | ValidationError::DuplicateCallbackName { module, name }
-        | ValidationError::DuplicateListenerName { module, name }
-        | ValidationError::BuilderStructEmpty { module, name } => {
+        | ValidationError::DuplicateListenerName { module, name } => {
             obj.insert("module".into(), Value::String(module.clone()));
             obj.insert("name".into(), Value::String(name.clone()));
         }
@@ -252,8 +250,13 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
         ValidationError::IteratorInInvalidPosition { location } => {
             obj.insert("location".into(), Value::String(location.clone()));
         }
-        ValidationError::UnsupportedElementType { location, ty } => {
-            obj.insert("location".into(), Value::String(location.clone()));
+        ValidationError::MutableParamUnsupported {
+            function,
+            param,
+            ty,
+        } => {
+            obj.insert("function".into(), Value::String(function.clone()));
+            obj.insert("param".into(), Value::String(param.clone()));
             obj.insert("type".into(), Value::String(ty.clone()));
         }
         ValidationError::AsyncIteratorReturn { module, function } => {

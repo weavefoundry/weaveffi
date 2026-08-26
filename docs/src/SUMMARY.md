@@ -11,6 +11,7 @@
 - [Samples](samples.md)
 - [Reference](reference/README.md)
   - [IDL Schema](reference/idl.md)
+  - [Value Buffer Protocol](reference/value-buffers.md)
   - [Memory & Error Model](reference/memory-error.md)
   - [Naming and Package Conventions](reference/naming.md)
 - [Generators](generators/README.md)

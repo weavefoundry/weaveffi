@@ -3,13 +3,13 @@
 //! This module is the single source of truth for *how a validated `Api`
 //! lowers onto the stable C ABI*: which symbols exist, the exact ordered
 //! parameter list of each, and how every [`TypeRef`] crosses the boundary
-//! (by value, as a pointer, as `ptr`+`len`, as parallel `keys`/`values`
-//! arrays, with a trailing `out_err`, …).
+//! (by value, as a pointer, as `ptr`+`len`, as a serialized value buffer,
+//! with a trailing `out_err`, …).
 //!
 //! Before this module existed, each of the eleven language generators *and*
 //! the Rust scaffold re-derived the calling convention independently, kept in
 //! sync only by snapshot tests. They now share [`lower_param`],
-//! [`lower_return`], [`element_ctype`], [`callback_result_params`], and the
+//! [`lower_return`], [`is_buffered`], [`callback_result_params`], and the
 //! signature assembly helpers below, and map the resulting [`CType`] onto
 //! their own FFI vocabulary. The C rendering ([`CType::render_c`]) is the
 //! canonical one.
@@ -19,8 +19,7 @@ pub mod lower;
 
 pub use ctype::{CType, ConstPos};
 pub use lower::{
-    callback_result_params, element_ctype, lower_param, lower_return, struct_tag, AbiParam,
-    AbiReturn,
+    callback_result_params, is_buffered, lower_param, lower_return, struct_tag, AbiParam, AbiReturn,
 };
 
 use weaveffi_ir::ir::{Function, Param, TypeRef};

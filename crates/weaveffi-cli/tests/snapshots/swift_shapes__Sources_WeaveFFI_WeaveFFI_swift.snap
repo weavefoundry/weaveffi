@@ -42,140 +42,191 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 /// An algebraic shape (sum type with associated data)
-public class Shape {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_shapes_Shape_destroy(ptr)
-    }
-
-    public enum Tag: Int32 {
-        /// The empty shape (a unit variant)
-        case empty = 0
-        /// A circle with a radius
-        case circle = 1
-        /// An axis-aligned rectangle
-        case rectangle = 2
-        /// An integer-bounded shape (exercises narrow + wide ints)
-        case bounded = 3
-        /// A labeled shape with a small count
-        case labeled = 4
-    }
-
-    /// The active variant's discriminant.
-    public var tag: Tag {
-        return Tag(rawValue: weaveffi_shapes_Shape_tag(ptr))!
-    }
-
+public enum Shape {
     /// The empty shape (a unit variant)
-    public static func empty() throws -> Shape {
-        var err = weaveffi_error(code: 0, message: nil)
-        let ptr = weaveffi_shapes_Shape_Empty_new(&err)
-        try check(&err)
-        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Shape(ptr: ptr)
-    }
-
+    case empty
     /// A circle with a radius
-    public static func circle(radius: Double) throws -> Shape {
-        var err = weaveffi_error(code: 0, message: nil)
-        let ptr = weaveffi_shapes_Shape_Circle_new(radius, &err)
-        try check(&err)
-        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Shape(ptr: ptr)
-    }
-
+    case circle(radius: Double)
     /// An axis-aligned rectangle
-    public static func rectangle(width: Float, height: Float) throws -> Shape {
-        var err = weaveffi_error(code: 0, message: nil)
-        let ptr = weaveffi_shapes_Shape_Rectangle_new(width, height, &err)
-        try check(&err)
-        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Shape(ptr: ptr)
-    }
-
+    case rectangle(width: Float, height: Float)
     /// An integer-bounded shape (exercises narrow + wide ints)
-    public static func bounded(min: Int16, max: Int16, weight: UInt64) throws -> Shape {
-        var err = weaveffi_error(code: 0, message: nil)
-        let ptr = weaveffi_shapes_Shape_Bounded_new(min, max, weight, &err)
-        try check(&err)
-        guard let ptr = ptr else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Shape(ptr: ptr)
-    }
-
+    case bounded(min: Int16, max: Int16, weight: UInt64)
     /// A labeled shape with a small count
-    public static func labeled(label: String, count: UInt8) throws -> Shape {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: OpaquePointer? = label.withCString { label_ptr in
-                return weaveffi_shapes_Shape_Labeled_new(label_ptr, count, &err)
-        }
-        try check(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Shape(ptr: result)
+    case labeled(label: String, count: UInt8)
+}
+
+/// Serializes a `Shape` into the value-buffer wire format.
+func wvWriteShape(_ value: Shape, into w: inout WvWriter) {
+    switch value {
+    case .empty:
+        w.writeInt32(0)
+    case let .circle(v0):
+        w.writeInt32(1)
+        w.writeDouble(v0)
+    case let .rectangle(v1, v2):
+        w.writeInt32(2)
+        w.writeFloat(v1)
+        w.writeFloat(v2)
+    case let .bounded(v3, v4, v5):
+        w.writeInt32(3)
+        w.writeInt16(v3)
+        w.writeInt16(v4)
+        w.writeUInt64(v5)
+    case let .labeled(v6, v7):
+        w.writeInt32(4)
+        w.writeString(v6)
+        w.writeUInt8(v7)
     }
+}
 
-
-    /// Radius in points
-    public var circleRadius: Double {
-        return weaveffi_shapes_Shape_Circle_get_radius(ptr)
-    }
-
-    public var rectangleWidth: Float {
-        return weaveffi_shapes_Shape_Rectangle_get_width(ptr)
-    }
-
-    public var rectangleHeight: Float {
-        return weaveffi_shapes_Shape_Rectangle_get_height(ptr)
-    }
-
-    public var boundedMin: Int16 {
-        return weaveffi_shapes_Shape_Bounded_get_min(ptr)
-    }
-
-    public var boundedMax: Int16 {
-        return weaveffi_shapes_Shape_Bounded_get_max(ptr)
-    }
-
-    public var boundedWeight: UInt64 {
-        return weaveffi_shapes_Shape_Bounded_get_weight(ptr)
-    }
-
-    public var labeledLabel: String {
-        let raw = weaveffi_shapes_Shape_Labeled_get_label(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
-    public var labeledCount: UInt8 {
-        return weaveffi_shapes_Shape_Labeled_get_count(ptr)
+/// Deserializes a `Shape` from the value-buffer wire format.
+func wvReadShape(_ r: inout WvReader) -> Shape {
+    let tag = r.readInt32()
+    switch tag {
+    case 0:
+        return .empty
+    case 1:
+        let v8 = r.readDouble()
+        return .circle(radius: v8)
+    case 2:
+        let v9 = r.readFloat()
+        let v10 = r.readFloat()
+        return .rectangle(width: v9, height: v10)
+    case 3:
+        let v11 = r.readInt16()
+        let v12 = r.readInt16()
+        let v13 = r.readUInt64()
+        return .bounded(min: v11, max: v12, weight: v13)
+    case 4:
+        let v14 = r.readString()
+        let v15 = r.readUInt8()
+        return .labeled(label: v14, count: v15)
+    default:
+        wvDecodeFailure("unknown Shape tag \(tag)")
     }
 }
 
@@ -187,63 +238,73 @@ public enum Channel: UInt32 {
 }
 
 /// One field per supported numeric primitive
-public class Numerics {
-    let ptr: OpaquePointer
+public struct Numerics {
+    public var a: Int8
+    public var b: Int16
+    public var c: Int32
+    public var d: Int64
+    public var e: UInt8
+    public var f: UInt16
+    public var g: UInt32
+    public var h: UInt64
+    public var i: Float
+    public var j: Double
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
+    /// Creates a `Numerics` value.
+    public init(a: Int8, b: Int16, c: Int32, d: Int64, e: UInt8, f: UInt16, g: UInt32, h: UInt64, i: Float, j: Double) {
+        self.a = a
+        self.b = b
+        self.c = c
+        self.d = d
+        self.e = e
+        self.f = f
+        self.g = g
+        self.h = h
+        self.i = i
+        self.j = j
     }
+}
 
-    deinit {
-        weaveffi_shapes_Numerics_destroy(ptr)
-    }
+/// Serializes a `Numerics` into the value-buffer wire format.
+func wvWriteNumerics(_ value: Numerics, into w: inout WvWriter) {
+    w.writeInt8(value.a)
+    w.writeInt16(value.b)
+    w.writeInt32(value.c)
+    w.writeInt64(value.d)
+    w.writeUInt8(value.e)
+    w.writeUInt16(value.f)
+    w.writeUInt32(value.g)
+    w.writeUInt64(value.h)
+    w.writeFloat(value.i)
+    w.writeDouble(value.j)
+}
 
-    public var a: Int8 {
-        return weaveffi_shapes_Numerics_get_a(ptr)
-    }
-
-    public var b: Int16 {
-        return weaveffi_shapes_Numerics_get_b(ptr)
-    }
-
-    public var c: Int32 {
-        return weaveffi_shapes_Numerics_get_c(ptr)
-    }
-
-    public var d: Int64 {
-        return weaveffi_shapes_Numerics_get_d(ptr)
-    }
-
-    public var e: UInt8 {
-        return weaveffi_shapes_Numerics_get_e(ptr)
-    }
-
-    public var f: UInt16 {
-        return weaveffi_shapes_Numerics_get_f(ptr)
-    }
-
-    public var g: UInt32 {
-        return weaveffi_shapes_Numerics_get_g(ptr)
-    }
-
-    public var h: UInt64 {
-        return weaveffi_shapes_Numerics_get_h(ptr)
-    }
-
-    public var i: Float {
-        return weaveffi_shapes_Numerics_get_i(ptr)
-    }
-
-    public var j: Double {
-        return weaveffi_shapes_Numerics_get_j(ptr)
-    }
+/// Deserializes a `Numerics` from the value-buffer wire format.
+func wvReadNumerics(_ r: inout WvReader) -> Numerics {
+    let v0 = r.readInt8()
+    let v1 = r.readInt16()
+    let v2 = r.readInt32()
+    let v3 = r.readInt64()
+    let v4 = r.readUInt8()
+    let v5 = r.readUInt16()
+    let v6 = r.readUInt32()
+    let v7 = r.readUInt64()
+    let v8 = r.readFloat()
+    let v9 = r.readDouble()
+    return Numerics(a: v0, b: v1, c: v2, d: v3, e: v4, f: v5, g: v6, h: v7, i: v8, j: v9)
 }
 
 public enum Shapes {
     /// Render a shape to a string
     public static func describe(shape: Shape) -> String {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_shapes_describe(shape.ptr, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var shapeWriter = WvWriter()
+        wvWriteShape(shape, into: &shapeWriter)
+        let rv: UnsafePointer<CChar>? = shapeWriter.bytes.withUnsafeBufferPointer { shape_buf in
+            let shape_ptr = shape_buf.baseAddress
+            let shape_len = shape_buf.count
+            return weaveffi_shapes_describe(shape_ptr, shape_len, &err)
+        }
         trap(&err)
         guard let rv = rv else { fatalError("-1: null string") }
         defer { weaveffi_free_string(rv) }
@@ -251,30 +312,49 @@ public enum Shapes {
     }
     /// Scale a shape by a factor, returning a new shape
     public static func scale(shape: Shape, factor: Double) -> Shape {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_shapes_scale(shape.ptr, factor, &err)
-        trap(&err)
-        guard let rv = rv else { fatalError("-1: null pointer") }
-        return Shape(ptr: rv)
-    }
-    /// Sum a list of bytes into a wide integer (numerics smoke)
-    public static func sumBytes(values: [UInt8]) -> UInt64 {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: UInt64 = values.withUnsafeBufferPointer { values_buf in
-            let values_ptr = values_buf.baseAddress
-            let values_len = values_buf.count
-                return weaveffi_shapes_sum_bytes(values_ptr, values_len, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var shapeWriter = WvWriter()
+        wvWriteShape(shape, into: &shapeWriter)
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = shapeWriter.bytes.withUnsafeBufferPointer { shape_buf in
+            let shape_ptr = shape_buf.baseAddress
+            let shape_len = shape_buf.count
+            return weaveffi_shapes_scale(shape_ptr, shape_len, factor, &outLen, &err)
         }
         trap(&err)
-        return result
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadShape(&rvReader)
+        rvReader.finish()
+        return v0
+    }
+    /// Sum a list of bytes into a wide integer (numerics smoke)
+    public static func sumBytes(values: Data) -> UInt64 {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let valuesBytes = Array(values)
+        let rv: UInt64 = valuesBytes.withUnsafeBufferPointer { values_buf in
+            let values_ptr = values_buf.baseAddress
+            let values_len = values_buf.count
+            return weaveffi_shapes_sum_bytes(values_ptr, values_len, &err)
+        }
+        trap(&err)
+        return rv
     }
     /// Build a Numerics struct from every numeric primitive
     public static func makeNumerics(a: Int8, b: Int16, c: Int32, d: Int64, e: UInt8, f: UInt16, g: UInt32, h: UInt64, i: Float, j: Double) -> Numerics {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, &outLen, &err)
         trap(&err)
-        guard let rv = rv else { fatalError("-1: null pointer") }
-        return Numerics(ptr: rv)
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadNumerics(&rvReader)
+        rvReader.finish()
+        return v0
     }
 }
 

@@ -177,9 +177,11 @@ C-style enum), or `Interface`, and qualifies cross-module references
 with the owning module's dot-joined path. Generators run strictly
 post-resolution: no `Named` reference remains, and a generator may
 treat one as a bug (the core ABI lowering panics on it). `Record` and
-`RichEnum` share the opaque-object-pointer ABI
-(`TypeRef::is_object_ref()` returns true for both), while `Enum`
-lowers by value as an integer.
+`RichEnum` are *buffered* types (`weaveffi_core::abi::is_buffered`
+returns true for both, along with optionals, lists, and maps): they
+cross the ABI by value as one serialized `(const uint8_t*, size_t)`
+pair (see the [Value Buffer Protocol](reference/value-buffers.md)),
+while `Enum` lowers by value as an integer.
 
 Every IR type derives `Debug`, `Clone`, `PartialEq`, `Serialize`, and
 `Deserialize`. `Eq` is derived where possible; a few types (`Api`,
@@ -194,7 +196,7 @@ JSON Schema export rely on it.
 
 ### Schema versioning
 
-`CURRENT_SCHEMA_VERSION` (currently `"0.5.0"`) lives in
+`CURRENT_SCHEMA_VERSION` (currently `"0.6.0"`) lives in
 [`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
 contains exactly the current version; older schema revisions are rejected
 by validation with an actionable error. When you change the schema:
@@ -240,7 +242,7 @@ Errors enforced today:
 - `throws: true` requires an error domain in scope (the module or an
   ancestor).
 - Iterator return types are valid in return position only.
-- Map keys must be a primitive or enum type.
+- Map keys must be a scalar, string, or enum type.
 - `event_callback` on a listener must reference a callback in the same
   module.
 - Error domain name must not collide with a function name in the same
@@ -479,18 +481,21 @@ generated C output uses it consistently, including references to
 `{c_prefix}_error_clear`, `{c_prefix}_free_string`,
 `{c_prefix}_free_bytes`).
 
-Struct lifecycle, enum constants, and getter symbols follow the
-patterns in the [C generator reference](generators/c.md).
+Interface lifecycle symbols and enum constants follow the patterns in
+the [C generator reference](generators/c.md).
 
 ## The ABI lowering model
 
 The C ABI is the foundation every binding sits on: a flat, C-callable
 surface where each IDL type lowers to a fixed sequence of C parameters.
 A `string` becomes one `const char*`; `bytes` becomes
-`const uint8_t* {name}_ptr, size_t {name}_len`; a `map<K,V>` becomes
-parallel `{name}_keys` / `{name}_values` / `{name}_len` slots;
-collection and out-of-band returns append `out_*` pointers; and every
-fallible call ends with a trailing `{prefix}_error*`.
+`const uint8_t* {name}_ptr, size_t {name}_len`; every buffered type
+(records, rich enums, optionals, lists, maps; see
+[`is_buffered`][abi-source]) becomes the same borrowed
+`{name}_ptr` / `{name}_len` pair holding its serialized
+[value buffer](reference/value-buffers.md); bytes and buffered returns
+append a `size_t* out_len` pointer; and every fallible call ends with a
+trailing `{prefix}_error*`.
 
 That calling convention is defined **once**, in
 [`weaveffi_core::abi`][abi-source], rather than re-derived inside each
@@ -524,7 +529,7 @@ their generator rather than leaking into the shared model:
   slot differently, so `lower_return` refuses an `Iterator` and each
   caller lowers it explicitly.
 - **`byref` out-params.** ctypes (Python) and P/Invoke (.NET) express a
-  map return's `out_keys` / `out_values` with an extra pointer level or
+  bytes or buffered return's `out_len` with an extra pointer level or
   the C# `out` keyword; those renderings stay in the respective
   generator.
 

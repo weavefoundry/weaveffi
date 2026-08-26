@@ -32,40 +32,17 @@ export interface Numerics {
   j: number;
 }
 /** An algebraic shape (sum type with associated data) */
-export class Shape {
+export type Shape =
   /** The empty shape (a unit variant) */
-  static empty(): Shape;
+  | { tag: 'Empty' }
   /** A circle with a radius */
-  static circle(radius: number): Shape;
+  | { tag: 'Circle'; radius: number }
   /** An axis-aligned rectangle */
-  static rectangle(width: number, height: number): Shape;
+  | { tag: 'Rectangle'; width: number; height: number }
   /** An integer-bounded shape (exercises narrow + wide ints) */
-  static bounded(min: number, max: number, weight: number): Shape;
+  | { tag: 'Bounded'; min: number; max: number; weight: number }
   /** A labeled shape with a small count */
-  static labeled(label: string, count: number): Shape;
-  /** The active variant's discriminant. */
-  tag(): number;
-  /** Radius in points */
-  get circleRadius(): number;
-  get rectangleWidth(): number;
-  get rectangleHeight(): number;
-  get boundedMin(): number;
-  get boundedMax(): number;
-  get boundedWeight(): number;
-  get labeledLabel(): string;
-  get labeledCount(): number;
-  /** Free the underlying native object. */
-  destroy(): void;
-}
-export namespace Shape {
-  const Tag: Readonly<{
-    Empty: 0,
-    Circle: 1,
-    Rectangle: 2,
-    Bounded: 3,
-    Labeled: 4,
-  }>;
-}
+  | { tag: 'Labeled'; label: string; count: number };
 /** A plain C-style enum (no payloads) */
 export enum Channel {
   Red = 0,
@@ -87,7 +64,7 @@ export function scale(shape: Shape, factor: number): Shape
  * Sum a list of bytes into a wide integer (numerics smoke)
  * Maps to C function: weaveffi_shapes_sum_bytes
  */
-export function sumBytes(values: number[]): number
+export function sumBytes(values: Buffer): number
 /**
  * Build a Numerics struct from every numeric primitive
  * Maps to C function: weaveffi_shapes_make_numerics

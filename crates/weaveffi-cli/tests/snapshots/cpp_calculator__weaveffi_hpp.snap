@@ -46,7 +46,16 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+/* Error slot written by every fallible call. `payload_ptr`/`payload_len`
+   hold the matched error code's fields serialized in the WeaveFFI value
+   buffer format (null when the code declares no fields); both the message
+   and the payload are released by weaveffi_error_clear. */
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
+} weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
@@ -122,8 +131,8 @@ public:
 
 namespace detail {
 
-/** Map a `calculator` error code to its typed exception (CalcError for unknown codes). */
-inline std::exception_ptr make_calculator_error(int32_t code, const std::string& msg) {
+/** Map a `calculator` error code and payload to its typed exception (CalcError for unknown codes). */
+inline std::exception_ptr make_calculator_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
     switch (code) {
     case 1: return std::make_exception_ptr(DivisionByZeroError(msg));
     default: return std::make_exception_ptr(CalcError(code, msg));
@@ -134,9 +143,9 @@ inline std::exception_ptr make_calculator_error(int32_t code, const std::string&
 inline void check_calculator(weaveffi_error& err) {
     if (err.code == 0) return;
     std::string msg(err.message ? err.message : "unknown error");
-    int32_t code = err.code;
+    std::exception_ptr ex = make_calculator_error(err.code, msg, err.payload_ptr, err.payload_len);
     weaveffi_error_clear(&err);
-    std::rethrow_exception(make_calculator_error(code, msg));
+    std::rethrow_exception(ex);
 }
 
 } // namespace detail

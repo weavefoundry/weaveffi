@@ -31,8 +31,9 @@
 //!   [`macro@enumeration`] a `#[repr(i32)]` C-style enum.
 //! * [`macro@interface`] declares an opaque object type whose `impl` block's
 //!   `pub fn`s become constructors, methods, and statics.
-//! * [`macro@error`] declares the module's error domain from a unit-variant
-//!   enum with explicit discriminants.
+//! * [`macro@error`] declares the module's error domain from an enum with
+//!   explicit discriminants; a variant's named fields become the code's
+//!   structured payload.
 //! * [`macro@callback`] / [`macro@listener`] declare a callback and an event
 //!   listener; [`macro@cancellable`] marks an async function as cancellable.
 //!
@@ -76,7 +77,8 @@ marker_attr! {
     export
 }
 marker_attr! {
-    /// Declare a by-value record (struct) with generated create/getters.
+    /// Declare a by-value record (struct) serialized in the value-buffer
+    /// format when it crosses the ABI.
     record
 }
 marker_attr! {
@@ -105,8 +107,4 @@ marker_attr! {
 marker_attr! {
     /// Mark an async function as accepting a cancellation token.
     cancellable
-}
-marker_attr! {
-    /// Opt a record into a generated fluent builder.
-    builder
 }

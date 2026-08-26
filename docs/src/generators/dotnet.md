@@ -4,7 +4,8 @@
 
 The .NET target emits a C# class library that wraps the C ABI through
 [P/Invoke](https://learn.microsoft.com/en-us/dotnet/standard/native-interop/pinvoke).
-Structs and interfaces are exposed as `IDisposable` classes with
+Structs and rich enums are plain C# value classes packed and unpacked
+from value buffers, interfaces are exposed as `IDisposable` classes with
 PascalCase members, error domains become managed exception types, and
 the project targets `net8.0`.
 
@@ -39,19 +40,19 @@ package named `kvstore` produces `Kvstore.cs` inside
 | `string`     | `string`                   | `IntPtr`      |
 | `handle`     | `ulong`                    | `ulong`       |
 | `bytes`      | `byte[]`                   | `IntPtr`      |
-| `StructName` | `StructName`               | `IntPtr`      |
+| `StructName` | `StructName` (sealed value class) | value buffer (`IntPtr` + length) |
 | `InterfaceName` | `InterfaceName`         | `IntPtr`      |
 | `EnumName` (plain) | `EnumName`           | `int`         |
-| `EnumName` (rich)  | `EnumName`           | `IntPtr`      |
-| `T?`         | `T?` (nullable)            | `IntPtr`      |
-| `[T]`        | `T[]`                      | `IntPtr`      |
-| `{K: V}`     | `Dictionary<K, V>`         | `IntPtr`      |
+| `EnumName` (rich)  | `EnumName` (closed class hierarchy) | value buffer (`IntPtr` + length) |
+| `T?`         | `T?` (nullable)            | value buffer; `Interface?` stays `IntPtr` |
+| `[T]`        | `T[]`                      | value buffer (`IntPtr` + length) |
+| `{K: V}`     | `Dictionary<K, V>`         | value buffer (`IntPtr` + length) |
 | `iter<T>`    | `IEnumerable<T>` (lazy)    | `IntPtr`      |
 
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -101,49 +102,36 @@ public enum ContactType
 }
 ```
 
-Structs are wrapped in `IDisposable` classes with a finalizer safety
-net:
+Structs are sealed value classes: one get-only PascalCase property per
+field plus a positional constructor. They own no native resources, so
+there's no handle, no `Dispose`, and no getter symbols:
 
 ```csharp
-public class Contact : IDisposable
+/// <summary>A contact record</summary>
+public sealed class Contact
 {
-    private IntPtr _handle;
-    private bool _disposed;
+    public string Name { get; }
+    public string? Email { get; }
+    public int Age { get; }
+    public ContactType ContactType { get; }
 
-    internal Contact(IntPtr handle)
+    public Contact(string name, string? email, int age, ContactType contactType)
     {
-        _handle = handle;
+        Name = name;
+        Email = email;
+        Age = age;
+        ContactType = contactType;
     }
 
-    internal IntPtr Handle => _handle;
-
-    public string Name
-    {
-        get
-        {
-            var ptr = NativeMethods.weaveffi_contacts_Contact_get_name(_handle);
-            var str = WeaveFFIHelpers.PtrToString(ptr);
-            NativeMethods.weaveffi_free_string(ptr);
-            return str ?? "";
-        }
-    }
-
-    public void Dispose()
-    {
-        if (!_disposed)
-        {
-            NativeMethods.weaveffi_contacts_Contact_destroy(_handle);
-            _disposed = true;
-        }
-        GC.SuppressFinalize(this);
-    }
-
-    ~Contact()
-    {
-        Dispose();
-    }
+    internal void WriteTo(WeaveFFIBufferWriter writer) { /* generated */ }
+    internal static Contact ReadFrom(WeaveFFIBufferReader reader) { /* generated */ }
 }
 ```
+
+A `Contact` crosses the ABI serialized in the
+[value-buffer format](../reference/value-buffers.md) as a single
+pointer-plus-length pair; the internal `WriteTo`/`ReadFrom` pair packs and
+unpacks the wire bytes.
 
 Functions live as static methods on a class named after the module.
 Method names are PascalCase with the module prefix stripped
@@ -160,17 +148,22 @@ public static class Contacts
     {
         var err = new WeaveFFIError();
         var namePtr = Marshal.StringToCoTaskMemUTF8(name);
-        var emailPtr = email != null ? Marshal.StringToCoTaskMemUTF8(email) : IntPtr.Zero;
+        // Optionals are buffered: pack the argument into a value buffer,
+        // pinned while the producer borrows it for the call.
+        byte[] emailBuf = /* generated pack routine for string? */;
+        var emailPin = GCHandle.Alloc(emailBuf, GCHandleType.Pinned);
         try
         {
-            var result = NativeMethods.weaveffi_contacts_create_contact(namePtr, emailPtr, age, ref err);
+            var result = NativeMethods.weaveffi_contacts_create_contact(
+                namePtr, emailPin.AddrOfPinnedObject(), (UIntPtr)emailBuf.Length,
+                age, ref err);
             WeaveFFIError.Check(err);
             return result;
         }
         finally
         {
+            emailPin.Free();
             Marshal.FreeCoTaskMem(namePtr);
-            if (emailPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(emailPtr);
         }
     }
 }
@@ -187,7 +180,7 @@ internal static class NativeMethods
     internal static extern void weaveffi_free_string(IntPtr ptr);
 
     [DllImport(LibName, EntryPoint = "weaveffi_contacts_create_contact", CallingConvention = CallingConvention.Cdecl)]
-    internal static extern ulong weaveffi_contacts_create_contact(IntPtr name, IntPtr email, int age, ref WeaveFFIError err);
+    internal static extern ulong weaveffi_contacts_create_contact(IntPtr name, IntPtr email, UIntPtr emailLen, int age, ref WeaveFFIError err);
 }
 ```
 
@@ -240,6 +233,10 @@ marshalling failures), and their doc comments carry an
 `<exception cref="KvException">` tag. A callable without `throws` uses
 the generic `WeaveFFIError.Check`, which only throws
 `WeaveFFIException` if the producer misbehaves.
+
+An error code that declares payload `fields:` carries them serialized in
+the error's payload buffer; `FromCode` decodes them and exposes each
+field through the exception's `Data` dictionary.
 
 ```csharp
 try
@@ -327,8 +324,9 @@ public class Store : IDisposable
 ```
 
 Functions elsewhere in the IDL pass the wrapper's handle across the
-boundary (`KvStats.GetStats(store)` reads `store.Handle` and returns a
-new `Stats`). Deprecated members carry `[Obsolete]`:
+boundary (`KvStats.GetStats(store)` reads `store.Handle`; the returned
+`Stats` record is decoded from a value buffer). Deprecated members carry
+`[Obsolete]`:
 
 ```csharp
 using var store = Store.Open("/tmp/cache.kv");
@@ -340,12 +338,12 @@ long reclaimed = await store.Compact();
 ## Rich (algebraic) enums
 
 A *rich* (algebraic) enum, a sum type whose variants carry associated
-data, lowers to an **opaque handle** at the C ABI, just like a struct,
-and uses the same `IDisposable` ownership model as the struct wrappers
-above. The generated C# type is a class wrapping an `IntPtr`, with one
-static factory per variant, a nested `Tag` enum for the discriminant, and
-per-variant property getters. (A plain C-style enum with no payloads
-stays a normal C# `enum` backed by `int`; see above.)
+data, becomes a closed class hierarchy: an abstract base class with a
+private constructor plus one nested sealed class per variant, each shaped
+like a record (typed get-only properties and a positional constructor).
+Rich enums own no native resources and declare no C symbols. (A plain
+C-style enum with no payloads stays a normal C# `enum` backed by `int`;
+see above.)
 
 For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
@@ -353,126 +351,63 @@ For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 
 ```csharp
 /// <summary>An algebraic shape (sum type with associated data)</summary>
-public class Shape : IDisposable
+public abstract class Shape
 {
-    private IntPtr _handle;
-    private bool _disposed;
-
-    internal Shape(IntPtr handle)
+    private Shape()
     {
-        _handle = handle;
     }
 
-    internal IntPtr Handle => _handle;
-
-    public enum Tag
+    /// <summary>The empty shape</summary>
+    public sealed class Empty : Shape
     {
-        Empty = 0,
-        Circle = 1,
-        Rectangle = 2,
-        Labeled = 3,
-    }
-
-    public Tag GetTag()
-    {
-        return (Tag)NativeMethods.weaveffi_shapes_Shape_tag(_handle);
     }
 
     /// <summary>A circle with a radius</summary>
-    public static Shape Circle(double radius)
+    public sealed class Circle : Shape
     {
-        var err = new WeaveFFIError();
-        var result = NativeMethods.weaveffi_shapes_Shape_Circle_new(radius, ref err);
-        WeaveFFIError.Check(err);
-        return new Shape(result);
+        public double Radius { get; }
+
+        public Circle(double radius)
+        {
+            Radius = radius;
+        }
     }
 
     /// <summary>A labeled shape with a small count</summary>
-    public static Shape Labeled(string label, byte count)
+    public sealed class Labeled : Shape
     {
-        var err = new WeaveFFIError();
-        var labelPtr = Marshal.StringToCoTaskMemUTF8(label);
-        try
+        public string Label { get; }
+        public byte Count { get; }
+
+        public Labeled(string label, byte count)
         {
-            var result = NativeMethods.weaveffi_shapes_Shape_Labeled_new(labelPtr, count, ref err);
-            WeaveFFIError.Check(err);
-            return new Shape(result);
-        }
-        finally
-        {
-            Marshal.FreeCoTaskMem(labelPtr);
+            Label = label;
+            Count = count;
         }
     }
 
-    /// <summary>Radius in points</summary>
-    public double CircleRadius
-    {
-        get
-        {
-            return NativeMethods.weaveffi_shapes_Shape_Circle_get_radius(_handle);
-        }
-    }
-
-    public byte LabeledCount
-    {
-        get
-        {
-            return NativeMethods.weaveffi_shapes_Shape_Labeled_get_count(_handle);
-        }
-    }
-
-    public void Dispose()
-    {
-        if (!_disposed)
-        {
-            NativeMethods.weaveffi_shapes_Shape_destroy(_handle);
-            _disposed = true;
-        }
-        GC.SuppressFinalize(this);
-    }
-
-    ~Shape()
-    {
-        Dispose();
-    }
+    internal void WriteTo(WeaveFFIBufferWriter writer) { /* generated */ }
+    internal static Shape ReadFrom(WeaveFFIBufferReader reader) { /* generated */ }
 }
 ```
 
-The `static` factories (`Shape.Empty()`, `Shape.Circle(double)`,
-`Shape.Rectangle(float, float)`, `Shape.Labeled(string, byte)`) call the
-per-variant constructors `weaveffi_shapes_Shape_<Variant>_new`; `GetTag()`
-reads the discriminant via `weaveffi_shapes_Shape_tag`; each getter reads
-one variant field via `weaveffi_shapes_Shape_<Variant>_get_<field>`; and
-`Dispose()` frees the handle via `weaveffi_shapes_Shape_destroy`. The
-P/Invoke entries live in `NativeMethods`:
+On the wire a `Shape` is a value buffer holding the `i32` variant tag
+followed by the active variant's fields in declaration order. Construct
+variants with `new`, and match on the nested classes with pattern
+matching:
 
 ```csharp
-[DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_tag", CallingConvention = CallingConvention.Cdecl)]
-internal static extern int weaveffi_shapes_Shape_tag(IntPtr ptr);
-
-[DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_Circle_new", CallingConvention = CallingConvention.Cdecl)]
-internal static extern IntPtr weaveffi_shapes_Shape_Circle_new(double radius, ref WeaveFFIError err);
-
-[DllImport(LibName, EntryPoint = "weaveffi_shapes_Shape_destroy", CallingConvention = CallingConvention.Cdecl)]
-internal static extern void weaveffi_shapes_Shape_destroy(IntPtr ptr);
-```
-
-Free functions that take or return the enum live on the module class
-`Shapes` and pass the wrapper's handle across the boundary
-(`Shapes.Describe(Shape)`, `Shapes.Scale(Shape, double)`):
-
-```csharp
-using var c = Shape.Circle(2.0);
-Console.WriteLine(c.GetTag());                // Tag.Circle
-Console.WriteLine(c.CircleRadius);            // 2
-using var bigger = Shapes.Scale(c, 3.0);      // returns a new Shape
+var c = new Shape.Circle(2.0);
+if (c is Shape.Circle circle)
+{
+    Console.WriteLine(circle.Radius);          // 2
+}
+var bigger = Shapes.Scale(c, 3.0);             // returns a new Shape
 Console.WriteLine(Shapes.Describe(bigger));
 ```
 
-**Ownership:** a `Shape` owns its native handle, so dispose every `Shape`
-you create or receive, including the one returned by `Shapes.Scale`, with
-`using` or an explicit `Dispose()`. The finalizer is a safety net that
-runs on a non-deterministic schedule.
+Values are plain managed data: there's nothing to dispose and no native
+handle to track.
 
 ## Build instructions
 
@@ -505,20 +440,21 @@ runs on a non-deterministic schedule.
 
 ## Memory and ownership
 
-- Each struct and interface class implements `IDisposable`; use
-  `using` for deterministic cleanup. The finalizer is a safety net
-  only and runs on a non-deterministic schedule.
-- Strings returned from getters are copied into managed memory and the
-  raw pointer is freed via `weaveffi_free_string` immediately, so
-  string properties do not require any disposal.
+- Each interface class implements `IDisposable`; use `using` for
+  deterministic cleanup. The finalizer is a safety net only and runs
+  on a non-deterministic schedule. Structs and rich enums are plain
+  managed values with nothing to dispose.
+- Returned strings are copied into managed memory and the raw pointer
+  is freed via `weaveffi_free_string` immediately.
 - Strings passed as parameters are marshalled with
   `Marshal.StringToCoTaskMemUTF8` and freed in a `finally` block.
-- Returned `byte[]`, array, and dictionary buffers are copied into
-  managed memory and released with `weaveffi_free_bytes`; string
-  elements are freed individually with `weaveffi_free_string` first.
-- Optional struct returns surface as `IntPtr.Zero` from the C ABI and
-  become `null` in C#. A boxed optional scalar is dereferenced and its
-  box freed with `weaveffi_free_bytes`.
+- Buffered values (structs, rich enums, optionals, arrays, and
+  dictionaries) cross as one value buffer: parameters are packed into
+  a pinned `byte[]` that the producer borrows for the call; returns
+  are copied into managed memory, released with `weaveffi_free_bytes`,
+  and decoded into the C# value.
+- An optional interface return surfaces as `IntPtr.Zero` from the C
+  ABI and becomes `null` in C#.
 - `iter<T>` functions return a lazy, single-use `IEnumerable<T>`
   (`WeaveFFIOnceEnumerable<T>`) that pulls one item through the C
   `_next` function per enumeration step; each string element is copied
@@ -542,12 +478,14 @@ is in flight:
 public static async Task<TaskResult> RunTask(string name)
 {
     var tcs = new TaskCompletionSource<TaskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-    NativeMethods.AsyncCb_weaveffi_tasks_run_task callback = (context, err, result) =>
+    NativeMethods.AsyncCb_weaveffi_tasks_run_task callback = (context, err, result, resultLen) =>
     {
         try
         {
             // ... tcs.SetException(TaskException.FromCode(...)) on error ...
-            tcs.SetResult(new TaskResult(result));
+            // TaskResult is a record: decode the borrowed (result, resultLen)
+            // value buffer into the managed value.
+            tcs.SetResult(TaskResult.ReadFrom(/* reader over the copied bytes */));
         }
         finally
         {
@@ -577,14 +515,13 @@ public static async Task<TaskResult> RunTask(string name)
   (`KvException.FromCode` on `Store.Compact()`); otherwise a failure
   can only be a producer bug and faults the task with
   `WeaveFFIException`.
-- Result ownership follows the async contract: string, bytes, array,
-  map, and boxed optional scalar results are borrowed for the
-  callback's duration, so the callback deep-copies them into managed
-  values and never frees them (the producer does after the callback
-  returns). Object results (records, rich enums, interfaces, including
-  optional ones) are the exception: the callback receives ownership,
-  and the wrapper adopts the pointer, as `new TaskResult(result)` does
-  above.
+- Result ownership follows the async contract: string, bytes, and
+  buffered results (records, rich enums, optionals, arrays, maps,
+  arriving as a `(result, resultLen)` pair) are borrowed for the
+  callback's duration, so the callback copies or decodes them into
+  managed values and never frees them (the producer does after the
+  callback returns). An owned interface result is the exception: the
+  callback receives ownership and the wrapper adopts the pointer.
 
 Async interface methods follow the same pattern as instance methods:
 `await store.Compact()` returns `Task<long>`.
@@ -650,8 +587,8 @@ Threading caveats:
 - **`DllNotFoundException: Unable to load DLL 'weaveffi'`**: the
   runtime cannot find the shared library. Place it in the application
   directory or set `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
-- **`AccessViolationException` on dispose**: the struct has been
-  disposed twice. Wrap usage in `using` and avoid passing handles
+- **`AccessViolationException` on dispose**: the interface object has
+  been disposed twice. Wrap usage in `using` and avoid passing handles
   around once disposed.
 - **Strings returned with garbage characters**: make sure your
   binding is targeting `UTF8` (`Marshal.PtrToStringUTF8`,

@@ -251,12 +251,17 @@ pub fn render_c_header_from_model(
     out.push_str("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
     cabi::render_runtime_decls(&mut out, prefix);
     out.push_str("/*\n");
-    out.push_str(" * Map convention: Maps are passed as parallel arrays of keys and values.\n");
-    out.push_str(" * A map parameter {K:V} named \"m\" expands to:\n");
-    out.push_str(" *   const K* m_keys, const V* m_values, size_t m_len\n");
-    out.push_str(" * A map return value expands to out-parameters that receive callee-\n");
-    out.push_str(" * allocated arrays; the caller passes the address of its own pointers:\n");
-    out.push_str(" *   K** out_keys, V** out_values, size_t* out_len\n");
+    out.push_str(" * Value buffer convention: records, rich enums, lists, maps, and\n");
+    out.push_str(" * optionals cross the ABI serialized in the WeaveFFI value buffer\n");
+    out.push_str(" * format (little-endian; see the generated bindings or the WeaveFFI\n");
+    out.push_str(" * buffer protocol spec for the per-type encoding).\n");
+    out.push_str(" * A buffered parameter named \"v\" expands to a borrowed view:\n");
+    out.push_str(" *   const uint8_t* v_ptr, size_t v_len\n");
+    out.push_str(" * A buffered return is a producer-allocated buffer returned as\n");
+    out.push_str(" * `const uint8_t*` with a trailing `size_t* out_len`; the caller\n");
+    out.push_str(&format!(
+        " * decodes it and then releases it with {prefix}_free_bytes.\n"
+    ));
     out.push_str(" */\n\n");
 
     cabi::render_decls(&mut out, &model.modules, prefix, true);
@@ -307,7 +312,7 @@ mod tests {
         use weaveffi_core::platform::{BinarySet, Platform};
 
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![module("calc")],
             generators: None,
             package: None,
@@ -390,7 +395,7 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -407,6 +412,44 @@ mod tests {
         assert!(h.contains("#ifndef WEAVEFFI_H"));
         assert!(h.contains("typedef uint64_t weaveffi_handle_t;"));
         assert!(h.contains("void weaveffi_free_string(const char* ptr);"));
+    }
+
+    #[test]
+    fn typed_handle_target_gets_forward_typedef() {
+        // A typed handle's target has no declaration of its own (records are
+        // value types now), so the header must forward-declare its opaque tag
+        // before any prototype uses it, including across modules.
+        let shared = Module {
+            structs: vec![StructDef {
+                name: "Token".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            ..module("shared")
+        };
+        let main = Module {
+            functions: vec![func(
+                "open_typed_handle",
+                vec![],
+                Some(TypeRef::TypedHandle("shared.Token".into())),
+            )],
+            ..module("main")
+        };
+        let h = header(&api(vec![shared, main]), "weaveffi");
+        let typedef = "typedef struct weaveffi_shared_Token weaveffi_shared_Token;";
+        assert!(h.contains(typedef), "missing tag typedef, header:\n{h}");
+        let use_at = h
+            .find("weaveffi_shared_Token* weaveffi_main_open_typed_handle")
+            .expect("prototype present");
+        assert!(
+            h.find(typedef).unwrap() < use_at,
+            "typedef must precede its first use"
+        );
     }
 
     #[test]
@@ -495,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_with_builder() {
+    fn record_is_a_value_type_with_no_c_object() {
         let m = Module {
             structs: vec![StructDef {
                 name: "Contact".into(),
@@ -506,18 +549,53 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: true,
             }],
+            functions: vec![func(
+                "save",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                None,
+            )],
             ..module("contacts")
         };
         let h = header(&api(vec![m]), "weaveffi");
-        assert!(h.contains("typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;"));
+        // Records cross the ABI as serialized buffers: no opaque tag, no
+        // getters, no builder machinery.
+        assert!(!h.contains("typedef struct weaveffi_contacts_Contact"));
+        assert!(!h.contains("Contact_get_name"));
+        assert!(!h.contains("ContactBuilder"));
+        // A record parameter lowers to a borrowed ptr + len view.
         assert!(h.contains(
-            "const char* weaveffi_contacts_Contact_get_name(const weaveffi_contacts_Contact* ptr);"
+            "void weaveffi_contacts_save(const uint8_t* contact_ptr, size_t contact_len, weaveffi_error* out_err);"
         ));
-        assert!(h.contains(
-            "weaveffi_contacts_ContactBuilder* weaveffi_contacts_Contact_Builder_new(void);"
-        ));
+    }
+
+    #[test]
+    fn record_return_uses_out_buffer_params() {
+        let m = Module {
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            functions: vec![func(
+                "load",
+                vec![param("id", TypeRef::I64)],
+                Some(TypeRef::Record("Contact".into())),
+            )],
+            ..module("contacts")
+        };
+        let h = header(&api(vec![m]), "weaveffi");
+        assert!(
+            h.contains(
+                "const uint8_t* weaveffi_contacts_load(int64_t id, size_t* out_len, weaveffi_error* out_err);"
+            ),
+            "expected buffered return with out_len, header was:\n{h}"
+        );
     }
 
     #[test]
@@ -666,12 +744,14 @@ mod tests {
                         code: 1001,
                         message: "key not found".into(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "Expired".into(),
                         code: 1002,
                         message: "entry expired".into(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),

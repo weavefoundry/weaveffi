@@ -21,21 +21,21 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
-### Structs
+### Records
 
-Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields. A returned struct handle is owned by the consumer; the JS wrapper's `free()` releases it via the struct's `_destroy` symbol.
+Records are **plain JavaScript objects**. A record crosses the boundary serialized in the WeaveFFI value-buffer format as one pointer + length pair in linear memory; the glue packs and unpacks it automatically, so there are no handles, no accessor functions, and nothing to free.
 
 ### Enums
 
-Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. Rich (algebraic) enums are plain objects tagged by variant name (`{ tag: "Circle", radius: 2 }`) and cross the boundary serialized in a value buffer, exactly like records.
 
 ### Optionals
 
-Optional values use **`0` / `null`** to represent the absent case. Scalar optionals are boxed by pointer (a null pointer signals absence); handle-typed and string optionals pass a null pointer (`0`) directly.
+Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent).
 
-### Lists
+### Lists and Maps
 
-Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+Lists are JS arrays; maps are plain objects (a `Map` instance is also accepted on input). Both cross the boundary serialized in a value buffer as one pointer + length pair, recursing through element types.
 
 ### Iterators
 
@@ -45,13 +45,15 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 
 Each listener surfaces as a `register.../unregister...` pair. `register` takes a plain JS function and returns a numeric subscription id; `unregister` takes that id and stops delivery. Delivery is **synchronous and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events fire only while a call into the module is on the stack (for example, a producer function that emits during its own execution). A producer that emits from a spawned thread cannot run on this target at all.
 
-Callback arguments are **borrowed for the duration of the callback**: strings and byte buffers are copied into JS values before your function runs, but struct, rich-enum, and interface arguments wrap producer-owned memory. Read what you need inside the callback and do not retain the wrapper or call `free()` on it.
+Callback arguments are **borrowed for the duration of the callback**: strings, byte buffers, and buffered values (records, rich enums, optionals, lists, maps) are copied or decoded into JS values before your function runs, and interface arguments wrap producer-owned objects. Read what you need inside the callback and do not retain an interface wrapper or call `free()` on it.
 
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each Wasm function. Your Wasm module must
-export the following functions:
+pointer as the last argument to each Wasm function. The error struct is
+16 bytes on wasm32: `{ i32 code, char* message, uint8_t* payload_ptr,
+size_t payload_len }`. Your Wasm module must export the following
+functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
@@ -62,7 +64,9 @@ export the following functions:
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
-for producer panics and marshalling failures.
+for producer panics and marshalling failures. When the matched error code
+declares payload fields, the wrapper decodes them from the error's value
+buffer and attaches them as properties on the thrown error.
 
 ## API Reference
 
@@ -74,20 +78,20 @@ for producer panics and marshalling failures.
 
 Send a message, triggering the OnMessage callback
 
-`weaveffi_events_send_message(text: i32, i32) -> void`
+`weaveffi_events_send_message(text: i32) -> void`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `text` | `string` | `i32, i32` | ptr + len in linear memory |
+| `text` | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_events_get_messages`
 
 Return an iterator over all sent messages
 
-`weaveffi_events_get_messages() -> i64`
+`weaveffi_events_get_messages() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `iter<string>` | `i64` | opaque iterator handle |
+| _returns_ | `iter<string>` | `i32` | opaque iterator handle |
 
 <!-- END README.md -->

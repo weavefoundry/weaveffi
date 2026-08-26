@@ -53,7 +53,6 @@ mod kitchen {
 
     /// Kitchen sink struct exercising every field feature
     #[weaveffi::record]
-    #[weaveffi::builder]
     struct Item {
         /// Stable identifier
         id: i64,
