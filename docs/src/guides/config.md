@@ -60,7 +60,7 @@ module-prefixed wrapper names across every supporting target.
 ### 2. Embed `generators:` in the IDL
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions:

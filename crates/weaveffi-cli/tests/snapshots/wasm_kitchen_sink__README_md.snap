@@ -21,21 +21,21 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
-### Structs
+### Records
 
-Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields. A returned struct handle is owned by the consumer; the JS wrapper's `free()` releases it via the struct's `_destroy` symbol.
+Records are **plain JavaScript objects**. A record crosses the boundary serialized in the WeaveFFI value-buffer format as one pointer + length pair in linear memory; the glue packs and unpacks it automatically, so there are no handles, no accessor functions, and nothing to free.
 
 ### Enums
 
-Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. Rich (algebraic) enums are plain objects tagged by variant name (`{ tag: "Circle", radius: 2 }`) and cross the boundary serialized in a value buffer, exactly like records.
 
 ### Optionals
 
-Optional values use **`0` / `null`** to represent the absent case. Scalar optionals are boxed by pointer (a null pointer signals absence); handle-typed and string optionals pass a null pointer (`0`) directly.
+Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent).
 
-### Lists
+### Lists and Maps
 
-Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+Lists are JS arrays; maps are plain objects (a `Map` instance is also accepted on input). Both cross the boundary serialized in a value buffer as one pointer + length pair, recursing through element types.
 
 ### Iterators
 
@@ -45,13 +45,15 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 
 Each listener surfaces as a `register.../unregister...` pair. `register` takes a plain JS function and returns a numeric subscription id; `unregister` takes that id and stops delivery. Delivery is **synchronous and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events fire only while a call into the module is on the stack (for example, a producer function that emits during its own execution). A producer that emits from a spawned thread cannot run on this target at all.
 
-Callback arguments are **borrowed for the duration of the callback**: strings and byte buffers are copied into JS values before your function runs, but struct, rich-enum, and interface arguments wrap producer-owned memory. Read what you need inside the callback and do not retain the wrapper or call `free()` on it.
+Callback arguments are **borrowed for the duration of the callback**: strings, byte buffers, and buffered values (records, rich enums, optionals, lists, maps) are copied or decoded into JS values before your function runs, and interface arguments wrap producer-owned objects. Read what you need inside the callback and do not retain an interface wrapper or call `free()` on it.
 
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each Wasm function. Your Wasm module must
-export the following functions:
+pointer as the last argument to each Wasm function. The error struct is
+16 bytes on wasm32: `{ i32 code, char* message, uint8_t* payload_ptr,
+size_t payload_len }`. Your Wasm module must export the following
+functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
@@ -62,7 +64,9 @@ export the following functions:
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
-for producer panics and marshalling failures.
+for producer panics and marshalling failures. When the matched error code
+declares payload fields, the wrapper decodes them from the error's value
+buffer and attaches them as properties on the thrown error.
 
 ## API Reference
 
@@ -74,11 +78,11 @@ for producer panics and marshalling failures.
 
 Trivial cross-module helper
 
-`weaveffi_shared_ping() -> i32, i32`
+`weaveffi_shared_ping() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 #### Structs
 
@@ -86,23 +90,23 @@ Trivial cross-module helper
 
 A reusable token referenced across modules
 
-Passed as opaque handle (`i64`).
+A plain JS object, serialized in a value buffer (`i32` ptr + `i32` len) at the boundary. Fields in declaration (wire) order:
 
-| Accessor | Wasm Return |
-|----------|-------------|
-| `weaveffi_shared_Token_get_id` | `i64` |
-| `weaveffi_shared_Token_get_label` | `i32, i32` |
+| Field | Type |
+|-------|------|
+| `id` | `i64` |
+| `label` | `string` |
 
 ### Module: `kitchen`
 
 #### Error Domain: `KitchenErrorsError`
 
-Throwing wrappers in this module raise `KitchenErrorsError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`.
+Throwing wrappers in this module raise `KitchenErrorsError` (a `WeaveFFIError` subclass); each code below is its own subclass carrying the stable `code`. Payload fields are decoded from the error's value buffer and attached as properties on the thrown error.
 
-| Class | Code | Default Message |
-|-------|------|-----------------|
-| `NotFound` | `1` | Item not found |
-| `InvalidInput` | `2` | Invalid input |
+| Class | Code | Default Message | Payload Fields |
+|-------|------|-----------------|----------------|
+| `NotFound` | `1` | Item not found | (none) |
+| `InvalidInput` | `2` | Invalid input | (none) |
 
 #### Functions
 
@@ -155,12 +159,12 @@ Identity for bool
 
 ##### `weaveffi_kitchen_echo_string`
 
-`weaveffi_kitchen_echo_string(s: i32, i32) -> i32, i32`
+`weaveffi_kitchen_echo_string(s: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `s` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| `s` | `string` | `i32` | NUL-terminated C string pointer |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_kitchen_echo_bytes`
 
@@ -175,12 +179,12 @@ Identity for bool
 
 Borrowed string parameter
 
-`weaveffi_kitchen_echo_borrowed_str(s: i32, i32) -> i32, i32`
+`weaveffi_kitchen_echo_borrowed_str(s: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `s` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| `s` | `string` | `i32` | NUL-terminated C string pointer |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_kitchen_echo_borrowed_bytes`
 
@@ -201,28 +205,28 @@ Returns an opaque handle
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `handle` | `i64` | opaque pointer |
+| _returns_ | `handle` | `i64` | opaque 64-bit handle |
 
 ##### `weaveffi_kitchen_open_typed_handle`
 
 Returns a typed handle
 
-`weaveffi_kitchen_open_typed_handle() -> i64`
+`weaveffi_kitchen_open_typed_handle() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `handle` | `i64` | opaque pointer |
+| _returns_ | `handle` | `i32` | opaque pointer |
 
 ##### `weaveffi_kitchen_maybe_item`
 
 Optional struct return
 
-`weaveffi_kitchen_maybe_item(id: i64) -> i64`
+`weaveffi_kitchen_maybe_item(id: i64) -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `i64` | `i64` | native Wasm i64 |
-| _returns_ | `Item?` | `i64` | opaque handle, 0 = absent |
+| _returns_ | `Item?` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 ##### `weaveffi_kitchen_list_items`
 
@@ -232,59 +236,59 @@ List of structs
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `[Item]` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `[Item]` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 ##### `weaveffi_kitchen_get_attrs`
 
 Map return type
 
-`weaveffi_kitchen_get_attrs() -> i64`
+`weaveffi_kitchen_get_attrs() -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `{string:i32}` | `i64` | opaque handle in linear memory |
+| _returns_ | `{string:i32}` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 ##### `weaveffi_kitchen_stream_items`
 
 Iterator return type
 
-`weaveffi_kitchen_stream_items() -> i64`
+`weaveffi_kitchen_stream_items() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `iter<Item>` | `i64` | opaque iterator handle |
+| _returns_ | `iter<Item>` | `i32` | opaque iterator handle |
 
 ##### `weaveffi_kitchen_cross_module_token`
 
 Returns the shared Token type from another module
 
-`weaveffi_kitchen_cross_module_token() -> i64`
+`weaveffi_kitchen_cross_module_token() -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `Token` | `i64` | opaque handle in linear memory |
+| _returns_ | `Token` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 ##### `weaveffi_kitchen_do_async`
 
 Async operation
 
-`weaveffi_kitchen_do_async(input: i32, i32) -> i32, i32`
+`weaveffi_kitchen_do_async(input: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `input` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| `input` | `string` | `i32` | NUL-terminated C string pointer |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_kitchen_do_cancellable`
 
 Cancellable async operation
 
-`weaveffi_kitchen_do_cancellable(input: i32, i32) -> i32, i32`
+`weaveffi_kitchen_do_cancellable(input: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `input` | `string` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| `input` | `string` | `i32` | NUL-terminated C string pointer |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_kitchen_legacy_op`
 
@@ -314,28 +318,28 @@ Replacement for legacy_op
 
 A pocket-sized interface exercising the object surface
 
-Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+Passed as an **opaque object pointer** (`i32`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
 
 ##### `weaveffi_kitchen_Gadget_new`
 
 Create a gadget with the given id
 
-`weaveffi_kitchen_Gadget_new(id: i64) -> i64`
+`weaveffi_kitchen_Gadget_new(id: i64) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `i64` | `i64` | native Wasm i64 |
-| _returns_ | `Gadget` | `i64` | opaque handle in linear memory |
+| _returns_ | `Gadget` | `i32` | opaque object pointer |
 
 ##### `weaveffi_kitchen_Gadget_describe`
 
 Render the gadget as a human-readable string
 
-`weaveffi_kitchen_Gadget_describe() -> i32, i32`
+`weaveffi_kitchen_Gadget_describe() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_kitchen_Gadget_poke`
 
@@ -352,11 +356,11 @@ Poke the gadget a number of times, failing on a negative count
 
 The gadget subsystem version string
 
-`weaveffi_kitchen_Gadget_version() -> i32, i32`
+`weaveffi_kitchen_Gadget_version() -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_kitchen_Gadget_destroy`
 
@@ -368,44 +372,22 @@ Releases the object reference. Called by the wrapper's `free()`.
 
 Kitchen sink struct exercising every field feature
 
-Passed as opaque handle (`i64`).
+A plain JS object, serialized in a value buffer (`i32` ptr + `i32` len) at the boundary. Fields in declaration (wire) order:
 
-| Accessor | Wasm Return |
-|----------|-------------|
-| `weaveffi_kitchen_Item_get_id` | `i64` |
-| `weaveffi_kitchen_Item_get_name` | `i32, i32` |
-| `weaveffi_kitchen_Item_get_count` | `i32` |
-| `weaveffi_kitchen_Item_get_enabled` | `i32` |
-| `weaveffi_kitchen_Item_get_ratio` | `f64` |
-| `weaveffi_kitchen_Item_get_nick` | `i32` |
-| `weaveffi_kitchen_Item_get_payload` | `i32, i32` |
-| `weaveffi_kitchen_Item_get_tags` | `i32, i32` |
-| `weaveffi_kitchen_Item_get_attrs` | `i64` |
-| `weaveffi_kitchen_Item_get_parent` | `i32` |
-| `weaveffi_kitchen_Item_get_token` | `i64` |
-| `weaveffi_kitchen_Item_get_priority` | `i32` |
-
-##### `ItemBuilder`
-
-Builder for `Item`.
-
-| Function | Args | Return |
-|----------|------|--------|
-| `weaveffi_kitchen_Item_Builder_new` | none | `i32` (handle) |
-| `weaveffi_kitchen_Item_Builder_set_id` | `i32` handle, `i64` value | none |
-| `weaveffi_kitchen_Item_Builder_set_name` | `i32` handle, `i32, i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_count` | `i32` handle, `i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_enabled` | `i32` handle, `i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_ratio` | `i32` handle, `f64` value | none |
-| `weaveffi_kitchen_Item_Builder_set_nick` | `i32` handle, `i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_payload` | `i32` handle, `i32, i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_tags` | `i32` handle, `i32, i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_attrs` | `i32` handle, `i64` value | none |
-| `weaveffi_kitchen_Item_Builder_set_parent` | `i32` handle, `i32` value | none |
-| `weaveffi_kitchen_Item_Builder_set_token` | `i32` handle, `i64` value | none |
-| `weaveffi_kitchen_Item_Builder_set_priority` | `i32` handle, `i32` value | none |
-| `weaveffi_kitchen_Item_Builder_build` | `i32` handle | `i32` (handle) |
-| `weaveffi_kitchen_Item_Builder_destroy` | `i32` handle | none |
+| Field | Type |
+|-------|------|
+| `id` | `i64` |
+| `name` | `string` |
+| `count` | `i32` |
+| `enabled` | `bool` |
+| `ratio` | `f64` |
+| `nick` | `u32` |
+| `payload` | `bytes` |
+| `tags` | `[string]` |
+| `attrs` | `{string:string}` |
+| `parent` | `i64?` |
+| `token` | `Token` |
+| `priority` | `Priority` |
 
 #### Enums
 

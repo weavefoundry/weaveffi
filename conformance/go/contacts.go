@@ -2,10 +2,10 @@
 //
 // Imports the generated cgo package and asserts the contacts surface: the
 // ContactBook interface (factory constructor, methods on the wrapper, explicit
-// Close), enum constants, opaque-handle structs with getter methods, optional
-// strings (pointer email), list-of-struct returns, the throws split (plain
-// returns for non-throwing methods), and the typed ContactsError domain via
-// errors.As.
+// Close), enum constants, plain value-struct records returned by value and
+// decoded from value buffers, optional strings (pointer email) present and
+// absent, list-of-record returns, the throws split (plain returns for
+// non-throwing methods), and the typed ContactsError domain via errors.As.
 
 package main
 
@@ -31,11 +31,11 @@ func main() {
 	email := "alice@example.com"
 	alice, err := book.Add("Alice", "Smith", &email, wv.ContactTypeWork)
 	expect(err == nil, "add alice")
-	expect(alice.Id() > 0, "alice id positive")
-	expect(alice.FirstName() == "Alice", "first name")
-	expect(alice.LastName() == "Smith", "last name")
-	expect(alice.Email() != nil && *alice.Email() == "alice@example.com", "email")
-	expect(alice.ContactType() == wv.ContactTypeWork, "contact type")
+	expect(alice.Id > 0, "alice id positive")
+	expect(alice.FirstName == "Alice", "first name")
+	expect(alice.LastName == "Smith", "last name")
+	expect(alice.Email != nil && *alice.Email == "alice@example.com", "email")
+	expect(alice.ContactType == wv.ContactTypeWork, "contact type")
 
 	// Typed error: an empty name reports ContactsError InvalidName.
 	_, err = book.Add("", "Smith", nil, wv.ContactTypePersonal)
@@ -48,20 +48,20 @@ func main() {
 	// Optional string: a missing email round-trips as a nil pointer.
 	bob, err := book.Add("Bob", "Jones", nil, wv.ContactTypePersonal)
 	expect(err == nil, "add bob")
-	cb, err := book.Get(bob.Id())
+	cb, err := book.Get(bob.Id)
 	expect(err == nil, "get bob")
-	expect(cb.Email() == nil, "bob email nil")
+	expect(cb.Email == nil, "bob email nil")
 
 	// Non-throwing methods have plain returns (no error result).
 	expect(book.Count() == 2, "count == 2")
 
 	all := book.List()
 	expect(len(all) == 2, "list length == 2")
-	names := []string{all[0].FirstName(), all[1].FirstName()}
+	names := []string{all[0].FirstName, all[1].FirstName}
 	sort.Strings(names)
 	expect(names[0] == "Alice" && names[1] == "Bob", "list names")
 
-	expect(book.Remove(alice.Id()), "remove returns true")
+	expect(book.Remove(alice.Id), "remove returns true")
 	expect(book.Count() == 1, "count == 1 after remove")
 
 	// Typed error: a missing id reports ContactsError NotFound.

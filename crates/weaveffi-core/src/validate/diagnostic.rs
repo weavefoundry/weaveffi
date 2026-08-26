@@ -110,7 +110,7 @@ fn find_offending_span(err: &ValidationError, src: &str) -> Option<SourceSpan> {
         ValidationError::UnsupportedCallbackParamType { param, .. } => Some(param.as_str()),
         ValidationError::ListenerCallbackNotFound { callback, .. } => Some(callback.as_str()),
         ValidationError::DuplicateListenerName { name, .. } => Some(name.as_str()),
-        ValidationError::BuilderStructEmpty { name, .. } => Some(name.as_str()),
+        ValidationError::MutableParamUnsupported { param, .. } => Some(param.as_str()),
         ValidationError::UnsupportedSchemaVersion { version, .. } => Some(version.as_str()),
         ValidationError::AsyncIteratorReturn { function, .. } => Some(function.as_str()),
         ValidationError::DuplicateInterfaceName { name, .. } => Some(name.as_str()),

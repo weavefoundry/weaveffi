@@ -6,8 +6,9 @@ The Go target produces idiomatic Go bindings that use CGo to call the C
 ABI. The generator emits one Go source file (`weaveffi.go`) plus a
 `go.mod` so the result can be imported by any Go module. Functions
 marked `throws: true` return `(value, error)` to match Go conventions;
-all other wrappers return plain values. Struct and interface wrappers
-expose methods plus an explicit `Close()`. Functions returning
+all other wrappers return plain values. Structs and rich enums are plain
+Go value types packed and unpacked from value buffers; interface
+wrappers expose methods plus an explicit `Close()`. Functions returning
 `iter<T>` produce standard-library `iter.Seq`/`iter.Seq2` sequences,
 so the generated module requires Go 1.23 or later (the emitted
 `go.mod` declares `go 1.23`).
@@ -38,13 +39,13 @@ so the generated module requires Go 1.23 or later (the emitted
 | `string`     | `string`      | `*C.char` (via `C.CString`/`C.GoString`) |
 | `bytes`      | `[]byte`      | `*C.uint8_t` + `C.size_t`  |
 | `handle`     | `int64`       | `C.weaveffi_handle_t`      |
-| `Struct`     | `*StructName` | `*C.weaveffi_mod_Struct`   |
+| `Struct`     | `StructName` (plain struct) | value buffer (`*C.uint8_t` + `C.size_t`) |
 | `Interface`  | `*InterfaceName` | `*C.weaveffi_mod_Interface` |
 | `Enum` (plain) | `EnumName`  | `C.weaveffi_mod_Enum`      |
-| `Enum` (rich)  | `*EnumName` | `*C.weaveffi_mod_Enum`     |
-| `T?`         | `*T`          | pointer to scalar; nil-able pointer for strings/structs |
-| `[T]`        | `[]T`         | pointer + `C.size_t`       |
-| `{K: V}`     | `map[K]V`     | key/value arrays + `C.size_t` |
+| `Enum` (rich)  | `EnumName` (value type) | value buffer (`*C.uint8_t` + `C.size_t`) |
+| `T?`         | `*T`          | value buffer; `Interface?` stays a nil-able pointer |
+| `[T]`        | `[]T`         | value buffer (`*C.uint8_t` + `C.size_t`) |
+| `{K: V}`     | `map[K]V`     | value buffer (`*C.uint8_t` + `C.size_t`) |
 | `iter<T>`    | `iter.Seq[T]`, or `iter.Seq2[T, error]` when the function throws | opaque iterator pointer + `_next`/`_destroy` |
 
 Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
@@ -52,7 +53,7 @@ Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -122,35 +123,22 @@ const (
 )
 ```
 
-Structs hold a typed C pointer and expose getters plus `Close()`:
+Structs become plain Go structs with exported, typed fields:
 
 ```go
+// Contact is a plain value; there's no native handle and no Close.
 type Contact struct {
-	ptr *C.weaveffi_contacts_Contact
-}
-
-func (s *Contact) FirstName() string {
-	cStr := C.weaveffi_contacts_Contact_get_first_name(s.ptr)
-	goResult := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return goResult
-}
-
-func (s *Contact) Email() *string {
-	cStr := C.weaveffi_contacts_Contact_get_email(s.ptr)
-	if cStr == nil { return nil }
-	v := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return &v
-}
-
-func (s *Contact) Close() {
-	if s.ptr != nil {
-		C.weaveffi_contacts_Contact_destroy(s.ptr)
-		s.ptr = nil
-	}
+	Id          int64
+	FirstName   string
+	Email       *string
+	ContactType ContactType
 }
 ```
+
+There are no C symbols behind a struct. A `Contact` crosses the ABI
+serialized in the [value-buffer format](../reference/value-buffers.md) as a
+single `(*C.uint8_t, C.size_t)` pair; the package carries a private buffer
+reader and writer plus one generated pack and unpack routine per type.
 
 Function wrappers are PascalCase with the IDL module prefix stripped
 (`CreateContact`, not `ContactsCreateContact`); set
@@ -164,14 +152,14 @@ marshalling failure:
 func CreateContact(firstName string, email *string, contactType ContactType) int64 {
 	cFirstName := C.CString(firstName)
 	defer C.free(unsafe.Pointer(cFirstName))
-	var cEmail *C.char
-	if email != nil {
-		cEmail = C.CString(*email)
-		defer C.free(unsafe.Pointer(cEmail))
-	}
+	// Optionals are buffered: pack the argument into a value buffer,
+	// borrowed by the producer for the duration of the call.
+	emailBuf := /* generated pack routine for *string */
 	var cErr C.weaveffi_error
 	result := C.weaveffi_contacts_create_contact(
-		cFirstName, cEmail, C.weaveffi_contacts_ContactType(contactType), &cErr)
+		cFirstName,
+		(*C.uint8_t)(unsafe.Pointer(&emailBuf[0])), C.size_t(len(emailBuf)),
+		C.weaveffi_contacts_ContactType(contactType), &cErr)
 	wvTrap(&cErr)
 	return int64(result)
 }
@@ -180,26 +168,24 @@ func CreateContact(firstName string, email *string, contactType ContactType) int
 A function marked `throws: true` returns `(value, error)` instead; see
 [Typed errors](#typed-errors).
 
-Lists round-trip through `unsafe.Slice`; after the copy, the wrapper
-releases the producer's buffer with `weaveffi_free_bytes` (and frees
-string elements individually with `weaveffi_free_string` first):
+Lists, maps, and other buffered returns arrive as one value buffer: the
+wrapper copies the bytes into Go memory, releases the producer's buffer
+with `weaveffi_free_bytes`, then decodes the Go value:
 
 ```go
 var cOutLen C.size_t
-result := C.weaveffi_store_list_ids(&cOutLen, &cErr)
-count := int(cOutLen)
-if count == 0 || result == nil { return nil, nil }
-goResult := make([]int32, count)
-cSlice := unsafe.Slice((*C.int32_t)(unsafe.Pointer(result)), count)
-for i, v := range cSlice { goResult[i] = int32(v) }
-C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
+raw := C.weaveffi_store_list_ids(&cOutLen, &cErr)
+wvTrap(&cErr)
+buf := C.GoBytes(unsafe.Pointer(raw), C.int(cOutLen))
+C.weaveffi_free_bytes(raw, cOutLen)
+ids := /* generated unpack routine over buf */
 ```
 
 The Go module path defaults to `weaveffi`; override it via the
 generator config:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions:
@@ -263,6 +249,10 @@ A callable without `throws` returns a plain value and checks its slot
 with `wvTrap`, which panics on the codes that can only mean a producer
 bug.
 
+An error code that declares payload `fields:` carries them serialized in
+the error's payload buffer; the mapper decodes them into typed fields on
+the error value before `weaveffi_error_clear` releases the buffer.
+
 ## Interfaces
 
 An `interfaces:` entry becomes a struct holding the typed C pointer.
@@ -324,9 +314,8 @@ func (s *Store) Close() {
 ```
 
 Functions elsewhere in the IDL pass the wrapper's pointer across the
-boundary (`GetStats(store)` returns a new `*Stats`). Deprecated
-members carry a standard `// Deprecated:` comment that `go vet` and
-editors understand. As with structs, pair every wrapper with
+boundary. Deprecated members carry a standard `// Deprecated:` comment
+that `go vet` and editors understand. Pair every interface wrapper with
 `defer store.Close()`:
 
 ```go
@@ -342,106 +331,33 @@ fmt.Println(store.Count(), StoreDefaultCapacity())
 ## Rich (algebraic) enums
 
 A *rich* (algebraic) enum, a sum type whose variants carry associated
-data, lowers to an **opaque object pointer** at the C ABI, exactly like a
-struct, and shares the same ownership model as the struct wrappers above.
-The Go wrapper is a struct holding a typed C pointer, with one
-`New<Enum><Variant>` constructor per variant, a `Tag()` method returning
-the `int32` discriminant, per-variant field getter methods, and an
-explicit `Close()`. (A plain C-style enum with no payloads stays a typed
-`int32` alias with `const` values; see above.)
+data, crosses the C ABI as a serialized value buffer, exactly like a
+struct: an `i32` tag (the declared discriminant, or declaration order)
+followed by the active variant's fields in order. There are no per-variant
+C constructors, tag readers, getters, or destroy symbols, and the Go
+surface is a plain value type with no `Close()`. (A plain C-style enum
+with no payloads stays a typed `int32` alias with `const` values; see
+above.)
 
 For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }`), the generator emits (abridged):
+`Labeled { label: string, count: u8 }`), the bindings expose the variant
+discriminants as package constants
+(`ShapeEmpty`/`ShapeCircle`/`ShapeRectangle`/`ShapeLabeled`), a way to
+construct each variant with its fields, and typed access to the active
+variant's data. Values are plain Go data, so nothing needs to be freed:
 
 ```go
-// Shape: An algebraic shape (sum type with associated data)
-type Shape struct {
-	ptr *C.weaveffi_shapes_Shape
-}
-
-const (
-	// ShapeEmpty: The empty shape
-	ShapeEmpty int32 = 0
-	// ShapeCircle: A circle with a radius
-	ShapeCircle int32 = 1
-	// ShapeRectangle: An axis-aligned rectangle
-	ShapeRectangle int32 = 2
-	// ShapeLabeled: A labeled shape with a small count
-	ShapeLabeled int32 = 3
-)
-
-func (s *Shape) Tag() int32 {
-	return int32(C.weaveffi_shapes_Shape_tag(s.ptr))
-}
-
-// NewShapeCircle: A circle with a radius
-func NewShapeCircle(radius float64) (*Shape, error) {
-	var cErr C.weaveffi_error
-	result := C.weaveffi_shapes_Shape_Circle_new(C.double(radius), &cErr)
-	if cErr.code != 0 {
-		return nil, wvBrandError(wvTakeError(&cErr))
-	}
-	return &Shape{ptr: result}, nil
-}
-
-// NewShapeLabeled: A labeled shape with a small count
-func NewShapeLabeled(label string, count uint8) (*Shape, error) {
-	cLabel := C.CString(label)
-	defer C.free(unsafe.Pointer(cLabel))
-	var cErr C.weaveffi_error
-	result := C.weaveffi_shapes_Shape_Labeled_new(cLabel, C.uint8_t(count), &cErr)
-	if cErr.code != 0 {
-		return nil, wvBrandError(wvTakeError(&cErr))
-	}
-	return &Shape{ptr: result}, nil
-}
-
-// CircleRadius: Radius in points
-func (s *Shape) CircleRadius() float64 {
-	return float64(C.weaveffi_shapes_Shape_Circle_get_radius(s.ptr))
-}
-
-func (s *Shape) LabeledCount() uint8 {
-	return uint8(C.weaveffi_shapes_Shape_Labeled_get_count(s.ptr))
-}
-
-func (s *Shape) Close() {
-	if s.ptr != nil {
-		C.weaveffi_shapes_Shape_destroy(s.ptr)
-		s.ptr = nil
-	}
-}
-```
-
-Each `NewShape<Variant>` calls a per-variant constructor
-(`weaveffi_shapes_Shape_<Variant>_new`); `Tag()` reads the discriminant
-(`weaveffi_shapes_Shape_tag`) and can be compared against the package
-constants `ShapeEmpty`/`ShapeCircle`/`ShapeRectangle`/`ShapeLabeled`; the
-getter methods read one variant field
-(`weaveffi_shapes_Shape_<Variant>_get_<field>`); and `Close()` frees the
-pointer (`weaveffi_shapes_Shape_destroy`). Free functions that take or
-return the enum pass the wrapper's pointer across the boundary
-(`Describe(*Shape)`, `Scale(*Shape, float64)`; both are non-throwing
-here, so they return plain values):
-
-```go
-c, err := NewShapeCircle(2.0)
-if err != nil {
-	return err
-}
-defer c.Close()
+c := /* construct the Circle variant with radius 2.0 */
 fmt.Println(c.Tag() == ShapeCircle) // true
-fmt.Println(c.CircleRadius())       // 2
 
-bigger := Scale(c, 3.0) // returns a new *Shape
-defer bigger.Close()
+bigger := Scale(c, 3.0) // returns a new Shape value
 fmt.Println(Describe(bigger))
 ```
 
-**Ownership:** a `*Shape` owns its native pointer. Go has no deterministic
-destructors, so pair every constructor (and every `*Shape` returned by
-`Scale`) with `defer s.Close()`.
+Free functions that take or return the enum pack it into a value buffer
+on the way in and unpack the returned buffer on the way out, releasing
+the producer's bytes with `weaveffi_free_bytes`.
 
 ## Build instructions
 
@@ -484,16 +400,14 @@ use a MinGW-w64 toolchain or the MSVC build provided by `go env`.
 - **Bytes:** input slices are passed by pointer for the duration of
   the call (no copy); returned bytes are copied with `C.GoBytes` and
   then `weaveffi_free_bytes` is called.
-- **Lists and maps out:** each element is copied (string elements are
-  freed individually with `weaveffi_free_string`), then the array
-  buffer, or both parallel key/value buffers for a map, is released
-  with `weaveffi_free_bytes`.
-- **Structs and interfaces:** wrappers hold a typed C pointer. Always
-  pair with `defer s.Close()` because Go has no deterministic
-  destructors.
-- **Optionals:** scalar optionals are `*T`; struct/string optionals
-  rely on a nil pointer to indicate absence. A returned boxed scalar
-  is dereferenced and its box freed with `weaveffi_free_bytes`.
+- **Buffered values (structs, rich enums, optionals, lists, maps):**
+  parameters are packed into a value buffer that the producer borrows
+  for the duration of the call; returns are copied into Go memory,
+  released with `weaveffi_free_bytes`, and decoded into the Go value.
+  Nothing to close afterward.
+- **Interfaces:** wrappers hold a typed C pointer. Always pair with
+  `defer s.Close()` because Go has no deterministic destructors.
+  `Interface?` stays a nil-able pointer.
 
 ## Callbacks and listeners
 
@@ -606,10 +520,11 @@ func (s *Store) Compact() (int64, error) {
 The completion callback fires exactly once, on a producer thread. The
 trampoline removes the channel from the registry with `wvCallbackTake`
 (one-shot), converts the C error or result inside the callback (result
-buffers such as strings and arrays are borrowed from the producer for
-the callback's duration, so the trampoline copies them into Go memory
-and never frees them; owned-object results are adopted into a wrapper
-instead), and sends a single `wvOutcome…` value:
+buffers such as strings and buffered values are borrowed from the
+producer for the callback's duration, so the trampoline copies or
+decodes them into Go memory and never frees them; an owned interface
+result is adopted into a wrapper instead), and sends a single
+`wvOutcome…` value:
 
 ```go
 //export goWv_weaveffi_kv_Store_compact_callback
@@ -681,8 +596,9 @@ func GetMessages() iter.Seq[string] {
 ```
 
 Each yielded element is copied into Go memory and its Rust allocation
-released per element (strings via `weaveffi_free_string`; record
-elements are adopted by owning wrappers). The deferred `_destroy` call
+released per element (strings via `weaveffi_free_string`; buffered
+elements arrive as value buffers that are decoded and released with
+`weaveffi_free_bytes`). The deferred `_destroy` call
 runs exactly once, whether the consumer exhausts the sequence or
 breaks out of the `for range` loop early. Ranging over the same
 returned sequence again launches a fresh producer iterator.
@@ -723,8 +639,8 @@ instead of yielding it.
   the `-l` flag or `-L` directory. Recheck the environment exports.
 - **`could not determine kind of name` in CGo**: ensure
   `CGO_CFLAGS` points at the directory containing `weaveffi.h`.
-- **Crashes after struct goes out of scope**: Go doesn't call
-  `Close()` for you. Either `defer s.Close()` or wrap usage in a
+- **Crashes after an interface object goes out of scope**: Go doesn't
+  call `Close()` for you. Either `defer s.Close()` or wrap usage in a
   helper that takes a closure.
 - **`go: cannot find module providing package weaveffi`**: change
   the generator config so `go.mod` declares the module path you

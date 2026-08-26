@@ -42,26 +42,127 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 /// Typed errors reported by the `calculator` module.
@@ -81,7 +182,7 @@ public enum CalcError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapCalculator(code: Int32, message: String) -> Error {
+func mapCalculator(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return CalcError.divisionByZero(message: message.isEmpty ? "division by zero" : message)
     default: return WeaveFFIError.error(code: code, message: message)
@@ -93,44 +194,44 @@ func checkCalculator(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapCalculator(code: code, message: message)
+        throw mapCalculator(code: code, message: message, payload: payload)
     }
 }
 
 public enum Calculator {
     /// Add two integers
     public static func add(a: Int32, b: Int32) -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_calculator_add(a, b, &err)
         trap(&err)
         return rv
     }
     /// Multiply two integers
     public static func mul(a: Int32, b: Int32) -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_calculator_mul(a, b, &err)
         trap(&err)
         return rv
     }
     /// Divide two integers, failing on a zero divisor
     public static func div(a: Int32, b: Int32) throws -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_calculator_div(a, b, &err)
         try checkCalculator(&err)
         return rv
     }
     /// Echo a string back
     public static func echo(s: String) -> String {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: String = s.withCString { s_ptr in
-                let rv = weaveffi_calculator_echo(s_ptr, &err)
-                trap(&err)
-                guard let rv = rv else { fatalError("-1: null string") }
-                defer { weaveffi_free_string(rv) }
-                return String(cString: rv)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let rv: UnsafePointer<CChar>? = s.withCString { s_ptr in
+            return weaveffi_calculator_echo(s_ptr, &err)
         }
-        return result
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null string") }
+        defer { weaveffi_free_string(rv) }
+        return String(cString: rv)
     }
 }
 

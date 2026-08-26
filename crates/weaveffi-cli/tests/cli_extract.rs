@@ -530,17 +530,15 @@ mod legacy {
 
 #[test]
 fn extract_mutable_reference_to_mutable_flag() {
+    // Only string and bytes parameters support `mutable: true` (buffered
+    // types cross the ABI as borrowed serialized buffers with no write-back
+    // lowering), so the fixture uses `&mut String`.
     let (_dir, src_path) = write_src(
         r#"
 #[weaveffi::module]
 mod buffers {
-    #[weaveffi::record]
-    struct Buffer {
-        capacity: i32,
-    }
-
     #[weaveffi::export]
-    fn fill(buf: &mut Buffer, value: i32) {
+    fn fill(buf: &mut String, value: i32) {
         todo!()
     }
 }

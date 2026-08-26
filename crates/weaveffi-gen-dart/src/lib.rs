@@ -4,27 +4,33 @@
 //! bindings over the C ABI for use in Flutter and Dart projects.
 //! Implements [`LanguageBackend`]; the shared driver bridges it into the
 //! generator pipeline.
+//!
+//! Records and rich enums are value types: they render as plain Dart classes
+//! (a sealed hierarchy for a rich enum) and cross the ABI serialized in the
+//! WeaveFFI value-buffer format as one `(ptr, len)` pair. The generated
+//! library ships a small private buffer writer/reader implementing that
+//! format, plus one pack and one unpack routine per record and rich enum.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
 use camino::Utf8Path;
-use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
+use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
+use weaveffi_core::abi::is_buffered;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
-    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    RichVariantBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
-use weaveffi_core::plan::{ElemFree, ErrorStrategy};
+use weaveffi_core::plan::{elem_free, ElemFree, ErrorStrategy};
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
@@ -283,6 +289,7 @@ the working directory) and falls back to the system search path;
     )
 }
 
+/// The idiomatic Dart type a [`TypeRef`] surfaces as.
 fn dart_type(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I8
@@ -315,74 +322,13 @@ fn dart_type(ty: &TypeRef) -> String {
     }
 }
 
-fn dart_nullable_type_for_builder_field(ty: &TypeRef) -> String {
-    let t = dart_type(ty);
-    if t.ends_with('?') {
-        t
-    } else {
-        format!("{t}?")
-    }
+/// The bare local Dart class name of a (possibly dot-qualified) user type.
+fn dart_class(name: &str) -> String {
+    local_type_name(name).to_upper_camel_case()
 }
 
-fn native_ffi_type(ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::I8 => "Int8".into(),
-        TypeRef::I16 => "Int16".into(),
-        TypeRef::I32 => "Int32".into(),
-        TypeRef::U8 => "Uint8".into(),
-        TypeRef::U16 => "Uint16".into(),
-        TypeRef::U32 => "Uint32".into(),
-        TypeRef::U64 => "Uint64".into(),
-        TypeRef::I64 | TypeRef::Handle => "Int64".into(),
-        TypeRef::F32 => "Float".into(),
-        TypeRef::F64 => "Double".into(),
-        // A C `bool` is one byte; `Bool` keeps by-value slots, boxed
-        // optionals, and element strides in step with the producer.
-        TypeRef::Bool => "Bool".into(),
-        TypeRef::Enum(_) => "Int32".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => "Pointer<Void>".into(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-        TypeRef::Optional(inner) => native_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
-    }
-}
-
-fn dart_ffi_type(ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::I64
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::U64
-        | TypeRef::Handle
-        | TypeRef::Enum(_) => "int".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::F32 | TypeRef::F64 => "double".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "Pointer<Uint8>".into(),
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => "Pointer<Void>".into(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-        TypeRef::Optional(inner) => dart_ffi_type(inner),
-        TypeRef::List(_) | TypeRef::Iterator(_) | TypeRef::Map(_, _) => "Pointer<Void>".into(),
-    }
-}
-
-// ── Complex-type marshaling (inputs, getters, returns) ──
-
-/// dart:ffi (native, dart) types of a leaf scalar passed by value or stored
-/// as a boxed or array element. `Bool` is one byte, matching the producer's C
-/// `bool`, so element strides and boxed-scalar frees stay honest.
+/// dart:ffi (native, dart) types of a leaf scalar passed by value. `Bool` is
+/// one byte, matching the producer's C `bool`, so by-value slots stay honest.
 fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
     match ty {
         TypeRef::I8 => ("Int8", "int"),
@@ -400,52 +346,29 @@ fn scalar_ffi(ty: &TypeRef) -> (&'static str, &'static str) {
     }
 }
 
-/// dart:ffi pointer type of the array staged for a `[T]`/map-side *input* (the C
-/// element is `const char*` for strings, `T*` for handles, or a value scalar).
-fn input_array_ffi(elem: &TypeRef) -> String {
-    match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Utf8>>".into(),
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => "Pointer<Pointer<Void>>".into(),
-        _ => format!("Pointer<{}>", scalar_ffi(elem).0),
-    }
-}
+// ── ABI slot typing ──
 
 /// The (native, dart) FFI typedef slot pairs a single input parameter expands
-/// into. Simple types stay one slot (matching [`native_ffi_type`]); bytes/list/
-/// map fan out to the ABI's `(ptr, len)` / `(keys, vals, len)` shape; nullable
-/// scalars pass through a pointer.
+/// into, mirroring the C ABI: a buffered value is one borrowed
+/// `(const uint8_t*, size_t)` pair; bytes fan out to `(ptr, len)`; strings,
+/// interfaces, and typed handles stay one pointer slot; everything else is a
+/// by-value scalar.
 fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
     let ptr = |s: &str| (s.to_string(), s.to_string());
+    if is_buffered(ty) {
+        return vec![ptr("Pointer<Uint8>"), ("Size".into(), "int".into())];
+    }
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![ptr("Pointer<Uint8>"), ("Size".into(), "int".into())]
         }
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            vec![ptr(&input_array_ffi(inner)), ("Size".into(), "int".into())]
-        }
-        TypeRef::Map(k, v) => vec![
-            ptr(&input_array_ffi(k)),
-            ptr(&input_array_ffi(v)),
-            ("Size".into(), "int".into()),
-        ],
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => vec![ptr("Pointer<Void>")],
-            other => vec![ptr(&format!("Pointer<{}>", scalar_ffi(other).0))],
-        },
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![ptr("Pointer<Utf8>")],
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
-            vec![ptr("Pointer<Void>")]
-        }
+        TypeRef::Interface(_) | TypeRef::TypedHandle(_) => vec![ptr("Pointer<Void>")],
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable object pointer, null meaning none.
+        TypeRef::Optional(inner) => input_slots(inner),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         _ => {
             let (n, d) = scalar_ffi(ty);
             vec![(n.into(), d.into())]
@@ -453,440 +376,472 @@ fn input_slots(ty: &TypeRef) -> Vec<(String, String)> {
     }
 }
 
-/// Emit pre-call staging for one input (`name`), returning the call-argument
-/// expressions it contributes (in ABI order) and appending any cleanup
-/// statements to `frees`. Mirrors the `(ptr, len)` / `(keys, vals, len)` ABI.
-fn emit_input(out: &mut String, name: &str, ty: &TypeRef, frees: &mut Vec<String>) -> Vec<String> {
+/// The FFI return type (native, dart) of a call symbol. Buffered and bytes
+/// returns come back as a producer-allocated `Pointer<Uint8>`; strings as
+/// `Pointer<Utf8>`; interfaces and typed handles as opaque pointers.
+fn return_ffi(ty: &TypeRef) -> (String, String) {
+    let ptr = |s: &str| (s.to_string(), s.to_string());
+    if is_buffered(ty) {
+        return ptr("Pointer<Uint8>");
+    }
     match ty {
-        TypeRef::Bool => vec![name.to_string()],
-        TypeRef::Enum(_) => vec![format!("{name}.value")],
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            vec![format!("{name}._handle")]
+        TypeRef::Bytes | TypeRef::BorrowedBytes => ptr("Pointer<Uint8>"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ptr("Pointer<Utf8>"),
+        TypeRef::Interface(_) | TypeRef::TypedHandle(_) => ptr("Pointer<Void>"),
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(inner) => return_ffi(inner),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::Iterator(_) => {
+            unreachable!("iterator returns are lowered through IteratorBinding")
+        }
+        _ => {
+            let (n, d) = scalar_ffi(ty);
+            (n.into(), d.into())
+        }
+    }
+}
+
+/// The trailing FFI typedef slots (native, dart) a return type contributes:
+/// bytes and every buffered return add a single `size_t* out_len`.
+fn return_out_slots(ty: &TypeRef) -> Vec<(String, String)> {
+    if is_buffered(ty) || matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+        vec![("Pointer<Size>".into(), "Pointer<Size>".into())]
+    } else {
+        vec![]
+    }
+}
+
+/// Whether a return owes the caller a decode from a producer-allocated
+/// `(ptr, out_len)` buffer (a bytes return or any buffered value).
+fn returns_buffer(ty: &TypeRef) -> bool {
+    is_buffered(ty) || matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes)
+}
+
+// ── Value-buffer encode/decode codegen ──
+
+/// The `_pack{Name}` helper name for a (possibly dot-qualified) record or
+/// rich-enum reference.
+fn pack_fn(name: &str) -> String {
+    format!("_pack{}", dart_class(name))
+}
+
+/// The `_unpack{Name}` helper name for a (possibly dot-qualified) record or
+/// rich-enum reference.
+fn unpack_fn(name: &str) -> String {
+    format!("_unpack{}", dart_class(name))
+}
+
+/// Mint a fresh `t{n}` temporary name.
+fn fresh(tmp: &mut usize) -> String {
+    let n = *tmp;
+    *tmp += 1;
+    format!("t{n}")
+}
+
+/// The Dart expression decoding one value of `ty` from the reader named `r`.
+///
+/// Optionals, lists, and maps recurse; records and rich enums call their
+/// generated `_unpack{Name}` helper. All read expressions evaluate strictly
+/// left to right, so composing them preserves the wire order.
+fn read_expr(r: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Bool => format!("{r}.readBool()"),
+        TypeRef::I8 => format!("{r}.readInt8()"),
+        TypeRef::I16 => format!("{r}.readInt16()"),
+        TypeRef::I32 => format!("{r}.readInt32()"),
+        TypeRef::I64 => format!("{r}.readInt64()"),
+        TypeRef::U8 => format!("{r}.readUint8()"),
+        TypeRef::U16 => format!("{r}.readUint16()"),
+        TypeRef::U32 => format!("{r}.readUint32()"),
+        TypeRef::U64 => format!("{r}.readUint64()"),
+        TypeRef::F32 => format!("{r}.readFloat32()"),
+        TypeRef::F64 => format!("{r}.readFloat64()"),
+        TypeRef::Handle => format!("{r}.readUint64()"),
+        TypeRef::TypedHandle(n) => format!(
+            "{}._(Pointer<Void>.fromAddress({r}.readUint64()))",
+            dart_class(n)
+        ),
+        TypeRef::Enum(n) => format!("{}.fromValue({r}.readInt32())", dart_class(n)),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{r}.readString()"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => format!("{r}.readBytes()"),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => format!("{}({r})", unpack_fn(n)),
+        TypeRef::Optional(inner) => {
+            format!("({r}.readOptionFlag() ? {} : null)", read_expr(r, inner))
+        }
+        TypeRef::List(inner) => format!(
+            "List<{}>.generate({r}.readLength(), (_) => {})",
+            dart_type(inner),
+            read_expr(r, inner)
+        ),
+        TypeRef::Map(k, v) => format!(
+            "<{}, {}>{{ for (var i = {r}.readLength(); i > 0; i--) {}: {} }}",
+            dart_type(k),
+            dart_type(v),
+            read_expr(r, k),
+            read_expr(r, v)
+        ),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("interfaces and iterators never appear inside a value buffer")
+        }
+    }
+}
+
+/// Emit the statements encoding `expr` (a value of `ty`) into the writer
+/// named `wr`. Optionals, lists, and maps recurse through fresh `t{n}`
+/// temporaries; records and rich enums call their generated `_pack{Name}`
+/// helper.
+fn write_stmts(w: &mut CodeWriter, wr: &str, expr: &str, ty: &TypeRef, tmp: &mut usize) {
+    match ty {
+        TypeRef::Bool => {
+            w.line(format!("{wr}.writeBool({expr});"));
+        }
+        TypeRef::I8 => {
+            w.line(format!("{wr}.writeInt8({expr});"));
+        }
+        TypeRef::I16 => {
+            w.line(format!("{wr}.writeInt16({expr});"));
+        }
+        TypeRef::I32 => {
+            w.line(format!("{wr}.writeInt32({expr});"));
+        }
+        TypeRef::I64 => {
+            w.line(format!("{wr}.writeInt64({expr});"));
+        }
+        TypeRef::U8 => {
+            w.line(format!("{wr}.writeUint8({expr});"));
+        }
+        TypeRef::U16 => {
+            w.line(format!("{wr}.writeUint16({expr});"));
+        }
+        TypeRef::U32 => {
+            w.line(format!("{wr}.writeUint32({expr});"));
+        }
+        TypeRef::U64 => {
+            w.line(format!("{wr}.writeUint64({expr});"));
+        }
+        TypeRef::F32 => {
+            w.line(format!("{wr}.writeFloat32({expr});"));
+        }
+        TypeRef::F64 => {
+            w.line(format!("{wr}.writeFloat64({expr});"));
+        }
+        TypeRef::Handle => {
+            w.line(format!("{wr}.writeUint64({expr});"));
+        }
+        TypeRef::TypedHandle(_) => {
+            w.line(format!("{wr}.writeUint64({expr}._handle.address);"));
+        }
+        TypeRef::Enum(_) => {
+            w.line(format!("{wr}.writeInt32({expr}.value);"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!("{wr}.writeString({expr});"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line(format!("{wr}.writeBytes({expr});"));
+        }
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            w.line(format!("{}({wr}, {expr});", pack_fn(n)));
+        }
+        TypeRef::Optional(inner) => {
+            let t = fresh(tmp);
+            w.line(format!("final {t} = {expr};"));
+            w.line(format!("if ({t} == null) {{"));
+            w.scope(|w| {
+                w.line(format!("{wr}.writeOptionFlag(false);"));
+            });
+            w.line("} else {");
+            w.scope(|w| {
+                w.line(format!("{wr}.writeOptionFlag(true);"));
+                write_stmts(w, wr, &t, inner, &mut *tmp);
+            });
+            w.line("}");
+        }
+        TypeRef::List(inner) => {
+            let t = fresh(tmp);
+            let e = fresh(tmp);
+            w.line(format!("final {t} = {expr};"));
+            w.line(format!("{wr}.writeLength({t}.length);"));
+            w.line(format!("for (final {e} in {t}) {{"));
+            w.scope(|w| {
+                write_stmts(w, wr, &e, inner, &mut *tmp);
+            });
+            w.line("}");
+        }
+        TypeRef::Map(k, v) => {
+            let t = fresh(tmp);
+            let e = fresh(tmp);
+            w.line(format!("final {t} = {expr};"));
+            w.line(format!("{wr}.writeLength({t}.length);"));
+            w.line(format!("for (final {e} in {t}.entries) {{"));
+            w.scope(|w| {
+                write_stmts(w, wr, &format!("{e}.key"), k, &mut *tmp);
+                write_stmts(w, wr, &format!("{e}.value"), v, &mut *tmp);
+            });
+            w.line("}");
         }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::I64
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Handle => {
-            vec![name.to_string()]
-        }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let p = format!("{name}Ptr");
-            let mut w = CodeWriter::two_space().with_depth(1);
-            w.line(format!("final {p} = {name}.toNativeUtf8();"));
-            out.push_str(&w.finish());
-            frees.push(format!("calloc.free({p});"));
-            vec![p]
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let p = format!("{name}Ptr");
-            let mut w = CodeWriter::two_space().with_depth(1);
-            w.line(format!(
-                "final {p} = {name}.isEmpty ? nullptr : calloc<Uint8>({name}.length);"
-            ));
-            w.line(format!(
-                "for (var i = 0; i < {name}.length; i++) {{ {p}[i] = {name}[i]; }}"
-            ));
-            out.push_str(&w.finish());
-            frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
-            vec![p, format!("{name}.length")]
-        }
-        TypeRef::Optional(inner) => emit_optional_input(out, name, inner, frees),
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => emit_list_input(out, name, inner, frees),
-        TypeRef::Map(k, v) => emit_map_input(out, name, k, v, frees),
-    }
-}
-
-fn emit_optional_input(
-    out: &mut String,
-    name: &str,
-    inner: &TypeRef,
-    frees: &mut Vec<String>,
-) -> Vec<String> {
-    let p = format!("{name}Ptr");
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let mut w = CodeWriter::two_space().with_depth(1);
-            w.line(format!(
-                "final {p} = {name} == null ? nullptr : {name}.toNativeUtf8();"
-            ));
-            out.push_str(&w.finish());
-            frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
-            vec![p]
-        }
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            vec![format!("{name}?._handle ?? nullptr")]
-        }
-        other => {
-            let (native, _) = scalar_ffi(other);
-            let val = match other {
-                TypeRef::Enum(_) => format!("{name}.value"),
-                _ => name.to_string(),
-            };
-            let mut w = CodeWriter::two_space().with_depth(1);
-            w.line(format!("Pointer<{native}> {p} = nullptr;"));
-            w.line(format!("if ({name} != null) {{"));
-            w.scope(|w| {
-                w.line(format!("{p} = calloc<{native}>();"));
-                w.line(format!("{p}.value = {val};"));
-            });
-            w.line("}");
-            out.push_str(&w.finish());
-            frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
-            vec![p]
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("interfaces and iterators never appear inside a value buffer")
         }
     }
 }
 
-fn emit_list_input(
-    out: &mut String,
-    name: &str,
-    inner: &TypeRef,
-    frees: &mut Vec<String>,
-) -> Vec<String> {
-    let p = format!("{name}Ptr");
-    let arr_ty = input_array_ffi(inner);
-    let inner_ffi = arr_ty
-        .strip_prefix("Pointer<")
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or("Pointer<Void>")
-        .to_string();
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.line(format!(
-        "final {p} = {name}.isEmpty ? nullptr : calloc<{inner_ffi}>({name}.length);"
-    ));
-    w.line(format!("for (var i = 0; i < {name}.length; i++) {{"));
-    w.scope(|w| {
-        w.line(format!(
-            "{p}[i] = {};",
-            elem_to_native(&format!("{name}[i]"), inner)
-        ));
-    });
-    w.line("}");
-    out.push_str(&w.finish());
-    if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        frees.push(format!(
-            "if ({p} != nullptr) {{ for (var i = 0; i < {name}.length; i++) {{ calloc.free({p}[i]); }} calloc.free({p}); }}"
-        ));
-    } else {
-        frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
+/// Emit the private Dart value-buffer runtime: the little-endian, packed
+/// writer and reader plus the staging/copy helpers wrappers use to move
+/// encodings across the boundary.
+fn render_buffer_runtime(out: &mut String) {
+    out.push_str(
+        r#"
+// ── WeaveFFI value-buffer runtime ──
+// Records, rich enums, optionals, lists, maps, and error payloads cross the
+// C ABI serialized in this little-endian, packed format. A malformed buffer
+// is a producer/consumer contract violation, never a typed domain error.
+
+Never _bufferError(String context) =>
+    throw StateError('malformed WeaveFFI value buffer: $context');
+
+// Copies a borrowed native (ptr, len) buffer into Dart-owned memory.
+Uint8List _copyNativeBytes(Pointer<Uint8> ptr, int len) =>
+    ptr == nullptr ? Uint8List(0) : Uint8List.fromList(ptr.asTypedList(len));
+
+// Stages an encoding into native memory for a borrowed (ptr, len) argument;
+// the caller frees the pointer after the call returns.
+Pointer<Uint8> _stageBytes(Uint8List bytes) {
+  final ptr = calloc<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+  if (bytes.isNotEmpty) ptr.asTypedList(bytes.length).setAll(0, bytes);
+  return ptr;
+}
+
+final class _BufferWriter {
+  Uint8List _buf = Uint8List(64);
+  ByteData? _view;
+  int _len = 0;
+
+  ByteData get _data => _view ??= ByteData.sublistView(_buf);
+
+  void _ensure(int extra) {
+    if (_len + extra <= _buf.length) return;
+    var cap = _buf.length * 2;
+    while (cap < _len + extra) {
+      cap *= 2;
     }
-    vec![p, format!("{name}.length")]
+    final next = Uint8List(cap);
+    next.setRange(0, _len, _buf);
+    _buf = next;
+    _view = null;
+  }
+
+  Uint8List takeBytes() => Uint8List.sublistView(_buf, 0, _len);
+
+  void writeBool(bool v) => writeUint8(v ? 1 : 0);
+
+  void writeOptionFlag(bool present) => writeUint8(present ? 1 : 0);
+
+  void writeInt8(int v) {
+    _ensure(1);
+    _data.setInt8(_len, v);
+    _len += 1;
+  }
+
+  void writeUint8(int v) {
+    _ensure(1);
+    _data.setUint8(_len, v);
+    _len += 1;
+  }
+
+  void writeInt16(int v) {
+    _ensure(2);
+    _data.setInt16(_len, v, Endian.little);
+    _len += 2;
+  }
+
+  void writeUint16(int v) {
+    _ensure(2);
+    _data.setUint16(_len, v, Endian.little);
+    _len += 2;
+  }
+
+  void writeInt32(int v) {
+    _ensure(4);
+    _data.setInt32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeUint32(int v) {
+    _ensure(4);
+    _data.setUint32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeInt64(int v) {
+    _ensure(8);
+    _data.setInt64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeUint64(int v) {
+    _ensure(8);
+    _data.setUint64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeFloat32(double v) {
+    _ensure(4);
+    _data.setFloat32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeFloat64(double v) {
+    _ensure(8);
+    _data.setFloat64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeLength(int v) => writeUint32(v);
+
+  void writeString(String v) {
+    final bytes = utf8.encode(v);
+    writeLength(bytes.length);
+    _ensure(bytes.length);
+    _buf.setRange(_len, _len + bytes.length, bytes);
+    _len += bytes.length;
+  }
+
+  void writeBytes(List<int> v) {
+    writeLength(v.length);
+    _ensure(v.length);
+    _buf.setRange(_len, _len + v.length, v);
+    _len += v.length;
+  }
 }
 
-fn emit_map_input(
-    out: &mut String,
-    name: &str,
-    k: &TypeRef,
-    v: &TypeRef,
-    frees: &mut Vec<String>,
-) -> Vec<String> {
-    let kp = format!("{name}Keys");
-    let vp = format!("{name}Vals");
-    let kff = input_array_ffi(k);
-    let vff = input_array_ffi(v);
-    let ki = kff
-        .strip_prefix("Pointer<")
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or("Pointer<Void>")
-        .to_string();
-    let vi = vff
-        .strip_prefix("Pointer<")
-        .and_then(|s| s.strip_suffix('>'))
-        .unwrap_or("Pointer<Void>")
-        .to_string();
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.line(format!("final {name}Entries = {name}.entries.toList();"));
-    w.line(format!(
-        "final {kp} = {name}.isEmpty ? nullptr : calloc<{ki}>({name}.length);"
-    ));
-    w.line(format!(
-        "final {vp} = {name}.isEmpty ? nullptr : calloc<{vi}>({name}.length);"
-    ));
-    w.line(format!("for (var i = 0; i < {name}Entries.length; i++) {{"));
-    w.scope(|w| {
-        w.line(format!(
-            "{kp}[i] = {};",
-            elem_to_native(&format!("{name}Entries[i].key"), k)
-        ));
-        w.line(format!(
-            "{vp}[i] = {};",
-            elem_to_native(&format!("{name}Entries[i].value"), v)
-        ));
-    });
-    w.line("}");
-    out.push_str(&w.finish());
-    let free_arr = |which: &str, ty: &TypeRef| -> String {
-        if matches!(ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-            format!("if ({which} != nullptr) {{ for (var i = 0; i < {name}.length; i++) {{ calloc.free({which}[i]); }} calloc.free({which}); }}")
-        } else {
-            format!("if ({which} != nullptr) calloc.free({which});")
-        }
-    };
-    frees.push(free_arr(&kp, k));
-    frees.push(free_arr(&vp, v));
-    vec![kp, vp, format!("{name}.length")]
+final class _BufferReader {
+  final Uint8List _buf;
+  final ByteData _data;
+  int _pos = 0;
+
+  _BufferReader(Uint8List buf)
+      : _buf = buf,
+        _data = ByteData.sublistView(buf);
+
+  int get _remaining => _buf.length - _pos;
+
+  void _require(int n, String context) {
+    if (_remaining < n) _bufferError(context);
+  }
+
+  bool readBool() {
+    _require(1, 'bool');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('bool byte out of range');
+    return b == 1;
+  }
+
+  bool readOptionFlag() {
+    _require(1, 'option flag');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('option flag byte out of range');
+    return b == 1;
+  }
+
+  int readInt8() {
+    _require(1, 'i8');
+    return _data.getInt8(_pos++);
+  }
+
+  int readUint8() {
+    _require(1, 'u8');
+    return _buf[_pos++];
+  }
+
+  int readInt16() {
+    _require(2, 'i16');
+    final v = _data.getInt16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readUint16() {
+    _require(2, 'u16');
+    final v = _data.getUint16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readInt32() {
+    _require(4, 'i32');
+    final v = _data.getInt32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readUint32() {
+    _require(4, 'u32');
+    final v = _data.getUint32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readInt64() {
+    _require(8, 'i64');
+    final v = _data.getInt64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readUint64() {
+    _require(8, 'u64');
+    final v = _data.getUint64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  double readFloat32() {
+    _require(4, 'f32');
+    final v = _data.getFloat32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  double readFloat64() {
+    _require(8, 'f64');
+    final v = _data.getFloat64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readLength() {
+    final n = readUint32();
+    if (n > _remaining) _bufferError('length prefix exceeds remaining buffer');
+    return n;
+  }
+
+  String readString() {
+    final n = readLength();
+    final s = utf8.decode(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return s;
+  }
+
+  Uint8List readBytes() {
+    final n = readLength();
+    final b = Uint8List.fromList(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return b;
+  }
+
+  void expectEnd() {
+    if (_remaining != 0) _bufferError('trailing bytes after value');
+  }
+}
+"#,
+    );
 }
 
-/// Native expression converting a Dart element (`expr`) of a list/map into the
-/// value stored in a native array slot.
-fn elem_to_native(expr: &str, ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{expr}.toNativeUtf8()"),
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => {
-            format!("{expr}._handle")
-        }
-        TypeRef::Enum(_) => format!("{expr}.value"),
-        _ => expr.to_string(),
-    }
-}
-
-/// Whether a return type lowers to callee-allocated out-parameters (so the call
-/// wrapper must allocate `outLen`/`outKeys`/`outVals` and decode afterwards).
-fn return_has_out_params(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _)
-    )
-}
-
-/// Whether an `optional<inner>` already lowers to a nullable pointer (so the
-/// option is encoded by the pointer's nullness, not an extra indirection).
-fn optional_inner_is_pointer(inner: &TypeRef) -> bool {
-    matches!(
-        inner,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_)
-    )
-}
-
-/// The FFI return type (native, dart) of a call symbol. Maps return-by-value via
-/// out-params to a `void` symbol; an optional scalar lowers to a nullable
-/// pointer-to-scalar; everything else follows [`native_ffi_type`].
-fn return_ffi(ty: &TypeRef) -> (String, String) {
-    match ty {
-        TypeRef::Map(_, _) => ("Void".into(), "void".into()),
-        TypeRef::Optional(inner) if !optional_inner_is_pointer(inner) => {
-            let p = format!("Pointer<{}>", scalar_ffi(inner).0);
-            (p.clone(), p)
-        }
-        _ => (native_ffi_type(ty), dart_ffi_type(ty)),
-    }
-}
-
-/// dart:ffi type of the `outKeys`/`outValues` pointer passed *by address* for a
-/// map return (the C slot is `K***`/`V***`).
-fn map_out_ffi(elem: &TypeRef) -> String {
-    match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Pointer<Pointer<Utf8>>>".into(),
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => "Pointer<Pointer<Pointer<Void>>>".into(),
-        _ => format!("Pointer<Pointer<{}>>", scalar_ffi(elem).0),
-    }
-}
-
-/// Read one decoded array/map element (`arr` is the typed array pointer).
-/// A string element is copied (the caller owes its release separately); an
-/// object element is adopted by its wrapper class, whose `dispose()` owns the
-/// eventual destroy. A `Bool` slot already reads back as a Dart `bool`.
-fn map_elem_read(arr: &str, idx: &str, ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{arr}[{idx}].toDartString()"),
-        TypeRef::Enum(n) => format!(
-            "{}.fromValue({arr}[{idx}])",
-            local_type_name(n).to_upper_camel_case()
-        ),
-        TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => {
-            format!(
-                "{}._({arr}[{idx}])",
-                local_type_name(n).to_upper_camel_case()
-            )
-        }
-        _ => format!("{arr}[{idx}]"),
-    }
-}
-
-/// The trailing FFI typedef slots (native, dart) a return type contributes for
-/// its callee-allocated out-parameters.
-fn return_out_slots(ty: &TypeRef) -> Vec<(String, String)> {
-    let ptr = |s: String| (s.clone(), s);
-    match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-            vec![ptr("Pointer<Size>".into())]
-        }
-        TypeRef::Map(k, v) => vec![
-            ptr(map_out_ffi(k)),
-            ptr(map_out_ffi(v)),
-            ptr("Pointer<Size>".into()),
-        ],
-        _ => vec![],
-    }
-}
-
-/// Allocate the out-parameter locals a complex return needs before the call,
-/// returning the extra call-argument expressions and recording cleanup.
-fn emit_return_alloc(
-    out: &mut String,
-    ty: &TypeRef,
-    frees: &mut Vec<String>,
-    indent: &str,
-) -> Vec<String> {
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    let args = match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-            w.line("final outLen = calloc<Size>();");
-            frees.push("calloc.free(outLen);".into());
-            vec!["outLen".into()]
-        }
-        TypeRef::Map(k, v) => {
-            let kf = map_out_ffi(k);
-            let vf = map_out_ffi(v);
-            // `outKeys`/`outValues` hold the array pointer the callee writes.
-            let ki = kf
-                .strip_prefix("Pointer<")
-                .and_then(|s| s.strip_suffix('>'))
-                .unwrap();
-            let vi = vf
-                .strip_prefix("Pointer<")
-                .and_then(|s| s.strip_suffix('>'))
-                .unwrap();
-            w.line(format!("final outKeys = calloc<{ki}>();"));
-            w.line(format!("final outValues = calloc<{vi}>();"));
-            w.line("final outLen = calloc<Size>();");
-            frees.push("calloc.free(outKeys);".into());
-            frees.push("calloc.free(outValues);".into());
-            frees.push("calloc.free(outLen);".into());
-            vec!["outKeys".into(), "outValues".into(), "outLen".into()]
-        }
-        _ => vec![],
-    };
-    out.push_str(&w.finish());
-    args
-}
-
-/// Emit the post-call decode of a (possibly complex) return into the wrapper's
-/// Dart return value. `result` is the call result (absent for `void` map returns).
-fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
-    match ty {
-        TypeRef::List(inner) => emit_list_conversion(out, inner, indent),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-            w.line("final n = outLen.value;");
-            w.line("if (result == nullptr) return <int>[];");
-            w.line("final bytes = List<int>.generate(n, (i) => result[i]);");
-            // Copy first, then release the producer's buffer.
-            w.line("_weaveffiFreeBytes(result, n);");
-            w.line("return bytes;");
-            out.push_str(&w.finish());
-        }
-        TypeRef::Map(k, v) => {
-            let kt = dart_type(k);
-            let vt = dart_type(v);
-            let kp = elem_pointee(k);
-            let vp = elem_pointee(v);
-            let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-            w.line("final n = outLen.value;");
-            w.line(format!("final m = <{kt}, {vt}>{{}};"));
-            w.line("final keys = outKeys.value;");
-            w.line("final vals = outValues.value;");
-            w.line("for (var i = 0; i < n; i++) {");
-            w.scope(|w| {
-                w.line(format!(
-                    "m[{}] = {};",
-                    map_elem_read("keys", "i", k),
-                    map_elem_read("vals", "i", v)
-                ));
-            });
-            w.line("}");
-            // Release each copied string element, then both parallel arrays.
-            for (arr, ty) in [("keys", k), ("vals", v)] {
-                if matches!(ty.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-                    w.line("for (var i = 0; i < n; i++) {");
-                    w.scope(|w| {
-                        w.line(format!("_weaveffiFreeString({arr}[i]);"));
-                    });
-                    w.line("}");
-                }
-            }
-            w.line("if (keys != nullptr) {");
-            w.scope(|w| {
-                w.line(format!(
-                    "_weaveffiFreeBytes(keys.cast(), n * sizeOf<{kp}>());"
-                ));
-            });
-            w.line("}");
-            w.line("if (vals != nullptr) {");
-            w.scope(|w| {
-                w.line(format!(
-                    "_weaveffiFreeBytes(vals.cast(), n * sizeOf<{vp}>());"
-                ));
-            });
-            w.line("}");
-            w.line("return m;");
-            out.push_str(&w.finish());
-        }
-        _ => emit_result_conversion(out, ty, indent),
-    }
-}
-
-/// Convert a single native leaf value (`expr`) into its Dart representation.
-/// A `Bool` slot already reads back as a Dart `bool`.
-fn read_value(expr: &str, ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{expr}.toDartString()"),
-        TypeRef::Enum(n) => format!(
-            "{}.fromValue({expr})",
-            local_type_name(n).to_upper_camel_case()
-        ),
-        TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => {
-            format!("{}._({expr})", local_type_name(n).to_upper_camel_case())
-        }
-        _ => expr.to_string(),
-    }
-}
-
-/// dart:ffi pointee type of one element slot: an iterator's `out_item`
-/// allocation, a returned array's element, or a returned map's key/value
-/// element (the C slot is `T*`).
-fn elem_pointee(elem: &TypeRef) -> String {
-    match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "Pointer<Utf8>".into(),
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => "Pointer<Void>".into(),
-        _ => scalar_ffi(elem).0.to_string(),
-    }
-}
-
+/// Emit the dart:ffi typedef pair and `lookupFunction` binding for one C
+/// symbol.
 fn emit_typedef_and_lookup(
     out: &mut String,
     c_sym: &str,
@@ -983,11 +938,13 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
     out.push_str(
         "// ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element\n\n",
     );
-    out.push_str("import 'dart:ffi';\n");
-    out.push_str("import 'dart:io' show Platform;\n");
     if has_async {
         out.push_str("import 'dart:async';\n");
     }
+    out.push_str("import 'dart:convert';\n");
+    out.push_str("import 'dart:ffi';\n");
+    out.push_str("import 'dart:io' show Platform;\n");
+    out.push_str("import 'dart:typed_data';\n\n");
     out.push_str("import 'package:ffi/ffi.dart';\n\n");
 
     out.push_str("DynamicLibrary _openLibrary() {\n");
@@ -1012,10 +969,17 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
     out.push_str("}\n\n");
     out.push_str("final DynamicLibrary _lib = _openLibrary();\n\n");
 
+    // The error slot every fallible call writes. `payloadPtr`/`payloadLen`
+    // hold the matched error code's fields serialized in the value-buffer
+    // format (null when the code declares no fields); `weaveffi_error_clear`
+    // releases both the message and the payload.
     out.push_str("final class _WeaveFFIError extends Struct {\n");
     out.push_str("  @Int32()\n");
     out.push_str("  external int code;\n");
     out.push_str("  external Pointer<Utf8> message;\n");
+    out.push_str("  external Pointer<Uint8> payloadPtr;\n");
+    out.push_str("  @Size()\n");
+    out.push_str("  external int payloadLen;\n");
     out.push_str("}\n");
 
     emit_typedef_and_lookup(
@@ -1029,9 +993,9 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
 
     // Runtime release helpers: every returned `const char*` is freed with
     // `weaveffi_free_string` after copying, and every producer-allocated
-    // buffer (bytes, array, map, boxed optional scalar) with
-    // `weaveffi_free_bytes`. The runtime always exports these under the
-    // canonical `weaveffi_` names, like `weaveffi_error_clear`.
+    // buffer (bytes and serialized value buffers) with `weaveffi_free_bytes`.
+    // The runtime always exports these under the canonical `weaveffi_` names,
+    // like `weaveffi_error_clear`.
     emit_typedef_and_lookup(
         &mut out,
         "weaveffi_free_string",
@@ -1070,6 +1034,8 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
     out.push_str("  }\n");
     out.push_str("}\n");
 
+    render_buffer_runtime(&mut out);
+
     let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
     if has_listeners {
         out.push_str("\n// Live listener trampolines by subscription id. Holding the\n");
@@ -1101,12 +1067,9 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
         }
         for s in &module.structs {
             render_struct(&mut out, s);
-            if s.builder.is_some() {
-                render_dart_builder(&mut out, s);
-            }
         }
         for i in &module.interfaces {
-            render_interface(&mut out, module, i, &model.prefix);
+            render_interface(&mut out, module, i);
         }
         for cb in &module.callbacks {
             render_callback_typedef(&mut out, cb);
@@ -1115,13 +1078,7 @@ fn render_dart_module(api: &Api, model: &BindingModel, config: &DartConfig) -> S
             render_listener(&mut out, module, l, config.strip_module_prefix);
         }
         for f in &module.functions {
-            render_function(
-                &mut out,
-                module,
-                f,
-                config.strip_module_prefix,
-                &model.prefix,
-            );
+            render_function(&mut out, module, f, config.strip_module_prefix);
         }
     }
 
@@ -1176,10 +1133,11 @@ impl<'a> ErrCtx<'a> {
     }
 
     /// The expression building the exception for an async completion's
-    /// already-captured `code`/`msg` locals.
+    /// already-captured `code`/`msg` (and, for a domain error, `payload`)
+    /// locals.
     fn map_expr(&self) -> String {
         match self.thrown_exception() {
-            Some(exc) => format!("_map{exc}(code, msg)"),
+            Some(exc) => format!("_map{exc}(code, msg, payload)"),
             None => "WeaveFFIException(code, msg)".to_string(),
         }
     }
@@ -1187,8 +1145,10 @@ impl<'a> ErrCtx<'a> {
 
 /// Render one module's declared error domain: the domain exception extending
 /// the generic [`errors::EXCEPTION_BRAND`], one exception subclass per code
-/// carrying its stable code and default message, and the `_map`/`_check`
-/// helpers that throwing wrappers route their out-err slots through. Unknown
+/// carrying its stable code, default message, and any decoded payload fields,
+/// and the `_map`/`_check` helpers that throwing wrappers route their out-err
+/// slots through. When a code declares payload fields, the mapper decodes the
+/// error's payload buffer into the exception's typed properties. Unknown
 /// codes (panics, marshalling failures) fall back to the generic exception.
 fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     let exc = dart_exception_name(&eb.type_name);
@@ -1215,22 +1175,67 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
             w.raw(d);
         }
         w.block(format!("class {class} extends {exc} {{"), "}", |w| {
-            w.line(format!(
-                "{class}([String message = '{message}']) : super({}, message);",
-                c.value
-            ));
+            if c.fields.is_empty() {
+                w.line(format!(
+                    "{class}([String message = '{message}']) : super({}, message);",
+                    c.value
+                ));
+            } else {
+                for f in &c.fields {
+                    let mut fd = String::new();
+                    emit_doc(&mut fd, &f.doc, "  ");
+                    w.raw(fd);
+                    w.line(format!(
+                        "final {} {};",
+                        dart_type(&f.ty),
+                        f.name.to_lower_camel_case()
+                    ));
+                }
+                w.blank();
+                let params: Vec<String> = c
+                    .fields
+                    .iter()
+                    .map(|f| format!("this.{}", f.name.to_lower_camel_case()))
+                    .collect();
+                w.line(format!(
+                    "{class}({}, [String message = '{message}']) : super({}, message);",
+                    params.join(", "),
+                    c.value
+                ));
+            }
         });
     }
 
     w.blank();
-    w.line(format!("{brand} _map{exc}(int code, String message) {{"));
+    w.line(format!(
+        "{brand} _map{exc}(int code, String message, Uint8List payload) {{"
+    ));
     w.scope(|w| {
         w.block("switch (code) {", "}", |w| {
             for c in &eb.codes {
-                w.line(format!("case {}:", c.value));
-                w.scope(|w| {
-                    w.line(format!("return {}(message);", dart_exception_name(&c.name)));
-                });
+                let class = dart_exception_name(&c.name);
+                if c.fields.is_empty() {
+                    w.line(format!("case {}:", c.value));
+                    w.scope(|w| {
+                        w.line(format!("return {class}(message);"));
+                    });
+                } else {
+                    // Braces give each payload-decoding case its own scope,
+                    // so the reader and field locals never collide between
+                    // cases (a Dart switch otherwise shares one scope).
+                    w.line(format!("case {}: {{", c.value));
+                    w.scope(|w| {
+                        w.line("final r = _BufferReader(payload);");
+                        let mut args: Vec<String> = Vec::new();
+                        for (i, f) in c.fields.iter().enumerate() {
+                            w.line(format!("final v{i} = {};", read_expr("r", &f.ty)));
+                            args.push(format!("v{i}"));
+                        }
+                        w.line("r.expectEnd();");
+                        w.line(format!("return {class}({}, message);", args.join(", ")));
+                    });
+                    w.line("}");
+                }
             }
             w.line("default:");
             w.scope(|w| {
@@ -1248,15 +1253,16 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
             w.block("if (err.ref.code != 0) {", "}", |w| {
                 w.line("final code = err.ref.code;");
                 w.line("final msg = err.ref.message.toDartString();");
+                w.line("final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);");
                 w.line("_weaveffiErrorClear(err);");
-                w.line(format!("throw _map{exc}(code, msg);"));
+                w.line(format!("throw _map{exc}(code, msg, payload);"));
             });
         },
     );
     out.push_str(&w.finish());
 }
 
-/// The [`ErrCtx`] for one callable of `module`: its [`ErrorStrategy`] paired
+/// The [`ErrCtx`] for one callable of a module: its [`ErrorStrategy`] paired
 /// with the exception class of the domain in effect (own or inherited).
 fn err_ctx<'a>(f: &FnBinding, exception: Option<&'a str>) -> ErrCtx<'a> {
     ErrCtx {
@@ -1265,14 +1271,14 @@ fn err_ctx<'a>(f: &FnBinding, exception: Option<&'a str>) -> ErrCtx<'a> {
     }
 }
 
-/// Render one interface as an opaque-object wrapper class, mirroring the Dart
-/// struct wrapper: it owns the C handle behind a private `_handle`, frees it
-/// once in `dispose()` via the interface's destroy symbol, and exposes the
-/// canonical `new` constructor as an unnamed factory (`Store(...)`), every
-/// other constructor as a named factory (`Store.open(...)`), instance methods
-/// that pass `_handle` as the implicit leading FFI argument, and statics as
-/// `static` methods. Member FFI typedefs and lookups stay at file scope.
-fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding, prefix: &str) {
+/// Render one interface as an opaque-object wrapper class: it owns the C
+/// handle behind a private `_handle`, frees it once in `dispose()` via the
+/// interface's destroy symbol, and exposes the canonical `new` constructor as
+/// an unnamed factory (`Store(...)`), every other constructor as a named
+/// factory (`Store.open(...)`), instance methods that pass `_handle` as the
+/// implicit leading FFI argument, and statics as `static` methods. Member FFI
+/// typedefs and lookups stay at file scope.
+fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding) {
     let class_name = i.name.to_upper_camel_case();
     emit_typedef_and_lookup(
         out,
@@ -1303,8 +1309,6 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
             &kind,
             &c.name.to_lower_camel_case(),
             err_ctx(c, exc.as_deref()),
-            module,
-            prefix,
         );
     }
     for m in &i.methods {
@@ -1315,8 +1319,6 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
             &DartDecl::Method,
             &m.name.to_lower_camel_case(),
             err_ctx(m, exc.as_deref()),
-            module,
-            prefix,
         );
     }
     for s in &i.statics {
@@ -1327,8 +1329,6 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
             &DartDecl::Static,
             &s.name.to_lower_camel_case(),
             err_ctx(s, exc.as_deref()),
-            module,
-            prefix,
         );
     }
 
@@ -1356,9 +1356,10 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
     out.push_str(&w.finish());
 }
 
+/// Render one enum. A C-style enum becomes an enhanced Dart `enum`; a rich
+/// (algebraic) enum is a value type and becomes a sealed class hierarchy with
+/// pack/unpack helpers.
 fn render_enum(out: &mut String, e: &EnumBinding) {
-    // A rich (algebraic) enum crosses the ABI as an opaque object, so it is
-    // emitted as a wrapper class (like a struct), not a plain Dart `enum`.
     if e.is_rich() {
         render_rich_enum(out, e);
         return;
@@ -1390,24 +1391,12 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
+/// Render one record as a plain Dart value class (final typed fields, a named
+/// constructor argument per field), plus its `_pack{Name}`/`_unpack{Name}`
+/// buffer helpers. Records declare no C symbols: no destroy, no getters, no
+/// builders; instances cross the ABI serialized in value buffers.
 fn render_struct(out: &mut String, s: &StructBinding) {
     let class_name = s.name.to_upper_camel_case();
-    // Symbols come precomputed from the shared BindingModel, so Dart never
-    // re-derives the `{prefix}_{module}_{Name}_*` scheme itself.
-    let destroy_sym = &s.destroy_symbol;
-    emit_typedef_and_lookup(
-        out,
-        destroy_sym,
-        "Pointer<Void>",
-        "Pointer<Void>",
-        "Void",
-        "void",
-    );
-
-    for field in &s.fields {
-        emit_field_getter_typedef(out, field);
-    }
-
     let mut w = CodeWriter::two_space();
     w.blank();
     {
@@ -1416,459 +1405,196 @@ fn render_struct(out: &mut String, s: &StructBinding) {
         w.raw(d);
     }
     w.block(format!("class {class_name} {{"), "}", |w| {
-        w.line("final Pointer<Void> _handle;");
-        w.line(format!("{class_name}._(this._handle);"));
-        w.blank();
-        w.block("void dispose() {", "}", |w| {
-            w.line(format!("_{}(_handle);", destroy_sym.to_lower_camel_case()));
-        });
-        for field in &s.fields {
-            let mut m = String::new();
-            emit_field_getter_method(&mut m, field);
-            w.raw(m);
+        for f in &s.fields {
+            let mut fd = String::new();
+            emit_doc(&mut fd, &f.doc, "  ");
+            w.raw(fd);
+            w.line(format!(
+                "final {} {};",
+                dart_type(&f.ty),
+                f.name.to_lower_camel_case()
+            ));
+        }
+        if !s.fields.is_empty() {
+            w.blank();
+            let params: Vec<String> = s
+                .fields
+                .iter()
+                .map(|f| {
+                    let n = f.name.to_lower_camel_case();
+                    if matches!(f.ty, TypeRef::Optional(_)) {
+                        format!("this.{n}")
+                    } else {
+                        format!("required this.{n}")
+                    }
+                })
+                .collect();
+            w.line(format!("{class_name}({{{}}});", params.join(", ")));
         }
     });
-    out.push_str(&w.finish());
-}
 
-/// Emit the dart:ffi typedef + `lookupFunction` for one opaque-object field
-/// getter (a struct field or a rich-enum variant field). The getter takes only
-/// the opaque handle and reports no error; a bytes/list field adds its
-/// callee-allocated out-param and a map field adds its triple and lowers to a
-/// `void` symbol. The lookup is keyed on the field's precomputed
-/// `getter_symbol`, so a rich enum may rename the Dart member freely.
-fn emit_field_getter_typedef(out: &mut String, field: &FieldBinding) {
-    let getter_sym = &field.getter_symbol;
-    let mut nparams = vec!["Pointer<Void>".to_string()];
-    let mut dparams = vec!["Pointer<Void>".to_string()];
-    for (n, d) in return_out_slots(&field.ty) {
-        nparams.push(n);
-        dparams.push(d);
-    }
-    let (nr, dr) = return_ffi(&field.ty);
-    emit_typedef_and_lookup(
-        out,
-        getter_sym,
-        &nparams.join(", "),
-        &dparams.join(", "),
-        &nr,
-        &dr,
-    );
-}
-
-/// Emit the idiomatic Dart getter for one opaque-object field. The member name
-/// comes from `field.name`, so a rich enum can namespace it per variant (e.g.
-/// `circleRadius`) by passing a renamed [`FieldBinding`], while the FFI lookup
-/// stays keyed on the precomputed `getter_symbol`. Receiver is the wrapper's
-/// `_handle`, common to both the struct and rich-enum classes.
-fn emit_field_getter_method(out: &mut String, field: &FieldBinding) {
-    let getter_sym = &field.getter_symbol;
-    let dart_ret = dart_type(&field.ty);
-    let fname = field.name.to_lower_camel_case();
-
-    let mut w = CodeWriter::two_space().with_depth(1);
+    // Pack: each field in declaration (wire) order.
     w.blank();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &field.doc, "  ");
-        w.raw(d);
-    }
-    w.line(format!("{dart_ret} get {fname} {{"));
-    if return_has_out_params(&field.ty) {
-        let mut frees: Vec<String> = Vec::new();
-        let mut args = vec!["_handle".to_string()];
-        let mut alloc = String::new();
-        args.extend(emit_return_alloc(&mut alloc, &field.ty, &mut frees, "    "));
-        let mut dec = String::new();
-        emit_return_decode(&mut dec, &field.ty, "      ");
-        w.raw(alloc);
-        w.scope(|w| {
-            w.line("try {");
+    w.line(format!(
+        "void _pack{class_name}(_BufferWriter w, {class_name} v) {{"
+    ));
+    w.scope(|w| {
+        let mut tmp = 0usize;
+        for f in &s.fields {
+            write_stmts(
+                w,
+                "w",
+                &format!("v.{}", f.name.to_lower_camel_case()),
+                &f.ty,
+                &mut tmp,
+            );
+        }
+    });
+    w.line("}");
+
+    // Unpack: named constructor arguments evaluate in source order, which is
+    // the field declaration (wire) order.
+    w.blank();
+    w.line(format!(
+        "{class_name} _unpack{class_name}(_BufferReader r) {{"
+    ));
+    w.scope(|w| {
+        if s.fields.is_empty() {
+            w.line(format!("return {class_name}();"));
+        } else {
+            w.line(format!("return {class_name}("));
             w.scope(|w| {
-                if matches!(&field.ty, TypeRef::Map(_, _)) {
+                for f in &s.fields {
                     w.line(format!(
-                        "_{}({});",
-                        getter_sym.to_lower_camel_case(),
-                        args.join(", ")
-                    ));
-                } else {
-                    w.line(format!(
-                        "final result = _{}({});",
-                        getter_sym.to_lower_camel_case(),
-                        args.join(", ")
+                        "{}: {},",
+                        f.name.to_lower_camel_case(),
+                        read_expr("r", &f.ty)
                     ));
                 }
-                w.raw(&dec);
             });
-            w.line("} finally {");
-            w.scope(|w| {
-                for fr in &frees {
-                    w.line(fr);
-                }
-            });
-            w.line("}");
-        });
-    } else {
-        let mut conv = String::new();
-        emit_result_conversion(&mut conv, &field.ty, "    ");
-        w.scope(|w| {
-            w.line(format!(
-                "final result = _{}(_handle);",
-                getter_sym.to_lower_camel_case()
-            ));
-            w.raw(conv);
-        });
-    }
+            w.line(");");
+        }
+    });
     w.line("}");
     out.push_str(&w.finish());
 }
 
-fn render_dart_builder(out: &mut String, s: &StructBinding) {
-    let class_name = s.name.to_upper_camel_case();
-    let builder_name = format!("{class_name}Builder");
-    let create_sym = &s.create.symbol;
+/// The Dart subclass name of one rich-enum variant: `{Enum}{Variant}`.
+fn variant_class(base: &str, variant: &str) -> String {
+    format!("{base}{}", variant.to_upper_camel_case())
+}
 
-    // `{Struct}_create(<field slots>, error* out_err) -> {Struct}*`: each field
-    // expands to its ABI slots, then the trailing error pointer.
-    let mut nparams: Vec<String> = Vec::new();
-    let mut dparams: Vec<String> = Vec::new();
-    for field in &s.fields {
-        for (n, d) in input_slots(&field.ty) {
-            nparams.push(n);
-            dparams.push(d);
-        }
-    }
-    nparams.push("Pointer<_WeaveFFIError>".into());
-    dparams.push("Pointer<_WeaveFFIError>".into());
-    emit_typedef_and_lookup(
-        out,
-        create_sym,
-        &nparams.join(", "),
-        &dparams.join(", "),
-        "Pointer<Void>",
-        "Pointer<Void>",
-    );
-
-    let mut frees: Vec<String> = Vec::new();
-    let mut call_args: Vec<String> = Vec::new();
-    let mut staging = String::new();
-    for field in &s.fields {
-        let args = emit_input(
-            &mut staging,
-            &field.name.to_lower_camel_case(),
-            &field.ty,
-            &mut frees,
-        );
-        call_args.extend(args);
-    }
-    frees.push("calloc.free(err);".into());
-    call_args.push("err".into());
-
+/// Render one rich (algebraic) enum as an idiomatic sealed class hierarchy:
+/// a sealed base class plus one subclass per variant carrying that variant's
+/// fields, and `_pack{Name}`/`_unpack{Name}` helpers encoding the `i32` tag
+/// followed by the active variant's fields. Rich enums declare no C symbols;
+/// values cross the ABI serialized in value buffers.
+fn render_rich_enum(out: &mut String, e: &EnumBinding) {
+    let base = e.name.to_upper_camel_case();
     let mut w = CodeWriter::two_space();
     w.blank();
     {
         let mut d = String::new();
-        emit_doc(&mut d, &s.doc, "");
+        emit_doc(&mut d, &e.doc, "");
         w.raw(d);
     }
-    w.block(format!("class {builder_name} {{"), "}", |w| {
-        for field in &s.fields {
-            let dt = dart_nullable_type_for_builder_field(&field.ty);
-            let priv_name = field.name.to_lower_camel_case();
-            w.line(format!("{dt} _{priv_name};"));
-        }
+    w.block(format!("sealed class {base} {{"), "}", |w| {
+        w.line(format!("const {base}();"));
+    });
 
-        for field in &s.fields {
-            let pascal = field.name.to_upper_camel_case();
-            let dt = dart_type(&field.ty);
-            let priv_name = field.name.to_lower_camel_case();
-            w.blank();
-            {
-                let mut fd = String::new();
-                emit_doc(&mut fd, &field.doc, "  ");
-                w.raw(fd);
-            }
-            w.block(
-                format!("{builder_name} with{pascal}({dt} value) {{"),
-                "}",
-                |w| {
-                    w.line(format!("_{priv_name} = value;"));
-                    w.line("return this;");
-                },
-            );
-        }
-
+    for v in &e.variants {
+        let cls = variant_class(&base, &v.name);
         w.blank();
-        w.block(format!("{class_name} build() {{"), "}", |w| {
-            // Required fields must be set; optional fields default to null.
-            for field in &s.fields {
-                if !matches!(&field.ty, TypeRef::Optional(_)) {
-                    let priv_name = field.name.to_lower_camel_case();
-                    w.block(format!("if (_{priv_name} == null) {{"), "}", |w| {
-                        w.line(format!(
-                            "throw StateError('missing field: {}');",
-                            field.name
-                        ));
+        {
+            let mut vd = String::new();
+            emit_doc(&mut vd, &v.doc, "");
+            w.raw(vd);
+        }
+        if v.fields.is_empty() {
+            w.line(format!("class {cls} extends {base} {{}}"));
+        } else {
+            w.block(format!("class {cls} extends {base} {{"), "}", |w| {
+                for f in &v.fields {
+                    let mut fd = String::new();
+                    emit_doc(&mut fd, &f.doc, "  ");
+                    w.raw(fd);
+                    w.line(format!(
+                        "final {} {};",
+                        dart_type(&f.ty),
+                        f.name.to_lower_camel_case()
+                    ));
+                }
+                w.blank();
+                let params: Vec<String> = v
+                    .fields
+                    .iter()
+                    .map(|f| format!("this.{}", f.name.to_lower_camel_case()))
+                    .collect();
+                w.line(format!("{cls}({});", params.join(", ")));
+            });
+        }
+    }
+
+    // Pack: the i32 tag, then the active variant's fields in order. The
+    // sealed base makes the switch exhaustive without a default arm. One
+    // temp counter spans all cases: a Dart switch shares a single scope for
+    // plain declarations, so names must stay unique across cases.
+    w.blank();
+    w.line(format!("void _pack{base}(_BufferWriter w, {base} v) {{"));
+    w.scope(|w| {
+        w.line("switch (v) {");
+        w.scope(|w| {
+            let mut tmp = 0usize;
+            for v in &e.variants {
+                let cls = variant_class(&base, &v.name);
+                if v.fields.is_empty() {
+                    w.line(format!("case {cls}():"));
+                    w.scope(|w| {
+                        w.line(format!("w.writeInt32({});", v.value));
+                    });
+                } else {
+                    let b = fresh(&mut tmp);
+                    w.line(format!("case final {cls} {b}:"));
+                    w.scope(|w| {
+                        w.line(format!("w.writeInt32({});", v.value));
+                        for f in &v.fields {
+                            write_stmts(
+                                w,
+                                "w",
+                                &format!("{b}.{}", f.name.to_lower_camel_case()),
+                                &f.ty,
+                                &mut tmp,
+                            );
+                        }
                     });
                 }
             }
-            for field in &s.fields {
-                let priv_name = field.name.to_lower_camel_case();
-                if matches!(&field.ty, TypeRef::Optional(_)) {
-                    w.line(format!("final {priv_name} = _{priv_name};"));
-                } else {
-                    w.line(format!("final {priv_name} = _{priv_name}!;"));
-                }
-            }
-            w.raw(&staging);
-            w.line("final err = calloc<_WeaveFFIError>();");
-            w.line("try {");
-            w.scope(|w| {
-                w.line(format!(
-                    "final result = _{}({});",
-                    create_sym.to_lower_camel_case(),
-                    call_args.join(", ")
-                ));
-                w.line("_checkError(err);");
-                w.line(format!("return {class_name}._(result);"));
-            });
-            w.line("} finally {");
-            w.scope(|w| {
-                for fr in &frees {
-                    w.line(fr);
-                }
-            });
-            w.line("}");
         });
+        w.line("}");
     });
-    out.push_str(&w.finish());
-}
+    w.line("}");
 
-/// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the
-/// Dart struct wrapper: it owns the C handle behind a private `_handle` (so the
-/// existing function marshalling, `x._handle` in, `Name._(result)` out, keeps
-/// working unchanged, since a `TypeRef::RichEnum` reference shares the
-/// record's opaque-pointer ABI), frees it
-/// once in `dispose()`, and exposes a `tag` discriminant reader, one `factory`
-/// per variant (`Shape.circle(2.5)`), and per-variant field getters namespaced
-/// by variant (`circleRadius`) to avoid collisions. The opaque-object surface
-/// (tag/destroy symbols, per-variant constructors and field getters) is
-/// precomputed in the binding model exactly like a struct's.
-fn render_rich_enum(out: &mut String, e: &EnumBinding) {
-    let rich = e
-        .rich
-        .as_ref()
-        .expect("render_rich_enum requires a rich (algebraic) enum");
-    let class_name = e.name.to_upper_camel_case();
-    let tag_name = format!("{class_name}Tag");
-
-    // A top-level discriminant enum (`ShapeTag.circle`), rendered exactly like a
-    // plain enum so the active variant reads back as a typed value.
-    render_rich_enum_tag(out, e, &tag_name);
-
-    // FFI typedefs + lookups, keyed on the model's precomputed symbols: the
-    // destructor, the tag getter, one constructor per variant, and every
-    // per-variant field getter.
-    emit_typedef_and_lookup(
-        out,
-        &rich.destroy_symbol,
-        "Pointer<Void>",
-        "Pointer<Void>",
-        "Void",
-        "void",
-    );
-    emit_typedef_and_lookup(
-        out,
-        &rich.tag_symbol,
-        "Pointer<Void>",
-        "Pointer<Void>",
-        "Int32",
-        "int",
-    );
-    for v in &rich.variants {
-        emit_rich_variant_create_typedef(out, v);
-    }
-    for v in &rich.variants {
-        for field in namespaced_variant_fields(v) {
-            emit_field_getter_typedef(out, &field);
-        }
-    }
-
-    let mut w = CodeWriter::two_space();
+    // Unpack: constructor arguments evaluate left to right, preserving the
+    // wire order of the variant's fields.
     w.blank();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &e.doc, "");
-        w.raw(d);
-    }
-    w.block(format!("class {class_name} {{"), "}", |w| {
-        w.line("final Pointer<Void> _handle;");
-        w.line(format!("{class_name}._(this._handle);"));
-        w.blank();
-        w.block("void dispose() {", "}", |w| {
-            w.line(format!(
-                "_{}(_handle);",
-                rich.destroy_symbol.to_lower_camel_case()
-            ));
-        });
-
-        // The active variant's discriminant, read back as the typed tag enum.
-        w.blank();
-        w.line(format!(
-            "{tag_name} get tag =>\n      {tag_name}.fromValue(_{}(_handle));",
-            rich.tag_symbol.to_lower_camel_case()
-        ));
-
-        // One factory constructor per variant (`Shape.circle(2.5)`).
-        for v in &rich.variants {
-            let mut m = String::new();
-            emit_rich_variant_factory(&mut m, &class_name, v);
-            w.raw(m);
-        }
-
-        // Per-variant field getters, namespaced by variant (`circleRadius`).
-        for v in &rich.variants {
-            for field in namespaced_variant_fields(v) {
-                let mut m = String::new();
-                emit_field_getter_method(&mut m, &field);
-                w.raw(m);
-            }
-        }
-    });
-    out.push_str(&w.finish());
-}
-
-/// The typed discriminant of a rich enum, emitted as a top-level Dart `enum`
-/// (Dart cannot nest an `enum` in a class). Mirrors [`render_enum`]'s enhanced
-/// enum so `tag` reads back as e.g. `ShapeTag.circle`.
-fn render_rich_enum_tag(out: &mut String, e: &EnumBinding, tag_name: &str) {
-    let mut w = CodeWriter::two_space();
-    w.blank();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &e.doc, "");
-        w.raw(d);
-    }
-    w.block(format!("enum {tag_name} {{"), "}", |w| {
-        for v in &e.variants {
-            let vname = v.name.to_lower_camel_case();
-            let mut vd = String::new();
-            emit_doc(&mut vd, &v.doc, "  ");
-            w.raw(vd);
-            w.line(format!("{vname}({}),", v.value));
-        }
-        w.line(";");
-        w.line(format!("const {tag_name}(this.value);"));
-        w.line("final int value;");
-        w.blank();
-        w.line(format!(
-            "static {tag_name} fromValue(int value) =>\n      {tag_name}.values.firstWhere((e) => e.value == value);"
-        ));
-    });
-    out.push_str(&w.finish());
-}
-
-/// Project a variant's fields into [`FieldBinding`]s whose Dart member name is
-/// namespaced by the variant (`circle` + `radius` -> `circle_radius`, rendered
-/// `circleRadius`). The precomputed `getter_symbol` is left untouched, so the
-/// FFI lookup still targets the correct per-variant C symbol; this is what lets
-/// the rich enum reuse the struct field-getter renderers verbatim.
-fn namespaced_variant_fields(v: &RichVariantBinding) -> Vec<FieldBinding> {
-    let variant = v.name.to_snake_case();
-    v.fields
-        .iter()
-        .map(|f| {
-            let mut namespaced = f.clone();
-            namespaced.name = format!("{variant}_{}", f.name);
-            namespaced
-        })
-        .collect()
-}
-
-/// Emit the dart:ffi typedef + lookup for one variant constructor
-/// (`{c_tag}_{Variant}_new`): each variant field lowers to its ABI input slots,
-/// then a trailing `out_err`; the call returns the opaque handle. Mirrors the
-/// struct builder's `create` typedef.
-fn emit_rich_variant_create_typedef(out: &mut String, v: &RichVariantBinding) {
-    let create_sym = &v.create.symbol;
-    let mut nparams: Vec<String> = Vec::new();
-    let mut dparams: Vec<String> = Vec::new();
-    for f in &v.fields {
-        for (n, d) in input_slots(&f.ty) {
-            nparams.push(n);
-            dparams.push(d);
-        }
-    }
-    nparams.push("Pointer<_WeaveFFIError>".into());
-    dparams.push("Pointer<_WeaveFFIError>".into());
-    emit_typedef_and_lookup(
-        out,
-        create_sym,
-        &nparams.join(", "),
-        &dparams.join(", "),
-        "Pointer<Void>",
-        "Pointer<Void>",
-    );
-}
-
-/// Emit one variant's factory constructor (`Shape.circle(double radius)`).
-/// Mirrors the struct builder's `build()`: each field marshals to its ABI
-/// argument slots via [`emit_input`], the call threads an `out_err` checked with
-/// `_checkError`, and the returned handle is wrapped (`return Shape._(result)`).
-/// A unit variant takes no parameters and passes only the error slot.
-fn emit_rich_variant_factory(out: &mut String, class_name: &str, v: &RichVariantBinding) {
-    let create_sym = &v.create.symbol;
-    let factory = v.name.to_lower_camel_case();
-    let params: Vec<String> = v
-        .fields
-        .iter()
-        .map(|f| format!("{} {}", dart_type(&f.ty), f.name.to_lower_camel_case()))
-        .collect();
-
-    let mut frees: Vec<String> = Vec::new();
-    let mut call_args: Vec<String> = Vec::new();
-    let mut staging = String::new();
-    for f in &v.fields {
-        let args = emit_input(
-            &mut staging,
-            &f.name.to_lower_camel_case(),
-            &f.ty,
-            &mut frees,
-        );
-        call_args.extend(args);
-    }
-    frees.push("calloc.free(err);".into());
-    call_args.push("err".into());
-
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.blank();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &v.doc, "  ");
-        w.raw(d);
-    }
-    w.line(format!(
-        "factory {class_name}.{factory}({}) {{",
-        params.join(", ")
-    ));
-    w.raw(staging);
+    w.line(format!("{base} _unpack{base}(_BufferReader r) {{"));
     w.scope(|w| {
-        w.line("final err = calloc<_WeaveFFIError>();");
-        w.line("try {");
+        w.line("final tag = r.readInt32();");
+        w.line("switch (tag) {");
         w.scope(|w| {
-            w.line(format!(
-                "final result = _{}({});",
-                create_sym.to_lower_camel_case(),
-                call_args.join(", ")
-            ));
-            w.line("_checkError(err);");
-            w.line(format!("return {class_name}._(result);"));
-        });
-        w.line("} finally {");
-        w.scope(|w| {
-            for fr in &frees {
-                w.line(fr);
+            for v in &e.variants {
+                let cls = variant_class(&base, &v.name);
+                w.line(format!("case {}:", v.value));
+                w.scope(|w| {
+                    let args: Vec<String> =
+                        v.fields.iter().map(|f| read_expr("r", &f.ty)).collect();
+                    w.line(format!("return {cls}({});", args.join(", ")));
+                });
             }
+            w.line("default:");
+            w.scope(|w| {
+                w.line(format!("_bufferError('unknown {base} tag $tag');"));
+            });
         });
         w.line("}");
     });
@@ -1923,13 +1649,7 @@ impl DartDecl<'_> {
     }
 }
 
-fn render_function(
-    out: &mut String,
-    module: &ModuleBinding,
-    f: &FnBinding,
-    strip: bool,
-    prefix: &str,
-) {
+fn render_function(out: &mut String, module: &ModuleBinding, f: &FnBinding, strip: bool) {
     let name = wrapper_name(&module.path, &f.name, strip).to_lower_camel_case();
     let exc = module
         .error
@@ -1943,8 +1663,6 @@ fn render_function(
         &DartDecl::TopLevel,
         &name,
         err_ctx(f, exc.as_deref()),
-        module,
-        prefix,
     );
     out.push_str(&decl);
 }
@@ -1952,9 +1670,6 @@ fn render_function(
 /// Render one callable: its FFI typedefs and lookups into `lookups` (always
 /// top-level) and its Dart wrapper declaration into `decl` (top-level for a
 /// free function, spliced into the class body for an interface member).
-/// `module` and `prefix` locate the callable for the plan's per-element
-/// release decisions (an iterator's [`ElemFree`]).
-#[allow(clippy::too_many_arguments)]
 fn render_callable(
     lookups: &mut String,
     decl: &mut String,
@@ -1962,8 +1677,6 @@ fn render_callable(
     kind: &DartDecl,
     name: &str,
     err: ErrCtx,
-    module: &ModuleBinding,
-    prefix: &str,
 ) {
     // `c_base` is the prefixed `{prefix}_{module}_{name}` symbol the shared
     // BindingModel already computed; the async/iterator suffixing matches the C
@@ -1991,9 +1704,9 @@ fn render_callable(
         return;
     }
 
-    // Each input parameter expands to its ABI slots (bytes/list/map fan out to
-    // `(ptr, len)` / `(keys, vals, len)`); a complex return adds its callee-
-    // allocated out-params; the trailing error slot closes the signature. An
+    // Each input parameter expands to its ABI slots (bytes and buffered
+    // values fan out to `(ptr, len)`); a bytes or buffered return adds its
+    // `out_len` slot; the trailing error slot closes the signature. An
     // instance method's `AbiFn` carries an implicit leading `self` pointer.
     let mut native_params: Vec<String> = Vec::new();
     let mut dart_params: Vec<String> = Vec::new();
@@ -2008,17 +1721,23 @@ fn render_callable(
         }
     }
     if let Some(ret) = &f.ret {
-        for (n, d) in return_out_slots(ret) {
-            native_params.push(n);
-            dart_params.push(d);
+        if !matches!(f.shape, CallShape::Iterator(_)) {
+            for (n, d) in return_out_slots(ret) {
+                native_params.push(n);
+                dart_params.push(d);
+            }
         }
     }
     native_params.push("Pointer<_WeaveFFIError>".into());
     dart_params.push("Pointer<_WeaveFFIError>".into());
 
-    let (native_ret, dart_ret) = match &f.ret {
-        Some(ret) => return_ffi(ret),
-        None => ("Void".into(), "void".into()),
+    let (native_ret, dart_ret) = match &f.shape {
+        // The iterator launcher returns the opaque iterator handle.
+        CallShape::Iterator(_) => ("Pointer<Void>".to_string(), "Pointer<Void>".to_string()),
+        _ => match &f.ret {
+            Some(ret) => return_ffi(ret),
+            None => ("Void".into(), "void".into()),
+        },
     };
 
     emit_typedef_and_lookup(
@@ -2045,7 +1764,7 @@ fn render_callable(
         // launch, per-element pulls, cleanup) lives in the generator body.
         w.line(kind.open_line_sync_star(&pub_ret, name, &params));
         let mut body = String::new();
-        emit_iterator_body(&mut body, f, c_sym, ib, err, module, prefix);
+        emit_iterator_body(&mut body, f, c_sym, ib, err);
         w.raw(body);
     } else {
         w.line(kind.open_line(&pub_ret, name, &params));
@@ -2082,7 +1801,7 @@ fn emit_wrapper_doc(w: &mut CodeWriter, f: &FnBinding, err: ErrCtx) {
         w.line("/// The native iterator handle is destroyed exactly once: eagerly when");
         w.line("/// the iteration completes or fails, or by a GC finalizer if the");
         w.line("/// iteration is abandoned before it is exhausted.");
-        if ib.elem.is_object_ref() {
+        if matches!(ib.elem, TypeRef::Interface(_)) {
             w.line("///");
             w.line("/// Each yielded element is owned by the caller: call its `dispose()`");
             w.line("/// when you are done with it.");
@@ -2115,85 +1834,54 @@ fn render_callback_typedef(out: &mut String, cb: &CallbackBinding) {
     ));
 }
 
-/// The Dart expression converting one callback parameter's trampoline slots
-/// into the value handed to the user callback. Slot names follow the lowered
-/// ABI (`{n}`, `{n}_ptr`/`{n}_len`, `{n}_keys`/`{n}_values`/`{n}_len`).
-fn cb_arg_expr(p: &ParamBinding) -> String {
-    let n0 = p.abi[0].name.to_lower_camel_case();
-    match &p.ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::I64
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::U64
-        | TypeRef::Handle
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool => n0,
-        TypeRef::Enum(name) => format!(
-            "{}.fromValue({n0})",
-            local_type_name(name).to_upper_camel_case()
-        ),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("{n0} == nullptr ? '' : {n0}.toDartString()")
+/// Emit the statements converting one callback's trampoline slots into the
+/// values handed to the user callback, returning the argument expressions.
+/// Buffered arguments arrive as borrowed `(ptr, len)` pairs valid only for
+/// the dispatch, so they are decoded here, inside the borrow window. Slot
+/// names follow the lowered ABI (`{n}` or `{n}_ptr`/`{n}_len`).
+fn emit_cb_args(w: &mut CodeWriter, cb: &CallbackBinding) -> Vec<String> {
+    let mut args = Vec::new();
+    for p in &cb.params {
+        let base = p.name.to_lower_camel_case();
+        let n0 = p.abi[0].name.to_lower_camel_case();
+        if is_buffered(&p.ty) {
+            let n1 = p.abi[1].name.to_lower_camel_case();
+            w.line(format!("final {base}Data = _copyNativeBytes({n0}, {n1});"));
+            w.line(format!("final {base}Reader = _BufferReader({base}Data);"));
+            w.line(format!(
+                "final {base}Value = {};",
+                read_expr(&format!("{base}Reader"), &p.ty)
+            ));
+            w.line(format!("{base}Reader.expectEnd();"));
+            args.push(format!("{base}Value"));
+            continue;
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let len = p.abi[1].name.to_lower_camel_case();
-            format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({len}).toList()")
-        }
-        // Borrowed for the duration of the callback: do not dispose().
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Interface(name) => {
-            format!("{}._({n0})", local_type_name(name).to_upper_camel_case())
-        }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-        TypeRef::Optional(inner) => match inner.as_ref() {
+        args.push(match &p.ty {
+            TypeRef::Enum(name) => format!("{}.fromValue({n0})", dart_class(name)),
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                format!("{n0} == nullptr ? null : {n0}.toDartString()")
+                format!("{n0} == nullptr ? '' : {n0}.toDartString()")
             }
             TypeRef::Bytes | TypeRef::BorrowedBytes => {
                 let len = p.abi[1].name.to_lower_camel_case();
-                format!("{n0} == nullptr ? null : {n0}.asTypedList({len}).toList()")
+                format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({len}).toList()")
             }
-            TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::TypedHandle(name)
-            | TypeRef::Interface(name) => {
-                format!(
-                    "{n0} == nullptr ? null : {}._({n0})",
-                    local_type_name(name).to_upper_camel_case()
-                )
+            // Borrowed for the duration of the callback: do not dispose().
+            TypeRef::Interface(name) | TypeRef::TypedHandle(name) => {
+                format!("{}._({n0})", dart_class(name))
             }
-            TypeRef::Enum(name) => format!(
-                "{n0} == nullptr ? null : {}.fromValue({n0}.value)",
-                local_type_name(name).to_upper_camel_case()
-            ),
-            _ => format!("{n0} == nullptr ? null : {n0}.value"),
-        },
-        TypeRef::List(inner) => {
-            let len = p.abi[1].name.to_lower_camel_case();
-            let elem = map_elem_read(&n0, "i", inner);
-            let dt = dart_type(inner);
-            format!("{n0} == nullptr ? <{dt}>[] : List.generate({len}, (i) => {elem})")
-        }
-        TypeRef::Map(k, v) => {
-            let keys = p.abi[0].name.to_lower_camel_case();
-            let vals = p.abi[1].name.to_lower_camel_case();
-            let len = p.abi[2].name.to_lower_camel_case();
-            let kexpr = map_elem_read(&keys, "i", k);
-            let vexpr = map_elem_read(&vals, "i", v);
-            let (kt, vt) = (dart_type(k), dart_type(v));
-            format!(
-                "{keys} == nullptr ? <{kt}, {vt}>{{}} : {{ for (var i = 0; i < {len}; i++) {kexpr}: {vexpr} }}"
-            )
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
+            // Only `Interface?` reaches here (every other optional is
+            // buffered): a nullable borrowed object pointer.
+            TypeRef::Optional(inner) => match inner.as_ref() {
+                TypeRef::Interface(name) | TypeRef::TypedHandle(name) => {
+                    format!("{n0} == nullptr ? null : {}._({n0})", dart_class(name))
+                }
+                _ => unreachable!("only optional interfaces stay unbuffered"),
+            },
+            TypeRef::Named(_) => unreachable!("unresolved type reference"),
+            _ => n0,
+        });
     }
+    args
 }
 
 /// The register/unregister wrapper pair for one listener. The trampoline is an
@@ -2232,7 +1920,6 @@ fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding, str
         }
     }
     tramp_decls.push("Pointer<Void> context".into());
-    let call_args: Vec<String> = cb.params.iter().map(cb_arg_expr).collect();
 
     let mut w = CodeWriter::two_space();
     w.blank();
@@ -2257,6 +1944,7 @@ fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding, str
                 tramp_decls.join(", ")
             ));
             w.scope(|w| {
+                let call_args = emit_cb_args(w, cb);
                 w.line(format!("callback({});", call_args.join(", ")));
             });
             w.line("});");
@@ -2283,69 +1971,35 @@ fn render_listener(out: &mut String, m: &ModuleBinding, l: &ListenerBinding, str
     out.push_str(&w.finish());
 }
 
-/// Returns the (native, dart) FFI types of the trailing callback parameters
-/// (those after `(context, err)`) for an async function with the given return
-/// type. The empty vec means the callback signature is `(context, err)` with
-/// no extra payload. Buffer results arrive as borrowed `(ptr, len)` pairs
-/// typed like the sync array shapes; a map arrives as parallel key/value
-/// arrays.
-fn async_cb_extra_params(ret: Option<&TypeRef>) -> Vec<(String, String)> {
-    let ptr = |s: String| (s.clone(), s);
-    match ret {
-        None => vec![],
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
-            vec![ptr("Pointer<Uint8>".into()), ("Size".into(), "int".into())]
-        }
-        Some(TypeRef::List(inner)) => {
-            vec![ptr(input_array_ffi(inner)), ("Size".into(), "int".into())]
-        }
-        Some(TypeRef::Map(k, v)) => vec![
-            ptr(input_array_ffi(k)),
-            ptr(input_array_ffi(v)),
-            ("Size".into(), "int".into()),
-        ],
-        Some(TypeRef::Optional(inner)) => vec![match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => ptr("Pointer<Utf8>".into()),
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => ptr("Pointer<Void>".into()),
-            // A boxed optional scalar arrives as a nullable pointer-to-scalar.
-            other => ptr(format!("Pointer<{}>", scalar_ffi(other).0)),
-        }],
-        Some(t) => vec![match t {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => ptr("Pointer<Utf8>".into()),
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => ptr("Pointer<Void>".into()),
-            other => {
-                let (n, d) = scalar_ffi(other);
-                (n.into(), d.into())
-            }
-        }],
+/// The (native, dart, name) slot triples an async completion callback carries
+/// after its `(context, err)` prefix. Bytes and buffered results arrive as
+/// borrowed `(result, resultLen)` pairs; interfaces as adopted pointers;
+/// everything else by value.
+fn async_cb_result_slots(ret: Option<&TypeRef>) -> Vec<(String, String, String)> {
+    let Some(ty) = ret else {
+        return vec![];
+    };
+    let pair = |n: &str, d: &str, name: &str| (n.to_string(), d.to_string(), name.to_string());
+    if is_buffered(ty) || matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+        return vec![
+            pair("Pointer<Uint8>", "Pointer<Uint8>", "result"),
+            pair("Size", "int", "resultLen"),
+        ];
     }
-}
-
-/// The Dart parameter names of an async callback's trailing result slots,
-/// mirroring [`async_cb_extra_params`].
-fn async_cb_arg_names(ret: Option<&TypeRef>) -> Vec<String> {
-    let mut names = vec!["context".to_string(), "err".to_string()];
-    match ret {
-        None => {}
-        Some(TypeRef::Map(_, _)) => {
-            names.extend([
-                "resultKeys".into(),
-                "resultValues".into(),
-                "resultLen".into(),
-            ]);
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            vec![pair("Pointer<Utf8>", "Pointer<Utf8>", "result")]
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
-            names.extend(["result".into(), "resultLen".into()]);
+        TypeRef::Interface(_) | TypeRef::TypedHandle(_) | TypeRef::Optional(_) => {
+            // Only `Interface?` optionals reach here; the slot is a nullable
+            // adopted object pointer.
+            vec![pair("Pointer<Void>", "Pointer<Void>", "result")]
         }
-        Some(_) => names.push("result".into()),
+        _ => {
+            let (n, d) = scalar_ffi(ty);
+            vec![pair(n, d, "result")]
+        }
     }
-    names
 }
 
 /// Render one async callable: its callback typedef and launcher lookup into
@@ -2363,10 +2017,10 @@ fn render_async_function(
     wrapper_params: &[String],
     err: ErrCtx,
 ) {
-    let cb_extras = async_cb_extra_params(f.ret.as_ref());
+    let cb_extras = async_cb_result_slots(f.ret.as_ref());
     let cb_native_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
         .chain(std::iter::once("Pointer<_WeaveFFIError>".to_string()))
-        .chain(cb_extras.iter().map(|(n, _)| n.clone()))
+        .chain(cb_extras.iter().map(|(n, _, _)| n.clone()))
         .collect();
 
     let cb_typedef = format!("_NativeAsyncCb_{c_sym}");
@@ -2377,24 +2031,24 @@ fn render_async_function(
 
     let async_sym = format!("{c_sym}_async");
     let self_slot = if f.has_self {
-        vec!["Pointer<Void>".to_string()]
+        vec![("Pointer<Void>".to_string(), "Pointer<Void>".to_string())]
     } else {
         vec![]
     };
-    let mut native_params: Vec<String> = self_slot.clone();
-    native_params.extend(f.params.iter().map(|p| native_ffi_type(&p.ty)));
-    if f.cancellable {
-        native_params.push("Pointer<Void>".into());
+    let mut input_ffi: Vec<(String, String)> = self_slot;
+    for p in &f.params {
+        input_ffi.extend(input_slots(&p.ty));
     }
-    native_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
-    native_params.push("Pointer<Void>".into());
-    let mut dart_params: Vec<String> = self_slot;
-    dart_params.extend(f.params.iter().map(|p| dart_ffi_type(&p.ty)));
     if f.cancellable {
-        dart_params.push("Pointer<Void>".into());
+        input_ffi.push(("Pointer<Void>".into(), "Pointer<Void>".into()));
     }
-    dart_params.push(format!("Pointer<NativeFunction<{cb_typedef}>>"));
-    dart_params.push("Pointer<Void>".into());
+    input_ffi.push((
+        format!("Pointer<NativeFunction<{cb_typedef}>>"),
+        format!("Pointer<NativeFunction<{cb_typedef}>>"),
+    ));
+    input_ffi.push(("Pointer<Void>".into(), "Pointer<Void>".into()));
+    let native_params: Vec<String> = input_ffi.iter().map(|(n, _)| n.clone()).collect();
+    let dart_params: Vec<String> = input_ffi.iter().map(|(_, d)| d.clone()).collect();
 
     emit_typedef_and_lookup(
         lookups,
@@ -2411,53 +2065,37 @@ fn render_async_function(
         "void".to_string()
     };
 
-    // String inputs are pinned across the async call and freed on completion;
-    // capture `(pointer name, source name)` up front so the writer emits the
-    // staging in order and the cleanup can reference the pointers.
-    let native_strings: Vec<(String, String)> = f
-        .params
-        .iter()
-        .filter(|p| matches!(p.ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr))
-        .map(|p| {
-            let pname = p.name.to_lower_camel_case();
-            (format!("{pname}Ptr"), pname)
-        })
-        .collect();
-
-    let cb_dart_params: Vec<String> = std::iter::once("Pointer<Void>".to_string())
-        .chain(std::iter::once("Pointer<_WeaveFFIError>".to_string()))
-        .chain(cb_extras.iter().map(|(_, d)| d.clone()))
-        .collect();
-    let cb_arg_names = async_cb_arg_names(f.ret.as_ref());
-    let cb_param_decls: Vec<String> = cb_dart_params
-        .iter()
-        .zip(cb_arg_names.iter())
-        .map(|(t, n)| format!("{t} {n}"))
-        .collect();
-
+    // Stage every input up front, exactly like the sync path; staged native
+    // memory is pinned until the future completes and released in
+    // whenComplete (or in the catch when the launch itself throws).
+    let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     if f.has_self {
         call_args.push("_handle".into());
     }
+    let mut stage = CodeWriter::two_space().with_depth(1);
+    let mut tmp = 0usize;
     for p in &f.params {
-        let pname = p.name.to_lower_camel_case();
-        call_args.push(match &p.ty {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{pname}Ptr"),
-            TypeRef::Enum(_) => format!("{pname}.value"),
-            TypeRef::TypedHandle(_)
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_) => {
-                format!("{pname}._handle")
-            }
-            _ => pname,
-        });
+        let args = emit_input(
+            &mut stage,
+            &p.name.to_lower_camel_case(),
+            &p.ty,
+            &mut frees,
+            &mut tmp,
+        );
+        call_args.extend(args);
     }
+    let staging = stage.finish();
     if f.cancellable {
         call_args.push("nullptr".into());
     }
     call_args.push("callable.nativeFunction".into());
     call_args.push("nullptr".into());
+
+    let cb_param_decls: Vec<String> = std::iter::once("Pointer<Void> context".to_string())
+        .chain(std::iter::once("Pointer<_WeaveFFIError> err".to_string()))
+        .chain(cb_extras.iter().map(|(_, d, n)| format!("{d} {n}")))
+        .collect();
 
     let var = async_sym.to_lower_camel_case();
 
@@ -2476,9 +2114,7 @@ fn render_async_function(
         "}",
         |w| {
             w.line(format!("final completer = Completer<{completer_type}>();"));
-            for (ptr, pname) in &native_strings {
-                w.line(format!("final {ptr} = {pname}.toNativeUtf8();"));
-            }
+            w.raw(&staging);
             w.line(format!("late NativeCallable<{cb_typedef}> callable;"));
             w.line(format!(
                 "callable = NativeCallable<{cb_typedef}>.listener(({}) {{",
@@ -2491,6 +2127,11 @@ fn render_async_function(
                     w.scope(|w| {
                         w.line("final code = err.ref.code;");
                         w.line("final msg = err.ref.message.toDartString();");
+                        if err.thrown_exception().is_some() {
+                            w.line(
+                                "final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);",
+                            );
+                        }
                         w.line("_weaveffiErrorClear(err);");
                         w.line(format!("completer.completeError({});", err.map_expr()));
                         w.line("return;");
@@ -2516,19 +2157,19 @@ fn render_async_function(
             w.line("} catch (e) {");
             w.scope(|w| {
                 w.line("callable.close();");
-                for (ptr, _) in &native_strings {
-                    w.line(format!("calloc.free({ptr});"));
+                for fr in &frees {
+                    w.line(fr);
                 }
                 w.line("rethrow;");
             });
             w.line("}");
-            if native_strings.is_empty() {
+            if frees.is_empty() {
                 w.line("return completer.future;");
             } else {
                 w.line("return completer.future.whenComplete(() {");
                 w.scope(|w| {
-                    for (ptr, _) in &native_strings {
-                        w.line(format!("calloc.free({ptr});"));
+                    for fr in &frees {
+                        w.line(fr);
                     }
                 });
                 w.line("});");
@@ -2539,95 +2180,182 @@ fn render_async_function(
 }
 
 /// Emit the callback statements that resolve the completer from the result
-/// slots. Borrowed buffers (strings, bytes, arrays, map buffers, boxed
-/// optional scalars) are valid only for the callback's duration, so they are
-/// deep-copied here and never freed; an owned-object result (record, rich
-/// enum, interface) is instead adopted by its wrapper class.
+/// slots. Bytes and buffered results are borrowed for the callback's
+/// duration, so they are copied (bytes) or decoded (buffered) here and never
+/// freed; an owned interface result is instead adopted by its wrapper class.
 fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    let Some(ty) = ty else {
+        w.line("completer.complete();");
+        out.push_str(&w.finish());
+        return;
+    };
+    if is_buffered(ty) {
+        // Decode inside the callback: the producer frees the encoding as
+        // soon as the callback returns.
+        w.line("final resultData = _copyNativeBytes(result, resultLen);");
+        w.line("final resultReader = _BufferReader(resultData);");
+        w.line(format!("final value = {};", read_expr("resultReader", ty)));
+        w.line("resultReader.expectEnd();");
+        w.line("completer.complete(value);");
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
-        None => {
-            w.line("completer.complete();");
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line("completer.complete(_copyNativeBytes(result, resultLen));");
         }
-        Some(TypeRef::Enum(name)) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line(format!("completer.complete({n}.fromValue(result));"));
+        // Borrowed: copy before the callback returns, never free.
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line("completer.complete(result.toDartString());");
+        }
+        TypeRef::Enum(name) => {
+            w.line(format!(
+                "completer.complete({}.fromValue(result));",
+                dart_class(name)
+            ));
         }
         // The callback receives ownership of an object result; the wrapper
         // adopts the pointer and its `dispose()` owns the eventual destroy.
-        Some(
-            TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::TypedHandle(name)
-            | TypeRef::Interface(name),
-        ) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line(format!("completer.complete({n}._(result));"));
-        }
-        // Borrowed: copy before the callback returns, never free.
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            w.line("completer.complete(result.toDartString());");
-        }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
-            w.line("completer.complete(result == nullptr");
-            w.line("    ? <int>[]");
-            w.line("    : List<int>.generate(resultLen, (i) => result[i]));");
-        }
-        Some(TypeRef::List(inner)) => {
-            let dt = dart_type(inner);
-            let read = map_elem_read("result", "i", inner);
-            w.line("completer.complete(result == nullptr");
-            w.line(format!("    ? <{dt}>[]"));
+        TypeRef::Interface(name) | TypeRef::TypedHandle(name) => {
             w.line(format!(
-                "    : List<{dt}>.generate(resultLen, (i) => {read}));"
+                "completer.complete({}._(result));",
+                dart_class(name)
             ));
         }
-        Some(TypeRef::Map(k, v)) => {
-            let (kt, vt) = (dart_type(k), dart_type(v));
-            let kread = map_elem_read("resultKeys", "i", k);
-            let vread = map_elem_read("resultValues", "i", v);
-            w.line(format!("final map = <{kt}, {vt}>{{}};"));
-            w.line("if (resultKeys != nullptr) {");
-            w.scope(|w| {
-                w.line("for (var i = 0; i < resultLen; i++) {");
-                w.scope(|w| {
-                    w.line(format!("map[{kread}] = {vread};"));
-                });
-                w.line("}");
-            });
-            w.line("}");
-            w.line("completer.complete(map);");
-        }
-        Some(TypeRef::Optional(inner)) => {
-            w.line("if (result == nullptr) {");
-            w.scope(|w| {
-                w.line("completer.complete(null);");
-            });
-            w.line("} else {");
-            w.scope(|w| match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line("completer.complete(result.toDartString());");
-                }
-                TypeRef::Record(name)
-                | TypeRef::RichEnum(name)
-                | TypeRef::TypedHandle(name)
-                | TypeRef::Interface(name) => {
-                    let n = local_type_name(name).to_upper_camel_case();
-                    w.line(format!("completer.complete({n}._(result));"));
-                }
-                TypeRef::Enum(name) => {
-                    let n = local_type_name(name).to_upper_camel_case();
-                    w.line(format!("completer.complete({n}.fromValue(result.value));"));
-                }
-                // Boxed optional scalar: copy the value, never free the box.
-                _ => {
-                    w.line("completer.complete(result.value);");
-                }
-            });
-            w.line("}");
-        }
-        Some(_) => {
+        // Only `Interface?` reaches here: null means none, otherwise adopt.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(name) | TypeRef::TypedHandle(name) => {
+                w.line(format!(
+                    "completer.complete(result == nullptr ? null : {}._(result));",
+                    dart_class(name)
+                ));
+            }
+            _ => unreachable!("only optional interfaces stay unbuffered"),
+        },
+        _ => {
             w.line("completer.complete(result);");
+        }
+    }
+    out.push_str(&w.finish());
+}
+
+/// Emit pre-call staging for one input (`name`), returning the call-argument
+/// expressions it contributes (in ABI order) and appending any cleanup
+/// statements to `frees`. A buffered value is encoded into a `_BufferWriter`,
+/// staged into native memory, and passed as a borrowed `(ptr, len)` pair the
+/// callee never frees.
+fn emit_input(
+    w: &mut CodeWriter,
+    name: &str,
+    ty: &TypeRef,
+    frees: &mut Vec<String>,
+    tmp: &mut usize,
+) -> Vec<String> {
+    if is_buffered(ty) {
+        let writer = format!("{name}Writer");
+        let buf = format!("{name}Buf");
+        let p = format!("{name}Ptr");
+        w.line(format!("final {writer} = _BufferWriter();"));
+        write_stmts(w, &writer, name, ty, tmp);
+        w.line(format!("final {buf} = {writer}.takeBytes();"));
+        w.line(format!("final {p} = _stageBytes({buf});"));
+        frees.push(format!("calloc.free({p});"));
+        return vec![p, format!("{buf}.length")];
+    }
+    match ty {
+        TypeRef::Enum(_) => vec![format!("{name}.value")],
+        TypeRef::Interface(_) | TypeRef::TypedHandle(_) => vec![format!("{name}._handle")],
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            let p = format!("{name}Ptr");
+            w.line(format!("final {p} = {name}.toNativeUtf8();"));
+            frees.push(format!("calloc.free({p});"));
+            vec![p]
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            let p = format!("{name}Ptr");
+            w.line(format!(
+                "final {p} = {name}.isEmpty ? nullptr : calloc<Uint8>({name}.length);"
+            ));
+            w.line(format!(
+                "for (var i = 0; i < {name}.length; i++) {{ {p}[i] = {name}[i]; }}"
+            ));
+            frees.push(format!("if ({p} != nullptr) calloc.free({p});"));
+            vec![p, format!("{name}.length")]
+        }
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable borrowed object pointer, null meaning none.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(_) | TypeRef::TypedHandle(_) => {
+                vec![format!("{name}?._handle ?? nullptr")]
+            }
+            _ => unreachable!("only optional interfaces stay unbuffered"),
+        },
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        _ => vec![name.to_string()],
+    }
+}
+
+/// Allocate the out-parameter locals a bytes or buffered return needs before
+/// the call, returning the extra call-argument expressions and recording
+/// cleanup.
+fn emit_return_alloc(w: &mut CodeWriter, ty: &TypeRef, frees: &mut Vec<String>) -> Vec<String> {
+    if returns_buffer(ty) {
+        w.line("final outLen = calloc<Size>();");
+        frees.push("calloc.free(outLen);".into());
+        vec!["outLen".into()]
+    } else {
+        vec![]
+    }
+}
+
+/// Emit the post-call decode of a return into the wrapper's Dart return
+/// value. A buffered return is copied out of the producer's buffer, released
+/// with `weaveffi_free_bytes`, and decoded through the buffer reader.
+fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    if is_buffered(ty) {
+        w.line("final n = outLen.value;");
+        w.line("final data = _copyNativeBytes(result, n);");
+        w.line("if (result != nullptr) _weaveffiFreeBytes(result, n);");
+        w.line("final reader = _BufferReader(data);");
+        w.line(format!("final value = {};", read_expr("reader", ty)));
+        w.line("reader.expectEnd();");
+        w.line("return value;");
+        out.push_str(&w.finish());
+        return;
+    }
+    match ty {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line("final n = outLen.value;");
+            w.line("if (result == nullptr) return <int>[];");
+            w.line("final bytes = List<int>.generate(n, (i) => result[i]);");
+            // Copy first, then release the producer's buffer.
+            w.line("_weaveffiFreeBytes(result, n);");
+            w.line("return bytes;");
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line("final value = result.toDartString();");
+            w.line("_weaveffiFreeString(result);");
+            w.line("return value;");
+        }
+        TypeRef::Enum(name) => {
+            w.line(format!("return {}.fromValue(result);", dart_class(name)));
+        }
+        TypeRef::Interface(name) | TypeRef::TypedHandle(name) => {
+            w.line(format!("return {}._(result);", dart_class(name)));
+        }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(name) | TypeRef::TypedHandle(name) => {
+                w.line("if (result == nullptr) return null;");
+                w.line(format!("return {}._(result);", dart_class(name)));
+            }
+            _ => unreachable!("only optional interfaces stay unbuffered"),
+        },
+        _ => {
+            w.line("return result;");
         }
     }
     out.push_str(&w.finish());
@@ -2639,26 +2367,28 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx)
     if f.has_self {
         call_args.push("_handle".into());
     }
-    let mut staging = String::new();
+    let mut stage = CodeWriter::two_space().with_depth(1);
+    let mut tmp = 0usize;
     for p in &f.params {
         let args = emit_input(
-            &mut staging,
+            &mut stage,
             &p.name.to_lower_camel_case(),
             &p.ty,
             &mut frees,
+            &mut tmp,
         );
         call_args.extend(args);
     }
     if let Some(ret) = &f.ret {
-        call_args.extend(emit_return_alloc(&mut staging, ret, &mut frees, "  "));
+        call_args.extend(emit_return_alloc(&mut stage, ret, &mut frees));
     }
+    let staging = stage.finish();
     frees.push("calloc.free(err);".into());
     call_args.push("err".into());
 
     let var = c_sym.to_lower_camel_case();
     let args = call_args.join(", ");
-    // A map return is a `void` symbol whose results land in the out-params.
-    let void_call = f.ret.is_none() || matches!(&f.ret, Some(TypeRef::Map(_, _)));
+    let void_call = f.ret.is_none();
     let mut dec = String::new();
     if let Some(ret) = &f.ret {
         emit_return_decode(&mut dec, ret, "    ");
@@ -2687,6 +2417,33 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx)
     out.push_str(&w.finish());
 }
 
+/// The dart:ffi pointee type of an iterator's `out_item` slot, plus whether
+/// the element also carries a `size_t* out_len` slot (bytes and every
+/// buffered element do).
+fn iter_item_slot(elem: &TypeRef) -> (String, bool) {
+    if is_buffered(elem) || matches!(elem, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+        return ("Pointer<Uint8>".into(), true);
+    }
+    match elem {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("Pointer<Utf8>".into(), false),
+        TypeRef::Interface(_) | TypeRef::TypedHandle(_) => ("Pointer<Void>".into(), false),
+        _ => (scalar_ffi(elem).0.to_string(), false),
+    }
+}
+
+/// Convert a single native by-value element (`expr`) into its Dart
+/// representation: enums map through `fromValue`, interface elements are
+/// adopted by their wrapper class, scalars pass through.
+fn direct_elem_read(expr: &str, ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Enum(n) => format!("{}.fromValue({expr})", dart_class(n)),
+        TypeRef::Interface(n) | TypeRef::TypedHandle(n) => {
+            format!("{}._({expr})", dart_class(n))
+        }
+        _ => expr.to_string(),
+    }
+}
+
 /// Bind the element `next`/`destroy` symbols of an iterator-returning
 /// function, plus a `NativeFinalizer` over the destroy symbol. The finalizer
 /// is the disposal backstop for abandoned iterations: Dart runs a `sync*`
@@ -2695,15 +2452,14 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx)
 /// block never runs; the finalizer reclaims the native handle when the
 /// suspended frame is collected instead.
 fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
-    let item = input_array_ffi(&ib.elem);
-    emit_typedef_and_lookup(
-        out,
-        &ib.next.symbol,
-        &format!("Pointer<Void>, {item}, Pointer<_WeaveFFIError>"),
-        &format!("Pointer<Void>, {item}, Pointer<_WeaveFFIError>"),
-        "Int32",
-        "int",
-    );
+    let (pointee, has_len) = iter_item_slot(&ib.elem);
+    let mut params = vec!["Pointer<Void>".to_string(), format!("Pointer<{pointee}>")];
+    if has_len {
+        params.push("Pointer<Size>".into());
+    }
+    params.push("Pointer<_WeaveFFIError>".into());
+    let joined = params.join(", ");
+    emit_typedef_and_lookup(out, &ib.next.symbol, &joined, &joined, "Int32", "int");
     emit_typedef_and_lookup(
         out,
         &ib.destroy_symbol,
@@ -2725,7 +2481,8 @@ fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
 /// The body runs lazily, on the first pull: it stages the inputs, launches
 /// the C iterator, and then issues exactly one producer `next` call per
 /// yielded element, releasing each element per the plan's [`ElemFree`] after
-/// copying (strings through `weaveffi_free_string`; object elements are
+/// copying or decoding (strings through `weaveffi_free_string`; bytes and
+/// buffered elements through `weaveffi_free_bytes`; interface elements are
 /// adopted by their wrapper class, whose `dispose()` owns the destroy).
 ///
 /// The handle is destroyed exactly once. The `try`/`finally` destroys it when
@@ -2741,37 +2498,47 @@ fn emit_iterator_body(
     c_sym: &str,
     ib: &IteratorBinding,
     err: ErrCtx,
-    module: &ModuleBinding,
-    prefix: &str,
 ) {
-    let proto = ib.protocol(f, &module.path, prefix);
+    let free_plan = elem_free(&ib.elem);
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     if f.has_self {
         call_args.push("_handle".into());
     }
-    let mut staging = String::new();
+    let mut stage = CodeWriter::two_space().with_depth(1);
+    let mut tmp = 0usize;
     for p in &f.params {
         let args = emit_input(
-            &mut staging,
+            &mut stage,
             &p.name.to_lower_camel_case(),
             &p.ty,
             &mut frees,
+            &mut tmp,
         );
         call_args.extend(args);
     }
+    let staging = stage.finish();
     frees.push("calloc.free(err);".into());
     call_args.push("err".into());
 
     let var = c_sym.to_lower_camel_case();
     let elem = &ib.elem;
+    let (pointee, has_len) = iter_item_slot(elem);
     let next_var = ib.next.symbol.to_lower_camel_case();
     let destroy_var = ib.destroy_symbol.to_lower_camel_case();
+    let next_args = if has_len {
+        "iter, outItem, outLen, err"
+    } else {
+        "iter, outItem, err"
+    };
 
     let mut w = CodeWriter::two_space().with_depth(1);
     w.raw(staging);
     w.line("final err = calloc<_WeaveFFIError>();");
-    w.line(format!("final outItem = calloc<{}>();", elem_pointee(elem)));
+    w.line(format!("final outItem = calloc<{pointee}>();"));
+    if has_len {
+        w.line("final outLen = calloc<Size>();");
+    }
     w.line("Pointer<Void> iter = nullptr;");
     w.line("final anchor = _IteratorLifetime();");
     w.line("try {");
@@ -2781,20 +2548,40 @@ fn emit_iterator_body(
         w.line(format!(
             "_{destroy_var}Finalizer.attach(anchor, iter, detach: anchor);"
         ));
-        w.line(format!("while (_{next_var}(iter, outItem, err) != 0) {{"));
+        w.line(format!("while (_{next_var}({next_args}) != 0) {{"));
         w.scope(|w| {
             w.line(err.check_stmt());
-            match &proto.elem_free {
+            match free_plan {
                 ElemFree::String => {
                     w.line("final itemPtr = outItem.value;");
                     w.line("final item = itemPtr.toDartString();");
                     w.line("_weaveffiFreeString(itemPtr);");
                     w.line("yield item;");
                 }
-                // The consumer adopts an object element; its wrapper's
-                // dispose() owns the eventual destroy.
-                ElemFree::Object { .. } | ElemFree::None => {
-                    w.line(format!("yield {};", read_value("outItem.value", elem)));
+                // Bytes and buffered elements: copy or decode, then release
+                // the producer's buffer with weaveffi_free_bytes.
+                ElemFree::Bytes => {
+                    w.line("final itemPtr = outItem.value;");
+                    w.line("final itemLen = outLen.value;");
+                    if is_buffered(elem) {
+                        w.line("final itemData = _copyNativeBytes(itemPtr, itemLen);");
+                        w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
+                        w.line("final itemReader = _BufferReader(itemData);");
+                        w.line(format!("final item = {};", read_expr("itemReader", elem)));
+                        w.line("itemReader.expectEnd();");
+                        w.line("yield item;");
+                    } else {
+                        w.line("final item = _copyNativeBytes(itemPtr, itemLen);");
+                        w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
+                        w.line("yield item;");
+                    }
+                }
+                // By-value element (or an adopted interface handle).
+                ElemFree::None => {
+                    w.line(format!(
+                        "yield {};",
+                        direct_elem_read("outItem.value", elem)
+                    ));
                 }
             }
         });
@@ -2810,6 +2597,9 @@ fn emit_iterator_body(
             w.line("iter = nullptr;");
         });
         w.line("}");
+        if has_len {
+            w.line("calloc.free(outLen);");
+        }
         w.line("calloc.free(outItem);");
         for fr in &frees {
             w.line(fr);
@@ -2819,124 +2609,89 @@ fn emit_iterator_body(
     out.push_str(&w.finish());
 }
 
-/// Materialises a `T*` + `out_len` C return into a Dart `List<T>`, then
-/// releases what the wrapper owes per the plan: string elements through
-/// `weaveffi_free_string` after copying, and the producer-allocated array
-/// buffer itself through `weaveffi_free_bytes` (`n * sizeOf<elem>`). Object
-/// elements transfer ownership to the caller, who disposes each wrapper.
-fn emit_list_conversion(out: &mut String, inner: &TypeRef, indent: &str) {
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.line("final n = outLen.value;");
-    let dt = dart_type(inner);
-    w.line(format!("if (result == nullptr) return <{dt}>[];"));
-    let pointee = elem_pointee(inner);
-    w.line(format!("final arr = result.cast<{pointee}>();"));
-    w.line(format!(
-        "final items = List<{dt}>.generate(n, (i) => {});",
-        map_elem_read("arr", "i", inner)
-    ));
-    if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        w.line("for (var i = 0; i < n; i++) {");
-        w.scope(|w| {
-            w.line("_weaveffiFreeString(arr[i]);");
-        });
-        w.line("}");
-    }
-    w.line(format!(
-        "_weaveffiFreeBytes(result.cast(), n * sizeOf<{pointee}>());"
-    ));
-    w.line("return items;");
-    out.push_str(&w.finish());
-}
-
-/// Emit the post-call conversion of a simple (non-out-param) return, paying
-/// the release the wrapper owes per the plan: a returned string is copied and
-/// then freed with `weaveffi_free_string`, a boxed optional scalar is
-/// dereferenced and freed with `weaveffi_free_bytes`, and an owned object
-/// pointer is adopted by its wrapper class (whose `dispose()` owns the
-/// destroy).
-fn emit_result_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("final value = result.toDartString();");
-            w.line("_weaveffiFreeString(result);");
-            w.line("return value;");
-        }
-        TypeRef::Enum(name) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line(format!("return {n}.fromValue(result);"));
-        }
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Interface(name) => {
-            let n = local_type_name(name).to_upper_camel_case();
-            w.line(format!("return {n}._(result);"));
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line("if (result == nullptr) return null;");
-                w.line("final value = result.toDartString();");
-                w.line("_weaveffiFreeString(result);");
-                w.line("return value;");
-            }
-            TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::TypedHandle(name)
-            | TypeRef::Interface(name) => {
-                let n = local_type_name(name).to_upper_camel_case();
-                w.line("if (result == nullptr) return null;");
-                w.line(format!("return {n}._(result);"));
-            }
-            // Optional scalars/bools/enums lower to a producer-boxed nullable
-            // pointer-to-scalar: dereference, then free the box.
-            TypeRef::Enum(name) => {
-                let n = local_type_name(name).to_upper_camel_case();
-                w.line("if (result == nullptr) return null;");
-                w.line(format!("final value = {n}.fromValue(result.value);"));
-                w.line("_weaveffiFreeBytes(result.cast(), sizeOf<Int32>());");
-                w.line("return value;");
-            }
-            other => {
-                let native = scalar_ffi(other).0;
-                w.line("if (result == nullptr) return null;");
-                w.line("final value = result.value;");
-                w.line(format!(
-                    "_weaveffiFreeBytes(result.cast(), sizeOf<{native}>());"
-                ));
-                w.line("return value;");
-            }
-        },
-        _ => {
-            w.line("return result;");
-        }
-    }
-    out.push_str(&w.finish());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use camino::Utf8Path;
     use weaveffi_core::codegen::Generator;
+    use weaveffi_ir::ir::{
+        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
+    };
 
-    #[test]
-    fn package_bundles_native_and_rewrites_loader() {
-        use weaveffi_core::package::{FileContent, PackageContext};
-        use weaveffi_core::platform::{BinarySet, Platform};
+    fn make_api(modules: Vec<Module>) -> Api {
+        Api {
+            version: "0.6.0".into(),
+            modules,
+            generators: None,
+            package: None,
+        }
+    }
 
-        let api = make_api(vec![simple_module(vec![Function {
-            name: "ping".into(),
-            params: vec![],
-            returns: None,
+    fn simple_module(functions: Vec<Function>) -> Module {
+        Module {
+            name: "math".into(),
+            functions,
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    fn func(name: &str, params: Vec<Param>, returns: Option<TypeRef>) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
             doc: None,
             throws: false,
             r#async: false,
             cancellable: false,
             deprecated: None,
             since: None,
-        }])]);
+        }
+    }
+
+    fn param(name: &str, ty: TypeRef) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        }
+    }
+
+    fn field(name: &str, ty: TypeRef) -> StructField {
+        StructField {
+            name: name.into(),
+            ty,
+            doc: None,
+            default: None,
+        }
+    }
+
+    /// Build the binding model and render the module exactly as the driver
+    /// does in production before calling [`LanguageBackend::files`]. Shadows
+    /// the production three-argument renderer for the test suite.
+    fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
+        let model = BindingModel::build(api, prefix);
+        let config = DartConfig {
+            prefix: Some(prefix.to_string()),
+            input_basename: Some(input_basename.to_string()),
+            ..DartConfig::default()
+        };
+        super::render_dart_module(api, &model, &config)
+    }
+
+    #[test]
+    fn package_bundles_native_and_rewrites_loader() {
+        use weaveffi_core::package::{FileContent, PackageContext};
+        use weaveffi_core::platform::{BinarySet, Platform};
+
+        let api = make_api(vec![simple_module(vec![func("ping", vec![], None)])]);
         let model = BindingModel::build(&api, "weaveffi");
         let mut bins = BinarySet::new("calculator");
         bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
@@ -2972,45 +2727,6 @@ mod tests {
                 && src.contains("native/darwin-arm64/libcalculator.dylib"),
             "packaged loader not applied: {src}"
         );
-    }
-    use weaveffi_ir::ir::{
-        Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
-    };
-
-    fn make_api(modules: Vec<Module>) -> Api {
-        Api {
-            version: "0.5.0".into(),
-            modules,
-            generators: None,
-            package: None,
-        }
-    }
-
-    fn simple_module(functions: Vec<Function>) -> Module {
-        Module {
-            name: "math".into(),
-            functions,
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            interfaces: vec![],
-            errors: None,
-            modules: vec![],
-        }
-    }
-
-    /// Build the binding model and render the module exactly as the driver
-    /// does in production before calling [`LanguageBackend::files`]. Shadows
-    /// the production three-argument renderer for the test suite.
-    fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
-        let model = BindingModel::build(api, prefix);
-        let config = DartConfig {
-            prefix: Some(prefix.to_string()),
-            input_basename: Some(input_basename.to_string()),
-            ..DartConfig::default()
-        };
-        super::render_dart_module(api, &model, &config)
     }
 
     #[test]
@@ -3066,57 +2782,96 @@ mod tests {
         );
     }
 
+    /// Buffered types occupy one `(Pointer<Uint8>, Size)` slot pair at the
+    /// FFI layer, no matter how deeply they nest; direct types keep their
+    /// dedicated slots.
     #[test]
-    fn native_ffi_type_mapping() {
-        assert_eq!(native_ffi_type(&TypeRef::I32), "Int32");
-        assert_eq!(native_ffi_type(&TypeRef::U32), "Uint32");
-        assert_eq!(native_ffi_type(&TypeRef::I64), "Int64");
-        assert_eq!(native_ffi_type(&TypeRef::F64), "Double");
-        // A C `bool` is one byte; `Bool` keeps strides and frees honest.
-        assert_eq!(native_ffi_type(&TypeRef::Bool), "Bool");
-        assert_eq!(native_ffi_type(&TypeRef::StringUtf8), "Pointer<Utf8>");
-        assert_eq!(native_ffi_type(&TypeRef::Handle), "Int64");
+    fn input_slots_mapping() {
+        let pair = |n: &str, d: &str| (n.to_string(), d.to_string());
+        let buffer = vec![
+            pair("Pointer<Uint8>", "Pointer<Uint8>"),
+            pair("Size", "int"),
+        ];
+        assert_eq!(input_slots(&TypeRef::Record("C".into())), buffer);
+        assert_eq!(input_slots(&TypeRef::RichEnum("S".into())), buffer);
+        assert_eq!(input_slots(&TypeRef::List(Box::new(TypeRef::I32))), buffer);
         assert_eq!(
-            native_ffi_type(&TypeRef::Record("X".into())),
-            "Pointer<Void>"
+            input_slots(&TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32)
+            )),
+            buffer
         );
         assert_eq!(
-            native_ffi_type(&TypeRef::RichEnum("X".into())),
-            "Pointer<Void>"
+            input_slots(&TypeRef::Optional(Box::new(TypeRef::I32))),
+            buffer
         );
-        assert_eq!(native_ffi_type(&TypeRef::Enum("X".into())), "Int32");
+        // Bytes share the (ptr, len) fan-out but are not a value buffer.
+        assert_eq!(input_slots(&TypeRef::Bytes), buffer);
+        assert_eq!(input_slots(&TypeRef::I32), vec![pair("Int32", "int")]);
+        assert_eq!(input_slots(&TypeRef::Bool), vec![pair("Bool", "bool")]);
         assert_eq!(
-            native_ffi_type(&TypeRef::TypedHandle("S".into())),
-            "Pointer<Void>"
+            input_slots(&TypeRef::StringUtf8),
+            vec![pair("Pointer<Utf8>", "Pointer<Utf8>")]
         );
+        assert_eq!(
+            input_slots(&TypeRef::Interface("Store".into())),
+            vec![pair("Pointer<Void>", "Pointer<Void>")]
+        );
+        // The one optional exception: a nullable interface pointer.
+        assert_eq!(
+            input_slots(&TypeRef::Optional(Box::new(TypeRef::Interface(
+                "Store".into()
+            )))),
+            vec![pair("Pointer<Void>", "Pointer<Void>")]
+        );
+    }
+
+    /// Buffered and bytes returns come back as `Pointer<Uint8>` plus a
+    /// trailing `Pointer<Size>` out-slot; everything else keeps its direct
+    /// return slot with no out-params.
+    #[test]
+    fn return_slots_mapping() {
+        for ty in [
+            TypeRef::Record("C".into()),
+            TypeRef::RichEnum("S".into()),
+            TypeRef::List(Box::new(TypeRef::Record("C".into()))),
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            TypeRef::Optional(Box::new(TypeRef::I64)),
+            TypeRef::Bytes,
+        ] {
+            assert_eq!(
+                return_ffi(&ty),
+                ("Pointer<Uint8>".to_string(), "Pointer<Uint8>".to_string()),
+                "{ty:?}"
+            );
+            assert_eq!(
+                return_out_slots(&ty),
+                vec![("Pointer<Size>".to_string(), "Pointer<Size>".to_string())],
+                "{ty:?}"
+            );
+        }
+        assert_eq!(
+            return_ffi(&TypeRef::StringUtf8),
+            ("Pointer<Utf8>".to_string(), "Pointer<Utf8>".to_string())
+        );
+        assert!(return_out_slots(&TypeRef::StringUtf8).is_empty());
+        assert_eq!(
+            return_ffi(&TypeRef::Optional(Box::new(TypeRef::Interface(
+                "Store".into()
+            )))),
+            ("Pointer<Void>".to_string(), "Pointer<Void>".to_string())
+        );
+        assert!(return_out_slots(&TypeRef::I32).is_empty());
     }
 
     #[test]
     fn generate_dart_basic() {
-        let api = make_api(vec![simple_module(vec![Function {
-            name: "add".into(),
-            params: vec![
-                Param {
-                    name: "a".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                },
-                Param {
-                    name: "b".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                },
-            ],
-            returns: Some(TypeRef::I32),
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-            since: None,
-        }])]);
+        let api = make_api(vec![simple_module(vec![func(
+            "add",
+            vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+            Some(TypeRef::I32),
+        )])]);
 
         let tmp = std::env::temp_dir().join("weaveffi_test_dart_basic");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3209,6 +2964,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The library always ships the private value-buffer runtime: a
+    /// little-endian writer/reader pair with truncation, flag-byte, and
+    /// trailing-bytes validation, plus the staging/copy helpers.
+    #[test]
+    fn emits_value_buffer_runtime() {
+        let api = make_api(vec![simple_module(vec![func("ping", vec![], None)])]);
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("final class _BufferWriter {"),
+            "missing writer: {dart}"
+        );
+        assert!(
+            dart.contains("final class _BufferReader {"),
+            "missing reader: {dart}"
+        );
+        assert!(
+            dart.contains("Endian.little"),
+            "buffers must be little-endian: {dart}"
+        );
+        assert!(
+            dart.contains("import 'dart:typed_data';") && dart.contains("import 'dart:convert';"),
+            "missing runtime imports: {dart}"
+        );
+        // Decoders reject truncation, hostile lengths, bad flag bytes, and
+        // trailing garbage.
+        assert!(
+            dart.contains("if (_remaining < n) _bufferError(context);"),
+            "missing truncation check: {dart}"
+        );
+        assert!(
+            dart.contains("length prefix exceeds remaining buffer"),
+            "missing length validation: {dart}"
+        );
+        assert!(
+            dart.contains("bool byte out of range")
+                && dart.contains("option flag byte out of range"),
+            "missing flag validation: {dart}"
+        );
+        assert!(
+            dart.contains("trailing bytes after value"),
+            "missing expectEnd validation: {dart}"
+        );
+        assert!(
+            dart.contains("Pointer<Uint8> _stageBytes(Uint8List bytes)")
+                && dart.contains("Uint8List _copyNativeBytes(Pointer<Uint8> ptr, int len)"),
+            "missing staging helpers: {dart}"
+        );
+    }
+
+    /// The error struct mirrors the C `weaveffi_error`, including the
+    /// structured payload slots.
+    #[test]
+    fn error_struct_has_payload_slots() {
+        let api = make_api(vec![simple_module(vec![func("ping", vec![], None)])]);
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("external Pointer<Uint8> payloadPtr;"),
+            "missing payload pointer: {dart}"
+        );
+        assert!(
+            dart.contains("@Size()\n  external int payloadLen;"),
+            "missing payload length: {dart}"
+        );
+    }
+
     #[test]
     fn generate_dart_with_structs() {
         let api = make_api(vec![Module {
@@ -3217,26 +3037,10 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: Some("A contact record".into()),
-                builder: false,
                 fields: vec![
-                    StructField {
-                        name: "id".into(),
-                        ty: TypeRef::I64,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "first_name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "email".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                        doc: None,
-                        default: None,
-                    },
+                    field("id", TypeRef::I64),
+                    field("first_name", TypeRef::StringUtf8),
+                    field("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
                 ],
             }],
             enums: vec![],
@@ -3249,62 +3053,79 @@ mod tests {
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
+        // A record is a plain Dart value class with final typed fields.
         assert!(dart.contains("class Contact {"), "missing class: {dart}");
+        assert!(dart.contains("final int id;"), "missing id field: {dart}");
         assert!(
-            dart.contains("Pointer<Void> _handle"),
-            "missing _handle: {dart}"
+            dart.contains("final String firstName;"),
+            "missing firstName field: {dart}"
         );
         assert!(
-            dart.contains("Contact._(this._handle)"),
-            "missing constructor: {dart}"
-        );
-        assert!(dart.contains("void dispose()"), "missing dispose: {dart}");
-        assert!(
-            dart.contains("weaveffi_contacts_Contact_destroy"),
-            "missing destroy sym: {dart}"
-        );
-        assert!(dart.contains("int get id"), "missing id getter: {dart}");
-        assert!(
-            dart.contains("weaveffi_contacts_Contact_get_id"),
-            "missing id getter sym: {dart}"
+            dart.contains("final String? email;"),
+            "missing optional email field: {dart}"
         );
         assert!(
-            dart.contains("String get firstName"),
-            "missing firstName getter: {dart}"
+            dart.contains("Contact({required this.id, required this.firstName, this.email});"),
+            "missing value constructor: {dart}"
+        );
+        // No C symbols exist for a record: no handle, no dispose, no getters,
+        // no builders.
+        assert!(
+            !dart.contains("Contact._("),
+            "record must not wrap a native handle: {dart}"
         );
         assert!(
-            dart.contains("weaveffi_contacts_Contact_get_first_name"),
-            "missing firstName getter sym: {dart}"
+            !dart.contains("weaveffi_contacts_Contact_destroy")
+                && !dart.contains("weaveffi_contacts_Contact_get_"),
+            "record must not bind C symbols: {dart}"
         );
         assert!(
-            dart.contains("result.toDartString()"),
-            "missing toDartString: {dart}"
+            !dart.contains("ContactBuilder"),
+            "builders are gone: {dart}"
+        );
+        // One pack and one unpack helper, fields in declaration (wire) order.
+        assert!(
+            dart.contains("void _packContact(_BufferWriter w, Contact v) {"),
+            "missing pack helper: {dart}"
         );
         assert!(
-            dart.contains("String? get email"),
-            "missing email getter: {dart}"
+            dart.contains("w.writeInt64(v.id);"),
+            "missing i64 field write: {dart}"
         );
         assert!(
-            dart.contains("weaveffi_contacts_Contact_get_email"),
-            "missing email getter sym: {dart}"
+            dart.contains("w.writeString(v.firstName);"),
+            "missing string field write: {dart}"
+        );
+        assert!(
+            dart.contains("w.writeOptionFlag(false);") && dart.contains("w.writeOptionFlag(true);"),
+            "missing optional flag writes: {dart}"
+        );
+        assert!(
+            dart.contains("Contact _unpackContact(_BufferReader r) {"),
+            "missing unpack helper: {dart}"
+        );
+        assert!(
+            dart.contains("id: r.readInt64(),")
+                && dart.contains("firstName: r.readString(),")
+                && dart.contains("email: (r.readOptionFlag() ? r.readString() : null),"),
+            "missing field reads in wire order: {dart}"
         );
     }
 
+    /// A record field of optional type is not `required`; every other field
+    /// is.
     #[test]
-    fn generate_dart_with_builder_struct() {
+    fn record_constructor_requires_non_optional_fields() {
         let api = make_api(vec![Module {
             name: "geo".into(),
             functions: vec![],
             structs: vec![StructDef {
                 name: "Point".into(),
                 doc: None,
-                builder: true,
-                fields: vec![StructField {
-                    name: "x".into(),
-                    ty: TypeRef::F64,
-                    doc: None,
-                    default: None,
-                }],
+                fields: vec![
+                    field("x", TypeRef::F64),
+                    field("label", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                ],
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3316,17 +3137,8 @@ mod tests {
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
-            dart.contains("class PointBuilder {"),
-            "builder class: {dart}"
-        );
-        assert!(
-            dart.contains("PointBuilder withX(double value)"),
-            "fluent setter: {dart}"
-        );
-        assert!(dart.contains("Point build() {"), "build method: {dart}");
-        assert!(
-            dart.contains("_checkError(err);") && dart.contains("return Point._(result);"),
-            "build calls FFI create and wraps the result: {dart}"
+            dart.contains("Point({required this.x, this.label});"),
+            "optional fields must not be required: {dart}"
         );
     }
 
@@ -3334,22 +3146,11 @@ mod tests {
     fn generate_dart_with_enums() {
         let api = make_api(vec![Module {
             name: "paint".into(),
-            functions: vec![Function {
-                name: "mix".into(),
-                params: vec![Param {
-                    name: "color".into(),
-                    ty: TypeRef::Enum("Color".into()),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Enum("Color".into())),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![func(
+                "mix",
+                vec![param("color", TypeRef::Enum("Color".into()))],
+                Some(TypeRef::Enum("Color".into())),
+            )],
             structs: vec![],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -3416,17 +3217,7 @@ mod tests {
 
     #[test]
     fn void_function() {
-        let api = make_api(vec![simple_module(vec![Function {
-            name: "reset".into(),
-            params: vec![],
-            returns: None,
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-            since: None,
-        }])]);
+        let api = make_api(vec![simple_module(vec![func("reset", vec![], None)])]);
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -3443,22 +3234,11 @@ mod tests {
     fn string_function() {
         let api = make_api(vec![Module {
             name: "text".into(),
-            functions: vec![Function {
-                name: "echo".into(),
-                params: vec![Param {
-                    name: "msg".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::StringUtf8),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![func(
+                "echo",
+                vec![param("msg", TypeRef::StringUtf8)],
+                Some(TypeRef::StringUtf8),
+            )],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -3499,22 +3279,11 @@ mod tests {
 
     #[test]
     fn bool_function() {
-        let api = make_api(vec![simple_module(vec![Function {
-            name: "is_valid".into(),
-            params: vec![Param {
-                name: "flag".into(),
-                ty: TypeRef::Bool,
-                mutable: false,
-                doc: None,
-            }],
-            returns: Some(TypeRef::Bool),
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-            since: None,
-        }])]);
+        let api = make_api(vec![simple_module(vec![func(
+            "is_valid",
+            vec![param("flag", TypeRef::Bool)],
+            Some(TypeRef::Bool),
+        )])]);
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -3540,20 +3309,12 @@ mod tests {
     #[test]
     fn async_function() {
         let api = make_api(vec![simple_module(vec![Function {
-            name: "fetch_data".into(),
-            params: vec![Param {
-                name: "id".into(),
-                ty: TypeRef::I32,
-                mutable: false,
-                doc: None,
-            }],
-            returns: Some(TypeRef::StringUtf8),
-            doc: None,
-            throws: false,
             r#async: true,
-            cancellable: false,
-            deprecated: None,
-            since: None,
+            ..func(
+                "fetch_data",
+                vec![param("id", TypeRef::I32)],
+                Some(TypeRef::StringUtf8),
+            )
         }])]);
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
@@ -3582,20 +3343,12 @@ mod tests {
     #[test]
     fn dart_async_pins_callback_for_lifetime() {
         let api = make_api(vec![simple_module(vec![Function {
-            name: "fetch_data".into(),
-            params: vec![Param {
-                name: "id".into(),
-                ty: TypeRef::I32,
-                mutable: false,
-                doc: None,
-            }],
-            returns: Some(TypeRef::StringUtf8),
-            doc: None,
-            throws: false,
             r#async: true,
-            cancellable: false,
-            deprecated: None,
-            since: None,
+            ..func(
+                "fetch_data",
+                vec![param("id", TypeRef::I32)],
+                Some(TypeRef::StringUtf8),
+            )
         }])]);
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         let pin_count = dart.matches(".listener(").count();
@@ -3612,26 +3365,19 @@ mod tests {
     }
 
     #[test]
-    fn struct_return_wraps_handle() {
+    fn record_return_decodes_buffer() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
-            functions: vec![Function {
-                name: "get_contact".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::Handle,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Record("Contact".into())),
+            functions: vec![func(
+                "get_contact",
+                vec![param("id", TypeRef::Handle)],
+                Some(TypeRef::Record("Contact".into())),
+            )],
+            structs: vec![StructDef {
+                name: "Contact".into(),
                 doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
-            structs: vec![],
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
@@ -3645,25 +3391,92 @@ mod tests {
             dart.contains("Contact getContact(int id)"),
             "missing signature: {dart}"
         );
+        // The buffered return is `Pointer<Uint8>` plus an `out_len` slot.
         assert!(
-            dart.contains("Contact._(result)"),
-            "missing struct wrapping: {dart}"
+            dart.contains("Pointer<Uint8> Function(Int64, Pointer<Size>, Pointer<_WeaveFFIError>)"),
+            "missing buffered return typedef: {dart}"
+        );
+        assert!(
+            dart.contains("final outLen = calloc<Size>();"),
+            "missing out_len alloc: {dart}"
+        );
+        // Copy, free the producer's buffer, decode, and reject trailing bytes.
+        assert!(
+            dart.contains("final data = _copyNativeBytes(result, n);"),
+            "missing copy: {dart}"
+        );
+        assert!(
+            dart.contains("if (result != nullptr) _weaveffiFreeBytes(result, n);"),
+            "buffered return must be freed after copying: {dart}"
+        );
+        assert!(
+            dart.contains("final value = _unpackContact(reader);"),
+            "missing decode: {dart}"
+        );
+        assert!(
+            dart.contains("reader.expectEnd();"),
+            "missing trailing-bytes check: {dart}"
+        );
+    }
+
+    /// A buffered parameter is encoded, staged into native memory, passed as
+    /// a borrowed (ptr, len) pair, and freed by the caller afterwards.
+    #[test]
+    fn record_param_staged_and_freed() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![func(
+                "save",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                None,
+            )],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![field("name", TypeRef::StringUtf8)],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("final contactWriter = _BufferWriter();")
+                && dart.contains("_packContact(contactWriter, contact);"),
+            "missing param encode: {dart}"
+        );
+        assert!(
+            dart.contains("final contactBuf = contactWriter.takeBytes();")
+                && dart.contains("final contactPtr = _stageBytes(contactBuf);"),
+            "missing native staging: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiContactsSave(contactPtr, contactBuf.length, err);"),
+            "missing (ptr, len) call: {dart}"
+        );
+        assert!(
+            dart.contains("calloc.free(contactPtr);"),
+            "staged buffer must be freed by the caller: {dart}"
+        );
+        // The callee borrows the encoding; the wrapper never routes a
+        // parameter through the runtime frees.
+        assert!(
+            !dart.contains("_weaveffiFreeBytes(contactPtr"),
+            "borrowed param must not be runtime-freed: {dart}"
         );
     }
 
     #[test]
     fn handle_uses_int64() {
-        let api = make_api(vec![simple_module(vec![Function {
-            name: "create".into(),
-            params: vec![],
-            returns: Some(TypeRef::Handle),
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-            since: None,
-        }])]);
+        let api = make_api(vec![simple_module(vec![func(
+            "create",
+            vec![],
+            Some(TypeRef::Handle),
+        )])]);
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
         assert!(
@@ -3719,22 +3532,11 @@ mod tests {
     fn generate_dart_with_optionals() {
         let api = make_api(vec![Module {
             name: "users".into(),
-            functions: vec![Function {
-                name: "find_user".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I64,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![func(
+                "find_user",
+                vec![param("id", TypeRef::I64)],
+                Some(TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+            )],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -3749,13 +3551,14 @@ mod tests {
             dart.contains("String? findUser(int id)"),
             "missing optional return type: {dart}"
         );
+        // An optional is buffered: a flag byte, then the value when present.
         assert!(
-            dart.contains("if (result == nullptr) return null;"),
-            "missing null check: {dart}"
+            dart.contains("final value = (reader.readOptionFlag() ? reader.readString() : null);"),
+            "missing optional decode: {dart}"
         );
         assert!(
-            dart.contains("result.toDartString()"),
-            "missing toDartString for optional: {dart}"
+            dart.contains("if (result != nullptr) _weaveffiFreeBytes(result, n);"),
+            "optional return buffer must be freed: {dart}"
         );
     }
 
@@ -3763,22 +3566,11 @@ mod tests {
     fn generate_dart_with_lists() {
         let api = make_api(vec![Module {
             name: "data".into(),
-            functions: vec![Function {
-                name: "get_scores".into(),
-                params: vec![Param {
-                    name: "items".into(),
-                    ty: TypeRef::List(Box::new(TypeRef::I32)),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![func(
+                "get_scores",
+                vec![param("items", TypeRef::List(Box::new(TypeRef::I32)))],
+                Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+            )],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -3793,9 +3585,22 @@ mod tests {
             dart.contains("List<String> getScores(List<int> items)"),
             "missing list signature: {dart}"
         );
+        // The list input is one serialized buffer: count then elements.
         assert!(
-            dart.contains("Pointer<Void>"),
-            "missing Pointer<Void> for list FFI type: {dart}"
+            dart.contains("itemsWriter.writeLength(t0.length);")
+                && dart.contains("itemsWriter.writeInt32(t1);"),
+            "missing list encode: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiDataGetScores(itemsPtr, itemsBuf.length, outLen, err)"),
+            "missing (ptr, len) call with out_len: {dart}"
+        );
+        // The list return decodes count then elements from one buffer.
+        assert!(
+            dart.contains(
+                "final value = List<String>.generate(reader.readLength(), (_) => reader.readString());"
+            ),
+            "missing list decode: {dart}"
         );
     }
 
@@ -3803,20 +3608,14 @@ mod tests {
     fn generate_dart_with_maps() {
         let api = make_api(vec![Module {
             name: "cache".into(),
-            functions: vec![Function {
-                name: "get_entries".into(),
-                params: vec![],
-                returns: Some(TypeRef::Map(
+            functions: vec![func(
+                "get_entries",
+                vec![],
+                Some(TypeRef::Map(
                     Box::new(TypeRef::StringUtf8),
                     Box::new(TypeRef::I32),
                 )),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            )],
             structs: vec![],
             enums: vec![],
             callbacks: vec![],
@@ -3831,6 +3630,17 @@ mod tests {
             dart.contains("Map<String, int> getEntries()"),
             "missing map return type: {dart}"
         );
+        // A map is one buffer: count then alternating key, value.
+        assert!(
+            dart.contains(
+                "<String, int>{ for (var i = reader.readLength(); i > 0; i--) reader.readString(): reader.readInt32() }"
+            ),
+            "missing map decode: {dart}"
+        );
+        assert!(
+            !dart.contains("outKeys") && !dart.contains("outValues"),
+            "parallel key/value arrays are gone: {dart}"
+        );
     }
 
     #[test]
@@ -3838,38 +3648,16 @@ mod tests {
         let api = make_api(vec![Module {
             name: "sessions".into(),
             functions: vec![
-                Function {
-                    name: "create_session".into(),
-                    params: vec![Param {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::TypedHandle("Session".into())),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "close_session".into(),
-                    params: vec![Param {
-                        name: "session".into(),
-                        ty: TypeRef::TypedHandle("Session".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: None,
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
+                func(
+                    "create_session",
+                    vec![param("name", TypeRef::StringUtf8)],
+                    Some(TypeRef::TypedHandle("Session".into())),
+                ),
+                func(
+                    "close_session",
+                    vec![param("session", TypeRef::TypedHandle("Session".into()))],
+                    None,
+                ),
             ],
             structs: vec![],
             enums: vec![],
@@ -3904,132 +3692,42 @@ mod tests {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![
-                Function {
-                    name: "create_contact".into(),
-                    params: vec![
-                        Param {
-                            name: "first_name".into(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "last_name".into(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "email".into(),
-                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "contact_type".into(),
-                            ty: TypeRef::Enum("ContactType".into()),
-                            mutable: false,
-                            doc: None,
-                        },
+                func(
+                    "create_contact",
+                    vec![
+                        param("first_name", TypeRef::StringUtf8),
+                        param("last_name", TypeRef::StringUtf8),
+                        param("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                        param("contact_type", TypeRef::Enum("ContactType".into())),
                     ],
-                    returns: Some(TypeRef::Handle),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "get_contact".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::Handle,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Record("Contact".into())),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "list_contacts".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "delete_contact".into(),
-                    params: vec![Param {
-                        name: "id".into(),
-                        ty: TypeRef::Handle,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Bool),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "count_contacts".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
+                    Some(TypeRef::Handle),
+                ),
+                func(
+                    "get_contact",
+                    vec![param("id", TypeRef::Handle)],
+                    Some(TypeRef::Record("Contact".into())),
+                ),
+                func(
+                    "list_contacts",
+                    vec![],
+                    Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
+                ),
+                func(
+                    "delete_contact",
+                    vec![param("id", TypeRef::Handle)],
+                    Some(TypeRef::Bool),
+                ),
+                func("count_contacts", vec![], Some(TypeRef::I32)),
             ],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: Some("A contact record".into()),
-                builder: false,
                 fields: vec![
-                    StructField {
-                        name: "id".into(),
-                        ty: TypeRef::I64,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "first_name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "last_name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "email".into(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "contact_type".into(),
-                        ty: TypeRef::Enum("ContactType".into()),
-                        doc: None,
-                        default: None,
-                    },
+                    field("id", TypeRef::I64),
+                    field("first_name", TypeRef::StringUtf8),
+                    field("last_name", TypeRef::StringUtf8),
+                    field("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                    field("contact_type", TypeRef::Enum("ContactType".into())),
                 ],
             }],
             enums: vec![EnumDef {
@@ -4084,22 +3782,18 @@ mod tests {
             dart.contains("/// A contact record"),
             "missing doc comment: {dart}"
         );
-        assert!(dart.contains("int get id"), "missing id getter: {dart}");
         assert!(
-            dart.contains("String get firstName"),
-            "missing firstName getter: {dart}"
+            dart.contains("final int id;")
+                && dart.contains("final String firstName;")
+                && dart.contains("final String? email;")
+                && dart.contains("final ContactType contactType;"),
+            "missing typed final fields: {dart}"
         );
+        // The enum field crosses the buffer as its i32 discriminant.
         assert!(
-            dart.contains("String get lastName"),
-            "missing lastName getter: {dart}"
-        );
-        assert!(
-            dart.contains("String? get email"),
-            "missing optional email getter: {dart}"
-        );
-        assert!(
-            dart.contains("ContactType get contactType"),
-            "missing contactType getter: {dart}"
+            dart.contains("w.writeInt32(v.contactType.value);")
+                && dart.contains("contactType: ContactType.fromValue(r.readInt32()),"),
+            "missing enum field encode/decode: {dart}"
         );
 
         assert!(
@@ -4113,6 +3807,10 @@ mod tests {
         assert!(
             dart.contains("List<Contact> listContacts()"),
             "missing listContacts: {dart}"
+        );
+        assert!(
+            dart.contains("(_) => _unpackContact(reader)"),
+            "list of records must decode elements: {dart}"
         );
         assert!(
             dart.contains("bool deleteContact(int id)"),
@@ -4158,33 +3856,16 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                builder: false,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
-            functions: vec![Function {
-                name: "find_contact".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Record("Contact".into())),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![func(
+                "find_contact",
+                vec![param("name", TypeRef::StringUtf8)],
+                Some(TypeRef::Record("Contact".into())),
+            )],
             interfaces: vec![],
             errors: None,
             modules: vec![],
@@ -4205,17 +3886,12 @@ mod tests {
         let err_check = fn_body
             .find("_checkError(err)")
             .expect("_checkError in findContact");
-        let contact_wrap = fn_body
-            .find("Contact._(result)")
-            .expect("Contact._ in findContact");
+        let decode = fn_body
+            .find("_unpackContact(reader)")
+            .expect("decode in findContact");
         assert!(
-            err_check < contact_wrap,
-            "error must be checked before wrapping struct return: {dart}"
-        );
-
-        assert!(
-            dart.contains("void dispose()") && dart.contains("_destroy"),
-            "struct return type should have dispose calling destroy: {dart}"
+            err_check < decode,
+            "error must be checked before decoding the return buffer: {dart}"
         );
     }
 
@@ -4223,25 +3899,18 @@ mod tests {
     fn dart_null_check_on_optional_return() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
-            functions: vec![Function {
-                name: "find_contact".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
+            functions: vec![func(
+                "find_contact",
+                vec![param("id", TypeRef::I32)],
+                Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
+            )],
+            structs: vec![StructDef {
+                name: "Contact".into(),
                 doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
-            structs: vec![],
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
@@ -4252,20 +3921,16 @@ mod tests {
 
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
 
-        let fn_start = dart
-            .find("Contact? findContact(")
-            .expect("findContact wrapper");
-        let fn_body = &dart[fn_start..];
-
-        let null_check = fn_body
-            .find("if (result == nullptr) return null")
-            .expect("null check in findContact");
-        let contact_wrap = fn_body
-            .find("Contact._(result)")
-            .expect("Contact._ in findContact");
         assert!(
-            null_check < contact_wrap,
-            "optional struct return should check null before wrapping: {dart}"
+            dart.contains("Contact? findContact(int id)"),
+            "missing optional record signature: {dart}"
+        );
+        // The option is a flag byte inside the buffer, not a null pointer.
+        assert!(
+            dart.contains(
+                "final value = (reader.readOptionFlag() ? _unpackContact(reader) : null);"
+            ),
+            "optional record must decode the flag then the value: {dart}"
         );
     }
 
@@ -4273,20 +3938,12 @@ mod tests {
         make_api(vec![Module {
             name: "docs".into(),
             functions: vec![Function {
-                name: "do_thing".into(),
-                params: vec![Param {
-                    name: "x".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::I32),
                 doc: Some("Performs a thing.".into()),
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
+                ..func(
+                    "do_thing",
+                    vec![param("x", TypeRef::I32)],
+                    Some(TypeRef::I32),
+                )
             }],
             structs: vec![StructDef {
                 name: "Item".into(),
@@ -4297,7 +3954,6 @@ mod tests {
                     doc: Some("Stable id".into()),
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Kind".into(),
@@ -4339,56 +3995,32 @@ mod tests {
     #[test]
     fn dart_emits_doc_on_field() {
         let dart = render_dart_module(&doc_api(), "weaveffi", "weaveffi.yml");
-        assert!(dart.contains("/// Stable id"), "{dart}");
+        assert!(
+            dart.contains("/// Stable id\n  final int id;"),
+            "field doc should sit on the final field: {dart}"
+        );
     }
 
     /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
     /// f64 payload, two f32 payloads, and a (string, u8) payload, plus a plain
-    /// sibling enum and functions that take/return the rich enum by handle.
+    /// sibling enum and functions that take/return the rich enum by value.
     fn rich_enum_api() -> Api {
         make_api(vec![Module {
             name: "shapes".into(),
             functions: vec![
-                Function {
-                    name: "describe".into(),
-                    params: vec![Param {
-                        name: "shape".into(),
-                        ty: TypeRef::RichEnum("Shape".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::StringUtf8),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "scale".into(),
-                    params: vec![
-                        Param {
-                            name: "shape".into(),
-                            ty: TypeRef::RichEnum("Shape".into()),
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "factor".into(),
-                            ty: TypeRef::F64,
-                            mutable: false,
-                            doc: None,
-                        },
+                func(
+                    "describe",
+                    vec![param("shape", TypeRef::RichEnum("Shape".into()))],
+                    Some(TypeRef::StringUtf8),
+                ),
+                func(
+                    "scale",
+                    vec![
+                        param("shape", TypeRef::RichEnum("Shape".into())),
+                        param("factor", TypeRef::F64),
                     ],
-                    returns: Some(TypeRef::RichEnum("Shape".into())),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
+                    Some(TypeRef::RichEnum("Shape".into())),
+                ),
             ],
             structs: vec![],
             enums: vec![
@@ -4418,18 +4050,8 @@ mod tests {
                             value: 2,
                             doc: None,
                             fields: vec![
-                                StructField {
-                                    name: "width".into(),
-                                    ty: TypeRef::F32,
-                                    doc: None,
-                                    default: None,
-                                },
-                                StructField {
-                                    name: "height".into(),
-                                    ty: TypeRef::F32,
-                                    doc: None,
-                                    default: None,
-                                },
+                                field("width", TypeRef::F32),
+                                field("height", TypeRef::F32),
                             ],
                         },
                         EnumVariant {
@@ -4437,18 +4059,8 @@ mod tests {
                             value: 3,
                             doc: None,
                             fields: vec![
-                                StructField {
-                                    name: "label".into(),
-                                    ty: TypeRef::StringUtf8,
-                                    doc: None,
-                                    default: None,
-                                },
-                                StructField {
-                                    name: "count".into(),
-                                    ty: TypeRef::U8,
-                                    doc: None,
-                                    default: None,
-                                },
+                                field("label", TypeRef::StringUtf8),
+                                field("count", TypeRef::U8),
                             ],
                         },
                     ],
@@ -4481,29 +4093,44 @@ mod tests {
     }
 
     #[test]
-    fn rich_enum_is_opaque_class_not_plain_enum() {
+    fn rich_enum_is_sealed_hierarchy() {
         let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
         // The rich enum must NOT be a plain Dart `enum`...
         assert!(
             !dart.contains("enum Shape {"),
             "rich enum must not render as a plain enum: {dart}"
         );
-        // ...but an opaque-object wrapper class, exactly like a struct.
+        // ...but a sealed base class with one subclass per variant.
         assert!(
-            dart.contains("class Shape {"),
-            "missing Shape class: {dart}"
+            dart.contains("sealed class Shape {"),
+            "missing sealed base: {dart}"
         );
         assert!(
-            dart.contains("final Pointer<Void> _handle;"),
-            "missing opaque handle field: {dart}"
+            dart.contains("class ShapeEmpty extends Shape {}"),
+            "missing unit variant subclass: {dart}"
         );
         assert!(
-            dart.contains("Shape._(this._handle);"),
-            "missing private wrapping constructor: {dart}"
+            dart.contains("class ShapeCircle extends Shape {"),
+            "missing circle subclass: {dart}"
         );
         assert!(
-            dart.contains("void dispose()") && dart.contains("weaveffi_shapes_Shape_destroy"),
-            "missing dispose()/destroy symbol: {dart}"
+            dart.contains("final double radius;") && dart.contains("ShapeCircle(this.radius);"),
+            "variant fields must be final constructor fields: {dart}"
+        );
+        assert!(
+            dart.contains("ShapeLabeled(this.label, this.count);"),
+            "multi-field variant constructor: {dart}"
+        );
+        // Rich enums declare no C symbols: no handle, no dispose, no
+        // per-variant constructors or getters.
+        assert!(
+            !dart.contains("Shape._(") && !dart.contains("weaveffi_shapes_Shape_"),
+            "rich enum must not bind C symbols: {dart}"
+        );
+        // Carries the per-variant field doc onto the final field.
+        assert!(
+            dart.contains("/// Radius in points"),
+            "variant field doc should be emitted: {dart}"
         );
         // A plain sibling enum still renders as a plain Dart enum.
         assert!(
@@ -4513,115 +4140,70 @@ mod tests {
     }
 
     #[test]
-    fn rich_enum_tag_reader() {
+    fn rich_enum_pack_writes_tag_then_fields() {
         let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
         assert!(
-            dart.contains("enum ShapeTag {"),
-            "missing typed discriminant enum: {dart}"
+            dart.contains("void _packShape(_BufferWriter w, Shape v) {"),
+            "missing pack helper: {dart}"
         );
         assert!(
-            dart.contains("empty(0)")
-                && dart.contains("circle(1)")
-                && dart.contains("rectangle(2)")
-                && dart.contains("labeled(3)"),
-            "missing tag discriminants: {dart}"
+            dart.contains("case ShapeEmpty():") && dart.contains("w.writeInt32(0);"),
+            "unit variant must write only its tag: {dart}"
         );
         assert!(
-            dart.contains("ShapeTag get tag"),
-            "missing tag discriminant reader: {dart}"
+            dart.contains("case final ShapeCircle t0:")
+                && dart.contains("w.writeInt32(1);")
+                && dart.contains("w.writeFloat64(t0.radius);"),
+            "circle must write tag then f64 radius: {dart}"
         );
         assert!(
-            dart.contains("ShapeTag.fromValue(_weaveffiShapesShapeTag(_handle))"),
-            "tag reader must read the C tag symbol: {dart}"
+            dart.contains("w.writeFloat32(t1.width);")
+                && dart.contains("w.writeFloat32(t1.height);"),
+            "rectangle must write both f32 fields in order: {dart}"
+        );
+        assert!(
+            dart.contains("w.writeString(t2.label);") && dart.contains("w.writeUint8(t2.count);"),
+            "labeled must write string then u8: {dart}"
         );
     }
 
     #[test]
-    fn rich_enum_per_variant_factories() {
+    fn rich_enum_unpack_switches_on_tag() {
         let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
         assert!(
-            dart.contains("factory Shape.empty()"),
-            "missing unit-variant factory: {dart}"
+            dart.contains("Shape _unpackShape(_BufferReader r) {"),
+            "missing unpack helper: {dart}"
         );
         assert!(
-            dart.contains("factory Shape.circle(double radius)"),
-            "missing f64 factory: {dart}"
+            dart.contains("final tag = r.readInt32();"),
+            "missing tag read: {dart}"
         );
         assert!(
-            dart.contains("factory Shape.rectangle(double width, double height)"),
-            "missing two-f32 factory: {dart}"
+            dart.contains("return ShapeEmpty();"),
+            "missing unit variant arm: {dart}"
         );
         assert!(
-            dart.contains("factory Shape.labeled(String label, int count)"),
-            "missing (string,u8) factory: {dart}"
-        );
-        // Each factory binds its own per-variant `_new` symbol...
-        assert!(
-            dart.contains("weaveffi_shapes_Shape_Empty_new")
-                && dart.contains("weaveffi_shapes_Shape_Circle_new")
-                && dart.contains("weaveffi_shapes_Shape_Rectangle_new")
-                && dart.contains("weaveffi_shapes_Shape_Labeled_new"),
-            "missing per-variant constructor symbols: {dart}"
-        );
-        // ...marshals string fields, checks the error, and wraps the handle.
-        assert!(
-            dart.contains("label.toNativeUtf8()"),
-            "labeled factory must marshal its string field: {dart}"
+            dart.contains("return ShapeCircle(r.readFloat64());"),
+            "missing circle arm: {dart}"
         );
         assert!(
-            dart.contains("_checkError(err);") && dart.contains("return Shape._(result);"),
-            "factory must check error and wrap the returned handle: {dart}"
+            dart.contains("return ShapeRectangle(r.readFloat32(), r.readFloat32());"),
+            "missing rectangle arm: {dart}"
+        );
+        assert!(
+            dart.contains("return ShapeLabeled(r.readString(), r.readUint8());"),
+            "missing labeled arm: {dart}"
+        );
+        // An unknown tag is a contract violation, not a silent default.
+        assert!(
+            dart.contains("_bufferError('unknown Shape tag $tag');"),
+            "missing unknown-tag rejection: {dart}"
         );
     }
 
     #[test]
-    fn rich_enum_per_variant_getters_namespaced() {
+    fn rich_enum_functions_marshal_buffers() {
         let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
-        // Getters are namespaced by variant to avoid collisions; numerics map to
-        // int/double (incl. f32 -> double, u8 -> int) and strings decode.
-        assert!(
-            dart.contains("double get circleRadius"),
-            "missing circleRadius getter: {dart}"
-        );
-        assert!(
-            dart.contains("double get rectangleWidth"),
-            "missing rectangleWidth getter: {dart}"
-        );
-        assert!(
-            dart.contains("double get rectangleHeight"),
-            "missing rectangleHeight getter: {dart}"
-        );
-        assert!(
-            dart.contains("String get labeledLabel"),
-            "missing labeledLabel getter: {dart}"
-        );
-        assert!(
-            dart.contains("int get labeledCount"),
-            "missing labeledCount getter: {dart}"
-        );
-        // Getters bind their per-variant C symbols and the string getter decodes.
-        assert!(
-            dart.contains("weaveffi_shapes_Shape_Circle_get_radius")
-                && dart.contains("weaveffi_shapes_Shape_Labeled_get_label"),
-            "missing per-variant getter symbols: {dart}"
-        );
-        assert!(
-            dart.contains("final value = result.toDartString();")
-                && dart.contains("_weaveffiFreeString(result);"),
-            "string getter must decode the C string and free it: {dart}"
-        );
-        // Carries the per-variant field doc through the namespaced getter.
-        assert!(
-            dart.contains("/// Radius in points"),
-            "variant field doc should be emitted: {dart}"
-        );
-    }
-
-    #[test]
-    fn rich_enum_functions_marshal_opaque_handle() {
-        let dart = render_dart_module(&rich_enum_api(), "weaveffi", "weaveffi.yml");
-        // Functions taking/returning the rich enum reference it as RichEnum,
-        // so they pass the opaque handle in and wrap the handle out unchanged.
         assert!(
             dart.contains("String describe(Shape shape)"),
             "missing describe signature: {dart}"
@@ -4630,13 +4212,20 @@ mod tests {
             dart.contains("Shape scale(Shape shape, double factor)"),
             "missing scale signature: {dart}"
         );
+        // A rich-enum argument is encoded and staged as a (ptr, len) pair...
         assert!(
-            dart.contains("shape._handle"),
-            "a rich-enum argument must marshal as its opaque handle: {dart}"
+            dart.contains("_packShape(shapeWriter, shape);")
+                && dart.contains("final shapePtr = _stageBytes(shapeBuf);"),
+            "rich-enum argument must be encoded and staged: {dart}"
+        );
+        // ...and a rich-enum return decodes then frees the buffer.
+        assert!(
+            dart.contains("final value = _unpackShape(reader);"),
+            "rich-enum return must decode: {dart}"
         );
         assert!(
-            dart.contains("return Shape._(result);"),
-            "a rich-enum return must wrap the opaque handle: {dart}"
+            dart.contains("if (result != nullptr) _weaveffiFreeBytes(result, n);"),
+            "rich-enum return buffer must be freed: {dart}"
         );
     }
 
@@ -4654,30 +4243,16 @@ mod tests {
             is_async: bool,
         ) -> Function {
             Function {
-                name: name.into(),
-                params,
-                returns,
-                doc: None,
                 throws,
                 r#async: is_async,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }
-        }
-        fn p(name: &str, ty: TypeRef) -> Param {
-            Param {
-                name: name.into(),
-                ty,
-                mutable: false,
-                doc: None,
+                ..func(name, params, returns)
             }
         }
         make_api(vec![Module {
             name: "kv".into(),
             functions: vec![f(
                 "inspect",
-                vec![p("store", TypeRef::Interface("Store".into()))],
+                vec![param("store", TypeRef::Interface("Store".into()))],
                 Some(TypeRef::I64),
                 false,
                 false,
@@ -4690,10 +4265,16 @@ mod tests {
                 name: "Store".into(),
                 doc: Some("A key-value store.".into()),
                 constructors: vec![
-                    f("new", vec![p("capacity", TypeRef::I64)], None, false, false),
+                    f(
+                        "new",
+                        vec![param("capacity", TypeRef::I64)],
+                        None,
+                        false,
+                        false,
+                    ),
                     f(
                         "open",
-                        vec![p("path", TypeRef::StringUtf8)],
+                        vec![param("path", TypeRef::StringUtf8)],
                         None,
                         true,
                         false,
@@ -4703,8 +4284,8 @@ mod tests {
                     f(
                         "put",
                         vec![
-                            p("key", TypeRef::StringUtf8),
-                            p("value", TypeRef::StringUtf8),
+                            param("key", TypeRef::StringUtf8),
+                            param("value", TypeRef::StringUtf8),
                         ],
                         None,
                         true,
@@ -4736,12 +4317,14 @@ mod tests {
                         code: 1001,
                         message: "key not found".into(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "IoError".into(),
                         code: 1004,
                         message: "I/O failure".into(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -4778,9 +4361,12 @@ mod tests {
                 && !dart.contains("IoErrorException"),
             "code exception must swap the Error suffix: {dart}"
         );
-        // The mapper covers each code and falls back to the generic exception.
+        // The mapper covers each code, receives the payload buffer, and falls
+        // back to the generic exception.
         assert!(
-            dart.contains("WeaveFFIException _mapKvException(int code, String message) {"),
+            dart.contains(
+                "WeaveFFIException _mapKvException(int code, String message, Uint8List payload) {"
+            ),
             "missing domain mapper: {dart}"
         );
         assert!(
@@ -4791,11 +4377,89 @@ mod tests {
             dart.contains("default:") && dart.contains("return WeaveFFIException(code, message);"),
             "mapper must fall back to the generic exception: {dart}"
         );
-        // The per-domain check helper throws through the mapper.
+        // The per-domain check helper copies the payload before clearing.
         assert!(
             dart.contains("void _checkKvException(Pointer<_WeaveFFIError> err) {")
-                && dart.contains("throw _mapKvException(code, msg);"),
+                && dart.contains(
+                    "final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);"
+                )
+                && dart.contains("throw _mapKvException(code, msg, payload);"),
             "missing domain check helper: {dart}"
+        );
+    }
+
+    /// A code that declares payload fields decodes them from the error's
+    /// payload buffer and exposes them as typed properties on the exception.
+    #[test]
+    fn error_payload_fields_decode_onto_exception() {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain};
+        let api = make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![Function {
+                throws: true,
+                ..func(
+                    "get",
+                    vec![param("key", TypeRef::StringUtf8)],
+                    Some(TypeRef::I64),
+                )
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KeyNotFound".into(),
+                        code: 1001,
+                        message: "key not found".into(),
+                        doc: None,
+                        fields: vec![
+                            field("key", TypeRef::StringUtf8),
+                            field("attempts", TypeRef::I32),
+                        ],
+                    },
+                    ErrorCode {
+                        name: "IoError".into(),
+                        code: 1004,
+                        message: "I/O failure".into(),
+                        doc: None,
+                        fields: vec![],
+                    },
+                ],
+            }),
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api, "weaveffi", "kv.yml");
+        // The exception carries the decoded payload as final typed fields.
+        assert!(
+            dart.contains("class KeyNotFoundException extends KvException {")
+                && dart.contains("final String key;")
+                && dart.contains("final int attempts;"),
+            "missing payload fields on the exception: {dart}"
+        );
+        assert!(
+            dart.contains(
+                "KeyNotFoundException(this.key, this.attempts, [String message = 'key not found']) : super(1001, message);"
+            ),
+            "missing payload-aware constructor: {dart}"
+        );
+        // The mapper decodes the payload in declaration (wire) order and
+        // rejects trailing bytes.
+        assert!(
+            dart.contains("final r = _BufferReader(payload);")
+                && dart.contains("final v0 = r.readString();")
+                && dart.contains("final v1 = r.readInt32();")
+                && dart.contains("r.expectEnd();")
+                && dart.contains("return KeyNotFoundException(v0, v1, message);"),
+            "mapper must decode payload fields in order: {dart}"
+        );
+        // A code without fields still maps directly.
+        assert!(
+            dart.contains("return IoException(message);"),
+            "plain code must map without payload decoding: {dart}"
         );
     }
 
@@ -4914,8 +4578,10 @@ mod tests {
             ),
             "async launcher must lead with _handle: {dart}"
         );
+        // The typed completion copies the payload inside the borrow window
+        // and completes with the mapped domain exception.
         assert!(
-            dart.contains("completer.completeError(_mapKvException(code, msg));"),
+            dart.contains("completer.completeError(_mapKvException(code, msg, payload));"),
             "async throwing method must complete with the typed exception: {dart}"
         );
     }
@@ -5012,34 +4678,25 @@ mod tests {
         );
     }
 
-    /// A free function returning `iter<record>` yields adopted wrapper
-    /// objects (the caller disposes each) and documents the streaming and
-    /// disposal contract.
+    /// A free function returning `iter<record>` decodes each producer buffer
+    /// then frees it with `weaveffi_free_bytes` (`ElemFree::Bytes`), and its
+    /// `_next` slot carries the extra `out_len` pointer.
     #[test]
-    fn iterator_of_records_yields_adopted_wrappers() {
+    fn iterator_of_records_decodes_and_frees_elements() {
         let api = make_api(vec![Module {
             name: "kv".into(),
             functions: vec![Function {
-                name: "entries".into(),
-                params: vec![],
-                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
                 doc: Some("Streams every entry.".into()),
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
+                ..func(
+                    "entries",
+                    vec![],
+                    Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
+                )
             }],
             structs: vec![StructDef {
                 name: "Entry".into(),
                 doc: None,
-                builder: false,
-                fields: vec![StructField {
-                    name: "key".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
+                fields: vec![field("key", TypeRef::StringUtf8)],
             }],
             enums: vec![],
             callbacks: vec![],
@@ -5053,9 +4710,24 @@ mod tests {
             dart.contains("Iterable<Entry> entries() sync* {"),
             "missing record iterator wrapper: {dart}"
         );
+        // The `_next` typedef carries `out_item` plus `out_len`.
         assert!(
-            dart.contains("yield Entry._(outItem.value);"),
-            "record elements must be adopted by their wrapper: {dart}"
+            dart.contains(
+                "Pointer<Void>, Pointer<Pointer<Uint8>>, Pointer<Size>, Pointer<_WeaveFFIError>"
+            ),
+            "missing buffered next slots: {dart}"
+        );
+        assert!(
+            dart.contains("final outLen = calloc<Size>();"),
+            "missing out_len alloc: {dart}"
+        );
+        // Each element is copied, freed with weaveffi_free_bytes, and decoded.
+        assert!(
+            dart.contains("final itemData = _copyNativeBytes(itemPtr, itemLen);")
+                && dart.contains("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);")
+                && dart.contains("final item = _unpackEntry(itemReader);")
+                && dart.contains("itemReader.expectEnd();"),
+            "record elements must be decoded then freed: {dart}"
         );
         // Non-throwing: launch and next errors trap via the generic check.
         let body = &dart[dart.find("Iterable<Entry> entries()").expect("body")..];
@@ -5063,14 +4735,15 @@ mod tests {
             body.contains("_checkError(err);"),
             "trap-strategy iterator must use the generic check: {dart}"
         );
-        // The generated doc states the streaming and disposal contract.
+        // The generated doc states the streaming contract.
         assert!(
             dart.contains("/// Returns a lazy [Iterable]:"),
             "missing streaming doc: {dart}"
         );
+        // Record elements are plain values now; no dispose note applies.
         assert!(
-            dart.contains("/// Each yielded element is owned by the caller:"),
-            "missing element ownership doc: {dart}"
+            !dart.contains("/// Each yielded element is owned by the caller:"),
+            "record elements carry no dispose obligation: {dart}"
         );
     }
 
@@ -5112,53 +4785,18 @@ mod tests {
             name: "calc".into(),
             functions: vec![
                 Function {
-                    name: "div".into(),
-                    params: vec![
-                        Param {
-                            name: "a".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
                     throws: true,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
+                    ..func(
+                        "div",
+                        vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                        Some(TypeRef::I32),
+                    )
                 },
-                Function {
-                    name: "add".into(),
-                    params: vec![
-                        Param {
-                            name: "a".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
+                func(
+                    "add",
+                    vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                    Some(TypeRef::I32),
+                ),
             ],
             structs: vec![],
             enums: vec![],
@@ -5172,6 +4810,7 @@ mod tests {
                     code: 1,
                     message: "Division by zero".into(),
                     doc: None,
+                    fields: vec![],
                 }],
             }),
             modules: vec![],
@@ -5233,6 +4872,11 @@ mod tests {
         );
         assert!(dart.contains("class Contact {"), "missing Contact: {dart}");
         assert!(
+            dart.contains("void _packContact(_BufferWriter w, Contact v) {")
+                && dart.contains("Contact _unpackContact(_BufferReader r) {"),
+            "missing Contact buffer helpers: {dart}"
+        );
+        assert!(
             dart.contains("class ContactBook {") && dart.contains("factory ContactBook() {"),
             "missing ContactBook interface: {dart}"
         );
@@ -5244,21 +4888,16 @@ mod tests {
             dart.contains("weaveffi_contacts_ContactBook_add"),
             "missing ContactBook add member symbol: {dart}"
         );
+        // Records declare no C symbols in the new ABI.
+        assert!(
+            !dart.contains("weaveffi_contacts_Contact_"),
+            "record C symbols must be gone: {dart}"
+        );
     }
 
     /// One-function module helper for the ownership-audit tests below.
     fn returning(name: &str, returns: TypeRef) -> Api {
-        make_api(vec![simple_module(vec![Function {
-            name: name.into(),
-            params: vec![],
-            returns: Some(returns),
-            doc: None,
-            throws: false,
-            r#async: false,
-            cancellable: false,
-            deprecated: None,
-            since: None,
-        }])])
+        make_api(vec![simple_module(vec![func(name, vec![], Some(returns))])])
     }
 
     #[test]
@@ -5283,55 +4922,32 @@ mod tests {
     }
 
     #[test]
-    fn string_list_return_frees_elements_and_buffer() {
+    fn string_list_return_decodes_one_buffer() {
         let dart = render_dart_module(
             &returning("names", TypeRef::List(Box::new(TypeRef::StringUtf8))),
             "weaveffi",
             "weaveffi.yml",
         );
+        // One producer buffer holding count + length-prefixed strings; no
+        // per-element C strings exist any more.
         assert!(
-            dart.contains("final arr = result.cast<Pointer<Utf8>>();"),
-            "missing element cast: {dart}"
-        );
-        // Each copied string element is released, then the array itself.
-        assert!(
-            dart.contains("_weaveffiFreeString(arr[i]);"),
-            "string elements must be freed after copying: {dart}"
-        );
-        assert!(
-            dart.contains("_weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Utf8>>());"),
-            "array buffer must be freed: {dart}"
-        );
-    }
-
-    #[test]
-    fn record_list_return_adopts_elements_and_frees_buffer() {
-        let dart = render_dart_module(
-            &returning(
-                "all",
-                TypeRef::List(Box::new(TypeRef::Record("Item".into()))),
+            dart.contains(
+                "final value = List<String>.generate(reader.readLength(), (_) => reader.readString());"
             ),
-            "weaveffi",
-            "weaveffi.yml",
+            "missing element decode: {dart}"
         );
-        // Object elements transfer to the caller (no per-element free); only
-        // the array buffer is released.
         assert!(
-            dart.contains("List<Item>.generate(n, (i) => Item._(arr[i]));"),
-            "record elements must be adopted: {dart}"
+            dart.contains("if (result != nullptr) _weaveffiFreeBytes(result, n);"),
+            "list buffer must be freed once: {dart}"
         );
         assert!(
             !dart.contains("_weaveffiFreeString(arr[i]);"),
-            "record elements must not be string-freed: {dart}"
-        );
-        assert!(
-            dart.contains("_weaveffiFreeBytes(result.cast(), n * sizeOf<Pointer<Void>>());"),
-            "array buffer must be freed: {dart}"
+            "no per-element string frees remain: {dart}"
         );
     }
 
     #[test]
-    fn map_return_frees_string_elements_and_parallel_arrays() {
+    fn map_return_decodes_one_buffer() {
         let dart = render_dart_module(
             &returning(
                 "tally",
@@ -5341,63 +4957,50 @@ mod tests {
             "weaveffi.yml",
         );
         assert!(
-            dart.contains("_weaveffiFreeString(keys[i]);"),
-            "string keys must be freed after copying: {dart}"
+            dart.contains(
+                "<String, int>{ for (var i = reader.readLength(); i > 0; i--) reader.readString(): reader.readInt32() }"
+            ),
+            "missing map decode: {dart}"
         );
         assert!(
-            dart.contains("_weaveffiFreeBytes(keys.cast(), n * sizeOf<Pointer<Utf8>>());"),
-            "keys array must be freed: {dart}"
-        );
-        assert!(
-            dart.contains("_weaveffiFreeBytes(vals.cast(), n * sizeOf<Int32>());"),
-            "values array must be freed: {dart}"
+            dart.contains("if (result != nullptr) _weaveffiFreeBytes(result, n);"),
+            "map buffer must be freed once: {dart}"
         );
     }
 
     #[test]
-    fn boxed_optional_scalar_return_is_freed() {
+    fn optional_scalar_return_decodes_flag() {
         let dart = render_dart_module(
             &returning("level", TypeRef::Optional(Box::new(TypeRef::I64))),
             "weaveffi",
             "weaveffi.yml",
         );
         assert!(
-            dart.contains("if (result == nullptr) return null;"),
-            "missing null check: {dart}"
+            dart.contains("final value = (reader.readOptionFlag() ? reader.readInt64() : null);"),
+            "boxed optionals are gone; the flag byte decides presence: {dart}"
         );
         assert!(
-            dart.contains("final value = result.value;")
-                && dart.contains("_weaveffiFreeBytes(result.cast(), sizeOf<Int64>());"),
-            "boxed scalar must be dereferenced then freed: {dart}"
+            dart.contains("if (result != nullptr) _weaveffiFreeBytes(result, n);"),
+            "optional return buffer must be freed: {dart}"
         );
     }
 
     /// Async result buffers are borrowed for the callback's duration: the
-    /// wrapper deep-copies them inside the callback and never frees them.
+    /// wrapper decodes them inside the callback and never frees them.
     #[test]
-    fn async_buffer_results_copy_and_never_free() {
+    fn async_buffer_results_decode_and_never_free() {
         let api = make_api(vec![simple_module(vec![
             Function {
-                name: "fetch_names".into(),
-                params: vec![],
-                returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
-                doc: None,
-                throws: false,
                 r#async: true,
-                cancellable: false,
-                deprecated: None,
-                since: None,
+                ..func(
+                    "fetch_names",
+                    vec![],
+                    Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                )
             },
             Function {
-                name: "fetch_blob".into(),
-                params: vec![],
-                returns: Some(TypeRef::Bytes),
-                doc: None,
-                throws: false,
                 r#async: true,
-                cancellable: false,
-                deprecated: None,
-                since: None,
+                ..func("fetch_blob", vec![], Some(TypeRef::Bytes))
             },
         ])]);
         let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
@@ -5405,12 +5008,16 @@ mod tests {
             dart.contains("Future<List<String>> fetchNames()"),
             "missing async list wrapper: {dart}"
         );
+        // The borrowed (ptr, len) pair is copied and decoded in the callback.
         assert!(
-            dart.contains(": List<String>.generate(resultLen, (i) => result[i].toDartString()));"),
-            "async list result must be copied element-wise: {dart}"
+            dart.contains("final resultData = _copyNativeBytes(result, resultLen);")
+                && dart.contains(
+                    "final value = List<String>.generate(resultReader.readLength(), (_) => resultReader.readString());"
+                ),
+            "async buffered result must be decoded inside the callback: {dart}"
         );
         assert!(
-            dart.contains(": List<int>.generate(resultLen, (i) => result[i]));"),
+            dart.contains("completer.complete(_copyNativeBytes(result, resultLen));"),
             "async bytes result must be copied: {dart}"
         );
         // Borrowed: the callback must not release the producer's buffers.
@@ -5421,6 +5028,105 @@ mod tests {
         assert!(
             !cb.contains("_weaveffiFree"),
             "async callback must never free borrowed result buffers: {cb}"
+        );
+    }
+
+    /// A buffered async *input* is staged like a sync input and released only
+    /// when the future completes (or the launch throws).
+    #[test]
+    fn async_buffered_input_staged_until_completion() {
+        let api = make_api(vec![Module {
+            name: "jobs".into(),
+            functions: vec![Function {
+                r#async: true,
+                ..func(
+                    "submit",
+                    vec![param("tags", TypeRef::List(Box::new(TypeRef::StringUtf8)))],
+                    Some(TypeRef::I64),
+                )
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
+        assert!(
+            dart.contains("final tagsPtr = _stageBytes(tagsBuf);"),
+            "missing staged async input: {dart}"
+        );
+        assert!(
+            dart.contains("_weaveffiJobsSubmitAsync(tagsPtr, tagsBuf.length, callable.nativeFunction, nullptr);"),
+            "launcher must pass the (ptr, len) pair: {dart}"
+        );
+        assert!(
+            dart.contains("return completer.future.whenComplete(() {")
+                && dart.contains("calloc.free(tagsPtr);"),
+            "staged input must be freed on completion: {dart}"
+        );
+    }
+
+    /// Buffered callback/listener arguments are borrowed (ptr, len) pairs
+    /// valid only during the dispatch: the trampoline decodes them before
+    /// invoking the user's closure and never frees them.
+    #[test]
+    fn listener_buffered_argument_decoded_in_borrow_window() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Event".into(),
+                doc: None,
+                fields: vec![field("name", TypeRef::StringUtf8)],
+            }],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "on_event".into(),
+                params: vec![param("event", TypeRef::Record("Event".into()))],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "events".into(),
+                event_callback: "on_event".into(),
+                doc: None,
+            }],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let dart = render_dart_module(&api, "weaveffi", "weaveffi.yml");
+        // The native callback typedef carries the (ptr, len) pair + context.
+        assert!(
+            dart.contains(
+                "typedef _NativeCb_weaveffi_events_on_event_fn = Void Function(Pointer<Uint8>, Size, Pointer<Void>);"
+            ),
+            "missing buffered callback typedef: {dart}"
+        );
+        // The trampoline decodes inside the borrow window, then dispatches.
+        assert!(
+            dart.contains("(Pointer<Uint8> eventPtr, int eventLen, Pointer<Void> context) {"),
+            "missing trampoline slots: {dart}"
+        );
+        assert!(
+            dart.contains("final eventData = _copyNativeBytes(eventPtr, eventLen);")
+                && dart.contains("final eventValue = _unpackEvent(eventReader);")
+                && dart.contains("callback(eventValue);"),
+            "trampoline must decode before invoking the user callback: {dart}"
+        );
+        // Borrowed: never freed by the consumer.
+        assert!(
+            !dart.contains("_weaveffiFreeBytes(eventPtr"),
+            "borrowed callback argument must not be freed: {dart}"
+        );
+        // Register/unregister plumbing is unchanged.
+        assert!(
+            dart.contains("int registerEvents(void Function(Event event) callback) {")
+                && dart.contains("void unregisterEvents(int id) {"),
+            "missing listener wrappers: {dart}"
         );
     }
 

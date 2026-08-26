@@ -2,12 +2,14 @@
 //! expanded numeric type set over the stable C ABI.
 //!
 //! `Shape` is a sum type whose variants carry associated data, so the
-//! `#[weaveffi::module]` expansion crosses it as an opaque object: a tag
-//! reader, per-variant constructors and field getters, and a destructor,
-//! exactly the surface a struct gets. `Channel` is a plain C-style enum that
-//! crosses as its `i32` discriminant. The producer writes only safe Rust; the
-//! macro emits the `weaveffi_shapes_*` thunks that line up 1:1 with the
-//! generated header (see `weaveffi generate shapes.yml --target c`).
+//! `#[weaveffi::module]` expansion crosses it as a value buffer: an `i32`
+//! tag followed by the active variant's fields, moved through one
+//! `(const uint8_t*, size_t)` slot pair. The macro implements `BufferValue`
+//! for the type instead of emitting per-variant C symbols. `Channel` is a
+//! plain C-style enum that crosses as its `i32` discriminant. The producer
+//! writes only safe Rust; the macro emits the `weaveffi_shapes_*` thunks that
+//! line up 1:1 with the generated header (see `weaveffi generate shapes.yml
+//! --target c`).
 
 /// Rich-enum + numerics smoke test
 #[weaveffi::module]
@@ -79,6 +81,7 @@ pub mod shapes {
 weaveffi::export_runtime!();
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use crate::shapes::*;
     use weaveffi::abi::{self, weaveffi_error};
@@ -87,60 +90,70 @@ mod tests {
         weaveffi_error::default()
     }
 
-    #[test]
-    fn circle_roundtrips_radius_and_tag() {
-        let mut err = new_err();
-        let s = weaveffi_shapes_Shape_Circle_new(2.5, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(weaveffi_shapes_Shape_tag(s), 1);
-        assert!((weaveffi_shapes_Shape_Circle_get_radius(s) - 2.5).abs() < 1e-9);
-        weaveffi_shapes_Shape_destroy(s);
+    /// Encode a shape into the borrowed value buffer a thunk parameter takes.
+    fn encode_shape(shape: &Shape) -> Vec<u8> {
+        abi::encode_value(shape)
     }
 
     #[test]
-    fn rectangle_uses_f32_fields() {
-        let mut err = new_err();
-        let s = weaveffi_shapes_Shape_Rectangle_new(3.0, 4.0, &mut err);
-        assert_eq!(weaveffi_shapes_Shape_tag(s), 2);
-        assert!((weaveffi_shapes_Shape_Rectangle_get_width(s) - 3.0).abs() < 1e-6);
-        assert!((weaveffi_shapes_Shape_Rectangle_get_height(s) - 4.0).abs() < 1e-6);
-        weaveffi_shapes_Shape_destroy(s);
+    fn circle_round_trips_with_tag() {
+        // A rich enum crosses as a value buffer: an i32 tag (declaration
+        // order, so Circle is 1) followed by the variant's fields.
+        let shape = Shape::Circle { radius: 2.5 };
+        let bytes = encode_shape(&shape);
+        assert_eq!(bytes[..4], 1i32.to_le_bytes());
+        assert_eq!(abi::decode_value::<Shape>(&bytes).unwrap(), shape);
     }
 
     #[test]
-    fn labeled_roundtrips_string_and_u8() {
-        let mut err = new_err();
-        let label = std::ffi::CString::new("hex").unwrap();
-        let s = weaveffi_shapes_Shape_Labeled_new(label.as_ptr(), 6, &mut err);
-        assert_eq!(err.code, 0);
-        assert_eq!(weaveffi_shapes_Shape_tag(s), 3);
-        let got = weaveffi_shapes_Shape_Labeled_get_label(s);
-        assert_eq!(abi::c_ptr_to_string(got).unwrap(), "hex");
-        abi::free_string(got);
-        assert_eq!(weaveffi_shapes_Shape_Labeled_get_count(s), 6);
-        weaveffi_shapes_Shape_destroy(s);
+    fn rectangle_round_trips_f32_fields() {
+        let shape = Shape::Rectangle {
+            width: 3.0,
+            height: 4.0,
+        };
+        let bytes = encode_shape(&shape);
+        assert_eq!(bytes[..4], 2i32.to_le_bytes());
+        assert_eq!(abi::decode_value::<Shape>(&bytes).unwrap(), shape);
+    }
+
+    #[test]
+    fn labeled_round_trips_string_and_u8() {
+        let shape = Shape::Labeled {
+            label: "hex".to_string(),
+            count: 6,
+        };
+        let bytes = encode_shape(&shape);
+        assert_eq!(bytes[..4], 3i32.to_le_bytes());
+        assert_eq!(abi::decode_value::<Shape>(&bytes).unwrap(), shape);
     }
 
     #[test]
     fn empty_has_tag_zero() {
-        let mut err = new_err();
-        let s = weaveffi_shapes_Shape_Empty_new(&mut err);
-        assert_eq!(weaveffi_shapes_Shape_tag(s), 0);
-        weaveffi_shapes_Shape_destroy(s);
+        let bytes = encode_shape(&Shape::Empty);
+        assert_eq!(bytes, 0i32.to_le_bytes());
+        assert_eq!(abi::decode_value::<Shape>(&bytes).unwrap(), Shape::Empty);
     }
 
     #[test]
     fn describe_and_scale() {
         let mut err = new_err();
-        let s = weaveffi_shapes_Shape_Circle_new(2.0, &mut err);
-        let d = weaveffi_shapes_describe(s, &mut err);
+        let circle = encode_shape(&Shape::Circle { radius: 2.0 });
+        let d = weaveffi_shapes_describe(circle.as_ptr(), circle.len(), &mut err);
+        assert_eq!(err.code, 0);
         assert_eq!(abi::c_ptr_to_string(d).unwrap(), "circle(r=2)");
         abi::free_string(d);
 
-        let scaled = weaveffi_shapes_scale(s, 3.0, &mut err);
-        assert!((weaveffi_shapes_Shape_Circle_get_radius(scaled) - 6.0).abs() < 1e-9);
-        weaveffi_shapes_Shape_destroy(scaled);
-        weaveffi_shapes_Shape_destroy(s);
+        // A buffered return: the thunk returns producer-owned bytes plus an
+        // out-length; the consumer decodes and frees them.
+        let mut out_len: usize = 0;
+        let scaled_ptr =
+            weaveffi_shapes_scale(circle.as_ptr(), circle.len(), 3.0, &mut out_len, &mut err);
+        assert_eq!(err.code, 0);
+        assert!(!scaled_ptr.is_null());
+        let scaled_bytes = unsafe { std::slice::from_raw_parts(scaled_ptr, out_len) };
+        let scaled = abi::decode_value::<Shape>(scaled_bytes).unwrap();
+        abi::free_bytes(scaled_ptr as *mut u8, out_len);
+        assert_eq!(scaled, Shape::Circle { radius: 6.0 });
     }
 
     #[test]
@@ -150,10 +163,5 @@ mod tests {
         let total = weaveffi_shapes_sum_bytes(data.as_ptr(), data.len(), &mut err);
         assert_eq!(total, 1000);
         assert_eq!(err.code, 0);
-    }
-
-    #[test]
-    fn destroy_null_is_safe() {
-        weaveffi_shapes_Shape_destroy(std::ptr::null_mut());
     }
 }

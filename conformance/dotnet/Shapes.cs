@@ -1,14 +1,15 @@
 // Conformance consumer: shapes sample, .NET target.
 //
 // Drives the generated P/Invoke surface for rich (algebraic) enums (Shapes.cs,
-// namespace Shapes): the IDisposable opaque-object `Shape` class, its nested
-// `Tag` enum + `GetTag()` reader, the per-variant static factories
-// (`Shape.Circle(...)`, `Shape.Empty()`, ...) and per-variant field accessors
-// (`CircleRadius`, `RectangleWidth`, `LabeledLabel`, ...), plus the free
-// functions that take and return `Shape` by value. Also covers the expanded
-// numerics (f32 fields, u8 field, list<u8> in / u64 out) and the plain C-style
-// `Channel` enum. The producer cdylib is resolved by absolute path via a
-// DllImportResolver reading WEAVEFFI_LIBRARY, mirroring the other backends.
+// namespace Shapes): the abstract `Shape` class with one sealed nested class
+// per variant (`Shape.Empty`, `Shape.Circle`, ...), variant construction via
+// the nested constructors, discrimination via C# pattern matching, and the
+// per-variant properties (`Radius`, `Width`, `Label`, ...). Shapes cross the
+// ABI as serialized value buffers behind the free functions that take and
+// return `Shape` by value. Also covers the expanded numerics (f32 fields, u8
+// field, list<u8> in / u64 out) and the plain C-style `Channel` enum. The
+// producer cdylib is resolved by absolute path via a DllImportResolver reading
+// WEAVEFFI_LIBRARY, mirroring the other backends.
 //
 // The IDL sets the .NET namespace to `Shapes` and the module is also `shapes`,
 // so the generated free-function class is `Shapes.Shapes`; `using static`
@@ -42,42 +43,44 @@ internal static class Program
         });
 
         // Unit variant.
-        using (var empty = Shape.Empty())
-        {
-            Expect(empty.GetTag() == Shape.Tag.Empty, "empty tag");
-        }
+        Shape empty = new Shape.Empty();
+        Expect(empty is Shape.Empty, "empty variant");
 
         // f64 payload.
-        using (var circle = Shape.Circle(2.5))
-        {
-            Expect(circle.GetTag() == Shape.Tag.Circle, "circle tag");
-            Expect(Math.Abs(circle.CircleRadius - 2.5) < 1e-9, "circle radius");
+        var circle = new Shape.Circle(2.5);
+        Expect(Math.Abs(circle.Radius - 2.5) < 1e-9, "circle radius");
 
-            // Free functions: Shape in, string/Shape out.
-            Expect(Describe(circle) == "circle(r=2.5)", "describe(circle)");
+        // Free functions: Shape in, string/Shape out.
+        Expect(Describe(circle) == "circle(r=2.5)", "describe(circle)");
 
-            using (var big = Scale(circle, 4.0))
-            {
-                Expect(big.GetTag() == Shape.Tag.Circle, "scaled tag");
-                Expect(Math.Abs(big.CircleRadius - 10.0) < 1e-9, "scaled radius");
-            }
-        }
+        Shape scaled = Scale(circle, 4.0);
+        Expect(scaled is Shape.Circle, "scaled variant");
+        var big = (Shape.Circle)scaled;
+        Expect(Math.Abs(big.Radius - 10.0) < 1e-9, "scaled radius");
 
         // Two f32 payloads.
-        using (var rect = Shape.Rectangle(3.0f, 4.0f))
-        {
-            Expect(rect.GetTag() == Shape.Tag.Rectangle, "rect tag");
-            Expect(Math.Abs(rect.RectangleWidth - 3.0f) < 1e-6f, "rect width");
-            Expect(Math.Abs(rect.RectangleHeight - 4.0f) < 1e-6f, "rect height");
-        }
+        var rect = new Shape.Rectangle(3.0f, 4.0f);
+        Expect(Math.Abs(rect.Width - 3.0f) < 1e-6f, "rect width");
+        Expect(Math.Abs(rect.Height - 4.0f) < 1e-6f, "rect height");
 
-        // string + u8 payload.
-        using (var labeled = Shape.Labeled("hex", 6))
+        // string + u8 payload, round-tripped through the producer to prove
+        // the variant encodes and decodes intact.
+        Shape labeledBack = Scale(new Shape.Labeled("hex", 6), 2.0);
+        Expect(labeledBack is Shape.Labeled, "labeled variant survives round trip");
+        var labeled = (Shape.Labeled)labeledBack;
+        Expect(labeled.Label == "hex", "labeled label");
+        Expect(labeled.Count == 6, "labeled count");
+
+        // Pattern matching discriminates variants like any C# sum type.
+        string kind = scaled switch
         {
-            Expect(labeled.GetTag() == Shape.Tag.Labeled, "labeled tag");
-            Expect(labeled.LabeledLabel == "hex", "labeled label");
-            Expect(labeled.LabeledCount == 6, "labeled count");
-        }
+            Shape.Empty _ => "empty",
+            Shape.Circle _ => "circle",
+            Shape.Rectangle _ => "rectangle",
+            Shape.Labeled _ => "labeled",
+            _ => "unknown",
+        };
+        Expect(kind == "circle", "switch pattern match");
 
         // Numerics: list<u8> in, u64 out.
         ulong total = SumBytes(new byte[] { 250, 250, 250, 250 });

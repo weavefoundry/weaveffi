@@ -3,7 +3,8 @@
 ## Overview
 
 The C++ target emits a header-only library `weaveffi.hpp` that wraps the
-C ABI in idiomatic C++17. Structs and interfaces become RAII classes with
+C ABI in idiomatic C++17. Structs become plain value structs, rich enums
+become `std::variant`-backed sum types, interfaces become RAII classes with
 deleted copies and movable handles, error domains map to typed exception
 hierarchies, async functions return `std::future`, and listeners accept
 `std::function` callbacks. A `CMakeLists.txt` is included so the generated
@@ -35,10 +36,10 @@ directory can be dropped into any CMake build.
 | `string`     | `std::string`                        | `const std::string&`        |
 | `bytes`      | `std::vector<uint8_t>`               | `const std::vector<uint8_t>&` |
 | `handle`     | `void*`                              | `void*`                     |
-| `StructName` | `StructName`                         | `const StructName&`         |
+| `StructName` | `StructName` (value struct)          | `const StructName&`         |
 | `InterfaceName` | `InterfaceName` (RAII class)      | `const InterfaceName&`      |
 | `EnumName` (plain) | `EnumName` (`enum class`)      | `EnumName`                  |
-| `EnumName` (rich)  | `EnumName` (RAII class)        | `const EnumName&`           |
+| `EnumName` (rich)  | `EnumName` (`std::variant`-backed sum type) | `const EnumName&` |
 | `T?`         | `std::optional<T>`                   | `const std::optional<T>&`   |
 | `[T]`        | `std::vector<T>`                     | `const std::vector<T>&`     |
 | `{K: V}`     | `std::unordered_map<K, V>`           | `const std::unordered_map<K, V>&` |
@@ -47,7 +48,7 @@ directory can be dropped into any CMake build.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -103,30 +104,22 @@ enum class ContactType : int32_t {
 };
 ```
 
-Structs become RAII handle wrappers with deleted copy and noexcept move:
+Structs become plain value structs with typed members:
 
 ```cpp
-class Contact {
-    void* handle_;
-public:
-    explicit Contact(void* h) : handle_(h) {}
-    ~Contact() {
-        if (handle_) weaveffi_contacts_Contact_destroy(
-            static_cast<weaveffi_contacts_Contact*>(handle_));
-    }
-    Contact(const Contact&) = delete;
-    Contact& operator=(const Contact&) = delete;
-    Contact(Contact&& o) noexcept : handle_(o.handle_) { o.handle_ = nullptr; }
-
-    std::string name() const {
-        const char* raw = weaveffi_contacts_Contact_get_name(
-            static_cast<const weaveffi_contacts_Contact*>(handle_));
-        std::string ret(raw);
-        weaveffi_free_string(raw);
-        return ret;
-    }
+struct Contact {
+    std::string name;
+    std::optional<std::string> email;
+    int32_t age;
+    ContactType contact_type;
 };
 ```
+
+There are no C symbols behind a struct. A `Contact` crosses the ABI
+serialized in the [value-buffer format](../reference/value-buffers.md) as a
+single `(const uint8_t*, size_t)` pair; the header carries a small private
+buffer reader and writer in the `detail` namespace plus one generated pack
+and unpack routine per type.
 
 Free functions live in a nested namespace per module inside the outer
 `weaveffi` namespace (configurable via `namespace`), keeping their
@@ -142,12 +135,17 @@ inline Contact create_contact(
     int32_t age)
 {
     weaveffi_error err{};
-    auto result = weaveffi_contacts_create_contact(
+    // Optionals are buffered: pack the argument into a value buffer.
+    std::vector<uint8_t> email_buf = /* generated pack routine */;
+    size_t out_len = 0;
+    const uint8_t* raw = weaveffi_contacts_create_contact(
         name.c_str(),
-        email.has_value() ? email.value().c_str() : nullptr,
-        age, &err);
+        email_buf.data(), email_buf.size(),
+        age, &out_len, &err);
     detail::check(err);
-    return Contact(result);
+    Contact ret = /* generated unpack routine over (raw, out_len) */;
+    weaveffi_free_bytes(raw, out_len);
+    return ret;
 }
 
 } // namespace contacts
@@ -203,10 +201,14 @@ marshalling failure), which arrive as the generic `weaveffi::WeaveFFIError`
 rather than a domain type. An unknown code on the typed path falls back to
 the domain class itself (`ContactsError`).
 
+An error code that declares payload `fields:` exposes them as typed members
+on its subclass, decoded from the error's payload buffer before
+`weaveffi_error_clear` releases it.
+
 ## Interfaces
 
-An `interfaces:` entry becomes a move-only RAII class following the same
-ownership model as struct wrappers. Constructors become static factories,
+An `interfaces:` entry becomes a move-only RAII class owning an opaque
+handle. Constructors become static factories,
 methods are instance members, statics are static members, and the
 destructor calls the implicit C `_destroy` symbol. From the `kvstore`
 sample's `Store` (trimmed):
@@ -258,56 +260,41 @@ pointer in a new instance.
 
 An enum whose variants declare `fields` is a *rich* (algebraic) enum, a sum
 type with associated data. Plain C-style enums stay `enum class`; a rich enum
-instead becomes an opaque RAII wrapper class with the same ownership model as a
-struct wrapper, plus a nested `Tag`, static factory methods, and per-variant
-getters. From the `shapes` sample:
+instead becomes a `std::variant`-backed sum type: one plain payload struct per
+variant carrying that variant's fields, aggregated into a variant type named
+after the enum. From the `shapes` sample, the surface follows this shape:
 
 ```cpp
 namespace weaveffi {
 
-class Shape {
-    void* handle_;
-public:
-    enum class Tag : int32_t { Empty = 0, Circle = 1, Rectangle = 2, Labeled = 3 };
-    Tag tag() const;
+struct ShapeEmpty {};
+struct ShapeCircle { double radius; };
+struct ShapeRectangle { float width; float height; };
+struct ShapeLabeled { std::string label; uint8_t count; };
 
-    static Shape Empty();
-    static Shape Circle(double radius);
-    static Shape Rectangle(float width, float height);
-    static Shape Labeled(const std::string& label, uint8_t count);
-
-    double circle_radius() const;
-    float rectangle_width() const;
-    float rectangle_height() const;
-    std::string labeled_label() const;
-    uint8_t labeled_count() const;
-
-    ~Shape();                       // calls weaveffi_shapes_Shape_destroy
-    Shape(const Shape&) = delete;   // move-only, like struct wrappers
-    Shape(Shape&&) noexcept;
-};
+using Shape = std::variant<ShapeEmpty, ShapeCircle, ShapeRectangle, ShapeLabeled>;
 
 } // namespace weaveffi
 ```
 
-Build a variant with its factory, switch on `tag()`, and read only the
-matching getters. Free functions take and return the wrapper by `const&` /
-by value:
+Values are plain data. Build the payload struct you need and inspect results
+with `std::holds_alternative`, `std::get`, or `std::visit`:
 
 ```cpp
-weaveffi::Shape shape = weaveffi::Shape::Circle(2.0);
+weaveffi::Shape shape = weaveffi::ShapeCircle{2.0};
 
-if (shape.tag() == weaveffi::Shape::Tag::Circle) {
-    std::cout << "radius = " << shape.circle_radius() << '\n';
+if (auto* c = std::get_if<weaveffi::ShapeCircle>(&shape)) {
+    std::cout << "radius = " << c->radius << '\n';
 }
 
-std::cout << weaveffi::shapes_describe(shape) << '\n';
-weaveffi::Shape bigger = weaveffi::shapes_scale(shape, 3.0);
+std::cout << weaveffi::shapes::describe(shape) << '\n';
+weaveffi::Shape bigger = weaveffi::shapes::scale(shape, 3.0);
 ```
 
-Ownership follows the struct-wrapper rules: the destructor calls
-`weaveffi_shapes_Shape_destroy`, copies are deleted, and moves transfer the
-handle, no manual free required.
+On the wire a rich enum is a value buffer holding an `i32` tag followed by
+the active variant's fields; there are no per-variant C constructors, tag
+readers, or destroy symbols. The wrappers pack and unpack the buffer, so no
+manual free is required.
 
 ## Build instructions
 
@@ -336,21 +323,17 @@ Then `#include "weaveffi.hpp"` and link against the Rust shared library
 
 ## Memory and ownership
 
-- Struct and interface wrappers own a single `void*` handle. The
-  destructor calls the C `_destroy` function. Copies are deleted; moves
-  transfer ownership by nulling the source handle.
-- Strings returned from getters are copied into `std::string` and the
-  raw pointer is freed via `weaveffi_free_string` before returning.
-- Optional fields use `std::optional<T>`; a `nullptr` from the C layer
-  becomes `std::nullopt`. A returned optional scalar arrives boxed
-  behind a pointer; the wrapper dereferences it and frees the box with
-  `weaveffi_free_bytes`.
-- `std::vector<T>` returns own their contents: the wrapper copies each
-  element (freeing string elements individually with
-  `weaveffi_free_string`), then releases the producer's buffer with
-  `weaveffi_free_bytes`; map returns release both parallel key/value
-  buffers the same way. List parameters borrow the underlying buffer
-  for the duration of the call.
+- Interface wrappers own a single `void*` handle. The destructor calls
+  the C `_destroy` function. Copies are deleted; moves transfer ownership
+  by nulling the source handle.
+- Structs, rich enums, optionals, lists, and maps are plain C++ values.
+  They cross the ABI serialized in a single value buffer: parameters are
+  packed by the wrapper and borrowed by the callee for the duration of
+  the call, and returns are unpacked into the C++ value and the
+  producer's buffer is released with `weaveffi_free_bytes`. Nothing to
+  free on the consumer side afterward.
+- Returned strings are copied into `std::string` and the raw pointer is
+  freed via `weaveffi_free_string` before returning.
 
 ## Callbacks and listeners
 
@@ -430,13 +413,13 @@ inline std::future<Contact> fetch_contact(int32_t id) {
     auto future = promise_ptr->get_future();
     weaveffi_contacts_fetch_contact_async(id,
         [](void* context, weaveffi_error* err,
-           weaveffi_contacts_Contact* result) {
+           const uint8_t* result_ptr, size_t result_len) {
             auto* p = static_cast<std::promise<Contact>*>(context);
             if (err && err->code != 0) {
                 std::string msg(err->message ? err->message : "unknown error");
                 p->set_exception(detail::make_error(err->code, msg));
             } else {
-                p->set_value(Contact(result));
+                p->set_value(/* unpack (result_ptr, result_len) */);
             }
             delete p;
         }, static_cast<void*>(promise_ptr));
@@ -447,12 +430,11 @@ inline std::future<Contact> fetch_contact(int32_t id) {
 Use it with `.get()` (blocking) or compose with your event loop. The
 completion lambda runs exactly once, on an arbitrary producer thread; it
 completes (or rejects) the promise and then deletes it. Result buffers
-passed to the callback (strings, bytes, arrays, and the error message)
-are borrowed from the producer for the callback's duration, so the
-lambda copies them into C++ values before returning and never frees
-them. Owned-object results are the exception: the callback receives
-ownership, so `Contact(result)` above adopts the pointer into a RAII
-wrapper. An async callable with `throws: true` rejects with the
+passed to the callback (strings, bytes, buffered values, and the error
+message) are borrowed from the producer for the callback's duration, so
+the lambda copies or unpacks them into C++ values before returning and
+never frees them. An owned interface result is the exception: the
+callback receives ownership and adopts the pointer into a RAII wrapper. An async callable with `throws: true` rejects with the
 module's typed domain exception (`detail::make_kv_error` and friends);
 one without `throws` rejects with the generic `WeaveFFIError` only when
 the producer has a bug.
@@ -547,8 +529,10 @@ for (const std::string& message : weaveffi::events::get_messages()) {
 ```
 
 Each pulled string is copied into `std::string` and its native
-allocation freed with `weaveffi_free_string`; record elements are
-adopted by RAII wrappers. The producer iterator is destroyed exactly
+allocation freed with `weaveffi_free_string`; a buffered element (a
+record, rich enum, optional, list, or map) arrives as a value buffer
+that is unpacked into the C++ value and released with
+`weaveffi_free_bytes`. The producer iterator is destroyed exactly
 once: eagerly when `next()` reports exhaustion (or an error), or from
 the range's destructor when iteration is abandoned early (the handle
 is nulled, so a double destroy is impossible).

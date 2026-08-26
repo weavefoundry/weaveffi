@@ -10,12 +10,12 @@
 #![warn(clippy::doc_markdown)]
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::CType;
+use weaveffi_core::abi::lower::split_qualified;
+use weaveffi_core::abi::{is_buffered, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{
@@ -24,9 +24,8 @@ use weaveffi_core::codegen::common::{
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
-    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-    RichEnumBinding, RichVariantBinding, StructBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::pkg::{self, ResolvedPackage};
 use weaveffi_core::plan::ErrorStrategy;
@@ -189,7 +188,13 @@ fn render_wasm_package_json(
     )
 }
 
+/// The wasm value-type spelling of one IDL type at the boundary, for the
+/// README's signature tables. Buffered types occupy two `i32` slots (pointer
+/// plus length); everything else keeps its scalar or pointer slot.
 fn wasm_type(ty: &TypeRef) -> &'static str {
+    if is_buffered(ty) {
+        return "i32, i32";
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -199,39 +204,25 @@ fn wasm_type(ty: &TypeRef) -> &'static str {
         | TypeRef::U32
         | TypeRef::Bool
         | TypeRef::Enum(_) => "i32",
-        TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::Handle
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_)
-        | TypeRef::Iterator(_)
-        | TypeRef::Map(_, _) => "i64",
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "i64",
         TypeRef::F32 => "f32",
         TypeRef::F64 => "f64",
-        TypeRef::StringUtf8
-        | TypeRef::BorrowedStr
-        | TypeRef::Bytes
-        | TypeRef::BorrowedBytes
-        | TypeRef::List(_) => "i32, i32",
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Iterator(_)
-            | TypeRef::Map(_, _) => "i64",
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => "i32, i32",
-            // Optional strings are a nullable char*; optional scalars
-            // (including `handle`) are boxed by pointer. Both are one i32.
-            _ => "i32",
-        },
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "i32",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "i32, i32",
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Iterator(_) => "i32",
+        // Only `Interface?` reaches here: a nullable object pointer.
+        TypeRef::Optional(_) => "i32",
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
+        }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
 fn wasm_type_note(ty: &TypeRef) -> &'static str {
+    if is_buffered(ty) {
+        return "value buffer: ptr + len in linear memory";
+    }
     match ty {
         TypeRef::I8 => "8-bit signed mapped to i32",
         TypeRef::I16 => "16-bit signed mapped to i32",
@@ -244,30 +235,17 @@ fn wasm_type_note(ty: &TypeRef) -> &'static str {
         TypeRef::F32 => "native Wasm f32",
         TypeRef::F64 => "native Wasm f64",
         TypeRef::Bool => "0 = false, 1 = true",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            "ptr + len in linear memory"
-        }
-        TypeRef::TypedHandle(_) | TypeRef::Handle => "opaque pointer",
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_) => {
-            "opaque handle in linear memory"
-        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "NUL-terminated C string pointer",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "ptr + len in linear memory",
+        TypeRef::TypedHandle(_) => "opaque pointer",
+        TypeRef::Handle => "opaque 64-bit handle",
+        TypeRef::Interface(_) => "opaque object pointer",
         TypeRef::Enum(_) => "variant discriminant",
-        TypeRef::List(_) => "ptr + len in linear memory",
-        TypeRef::Map(_, _) => "opaque handle in linear memory",
         TypeRef::Iterator(_) => "opaque iterator handle",
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Iterator(_)
-            | TypeRef::Map(_, _) => "opaque handle, 0 = absent",
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "nullable pointer, 0 = absent",
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-                "ptr + len, null ptr = absent"
-            }
-            _ => "boxed scalar pointer, 0 = absent",
-        },
+        TypeRef::Optional(_) => "nullable object pointer, 0 = absent",
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
+        }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
@@ -362,28 +340,25 @@ fn render_wasm_readme(
     out.push_str("## Complex Type Handling\n\n");
     out.push_str("Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). ");
     out.push_str("Complex types are encoded at the boundary as follows:\n\n");
-    out.push_str("### Structs\n\n");
-    out.push_str("Structs are passed as **opaque handles** (`i64` pointers into linear memory). ");
-    out.push_str(
-        "The host cannot inspect struct fields directly; use the generated accessor functions ",
-    );
-    out.push_str(&format!(
-        "(`{prefix}_{{module}}_{{struct}}_get_{{field}}`) to read/write fields. ",
-    ));
-    out.push_str(
-        "A returned struct handle is owned by the consumer; the JS wrapper's `free()` \
-         releases it via the struct's `_destroy` symbol.\n\n",
-    );
+    out.push_str("### Records\n\n");
+    out.push_str("Records are **plain JavaScript objects**. A record crosses the boundary ");
+    out.push_str("serialized in the WeaveFFI value-buffer format as one pointer + length ");
+    out.push_str("pair in linear memory; the glue packs and unpacks it automatically, so ");
+    out.push_str("there are no handles, no accessor functions, and nothing to free.\n\n");
     out.push_str("### Enums\n\n");
-    out.push_str("Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.\n\n");
+    out.push_str("C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. ");
+    out.push_str("Rich (algebraic) enums are plain objects tagged by variant name ");
+    out.push_str("(`{ tag: \"Circle\", radius: 2 }`) and cross the boundary serialized in a ");
+    out.push_str("value buffer, exactly like records.\n\n");
     out.push_str("### Optionals\n\n");
-    out.push_str("Optional values use **`0` / `null`** to represent the absent case. ");
-    out.push_str("Scalar optionals are boxed by pointer (a null pointer signals absence); ");
-    out.push_str("handle-typed and string optionals pass a null pointer (`0`) directly.\n\n");
-    out.push_str("### Lists\n\n");
-    out.push_str("Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) ");
-    out.push_str("referencing a contiguous region in linear memory. The caller is responsible ");
-    out.push_str("for allocating and freeing the backing memory.\n\n");
+    out.push_str("Optional values map to **`null`** for the absent case. An optional crosses ");
+    out.push_str("the boundary inside a value buffer as a one-byte presence flag followed by ");
+    out.push_str("the value when present. The one exception is an optional interface, which ");
+    out.push_str("stays a nullable object pointer (`0` = absent).\n\n");
+    out.push_str("### Lists and Maps\n\n");
+    out.push_str("Lists are JS arrays; maps are plain objects (a `Map` instance is also ");
+    out.push_str("accepted on input). Both cross the boundary serialized in a value buffer ");
+    out.push_str("as one pointer + length pair, recursing through element types.\n\n");
     out.push_str("### Iterators\n\n");
     out.push_str("`iter<T>` functions return a **lazy JS iterator** (typed ");
     out.push_str("`IterableIterator<T>`): each `next()` issues exactly one producer call, so ");
@@ -404,16 +379,19 @@ fn render_wasm_readme(
         );
         out.push_str(
             "Callback arguments are **borrowed for the duration of the callback**: \
-             strings and byte buffers are copied into JS values before your function \
-             runs, but struct, rich-enum, and interface arguments wrap producer-owned \
-             memory. Read what you need inside the callback and do not retain the \
-             wrapper or call `free()` on it.\n",
+             strings, byte buffers, and buffered values (records, rich enums, \
+             optionals, lists, maps) are copied or decoded into JS values before your \
+             function runs, and interface arguments wrap producer-owned objects. Read \
+             what you need inside the callback and do not retain an interface wrapper \
+             or call `free()` on it.\n",
         );
     }
     out.push_str("\n### Error Handling\n\n");
     out.push_str("The generated JS wrappers automatically handle errors by passing an error\n");
-    out.push_str("pointer as the last argument to each Wasm function. Your Wasm module must\n");
-    out.push_str("export the following functions:\n\n");
+    out.push_str("pointer as the last argument to each Wasm function. The error struct is\n");
+    out.push_str("16 bytes on wasm32: `{ i32 code, char* message, uint8_t* payload_ptr,\n");
+    out.push_str("size_t payload_len }`. Your Wasm module must export the following\n");
+    out.push_str("functions:\n\n");
     out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
     out.push_str("- `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");
@@ -422,7 +400,9 @@ fn render_wasm_readme(
     out.push_str("\nWrappers of functions declared `throws` raise the declaring module's typed\n");
     out.push_str("error class (a `WeaveFFIError` subclass with a per-code subclass, such as\n");
     out.push_str("`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only\n");
-    out.push_str("for producer panics and marshalling failures.\n");
+    out.push_str("for producer panics and marshalling failures. When the matched error code\n");
+    out.push_str("declares payload fields, the wrapper decodes them from the error's value\n");
+    out.push_str("buffer and attaches them as properties on the thrown error.\n");
 
     if !api.modules.is_empty() {
         render_api_reference(&mut out, api, model);
@@ -463,9 +443,6 @@ fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
             out.push_str("\n#### Structs\n");
             for s in &mb.structs {
                 render_struct_ref(out, s);
-                if s.builder.is_some() {
-                    render_builder_ref(out, s);
-                }
             }
         }
 
@@ -479,22 +456,35 @@ fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
 }
 
 /// Document a module's declared error domain: the JS class hierarchy it
-/// generates and the stable ABI code of each subclass.
+/// generates, the stable ABI code of each subclass, and any structured
+/// payload fields a code attaches to the thrown error.
 fn render_error_ref(out: &mut String, eb: &ErrorBinding) {
     out.push_str(&format!("\n#### Error Domain: `{}`\n\n", eb.type_name));
     out.push_str(&format!(
         "Throwing wrappers in this module raise `{}` (a `{ERROR_BRAND}` subclass); \
-         each code below is its own subclass carrying the stable `code`.\n\n",
+         each code below is its own subclass carrying the stable `code`. Payload \
+         fields are decoded from the error's value buffer and attached as \
+         properties on the thrown error.\n\n",
         eb.type_name
     ));
-    out.push_str("| Class | Code | Default Message |\n");
-    out.push_str("|-------|------|-----------------|\n");
+    out.push_str("| Class | Code | Default Message | Payload Fields |\n");
+    out.push_str("|-------|------|-----------------|----------------|\n");
     for c in &eb.codes {
+        let fields = if c.fields.is_empty() {
+            "(none)".to_string()
+        } else {
+            c.fields
+                .iter()
+                .map(|f| format!("`{}: {}`", f.name, type_display(&f.ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         out.push_str(&format!(
-            "| `{}` | `{}` | {} |\n",
+            "| `{}` | `{}` | {} | {} |\n",
             js_code_class_name(&c.name),
             c.value,
-            c.message
+            c.message,
+            fields
         ));
     }
 }
@@ -508,9 +498,9 @@ fn render_interface_ref(out: &mut String, i: &InterfaceBinding) {
         out.push_str("\n\n");
     }
     out.push_str(
-        "Passed as an **opaque handle** (`i64`), wrapped by a JS class. Constructors \
-         return an owned handle; methods pass the handle as the implicit leading `self` \
-         argument; `free()` releases the handle via the destroy symbol.\n",
+        "Passed as an **opaque object pointer** (`i32`), wrapped by a JS class. \
+         Constructors return an owned handle; methods pass the handle as the implicit \
+         leading `self` argument; `free()` releases the handle via the destroy symbol.\n",
     );
     for f in i
         .constructors
@@ -571,6 +561,8 @@ fn render_function_ref(out: &mut String, f: &FnBinding) {
     }
 }
 
+/// Document one record: a plain JS object serialized in a value buffer, with
+/// its field schema in declaration (wire) order.
 fn render_struct_ref(out: &mut String, s: &StructBinding) {
     out.push_str(&format!("\n##### `{}`\n\n", s.name));
 
@@ -579,45 +571,22 @@ fn render_struct_ref(out: &mut String, s: &StructBinding) {
         out.push_str("\n\n");
     }
 
-    out.push_str("Passed as opaque handle (`i64`).\n\n");
+    out.push_str(
+        "A plain JS object, serialized in a value buffer (`i32` ptr + `i32` len) at \
+         the boundary. Fields in declaration (wire) order:\n\n",
+    );
 
     if !s.fields.is_empty() {
-        out.push_str("| Accessor | Wasm Return |\n");
-        out.push_str("|----------|-------------|\n");
+        out.push_str("| Field | Type |\n");
+        out.push_str("|-------|------|\n");
         for field in &s.fields {
             out.push_str(&format!(
                 "| `{}` | `{}` |\n",
-                field.getter_symbol,
-                wasm_type(&field.ty)
+                field.name,
+                type_display(&field.ty)
             ));
         }
     }
-}
-
-fn render_builder_ref(out: &mut String, s: &StructBinding) {
-    let name = &s.name;
-    let Some(b) = &s.builder else {
-        return;
-    };
-    out.push_str(&format!("\n##### `{name}Builder`\n\n"));
-    out.push_str(&format!("Builder for `{name}`.\n\n"));
-    out.push_str("| Function | Args | Return |\n");
-    out.push_str("|----------|------|--------|\n");
-    out.push_str(&format!("| `{}` | none | `i32` (handle) |\n", b.new_symbol));
-    for (field, (_field_name, setter)) in s.fields.iter().zip(&b.setters) {
-        let wt = wasm_type(&field.ty);
-        out.push_str(&format!(
-            "| `{setter}` | `i32` handle, `{wt}` value | none |\n"
-        ));
-    }
-    out.push_str(&format!(
-        "| `{}` | `i32` handle | `i32` (handle) |\n",
-        b.build_symbol
-    ));
-    out.push_str(&format!(
-        "| `{}` | `i32` handle | none |\n",
-        b.destroy_symbol
-    ));
 }
 
 fn render_enum_ref(out: &mut String, e: &EnumBinding) {
@@ -628,8 +597,8 @@ fn render_enum_ref(out: &mut String, e: &EnumBinding) {
         out.push_str("\n\n");
     }
 
-    if let Some(rich) = &e.rich {
-        render_rich_enum_ref(out, rich);
+    if e.is_rich() {
+        render_rich_enum_ref(out, e);
         return;
     }
 
@@ -641,18 +610,18 @@ fn render_enum_ref(out: &mut String, e: &EnumBinding) {
     }
 }
 
-/// Document a rich (algebraic) enum: an opaque handle constructed via per-variant
-/// factories, with a `tag` discriminant reader and namespaced field getters,
-/// not a by-value `i32` discriminant like a plain enum.
-fn render_rich_enum_ref(out: &mut String, rich: &RichEnumBinding) {
+/// Document a rich (algebraic) enum: a plain tagged object serialized in a
+/// value buffer as an `i32` tag followed by the active variant's fields, not
+/// a by-value `i32` discriminant like a plain enum.
+fn render_rich_enum_ref(out: &mut String, e: &EnumBinding) {
     out.push_str(
-        "Rich (algebraic) enum, passed as an **opaque handle** (`i64`). Construct one with a \
-         per-variant factory, read the active variant via the `tag` discriminant, and access \
-         associated data through the namespaced getters.\n\n",
+        "Rich (algebraic) enum: a plain tagged object (`{ tag: \"Variant\", ...fields }`) \
+         serialized in a value buffer as an `i32` tag followed by the active variant's \
+         fields in declaration order.\n\n",
     );
     out.push_str("| Variant | Tag | Fields |\n");
     out.push_str("|---------|-----|--------|\n");
-    for v in &rich.variants {
+    for v in &e.variants {
         let fields = if v.fields.is_empty() {
             "(none)".to_string()
         } else {
@@ -671,17 +640,6 @@ fn is_string_type(ty: &TypeRef) -> bool {
     matches!(ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr)
 }
 
-/// True when an async return carries a list or map with string elements,
-/// whose borrowed buffers the completion callback reads without freeing.
-fn async_ret_has_string_buffers(ret: Option<&TypeRef>) -> bool {
-    match ret {
-        Some(TypeRef::List(inner)) => is_string_type(inner),
-        Some(TypeRef::Map(k, v)) => is_string_type(k) || is_string_type(v),
-        Some(TypeRef::Optional(inner)) => async_ret_has_string_buffers(Some(inner)),
-        _ => false,
-    }
-}
-
 /// Whether `ty` or any type nested inside it (optional payloads, list and
 /// iterator elements, map keys/values) satisfies `pred`.
 fn typeref_deep_any(ty: &TypeRef, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
@@ -697,9 +655,10 @@ fn typeref_deep_any(ty: &TypeRef, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
     }
 }
 
-/// Visit every boundary-crossing type in `api` (function params + returns and
-/// struct field types), recursing into composite types, and return whether any
-/// satisfies `pred`.
+/// Visit every boundary-crossing type in `api` (function, interface-member,
+/// and callback params and returns; struct, variant, and error payload field
+/// types), recursing into composite types, and return whether any satisfies
+/// `pred`.
 fn api_deep_any(api: &Api, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
     fn deep(ty: &TypeRef, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
         typeref_deep_any(ty, pred)
@@ -722,85 +681,67 @@ fn api_deep_any(api: &Api, pred: &dyn Fn(&TypeRef) -> bool) -> bool {
             .structs
             .iter()
             .any(|s| s.fields.iter().any(|f| deep(&f.ty, pred)))
-            // Rich (algebraic) enums marshal their variant fields exactly like
-            // struct fields, so a string/bytes/list living only inside a variant
-            // payload still pulls in the corresponding linear-memory helpers.
+            // Rich (algebraic) enums serialize their variant fields exactly
+            // like struct fields, so a string/bytes/list living only inside a
+            // variant payload still pulls in the corresponding helpers.
             || m.enums.iter().any(|e| {
                 e.variants
                     .iter()
                     .any(|v| v.fields.iter().any(|f| deep(&f.ty, pred)))
+            })
+            // Callback arguments are decoded by the listener trampolines.
+            || m.callbacks
+                .iter()
+                .any(|c| c.params.iter().any(|p| deep(&p.ty, pred)))
+            // Error payload fields are decoded from the error's value buffer.
+            || m.errors.as_ref().is_some_and(|d| {
+                d.codes
+                    .iter()
+                    .any(|c| c.fields.iter().any(|f| deep(&f.ty, pred)))
             })
             || m.modules.iter().any(|sub| module_any(sub, pred))
     }
     api.modules.iter().any(|m| module_any(m, pred))
 }
 
-/// The byte stride of one element of `ty` packed in a C array in linear memory
-/// (wasm32: pointers and 32-bit scalars are 4 bytes, 64-bit values 8, bool 1).
-fn wasm_stride(ty: &TypeRef) -> u32 {
+/// The byte size of the linear-memory slot an iterator `next` writes one
+/// element of `ty` into: 8 for a `ptr` + `len` pair (bytes and buffered
+/// values), pointer or scalar width otherwise.
+fn iter_slot_size(ty: &TypeRef) -> u32 {
+    if is_buffered(ty) {
+        return 8;
+    }
     match ty {
         TypeRef::Bool | TypeRef::I8 | TypeRef::U8 => 1,
         TypeRef::I16 | TypeRef::U16 => 2,
         TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => 8,
+        TypeRef::Bytes | TypeRef::BorrowedBytes => 8,
         _ => 4,
     }
 }
 
-/// Emit a JS expression that reads a single element of scalar/handle `ty` from
-/// the C array `base` at element index `idx` using DataView `dv`. Strings and
-/// structs are handled by the callers (they need freeing / class wrapping).
-fn wasm_read_scalar_elem(ty: &TypeRef, dv: &str, base: &str, idx: &str) -> String {
-    let stride = wasm_stride(ty);
-    let off = format!("{base} + {idx} * {stride}");
+/// A JS expression reading one by-value scalar of `ty` from `DataView` `dv`
+/// at byte offset `at`.
+fn read_scalar_at(ty: &TypeRef, dv: &str, at: &str) -> String {
     match ty {
-        TypeRef::Bool => format!("{dv}.getUint8({off}) !== 0"),
-        TypeRef::I8 => format!("{dv}.getInt8({off})"),
-        TypeRef::U8 => format!("{dv}.getUint8({off})"),
-        TypeRef::I16 => format!("{dv}.getInt16({off}, true)"),
-        TypeRef::U16 => format!("{dv}.getUint16({off}, true)"),
-        TypeRef::U32 => format!("{dv}.getUint32({off}, true)"),
-        TypeRef::I32 | TypeRef::Enum(_) => format!("{dv}.getInt32({off}, true)"),
-        TypeRef::I64 => format!("{dv}.getBigInt64({off}, true)"),
-        TypeRef::U64 | TypeRef::Handle => format!("{dv}.getBigUint64({off}, true)"),
-        TypeRef::F32 => format!("{dv}.getFloat32({off}, true)"),
-        TypeRef::F64 => format!("{dv}.getFloat64({off}, true)"),
-        _ => format!("{dv}.getInt32({off}, true)"),
+        TypeRef::Bool => format!("{dv}.getUint8({at}) !== 0"),
+        TypeRef::I8 => format!("{dv}.getInt8({at})"),
+        TypeRef::U8 => format!("{dv}.getUint8({at})"),
+        TypeRef::I16 => format!("{dv}.getInt16({at}, true)"),
+        TypeRef::U16 => format!("{dv}.getUint16({at}, true)"),
+        TypeRef::U32 => format!("{dv}.getUint32({at}, true)"),
+        TypeRef::I32 | TypeRef::Enum(_) => format!("{dv}.getInt32({at}, true)"),
+        TypeRef::I64 => format!("{dv}.getBigInt64({at}, true)"),
+        TypeRef::U64 | TypeRef::Handle => format!("{dv}.getBigUint64({at}, true)"),
+        TypeRef::F32 => format!("{dv}.getFloat32({at}, true)"),
+        TypeRef::F64 => format!("{dv}.getFloat64({at}, true)"),
+        // Opaque pointers (typed handles, interfaces) are i32 slots.
+        _ => format!("{dv}.getUint32({at}, true)"),
     }
 }
 
-/// Byte width of a scalar `ty` when boxed by pointer (optional-scalar ABI).
-fn scalar_width(ty: &TypeRef) -> u32 {
-    match ty {
-        TypeRef::Bool | TypeRef::I8 | TypeRef::U8 => 1,
-        TypeRef::I16 | TypeRef::U16 => 2,
-        TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => 8,
-        _ => 4,
-    }
-}
-
-/// Emit a `DataView` write of scalar `ty` at `off` from JS value `val`.
-fn emit_write_scalar(out: &mut String, indent: &str, ty: &TypeRef, dv: &str, off: &str, val: &str) {
-    let stmt = match ty {
-        TypeRef::Bool => format!("{dv}.setUint8({off}, {val} ? 1 : 0);"),
-        TypeRef::I8 => format!("{dv}.setInt8({off}, {val});"),
-        TypeRef::U8 => format!("{dv}.setUint8({off}, {val});"),
-        TypeRef::I16 => format!("{dv}.setInt16({off}, {val}, true);"),
-        TypeRef::U16 => format!("{dv}.setUint16({off}, {val}, true);"),
-        TypeRef::U32 => format!("{dv}.setUint32({off}, {val}, true);"),
-        TypeRef::I32 | TypeRef::Enum(_) => format!("{dv}.setInt32({off}, {val}, true);"),
-        TypeRef::I64 => format!("{dv}.setBigInt64({off}, BigInt({val}), true);"),
-        TypeRef::U64 | TypeRef::Handle => {
-            format!("{dv}.setBigUint64({off}, BigInt({val}), true);")
-        }
-        TypeRef::F32 => format!("{dv}.setFloat32({off}, {val}, true);"),
-        TypeRef::F64 => format!("{dv}.setFloat64({off}, {val}, true);"),
-        _ => format!("{dv}.setInt32({off}, {val}, true);"),
-    };
-    let _ = writeln!(out, "{indent}{stmt}");
-}
-
-/// A direct JS call argument for a scalar/handle value (coercing bool→0/1 and
-/// 64-bit values→BigInt as the wasm calling convention requires).
+/// A direct JS call argument for a scalar/handle value (coercing bool to 0/1
+/// and 64-bit values to `BigInt` as the wasm calling convention requires).
 fn js_arg_scalar(ty: &TypeRef, val: &str) -> String {
     match ty {
         TypeRef::Bool => format!("{val} ? 1 : 0"),
@@ -809,21 +750,449 @@ fn js_arg_scalar(ty: &TypeRef, val: &str) -> String {
     }
 }
 
+// ── Value-buffer codegen ──
+
+/// The `_write_*`/`_read_*` codec function names for a (possibly
+/// `module.Name`-qualified) record or rich enum referenced from
+/// `current_module`.
+fn buf_codec_names(name: &str, current_module: &str) -> (String, String) {
+    let (module, local) = split_qualified(name, current_module);
+    (
+        format!("_write_{module}_{local}"),
+        format!("_read_{module}_{local}"),
+    )
+}
+
+/// The buffer-writer method encoding one by-value scalar of `ty`, or `None`
+/// for a composite type the caller must recurse into.
+fn buf_scalar_method(ty: &TypeRef) -> Option<&'static str> {
+    Some(match ty {
+        TypeRef::Bool => "bool",
+        TypeRef::I8 => "i8",
+        TypeRef::U8 => "u8",
+        TypeRef::I16 => "i16",
+        TypeRef::U16 => "u16",
+        TypeRef::I32 | TypeRef::Enum(_) => "i32",
+        TypeRef::U32 => "u32",
+        TypeRef::I64 => "i64",
+        TypeRef::U64 | TypeRef::Handle | TypeRef::TypedHandle(_) => "u64",
+        TypeRef::F32 => "f32",
+        TypeRef::F64 => "f64",
+        _ => return None,
+    })
+}
+
+/// Append the statements serializing `val` (a JS expression of IDL type `ty`)
+/// into the buffer writer named `wtr`, resolving record and rich-enum
+/// references against `module`. `tmp` supplies collision-free local names.
+fn emit_buf_write_stmts(
+    w: &mut CodeWriter,
+    ty: &TypeRef,
+    wtr: &str,
+    val: &str,
+    module: &str,
+    tmp: &mut u32,
+) {
+    if let Some(m) = buf_scalar_method(ty) {
+        w.line(format!("{wtr}.{m}({val});"));
+        return;
+    }
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!("{wtr}.str({val});"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line(format!("{wtr}.bytes({val});"));
+        }
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            let (write_fn, _) = buf_codec_names(name, module);
+            w.line(format!("{write_fn}({wtr}, {val});"));
+        }
+        TypeRef::Optional(inner) => {
+            w.line(format!("if ({val} === null || {val} === undefined) {{"));
+            w.scope(|w| {
+                w.line(format!("{wtr}.flag(false);"));
+            });
+            w.line("} else {");
+            w.scope(|w| {
+                w.line(format!("{wtr}.flag(true);"));
+                emit_buf_write_stmts(w, inner, wtr, val, module, tmp);
+            });
+            w.line("}");
+        }
+        TypeRef::List(inner) => {
+            *tmp += 1;
+            let arr = format!("_a{tmp}");
+            let elem = format!("_e{tmp}");
+            w.line(format!("const {arr} = {val} || [];"));
+            w.line(format!("{wtr}.len({arr}.length);"));
+            w.line(format!("for (const {elem} of {arr}) {{"));
+            w.scope(|w| {
+                emit_buf_write_stmts(w, inner, wtr, &elem, module, tmp);
+            });
+            w.line("}");
+        }
+        TypeRef::Map(k, v) => {
+            *tmp += 1;
+            let src = format!("_s{tmp}");
+            let ents = format!("_m{tmp}");
+            let key = format!("_k{tmp}");
+            let value = format!("_v{tmp}");
+            w.line(format!("const {src} = {val} || {{}};"));
+            w.line(format!(
+                "const {ents} = {src} instanceof Map ? [...{src}.entries()] : Object.entries({src});"
+            ));
+            w.line(format!("{wtr}.len({ents}.length);"));
+            w.line(format!("for (const [{key}, {value}] of {ents}) {{"));
+            w.scope(|w| {
+                emit_buf_write_stmts(w, k, wtr, &key, module, tmp);
+                emit_buf_write_stmts(w, v, wtr, &value, module, tmp);
+            });
+            w.line("}");
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("interfaces and iterators never appear inside a value buffer")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        _ => unreachable!("scalar handled above"),
+    }
+}
+
+/// A JS expression decoding one value of IDL type `ty` from the buffer reader
+/// named `rdr`, resolving record and rich-enum references against `module`.
+/// Composite types recurse; lists and maps expand to inline arrow IIFEs so
+/// the whole decode stays a single expression.
+fn buf_read_expr(ty: &TypeRef, module: &str, rdr: &str) -> String {
+    match ty {
+        TypeRef::Bool => format!("{rdr}.bool()"),
+        TypeRef::I8 => format!("{rdr}.i8()"),
+        TypeRef::U8 => format!("{rdr}.u8()"),
+        TypeRef::I16 => format!("{rdr}.i16()"),
+        TypeRef::U16 => format!("{rdr}.u16()"),
+        TypeRef::I32 | TypeRef::Enum(_) => format!("{rdr}.i32()"),
+        TypeRef::U32 => format!("{rdr}.u32()"),
+        TypeRef::I64 => format!("{rdr}.i64()"),
+        TypeRef::U64 | TypeRef::Handle => format!("{rdr}.u64()"),
+        // A typed handle is an i32 pointer at the ABI but a u64 on the wire;
+        // narrowing back to a JS number keeps the two spellings interchangeable.
+        TypeRef::TypedHandle(_) => format!("Number({rdr}.u64())"),
+        TypeRef::F32 => format!("{rdr}.f32()"),
+        TypeRef::F64 => format!("{rdr}.f64()"),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("{rdr}.str()"),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => format!("{rdr}.bytes()"),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            let (_, read_fn) = buf_codec_names(name, module);
+            format!("{read_fn}({rdr})")
+        }
+        TypeRef::Optional(inner) => {
+            format!(
+                "({rdr}.flag() ? {} : null)",
+                buf_read_expr(inner, module, rdr)
+            )
+        }
+        TypeRef::List(inner) => {
+            let elem = buf_read_expr(inner, module, rdr);
+            format!(
+                "(() => {{ const _n = {rdr}.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push({elem}); return _arr; }})()"
+            )
+        }
+        TypeRef::Map(k, v) => {
+            let key = buf_read_expr(k, module, rdr);
+            let value = buf_read_expr(v, module, rdr);
+            format!(
+                "(() => {{ const _n = {rdr}.len(); const _obj = {{}}; for (let _i = 0; _i < _n; _i++) {{ const _k = {key}; _obj[_k] = {value}; }} return _obj; }})()"
+            )
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("interfaces and iterators never appear inside a value buffer")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// Emit the private value-buffer runtime: a growable little-endian writer and
+/// a strict reader implementing the WeaveFFI wire format. Malformed input (a
+/// producer/consumer contract violation) throws the generic brand error with
+/// code `-3`.
+fn emit_js_buffer_runtime(out: &mut String) {
+    let mut w = CodeWriter::two_space();
+    w.line("// Growable little-endian byte writer implementing the WeaveFFI value-buffer");
+    w.line("// wire format: values are packed back to back with no alignment; lengths and");
+    w.line("// counts are u32; strings are u32 byte length + UTF-8 bytes (no NUL).");
+    w.block("class _BufWriter {", "}", |w| {
+        w.block("constructor() {", "}", |w| {
+            w.line("this._u8 = new Uint8Array(64);");
+            w.line("this._dv = new DataView(this._u8.buffer);");
+            w.line("this._len = 0;");
+        });
+        w.block("_need(n) {", "}", |w| {
+            w.line("if (this._len + n <= this._u8.length) return;");
+            w.line("let cap = this._u8.length * 2;");
+            w.line("while (cap < this._len + n) cap *= 2;");
+            w.line("const u8 = new Uint8Array(cap);");
+            w.line("u8.set(this._u8.subarray(0, this._len));");
+            w.line("this._u8 = u8;");
+            w.line("this._dv = new DataView(u8.buffer);");
+        });
+        w.line("bool(v) { this._need(1); this._dv.setUint8(this._len, v ? 1 : 0); this._len += 1; }");
+        w.line("i8(v) { this._need(1); this._dv.setInt8(this._len, v); this._len += 1; }");
+        w.line("u8(v) { this._need(1); this._dv.setUint8(this._len, v); this._len += 1; }");
+        w.line("i16(v) { this._need(2); this._dv.setInt16(this._len, v, true); this._len += 2; }");
+        w.line("u16(v) { this._need(2); this._dv.setUint16(this._len, v, true); this._len += 2; }");
+        w.line("i32(v) { this._need(4); this._dv.setInt32(this._len, v, true); this._len += 4; }");
+        w.line("u32(v) { this._need(4); this._dv.setUint32(this._len, v, true); this._len += 4; }");
+        w.line("i64(v) { this._need(8); this._dv.setBigInt64(this._len, BigInt(v), true); this._len += 8; }");
+        w.line("u64(v) { this._need(8); this._dv.setBigUint64(this._len, BigInt(v), true); this._len += 8; }");
+        w.line("f32(v) { this._need(4); this._dv.setFloat32(this._len, v, true); this._len += 4; }");
+        w.line("f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }");
+        w.line("len(n) { this.u32(n); }");
+        w.line("flag(present) { this.u8(present ? 1 : 0); }");
+        w.block("str(v) {", "}", |w| {
+            w.line("const b = _enc.encode(v);");
+            w.line("this.len(b.length);");
+            w.line("this._need(b.length);");
+            w.line("this._u8.set(b, this._len);");
+            w.line("this._len += b.length;");
+        });
+        w.block("bytes(v) {", "}", |w| {
+            w.line("const b = v instanceof Uint8Array ? v : new Uint8Array(v);");
+            w.line("this.len(b.length);");
+            w.line("this._need(b.length);");
+            w.line("this._u8.set(b, this._len);");
+            w.line("this._len += b.length;");
+        });
+        w.line("finish() { return this._u8.subarray(0, this._len); }");
+    });
+    w.blank();
+    w.line("const _bufDec = new TextDecoder('utf-8', { fatal: true });");
+    w.blank();
+    w.line("// Strict little-endian reader for the WeaveFFI value-buffer wire format. A");
+    w.line("// malformed buffer (truncation, invalid bool or flag bytes, an oversized");
+    w.line("// length prefix, invalid UTF-8, trailing bytes) is a producer/consumer");
+    w.line("// contract violation and throws the generic brand error; code -3 marks a");
+    w.line("// consumer-side marshalling failure.");
+    w.block("class _BufReader {", "}", |w| {
+        w.block("constructor(bytes) {", "}", |w| {
+            w.line("this._u8 = bytes;");
+            w.line("this._dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);");
+            w.line("this._pos = 0;");
+        });
+        w.block("_bad(what) {", "}", |w| {
+            w.line(format!(
+                "throw new {ERROR_BRAND}(-3, 'malformed value buffer: ' + what);"
+            ));
+        });
+        w.block("_take(n, what) {", "}", |w| {
+            w.line("if (this._pos + n > this._u8.length) this._bad('truncated ' + what);");
+            w.line("const at = this._pos;");
+            w.line("this._pos += n;");
+            w.line("return at;");
+        });
+        w.block("bool() {", "}", |w| {
+            w.line("const b = this._u8[this._take(1, 'bool')];");
+            w.line("if (b > 1) this._bad('bool byte out of range');");
+            w.line("return b === 1;");
+        });
+        w.line("i8() { return this._dv.getInt8(this._take(1, 'i8')); }");
+        w.line("u8() { return this._u8[this._take(1, 'u8')]; }");
+        w.line("i16() { return this._dv.getInt16(this._take(2, 'i16'), true); }");
+        w.line("u16() { return this._dv.getUint16(this._take(2, 'u16'), true); }");
+        w.line("i32() { return this._dv.getInt32(this._take(4, 'i32'), true); }");
+        w.line("u32() { return this._dv.getUint32(this._take(4, 'u32'), true); }");
+        w.line("i64() { return this._dv.getBigInt64(this._take(8, 'i64'), true); }");
+        w.line("u64() { return this._dv.getBigUint64(this._take(8, 'u64'), true); }");
+        w.line("f32() { return this._dv.getFloat32(this._take(4, 'f32'), true); }");
+        w.line("f64() { return this._dv.getFloat64(this._take(8, 'f64'), true); }");
+        w.block("len() {", "}", |w| {
+            w.line("const n = this.u32();");
+            w.line("if (n > this._u8.length - this._pos) this._bad('length prefix exceeds remaining buffer');");
+            w.line("return n;");
+        });
+        w.block("flag() {", "}", |w| {
+            w.line("const b = this._u8[this._take(1, 'option flag')];");
+            w.line("if (b > 1) this._bad('option flag byte out of range');");
+            w.line("return b === 1;");
+        });
+        w.block("str() {", "}", |w| {
+            w.line("const n = this.len();");
+            w.line("const at = this._take(n, 'string bytes');");
+            w.block("try {", "} catch (e) {", |w| {
+                w.line("return _bufDec.decode(this._u8.subarray(at, at + n));");
+            });
+            w.scope(|w| {
+                w.line("this._bad('string is not valid UTF-8');");
+            });
+            w.line("}");
+        });
+        w.block("bytes() {", "}", |w| {
+            w.line("const n = this.len();");
+            w.line("const at = this._take(n, 'byte buffer');");
+            w.line("return this._u8.subarray(at, at + n).slice();");
+        });
+        w.block("end() {", "}", |w| {
+            w.line("if (this._pos !== this._u8.length) this._bad('trailing bytes after value');");
+        });
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit the module-scope `_write_*`/`_read_*` codec pair for every record and
+/// rich enum in the model, in model (declaration) order. Field order is fixed
+/// at generation time, so the codecs are direct straight-line code with no
+/// runtime dispatch.
+fn emit_js_buffer_codecs(out: &mut String, model: &BindingModel) {
+    let mut w = CodeWriter::two_space();
+    for m in &model.modules {
+        for s in &m.structs {
+            let (write_fn, read_fn) = buf_codec_names(&s.name, &m.path);
+            w.line(format!(
+                "// Serialize a `{}.{}` record into the value-buffer wire format.",
+                m.path, s.name
+            ));
+            w.block(format!("function {write_fn}(w, v) {{"), "}", |w| {
+                let mut tmp = 0u32;
+                for f in &s.fields {
+                    emit_buf_write_stmts(
+                        w,
+                        &f.ty,
+                        "w",
+                        &format!("v.{}", f.name),
+                        &m.path,
+                        &mut tmp,
+                    );
+                }
+            });
+            w.blank();
+            w.line(format!(
+                "// Decode a `{}.{}` record from the value-buffer wire format.",
+                m.path, s.name
+            ));
+            w.block(format!("function {read_fn}(r) {{"), "}", |w| {
+                w.line("const v = {};");
+                for f in &s.fields {
+                    w.line(format!(
+                        "v.{} = {};",
+                        f.name,
+                        buf_read_expr(&f.ty, &m.path, "r")
+                    ));
+                }
+                w.line("return v;");
+            });
+            w.blank();
+        }
+        for e in m.enums.iter().filter(|e| e.is_rich()) {
+            let (write_fn, read_fn) = buf_codec_names(&e.name, &m.path);
+            w.line(format!(
+                "// Serialize a `{}.{}` rich enum into the value-buffer wire format:",
+                m.path, e.name
+            ));
+            w.line("// an i32 tag, then the active variant's fields in order.");
+            w.block(format!("function {write_fn}(w, v) {{"), "}", |w| {
+                w.block("switch (v.tag) {", "}", |w| {
+                    for v in &e.variants {
+                        w.block(format!("case \"{}\": {{", v.name), "}", |w| {
+                            w.line(format!("w.i32({});", v.value));
+                            let mut tmp = 0u32;
+                            for f in &v.fields {
+                                emit_buf_write_stmts(
+                                    w,
+                                    &f.ty,
+                                    "w",
+                                    &format!("v.{}", f.name),
+                                    &m.path,
+                                    &mut tmp,
+                                );
+                            }
+                            w.line("break;");
+                        });
+                    }
+                    w.line("default:");
+                    w.scope(|w| {
+                        w.line(format!(
+                            "throw new {ERROR_BRAND}(-3, \"unknown {} variant tag: \" + v.tag);",
+                            e.name
+                        ));
+                    });
+                });
+            });
+            w.blank();
+            w.line(format!(
+                "// Decode a `{}.{}` rich enum from the value-buffer wire format.",
+                m.path, e.name
+            ));
+            w.block(format!("function {read_fn}(r) {{"), "}", |w| {
+                w.line("const _tag = r.i32();");
+                w.block("switch (_tag) {", "}", |w| {
+                    for v in &e.variants {
+                        if v.fields.is_empty() {
+                            w.line(format!("case {}:", v.value));
+                            w.scope(|w| {
+                                w.line(format!("return {{ tag: \"{}\" }};", v.name));
+                            });
+                        } else {
+                            w.block(format!("case {}: {{", v.value), "}", |w| {
+                                w.line(format!("const v = {{ tag: \"{}\" }};", v.name));
+                                for f in &v.fields {
+                                    w.line(format!(
+                                        "v.{} = {};",
+                                        f.name,
+                                        buf_read_expr(&f.ty, &m.path, "r")
+                                    ));
+                                }
+                                w.line("return v;");
+                            });
+                        }
+                    }
+                    w.line("default:");
+                    w.scope(|w| {
+                        w.line(format!(
+                            "throw new {ERROR_BRAND}(-3, \"malformed value buffer: unknown {} tag \" + _tag);",
+                            e.name
+                        ));
+                    });
+                });
+            });
+            w.blank();
+        }
+    }
+    out.push_str(&w.finish());
+}
+
 /// Stage one idiomatic input `value` of type `ty` into the Wasm ABI.
 ///
-/// Pushes any pre-call statements to `out` (at `indent`), the produced i32/i64
-/// call arguments to `args`, and any post-call cleanup statements to `cleanup`.
-/// `tmp` is a collision-free local-name base. Assumes `wasm` is in scope.
+/// Pushes any pre-call statements to `out` (at `indent`), the produced call
+/// arguments to `args`, and any post-call cleanup statements to `cleanup`.
+/// `tmp` is a collision-free local-name base; `module` resolves record and
+/// rich-enum codec references. Buffered values (records, rich enums,
+/// optionals, lists, maps) are encoded into a value buffer and staged like
+/// bytes: allocate, copy, pass `(ptr, len)`, dealloc after the call. Assumes
+/// `wasm` is in scope.
+#[allow(clippy::too_many_arguments)]
 fn emit_stage_input(
     out: &mut String,
     indent: &str,
     ty: &TypeRef,
     value: &str,
     tmp: &str,
+    module: &str,
     args: &mut Vec<String>,
     cleanup: &mut Vec<String>,
 ) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    if is_buffered(ty) {
+        w.line(format!("const {tmp}_w = new _BufWriter();"));
+        let mut n = 0u32;
+        emit_buf_write_stmts(&mut w, ty, &format!("{tmp}_w"), value, module, &mut n);
+        w.line(format!(
+            "const [{tmp}_p, {tmp}_l] = _bytes(wasm, {tmp}_w.finish());"
+        ));
+        args.push(format!("{tmp}_p"));
+        args.push(format!("{tmp}_l"));
+        cleanup.push(format!("wasm.weaveffi_dealloc({tmp}_p, {tmp}_l);"));
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("const [{tmp}_p, {tmp}_s] = _cstr(wasm, {value});"));
@@ -836,11 +1205,13 @@ fn emit_stage_input(
             args.push(format!("{tmp}_l"));
             cleanup.push(format!("wasm.weaveffi_dealloc({tmp}_p, {tmp}_l);"));
         }
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
+        TypeRef::Interface(_) => {
             args.push(format!("{value}._handle"));
+        }
+        // A typed handle is an opaque pointer the consumer received earlier;
+        // it passes through unwrapped.
+        TypeRef::TypedHandle(_) => {
+            args.push(value.to_string());
         }
         TypeRef::Bool
         | TypeRef::I8
@@ -857,94 +1228,13 @@ fn emit_stage_input(
         | TypeRef::Enum(_) => {
             args.push(js_arg_scalar(ty, value));
         }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => {
-                args.push(format!("({value} ? {value}._handle : 0)"));
-            }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("let {tmp}_p = 0, {tmp}_s = 0;"));
-                w.line(format!(
-                    "if ({value} !== null && {value} !== undefined) {{ [{tmp}_p, {tmp}_s] = _cstr(wasm, {value}); }}"
-                ));
-                args.push(format!("{tmp}_p"));
-                cleanup.push(format!(
-                    "if ({tmp}_p !== 0) wasm.weaveffi_dealloc({tmp}_p, {tmp}_s);"
-                ));
-            }
-            scalar => {
-                let width = scalar_width(scalar);
-                w.line(format!("let {tmp}_p = 0;"));
-                w.block(
-                    format!("if ({value} !== null && {value} !== undefined) {{"),
-                    "}",
-                    |w| {
-                        w.line(format!("{tmp}_p = wasm.weaveffi_alloc({width});"));
-                        w.line(format!(
-                            "const {tmp}_dv = new DataView(wasm.memory.buffer);"
-                        ));
-                        let ind = w.indent_str();
-                        let mut sc = String::new();
-                        emit_write_scalar(
-                            &mut sc,
-                            &ind,
-                            scalar,
-                            &format!("{tmp}_dv"),
-                            &format!("{tmp}_p"),
-                            value,
-                        );
-                        w.raw(sc);
-                    },
-                );
-                args.push(format!("{tmp}_p"));
-                cleanup.push(format!(
-                    "if ({tmp}_p !== 0) wasm.weaveffi_dealloc({tmp}_p, {width});"
-                ));
-            }
-        },
-        TypeRef::List(inner) => {
-            let mut staged = String::new();
-            emit_stage_list(&mut staged, indent, inner, value, tmp, args, cleanup);
-            w.raw(staged);
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable borrowed object pointer, null meaning none.
+        TypeRef::Optional(_) => {
+            args.push(format!("({value} ? {value}._handle : 0)"));
         }
-        TypeRef::Map(k, v) => {
-            let kt = format!("{tmp}_k");
-            let vt = format!("{tmp}_v");
-            w.line(format!("const {tmp}_m = {value} || {{}};"));
-            w.line(format!(
-                "const {tmp}_ks = ({tmp}_m instanceof Map) ? [...{tmp}_m.keys()] : Object.keys({tmp}_m);"
-            ));
-            w.line(format!(
-                "const {tmp}_vs = ({tmp}_m instanceof Map) ? [...{tmp}_m.values()] : Object.values({tmp}_m);"
-            ));
-            let mut kargs = Vec::new();
-            let mut vargs = Vec::new();
-            let mut staged = String::new();
-            emit_stage_list(
-                &mut staged,
-                indent,
-                k,
-                &format!("{tmp}_ks"),
-                &kt,
-                &mut kargs,
-                cleanup,
-            );
-            emit_stage_list(
-                &mut staged,
-                indent,
-                v,
-                &format!("{tmp}_vs"),
-                &vt,
-                &mut vargs,
-                cleanup,
-            );
-            w.raw(staged);
-            // Each list staged `(base, len)`; the map ABI is `(keys, values, len)`.
-            args.push(kargs[0].clone());
-            args.push(vargs[0].clone());
-            args.push(kargs[1].clone());
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as an input"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -952,177 +1242,12 @@ fn emit_stage_input(
     out.push_str(&w.finish());
 }
 
-/// Stage a JS array `value` of element type `inner` as a packed C array,
-/// pushing `(base, len)` to `args` and the frees to `cleanup`.
-fn emit_stage_list(
-    out: &mut String,
-    indent: &str,
-    inner: &TypeRef,
-    value: &str,
-    tmp: &str,
-    args: &mut Vec<String>,
-    cleanup: &mut Vec<String>,
-) {
-    let stride = wasm_stride(inner);
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.line(format!("const {tmp}_arr = {value} || [];"));
-    w.line(format!("const {tmp}_n = {tmp}_arr.length;"));
-    w.line(format!(
-        "const {tmp}_base = wasm.weaveffi_alloc({tmp}_n ? {tmp}_n * {stride} : 1);"
-    ));
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("const {tmp}_ep = [];"));
-            w.line(format!(
-                "for (let i = 0; i < {tmp}_n; i++) {tmp}_ep.push(_cstr(wasm, {tmp}_arr[i]));"
-            ));
-            w.block("{", "}", |w| {
-                w.line("const dv = new DataView(wasm.memory.buffer);");
-                w.line(format!("for (let i = 0; i < {tmp}_n; i++) dv.setUint32({tmp}_base + i * 4, {tmp}_ep[i][0], true);"));
-            });
-            cleanup.push(format!(
-                "for (const [ep, es] of {tmp}_ep) wasm.weaveffi_dealloc(ep, es);"
-            ));
-        }
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
-            w.block("{", "}", |w| {
-                w.line("const dv = new DataView(wasm.memory.buffer);");
-                w.line(format!("for (let i = 0; i < {tmp}_n; i++) dv.setInt32({tmp}_base + i * 4, {tmp}_arr[i]._handle, true);"));
-            });
-        }
-        scalar => {
-            w.block("{", "}", |w| {
-                w.line("const dv = new DataView(wasm.memory.buffer);");
-                w.block(format!("for (let i = 0; i < {tmp}_n; i++) {{"), "}", |w| {
-                    let ind = w.indent_str();
-                    let mut sc = String::new();
-                    emit_write_scalar(
-                        &mut sc,
-                        &ind,
-                        scalar,
-                        "dv",
-                        &format!("{tmp}_base + i * {stride}"),
-                        &format!("{tmp}_arr[i]"),
-                    );
-                    w.raw(sc);
-                });
-            });
-        }
-    }
-    cleanup.push(format!(
-        "wasm.weaveffi_dealloc({tmp}_base, {tmp}_n ? {tmp}_n * {stride} : 1);"
-    ));
-    args.push(format!("{tmp}_base"));
-    args.push(format!("{tmp}_n"));
-    out.push_str(&w.finish());
-}
-
-/// How string elements read out of a producer array are released, per the
-/// [`weaveffi_core::plan`] ownership contracts.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ElemOwnership {
-    /// Synchronous-return elements: the consumer owns each string and frees it
-    /// with `{prefix}_free_string` after copying.
-    Owned,
-    /// Async-callback elements: string buffers are borrowed for the callback's
-    /// duration, so they are copied out but never freed here.
-    Borrowed,
-}
-
-/// Emit `const {target} = ...;` building a JS array of `inner` elements from
-/// the C array at `base` (`len` elements). String elements are freed or left
-/// alone per `ownership`; record/rich-enum and interface elements are owned
-/// object pointers adopted by their wrapper classes either way. Assumes
-/// `wasm` in scope.
-fn emit_read_list_into(
-    out: &mut String,
-    indent: &str,
-    inner: &TypeRef,
-    base: &str,
-    len: &str,
-    target: &str,
-    ownership: ElemOwnership,
-) {
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => match ownership {
-            ElemOwnership::Owned => {
-                w.line(format!(
-                    "const {target} = _takeStrArray(wasm, {base}, {len});"
-                ));
-            }
-            ElemOwnership::Borrowed => {
-                w.line(format!(
-                    "const {target} = _readStrArray(wasm, {base}, {len});"
-                ));
-            }
-        },
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let cls = local_type_name(name);
-            w.line(format!("const {target} = [];"));
-            w.block("{", "}", |w| {
-                w.line("const dv = new DataView(wasm.memory.buffer);");
-                w.line(format!(
-                    "for (let i = 0; i < {len}; i++) {target}.push(new {cls}(wasm, dv.getInt32({base} + i * 4, true)));"
-                ));
-            });
-        }
-        TypeRef::Interface(name) => {
-            let cls = local_type_name(name);
-            w.line(format!("const {target} = [];"));
-            w.block("{", "}", |w| {
-                w.line("const dv = new DataView(wasm.memory.buffer);");
-                w.line(format!(
-                    "for (let i = 0; i < {len}; i++) {target}.push({cls}._wrap(dv.getInt32({base} + i * 4, true)));"
-                ));
-            });
-        }
-        scalar => {
-            w.line(format!("const {target} = [];"));
-            let elem = wasm_read_scalar_elem(scalar, "dv", base, "i");
-            w.block("{", "}", |w| {
-                w.line("const dv = new DataView(wasm.memory.buffer);");
-                w.line(format!(
-                    "for (let i = 0; i < {len}; i++) {target}.push({elem});"
-                ));
-            });
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-/// Emit `const {target} = ...;` building a JS object (`Record`) from the
-/// parallel key/value C arrays, with string elements released per
-/// `ownership`. Assumes `wasm` in scope.
+/// Emit the body that invokes `symbol` with the already-staged `in_args`,
+/// runs `cleanup`, routes the error slot through the `checker` helper, and
+/// decodes/returns the idiomatic value for `ret`. A buffered or bytes return
+/// allocates the trailing `out_len` slot before the call. Assumes `wasm` is
+/// in scope at `indent`.
 #[allow(clippy::too_many_arguments)]
-fn emit_read_map_into(
-    out: &mut String,
-    indent: &str,
-    k: &TypeRef,
-    v: &TypeRef,
-    ka: &str,
-    va: &str,
-    len: &str,
-    target: &str,
-    ownership: ElemOwnership,
-) {
-    emit_read_list_into(out, indent, k, ka, len, &format!("{target}_k"), ownership);
-    emit_read_list_into(out, indent, v, va, len, &format!("{target}_v"), ownership);
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.line(format!("const {target} = {{}};"));
-    w.line(format!(
-        "for (let i = 0; i < {len}; i++) {target}[{target}_k[i]] = {target}_v[i];"
-    ));
-    out.push_str(&w.finish());
-}
-
-/// Emit the body that invokes `symbol` with the already-staged `in_args`, runs
-/// `cleanup`, routes the error slot through the `checker` helper (when
-/// `Some`), and decodes/returns the idiomatic value for `ret`. Assumes `wasm`
-/// is in scope at `indent`.
 fn emit_return_decode(
     out: &mut String,
     indent: &str,
@@ -1130,40 +1255,23 @@ fn emit_return_decode(
     symbol: &str,
     in_args: &[String],
     cleanup: &[String],
-    checker: Option<&str>,
+    checker: &str,
+    module: &str,
 ) {
-    // Classify which trailing out-slots the return needs.
-    let unwrapped = match ret {
-        Some(TypeRef::Optional(inner)) => Some(inner.as_ref()),
-        other => other,
-    };
-    let needs_len = matches!(
-        unwrapped,
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_))
-    );
-    let needs_map = matches!(unwrapped, Some(TypeRef::Map(_, _)));
+    let needs_len =
+        ret.is_some_and(|t| is_buffered(t) || matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes));
 
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let mut call_args = in_args.to_vec();
     if needs_len {
         w.line("const _lp = wasm.weaveffi_alloc(4);");
         call_args.push("_lp".to_string());
-    } else if needs_map {
-        w.line("const _kp = wasm.weaveffi_alloc(4);");
-        w.line("const _vp = wasm.weaveffi_alloc(4);");
-        w.line("const _lp = wasm.weaveffi_alloc(4);");
-        call_args.push("_kp".to_string());
-        call_args.push("_vp".to_string());
-        call_args.push("_lp".to_string());
     }
-    if checker.is_some() {
-        w.line("const _err = _allocErr(wasm);");
-        call_args.push("_err".to_string());
-    }
+    w.line("const _err = _allocErr(wasm);");
+    call_args.push("_err".to_string());
 
     let call = format!("wasm.{symbol}({})", call_args.join(", "));
-    let captures_r = !needs_map && ret.is_some();
-    if captures_r {
+    if ret.is_some() {
         w.line(format!("const _r = {call};"));
     } else {
         w.line(format!("{call};"));
@@ -1172,22 +1280,38 @@ fn emit_return_decode(
     for stmt in cleanup {
         w.line(stmt);
     }
-    if let Some(checker) = checker {
-        w.line(format!("{checker}(wasm, _err);"));
-        w.line("_freeErr(wasm, _err);");
-    }
+    w.line(format!("{checker}(wasm, _err);"));
+    w.line("_freeErr(wasm, _err);");
     out.push_str(&w.finish());
 
-    emit_decode_value(out, indent, ret, "_r");
+    emit_decode_value(out, indent, ret, "_r", module);
 }
 
-/// Emit the `return ...;` (if any) that converts the raw result `r` plus any
-/// `_lp`/`_kp`/`_vp` out-slots already in scope into the idiomatic value.
-fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &str) {
+/// Emit the `return ...;` (if any) that converts the raw result `r` (plus the
+/// `_lp` out-slot already in scope for a bytes or buffered return) into the
+/// idiomatic value. A buffered return is copied out of linear memory,
+/// released with `weaveffi_free_bytes`, and decoded through the buffer
+/// reader, which rejects malformed encodings.
+fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &str, module: &str) {
     let Some(ret) = ret else {
         return;
     };
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
+    if is_buffered(ret) {
+        w.line("const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);");
+        w.line("wasm.weaveffi_dealloc(_lp, 4);");
+        w.line(format!(
+            "const _rd = new _BufReader(_takeBytes(wasm, {r}, _len));"
+        ));
+        w.line(format!(
+            "const _out = {};",
+            buf_read_expr(ret, module, "_rd")
+        ));
+        w.line("_rd.end();");
+        w.line("return _out;");
+        out.push_str(&w.finish());
+        return;
+    }
     match ret {
         TypeRef::Bool => {
             w.line(format!("return {r} !== 0;"));
@@ -1203,114 +1327,33 @@ fn emit_decode_value(out: &mut String, indent: &str, ret: Option<&TypeRef>, r: &
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
+        | TypeRef::TypedHandle(_)
         | TypeRef::Enum(_) => {
             w.line(format!("return {r};"));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("return _takeCStr(wasm, {r});"));
         }
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let cls = local_type_name(name);
-            w.line(format!("return new {cls}(wasm, {r});"));
-        }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("const _dv = new DataView(wasm.memory.buffer);");
-            w.line("const _len = _dv.getUint32(_lp, true);");
+            w.line("const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);");
             w.line("wasm.weaveffi_dealloc(_lp, 4);");
             w.line(format!("return _takeBytes(wasm, {r}, _len);"));
         }
-        TypeRef::List(inner) => {
-            let stride = wasm_stride(inner);
-            w.line("const _dv = new DataView(wasm.memory.buffer);");
-            w.line("const _len = _dv.getUint32(_lp, true);");
-            w.line("wasm.weaveffi_dealloc(_lp, 4);");
-            let mut tmp = String::new();
-            emit_read_list_into(
-                &mut tmp,
-                indent,
-                inner,
-                r,
-                "_len",
-                "_out",
-                ElemOwnership::Owned,
-            );
-            w.raw(tmp);
-            // The consumer owns the returned array buffer; release it after
-            // copying the elements out (each element already freed per its
-            // own plan above).
-            w.line(format!(
-                "if ({r} !== 0 && _len !== 0) wasm.weaveffi_free_bytes({r}, _len * {stride});"
-            ));
-            w.line("return _out;");
+        TypeRef::Interface(name) => {
+            let cls = local_type_name(name);
+            w.line(format!("return {cls}._wrap({r});"));
         }
-        TypeRef::Map(k, v) => {
-            let k_stride = wasm_stride(k);
-            let v_stride = wasm_stride(v);
-            w.line("const _dv = new DataView(wasm.memory.buffer);");
-            w.line("const _ka = _dv.getUint32(_kp, true);");
-            w.line("const _va = _dv.getUint32(_vp, true);");
-            w.line("const _len = _dv.getUint32(_lp, true);");
-            w.line("wasm.weaveffi_dealloc(_kp, 4);");
-            w.line("wasm.weaveffi_dealloc(_vp, 4);");
-            w.line("wasm.weaveffi_dealloc(_lp, 4);");
-            let mut tmp = String::new();
-            emit_read_map_into(
-                &mut tmp,
-                indent,
-                k,
-                v,
-                "_ka",
-                "_va",
-                "_len",
-                "_out",
-                ElemOwnership::Owned,
-            );
-            w.raw(tmp);
-            // The consumer owns both parallel arrays; release them after
-            // copying the entries out.
-            w.line(format!(
-                "if (_ka !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_ka, _len * {k_stride});"
-            ));
-            w.line(format!(
-                "if (_va !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_va, _len * {v_stride});"
-            ));
-            w.line("return _out;");
-        }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-                let cls = local_type_name(name);
-                w.line(format!("return {r} === 0 ? null : new {cls}(wasm, {r});"));
-            }
             TypeRef::Interface(name) => {
                 let cls = local_type_name(name);
                 w.line(format!("return {r} === 0 ? null : {cls}._wrap({r});"));
             }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("return _takeCStr(wasm, {r});"));
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _) => {
-                // Aggregate optionals: a null base decodes to empty by the readers.
-                let mut tmp = String::new();
-                emit_decode_value(&mut tmp, indent, Some(inner), r);
-                w.raw(tmp);
-            }
-            scalar => {
-                // Boxed optional scalar: dereference the box, then release it
-                // (the consumer owns the box per the return-free plan).
-                let width = scalar_width(scalar);
-                let getter = wasm_read_scalar_elem(scalar, "_dv", r, "0")
-                    .replace(&format!("{r} + 0 * {}", wasm_stride(scalar)), r);
-                w.line(format!("if ({r} === 0) return null;"));
-                w.line("const _dv = new DataView(wasm.memory.buffer);");
-                w.line(format!("const _v = {getter};"));
-                w.line(format!("wasm.weaveffi_free_bytes({r}, {width});"));
-                w.line("return _v;");
-            }
+            _ => unreachable!("non-interface optionals are buffered"),
         },
         TypeRef::Iterator(_) => unreachable!("iterator returns handled separately"),
-        TypeRef::Interface(name) => {
-            let cls = local_type_name(name);
-            w.line(format!("return {cls}._wrap({r});"));
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
@@ -1335,12 +1378,14 @@ fn ts_type_for(ty: &TypeRef) -> String {
         // Every 64-bit integer crosses the JS boundary as a BigInt: wasm i64
         // results arrive as BigInt and i64 arguments are BigInt-coerced.
         TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "bigint".into(),
-        // Records, rich enums, plain enums, typed handles, and interfaces
-        // surface as bare local TS names; a cross-module reference (resolved
-        // to e.g. `kv.Store`) must name the local `Store`, not the qualified
-        // IR name which is undeclared here.
-        TypeRef::TypedHandle(name)
-        | TypeRef::Enum(name)
+        // A typed handle is an opaque i32 pointer at the ABI, surfaced as a
+        // plain number.
+        TypeRef::TypedHandle(_) => "number".into(),
+        // Records, rich enums, plain enums, and interfaces surface as bare
+        // local TS names; a cross-module reference (resolved to e.g.
+        // `kv.Store`) must name the local `Store`, not the qualified IR name
+        // which is undeclared here.
+        TypeRef::Enum(name)
         | TypeRef::Record(name)
         | TypeRef::RichEnum(name)
         | TypeRef::Interface(name) => local_type_name(name).to_string(),
@@ -1538,22 +1583,16 @@ fn render_wasm_dts(
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
                 emit_doc(&mut out, &field.doc, "  ");
-                out.push_str(&format!(
-                    "  readonly {}: {};\n",
-                    field.name,
-                    ts_type_for(&field.ty)
-                ));
+                out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
             }
-            out.push_str("  /** Releases the producer-owned handle exactly once. */\n");
-            out.push_str("  free(): void;\n");
             out.push_str("}\n\n");
         }
 
         for e in &m.enums {
-            // A rich (algebraic) enum is an opaque-object wrapper class, not a
+            // A rich (algebraic) enum is a tagged plain-object union, not a
             // by-value discriminant constant.
             if e.is_rich() {
-                emit_dts_rich_enum_class(&mut out, e);
+                emit_dts_rich_enum_type(&mut out, e);
                 continue;
             }
             emit_doc(&mut out, &e.doc, "");
@@ -1604,39 +1643,26 @@ fn render_wasm_dts(
     out
 }
 
-/// Emit the TypeScript declaration for a rich (algebraic) enum: an opaque
-/// handle wrapper `class` exposing the `tag` discriminant reader, a frozen
-/// `Tag` map, one static factory per variant (`Shape.circle(...)`), the
-/// camelCase namespaced field getters, and `free()`. Mirrors the runtime JS
-/// class emitted by [`emit_rich_enum_class`].
-fn emit_dts_rich_enum_class(out: &mut String, e: &EnumDef) {
+/// Emit the TypeScript declaration for a rich (algebraic) enum: a
+/// discriminated union of plain object shapes, one member per variant, keyed
+/// by the string `tag`. Mirrors the runtime representation the buffer codecs
+/// pack and unpack.
+fn emit_dts_rich_enum_type(out: &mut String, e: &EnumDef) {
     let name = &e.name;
     let mut w = CodeWriter::two_space();
     w.doc(&e.doc, DocCommentStyle::Javadoc);
-    w.block(format!("export declare class {name} {{"), "}", |w| {
-        w.line("get tag(): number;");
-        w.block("static readonly Tag: Readonly<{", "}>;", |w| {
-            for v in &e.variants {
-                w.line(format!("{}: {};", v.name, v.value));
-            }
-        });
-        for v in &e.variants {
-            w.doc(&v.doc, DocCommentStyle::Javadoc);
-            let factory = v.name.to_lower_camel_case();
-            let params: Vec<String> = v
+    w.line(format!("export type {name} ="));
+    w.scope(|w| {
+        let last = e.variants.len().saturating_sub(1);
+        for (i, v) in e.variants.iter().enumerate() {
+            let fields: String = v
                 .fields
                 .iter()
-                .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
+                .map(|f| format!("; {}: {}", f.name, ts_type_for(&f.ty)))
                 .collect();
-            w.line(format!("static {factory}({}): {name};", params.join(", ")));
+            let term = if i == last { ";" } else { "" };
+            w.line(format!("| {{ tag: \"{}\"{fields} }}{term}", v.name));
         }
-        for v in &e.variants {
-            for f in &v.fields {
-                let js_name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
-                w.line(format!("get {js_name}(): {};", ts_type_for(&f.ty)));
-            }
-        }
-        w.line("free(): void;");
     });
     w.blank();
     out.push_str(&w.finish());
@@ -1823,8 +1849,8 @@ fn render_dts_listener(out: &mut String, mb: &ModuleBinding, l: &ListenerBinding
 
 /// Emit the TypeScript declarations for the error surface: the generic brand
 /// error, then one domain class per declaring module with its per-code
-/// subclasses (each carrying a literal-typed `CODE`) and the static aliases
-/// hung on the domain class.
+/// subclasses (each carrying a literal-typed `CODE` and any declared payload
+/// fields) and the static aliases hung on the domain class.
 fn emit_dts_error_classes(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::two_space();
     w.line("/** Base error for WeaveFFI failures: domain errors extend it, and it is");
@@ -1873,6 +1899,10 @@ fn emit_dts_error_classes(out: &mut String, model: &BindingModel) {
                 |w| {
                     w.line("constructor(message?: string);");
                     w.line(format!("static readonly CODE: {};", c.value));
+                    for f in &c.fields {
+                        w.doc(&f.doc, DocCommentStyle::Javadoc);
+                        w.line(format!("readonly {}: {};", f.name, ts_type_for(&f.ty)));
+                    }
                 },
             );
             w.blank();
@@ -1953,8 +1983,10 @@ fn emit_dts_interface_class(
 /// (unknown codes, marshalling failures, panics), then one domain class per
 /// declaring module (`class KvError extends WeaveFFIError`) with one subclass
 /// per code carrying its stable `CODE` and default message. Each code class
-/// is also aliased onto its domain class (`KvError.KeyNotFound`), which stays
-/// unambiguous even if two domains were to share a code spelling.
+/// is also aliased onto its domain class (`KvError.KeyNotFound`), and each
+/// domain gets a factory that builds the matching subclass and decodes any
+/// declared payload fields from the error's value buffer into properties on
+/// the thrown error.
 fn emit_js_error_classes(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::two_space();
     w.line("/** Base error for WeaveFFI failures: domain errors extend it, and it is");
@@ -2012,6 +2044,7 @@ fn emit_js_error_classes(out: &mut String, model: &BindingModel) {
 
         let table = js_error_code_table_name(eb);
         let factory = js_error_factory_name(eb);
+        let has_payload = eb.codes.iter().any(|c| !c.fields.is_empty());
         w.block(format!("const {table} = Object.freeze({{"), "});", |w| {
             for c in &eb.codes {
                 w.line(format!("{}: {},", c.value, js_code_class_name(&c.name)));
@@ -2024,13 +2057,42 @@ fn emit_js_error_classes(out: &mut String, model: &BindingModel) {
         w.line(format!(
             "// {ERROR_BRAND} for codes outside the domain (panics, marshalling)."
         ));
-        w.block(format!("function {factory}(code, message) {{"), "}", |w| {
-            w.line(format!("const _cls = {table}[code];"));
-            w.line(format!(
-                "if (!_cls) return new {ERROR_BRAND}(code, message);"
-            ));
-            w.line("return message ? new _cls(message) : new _cls();");
-        });
+        if has_payload {
+            w.line("// Codes that declare payload fields decode them from the error's");
+            w.line("// borrowed value buffer into properties on the thrown error.");
+        }
+        w.block(
+            format!("function {factory}(wasm, code, message, payloadPtr, payloadLen) {{"),
+            "}",
+            |w| {
+                w.line(format!("const _cls = {table}[code];"));
+                w.line(format!(
+                    "const _e = _cls ? (message ? new _cls(message) : new _cls()) : new {ERROR_BRAND}(code, message);"
+                ));
+                if has_payload {
+                    w.block("switch (code) {", "}", |w| {
+                        for c in eb.codes.iter().filter(|c| !c.fields.is_empty()) {
+                            w.block(format!("case {}: {{", c.value), "}", |w| {
+                                w.line(
+                                    "const _b = payloadPtr === 0 || payloadLen === 0 ? new Uint8Array(0) : new Uint8Array(wasm.memory.buffer, payloadPtr, payloadLen).slice();",
+                                );
+                                w.line("const _rd = new _BufReader(_b);");
+                                for f in &c.fields {
+                                    w.line(format!(
+                                        "_e.{} = {};",
+                                        f.name,
+                                        buf_read_expr(&f.ty, &eb.owner_path, "_rd")
+                                    ));
+                                }
+                                w.line("_rd.end();");
+                                w.line("break;");
+                            });
+                        }
+                    });
+                }
+                w.line("return _e;");
+            },
+        );
         w.blank();
     }
     out.push_str(&w.finish());
@@ -2043,7 +2105,9 @@ fn js_error_code_table_name(eb: &ErrorBinding) -> String {
 
 /// Emit one `_check{Domain}(wasm, errPtr)` helper per declaring module:
 /// identical to the generic `_checkErr` except the thrown error is built by
-/// the domain's factory, so domain codes surface as their typed subclasses.
+/// the domain's factory, so domain codes surface as their typed subclasses
+/// with any declared payload fields decoded and attached. The payload is
+/// decoded before `weaveffi_error_clear` releases it.
 fn emit_js_error_checkers(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::two_space();
     for m in &model.modules {
@@ -2061,11 +2125,13 @@ fn emit_js_error_checkers(out: &mut String, model: &BindingModel) {
             w.line("const dv = new DataView(wasm.memory.buffer);");
             w.line("const code = dv.getInt32(errPtr, true);");
             w.block("if (code !== 0) {", "}", |w| {
-                w.line("const msgPtr = dv.getUint32(errPtr + 4, true);");
-                w.line("const msg = _readCStr(wasm, msgPtr) || '';");
+                w.line("const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';");
+                w.line(format!(
+                    "const _e = {factory}(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));"
+                ));
                 w.line("wasm.weaveffi_error_clear(errPtr);");
-                w.line("wasm.weaveffi_dealloc(errPtr, 8);");
-                w.line(format!("throw {factory}(code, msg);"));
+                w.line("wasm.weaveffi_dealloc(errPtr, 16);");
+                w.line("throw _e;");
             });
         });
         w.blank();
@@ -2078,6 +2144,7 @@ fn emit_js_error_checkers(out: &mut String, model: &BindingModel) {
 /// prologue binds each one from its underscore-prefixed `Module` property, so
 /// this list must cover every call site the body emits. Async launchers are
 /// excluded: in Emscripten mode (the only caller) they are throwing stubs.
+/// Records and rich enums declare no C symbols at all.
 fn collect_called_symbols(model: &BindingModel) -> Vec<String> {
     fn push_unique(syms: &mut Vec<String>, s: &str) {
         if !syms.iter().any(|x| x == s) {
@@ -2086,33 +2153,6 @@ fn collect_called_symbols(model: &BindingModel) -> Vec<String> {
     }
     let mut syms = Vec::new();
     for m in &model.modules {
-        for e in &m.enums {
-            if let Some(rich) = &e.rich {
-                push_unique(&mut syms, &rich.tag_symbol);
-                for v in &rich.variants {
-                    push_unique(&mut syms, &v.create.symbol);
-                    for f in &v.fields {
-                        push_unique(&mut syms, &f.getter_symbol);
-                    }
-                }
-                push_unique(&mut syms, &rich.destroy_symbol);
-            }
-        }
-        for s in &m.structs {
-            push_unique(&mut syms, &s.create.symbol);
-            for f in &s.fields {
-                push_unique(&mut syms, &f.getter_symbol);
-            }
-            push_unique(&mut syms, &s.destroy_symbol);
-            if let Some(b) = &s.builder {
-                push_unique(&mut syms, &b.new_symbol);
-                for (_field, setter) in &b.setters {
-                    push_unique(&mut syms, setter);
-                }
-                push_unique(&mut syms, &b.build_symbol);
-                push_unique(&mut syms, &b.destroy_symbol);
-            }
-        }
         for f in m.callables() {
             match &f.shape {
                 CallShape::Iterator(it) => {
@@ -2158,62 +2198,36 @@ fn render_wasm_js_stub(
             .any(|f| f.is_async);
     // Listeners get real dispatch only in the standard loader; Emscripten
     // mode emits throwing stubs, so no trampolines or registry there either.
-    let listener_cbs: Vec<&CallbackBinding> = if emscripten {
+    let listener_cbs: Vec<(&str, &CallbackBinding)> = if emscripten {
         Vec::new()
     } else {
         collect_listener_callbacks(model)
     };
     let has_listeners = !listener_cbs.is_empty();
-    // Opaque-object wrappers (structs and rich/algebraic enums) construct via a
-    // fallible `*_new`/`*_create` that threads an `out_err`, so they need the
-    // error helpers even in a module that declares no free functions.
-    let has_opaque = model
+    // Records and rich enums are value types packed and unpacked by the
+    // module-scope codecs; any of them (or any buffered type, or an error
+    // payload) pulls in the buffer writer/reader runtime.
+    let has_codecs = model
         .modules
         .iter()
         .any(|m| !m.structs.is_empty() || m.enums.iter().any(|e| e.is_rich()));
-    let needs_err = has_functions || has_opaque;
+    let has_error_payloads = model.modules.iter().any(|m| {
+        m.error
+            .as_ref()
+            .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
+    });
+    let needs_buf = has_codecs || has_error_payloads || api_deep_any(api, &is_buffered);
+    // The buffer reader (and the codecs) reject malformed input by throwing
+    // the brand error, so the error surface is needed whenever buffers are.
+    let needs_err = has_functions || needs_buf;
     // Error messages always cross as C strings, so anything needing the error
     // helpers also needs the string-read helpers regardless of declared types.
-    // Listener callback arguments arrive as borrowed C strings read through
-    // the same helper, so their parameter types count too.
-    let needs_strings = needs_err
-        || api_deep_any(api, &|t| is_string_type(t))
-        || listener_cbs.iter().any(|cb| {
-            cb.params
-                .iter()
-                .any(|p| typeref_deep_any(&p.ty, &is_string_type))
-        });
-    let needs_bytes = api_deep_any(api, &|t| {
-        matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes)
-    });
-    // `weaveffi_free_bytes` releases byte returns, list/map container
-    // buffers, and boxed optional-scalar returns.
-    let needs_free_bytes = needs_bytes
-        || api_deep_any(api, &|t| match t {
-            TypeRef::List(_) | TypeRef::Map(_, _) => true,
-            TypeRef::Optional(inner) => !weaveffi_core::codegen::common::is_c_pointer_type(inner),
-            _ => false,
-        });
-    let needs_str_array = api_deep_any(api, &|t| match t {
-        TypeRef::List(inner) => is_string_type(inner),
-        TypeRef::Map(k, v) => is_string_type(k) || is_string_type(v),
-        TypeRef::Iterator(inner) => is_string_type(inner),
-        _ => false,
-    });
-    // Async list/map results and listener callback arguments arrive borrowed:
-    // their string elements are read without freeing, through a separate
-    // helper.
-    let needs_borrowed_str_array = (has_async
-        && model
-            .modules
-            .iter()
-            .flat_map(ModuleBinding::callables)
-            .filter(|f| f.is_async)
-            .any(|f| async_ret_has_string_buffers(f.ret.as_ref())))
-        || listener_cbs.iter().any(|cb| {
-            cb.params
-                .iter()
-                .any(|p| async_ret_has_string_buffers(Some(&p.ty)))
+    let needs_strings = needs_err || api_deep_any(api, &is_string_type);
+    // Buffered values are staged and released exactly like bytes, so the byte
+    // helpers cover both.
+    let needs_bytes = needs_buf
+        || api_deep_any(api, &|t| {
+            matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes)
         });
     // Any iterator-returning callable pulls in the shared lazy-iterator
     // wrapper class.
@@ -2231,12 +2245,13 @@ fn render_wasm_js_stub(
         out.push_str("// Boundary conventions for a wasm32-unknown-unknown build:\n");
     }
     out.push_str("//\n");
-    out.push_str("//   Handles   -> i32 pointer into linear memory (0 = null/absent)\n");
+    out.push_str("//   Objects   -> i32 pointer into linear memory (0 = null/absent)\n");
     out.push_str("//   Enums     -> i32 discriminant value\n");
     out.push_str("//   i64/u64   -> JavaScript BigInt\n");
     out.push_str("//   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer\n");
     out.push_str("//   Bytes     -> i32 data pointer + i32 length (out_len for returns)\n");
-    out.push_str("//   Optionals -> null handle / null pointer (0); scalars boxed by pointer\n");
+    out.push_str("//   Buffered  -> records, rich enums, optionals, lists, and maps cross\n");
+    out.push_str("//                as one value buffer: i32 pointer + i32 length\n");
     out.push('\n');
 
     if needs_err {
@@ -2274,7 +2289,8 @@ fn render_wasm_js_stub(
     }
 
     if needs_bytes {
-        out.push_str("// Stage a byte buffer; returns [ptr, len]; release with _free(ptr, len).\n");
+        out.push_str("// Stage a byte buffer (or an encoded value buffer); returns [ptr, len];\n");
+        out.push_str("// release with weaveffi_dealloc(ptr, len).\n");
         out.push_str("function _bytes(wasm, data) {\n");
         out.push_str("  const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);\n");
         out.push_str("  const ptr = wasm.weaveffi_alloc(u8.length);\n");
@@ -2283,7 +2299,7 @@ fn render_wasm_js_stub(
         );
         out.push_str("  return [ptr, u8.length];\n");
         out.push_str("}\n\n");
-        out.push_str("// Copy then free a producer-owned byte buffer.\n");
+        out.push_str("// Copy then free a producer-owned byte (or value) buffer.\n");
         out.push_str("function _takeBytes(wasm, ptr, len) {\n");
         out.push_str("  if (ptr === 0 || len === 0) return new Uint8Array(0);\n");
         out.push_str("  const copy = new Uint8Array(wasm.memory.buffer, ptr, len).slice();\n");
@@ -2292,43 +2308,16 @@ fn render_wasm_js_stub(
         out.push_str("}\n\n");
     }
 
-    if needs_str_array {
-        out.push_str("// Decode an array of `len` C strings at `base`, freeing each string\n");
-        out.push_str("// after copying (the consumer owns the elements); the caller releases\n");
-        out.push_str("// the array container separately.\n");
-        out.push_str("function _takeStrArray(wasm, base, len) {\n");
-        out.push_str("  const out = [];\n");
-        out.push_str("  if (base === 0) return out;\n");
-        out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
-        out.push_str("  const ptrs = [];\n");
-        out.push_str(
-            "  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));\n",
-        );
-        out.push_str("  for (const p of ptrs) out.push(_takeCStr(wasm, p));\n");
-        out.push_str("  return out;\n");
-        out.push_str("}\n\n");
-    }
-
-    if needs_borrowed_str_array {
-        out.push_str("// Decode an array of `len` borrowed C strings at `base` without\n");
-        out.push_str("// freeing anything: async completion callbacks receive buffers the\n");
-        out.push_str("// producer owns and reclaims after the callback returns.\n");
-        out.push_str("function _readStrArray(wasm, base, len) {\n");
-        out.push_str("  const out = [];\n");
-        out.push_str("  if (base === 0) return out;\n");
-        out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
-        out.push_str(
-            "  for (let i = 0; i < len; i++) out.push(_readCStr(wasm, dv.getUint32(base + i * 4, true)));\n",
-        );
-        out.push_str("  return out;\n");
-        out.push_str("}\n\n");
+    if needs_buf {
+        emit_js_buffer_runtime(&mut out);
     }
 
     if needs_err {
-        out.push_str("// Allocate a zeroed {i32 code, i32 message} error slot.\n");
+        out.push_str("// Allocate a zeroed 16-byte error slot:\n");
+        out.push_str("// { i32 code, char* message, uint8_t* payload_ptr, size_t payload_len }.\n");
         out.push_str("function _allocErr(wasm) {\n");
-        out.push_str("  const ptr = wasm.weaveffi_alloc(8);\n");
-        out.push_str("  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);\n");
+        out.push_str("  const ptr = wasm.weaveffi_alloc(16);\n");
+        out.push_str("  new Uint8Array(wasm.memory.buffer, ptr, 16).fill(0);\n");
         out.push_str("  return ptr;\n");
         out.push_str("}\n\n");
         out.push_str("// Throw (and free the slot) if the error slot carries a non-zero code.\n");
@@ -2342,32 +2331,38 @@ fn render_wasm_js_stub(
         out.push_str("    const msgPtr = dv.getUint32(errPtr + 4, true);\n");
         out.push_str("    const msg = _readCStr(wasm, msgPtr) || '';\n");
         out.push_str("    wasm.weaveffi_error_clear(errPtr);\n");
-        out.push_str("    wasm.weaveffi_dealloc(errPtr, 8);\n");
+        out.push_str("    wasm.weaveffi_dealloc(errPtr, 16);\n");
         out.push_str(&format!("    throw new {ERROR_BRAND}(code, msg);\n"));
         out.push_str("  }\n");
         out.push_str("}\n\n");
         out.push_str("// Release an error slot on the success path.\n");
         out.push_str("function _freeErr(wasm, errPtr) {\n");
-        out.push_str("  wasm.weaveffi_dealloc(errPtr, 8);\n");
+        out.push_str("  wasm.weaveffi_dealloc(errPtr, 16);\n");
         out.push_str("}\n\n");
         emit_js_error_checkers(&mut out, model);
         if has_async {
             out.push_str("// Throw if a borrowed (producer-owned) error carries a non-zero\n");
             out.push_str("// code. Used by async callbacks: the producer owns and frees the\n");
             out.push_str("// error struct, so the slot is read but never deallocated here.\n");
-            out.push_str("// `mkErr` maps domain codes for throwing callables; without it the\n");
-            out.push_str(&format!("// generic {ERROR_BRAND} is thrown.\n"));
+            out.push_str("// `mkErr` maps domain codes (and decodes payload fields) for\n");
+            out.push_str(&format!(
+                "// throwing callables; without it the generic {ERROR_BRAND} is thrown.\n"
+            ));
             out.push_str("function _checkErrRef(wasm, errPtr, mkErr) {\n");
             out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
             out.push_str("  const code = dv.getInt32(errPtr, true);\n");
             out.push_str("  if (code === 0) return;\n");
-            out.push_str("  const msgPtr = dv.getUint32(errPtr + 4, true);\n");
-            out.push_str("  const msg = _readCStr(wasm, msgPtr) || '';\n");
-            out.push_str(&format!(
-                "  throw mkErr ? mkErr(code, msg) : new {ERROR_BRAND}(code, msg);\n"
-            ));
+            out.push_str("  const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';\n");
+            out.push_str(
+                "  if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));\n",
+            );
+            out.push_str(&format!("  throw new {ERROR_BRAND}(code, msg);\n"));
             out.push_str("}\n\n");
         }
+    }
+
+    if has_codecs {
+        emit_js_buffer_codecs(&mut out, model);
     }
 
     if has_iterators {
@@ -2381,22 +2376,22 @@ fn render_wasm_js_stub(
         out.push_str("// producer handle: JS has no finalization hook that is reliable across\n");
         out.push_str("// every target this loader supports.\n");
         out.push_str("class _WeaveFFIIterator {\n");
-        out.push_str("  constructor(wasm, handle, stride, callNext, destroy, check, decode) {\n");
+        out.push_str("  constructor(wasm, handle, slotSize, callNext, destroy, check, decode) {\n");
         out.push_str("    this._wasm = wasm;\n");
         out.push_str("    this._handle = handle;\n");
-        out.push_str("    this._stride = stride;\n");
+        out.push_str("    this._slotSize = slotSize;\n");
         out.push_str("    this._callNext = callNext;\n");
         out.push_str("    this._destroyFn = destroy;\n");
         out.push_str("    this._check = check;\n");
         out.push_str("    this._decode = decode;\n");
-        out.push_str("    this._slot = wasm.weaveffi_alloc(stride);\n");
+        out.push_str("    this._slot = wasm.weaveffi_alloc(slotSize);\n");
         out.push_str("  }\n");
         out.push_str("  // Destroy the handle and release the element slot exactly once.\n");
         out.push_str("  _close() {\n");
         out.push_str("    if (this._handle === 0) return;\n");
         out.push_str("    this._destroyFn(this._handle);\n");
         out.push_str("    this._handle = 0;\n");
-        out.push_str("    this._wasm.weaveffi_dealloc(this._slot, this._stride);\n");
+        out.push_str("    this._wasm.weaveffi_dealloc(this._slot, this._slotSize);\n");
         out.push_str("    this._slot = 0;\n");
         out.push_str("  }\n");
         out.push_str("  next() {\n");
@@ -2443,10 +2438,9 @@ fn render_wasm_js_stub(
 
     for (module, _path) in walk_modules_with_path(&api.modules) {
         for e in &module.enums {
-            // Rich (algebraic) enums cross the ABI as opaque object handles, so
-            // they are emitted as wrapper classes below, never as a plain
-            // by-value discriminant object (which would also collide with the
-            // class declaration of the same name).
+            // Rich (algebraic) enums are tagged plain-object unions handled by
+            // the buffer codecs; only C-style enums surface as a by-value
+            // discriminant object.
             if e.is_rich() {
                 continue;
             }
@@ -2455,17 +2449,6 @@ fn render_wasm_js_stub(
                 out.push_str(&format!("  {}: {},\n", v.name, v.value));
             }
             out.push_str("});\n\n");
-        }
-    }
-
-    for module in &model.modules {
-        for s in &module.structs {
-            emit_struct_class(&mut out, s);
-        }
-        for e in &module.enums {
-            if e.is_rich() {
-                emit_rich_enum_class(&mut out, e);
-            }
         }
     }
 
@@ -2509,9 +2492,8 @@ fn render_wasm_js_stub(
     out.push_str(" * // Primitive: plain numbers in, number out.\n");
     out.push_str(" * const sum = api.math.add(1, 2);\n");
     out.push_str(" *\n");
-    out.push_str(" * // Struct: returns a wrapper instance exposing field getters.\n");
-    out.push_str(" * const person = api.contacts.create();\n");
-    out.push_str(" * console.log(person.name);\n");
+    out.push_str(" * // Record: plain objects in and out (serialized automatically).\n");
+    out.push_str(" * const person = api.contacts.create({ name: 'Ada', age: 36 });\n");
     out.push_str(" *\n");
     out.push_str(" * // Enum: pass the integer discriminant.\n");
     out.push_str(" * api.ui.set_color(0); // 0 = first variant\n");
@@ -2556,7 +2538,7 @@ fn render_wasm_js_stub(
                     format!("{prefix}_free_string"),
                 ));
             }
-            if needs_free_bytes {
+            if needs_bytes {
                 bindings.push((
                     "weaveffi_free_bytes".to_string(),
                     format!("{prefix}_free_bytes"),
@@ -2634,15 +2616,15 @@ fn render_wasm_js_stub(
             out.push_str("  // holds the JS callback and the producer's subscription id.\n");
             out.push_str("  let _nextLsnId = 1;\n");
             out.push_str("  const _listeners = new Map();\n\n");
-            for cb in &listener_cbs {
-                emit_js_listener_trampoline(&mut out, cb, "  ");
+            for (path, cb) in &listener_cbs {
+                emit_js_listener_trampoline(&mut out, path, cb, "  ");
             }
             out.push('\n');
         }
 
         // Interface classes close over the loaded `wasm` instance (and the
         // async machinery above), so they live inside the loader rather than
-        // at module scope like the struct wrappers.
+        // at module scope like the value-type codecs.
         for module in &model.modules {
             for i in &module.interfaces {
                 emit_interface_class(&mut out, module, i, "  ", emscripten);
@@ -2662,19 +2644,17 @@ fn render_wasm_js_stub(
     out
 }
 
-/// Whether a module subtree exposes anything (functions, interface classes,
-/// or struct factories), so empty namespace objects are not emitted.
+/// Whether a module subtree exposes anything at runtime (functions, interface
+/// classes, or listeners), so empty namespace objects are not emitted.
+/// Records and rich enums contribute nothing here: they are plain value
+/// shapes with no runtime members.
 fn module_tree_has_content(
     m: &Module,
     path: &str,
     by_path: &HashMap<&str, &ModuleBinding>,
 ) -> bool {
     let here = by_path.get(path).is_some_and(|mb| {
-        !mb.functions.is_empty()
-            || !mb.interfaces.is_empty()
-            || !mb.structs.is_empty()
-            || !mb.listeners.is_empty()
-            || mb.enums.iter().any(|e| e.is_rich())
+        !mb.functions.is_empty() || !mb.interfaces.is_empty() || !mb.listeners.is_empty()
     });
     here || m
         .modules
@@ -2694,13 +2674,12 @@ fn render_js_module_object(
         return;
     }
     let mb = by_path[module_path];
-    let error = mb.error.as_ref();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.block(format!("{}: {{", m.name), "},", |w| {
         let inner = w.indent_str();
         for f in &mb.functions {
             let mut tmp = String::new();
-            emit_js_callable(&mut tmp, f, error, JsDecl::Object, None, &inner, emscripten);
+            emit_js_callable(&mut tmp, mb, f, JsDecl::Object, None, &inner, emscripten);
             w.raw(tmp);
         }
         for l in &mb.listeners {
@@ -2717,18 +2696,6 @@ fn render_js_module_object(
         for i in &mb.interfaces {
             w.line(format!("{}: {},", i.name, i.name));
         }
-        for s in &mb.structs {
-            let mut tmp = String::new();
-            emit_js_struct_factory(&mut tmp, s, &inner);
-            w.raw(tmp);
-        }
-        for e in &mb.enums {
-            if e.is_rich() {
-                let mut tmp = String::new();
-                emit_js_rich_enum_factory(&mut tmp, e, &inner);
-                w.raw(tmp);
-            }
-        }
         for sub in &m.modules {
             let sub_path = format!("{module_path}_{}", sub.name);
             let mut tmp = String::new();
@@ -2743,12 +2710,12 @@ fn render_js_module_object(
 /// iterator members return a lazy JS iterator, async members return a
 /// `Promise` (or an explicit throwing stub in Emscripten mode), and
 /// everything else is a plain synchronous wrapper. `self_arg` threads the
-/// instance handle for interface methods; `error` is the module's effective
-/// domain for the throws split.
+/// instance handle for interface methods; `mb` supplies the module's error
+/// domain for the throws split and the module path for codec references.
 fn emit_js_callable(
     out: &mut String,
+    mb: &ModuleBinding,
     f: &FnBinding,
-    error: Option<&ErrorBinding>,
     decl: JsDecl,
     self_arg: Option<&str>,
     indent: &str,
@@ -2756,11 +2723,11 @@ fn emit_js_callable(
 ) {
     match &f.shape {
         CallShape::Iterator(ib) => {
-            emit_js_iterator_function_wrapper(out, f, ib, error, decl, self_arg, indent);
+            emit_js_iterator_function_wrapper(out, mb, f, ib, decl, self_arg, indent);
         }
         _ if f.is_async && emscripten => emit_js_async_stub(out, f, decl, indent),
-        _ if f.is_async => emit_js_async_function_wrapper(out, f, error, decl, self_arg, indent),
-        _ => emit_js_function_wrapper(out, f, error, decl, self_arg, indent),
+        _ if f.is_async => emit_js_async_function_wrapper(out, mb, f, decl, self_arg, indent),
+        _ => emit_js_function_wrapper(out, mb, f, decl, self_arg, indent),
     }
 }
 
@@ -2810,13 +2777,13 @@ fn emit_js_listener_stub(out: &mut String, l: &ListenerBinding, indent: &str) {
     out.push_str(&w.finish());
 }
 
-/// Every callback typedef referenced by at least one listener, deduplicated
-/// by `c_fn_type` in declaration order. Each gets one long-lived trampoline
-/// in the wasm function table, shared by all of its subscriptions (the
-/// per-subscription context id disambiguates), so register/unregister churn
-/// never grows the table.
-fn collect_listener_callbacks(model: &BindingModel) -> Vec<&CallbackBinding> {
-    let mut cbs: Vec<&CallbackBinding> = Vec::new();
+/// Every callback typedef referenced by at least one listener, paired with
+/// its declaring module's path and deduplicated by `c_fn_type` in declaration
+/// order. Each gets one long-lived trampoline in the wasm function table,
+/// shared by all of its subscriptions (the per-subscription context id
+/// disambiguates), so register/unregister churn never grows the table.
+fn collect_listener_callbacks(model: &BindingModel) -> Vec<(&str, &CallbackBinding)> {
+    let mut cbs: Vec<(&str, &CallbackBinding)> = Vec::new();
     for m in &model.modules {
         for l in &m.listeners {
             let Some(cb) = m.callback(&l.event_callback) else {
@@ -2824,8 +2791,8 @@ fn collect_listener_callbacks(model: &BindingModel) -> Vec<&CallbackBinding> {
                 // in-module.
                 unreachable!("listener '{}' references unknown callback", l.name);
             };
-            if !cbs.iter().any(|c| c.c_fn_type == cb.c_fn_type) {
-                cbs.push(cb);
+            if !cbs.iter().any(|(_, c)| c.c_fn_type == cb.c_fn_type) {
+                cbs.push((m.path.as_str(), cb));
             }
         }
     }
@@ -2851,37 +2818,40 @@ fn js_listener_tramp_name(c_fn_type: &str) -> String {
     format!("_lsnPtr_{c_fn_type}")
 }
 
-/// Emit `const {target} = ...;` decoding one callback argument from its raw
-/// wasm slot values into the idiomatic JS value the subscriber sees.
+/// Emit the statements decoding one callback argument from its raw wasm slot
+/// values into the idiomatic JS value (bound to `target`) the subscriber
+/// sees.
 ///
 /// The producer owns every argument for the duration of the dispatch (the
 /// `emit_*` helper frees lowered payloads after the last subscriber returns),
-/// so this is the borrowing side of the marshalling table: strings and byte
-/// buffers are copied out of linear memory and never freed here, and opaque
-/// pointers (records, rich enums, interfaces) are wrapped without taking
-/// ownership.
+/// so this is the borrowing side of the marshalling table: strings, byte
+/// buffers, and buffered values are copied or decoded out of linear memory
+/// and never freed here, and interface pointers are wrapped without taking
+/// ownership. Assumes `wasm` in scope.
 fn emit_cb_param_decode(
     out: &mut String,
     indent: &str,
     ty: &TypeRef,
     slots: &[String],
     target: &str,
+    module: &str,
 ) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let a = &slots[0];
-    // Optional aggregates share the plain aggregate decoding: the readers
-    // decode a null base to an empty aggregate (matching the async path).
-    let ty = match ty {
-        TypeRef::Optional(inner)
-            if matches!(
-                inner.as_ref(),
-                TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _)
-            ) =>
-        {
-            inner.as_ref()
-        }
-        other => other,
-    };
+    if is_buffered(ty) {
+        let b = &slots[1];
+        w.line(format!(
+            "const {target}_b = ({a} === 0 || {b} === 0) ? new Uint8Array(0) : new Uint8Array(wasm.memory.buffer, {a}, {b}).slice();"
+        ));
+        w.line(format!("const {target}_r = new _BufReader({target}_b);"));
+        w.line(format!(
+            "const {target} = {};",
+            buf_read_expr(ty, module, &format!("{target}_r"))
+        ));
+        w.line(format!("{target}_r.end();"));
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::Bool => {
             w.line(format!("const {target} = {a} !== 0;"));
@@ -2897,6 +2867,7 @@ fn emit_cb_param_decode(
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
+        | TypeRef::TypedHandle(_)
         | TypeRef::Enum(_) => {
             w.line(format!("const {target} = {a};"));
         }
@@ -2909,67 +2880,23 @@ fn emit_cb_param_decode(
                 "const {target} = ({a} === 0 || {b} === 0) ? new Uint8Array(0) : new Uint8Array(wasm.memory.buffer, {a}, {b}).slice();"
             ));
         }
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let cls = local_type_name(name);
-            w.line(format!("const {target} = new {cls}(wasm, {a});"));
-        }
         TypeRef::Interface(name) => {
             let cls = local_type_name(name);
             w.line(format!("const {target} = {cls}._wrap({a});"));
         }
-        TypeRef::List(inner) => {
-            let mut tmp = String::new();
-            emit_read_list_into(
-                &mut tmp,
-                indent,
-                inner,
-                a,
-                &slots[1],
-                target,
-                ElemOwnership::Borrowed,
-            );
-            w.raw(tmp);
-        }
-        TypeRef::Map(k, v) => {
-            let mut tmp = String::new();
-            emit_read_map_into(
-                &mut tmp,
-                indent,
-                k,
-                v,
-                a,
-                &slots[1],
-                &slots[2],
-                target,
-                ElemOwnership::Borrowed,
-            );
-            w.raw(tmp);
-        }
+        // Only `Interface?` reaches here: a nullable borrowed object pointer.
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("const {target} = _readCStr(wasm, {a});"));
-            }
-            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-                let cls = local_type_name(name);
-                w.line(format!(
-                    "const {target} = {a} === 0 ? null : new {cls}(wasm, {a});"
-                ));
-            }
             TypeRef::Interface(name) => {
                 let cls = local_type_name(name);
                 w.line(format!(
                     "const {target} = {a} === 0 ? null : {cls}._wrap({a});"
                 ));
             }
-            scalar => {
-                // Boxed optional scalar: the box is borrowed, so dereference
-                // without freeing.
-                let read =
-                    wasm_read_scalar_elem(scalar, "new DataView(wasm.memory.buffer)", a, "0")
-                        .replace(&format!("{a} + 0 * {}", wasm_stride(scalar)), a);
-                w.line(format!("const {target} = {a} === 0 ? null : {read};"));
-            }
+            _ => unreachable!("non-interface optionals are buffered"),
         },
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
+        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
@@ -2980,8 +2907,9 @@ fn emit_cb_param_decode(
 /// (loader scope). The trampoline's wasm signature mirrors the callback's ABI
 /// slots (the trailing `void* context` slot carries the subscription's
 /// context id); it looks up the subscription, decodes each argument per the
-/// borrowing contract, and invokes the JS callback synchronously.
-fn emit_js_listener_trampoline(out: &mut String, cb: &CallbackBinding, indent: &str) {
+/// borrowing contract, and invokes the JS callback synchronously. `module` is
+/// the callback's declaring module path, used to resolve codec references.
+fn emit_js_listener_trampoline(out: &mut String, module: &str, cb: &CallbackBinding, indent: &str) {
     let tramp = js_listener_tramp_name(&cb.c_fn_type);
     let param_types: Vec<String> = cb
         .abi_params
@@ -3015,7 +2943,7 @@ fn emit_js_listener_trampoline(out: &mut String, cb: &CallbackBinding, indent: &
                 slot_idx += n;
                 let target = format!("_p{i}");
                 let mut tmp = String::new();
-                emit_cb_param_decode(&mut tmp, &inner, &p.ty, slots, &target);
+                emit_cb_param_decode(&mut tmp, &inner, &p.ty, slots, &target, module);
                 w.raw(tmp);
                 call_args.push(target);
             }
@@ -3058,43 +2986,6 @@ fn emit_js_listener_api(out: &mut String, l: &ListenerBinding, indent: &str) {
     out.push_str(&w.finish());
 }
 
-/// Expose a struct's `create(...)` and (when present) `builder()` on the module
-/// object, bound to the loaded `wasm` instance.
-fn emit_js_struct_factory(out: &mut String, s: &StructBinding, indent: &str) {
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.block(format!("{}: {{", s.name), "},", |w| {
-        w.line(format!(
-            "create: (...args) => {}.create(wasm, ...args),",
-            s.name
-        ));
-        if s.builder.is_some() {
-            w.line(format!("builder: () => new {}Builder(wasm),", s.name));
-        }
-    });
-    out.push_str(&w.finish());
-}
-
-/// Expose a rich (algebraic) enum on the module object: one per-variant factory
-/// (`api.shapes.Shape.circle(2.5)`) plus the `Tag` discriminant map
-/// (`api.shapes.Shape.Tag.Circle`), all bound to the loaded `wasm` instance.
-fn emit_js_rich_enum_factory(out: &mut String, e: &EnumBinding, indent: &str) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
-    let name = &e.name;
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.block(format!("{name}: {{"), "},", |w| {
-        for v in &rich.variants {
-            let factory = v.name.to_lower_camel_case();
-            w.line(format!(
-                "{factory}: (...args) => {name}.{factory}(wasm, ...args),"
-            ));
-        }
-        w.line(format!("Tag: {name}.Tag,"));
-    });
-    out.push_str(&w.finish());
-}
-
 /// Emit a synchronous function as a method `name(params) { ... }` at `indent`,
 /// staging idiomatic inputs, calling the C symbol, and decoding the return.
 /// `self_arg` (an expression such as `this._handle`) becomes the implicit
@@ -3102,8 +2993,8 @@ fn emit_js_rich_enum_factory(out: &mut String, e: &EnumBinding, indent: &str) {
 /// [`js_checker_name`] enforces the throws split on the out-err slot.
 fn emit_js_function_wrapper(
     out: &mut String,
+    mb: &ModuleBinding,
     f: &FnBinding,
-    error: Option<&ErrorBinding>,
     decl: JsDecl,
     self_arg: Option<&str>,
     indent: &str,
@@ -3132,6 +3023,7 @@ fn emit_js_function_wrapper(
             &p.ty,
             &js_param_name(p),
             &format!("a{i}"),
+            &mb.path,
             &mut args,
             &mut cleanup,
         );
@@ -3143,35 +3035,41 @@ fn emit_js_function_wrapper(
         &f.c_base,
         &args,
         &cleanup,
-        Some(&js_checker_name(f, error)),
+        &js_checker_name(f, mb.error.as_ref()),
+        &mb.path,
     );
     w.raw(inner);
     w.line(decl.close());
     out.push_str(&w.finish());
 }
 
-/// The single-expression `(w, p) => ...` closure converting one element out
-/// of an iterator's `next` slot at pointer `p`, applying the per-element
-/// release plan (`ElemFree`): a string is copied out of wasm memory and then
-/// freed with `{prefix}_free_string`, a record or rich-enum pointer is
-/// adopted by its wrapper class, an interface pointer by `_wrap`, and a
-/// by-value element is read directly.
-fn js_iter_decode_closure(elem: &TypeRef, stride: u32) -> String {
+/// The `(w, p) => ...` closure converting one element out of an iterator's
+/// `next` slot at pointer `p`, applying the per-element release plan: a
+/// string is copied out of wasm memory and freed with `free_string`, a bytes
+/// or buffered element is copied out of its `ptr` + `len` pair and freed with
+/// `free_bytes` (buffered elements are then decoded through the buffer
+/// reader), an interface pointer is adopted by `_wrap`, and a by-value
+/// element is read directly.
+fn js_iter_decode_closure(elem: &TypeRef, module: &str) -> String {
+    if is_buffered(elem) {
+        let read = buf_read_expr(elem, module, "_rd");
+        return format!(
+            "(w, p) => {{ const dv = new DataView(w.memory.buffer); const _rd = new _BufReader(_takeBytes(w, dv.getUint32(p, true), dv.getUint32(p + 4, true))); const _v = {read}; _rd.end(); return _v; }}"
+        );
+    }
     match elem {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             "(w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true))".into()
         }
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let cls = local_type_name(name);
-            format!("(w, p) => new {cls}(w, new DataView(w.memory.buffer).getInt32(p, true))")
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            "(w, p) => { const dv = new DataView(w.memory.buffer); return _takeBytes(w, dv.getUint32(p, true), dv.getUint32(p + 4, true)); }".into()
         }
         TypeRef::Interface(name) => {
             let cls = local_type_name(name);
-            format!("(w, p) => {cls}._wrap(new DataView(w.memory.buffer).getInt32(p, true))")
+            format!("(w, p) => {cls}._wrap(new DataView(w.memory.buffer).getUint32(p, true))")
         }
         scalar => {
-            let read = wasm_read_scalar_elem(scalar, "new DataView(w.memory.buffer)", "p", "0")
-                .replace(&format!("p + 0 * {stride}"), "p");
+            let read = read_scalar_at(scalar, "new DataView(w.memory.buffer)", "p");
             format!("(w, p) => {read}")
         }
     }
@@ -3187,16 +3085,16 @@ fn js_iter_decode_closure(elem: &TypeRef, stride: u32) -> String {
 /// throwing function's domain errors keep their typed class.
 fn emit_js_iterator_function_wrapper(
     out: &mut String,
+    mb: &ModuleBinding,
     f: &FnBinding,
     ib: &IteratorBinding,
-    error: Option<&ErrorBinding>,
     decl: JsDecl,
     self_arg: Option<&str>,
     indent: &str,
 ) {
     let body = format!("{indent}  ");
     let js_params: Vec<String> = f.params.iter().map(js_param_name).collect();
-    let checker = js_checker_name(f, error);
+    let checker = js_checker_name(f, mb.error.as_ref());
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
 
     if let Some(msg) = &f.deprecated {
@@ -3219,6 +3117,7 @@ fn emit_js_iterator_function_wrapper(
             &p.ty,
             &js_param_name(p),
             &format!("a{i}"),
+            &mb.path,
             &mut args,
             &mut cleanup,
         );
@@ -3227,8 +3126,20 @@ fn emit_js_iterator_function_wrapper(
         args.push("0".to_string());
     }
     args.push("_err".to_string());
-    let stride = wasm_stride(&ib.elem);
-    let decode = js_iter_decode_closure(&ib.elem, stride);
+    let slot_size = iter_slot_size(&ib.elem);
+    // A `ptr` + `len` element (bytes or buffered) writes through two out
+    // slots; the second lives 4 bytes past the first.
+    let two_slot =
+        is_buffered(&ib.elem) || matches!(ib.elem, TypeRef::Bytes | TypeRef::BorrowedBytes);
+    let next_call = if two_slot {
+        format!(
+            "(it, slot, ep) => wasm.{}(it, slot, slot + 4, ep),",
+            ib.next.symbol
+        )
+    } else {
+        format!("(it, slot, ep) => wasm.{}(it, slot, ep),", ib.next.symbol)
+    };
+    let decode = js_iter_decode_closure(&ib.elem, &mb.path);
     w.scope(|w| {
         w.raw(&staged);
         w.line("const _err = _allocErr(wasm);");
@@ -3242,11 +3153,10 @@ fn emit_js_iterator_function_wrapper(
         }
         w.line(format!("{checker}(wasm, _err);"));
         w.line("_freeErr(wasm, _err);");
-        w.line(format!("return new _WeaveFFIIterator(wasm, _it, {stride},"));
         w.line(format!(
-            "  (it, slot, ep) => wasm.{}(it, slot, ep),",
-            ib.next.symbol
+            "return new _WeaveFFIIterator(wasm, _it, {slot_size},"
         ));
+        w.line(format!("  {next_call}"));
         w.line(format!("  (it) => wasm.{}(it),", ib.destroy_symbol));
         w.line(format!("  {checker}, {decode});"));
     });
@@ -3255,65 +3165,54 @@ fn emit_js_iterator_function_wrapper(
 }
 
 /// The wasm callback param-type list for an async function with the given
-/// return: always `(ctx i32, err i32, ...result)`. Pointers/handles are i32 on
-/// wasm32; only `i64`/`u64` widen to i64.
+/// return: always `(ctx i32, err i32, ...result)`. Pointers are i32 on
+/// wasm32; only `i64`/`u64` widen to i64; a buffered result arrives as a
+/// borrowed `ptr` + `len` pair (two i32 slots).
 fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
     let mut params = vec!["i32", "i32"];
-    match returns {
-        None => {}
-        Some(
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::Bool
-            | TypeRef::Enum(_)
-            | TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Iterator(_),
-        ) => {
+    let Some(ty) = returns else {
+        return params;
+    };
+    if is_buffered(ty) {
+        params.push("i32");
+        params.push("i32");
+        return params;
+    }
+    match ty {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::Bool
+        | TypeRef::Enum(_)
+        | TypeRef::StringUtf8
+        | TypeRef::BorrowedStr
+        | TypeRef::Interface(_)
+        | TypeRef::TypedHandle(_)
+        | TypeRef::Iterator(_)
+        // Only `Interface?` reaches here: a nullable object pointer.
+        | TypeRef::Optional(_) => {
             params.push("i32");
         }
-        Some(TypeRef::I64 | TypeRef::U64 | TypeRef::Handle) => {
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => {
             params.push("i64");
         }
-        Some(TypeRef::F32) => {
+        TypeRef::F32 => {
             params.push("f32");
         }
-        Some(TypeRef::F64) => {
+        TypeRef::F64 => {
             params.push("f64");
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_)) => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             params.push("i32");
             params.push("i32");
         }
-        Some(TypeRef::Map(_, _)) => {
-            params.push("i32");
-            params.push("i32");
-            params.push("i32");
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::Map(_, _) => {
-                params.push("i32");
-                params.push("i32");
-                params.push("i32");
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-                params.push("i32");
-                params.push("i32");
-            }
-            // Record/rich-enum/interface/typed-handle (null pointer = absent),
-            // strings (nullable pointer), and every scalar including `handle`
-            // (boxed by pointer) all arrive as a single i32 pointer.
-            _ => params.push("i32"),
-        },
-        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     params
 }
@@ -3325,37 +3224,45 @@ fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
 /// completion callback rejects with the typed error.
 ///
 /// The unwrap runs inside the completion callback, so it follows the async
-/// borrowing contract: string, byte, and array buffers are producer-owned and
-/// valid only for the callback's duration, so they are deep-copied out of
-/// wasm memory and never freed here. Owned-object results (records, rich
-/// enums, interfaces) are the exception: the callback receives ownership and
-/// the pointer is adopted by its wrapper class.
-fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_err: Option<&str>) {
+/// borrowing contract: string, byte, and value buffers are producer-owned and
+/// valid only for the callback's duration, so they are deep-copied or decoded
+/// out of wasm memory and never freed here. Owned interface results are the
+/// exception: the callback receives ownership and the pointer is adopted by
+/// its wrapper class.
+fn emit_async_unwrap(
+    out: &mut String,
+    indent: &str,
+    ret: Option<&TypeRef>,
+    mk_err: Option<&str>,
+    module: &str,
+) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let base = match mk_err {
         Some(factory) => format!("resolve, reject, mkErr: {factory}"),
         None => "resolve, reject".to_string(),
     };
     let plain = format!("_asyncContexts.set(ctxId, {{ {base} }});");
-    // Optional aggregates share the plain aggregate decoding: the readers
-    // decode a null base to an empty aggregate.
-    let ret = match ret {
-        Some(TypeRef::Optional(inner))
-            if matches!(
-                inner.as_ref(),
-                TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _)
-            ) =>
-        {
-            Some(inner.as_ref())
-        }
-        other => other,
-    };
     let Some(ret) = ret else {
         w.line(plain);
         out.push_str(&w.finish());
         return;
     };
     let open = format!("_asyncContexts.set(ctxId, {{ {base}, unwrap: ");
+    if is_buffered(ret) {
+        // Borrowed: copy the encoding out of wasm memory inside the callback,
+        // decode, never free (the producer reclaims it afterwards).
+        w.block(format!("{open}(w, ptr, len) => {{"), "} });", |w| {
+            w.line(
+                "const _b = ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice();",
+            );
+            w.line("const _rd = new _BufReader(_b);");
+            w.line(format!("const _v = {};", buf_read_expr(ret, module, "_rd")));
+            w.line("_rd.end();");
+            w.line("return _v;");
+        });
+        out.push_str(&w.finish());
+        return;
+    }
     match ret {
         TypeRef::Bool => {
             w.line(format!("{open}(w, r) => r !== 0 }});"));
@@ -3371,6 +3278,7 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
         | TypeRef::F32
         | TypeRef::F64
         | TypeRef::Handle
+        | TypeRef::TypedHandle(_)
         | TypeRef::Enum(_) => {
             w.line(plain);
         }
@@ -3378,37 +3286,19 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
             // Borrowed: copy out of wasm memory, never free.
             w.line(format!("{open}(w, p) => _readCStr(w, p) }});"));
         }
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let cls = local_type_name(name);
-            w.line(format!("{open}(w, h) => new {cls}(w, h) }});"));
-        }
         TypeRef::Interface(name) => {
             let cls = local_type_name(name);
             w.line(format!("{open}(w, h) => {cls}._wrap(h) }});"));
         }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
         TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-                let cls = local_type_name(name);
-                w.line(format!(
-                    "{open}(w, h) => h === 0 ? null : new {cls}(w, h) }});"
-                ));
-            }
             TypeRef::Interface(name) => {
                 let cls = local_type_name(name);
                 w.line(format!(
                     "{open}(w, h) => h === 0 ? null : {cls}._wrap(h) }});"
                 ));
             }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("{open}(w, p) => _readCStr(w, p) }});"));
-            }
-            scalar => {
-                // Boxed optional scalar: the box is borrowed, so dereference
-                // without freeing.
-                let read = wasm_read_scalar_elem(scalar, "new DataView(w.memory.buffer)", "p", "0")
-                    .replace(&format!("p + 0 * {}", wasm_stride(scalar)), "p");
-                w.line(format!("{open}(w, p) => p === 0 ? null : {read} }});"));
-            }
+            _ => unreachable!("non-interface optionals are buffered"),
         },
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             // Borrowed: slice() deep-copies out of wasm memory, never free.
@@ -3416,46 +3306,11 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
                 "{open}(w, ptr, len) => ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice() }});"
             ));
         }
-        TypeRef::List(inner) => {
-            w.block(format!("{open}(w, base, len) => {{"), "} });", |w| {
-                w.line("const wasm = w;");
-                let ind = w.indent_str();
-                let mut tmp = String::new();
-                emit_read_list_into(
-                    &mut tmp,
-                    &ind,
-                    inner,
-                    "base",
-                    "len",
-                    "_out",
-                    ElemOwnership::Borrowed,
-                );
-                w.raw(tmp);
-                w.line("return _out;");
-            });
-        }
-        TypeRef::Map(k, v) => {
-            w.block(format!("{open}(w, ka, va, len) => {{"), "} });", |w| {
-                w.line("const wasm = w;");
-                let ind = w.indent_str();
-                let mut tmp = String::new();
-                emit_read_map_into(
-                    &mut tmp,
-                    &ind,
-                    k,
-                    v,
-                    "ka",
-                    "va",
-                    "len",
-                    "_out",
-                    ElemOwnership::Borrowed,
-                );
-                w.raw(tmp);
-                w.line("return _out;");
-            });
-        }
         TypeRef::Iterator(_) => {
             w.line(plain);
+        }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
@@ -3468,8 +3323,8 @@ fn emit_async_unwrap(out: &mut String, indent: &str, ret: Option<&TypeRef>, mk_e
 /// reject with the generic brand error only for panics.
 fn emit_js_async_function_wrapper(
     out: &mut String,
+    mb: &ModuleBinding,
     f: &FnBinding,
-    error: Option<&ErrorBinding>,
     decl: JsDecl,
     self_arg: Option<&str>,
     indent: &str,
@@ -3489,7 +3344,8 @@ fn emit_js_async_function_wrapper(
         &mut unwrap,
         &body2,
         f.ret.as_ref(),
-        js_err_factory(f, error).as_deref(),
+        js_err_factory(f, mb.error.as_ref()).as_deref(),
+        &mb.path,
     );
     let mut staged = String::new();
     let mut args: Vec<String> = self_arg.iter().map(ToString::to_string).collect();
@@ -3501,6 +3357,7 @@ fn emit_js_async_function_wrapper(
             &p.ty,
             &js_param_name(p),
             &format!("a{i}"),
+            &mb.path,
             &mut args,
             &mut cleanup,
         );
@@ -3540,10 +3397,9 @@ fn emit_js_async_function_wrapper(
 /// closing over the loaded `wasm` instance. The canonical `new` constructor
 /// maps to `constructor`; other constructors and statics are static methods;
 /// methods pass `this._handle` as the implicit leading `self` argument. The
-/// internal `_wrap(handle)` adopts an owned handle without invoking the
-/// constructor (mirroring the struct wrappers' raw `(wasm, handle)` path),
-/// and `free()` releases the handle exactly once via the destroy symbol,
-/// matching the rich-enum cleanup idiom.
+/// internal `_wrap(handle)` adopts an owned handle (returns, iterator
+/// elements) without invoking the constructor, and `free()` releases the
+/// handle exactly once via the destroy symbol.
 fn emit_interface_class(
     out: &mut String,
     module: &ModuleBinding,
@@ -3582,6 +3438,7 @@ fn emit_interface_class(
                             &p.ty,
                             &js_param_name(p),
                             &format!("a{idx}"),
+                            &module.path,
                             &mut args,
                             &mut cleanup,
                         );
@@ -3604,7 +3461,7 @@ fn emit_interface_class(
             );
         }
 
-        // Internal: adopt an owned handle (returns, list/iterator elements)
+        // Internal: adopt an owned handle (returns, iterator elements)
         // without running the constructor.
         w.block("static _wrap(handle) {", "}", |w| {
             w.line(format!("const _o = Object.create({cls}.prototype);"));
@@ -3622,15 +3479,23 @@ fn emit_interface_class(
 
         for c in i.constructors.iter().filter(|c| c.name != "new") {
             let mut tmp = String::new();
-            emit_js_callable(&mut tmp, c, error, JsDecl::Static, None, &inner, emscripten);
+            emit_js_callable(
+                &mut tmp,
+                module,
+                c,
+                JsDecl::Static,
+                None,
+                &inner,
+                emscripten,
+            );
             w.raw(tmp);
         }
         for m in &i.methods {
             let mut tmp = String::new();
             emit_js_callable(
                 &mut tmp,
+                module,
                 m,
-                error,
                 JsDecl::Method,
                 Some("this._handle"),
                 &inner,
@@ -3640,298 +3505,17 @@ fn emit_interface_class(
         }
         for s in &i.statics {
             let mut tmp = String::new();
-            emit_js_callable(&mut tmp, s, error, JsDecl::Static, None, &inner, emscripten);
-            w.raw(tmp);
-        }
-    });
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Emit the module-level `class` for a struct: constructor, field getters, a
-/// static `create(...)` factory, and `free()` releasing the producer-owned
-/// handle exactly once (the consumer owns every struct handle it receives).
-fn emit_struct_class(out: &mut String, s: &StructBinding) {
-    let cls = &s.name;
-    let mut w = CodeWriter::two_space();
-    w.block(format!("class {cls} {{"), "}", |w| {
-        w.block("constructor(wasm, handle) {", "}", |w| {
-            w.line("this._wasm = wasm;");
-            w.line("this._handle = handle;");
-        });
-        for field in &s.fields {
-            let mut tmp = String::new();
-            emit_struct_getter(&mut tmp, field);
-            w.raw(tmp);
-        }
-        let mut tmp = String::new();
-        emit_struct_create(&mut tmp, s);
-        w.raw(tmp);
-        // Explicit cleanup: release the producer-owned handle exactly once.
-        w.block("free() {", "}", |w| {
-            w.block("if (this._handle !== 0) {", "}", |w| {
-                w.line(format!("this._wasm.{}(this._handle);", s.destroy_symbol));
-                w.line("this._handle = 0;");
-            });
-        });
-    });
-    w.blank();
-    out.push_str(&w.finish());
-    if s.builder.is_some() {
-        emit_builder_class(out, s);
-    }
-}
-
-/// Emit the module-level `class` for a rich (algebraic) enum: an opaque-handle
-/// wrapper mirroring [`emit_struct_class`]. Adds a `tag` discriminant reader, a
-/// frozen `Tag` map (`Shape.Tag.Circle`), one static factory per variant
-/// (`Shape.circle(...)`), per-variant field getters namespaced in camelCase
-/// (`circleRadius`), and an explicit `free()` releasing the handle once. The
-/// constructor signature and `_handle` field match the struct wrapper, so the
-/// existing function-wrapper marshalling (`x._handle` in, `new Shape(wasm, r)`
-/// out; a rich enum crosses the ABI exactly like a record) works unchanged.
-fn emit_rich_enum_class(out: &mut String, e: &EnumBinding) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
-    let cls = &e.name;
-    let mut w = CodeWriter::two_space();
-    w.block(format!("class {cls} {{"), "}", |w| {
-        w.block("constructor(wasm, handle) {", "}", |w| {
-            w.line("this._wasm = wasm;");
-            w.line("this._handle = handle;");
-        });
-
-        // Active variant discriminant (an i32, comparable to the `Tag` members).
-        w.block("get tag() {", "}", |w| {
-            w.line("const wasm = this._wasm;");
-            let ind = w.indent_str();
-            let mut tmp = String::new();
-            emit_return_decode(
+            emit_js_callable(
                 &mut tmp,
-                &ind,
-                Some(&TypeRef::I32),
-                &rich.tag_symbol,
-                &["this._handle".to_string()],
-                &[],
+                module,
+                s,
+                JsDecl::Static,
                 None,
+                &inner,
+                emscripten,
             );
             w.raw(tmp);
-        });
-
-        // One static factory per variant (`Shape.circle(2.5)`).
-        for v in &rich.variants {
-            let mut tmp = String::new();
-            emit_rich_enum_factory(&mut tmp, &e.name, v);
-            w.raw(tmp);
         }
-
-        // Per-variant field getters, namespaced in camelCase to avoid collisions.
-        // Reuse the struct getter renderer by projecting the camelCase name onto the
-        // field's precomputed getter symbol (identical marshalling).
-        for v in &rich.variants {
-            for f in &v.fields {
-                let mut namespaced = f.clone();
-                namespaced.name = format!("{}_{}", v.name, f.name).to_lower_camel_case();
-                let mut tmp = String::new();
-                emit_struct_getter(&mut tmp, &namespaced);
-                w.raw(tmp);
-            }
-        }
-
-        // Explicit cleanup: release the producer-owned handle exactly once.
-        w.block("free() {", "}", |w| {
-            w.block("if (this._handle !== 0) {", "}", |w| {
-                w.line(format!("this._wasm.{}(this._handle);", rich.destroy_symbol));
-                w.line("this._handle = 0;");
-            });
-        });
-    });
-
-    // Frozen discriminant map (`Shape.Tag.Circle === 1`).
-    w.block(format!("{cls}.Tag = Object.freeze({{"), "});", |w| {
-        for v in &e.variants {
-            w.line(format!("{}: {},", v.name, v.value));
-        }
-    });
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Emit `static <variant>(wasm, <fields...>)` for one rich-enum variant: stage
-/// each associated-data field (reusing the struct-field input marshalling),
-/// invoke the variant constructor, and return the wrapped instance. A unit
-/// variant takes only `wasm`.
-fn emit_rich_enum_factory(out: &mut String, enum_name: &str, v: &RichVariantBinding) {
-    let factory = v.name.to_lower_camel_case();
-    let params: Vec<String> = v.fields.iter().map(|f| f.name.clone()).collect();
-    let sig = if params.is_empty() {
-        "wasm".to_string()
-    } else {
-        format!("wasm, {}", params.join(", "))
-    };
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.block(format!("static {factory}({sig}) {{"), "}", |w| {
-        let ind = w.indent_str();
-        let mut inner = String::new();
-        let mut args = Vec::new();
-        let mut cleanup = Vec::new();
-        for (i, f) in v.fields.iter().enumerate() {
-            emit_stage_input(
-                &mut inner,
-                &ind,
-                &f.ty,
-                &f.name,
-                &format!("a{i}"),
-                &mut args,
-                &mut cleanup,
-            );
-        }
-        let ret = TypeRef::RichEnum(enum_name.to_string());
-        emit_return_decode(
-            &mut inner,
-            &ind,
-            Some(&ret),
-            &v.create.symbol,
-            &args,
-            &cleanup,
-            Some("_checkErr"),
-        );
-        w.raw(inner);
-    });
-    out.push_str(&w.finish());
-}
-
-/// Emit one `get field() { ... }` accessor that decodes the C getter's return.
-fn emit_struct_getter(out: &mut String, field: &FieldBinding) {
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.block(format!("get {}() {{", field.name), "}", |w| {
-        w.line("const wasm = this._wasm;");
-        let ind = w.indent_str();
-        let mut tmp = String::new();
-        emit_return_decode(
-            &mut tmp,
-            &ind,
-            Some(&field.ty),
-            &field.getter_symbol,
-            &["this._handle".to_string()],
-            &[],
-            None,
-        );
-        w.raw(tmp);
-    });
-    out.push_str(&w.finish());
-}
-
-/// Emit `static create(wasm, <fields...>)` that stages every field and returns a
-/// wrapped instance.
-fn emit_struct_create(out: &mut String, s: &StructBinding) {
-    let params: Vec<String> = s.fields.iter().map(|f| f.name.clone()).collect();
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.block(
-        format!("static create(wasm, {}) {{", params.join(", ")),
-        "}",
-        |w| {
-            let ind = w.indent_str();
-            let mut inner = String::new();
-            let mut args = Vec::new();
-            let mut cleanup = Vec::new();
-            for (i, f) in s.fields.iter().enumerate() {
-                emit_stage_input(
-                    &mut inner,
-                    &ind,
-                    &f.ty,
-                    &f.name,
-                    &format!("a{i}"),
-                    &mut args,
-                    &mut cleanup,
-                );
-            }
-            let ret = TypeRef::Record(s.name.clone());
-            emit_return_decode(
-                &mut inner,
-                &ind,
-                Some(&ret),
-                &s.create.symbol,
-                &args,
-                &cleanup,
-                Some("_checkErr"),
-            );
-            w.raw(inner);
-        },
-    );
-    out.push_str(&w.finish());
-}
-
-/// Emit the fluent `class XBuilder` for a struct that opted into a builder.
-/// The builder is single-use: `build()` releases the builder handle via its
-/// destroy symbol (whether or not the build succeeds), so abandoning a
-/// builder before `build()` leaks the handle unless `free()` is called.
-fn emit_builder_class(out: &mut String, s: &StructBinding) {
-    let Some(b) = &s.builder else {
-        return;
-    };
-    let cls = &s.name;
-    let mut w = CodeWriter::two_space();
-    w.block(format!("class {cls}Builder {{"), "}", |w| {
-        w.block("constructor(wasm) {", "}", |w| {
-            w.line("this._wasm = wasm;");
-            w.line(format!("this._b = wasm.{}();", b.new_symbol));
-        });
-        for (field, (_fname, setter)) in s.fields.iter().zip(&b.setters) {
-            w.block(format!("{}(value) {{", field.name), "}", |w| {
-                w.line("const wasm = this._wasm;");
-                let ind = w.indent_str();
-                let mut args = vec!["this._b".to_string()];
-                let mut cleanup = Vec::new();
-                let mut staged = String::new();
-                emit_stage_input(
-                    &mut staged,
-                    &ind,
-                    &field.ty,
-                    "value",
-                    "a0",
-                    &mut args,
-                    &mut cleanup,
-                );
-                w.raw(staged);
-                w.line(format!("wasm.{}({});", setter, args.join(", ")));
-                for stmt in &cleanup {
-                    w.line(stmt);
-                }
-                w.line("return this;");
-            });
-        }
-        w.block("build() {", "}", |w| {
-            w.line("const wasm = this._wasm;");
-            let ind = w.indent_str();
-            let ret = TypeRef::Record(cls.clone());
-            let mut tmp = String::new();
-            // The builder handle is released right after the build call (the
-            // destroy symbol is valid whether or not the build succeeded), so
-            // a failed build cannot leak the builder.
-            emit_return_decode(
-                &mut tmp,
-                &ind,
-                Some(&ret),
-                &b.build_symbol,
-                &["this._b".to_string()],
-                &[
-                    format!("wasm.{}(this._b);", b.destroy_symbol),
-                    "this._b = 0;".to_string(),
-                ],
-                Some("_checkErr"),
-            );
-            w.raw(tmp);
-        });
-        // Explicit cleanup for an abandoned builder: release the handle
-        // exactly once (a completed build() has already released it).
-        w.block("free() {", "}", |w| {
-            w.block("if (this._b !== 0) {", "}", |w| {
-                w.line(format!("this._wasm.{}(this._b);", b.destroy_symbol));
-                w.line("this._b = 0;");
-            });
-        });
     });
     w.blank();
     out.push_str(&w.finish());
@@ -3946,7 +3530,7 @@ mod tests {
 
     fn empty_api() -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![],
             generators: None,
             package: None,
@@ -3955,7 +3539,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -4009,25 +3593,67 @@ mod tests {
         render_wasm_readme(api, &model, prefix, input_basename, emscripten)
     }
 
+    fn field(name: &str, ty: TypeRef) -> StructField {
+        StructField {
+            name: name.into(),
+            ty,
+            doc: None,
+            default: None,
+        }
+    }
+
+    fn member(
+        name: &str,
+        params: Vec<Param>,
+        returns: Option<TypeRef>,
+        throws: bool,
+        is_async: bool,
+    ) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            throws,
+            r#async: is_async,
+            cancellable: is_async,
+            deprecated: None,
+            since: None,
+        }
+    }
+
+    fn param(name: &str, ty: TypeRef) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        }
+    }
+
+    fn str_param(name: &str) -> Param {
+        param(name, TypeRef::StringUtf8)
+    }
+
+    fn module(name: &str) -> Module {
+        Module {
+            name: name.into(),
+            functions: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }
+    }
+
     fn sample_api() -> Api {
         make_api(vec![Module {
-            name: "math".into(),
             functions: vec![Function {
                 name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
+                params: vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
                 returns: Some(TypeRef::I32),
                 doc: Some("Add two numbers".into()),
                 throws: false,
@@ -4039,21 +3665,7 @@ mod tests {
             structs: vec![StructDef {
                 name: "Point".into(),
                 doc: Some("A 2D point".into()),
-                fields: vec![
-                    StructField {
-                        name: "x".into(),
-                        ty: TypeRef::F64,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "y".into(),
-                        ty: TypeRef::F64,
-                        doc: None,
-                        default: None,
-                    },
-                ],
-                builder: false,
+                fields: vec![field("x", TypeRef::F64), field("y", TypeRef::F64)],
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -4079,11 +3691,7 @@ mod tests {
                     },
                 ],
             }],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("math")
         }])
     }
 
@@ -4092,33 +3700,10 @@ mod tests {
     /// stubbed in Emscripten mode).
     fn listener_api() -> Api {
         make_api(vec![Module {
-            name: "events".into(),
-            functions: vec![Function {
-                name: "send".into(),
-                params: vec![Param {
-                    name: "text".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![],
-            enums: vec![],
+            functions: vec![member("send", vec![str_param("text")], None, false, false)],
             callbacks: vec![weaveffi_ir::ir::CallbackDef {
                 name: "OnMessage".into(),
-                params: vec![Param {
-                    name: "message".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![str_param("message")],
                 doc: None,
             }],
             listeners: vec![weaveffi_ir::ir::ListenerDef {
@@ -4126,9 +3711,7 @@ mod tests {
                 event_callback: "OnMessage".into(),
                 doc: None,
             }],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("events")
         }])
     }
 
@@ -4202,6 +3785,7 @@ mod tests {
         assert!(readme.contains("### Callbacks and Listeners"), "{readme}");
         assert!(readme.contains("synchronous"), "{readme}");
         assert!(readme.contains("subscription id"), "{readme}");
+        assert!(readme.contains("buffered values"), "{readme}");
         assert!(!readme.contains("## Unsupported Features"), "{readme}");
     }
 
@@ -4258,11 +3842,13 @@ mod tests {
     }
 
     #[test]
-    fn readme_documents_structs() {
+    fn readme_documents_records_as_plain_objects() {
         let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
-        assert!(readme.contains("### Structs"));
-        assert!(readme.contains("opaque handles"));
-        assert!(readme.contains("`i64` pointers"));
+        assert!(readme.contains("### Records"));
+        assert!(readme.contains("plain JavaScript objects"));
+        assert!(readme.contains("value-buffer format"));
+        assert!(readme.contains("nothing to free"));
+        assert!(!readme.contains("opaque handles"));
     }
 
     #[test]
@@ -4271,14 +3857,16 @@ mod tests {
         assert!(readme.contains("### Enums"));
         assert!(readme.contains("`i32` values"));
         assert!(readme.contains("discriminant"));
+        assert!(readme.contains("tagged by variant name"));
     }
 
     #[test]
     fn readme_documents_optionals() {
         let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Optionals"));
-        assert!(readme.contains("`0` / `null`"));
-        assert!(readme.contains("boxed by pointer"));
+        assert!(readme.contains("`null`"));
+        assert!(readme.contains("presence flag"));
+        assert!(readme.contains("nullable object pointer"));
     }
 
     #[test]
@@ -4291,11 +3879,22 @@ mod tests {
     }
 
     #[test]
-    fn readme_documents_lists() {
+    fn readme_documents_lists_and_maps() {
         let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
-        assert!(readme.contains("### Lists"));
+        assert!(readme.contains("### Lists and Maps"));
+        assert!(readme.contains("serialized in a value buffer"));
         assert!(readme.contains("pointer + length"));
-        assert!(readme.contains("`i32` pointer, `i32` length"));
+    }
+
+    #[test]
+    fn readme_documents_error_struct_layout_and_payloads() {
+        let readme = readme_for(&empty_api(), "weaveffi", "weaveffi.yml", false);
+        assert!(readme.contains("16 bytes on wasm32"), "{readme}");
+        assert!(readme.contains("payload_ptr"), "{readme}");
+        assert!(
+            readme.contains("decodes them from the error's value"),
+            "{readme}"
+        );
     }
 
     #[test]
@@ -4323,7 +3922,7 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        assert!(js.contains("Struct: returns a wrapper instance exposing field getters."));
+        assert!(js.contains("Record: plain objects in and out (serialized automatically)."));
         assert!(js.contains("Enum: pass the integer discriminant."));
         assert!(js.contains("Optional: pass null to omit, a value to provide."));
         assert!(js.contains("List/Map: pass arrays/objects; receive arrays/objects."));
@@ -4339,10 +3938,11 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        assert!(js.contains("Handles   -> i32 pointer into linear memory (0 = null/absent)"));
+        assert!(js.contains("Objects   -> i32 pointer into linear memory (0 = null/absent)"));
         assert!(js.contains("Enums     -> i32 discriminant value"));
-        assert!(js.contains("Optionals -> null handle / null pointer (0)"));
-        assert!(js.contains("Bytes     -> i32 data pointer + i32 length"));
+        assert!(js.contains("Bytes     -> i32 data pointer + i32 length (out_len for returns)"));
+        assert!(js.contains("Buffered  -> records, rich enums, optionals, lists, and maps cross"));
+        assert!(js.contains("as one value buffer: i32 pointer + i32 length"));
     }
 
     #[test]
@@ -4405,12 +4005,14 @@ mod tests {
     }
 
     #[test]
-    fn api_reference_struct_accessors() {
+    fn api_reference_struct_fields() {
         let readme = readme_for(&sample_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("##### `Point`"));
-        assert!(readme.contains("opaque handle (`i64`)"));
-        assert!(readme.contains("| `weaveffi_math_Point_get_x` | `f64` |"));
-        assert!(readme.contains("| `weaveffi_math_Point_get_y` | `f64` |"));
+        assert!(readme.contains("A plain JS object, serialized in a value buffer"));
+        assert!(readme.contains("| `x` | `f64` |"));
+        assert!(readme.contains("| `y` | `f64` |"));
+        // Records declare no C symbols: no getters, no create, no destroy.
+        assert!(!readme.contains("weaveffi_math_Point"), "{readme}");
     }
 
     #[test]
@@ -4430,11 +4032,13 @@ mod tests {
         assert_eq!(wasm_type(&TypeRef::I64), "i64");
         assert_eq!(wasm_type(&TypeRef::F64), "f64");
         assert_eq!(wasm_type(&TypeRef::Bool), "i32");
-        assert_eq!(wasm_type(&TypeRef::StringUtf8), "i32, i32");
+        // A string is a single NUL-terminated C string pointer.
+        assert_eq!(wasm_type(&TypeRef::StringUtf8), "i32");
         assert_eq!(wasm_type(&TypeRef::Bytes), "i32, i32");
         assert_eq!(wasm_type(&TypeRef::Handle), "i64");
-        assert_eq!(wasm_type(&TypeRef::Record("Foo".into())), "i64");
-        assert_eq!(wasm_type(&TypeRef::RichEnum("Shape".into())), "i64");
+        // Buffered value types cross as one ptr + len pair.
+        assert_eq!(wasm_type(&TypeRef::Record("Foo".into())), "i32, i32");
+        assert_eq!(wasm_type(&TypeRef::RichEnum("Shape".into())), "i32, i32");
         assert_eq!(wasm_type(&TypeRef::Enum("Bar".into())), "i32");
         assert_eq!(
             wasm_type(&TypeRef::List(Box::new(TypeRef::I32))),
@@ -4445,14 +4049,23 @@ mod tests {
                 Box::new(TypeRef::StringUtf8),
                 Box::new(TypeRef::I32)
             )),
-            "i64"
+            "i32, i32"
         );
         assert_eq!(
             wasm_type(&TypeRef::Optional(Box::new(TypeRef::Record("Foo".into())))),
-            "i64"
+            "i32, i32"
         );
-        // Optional scalars are boxed by pointer: one i32 slot.
-        assert_eq!(wasm_type(&TypeRef::Optional(Box::new(TypeRef::I32))), "i32");
+        assert_eq!(
+            wasm_type(&TypeRef::Optional(Box::new(TypeRef::I32))),
+            "i32, i32"
+        );
+        // The one non-buffered optional: a nullable interface pointer.
+        assert_eq!(
+            wasm_type(&TypeRef::Optional(Box::new(TypeRef::Interface("S".into())))),
+            "i32"
+        );
+        assert_eq!(wasm_type(&TypeRef::TypedHandle("Contact".into())), "i32");
+        assert_eq!(wasm_type(&TypeRef::Interface("Store".into())), "i32");
     }
 
     #[test]
@@ -4462,15 +4075,15 @@ mod tests {
         assert_eq!(wasm_type_note(&TypeRef::Bool), "0 = false, 1 = true");
         assert_eq!(
             wasm_type_note(&TypeRef::StringUtf8),
-            "ptr + len in linear memory"
+            "NUL-terminated C string pointer"
         );
         assert_eq!(
             wasm_type_note(&TypeRef::Record("X".into())),
-            "opaque handle in linear memory"
+            "value buffer: ptr + len in linear memory"
         );
         assert_eq!(
             wasm_type_note(&TypeRef::RichEnum("X".into())),
-            "opaque handle in linear memory"
+            "value buffer: ptr + len in linear memory"
         );
         assert_eq!(
             wasm_type_note(&TypeRef::Enum("E".into())),
@@ -4478,11 +4091,15 @@ mod tests {
         );
         assert_eq!(
             wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::Record("S".into())))),
-            "opaque handle, 0 = absent"
+            "value buffer: ptr + len in linear memory"
         );
         assert_eq!(
             wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::I32))),
-            "boxed scalar pointer, 0 = absent"
+            "value buffer: ptr + len in linear memory"
+        );
+        assert_eq!(
+            wasm_type_note(&TypeRef::Optional(Box::new(TypeRef::Interface("S".into())))),
+            "nullable object pointer, 0 = absent"
         );
     }
 
@@ -4509,88 +4126,55 @@ mod tests {
         );
     }
 
-    #[test]
-    fn api_reference_complex_types() {
-        let api = make_api(vec![Module {
-            name: "contacts".into(),
-            functions: vec![Function {
-                name: "find".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
+    /// A `contacts` module with a string-to-optional-record lookup, reused by
+    /// the API-reference and marshalling tests.
+    fn contacts_api() -> Api {
+        make_api(vec![Module {
+            functions: vec![member(
+                "find",
+                vec![str_param("name")],
+                Some(TypeRef::Optional(Box::new(TypeRef::Record(
                     "Contact".into(),
                 )))),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+                false,
+                false,
+            )],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
                 fields: vec![
-                    StructField {
-                        name: "id".into(),
-                        ty: TypeRef::I32,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    },
+                    field("id", TypeRef::I32),
+                    field("name", TypeRef::StringUtf8),
                 ],
-                builder: false,
             }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
-        }]);
-        let readme = readme_for(&api, "weaveffi", "weaveffi.yml", false);
-        assert!(readme.contains("| `name` | `string` | `i32, i32` | ptr + len in linear memory |"));
-        assert!(readme.contains("| _returns_ | `Contact?` | `i64` | opaque handle, 0 = absent |"));
-        assert!(readme.contains("| `weaveffi_contacts_Contact_get_id` | `i32` |"));
-        assert!(readme.contains("| `weaveffi_contacts_Contact_get_name` | `i32, i32` |"));
+            ..module("contacts")
+        }])
+    }
+
+    #[test]
+    fn api_reference_complex_types() {
+        let readme = readme_for(&contacts_api(), "weaveffi", "weaveffi.yml", false);
+        assert!(
+            readme.contains("| `name` | `string` | `i32` | NUL-terminated C string pointer |"),
+            "{readme}"
+        );
+        assert!(
+            readme.contains(
+                "| _returns_ | `Contact?` | `i32, i32` | value buffer: ptr + len in linear memory |"
+            ),
+            "{readme}"
+        );
+        assert!(
+            !readme.contains("weaveffi_contacts_Contact_get"),
+            "{readme}"
+        );
     }
 
     #[test]
     fn api_reference_void_return() {
         let api = make_api(vec![Module {
-            name: "io".into(),
-            functions: vec![Function {
-                name: "print".into(),
-                params: vec![Param {
-                    name: "msg".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            functions: vec![member("print", vec![str_param("msg")], None, false, false)],
+            ..module("io")
         }]);
         let readme = readme_for(&api, "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("-> void`"));
@@ -4599,30 +4183,7 @@ mod tests {
 
     #[test]
     fn api_reference_multiple_modules() {
-        let api = make_api(vec![
-            Module {
-                name: "math".into(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                interfaces: vec![],
-                modules: vec![],
-            },
-            Module {
-                name: "io".into(),
-                functions: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                interfaces: vec![],
-                modules: vec![],
-            },
-        ]);
+        let api = make_api(vec![module("math"), module("io")]);
         let readme = readme_for(&api, "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("### Module: `math`"));
         assert!(readme.contains("### Module: `io`"));
@@ -4660,17 +4221,46 @@ mod tests {
         );
         assert!(js.contains("add(a, b)"));
         assert!(js.contains("wasm.weaveffi_math_add(a, b, _err)"));
-        assert!(js.contains("class Point"));
-        assert!(js.contains("get x()"));
-        assert!(js.contains("get y()"));
-        assert!(js.contains("weaveffi_math_Point_get_x"));
-        assert!(js.contains("weaveffi_math_Point_get_y"));
+        // The record is a plain value shape: codecs at module scope, no
+        // wrapper class, no getters, no module-object factory.
+        assert!(js.contains("function _write_math_Point(w, v) {"), "{js}");
+        assert!(js.contains("function _read_math_Point(r) {"), "{js}");
+        assert!(js.contains("w.f64(v.x);"), "{js}");
+        assert!(js.contains("v.x = r.f64();"), "{js}");
+        assert!(!js.contains("class Point"), "{js}");
+        assert!(!js.contains("get x()"), "{js}");
+        assert!(!js.contains("Point: {"), "{js}");
         assert!(js.contains("export const Color = Object.freeze("));
         assert!(js.contains("Red: 0"));
         assert!(js.contains("Green: 1"));
         assert!(js.contains("Blue: 2"));
         assert!(js.contains("_raw: wasm"));
         assert!(js.contains("math: {"));
+    }
+
+    #[test]
+    fn wasm_js_emits_buffer_runtime_when_records_present() {
+        let js = js_stub_for(
+            &sample_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi",
+            "weaveffi.yml",
+            "weaveffi_wasm.js",
+            false,
+        );
+        assert!(js.contains("class _BufWriter {"), "{js}");
+        assert!(js.contains("class _BufReader {"), "{js}");
+        // The reader is strict: little-endian DataView reads plus validation.
+        assert!(js.contains("truncated"), "{js}");
+        assert!(js.contains("bool byte out of range"), "{js}");
+        assert!(js.contains("option flag byte out of range"), "{js}");
+        assert!(
+            js.contains("length prefix exceeds remaining buffer"),
+            "{js}"
+        );
+        assert!(js.contains("trailing bytes after value"), "{js}");
+        assert!(js.contains("string is not valid UTF-8"), "{js}");
+        assert!(js.contains("{ fatal: true }"), "{js}");
     }
 
     #[test]
@@ -4689,9 +4279,12 @@ mod tests {
             "export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>"
         ));
         assert!(dts.contains("add(a: number, b: number): number"));
+        // Records are plain object interfaces: mutable fields, no free().
         assert!(dts.contains("export interface Point"));
-        assert!(dts.contains("readonly x: number"));
-        assert!(dts.contains("readonly y: number"));
+        assert!(dts.contains("  x: number;"));
+        assert!(dts.contains("  y: number;"));
+        assert!(!dts.contains("readonly x"));
+        assert!(!dts.contains("free(): void;"));
         assert!(dts.contains("export declare const Color"));
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4700,30 +4293,14 @@ mod tests {
     #[test]
     fn wasm_js_has_string_helpers() {
         let api = make_api(vec![Module {
-            name: "greeting".into(),
-            functions: vec![Function {
-                name: "greet".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::StringUtf8),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            functions: vec![member(
+                "greet",
+                vec![str_param("name")],
+                Some(TypeRef::StringUtf8),
+                false,
+                false,
+            )],
+            ..module("greeting")
         }]);
         let js = js_stub_for(
             &api,
@@ -4757,6 +4334,9 @@ mod tests {
         );
         assert!(js.contains("function _allocErr(wasm)"));
         assert!(js.contains("function _checkErr(wasm, errPtr)"));
+        // The slot is the 16-byte error struct with payload fields.
+        assert!(js.contains("wasm.weaveffi_alloc(16)"));
+        assert!(js.contains("wasm.weaveffi_dealloc(errPtr, 16);"));
     }
 
     #[test]
@@ -4823,40 +4403,19 @@ mod tests {
     #[test]
     fn wasm_typed_handle_type() {
         let api = make_api(vec![Module {
-            name: "contacts".into(),
-            functions: vec![Function {
-                name: "get_info".into(),
-                params: vec![Param {
-                    name: "contact".into(),
-                    ty: TypeRef::TypedHandle("Contact".into()),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            functions: vec![member(
+                "get_info",
+                vec![param("contact", TypeRef::TypedHandle("Contact".into()))],
+                None,
+                false,
+                false,
+            )],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("contacts")
         }]);
         let dts = dts_for(
             &api,
@@ -4866,8 +4425,8 @@ mod tests {
             false,
         );
         assert!(
-            dts.contains("contact: Contact"),
-            "TypedHandle should use class type not bigint: {dts}"
+            dts.contains("contact: number"),
+            "TypedHandle is an opaque i32 pointer surfaced as number: {dts}"
         );
         let js = js_stub_for(
             &api,
@@ -4878,50 +4437,33 @@ mod tests {
             false,
         );
         assert!(
-            js.contains("contact._handle"),
-            "TypedHandle should extract ._handle: {js}"
+            js.contains("wasm.weaveffi_contacts_get_info(contact, _err)"),
+            "TypedHandle passes through unwrapped: {js}"
         );
+        assert!(!js.contains("contact._handle"), "{js}");
     }
 
     #[test]
     fn wasm_deeply_nested_optional() {
         let api = make_api(vec![Module {
-            name: "edge".into(),
-            functions: vec![Function {
-                name: "process".into(),
-                params: vec![Param {
-                    name: "data".into(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
+            functions: vec![member(
+                "process",
+                vec![param(
+                    "data",
+                    TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
                         Box::new(TypeRef::Record("Contact".into())),
                     ))))),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+                )],
+                None,
+                false,
+                false,
+            )],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("edge")
         }]);
         let dts = dts_for(
             &api,
@@ -4939,33 +4481,20 @@ mod tests {
     #[test]
     fn wasm_map_of_lists() {
         let api = make_api(vec![Module {
-            name: "edge".into(),
-            functions: vec![Function {
-                name: "process".into(),
-                params: vec![Param {
-                    name: "scores".into(),
-                    ty: TypeRef::Map(
+            functions: vec![member(
+                "process",
+                vec![param(
+                    "scores",
+                    TypeRef::Map(
                         Box::new(TypeRef::StringUtf8),
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+                )],
+                None,
+                false,
+                false,
+            )],
+            ..module("edge")
         }]);
         let dts = dts_for(
             &api,
@@ -4983,36 +4512,23 @@ mod tests {
     #[test]
     fn wasm_enum_keyed_map() {
         let api = make_api(vec![Module {
-            name: "edge".into(),
-            functions: vec![Function {
-                name: "process".into(),
-                params: vec![Param {
-                    name: "contacts".into(),
-                    ty: TypeRef::Map(
+            functions: vec![member(
+                "process",
+                vec![param(
+                    "contacts",
+                    TypeRef::Map(
                         Box::new(TypeRef::Enum("Color".into())),
                         Box::new(TypeRef::Record("Contact".into())),
                     ),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+                )],
+                None,
+                false,
+                false,
+            )],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -5030,19 +4546,9 @@ mod tests {
                         doc: None,
                         fields: vec![],
                     },
-                    EnumVariant {
-                        name: "Blue".into(),
-                        value: 2,
-                        doc: None,
-                        fields: vec![],
-                    },
                 ],
             }],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("edge")
         }]);
         let dts = dts_for(
             &api,
@@ -5057,142 +4563,213 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wasm_no_double_free_on_error() {
-        let api = make_api(vec![Module {
-            name: "contacts".into(),
-            functions: vec![Function {
-                name: "find_contact".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Record("Contact".into())),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+    /// A one-function API returning a record, exercising both the buffered
+    /// parameter staging and the buffered return decode.
+    fn record_roundtrip_api() -> Api {
+        make_api(vec![Module {
+            functions: vec![member(
+                "save",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                Some(TypeRef::Record("Contact".into())),
+                false,
+                false,
+            )],
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
+                fields: vec![field("name", TypeRef::StringUtf8)],
             }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
-        }]);
-        let js = js_stub_for(
-            &api,
-            DEFAULT_MODULE_NAME,
-            "weaveffi",
-            "weaveffi.yml",
-            "weaveffi_wasm.js",
-            false,
+            ..module("contacts")
+        }])
+    }
+
+    #[test]
+    fn buffered_param_staged_like_bytes_and_deallocated() {
+        let js = js_for_api(&record_roundtrip_api());
+        // Encode into a _BufWriter, stage via _bytes (weaveffi_alloc + copy),
+        // pass (ptr, len), dealloc after the call.
+        assert!(js.contains("const a0_w = new _BufWriter();"), "{js}");
+        assert!(
+            js.contains("_write_contacts_Contact(a0_w, contact);"),
+            "{js}"
         );
         assert!(
-            js.contains("_cstr(wasm, name)"),
-            "string param should be copied to Wasm memory via _cstr"
+            js.contains("const [a0_p, a0_l] = _bytes(wasm, a0_w.finish());"),
+            "{js}"
         );
         assert!(
-            !js.contains("free(name"),
-            "caller must not free the JS string input"
+            js.contains("wasm.weaveffi_contacts_save(a0_p, a0_l, _lp, _err);"),
+            "{js}"
         );
-        let check_err = js
-            .find("_checkErr(wasm, _err)")
-            .expect("_checkErr(wasm, _err) should appear in generated JS");
-        let return_contact = js
-            .find("return new Contact(")
-            .expect("return new Contact( should appear for struct return");
+        let call = js.find("wasm.weaveffi_contacts_save(").unwrap();
+        let dealloc = js.find("wasm.weaveffi_dealloc(a0_p, a0_l);").unwrap();
+        assert!(call < dealloc, "staged encoding freed after the call: {js}");
+    }
+
+    #[test]
+    fn buffered_return_read_decoded_and_freed() {
+        let js = js_for_api(&record_roundtrip_api());
+        // The trailing out_len slot is allocated before the call and read
+        // (then released) afterwards.
+        assert!(js.contains("const _lp = wasm.weaveffi_alloc(4);"), "{js}");
         assert!(
-            check_err < return_contact,
-            "errors must be checked before constructing the result wrapper"
+            js.contains("const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);"),
+            "{js}"
+        );
+        assert!(js.contains("wasm.weaveffi_dealloc(_lp, 4);"), "{js}");
+        // The buffer is copied out and freed by _takeBytes, then decoded
+        // strictly (end() rejects trailing bytes).
+        assert!(
+            js.contains("const _rd = new _BufReader(_takeBytes(wasm, _r, _len));"),
+            "{js}"
         );
         assert!(
-            js.contains("class Contact {\n  constructor(wasm, handle) {"),
-            "struct returns should use a handle wrapper class"
+            js.contains("const _out = _read_contacts_Contact(_rd);"),
+            "{js}"
+        );
+        assert!(js.contains("_rd.end();"), "{js}");
+        assert!(js.contains("function _takeBytes(wasm, ptr, len)"), "{js}");
+        assert!(js.contains("wasm.weaveffi_free_bytes(ptr, len);"), "{js}");
+        // Errors are checked before the result is decoded, and no wrapper
+        // class exists for the record.
+        let check = js.find("_checkErr(wasm, _err)").expect("error check");
+        let decode = js
+            .find("const _out = _read_contacts_Contact(_rd);")
+            .expect("record decode");
+        assert!(check < decode, "errors checked before decoding: {js}");
+        assert!(!js.contains("class Contact"), "{js}");
+    }
+
+    #[test]
+    fn optional_record_return_uses_presence_flag() {
+        let js = js_for_api(&contacts_api());
+        // An optional record is buffered: a one-byte flag, then the value.
+        assert!(
+            js.contains("const _out = (_rd.flag() ? _read_contacts_Contact(_rd) : null);"),
+            "{js}"
         );
     }
 
     #[test]
-    fn wasm_null_check_on_optional_return() {
-        let api = make_api(vec![Module {
-            name: "contacts".into(),
-            functions: vec![Function {
-                name: "find_contact".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
-                    "Contact".into(),
-                )))),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![StructDef {
-                name: "Contact".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
-            }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
-        }]);
-        let js = js_stub_for(
-            &api,
-            DEFAULT_MODULE_NAME,
-            "weaveffi",
-            "weaveffi.yml",
-            "weaveffi_wasm.js",
+    fn optional_scalar_return_decodes_from_buffer() {
+        let js = js_for_api(&returning_api(
+            TypeRef::Optional(Box::new(TypeRef::I32)),
             false,
-        );
+        ));
         assert!(
-            js.contains("_r === 0 ? null : new Contact(wasm, _r)"),
-            "optional struct return should null-check before wrapping"
+            js.contains("const _out = (_rd.flag() ? _rd.i32() : null);"),
+            "{js}"
         );
+        // The old boxed-scalar protocol is gone.
+        assert!(!js.contains("wasm.weaveffi_free_bytes(_r, 4);"), "{js}");
+    }
+
+    #[test]
+    fn list_return_decodes_from_buffer() {
+        let js = js_for_api(&returning_api(
+            TypeRef::List(Box::new(TypeRef::StringUtf8)),
+            false,
+        ));
+        assert!(
+            js.contains(
+                "const _out = (() => { const _n = _rd.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(_rd.str()); return _arr; })();"
+            ),
+            "{js}"
+        );
+        // No parallel-array protocol remains.
+        assert!(!js.contains("_takeStrArray"), "{js}");
+    }
+
+    #[test]
+    fn map_return_decodes_from_buffer() {
+        let js = js_for_api(&returning_api(
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            false,
+        ));
+        assert!(
+            js.contains(
+                "const _out = (() => { const _n = _rd.len(); const _obj = {}; for (let _i = 0; _i < _n; _i++) { const _k = _rd.str(); _obj[_k] = _rd.i32(); } return _obj; })();"
+            ),
+            "{js}"
+        );
+        assert!(!js.contains("_ka"), "no parallel key array remains: {js}");
+    }
+
+    #[test]
+    fn list_param_serializes_elements_in_order() {
+        let api = make_api(vec![Module {
+            functions: vec![member(
+                "sum",
+                vec![param("xs", TypeRef::List(Box::new(TypeRef::I32)))],
+                Some(TypeRef::I64),
+                false,
+                false,
+            )],
+            ..module("m")
+        }]);
+        let js = js_for_api(&api);
+        assert!(js.contains("const _a1 = xs || [];"), "{js}");
+        assert!(js.contains("a0_w.len(_a1.length);"), "{js}");
+        assert!(js.contains("for (const _e1 of _a1) {"), "{js}");
+        assert!(js.contains("a0_w.i32(_e1);"), "{js}");
+    }
+
+    #[test]
+    fn map_param_accepts_map_instances_and_plain_objects() {
+        let api = make_api(vec![Module {
+            functions: vec![member(
+                "load",
+                vec![param(
+                    "scores",
+                    TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                )],
+                None,
+                false,
+                false,
+            )],
+            ..module("m")
+        }]);
+        let js = js_for_api(&api);
+        assert!(
+            js.contains(
+                "const _m1 = _s1 instanceof Map ? [..._s1.entries()] : Object.entries(_s1);"
+            ),
+            "{js}"
+        );
+        assert!(js.contains("a0_w.len(_m1.length);"), "{js}");
+        assert!(js.contains("for (const [_k1, _v1] of _m1) {"), "{js}");
+        assert!(js.contains("a0_w.str(_k1);"), "{js}");
+        assert!(js.contains("a0_w.i32(_v1);"), "{js}");
+    }
+
+    #[test]
+    fn optional_param_writes_presence_flag() {
+        let api = make_api(vec![Module {
+            functions: vec![member(
+                "set_timeout",
+                vec![param("ms", TypeRef::Optional(Box::new(TypeRef::I32)))],
+                None,
+                false,
+                false,
+            )],
+            ..module("m")
+        }]);
+        let js = js_for_api(&api);
+        assert!(
+            js.contains("if (ms === null || ms === undefined) {"),
+            "{js}"
+        );
+        assert!(js.contains("a0_w.flag(false);"), "{js}");
+        assert!(js.contains("a0_w.flag(true);"), "{js}");
+        assert!(js.contains("a0_w.i32(ms);"), "{js}");
     }
 
     #[test]
     fn wasm_async_returns_promise() {
         let api = make_api(vec![Module {
-            name: "math".into(),
             functions: vec![Function {
                 name: "compute".into(),
-                params: vec![Param {
-                    name: "x".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("x", TypeRef::I32)],
                 returns: Some(TypeRef::I32),
                 doc: None,
                 throws: false,
@@ -5201,13 +4778,7 @@ mod tests {
                 deprecated: None,
                 since: None,
             }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("math")
         }]);
         let js = js_stub_for(
             &api,
@@ -5256,15 +4827,9 @@ mod tests {
     #[test]
     fn wasm_async_pins_callback_for_lifetime() {
         let api = make_api(vec![Module {
-            name: "math".into(),
             functions: vec![Function {
                 name: "compute".into(),
-                params: vec![Param {
-                    name: "x".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("x", TypeRef::I32)],
                 returns: Some(TypeRef::I32),
                 doc: None,
                 throws: false,
@@ -5273,13 +4838,7 @@ mod tests {
                 deprecated: None,
                 since: None,
             }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("math")
         }]);
         let js = js_stub_for(
             &api,
@@ -5310,16 +4869,10 @@ mod tests {
     #[test]
     fn wasm_dts_async_function() {
         let api = make_api(vec![Module {
-            name: "math".into(),
             functions: vec![
                 Function {
                     name: "compute".into(),
-                    params: vec![Param {
-                        name: "x".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
+                    params: vec![param("x", TypeRef::I32)],
                     returns: Some(TypeRef::I32),
                     doc: None,
                     throws: false,
@@ -5328,38 +4881,15 @@ mod tests {
                     deprecated: None,
                     since: None,
                 },
-                Function {
-                    name: "add".into(),
-                    params: vec![
-                        Param {
-                            name: "a".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
+                member(
+                    "add",
+                    vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                    Some(TypeRef::I32),
+                    false,
+                    false,
+                ),
             ],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("math")
         }]);
         let dts = dts_for(
             &api,
@@ -5385,45 +4915,12 @@ mod tests {
     #[test]
     fn wasm_nested_module_output() {
         let api = make_api(vec![Module {
-            name: "parent".into(),
-            functions: vec![Function {
-                name: "outer_fn".into(),
-                params: vec![],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
+            functions: vec![member("outer_fn", vec![], Some(TypeRef::I32), false, false)],
             modules: vec![Module {
-                name: "child".into(),
-                functions: vec![Function {
-                    name: "inner_fn".into(),
-                    params: vec![],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                interfaces: vec![],
-                modules: vec![],
+                functions: vec![member("inner_fn", vec![], Some(TypeRef::I32), false, false)],
+                ..module("child")
             }],
+            ..module("parent")
         }]);
         let dts = dts_for(
             &api,
@@ -5468,7 +4965,6 @@ mod tests {
 
     fn doc_module() -> Module {
         Module {
-            name: "docs".into(),
             functions: vec![Function {
                 name: "do_thing".into(),
                 params: vec![Param {
@@ -5494,7 +4990,6 @@ mod tests {
                     doc: Some("Stable id".into()),
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Kind".into(),
@@ -5506,11 +5001,7 @@ mod tests {
                     fields: vec![],
                 }],
             }],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("docs")
         }
     }
 
@@ -5608,77 +5099,36 @@ mod tests {
     /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
     /// f64 payload, two f32 payloads, and a string + u8 payload, plus a plain
     /// sibling enum and free functions taking/returning the rich enum (already
-    /// resolved to `TypeRef::RichEnum`) so the handle marshalling is exercised too.
+    /// resolved to `TypeRef::RichEnum`) so the value-buffer marshalling is
+    /// exercised too.
     fn rich_enum_api() -> Api {
-        fn field(name: &str, ty: TypeRef) -> StructField {
-            StructField {
-                name: name.into(),
-                ty,
-                doc: None,
-                default: None,
-            }
-        }
         make_api(vec![Module {
-            name: "shapes".into(),
             functions: vec![
-                Function {
-                    name: "describe".into(),
-                    params: vec![Param {
-                        name: "shape".into(),
-                        ty: TypeRef::RichEnum("Shape".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::StringUtf8),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "scale".into(),
-                    params: vec![
-                        Param {
-                            name: "shape".into(),
-                            ty: TypeRef::RichEnum("Shape".into()),
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "factor".into(),
-                            ty: TypeRef::F64,
-                            mutable: false,
-                            doc: None,
-                        },
+                member(
+                    "describe",
+                    vec![param("shape", TypeRef::RichEnum("Shape".into()))],
+                    Some(TypeRef::StringUtf8),
+                    false,
+                    false,
+                ),
+                member(
+                    "scale",
+                    vec![
+                        param("shape", TypeRef::RichEnum("Shape".into())),
+                        param("factor", TypeRef::F64),
                     ],
-                    returns: Some(TypeRef::RichEnum("Shape".into())),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "sum_bytes".into(),
-                    params: vec![Param {
-                        name: "values".into(),
-                        ty: TypeRef::List(Box::new(TypeRef::U8)),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::U64),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                },
+                    Some(TypeRef::RichEnum("Shape".into())),
+                    false,
+                    false,
+                ),
+                member(
+                    "sum_bytes",
+                    vec![param("values", TypeRef::List(Box::new(TypeRef::U8)))],
+                    Some(TypeRef::U64),
+                    false,
+                    false,
+                ),
             ],
-            structs: vec![],
             enums: vec![
                 EnumDef {
                     name: "Shape".into(),
@@ -5735,16 +5185,12 @@ mod tests {
                     ],
                 },
             ],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("shapes")
         }])
     }
 
     #[test]
-    fn wasm_rich_enum_emits_wrapper_class() {
+    fn wasm_rich_enum_emits_buffer_codecs() {
         let js = js_stub_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
@@ -5753,71 +5199,31 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        // Opaque-handle wrapper class, like a struct.
-        assert!(
-            js.contains("class Shape {"),
-            "missing rich enum class: {js}"
-        );
-        assert!(
-            js.contains("  constructor(wasm, handle) {"),
-            "rich enum must wrap a handle: {js}"
-        );
-        // Tag reader + frozen discriminant map.
-        assert!(js.contains("  get tag() {"), "missing tag reader: {js}");
-        assert!(
-            js.contains("wasm.weaveffi_shapes_Shape_tag(this._handle)"),
-            "tag reader must call the tag symbol: {js}"
-        );
-        assert!(
-            js.contains("Shape.Tag = Object.freeze({"),
-            "missing Tag map: {js}"
-        );
-        // One static factory per variant; unit variant takes only wasm.
-        assert!(js.contains("static empty(wasm) {"), "missing empty(): {js}");
-        assert!(
-            js.contains("static circle(wasm, radius) {"),
-            "missing circle(radius): {js}"
-        );
-        assert!(
-            js.contains("static rectangle(wasm, width, height) {"),
-            "missing rectangle(width, height): {js}"
-        );
-        assert!(
-            js.contains("static labeled(wasm, label, count) {"),
-            "missing labeled(label, count): {js}"
-        );
-        assert!(
-            js.contains("wasm.weaveffi_shapes_Shape_Circle_new(radius, _err)"),
-            "circle factory must call the variant constructor: {js}"
-        );
-        // String payload staged via the shared _cstr helper.
-        assert!(
-            js.contains("_cstr(wasm, label)"),
-            "labeled factory must stage its string payload: {js}"
-        );
-        // Per-variant getters, namespaced in camelCase.
-        assert!(
-            js.contains("  get circleRadius() {"),
-            "missing circleRadius getter: {js}"
-        );
-        assert!(
-            js.contains("  get rectangleWidth() {") && js.contains("  get rectangleHeight() {"),
-            "missing rectangle getters: {js}"
-        );
-        assert!(
-            js.contains("  get labeledLabel() {") && js.contains("  get labeledCount() {"),
-            "missing labeled getters: {js}"
-        );
-        assert!(
-            js.contains("wasm.weaveffi_shapes_Shape_Circle_get_radius(this._handle)"),
-            "getter must call the field getter symbol: {js}"
-        );
-        // Explicit cleanup via the destroy symbol.
-        assert!(js.contains("  free() {"), "missing free(): {js}");
-        assert!(
-            js.contains("this._wasm.weaveffi_shapes_Shape_destroy(this._handle)"),
-            "free must call the destroy symbol: {js}"
-        );
+        // The writer switches on the string tag and packs the i32 discriminant
+        // plus the active variant's fields in declaration order.
+        assert!(js.contains("function _write_shapes_Shape(w, v) {"), "{js}");
+        assert!(js.contains("switch (v.tag) {"), "{js}");
+        assert!(js.contains("case \"Empty\": {"), "{js}");
+        assert!(js.contains("case \"Circle\": {"), "{js}");
+        assert!(js.contains("w.i32(1);"), "{js}");
+        assert!(js.contains("w.f64(v.radius);"), "{js}");
+        assert!(js.contains("w.f32(v.width);"), "{js}");
+        assert!(js.contains("w.str(v.label);"), "{js}");
+        assert!(js.contains("w.u8(v.count);"), "{js}");
+        assert!(js.contains("unknown Shape variant tag"), "{js}");
+        // The reader switches on the numeric tag and rebuilds the tagged
+        // plain object.
+        assert!(js.contains("function _read_shapes_Shape(r) {"), "{js}");
+        assert!(js.contains("const _tag = r.i32();"), "{js}");
+        assert!(js.contains("return { tag: \"Empty\" };"), "{js}");
+        assert!(js.contains("const v = { tag: \"Circle\" };"), "{js}");
+        assert!(js.contains("v.radius = r.f64();"), "{js}");
+        assert!(js.contains("unknown Shape tag"), "{js}");
+        // No handle-wrapper machinery remains.
+        assert!(!js.contains("class Shape"), "{js}");
+        assert!(!js.contains("Shape.Tag"), "{js}");
+        assert!(!js.contains("Shape_destroy"), "{js}");
+        assert!(!js.contains("Shape_Circle_new"), "{js}");
     }
 
     #[test]
@@ -5830,8 +5236,7 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
-        // The rich enum must NOT be emitted as a by-value discriminant object
-        // (which would also collide with the class declaration).
+        // The rich enum must NOT be emitted as a by-value discriminant object.
         assert!(
             !js.contains("export const Shape = Object.freeze("),
             "rich enum must not be a plain enum object: {js}"
@@ -5844,7 +5249,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_rich_enum_module_factory_and_tag() {
+    fn wasm_rich_enum_function_marshals_value_buffer() {
         let js = js_stub_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
@@ -5853,60 +5258,36 @@ mod tests {
             "weaveffi_wasm.js",
             false,
         );
+        // A rich enum crosses the ABI as a value buffer: encoded on the way
+        // in, staged like bytes, decoded on the way out.
+        assert!(js.contains("_write_shapes_Shape(a0_w, shape);"), "{js}");
         assert!(
-            js.contains("Shape: {"),
-            "missing module factory object: {js}"
-        );
-        assert!(
-            js.contains("circle: (...args) => Shape.circle(wasm, ...args),"),
-            "missing variant factory binding: {js}"
-        );
-        assert!(
-            js.contains("empty: (...args) => Shape.empty(wasm, ...args),"),
-            "missing unit-variant factory binding: {js}"
+            js.contains("wasm.weaveffi_shapes_describe(a0_p, a0_l, _err);"),
+            "describe must pass the staged (ptr, len) pair: {js}"
         );
         assert!(
-            js.contains("Tag: Shape.Tag,"),
-            "module factory should expose the Tag map: {js}"
-        );
-    }
-
-    #[test]
-    fn wasm_rich_enum_function_marshals_handle() {
-        let js = js_stub_for(
-            &rich_enum_api(),
-            DEFAULT_MODULE_NAME,
-            "weaveffi",
-            "weaveffi.yml",
-            "weaveffi_wasm.js",
-            false,
-        );
-        // A rich enum crosses the ABI as an opaque handle, so functions pass it in
-        // and wrap the returned handle out, identical to a struct.
-        assert!(
-            js.contains("wasm.weaveffi_shapes_describe(shape._handle, _err)"),
-            "describe must pass the enum handle: {js}"
+            js.contains("wasm.weaveffi_shapes_scale(a0_p, a0_l, factor, _lp, _err);"),
+            "scale must pass the pair, the scalar, and the out_len slot: {js}"
         );
         assert!(
-            js.contains("wasm.weaveffi_shapes_scale(shape._handle, factor, _err)"),
-            "scale must pass the enum handle: {js}"
+            js.contains("const _out = _read_shapes_Shape(_rd);"),
+            "scale must decode the returned buffer: {js}"
         );
-        assert!(
-            js.contains("return new Shape(wasm, _r);"),
-            "scale must wrap the returned handle: {js}"
-        );
-        // Errors are checked before the result wrapper is constructed.
+        // Errors are checked before the result is decoded.
         let check = js
             .find("_checkErr(wasm, _err)")
             .expect("scale should check the error slot");
-        let wrap = js
-            .find("return new Shape(wasm, _r);")
-            .expect("scale should wrap the result");
-        assert!(check < wrap, "errors must be checked before wrapping: {js}");
+        let decode = js
+            .find("const _out = _read_shapes_Shape(_rd);")
+            .expect("scale should decode the result");
+        assert!(
+            check < decode,
+            "errors must be checked before decoding: {js}"
+        );
     }
 
     #[test]
-    fn wasm_rich_enum_dts_class() {
+    fn wasm_rich_enum_dts_union() {
         let dts = dts_for(
             &rich_enum_api(),
             DEFAULT_MODULE_NAME,
@@ -5914,47 +5295,27 @@ mod tests {
             "weaveffi_wasm.d.ts",
             false,
         );
+        // A discriminated union of plain object shapes, keyed by `tag`.
+        assert!(dts.contains("export type Shape ="), "{dts}");
+        assert!(dts.contains("| { tag: \"Empty\" }"), "{dts}");
         assert!(
-            dts.contains("export declare class Shape {"),
-            "missing rich enum class declaration: {dts}"
+            dts.contains("| { tag: \"Circle\"; radius: number }"),
+            "{dts}"
         );
         assert!(
-            dts.contains("  get tag(): number;"),
-            "missing tag type: {dts}"
+            dts.contains("| { tag: \"Rectangle\"; width: number; height: number }"),
+            "{dts}"
         );
         assert!(
-            dts.contains("  static readonly Tag: Readonly<{"),
-            "missing Tag map type: {dts}"
+            dts.contains("| { tag: \"Labeled\"; label: string; count: number };"),
+            "{dts}"
         );
-        assert!(
-            dts.contains("  static empty(): Shape;"),
-            "missing empty factory type: {dts}"
-        );
-        assert!(
-            dts.contains("  static circle(radius: number): Shape;"),
-            "missing circle factory type: {dts}"
-        );
-        assert!(
-            dts.contains("  static labeled(label: string, count: number): Shape;"),
-            "missing labeled factory type: {dts}"
-        );
-        assert!(
-            dts.contains("  get circleRadius(): number;"),
-            "missing circleRadius type: {dts}"
-        );
-        assert!(
-            dts.contains("  get labeledLabel(): string;"),
-            "missing labeledLabel type: {dts}"
-        );
-        assert!(dts.contains("  free(): void;"), "missing free type: {dts}");
-        // Not a by-value const, and the function signatures reference the class.
-        assert!(
-            !dts.contains("export declare const Shape"),
-            "rich enum must not be a const map in d.ts: {dts}"
-        );
+        // Not a class, not a by-value const map.
+        assert!(!dts.contains("export declare class Shape"), "{dts}");
+        assert!(!dts.contains("export declare const Shape"), "{dts}");
         assert!(
             dts.contains("scale(shape: Shape, factor: number): Shape"),
-            "functions should reference the Shape class type: {dts}"
+            "functions should reference the union type: {dts}"
         );
     }
 
@@ -5979,15 +5340,9 @@ mod tests {
     /// A one-function async API for the Emscripten stub tests.
     fn async_api() -> Api {
         make_api(vec![Module {
-            name: "math".into(),
             functions: vec![Function {
                 name: "compute".into(),
-                params: vec![Param {
-                    name: "x".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("x", TypeRef::I32)],
                 returns: Some(TypeRef::I32),
                 doc: None,
                 throws: false,
@@ -5996,13 +5351,7 @@ mod tests {
                 deprecated: None,
                 since: None,
             }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("math")
         }])
     }
 
@@ -6038,9 +5387,10 @@ mod tests {
             js.contains("weaveffi_math_add: m['_weaveffi_math_add'],"),
             "missing business symbol binding: {js}"
         );
+        // Records declare no C symbols, so nothing Point-related is bound.
         assert!(
-            js.contains("weaveffi_math_Point_get_x: m['_weaveffi_math_Point_get_x'],"),
-            "missing struct getter binding: {js}"
+            !js.contains("m['_weaveffi_math_Point"),
+            "records must not bind any symbols: {js}"
         );
         assert!(
             js.contains("get memory() { return { buffer: m['HEAPU8'].buffer }; },"),
@@ -6104,6 +5454,10 @@ mod tests {
         assert!(
             js.contains("weaveffi_error_clear: m['_acme_error_clear'],"),
             "error_clear must map to the prefixed export: {js}"
+        );
+        assert!(
+            js.contains("weaveffi_free_bytes: m['_acme_free_bytes'],"),
+            "free_bytes must map to the prefixed export: {js}"
         );
     }
 
@@ -6180,48 +5534,14 @@ mod tests {
         assert_eq!(ts_type_for(&TypeRef::BorrowedBytes), "Uint8Array");
     }
 
-    // --- 0.5.0 overhaul: interfaces, typed errors, throws split, naming ---
-
-    fn member(
-        name: &str,
-        params: Vec<Param>,
-        returns: Option<TypeRef>,
-        throws: bool,
-        is_async: bool,
-    ) -> Function {
-        Function {
-            name: name.into(),
-            params,
-            returns,
-            doc: None,
-            throws,
-            r#async: is_async,
-            cancellable: is_async,
-            deprecated: None,
-            since: None,
-        }
-    }
-
-    fn str_param(name: &str) -> Param {
-        Param {
-            name: name.into(),
-            ty: TypeRef::StringUtf8,
-            mutable: false,
-            doc: None,
-        }
-    }
+    // --- Interfaces, typed errors, throws split, naming ---
 
     /// A kvstore-shaped module: a `Store` interface (canonical `new` plus an
     /// `open` factory, sync/iterator/async methods, one static), a `KvError`
     /// domain, and one non-throwing free function.
     fn kv_api() -> Api {
         make_api(vec![Module {
-            name: "kv".into(),
             functions: vec![member("flush_all", vec![], None, false, false)],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
             errors: Some(weaveffi_ir::ir::ErrorDomain {
                 name: "KvError".into(),
                 codes: vec![
@@ -6230,12 +5550,14 @@ mod tests {
                         code: 1001,
                         message: "key not found".into(),
                         doc: None,
+                        fields: vec![],
                     },
                     weaveffi_ir::ir::ErrorCode {
                         name: "StoreFull".into(),
                         code: 1003,
                         message: "store is full".into(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -6249,15 +5571,7 @@ mod tests {
                 methods: vec![
                     member(
                         "put",
-                        vec![
-                            str_param("key"),
-                            Param {
-                                name: "ttl_seconds".into(),
-                                ty: TypeRef::I64,
-                                mutable: false,
-                                doc: None,
-                            },
-                        ],
+                        vec![str_param("key"), param("ttl_seconds", TypeRef::I64)],
                         None,
                         true,
                         false,
@@ -6286,7 +5600,7 @@ mod tests {
                     false,
                 )],
             }],
-            modules: vec![],
+            ..module("kv")
         }])
     }
 
@@ -6330,7 +5644,7 @@ mod tests {
         );
         // Statics are static methods.
         assert!(js.contains("static defaultCapacity() {"), "{js}");
-        // Disposal mirrors the rich-enum idiom: free() releases exactly once.
+        // Disposal: free() releases exactly once.
         assert!(js.contains("free() {"), "{js}");
         assert!(
             js.contains("wasm.weaveffi_kv_Store_destroy(this._handle);"),
@@ -6441,27 +5755,32 @@ mod tests {
         assert!(js.contains("KeyNotFound.CODE = 1001;"), "{js}");
         assert!(js.contains("KvError.KeyNotFound = KeyNotFound;"), "{js}");
         assert!(js.contains("StoreFull.CODE = 1003;"), "{js}");
-        // The factory maps unknown codes to the generic brand error.
+        // The factory takes the payload slots (unused here: no code declares
+        // fields) and maps unknown codes to the generic brand error.
         assert!(
-            js.contains("function _kvErrorFrom(code, message) {"),
+            js.contains("function _kvErrorFrom(wasm, code, message, payloadPtr, payloadLen) {"),
             "{js}"
         );
-        assert!(
-            js.contains("if (!_cls) return new WeaveFFIError(code, message);"),
-            "{js}"
-        );
+        assert!(js.contains("const _cls = _KV_ERROR_CODES[code];"), "{js}");
+        assert!(js.contains("new WeaveFFIError(code, message);"), "{js}");
     }
 
     #[test]
     fn throws_split_selects_typed_or_generic_checker() {
         let js = kv_js();
-        // Throwing members route the out-err slot through the domain checker.
+        // Throwing members route the out-err slot through the domain checker,
+        // which reads all four error-struct fields (code, message, payload).
         assert!(
             js.contains("function _checkKvError(wasm, errPtr) {"),
             "{js}"
         );
         assert!(js.contains("_checkKvError(wasm, _err);"), "{js}");
-        assert!(js.contains("throw _kvErrorFrom(code, msg);"), "{js}");
+        assert!(
+            js.contains(
+                "const _e = _kvErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));"
+            ),
+            "{js}"
+        );
         // The non-throwing free function keeps the generic checker.
         assert!(js.contains("flushAll() {"), "{js}");
         let flush = js
@@ -6485,8 +5804,11 @@ mod tests {
             js.contains("if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);"),
             "{js}"
         );
+        // The borrowed-error checker hands the payload slots to the factory.
         assert!(
-            js.contains("throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);"),
+            js.contains(
+                "if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));"
+            ),
             "{js}"
         );
         // The launcher passes the cancel slot and callback as usual.
@@ -6566,7 +5888,10 @@ mod tests {
     fn kv_readme_documents_error_domain_and_interface() {
         let readme = readme_for(&kv_api(), "weaveffi", "weaveffi.yml", false);
         assert!(readme.contains("Error Domain: `KvError`"), "{readme}");
-        assert!(readme.contains("| `KeyNotFound` | `1001` |"), "{readme}");
+        assert!(
+            readme.contains("| `KeyNotFound` | `1001` | key not found | (none) |"),
+            "{readme}"
+        );
         assert!(readme.contains("##### `Store`"), "{readme}");
         assert!(readme.contains("weaveffi_kv_Store_destroy"), "{readme}");
     }
@@ -6604,20 +5929,238 @@ mod tests {
         );
     }
 
-    // --- Ownership audit: return-marshalling release calls ---
+    #[test]
+    fn optional_interface_stays_nullable_pointer() {
+        let api = make_api(vec![Module {
+            interfaces: vec![weaveffi_ir::ir::InterfaceDef {
+                name: "Session".into(),
+                doc: None,
+                constructors: vec![member("new", vec![], None, false, false)],
+                methods: vec![member(
+                    "find",
+                    vec![param(
+                        "other",
+                        TypeRef::Optional(Box::new(TypeRef::Interface("Session".into()))),
+                    )],
+                    Some(TypeRef::Optional(Box::new(TypeRef::Interface(
+                        "Session".into(),
+                    )))),
+                    false,
+                    false,
+                )],
+                statics: vec![],
+            }],
+            ..module("net")
+        }]);
+        let js = js_for_api(&api);
+        // An optional interface is the one non-buffered optional: a nullable
+        // borrowed pointer in, a nullable owned pointer out.
+        assert!(js.contains("(other ? other._handle : 0)"), "{js}");
+        assert!(
+            js.contains("return _r === 0 ? null : Session._wrap(_r);"),
+            "{js}"
+        );
+        let dts = dts_for(
+            &api,
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+            false,
+        );
+        assert!(
+            dts.contains("find(other: Session | null): Session | null;"),
+            "{dts}"
+        );
+    }
+
+    // --- Structured error payloads ---
+
+    /// An error domain where one code declares payload fields, plus a
+    /// throwing function so the checker path is generated.
+    fn payload_api() -> Api {
+        make_api(vec![Module {
+            functions: vec![member("login", vec![str_param("name")], None, true, false)],
+            errors: Some(weaveffi_ir::ir::ErrorDomain {
+                name: "AuthError".into(),
+                codes: vec![
+                    weaveffi_ir::ir::ErrorCode {
+                        name: "LockedOut".into(),
+                        code: 1001,
+                        message: "locked out".into(),
+                        doc: None,
+                        fields: vec![
+                            field("retry_after_secs", TypeRef::I32),
+                            field("user", TypeRef::StringUtf8),
+                        ],
+                    },
+                    weaveffi_ir::ir::ErrorCode {
+                        name: "Denied".into(),
+                        code: 1002,
+                        message: "denied".into(),
+                        doc: None,
+                        fields: vec![],
+                    },
+                ],
+            }),
+            ..module("auth")
+        }])
+    }
+
+    #[test]
+    fn error_payload_fields_decoded_and_attached() {
+        let js = js_for_api(&payload_api());
+        // The factory decodes the borrowed payload buffer per code and
+        // attaches the fields as properties on the thrown error.
+        assert!(
+            js.contains("function _authErrorFrom(wasm, code, message, payloadPtr, payloadLen) {"),
+            "{js}"
+        );
+        assert!(js.contains("case 1001: {"), "{js}");
+        assert!(js.contains("_e.retry_after_secs = _rd.i32();"), "{js}");
+        assert!(js.contains("_e.user = _rd.str();"), "{js}");
+        assert!(js.contains("_rd.end();"), "{js}");
+        // The payload-free code has no decode arm.
+        assert!(!js.contains("case 1002: {"), "{js}");
+        // The checker hands the payload slots (offsets 8 and 12 of the
+        // 16-byte struct) to the factory before clearing the error.
+        assert!(
+            js.contains("function _checkAuthError(wasm, errPtr) {"),
+            "{js}"
+        );
+        let checker = js
+            .split("function _checkAuthError(wasm, errPtr) {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("checker body");
+        let decode = checker
+            .find("const _e = _authErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));")
+            .expect("checker decodes payload");
+        let clear = checker
+            .find("wasm.weaveffi_error_clear(errPtr);")
+            .expect("clear");
+        assert!(
+            decode < clear,
+            "payload must be decoded before error_clear frees it: {checker}"
+        );
+    }
+
+    #[test]
+    fn error_payload_fields_declared_in_dts() {
+        let dts = dts_for(
+            &payload_api(),
+            DEFAULT_MODULE_NAME,
+            "weaveffi.yml",
+            "weaveffi_wasm.d.ts",
+            false,
+        );
+        assert!(
+            dts.contains("export declare class LockedOut extends AuthError {"),
+            "{dts}"
+        );
+        assert!(dts.contains("readonly retry_after_secs: number;"), "{dts}");
+        assert!(dts.contains("readonly user: string;"), "{dts}");
+    }
+
+    #[test]
+    fn error_payload_fields_listed_in_readme() {
+        let readme = readme_for(&payload_api(), "weaveffi", "weaveffi.yml", false);
+        assert!(
+            readme.contains(
+                "| `LockedOut` | `1001` | locked out | `retry_after_secs: i32`, `user: string` |"
+            ),
+            "{readme}"
+        );
+        assert!(
+            readme.contains("| `Denied` | `1002` | denied | (none) |"),
+            "{readme}"
+        );
+    }
+
+    // --- Buffered iterators and callbacks ---
+
+    #[test]
+    fn iterator_buffered_elements_decode_then_free() {
+        let api = make_api(vec![Module {
+            functions: vec![member(
+                "scan",
+                vec![],
+                Some(TypeRef::Iterator(Box::new(TypeRef::Record("Entry".into())))),
+                false,
+                false,
+            )],
+            structs: vec![StructDef {
+                name: "Entry".into(),
+                doc: None,
+                fields: vec![field("id", TypeRef::I32)],
+            }],
+            ..module("m")
+        }]);
+        let js = js_for_api(&api);
+        // A buffered element writes through two out slots (ptr at p, len at
+        // p + 4), so the slot is 8 bytes and next threads both pointers.
+        assert!(
+            js.contains("return new _WeaveFFIIterator(wasm, _it, 8,"),
+            "{js}"
+        );
+        assert!(js.contains("_next(it, slot, slot + 4, ep),"), "{js}");
+        // Each element is copied out and freed (via _takeBytes ->
+        // weaveffi_free_bytes), then strictly decoded.
+        assert!(
+            js.contains(
+                "const _rd = new _BufReader(_takeBytes(w, dv.getUint32(p, true), dv.getUint32(p + 4, true)));"
+            ),
+            "{js}"
+        );
+        assert!(js.contains("const _v = _read_m_Entry(_rd);"), "{js}");
+        assert!(js.contains("_rd.end(); return _v;"), "{js}");
+    }
+
+    #[test]
+    fn callback_buffered_argument_decoded_borrowed() {
+        let api = make_api(vec![Module {
+            structs: vec![StructDef {
+                name: "Msg".into(),
+                doc: None,
+                fields: vec![field("text", TypeRef::StringUtf8)],
+            }],
+            callbacks: vec![weaveffi_ir::ir::CallbackDef {
+                name: "OnMessage".into(),
+                params: vec![param("msg", TypeRef::Record("Msg".into()))],
+                doc: None,
+            }],
+            listeners: vec![weaveffi_ir::ir::ListenerDef {
+                name: "message_listener".into(),
+                event_callback: "OnMessage".into(),
+                doc: None,
+            }],
+            ..module("events")
+        }]);
+        let js = js_for_api(&api);
+        // The buffered argument occupies two i32 slots plus the context slot.
+        assert!(
+            js.contains("_registerTrampoline(_table, ['i32', 'i32', 'i32'],"),
+            "{js}"
+        );
+        // Borrowed: the encoding is copied out of wasm memory (never freed)
+        // and decoded before the subscriber runs.
+        assert!(
+            js.contains(
+                "const _p0_b = (a0 === 0 || a1 === 0) ? new Uint8Array(0) : new Uint8Array(wasm.memory.buffer, a0, a1).slice();"
+            ),
+            "{js}"
+        );
+        assert!(js.contains("const _p0 = _read_events_Msg(_p0_r);"), "{js}");
+        assert!(js.contains("_p0_r.end();"), "{js}");
+        assert!(js.contains("_l.callback(_p0);"), "{js}");
+    }
+
+    // --- Async completion contract: borrowed buffers are copied, not freed ---
 
     /// A one-module API with a single free function of the given return type.
     fn returning_api(ret: TypeRef, is_async: bool) -> Api {
         make_api(vec![Module {
-            name: "m".into(),
             functions: vec![member("get_it", vec![], Some(ret), false, is_async)],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("m")
         }])
     }
 
@@ -6631,114 +6174,6 @@ mod tests {
             false,
         )
     }
-
-    #[test]
-    fn list_return_frees_elements_and_container() {
-        let js = js_for_api(&returning_api(
-            TypeRef::List(Box::new(TypeRef::StringUtf8)),
-            false,
-        ));
-        // Each string element is freed by _takeStrArray; the array buffer
-        // itself is then released with free_bytes.
-        assert!(js.contains("_takeStrArray(wasm, _r, _len);"), "{js}");
-        assert!(
-            js.contains("if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);"),
-            "{js}"
-        );
-    }
-
-    #[test]
-    fn map_return_frees_both_parallel_arrays() {
-        let js = js_for_api(&returning_api(
-            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-            false,
-        ));
-        assert!(
-            js.contains("if (_ka !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_ka, _len * 4);"),
-            "{js}"
-        );
-        assert!(
-            js.contains("if (_va !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_va, _len * 4);"),
-            "{js}"
-        );
-    }
-
-    #[test]
-    fn optional_scalar_return_frees_the_box() {
-        let js = js_for_api(&returning_api(
-            TypeRef::Optional(Box::new(TypeRef::I32)),
-            false,
-        ));
-        assert!(js.contains("if (_r === 0) return null;"), "{js}");
-        assert!(js.contains("wasm.weaveffi_free_bytes(_r, 4);"), "{js}");
-    }
-
-    #[test]
-    fn struct_wrapper_releases_handle_via_free() {
-        let js = js_stub_for(
-            &sample_api(),
-            DEFAULT_MODULE_NAME,
-            "weaveffi",
-            "weaveffi.yml",
-            "weaveffi_wasm.js",
-            false,
-        );
-        assert!(
-            js.contains("this._wasm.weaveffi_math_Point_destroy(this._handle);"),
-            "struct free() must call the destroy symbol: {js}"
-        );
-        let dts = dts_for(
-            &sample_api(),
-            DEFAULT_MODULE_NAME,
-            "weaveffi.yml",
-            "weaveffi_wasm.d.ts",
-            false,
-        );
-        assert!(
-            dts.contains("free(): void;"),
-            "struct interface must declare free(): {dts}"
-        );
-    }
-
-    #[test]
-    fn builder_build_releases_builder_handle() {
-        let api = make_api(vec![Module {
-            name: "geo".into(),
-            functions: vec![],
-            structs: vec![StructDef {
-                name: "Point".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "x".into(),
-                    ty: TypeRef::F64,
-                    doc: None,
-                    default: None,
-                }],
-                builder: true,
-            }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
-        }]);
-        let js = js_for_api(&api);
-        // build() destroys the single-use builder handle before the error
-        // check, so a failed build cannot leak it.
-        assert!(
-            js.contains("wasm.weaveffi_geo_Point_Builder_destroy(this._b);"),
-            "{js}"
-        );
-        assert!(js.contains("this._b = 0;"), "{js}");
-        // An abandoned builder can still be released explicitly.
-        assert!(
-            js.contains("this._wasm.weaveffi_geo_Point_Builder_destroy(this._b);"),
-            "{js}"
-        );
-    }
-
-    // --- Async completion contract: borrowed buffers are copied, not freed ---
 
     #[test]
     fn async_string_result_is_copied_not_freed() {
@@ -6767,38 +6202,56 @@ mod tests {
     }
 
     #[test]
-    fn async_string_list_result_reads_borrowed_elements() {
+    fn async_buffered_result_decoded_inside_callback_not_freed() {
         let js = js_for_api(&returning_api(
             TypeRef::List(Box::new(TypeRef::StringUtf8)),
             true,
         ));
+        // The borrowed value buffer arrives as (ptr, len): the callback copies
+        // it out of wasm memory, decodes, and never frees it.
+        assert!(js.contains("unwrap: (w, ptr, len) => {"), "{js}");
         assert!(
-            js.contains("function _readStrArray(wasm, base, len) {"),
+            js.contains(
+                "const _b = ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice();"
+            ),
             "{js}"
         );
-        assert!(js.contains("_readStrArray(wasm, base, len);"), "{js}");
-        // The borrowed array buffer is never freed by the callback.
-        assert!(!js.contains("wasm.weaveffi_free_bytes(base"), "{js}");
+        assert!(js.contains("_arr.push(_rd.str())"), "{js}");
+        assert!(js.contains("_rd.end();"), "{js}");
+        // The unwrap closure binds the exports object as `w`, so any free
+        // call inside it would spell `w.weaveffi_free_bytes` (the shared
+        // `_takeBytes` helper legitimately frees owned returns elsewhere).
+        assert!(
+            !js.contains("w.weaveffi_free_bytes("),
+            "the producer frees the borrowed result buffer: {js}"
+        );
+        assert!(
+            !js.contains("unwrap: (w, ptr, len) => _takeBytes"),
+            "async unwrap must not adopt the borrowed buffer: {js}"
+        );
+        // The completion callback carries (ctx, err, ptr, len): four i32s.
+        assert!(js.contains("_cbPtr_i32_i32_i32_i32"), "{js}");
+        assert!(
+            js.contains("wasm.weaveffi_m_get_it_async(0, _cbPtr_i32_i32_i32_i32, ctxId);"),
+            "{js}"
+        );
     }
 
     #[test]
-    fn async_optional_scalar_result_unboxes_without_freeing() {
+    fn async_optional_scalar_result_decodes_from_buffer() {
         let js = js_for_api(&returning_api(
             TypeRef::Optional(Box::new(TypeRef::I32)),
             true,
         ));
         assert!(
-            js.contains(
-                "unwrap: (w, p) => p === 0 ? null : new DataView(w.memory.buffer).getInt32(p, true) });"
-            ),
-            "async optional scalars arrive as a borrowed box: {js}"
+            js.contains("const _v = (_rd.flag() ? _rd.i32() : null);"),
+            "async optional scalars decode from the borrowed buffer: {js}"
         );
     }
 
     #[test]
-    fn async_record_result_is_adopted() {
+    fn async_record_result_decoded_from_buffer() {
         let api = make_api(vec![Module {
-            name: "m".into(),
             functions: vec![member(
                 "get_it",
                 vec![],
@@ -6809,26 +6262,40 @@ mod tests {
             structs: vec![StructDef {
                 name: "Contact".into(),
                 doc: None,
-                fields: vec![StructField {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
+                fields: vec![field("id", TypeRef::I32)],
             }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            ..module("m")
+        }]);
+        let js = js_for_api(&api);
+        // A record result is a borrowed value buffer, decoded in the callback.
+        assert!(js.contains("const _v = _read_m_Contact(_rd);"), "{js}");
+        assert!(!js.contains("new Contact(w, h)"), "{js}");
+    }
+
+    #[test]
+    fn async_interface_result_is_adopted() {
+        let api = make_api(vec![Module {
+            functions: vec![member(
+                "connect",
+                vec![],
+                Some(TypeRef::Interface("Session".into())),
+                false,
+                true,
+            )],
+            interfaces: vec![weaveffi_ir::ir::InterfaceDef {
+                name: "Session".into(),
+                doc: None,
+                constructors: vec![member("new", vec![], None, false, false)],
+                methods: vec![],
+                statics: vec![],
+            }],
+            ..module("net")
         }]);
         let js = js_for_api(&api);
         // An owned-object result transfers ownership: the callback adopts the
         // pointer into a wrapper whose free() calls the destroy symbol.
         assert!(
-            js.contains("unwrap: (w, h) => new Contact(w, h) });"),
+            js.contains("unwrap: (w, h) => Session._wrap(h) });"),
             "{js}"
         );
     }

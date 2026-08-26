@@ -40,15 +40,13 @@ export declare class InvalidStatus extends DocsErrorsError {
  */
 export interface Document {
   /** Stable opaque identifier */
-  readonly id: bigint;
+  id: bigint;
   /** Human-readable title shown in lists */
-  readonly title: string;
+  title: string;
   /** Current lifecycle status */
-  readonly status: Status;
+  status: Status;
   /** Free-form tags for grouping */
-  readonly tags: string[];
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  tags: string[];
 }
 
 /**

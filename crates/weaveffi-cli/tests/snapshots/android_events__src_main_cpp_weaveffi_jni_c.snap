@@ -117,7 +117,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_unregisterMessageListener(JNIE
 }
 
 JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_sendMessage(JNIEnv* env, jclass clazz, jstring text) {
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     const char* text_chars = (*env)->GetStringUTFChars(env, text, NULL);
     weaveffi_events_send_message(text_chars, &err);
     (*env)->ReleaseStringUTFChars(env, text, text_chars);
@@ -129,7 +129,7 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_sendMessage(JNIEnv* env, jclas
 }
 
 JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getMessagesJni(JNIEnv* env, jclass clazz) {
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     weaveffi_events_GetMessagesIterator* _iter = weaveffi_events_get_messages(&err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
@@ -141,7 +141,7 @@ JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getMessagesJni(JNIEnv* env, j
 JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_EventsGetMessagesIterator_nativeNext(JNIEnv* env, jclass clazz, jlong handle) {
     weaveffi_events_GetMessagesIterator* _iter = (weaveffi_events_GetMessagesIterator*)(intptr_t)handle;
     const char* _item = (const char*)0;
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0, NULL, NULL, 0};
     int32_t _has = weaveffi_events_GetMessagesIterator_next(_iter, &_item, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);

@@ -50,8 +50,8 @@ fn generate_go_contacts() {
         "ctor named `new` should surface as NewContactBook"
     );
     assert!(
-        go.contains("func (s *ContactBook) Add(firstName string, lastName string, email *string, contactType ContactType) (*Contact, error) {"),
-        "throwing method should keep the (T, error) shape"
+        go.contains("func (s *ContactBook) Add(firstName string, lastName string, email *string, contactType ContactType) (Contact, error) {"),
+        "throwing method should keep the (T, error) shape with a by-value record"
     );
     assert!(
         go.contains("func (s *ContactBook) Count() int32 {"),
@@ -80,7 +80,7 @@ fn generate_go_contacts() {
         "missing NotFound code constant"
     );
     assert!(
-        go.contains("return nil, wvMapContacts(wvTakeError(&cErr))"),
+        go.contains("wvMapContacts(wvTakeError(&cErr))"),
         "throwing methods should map through the domain helper"
     );
 

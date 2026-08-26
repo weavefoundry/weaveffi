@@ -42,26 +42,127 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 /// Typed errors reported by the `contacts` module.
@@ -84,7 +185,7 @@ public enum ContactsError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapContacts(code: Int32, message: String) -> Error {
+func mapContacts(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return ContactsError.invalidName(message: message.isEmpty ? "name must not be empty" : message)
     case 2: return ContactsError.notFound(message: message.isEmpty ? "contact not found" : message)
@@ -97,8 +198,9 @@ func checkContacts(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapContacts(code: code, message: message)
+        throw mapContacts(code: code, message: message, payload: payload)
     }
 }
 
@@ -108,45 +210,49 @@ public enum ContactType: UInt32 {
     case other = 2
 }
 
-public class Contact {
-    let ptr: OpaquePointer
+public struct Contact {
+    public var id: Int64
+    public var firstName: String
+    public var lastName: String
+    public var email: String?
+    public var contactType: ContactType
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
+    /// Creates a `Contact` value.
+    public init(id: Int64, firstName: String, lastName: String, email: String?, contactType: ContactType) {
+        self.id = id
+        self.firstName = firstName
+        self.lastName = lastName
+        self.email = email
+        self.contactType = contactType
     }
+}
 
-    deinit {
-        weaveffi_contacts_Contact_destroy(ptr)
+/// Serializes a `Contact` into the value-buffer wire format.
+func wvWriteContact(_ value: Contact, into w: inout WvWriter) {
+    w.writeInt64(value.id)
+    w.writeString(value.firstName)
+    w.writeString(value.lastName)
+    if let v0 = value.email {
+        w.writeOptionFlag(true)
+        w.writeString(v0)
+    } else {
+        w.writeOptionFlag(false)
     }
+    w.writeInt32(Int32(bitPattern: value.contactType.rawValue))
+}
 
-    public var id: Int64 {
-        return weaveffi_contacts_Contact_get_id(ptr)
+/// Deserializes a `Contact` from the value-buffer wire format.
+func wvReadContact(_ r: inout WvReader) -> Contact {
+    let v1 = r.readInt64()
+    let v2 = r.readString()
+    let v3 = r.readString()
+    var v4: String? = nil
+    if r.readOptionFlag() {
+        let v5 = r.readString()
+        v4 = v5
     }
-
-    public var first_name: String {
-        let raw = weaveffi_contacts_Contact_get_first_name(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
-    public var last_name: String {
-        let raw = weaveffi_contacts_Contact_get_last_name(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
-    public var email: String? {
-        let p = weaveffi_contacts_Contact_get_email(ptr)
-        guard let p = p else { return nil }
-        defer { weaveffi_free_string(p) }
-        return String(cString: p)
-    }
-
-    public var contact_type: ContactType {
-        return ContactType(rawValue: weaveffi_contacts_Contact_get_contact_type(ptr).rawValue)!
-    }
+    let v6 = ContactType(rawValue: UInt32(bitPattern: r.readInt32()))!
+    return Contact(id: v1, firstName: v2, lastName: v3, email: v4, contactType: v6)
 }
 
 /// An in-memory address book owning its contacts
@@ -161,49 +267,80 @@ public final class ContactBook {
         weaveffi_contacts_ContactBook_destroy(ptr)
     }
     public init() {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_contacts_ContactBook_new(&err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null pointer") }
         self.ptr = rv
     }
     public func add(firstName: String, lastName: String, email: String?, contactType: ContactType) throws -> Contact {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: OpaquePointer? = firstName.withCString { firstName_ptr in
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var emailWriter = WvWriter()
+        if let v0 = email {
+            emailWriter.writeOptionFlag(true)
+            emailWriter.writeString(v0)
+        } else {
+            emailWriter.writeOptionFlag(false)
+        }
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = firstName.withCString { firstName_ptr in
             return lastName.withCString { lastName_ptr in
-                return withOptionalCString(email) { email_ptr in
-                        return weaveffi_contacts_ContactBook_add(ptr, firstName_ptr, lastName_ptr, email_ptr, weaveffi_contacts_ContactType(contactType.rawValue), &err)
+                return emailWriter.bytes.withUnsafeBufferPointer { email_buf in
+                    let email_ptr = email_buf.baseAddress
+                    let email_len = email_buf.count
+                    return weaveffi_contacts_ContactBook_add(ptr, firstName_ptr, lastName_ptr, email_ptr, email_len, weaveffi_contacts_ContactType(contactType.rawValue), &outLen, &err)
                 }
             }
         }
         try checkContacts(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Contact(ptr: result)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v1 = wvReadContact(&rvReader)
+        rvReader.finish()
+        return v1
     }
     public func get(id: Int64) throws -> Contact {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_contacts_ContactBook_get(ptr, id, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_contacts_ContactBook_get(ptr, id, &outLen, &err)
         try checkContacts(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Contact(ptr: rv)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadContact(&rvReader)
+        rvReader.finish()
+        return v0
     }
     public func list() -> [Contact] {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         var outLen: Int = 0
         let rv = weaveffi_contacts_ContactBook_list(ptr, &outLen, &err)
         trap(&err)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        return (0..<outLen).map { Contact(ptr: rv[$0]!) }
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let n1 = rvReader.readLen()
+        var v0: [Contact] = []
+        v0.reserveCapacity(n1)
+        for _ in 0..<n1 {
+            let v2 = wvReadContact(&rvReader)
+            v0.append(v2)
+        }
+        rvReader.finish()
+        return v0
     }
     public func remove(id: Int64) -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_contacts_ContactBook_remove(ptr, id, &err)
         trap(&err)
         return rv
     }
     public func count() -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_contacts_ContactBook_count(ptr, &err)
         trap(&err)
         return rv

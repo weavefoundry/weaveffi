@@ -1,27 +1,33 @@
 // Conformance consumer: kvstore sample, Android/Kotlin (JNI) target.
 //
-// Exercises the 0.5.0 interface surface: `Store` is a generated Closeable
+// Exercises the value-type interface surface: `Store` is a generated Closeable
 // class (companion factory `open`, instance methods, static `defaultCapacity`,
-// destroy through `close()`), and `KvError` is a typed exception domain
-// (`KvException` sealed subclasses extending the generic `WeaveFFIException`).
-// Asserts the typed-error paths (IoError from `open("")`, KeyNotFound from a
-// missing `get`, Expired from a TTL-elapsed `get`), plus the existing
-// behavioral surface adapted to the class API: struct materialization
-// (`Entry.value` bytes, nullable `expires_at`, `tags` array, `metadata` map
-// over the triple-pointer ABI), the iterator-backed `listKeys` with prefix
-// filtering, the `EntryBuilder` round-trip, the nested `kv.stats` module, the
-// JNI eviction listener (register, fire, unregister), the deprecated
-// `legacyPut`, and the suspend `compact` resumed from the producer's worker
-// thread. Compiled in-module with the generated `WeaveFFI.kt`, so `internal`
-// constructors are reachable.
+// destroy through `close()`), `Entry` and `Stats` are plain data classes
+// decoded from value buffers, and `KvError` is a typed exception domain
+// (`KvException` sealed subclasses extending the generic `WeaveFFIException`,
+// raised through the payload-aware `fromCode` factory). Asserts the typed-error
+// paths (IoError from `open("")`, KeyNotFound from a missing `get`, Expired
+// from a TTL-elapsed `get`), plus the existing behavioral surface: record
+// materialization (`Entry.value` bytes, nullable `expires_at`, `tags` list,
+// `metadata` map decoded from one buffer), the buffered-optional parameters
+// (`ttlSeconds`, the `listKeys` prefix), the iterator-backed `listKeys`, the
+// `Entry` value-buffer round trip through the generated pack/unpack routines,
+// the nested `kv.stats` module, the JNI eviction listener (register, fire,
+// unregister), the deprecated `legacyPut`, and the suspend `compact` resumed
+// from the producer's worker thread. Compiled in-module with the generated
+// `WeaveFFI.kt`, so the `internal` buffer helpers are reachable.
 @file:JvmName("Main")
 
-import com.weaveffi.EntryBuilder
+import com.weaveffi.Entry
 import com.weaveffi.EntryKind
 import com.weaveffi.KvException
 import com.weaveffi.Store
 import com.weaveffi.WeaveFFI
 import com.weaveffi.WeaveFFIException
+import com.weaveffi.packEntry
+import com.weaveffi.unpackEntry
+import com.weaveffi.weaveDecode
+import com.weaveffi.weaveEncode
 import kotlin.system.exitProcess
 import kotlinx.coroutines.runBlocking
 
@@ -51,6 +57,7 @@ fun main() {
     expect(openErr is WeaveFFIException, "IoError is a WeaveFFIException")
     val openCode = (openErr as? WeaveFFIException)?.code
     expect(openCode == 1004, "IoError code 1004 (got $openCode)")
+    expect(openErr?.message == "I/O failure", "IoError message (got ${openErr?.message})")
 
     // Static on the interface's companion.
     expect(Store.defaultCapacity() == 1_000_000L, "defaultCapacity == 1000000")
@@ -69,32 +76,33 @@ fun main() {
         expect(store.delete("legacy"), "delete legacy")
 
         // Iterator-backed list-of-string return, drained through Kotlin's
-        // Iterator; the backing BTreeMap yields sorted order.
+        // Iterator; the backing BTreeMap yields sorted order. The absent
+        // prefix crosses as a buffered `string?`.
         val keys = mutableListOf<String>()
         val it = store.listKeys(null)
         while (it.hasNext()) keys.add(it.next())
         expect(keys == listOf("alpha", "beta"), "listKeys sorted (got $keys)")
 
-        // Optional prefix filter.
+        // Present optional prefix filter.
         val filtered = mutableListOf<String>()
         val itAl = store.listKeys("al")
         while (itAl.hasNext()) filtered.add(itAl.next())
         expect(filtered == listOf("alpha"), "listKeys prefix filter (got $filtered)")
 
-        // Optional struct return arrives as a wrapped `Entry?`.
+        // Buffered `Entry?` return, decoded into the data class.
         val alpha = store.get("alpha")
         expect(alpha != null, "get alpha present")
         expect(alpha!!.id > 0, "entry id positive")
         expect(alpha.key == "alpha", "entry key")
 
-        // Bytes getter -> ByteArray.
+        // Bytes field -> ByteArray.
         expect(
             alpha.value.size == 3 && alpha.value[0].toInt() == 1 && alpha.value[2].toInt() == 3,
             "entry value bytes"
         )
-        // Optional-scalar getter: alpha had no TTL -> null.
+        // Optional scalar field: alpha had no TTL -> null.
         expect(alpha.expires_at == null, "alpha expires_at null")
-        // `put` stores empty tags/metadata, so the getters return empty collections.
+        // `put` stores empty tags/metadata, so the decoded collections are empty.
         expect(alpha.tags.isEmpty(), "alpha tags empty")
         expect(alpha.metadata.isEmpty(), "alpha metadata empty")
 
@@ -120,41 +128,45 @@ fun main() {
         )
         expect(store.count() == 2L, "expired entry evicted on read")
 
-        // Builder carries a non-empty list + map so the list/map getters return
-        // producer-allocated arrays (the case the triple-pointer ABI redesign fixes).
-        val built = EntryBuilder()
-            .withId(7L)
-            .withKey("built")
-            .withValue(payload)
-            .withCreatedAt(1000L)
-            .withExpiresAt(null)
-            .withTags(arrayOf("hot", "fast"))
-            .withMetadata(mapOf("source" to "test", "env" to "prod"))
-            .build()
-        expect(built.tags.toSet() == setOf("hot", "fast"), "built tags")
+        // An Entry with a non-empty list + map round-trips through the
+        // generated pack/unpack routines (the value-buffer replacement for the
+        // old builder + per-field getters).
+        val built = Entry(
+            id = 7L,
+            key = "built",
+            value = payload,
+            created_at = 1000L,
+            expires_at = null,
+            tags = listOf("hot", "fast"),
+            metadata = mapOf("source" to "test", "env" to "prod"),
+        )
+        val builtBack = weaveDecode(weaveEncode { w -> packEntry(w, built) }) { r -> unpackEntry(r) }
+        expect(builtBack.tags.toSet() == setOf("hot", "fast"), "built tags")
         expect(
-            built.metadata["source"] == "test" && built.metadata["env"] == "prod",
+            builtBack.metadata["source"] == "test" && builtBack.metadata["env"] == "prod",
             "built metadata"
         )
-        // Optional field omitted (null) round-trips as absent, not an error.
-        expect(built.expires_at == null, "built expires_at null")
+        expect(builtBack.value.contentEquals(payload), "built value bytes")
+        // Optional field left null round-trips as absent, not an error.
+        expect(builtBack.expires_at == null, "built expires_at null")
 
-        // Empty collections via the builder still decode cleanly.
-        val empty = EntryBuilder()
-            .withId(8L)
-            .withKey("empty")
-            .withValue(payload)
-            .withCreatedAt(1L)
-            .withExpiresAt(99L)
-            .withTags(arrayOf())
-            .withMetadata(emptyMap())
-            .build()
-        expect(empty.tags.isEmpty(), "empty tags")
-        expect(empty.metadata.isEmpty(), "empty metadata")
-        expect(empty.expires_at == 99L, "empty expires_at present")
+        // Empty collections and a present optional still decode cleanly.
+        val empty = Entry(
+            id = 8L,
+            key = "empty",
+            value = payload,
+            created_at = 1L,
+            expires_at = 99L,
+            tags = listOf(),
+            metadata = emptyMap(),
+        )
+        val emptyBack = weaveDecode(weaveEncode { w -> packEntry(w, empty) }) { r -> unpackEntry(r) }
+        expect(emptyBack.tags.isEmpty(), "empty tags")
+        expect(emptyBack.metadata.isEmpty(), "empty metadata")
+        expect(emptyBack.expires_at == 99L, "empty expires_at present")
 
         // kv.stats submodule: free function taking the interface (borrowed
-        // handle) and returning a wrapped struct.
+        // handle) and returning a buffered record.
         val stats = WeaveFFI.getStats(store)
         expect(stats.total_entries == 2L, "stats total entries == 2")
         expect(stats.total_bytes == 6L, "stats total bytes == 6 (got ${stats.total_bytes})")

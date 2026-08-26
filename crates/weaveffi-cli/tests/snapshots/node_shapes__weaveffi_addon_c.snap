@@ -10,7 +10,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
-static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message, const uint8_t* payload_ptr, size_t payload_len) {
     napi_value msg;
     napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
     napi_value err;
@@ -18,242 +18,25 @@ static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const ch
     napi_value code_val;
     napi_create_int32(env, code, &code_val);
     napi_set_named_property(env, err, "code", code_val);
+    if (payload_ptr != NULL) {
+        napi_value payload_val;
+        napi_create_buffer_copy(env, payload_len, payload_ptr, NULL, &payload_val);
+        napi_set_named_property(env, err, "payload", payload_val);
+    }
     return err;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_tag(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_int32(env, weaveffi_shapes_Shape_tag(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Empty_new(napi_env env, napi_callback_info info) {
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
-  weaveffi_error err = {0};
-  weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Empty_new(&err);
-  if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
-    weaveffi_error_clear(&err);
-    return NULL;
-  }
-  napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Circle_new(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  double radius;
-  napi_get_value_double(env, args[0], &radius);
-  weaveffi_error err = {0};
-  weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Circle_new(radius, &err);
-  if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
-    weaveffi_error_clear(&err);
-    return NULL;
-  }
-  napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Rectangle_new(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value args[2];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  double width_raw;
-  napi_get_value_double(env, args[0], &width_raw);
-  double height_raw;
-  napi_get_value_double(env, args[1], &height_raw);
-  weaveffi_error err = {0};
-  weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Rectangle_new((float)width_raw, (float)height_raw, &err);
-  if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
-    weaveffi_error_clear(&err);
-    return NULL;
-  }
-  napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Bounded_new(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value args[3];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int32_t min_raw;
-  napi_get_value_int32(env, args[0], &min_raw);
-  int32_t max_raw;
-  napi_get_value_int32(env, args[1], &max_raw);
-  int64_t weight_raw;
-  napi_get_value_int64(env, args[2], &weight_raw);
-  weaveffi_error err = {0};
-  weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Bounded_new((int16_t)min_raw, (int16_t)max_raw, (uint64_t)weight_raw, &err);
-  if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
-    weaveffi_error_clear(&err);
-    return NULL;
-  }
-  napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Labeled_new(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value args[2];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  size_t label_len;
-  napi_get_value_string_utf8(env, args[0], NULL, 0, &label_len);
-  char* label = (char*)malloc(label_len + 1);
-  napi_get_value_string_utf8(env, args[0], label, label_len + 1, &label_len);
-  uint32_t count_raw;
-  napi_get_value_uint32(env, args[1], &count_raw);
-  weaveffi_error err = {0};
-  weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Labeled_new(label, (uint8_t)count_raw, &err);
-  free(label);
-  if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
-    weaveffi_error_clear(&err);
-    return NULL;
-  }
-  napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Circle_get_radius(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_double(env, weaveffi_shapes_Shape_Circle_get_radius(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Rectangle_get_width(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_double(env, weaveffi_shapes_Shape_Rectangle_get_width(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Rectangle_get_height(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_double(env, weaveffi_shapes_Shape_Rectangle_get_height(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Bounded_get_min(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_int32(env, weaveffi_shapes_Shape_Bounded_get_min(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Bounded_get_max(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_int32(env, weaveffi_shapes_Shape_Bounded_get_max(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Bounded_get_weight(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_int64(env, (int64_t)weaveffi_shapes_Shape_Bounded_get_weight(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Labeled_get_label(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  {
-    char* ret_s = (char*)weaveffi_shapes_Shape_Labeled_get_label(self);
-    napi_create_string_utf8(env, ret_s, NAPI_AUTO_LENGTH, &ret);
-    weaveffi_free_string(ret_s);
-  }
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_Labeled_get_count(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  napi_value ret;
-  napi_create_uint32(env, weaveffi_shapes_Shape_Labeled_get_count(self), &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_shapes_Shape_destroy(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_shapes_Shape* self = (weaveffi_shapes_Shape*)(intptr_t)self_raw;
-  weaveffi_shapes_Shape_destroy(self);
-  napi_value ret;
-  napi_get_undefined(env, &ret);
-  return ret;
 }
 
 static napi_value Napi_weaveffi_shapes_describe(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t shape_raw;
-  napi_get_value_int64(env, args[0], &shape_raw);
+  void* shape_raw;
+  size_t shape_len;
+  napi_get_buffer_info(env, args[0], &shape_raw, &shape_len);
   weaveffi_error err = {0};
-  const char* result = weaveffi_shapes_describe((const weaveffi_shapes_Shape*)(intptr_t)shape_raw, &err);
+  const char* result = weaveffi_shapes_describe((const uint8_t*)shape_raw, shape_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -267,19 +50,22 @@ static napi_value Napi_weaveffi_shapes_scale(napi_env env, napi_callback_info in
   size_t argc = 2;
   napi_value args[2];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t shape_raw;
-  napi_get_value_int64(env, args[0], &shape_raw);
+  void* shape_raw;
+  size_t shape_len;
+  napi_get_buffer_info(env, args[0], &shape_raw, &shape_len);
   double factor;
   napi_get_value_double(env, args[1], &factor);
   weaveffi_error err = {0};
-  weaveffi_shapes_Shape* result = weaveffi_shapes_scale((const weaveffi_shapes_Shape*)(intptr_t)shape_raw, factor, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_shapes_scale((const uint8_t*)shape_raw, shape_len, factor, &out_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
@@ -287,21 +73,13 @@ static napi_value Napi_weaveffi_shapes_sum_bytes(napi_env env, napi_callback_inf
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  uint32_t values_count;
-  napi_get_array_length(env, args[0], &values_count);
-  uint8_t* values_arr = (uint8_t*)malloc(sizeof(uint8_t) * (values_count + 1));
-  for (uint32_t values_i = 0; values_i < values_count; values_i++) {
-    napi_value values_el;
-    napi_get_element(env, args[0], values_i, &values_el);
-    uint32_t values_nv;
-    napi_get_value_uint32(env, values_el, &values_nv);
-    values_arr[values_i] = (uint8_t)values_nv;
-  }
+  void* values_raw;
+  size_t values_len;
+  napi_get_buffer_info(env, args[0], &values_raw, &values_len);
   weaveffi_error err = {0};
-  uint64_t result = weaveffi_shapes_sum_bytes(values_arr, (size_t)values_count, &err);
-  free(values_arr);
+  uint64_t result = weaveffi_shapes_sum_bytes((const uint8_t*)values_raw, values_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -335,74 +113,27 @@ static napi_value Napi_weaveffi_shapes_make_numerics(napi_env env, napi_callback
   double j;
   napi_get_value_double(env, args[9], &j);
   weaveffi_error err = {0};
-  weaveffi_shapes_Numerics* result = weaveffi_shapes_make_numerics((int8_t)a_raw, (int16_t)b_raw, c, d, (uint8_t)e_raw, (uint16_t)f_raw, g, (uint64_t)h_raw, (float)i_raw, j, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_shapes_make_numerics((int8_t)a_raw, (int16_t)b_raw, c, d, (uint8_t)e_raw, (uint16_t)f_raw, g, (uint64_t)h_raw, (float)i_raw, j, &out_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  {
-    weaveffi_shapes_Numerics* ret_p = (weaveffi_shapes_Numerics*)result;
-    napi_create_object(env, &ret);
-    napi_value ret_a;
-    napi_create_int32(env, weaveffi_shapes_Numerics_get_a(ret_p), &ret_a);
-    napi_set_named_property(env, ret, "a", ret_a);
-    napi_value ret_b;
-    napi_create_int32(env, weaveffi_shapes_Numerics_get_b(ret_p), &ret_b);
-    napi_set_named_property(env, ret, "b", ret_b);
-    napi_value ret_c;
-    napi_create_int32(env, weaveffi_shapes_Numerics_get_c(ret_p), &ret_c);
-    napi_set_named_property(env, ret, "c", ret_c);
-    napi_value ret_d;
-    napi_create_int64(env, weaveffi_shapes_Numerics_get_d(ret_p), &ret_d);
-    napi_set_named_property(env, ret, "d", ret_d);
-    napi_value ret_e;
-    napi_create_uint32(env, weaveffi_shapes_Numerics_get_e(ret_p), &ret_e);
-    napi_set_named_property(env, ret, "e", ret_e);
-    napi_value ret_f;
-    napi_create_uint32(env, weaveffi_shapes_Numerics_get_f(ret_p), &ret_f);
-    napi_set_named_property(env, ret, "f", ret_f);
-    napi_value ret_g;
-    napi_create_uint32(env, weaveffi_shapes_Numerics_get_g(ret_p), &ret_g);
-    napi_set_named_property(env, ret, "g", ret_g);
-    napi_value ret_h;
-    napi_create_int64(env, (int64_t)weaveffi_shapes_Numerics_get_h(ret_p), &ret_h);
-    napi_set_named_property(env, ret, "h", ret_h);
-    napi_value ret_i;
-    napi_create_double(env, weaveffi_shapes_Numerics_get_i(ret_p), &ret_i);
-    napi_set_named_property(env, ret, "i", ret_i);
-    napi_value ret_j;
-    napi_create_double(env, weaveffi_shapes_Numerics_get_j(ret_p), &ret_j);
-    napi_set_named_property(env, ret, "j", ret_j);
-    weaveffi_shapes_Numerics_destroy(ret_p);
-  }
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
-    { "Shape_tag", NULL, Napi_weaveffi_shapes_Shape_tag, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_empty_new", NULL, Napi_weaveffi_shapes_Shape_Empty_new, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_circle_new", NULL, Napi_weaveffi_shapes_Shape_Circle_new, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_rectangle_new", NULL, Napi_weaveffi_shapes_Shape_Rectangle_new, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_bounded_new", NULL, Napi_weaveffi_shapes_Shape_Bounded_new, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_labeled_new", NULL, Napi_weaveffi_shapes_Shape_Labeled_new, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_circle_get_radius", NULL, Napi_weaveffi_shapes_Shape_Circle_get_radius, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_rectangle_get_width", NULL, Napi_weaveffi_shapes_Shape_Rectangle_get_width, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_rectangle_get_height", NULL, Napi_weaveffi_shapes_Shape_Rectangle_get_height, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_bounded_get_min", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_min, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_bounded_get_max", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_max, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_bounded_get_weight", NULL, Napi_weaveffi_shapes_Shape_Bounded_get_weight, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_labeled_get_label", NULL, Napi_weaveffi_shapes_Shape_Labeled_get_label, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_labeled_get_count", NULL, Napi_weaveffi_shapes_Shape_Labeled_get_count, NULL, NULL, NULL, napi_default, NULL },
-    { "Shape_destroy", NULL, Napi_weaveffi_shapes_Shape_destroy, NULL, NULL, NULL, napi_default, NULL },
     { "describe", NULL, Napi_weaveffi_shapes_describe, NULL, NULL, NULL, napi_default, NULL },
     { "scale", NULL, Napi_weaveffi_shapes_scale, NULL, NULL, NULL, napi_default, NULL },
     { "sumBytes", NULL, Napi_weaveffi_shapes_sum_bytes, NULL, NULL, NULL, napi_default, NULL },
     { "makeNumerics", NULL, Napi_weaveffi_shapes_make_numerics, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 19, props);
+  napi_define_properties(env, exports, 4, props);
   return exports;
 }
 

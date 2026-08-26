@@ -4,10 +4,11 @@
 
 The Wasm target produces a typed ES module loader for
 `wasm32-unknown-unknown` builds of WeaveFFI cdylibs. The loader wraps
-the raw exports in idiomatic JavaScript: per-module namespaces, struct
-wrapper classes with getters, thrown `Error`s instead of error slots,
-`Promise`-based async functions, and automatic string/bytes staging in
-linear memory. TypeScript declarations describe the whole surface.
+the raw exports in idiomatic JavaScript: per-module namespaces, plain
+JS objects for records and tagged objects for rich enums, thrown
+`Error`s instead of error slots, `Promise`-based async functions, and
+automatic string/bytes staging in linear memory. TypeScript
+declarations describe the whole surface.
 
 C and C++ producers compiled with Emscripten are supported through a
 dedicated loader variant; see [Emscripten mode](#emscripten-mode).
@@ -21,7 +22,7 @@ events fire only while a call into the module is on the stack; see
 
 | File | Purpose |
 |------|---------|
-| `generated/wasm/weaveffi_wasm.js` | ES module: memory helpers, struct wrapper classes, and the async `loadWeaveffiWasm(url)` loader returning typed bindings |
+| `generated/wasm/weaveffi_wasm.js` | ES module: memory helpers, value-buffer codecs, and the async `loadWeaveffiWasm(url)` loader returning typed bindings |
 | `generated/wasm/weaveffi_wasm.d.ts` | TypeScript declarations for the loader and every module namespace |
 | `generated/wasm/package.json` | npm package manifest (`type: "module"`) |
 | `generated/wasm/README.md` | Quickstart and boundary conventions |
@@ -40,11 +41,13 @@ events fire only while a call into the module is on the stack; see
 | `bool`       | `i32`         | `boolean` (0/1 at the boundary) |
 | `string`     | `i32` pointer (NUL-terminated UTF-8) | `string`, staged via `weaveffi_alloc` |
 | `bytes`      | `i32` pointer + `i32` length | `Uint8Array` copy |
-| `handle` / `StructName` | `i32` pointer into linear memory (0 = null) | struct wrapper class with getters |
+| `handle` / `InterfaceName` | `i32` pointer into linear memory (0 = null) | interface wrapper class |
+| `StructName` | value buffer (`i32` pointer + `i32` length) | plain JS object |
 | `EnumName` (plain, C-style)   | `i32` discriminant | `number` |
-| `EnumName` (rich / algebraic) | `i32` pointer into linear memory (0 = null) | wrapper `class` (e.g. `Shape`) |
-| `T?`         | 0 / null pointer; scalars boxed by pointer | `T \| null` |
-| `[T]`        | `i32` pointer + `i32` length | `Array` copy |
+| `EnumName` (rich / algebraic) | value buffer (`i32` pointer + `i32` length) | tagged plain object (`{ tag: "Circle", radius: 2 }`) |
+| `T?`         | value buffer; `Interface?` stays a 0/null pointer | `T \| null` |
+| `[T]`        | value buffer (`i32` pointer + `i32` length) | `Array` copy |
+| `{K: V}`     | value buffer (`i32` pointer + `i32` length) | plain object (`Map` accepted on input) |
 | `iter<T>`    | iterator handle + `next` out-param | lazy `IterableIterator<T>` |
 
 ## Example IDL → generated code
@@ -70,9 +73,9 @@ for (const m of api.events.getMessages()) { // iter<string> -> lazy iterable
 }
 ```
 
-Structs come back as wrapper classes holding the native handle, with a
-getter per field and a static `create` when the struct has a
-constructor:
+Structs come back as plain JS objects, serialized in a value buffer at
+the boundary and packed/unpacked automatically by the glue; there are
+no handles, no accessor functions, and nothing to free:
 
 ```javascript
 const result = await api.tasks.runTask('build');
@@ -139,6 +142,10 @@ the domain, the generic `WeaveFFIError`. A callable without `throws`
 uses the generic checker only; a failure there can only be a producer
 bug and throws `WeaveFFIError`.
 
+An error code that declares payload `fields:` carries them serialized
+in the error's payload buffer; the checker decodes them onto the thrown
+error object before clearing the slot.
+
 ## Interfaces
 
 An `interfaces:` entry becomes a class exposed on its module's namespace
@@ -196,146 +203,45 @@ allocation lives until the module instance is dropped.
 
 A *rich* (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style enum stays an `i32` discriminant (surfaced as a
-`number` plus a frozen constants object), but a rich enum lowers to an
-**opaque object handle**, an `i32` pointer into linear memory, exactly
-like a struct wrapper. The loader wraps it in a `Shape` class that owns
-that handle for the lifetime of the module instance.
+`number` plus a frozen constants object), but a rich enum is a plain
+object tagged by variant name (`{ tag: "Circle", radius: 2 }`) that
+crosses the boundary serialized in a value buffer, exactly like a
+record: an `i32` tag followed by the active variant's fields.
 
 For a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }`, the generated `Shape` class has
-one static factory per variant, a `tag` getter, a getter per variant
-field, and an explicit `free()` (there is no `FinalizationRegistry` on
-this target):
-
-```js
-class Shape {
-  constructor(wasm, handle) {
-    this._wasm = wasm;
-    this._handle = handle;
-  }
-  get tag() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_shapes_Shape_tag(this._handle);
-    return _r;
-  }
-  static empty(wasm) {
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_shapes_Shape_Empty_new(_err);
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Shape(wasm, _r);
-  }
-  static circle(wasm, radius) {
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_shapes_Shape_Circle_new(radius, _err);
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Shape(wasm, _r);
-  }
-  // ... rectangle(wasm, width, height), labeled(wasm, label, count) ...
-  get circleRadius() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_shapes_Shape_Circle_get_radius(this._handle);
-    return _r;
-  }
-  get labeledLabel() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_shapes_Shape_Labeled_get_label(this._handle);
-    return _takeCStr(wasm, _r);
-  }
-  // ... rectangleWidth, rectangleHeight, labeledCount ...
-  free() {
-    if (this._handle !== 0) {
-      this._wasm.weaveffi_shapes_Shape_destroy(this._handle);
-      this._handle = 0;
-    }
-  }
-}
-Shape.Tag = Object.freeze({
-  Empty: 0,
-  Circle: 1,
-  Rectangle: 2,
-  Labeled: 3,
-});
-```
-
-The `wasm` instance is bound for you by the loader, so on the returned
-API the factories take only their declared arguments. Under
-`api.shapes.Shape` you get `empty()`, `circle(radius)`,
-`rectangle(width, height)`, `labeled(label, count)`, plus the frozen
-`Tag` map:
-
-```js
-shapes: {
-  // ...
-  Shape: {
-    empty: (...args) => Shape.empty(wasm, ...args),
-    circle: (...args) => Shape.circle(wasm, ...args),
-    rectangle: (...args) => Shape.rectangle(wasm, ...args),
-    labeled: (...args) => Shape.labeled(wasm, ...args),
-    Tag: Shape.Tag,
-  },
-},
-```
-
-The active variant is read through the `tag` getter (no call
-parentheses) and compared against `api.shapes.Shape.Tag`. Each variant
-field is a camelCased getter: `circleRadius`, `rectangleWidth`,
-`rectangleHeight`, `labeledLabel`, `labeledCount`. Functions that take
-or return the enum pass the wrapper directly: `describe(shape)` reads
-`shape._handle`, and `scale(shape, factor)` returns a fresh `Shape`.
-
-The generated `weaveffi_wasm.d.ts` types the wrapper as an
-`export declare class`:
+`Labeled { label: string, count: u8 }`, the generated
+`weaveffi_wasm.d.ts` types the value as a discriminated union:
 
 ```typescript
-export declare class Shape {
-  get tag(): number;
-  static readonly Tag: Readonly<{
-    Empty: 0;
-    Circle: 1;
-    Rectangle: 2;
-    Labeled: 3;
-  }>;
-  static empty(): Shape;
-  static circle(radius: number): Shape;
-  static rectangle(width: number, height: number): Shape;
-  static labeled(label: string, count: number): Shape;
-  get circleRadius(): number;
-  get rectangleWidth(): number;
-  get rectangleHeight(): number;
-  get labeledLabel(): string;
-  get labeledCount(): number;
-  free(): void;
-}
+export type Shape =
+  | { tag: "Empty" }
+  | { tag: "Circle"; radius: number }
+  | { tag: "Rectangle"; width: number; height: number }
+  | { tag: "Labeled"; label: string; count: number };
 ```
 
-A short round-trip that constructs a couple of variants, reads the tag and a
-field, calls `describe` / `scale`, then frees the handles:
+Construct values as object literals and branch on `tag`; TypeScript
+narrows the union automatically:
 
 ```js
 const api = await loadWeaveffiWasm('/shapes.wasm');
 
-const circle = api.shapes.Shape.circle(2.0);
-const label = api.shapes.Shape.labeled('unit', 3);
+const circle = { tag: 'Circle', radius: 2.0 };
+const label = { tag: 'Labeled', label: 'unit', count: 3 };
 
-if (circle.tag === api.shapes.Shape.Tag.Circle) {
-  console.log(circle.circleRadius); // 2
+if (circle.tag === 'Circle') {
+  console.log(circle.radius); // 2
 }
 
 console.log(api.shapes.describe(circle)); // native-rendered description
-const bigger = api.shapes.scale(circle, 3.0); // a fresh Shape
-
-// No FinalizationRegistry on this target. Free handles yourself.
-circle.free();
-label.free();
-bigger.free();
+const bigger = api.shapes.scale(circle, 3.0); // a fresh Shape object
 ```
 
-**Ownership:** a `Shape` owns its native object. JavaScript has no
-deterministic destructors here, so call `free()` when you are done;
-otherwise the allocation lives until the module instance is dropped.
+Values are plain JavaScript data: there are no handles, no per-variant
+factories or getters, and nothing to `free()`. The glue packs an
+argument into linear memory for the duration of the call and unpacks a
+returned buffer into a fresh object.
 
 ## Async support
 
@@ -350,7 +256,7 @@ trampoline per completion-callback signature using the
 runTask(name) {
   return new Promise((resolve, reject) => {
     const ctxId = _nextCtxId++;
-    _asyncContexts.set(ctxId, { resolve, reject, mkErr: _taskErrorFrom, unwrap: (w, h) => new TaskResult(w, h) });
+    _asyncContexts.set(ctxId, { resolve, reject, mkErr: _taskErrorFrom /* decodes the result value buffer */ });
     const [a0_p, a0_s] = _cstr(wasm, name);
     wasm.weaveffi_tasks_run_task_async(a0_p, _cbPtr_i32_i32_i32, ctxId);
     wasm.weaveffi_dealloc(a0_p, a0_s);
@@ -487,11 +393,12 @@ Two semantic points to keep in mind:
   emits from a spawned thread cannot run on `wasm32-unknown-unknown`
   at all (`std::thread::spawn` fails there).
 - **Callback arguments are borrowed.** The producer owns every argument
-  for the duration of the dispatch. Strings and byte buffers are copied
-  into JavaScript values before your callback runs, but struct,
-  rich-enum, and interface arguments wrap producer-owned memory: read
-  what you need inside the callback and do not retain the wrapper or
-  call `free()` on it.
+  for the duration of the dispatch. Strings, byte buffers, and buffered
+  values (records, rich enums, optionals, lists, maps) are copied or
+  decoded into fresh JavaScript values before your callback runs, so
+  they're safe to retain. An interface argument wraps producer-owned
+  memory: read what you need inside the callback and do not retain the
+  wrapper or call `free()` on it.
 
 In [Emscripten mode](#emscripten-mode) callbacks and listeners are not
 supported; each register/unregister entry point becomes an explicit
@@ -606,15 +513,17 @@ Serve it over HTTP and load it with the generated helper:
 
 ## Memory and ownership
 
-- The wrapper stages strings, bytes, and arrays into linear memory with
-  the exported `weaveffi_alloc` / `weaveffi_dealloc` and releases them
-  after the call; you don't manage buffers for typed calls.
-- Producer-owned returns (strings, arrays, struct fields) are copied to
-  JavaScript values and freed via `weaveffi_free_string` /
-  `weaveffi_dealloc` inside the wrapper.
-- Struct wrapper objects hold a native handle. JavaScript has no
-  deterministic destructors; the underlying allocation lives until the
-  module is dropped. Treat handles as owned by the module instance.
+- The wrapper stages strings, bytes, and value buffers into linear
+  memory with the exported `weaveffi_alloc` / `weaveffi_dealloc` and
+  releases them after the call; you don't manage buffers for typed
+  calls.
+- Producer-owned returns (strings and value buffers) are copied or
+  decoded into JavaScript values and freed via `weaveffi_free_string` /
+  `weaveffi_free_bytes` inside the wrapper.
+- Records, rich enums, optionals, lists, and maps are plain JavaScript
+  values with nothing to free. Interface wrapper objects hold a native
+  handle: call `free()` when done, or the allocation lives until the
+  module is dropped.
 - Error slots are allocated, checked, and cleared internally; failures
   surface as thrown `Error`s with the producer's code and message.
 - When you bypass the typed surface via `_raw`, the conventions at the

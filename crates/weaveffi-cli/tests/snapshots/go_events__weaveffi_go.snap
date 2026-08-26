@@ -37,18 +37,23 @@ func (e *WeaveFFIError) Error() string {
 }
 
 // wvTakeError reads and clears a non-zero C error slot, returning its
-// code and message.
-func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+// code, message, and a copy of its structured payload buffer (nil when
+// the code declares no payload fields).
+func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {
 	code := int32(cErr.code)
 	msg := ""
 	if cErr.message != nil {
 		msg = C.GoString(cErr.message)
 	}
+	var payload []byte
+	if cErr.payload_ptr != nil {
+		payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))
+	}
 	C.weaveffi_error_clear(cErr)
-	return code, msg
+	return code, msg, payload
 }
 
-func wvBrandError(code int32, message string) error {
+func wvBrandError(code int32, message string, _ []byte) error {
 	return &WeaveFFIError{Code: code, Message: message}
 }
 
@@ -57,7 +62,7 @@ func wvBrandError(code int32, message string) error {
 // a producer panic or a marshalling failure.
 func wvTrap(cErr *C.weaveffi_error) {
 	if cErr.code != 0 {
-		code, msg := wvTakeError(cErr)
+		code, msg, _ := wvTakeError(cErr)
 		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
 	}
 }

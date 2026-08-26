@@ -35,34 +35,30 @@ export declare class InvalidInput extends KitchenErrorsError {
 
 /** A reusable token referenced across modules */
 export interface Token {
-  readonly id: bigint;
-  readonly label: string;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  id: bigint;
+  label: string;
 }
 
 /** Kitchen sink struct exercising every field feature */
 export interface Item {
   /** Stable identifier */
-  readonly id: bigint;
+  id: bigint;
   /** Display name */
-  readonly name: string;
+  name: string;
   /** Initial count */
-  readonly count: number;
+  count: number;
   /** Whether the item is enabled */
-  readonly enabled: boolean;
+  enabled: boolean;
   /** Scaling ratio */
-  readonly ratio: number;
-  readonly nick: number;
-  readonly payload: Uint8Array;
-  readonly tags: string[];
-  readonly attrs: Record<string, string>;
-  readonly parent: bigint | null;
+  ratio: number;
+  nick: number;
+  payload: Uint8Array;
+  tags: string[];
+  attrs: Record<string, string>;
+  parent: bigint | null;
   /** Cross-module struct reference */
-  readonly token: Token;
-  readonly priority: Priority;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  token: Token;
+  priority: Priority;
 }
 
 /** Task priority levels */
@@ -159,7 +155,7 @@ export interface WeaveffiWasmModule {
      * Returns a typed handle
      * @throws {WeaveFFIError} if the native call fails
      */
-    openTypedHandle(): Token;
+    openTypedHandle(): number;
     /**
      * Optional struct return
      * @throws {KitchenErrorsError} on a domain error code

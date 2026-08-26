@@ -62,28 +62,6 @@ export interface Item {
   token: Token;
   priority: Priority;
 }
-/** Kitchen sink struct exercising every field feature */
-export interface ItemBuilder {
-  /** Stable identifier */
-  withId(value: number): ItemBuilder;
-  /** Display name */
-  withName(value: string): ItemBuilder;
-  /** Initial count */
-  withCount(value: number): ItemBuilder;
-  /** Whether the item is enabled */
-  withEnabled(value: boolean): ItemBuilder;
-  /** Scaling ratio */
-  withRatio(value: number): ItemBuilder;
-  withNick(value: number): ItemBuilder;
-  withPayload(value: Buffer): ItemBuilder;
-  withTags(value: string[]): ItemBuilder;
-  withAttrs(value: Record<string, string>): ItemBuilder;
-  withParent(value: number | null): ItemBuilder;
-  /** Cross-module struct reference */
-  withToken(value: Token): ItemBuilder;
-  withPriority(value: Priority): ItemBuilder;
-  build(): Item;
-}
 /** Task priority levels */
 export enum Priority {
   /** Low priority */

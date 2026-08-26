@@ -42,26 +42,127 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 private final class ContinuationRef<T, E: Error> {
@@ -78,33 +179,34 @@ var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
 let wvListenerLock = NSLock()
 
 /// A reusable token referenced across modules
-public class Token {
-    let ptr: OpaquePointer
+public struct Token {
+    public var id: Int64
+    public var label: String
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
+    /// Creates a `Token` value.
+    public init(id: Int64, label: String) {
+        self.id = id
+        self.label = label
     }
+}
 
-    deinit {
-        weaveffi_shared_Token_destroy(ptr)
-    }
+/// Serializes a `Token` into the value-buffer wire format.
+func wvWriteToken(_ value: Token, into w: inout WvWriter) {
+    w.writeInt64(value.id)
+    w.writeString(value.label)
+}
 
-    public var id: Int64 {
-        return weaveffi_shared_Token_get_id(ptr)
-    }
-
-    public var label: String {
-        let raw = weaveffi_shared_Token_get_label(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
+/// Deserializes a `Token` from the value-buffer wire format.
+func wvReadToken(_ r: inout WvReader) -> Token {
+    let v0 = r.readInt64()
+    let v1 = r.readString()
+    return Token(id: v0, label: v1)
 }
 
 public enum Shared {
     /// Trivial cross-module helper
     public static func ping() -> String {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_shared_ping(&err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null string") }
@@ -133,7 +235,7 @@ public enum KitchenErrorsError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapKitchen(code: Int32, message: String) -> Error {
+func mapKitchen(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return KitchenErrorsError.notFound(message: message.isEmpty ? "Item not found" : message)
     case 2: return KitchenErrorsError.invalidInput(message: message.isEmpty ? "Invalid input" : message)
@@ -146,8 +248,9 @@ func checkKitchen(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapKitchen(code: code, message: message)
+        throw mapKitchen(code: code, message: message, payload: payload)
     }
 }
 
@@ -162,246 +265,103 @@ public enum Priority: UInt32 {
 }
 
 /// Kitchen sink struct exercising every field feature
-public class Item {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_kitchen_Item_destroy(ptr)
-    }
-
+public struct Item {
     /// Stable identifier
-    public var id: Int64 {
-        return weaveffi_kitchen_Item_get_id(ptr)
-    }
-
+    public var id: Int64
     /// Display name
-    public var name: String {
-        let raw = weaveffi_kitchen_Item_get_name(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
+    public var name: String
     /// Initial count
-    public var count: Int32 {
-        return weaveffi_kitchen_Item_get_count(ptr)
-    }
-
+    public var count: Int32
     /// Whether the item is enabled
-    public var enabled: Bool {
-        return weaveffi_kitchen_Item_get_enabled(ptr)
-    }
-
+    public var enabled: Bool
     /// Scaling ratio
-    public var ratio: Double {
-        return weaveffi_kitchen_Item_get_ratio(ptr)
-    }
-
-    public var nick: UInt32 {
-        return weaveffi_kitchen_Item_get_nick(ptr)
-    }
-
-    public var payload: Data {
-        var outLen: Int = 0
-        let raw = weaveffi_kitchen_Item_get_payload(ptr, &outLen)
-        guard let raw = raw else { return Data() }
-        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: raw), outLen) }
-        return Data(bytes: raw, count: outLen)
-    }
-
-    public var tags: [String] {
-        var outLen: Int = 0
-        let rv = weaveffi_kitchen_Item_get_tags(ptr, &outLen)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        var items: [String] = []
-        items.reserveCapacity(outLen)
-        for i in 0..<outLen {
-            items.append(String(cString: rv[i]!))
-            weaveffi_free_string(rv[i])
-        }
-        return items
-    }
-
-    public var attrs: [String: String] {
-        var outKeysPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
-        var outValuesPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
-        var outLen: Int = 0
-        weaveffi_kitchen_Item_get_attrs(ptr, &outKeysPtr, &outValuesPtr, &outLen)
-        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
-        defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }
-        var result: [String: String] = [:]
-        for i in 0..<outLen {
-            result[String(cString: outKeys[i]!)] = String(cString: outValues[i]!)
-            weaveffi_free_string(outKeys[i])
-            weaveffi_free_string(outValues[i])
-        }
-        return result
-    }
-
-    public var parent: Int64? {
-        let p = weaveffi_kitchen_Item_get_parent(ptr)
-        guard let p = p else { return nil }
-        defer { wvFreeBox(p) }
-        return p.pointee
-    }
-
+    public var ratio: Double
+    public var nick: UInt32
+    public var payload: Data
+    public var tags: [String]
+    public var attrs: [String: String]
+    public var parent: Int64?
     /// Cross-module struct reference
-    public var token: Token {
-        return Token(ptr: weaveffi_kitchen_Item_get_token(ptr)!)
-    }
+    public var token: Token
+    public var priority: Priority
 
-    public var priority: Priority {
-        return Priority(rawValue: weaveffi_kitchen_Item_get_priority(ptr).rawValue)!
+    /// Creates a `Item` value.
+    public init(id: Int64, name: String, count: Int32, enabled: Bool, ratio: Double, nick: UInt32, payload: Data, tags: [String], attrs: [String: String], parent: Int64?, token: Token, priority: Priority) {
+        self.id = id
+        self.name = name
+        self.count = count
+        self.enabled = enabled
+        self.ratio = ratio
+        self.nick = nick
+        self.payload = payload
+        self.tags = tags
+        self.attrs = attrs
+        self.parent = parent
+        self.token = token
+        self.priority = priority
     }
 }
 
-/// Kitchen sink struct exercising every field feature
-public class ItemBuilder {
-    private var _id: Int64?
-    private var _name: String?
-    private var _count: Int32?
-    private var _enabled: Bool?
-    private var _ratio: Double?
-    private var _nick: UInt32?
-    private var _payload: Data?
-    private var _tags: [String]?
-    private var _attrs: [String: String]?
-    private var _parent: Int64??
-    private var _token: Token?
-    private var _priority: Priority?
-
-    public init() {}
-
-    /// Stable identifier
-    @discardableResult
-    public func withId(_ value: Int64) -> Self {
-        self._id = value
-        return self
+/// Serializes a `Item` into the value-buffer wire format.
+func wvWriteItem(_ value: Item, into w: inout WvWriter) {
+    w.writeInt64(value.id)
+    w.writeString(value.name)
+    w.writeInt32(value.count)
+    w.writeBool(value.enabled)
+    w.writeDouble(value.ratio)
+    w.writeUInt32(value.nick)
+    w.writeBytes(value.payload)
+    w.writeLen(value.tags.count)
+    for v0 in value.tags {
+        w.writeString(v0)
     }
-
-    /// Display name
-    @discardableResult
-    public func withName(_ value: String) -> Self {
-        self._name = value
-        return self
+    w.writeLen(value.attrs.count)
+    for (v1, v2) in value.attrs {
+        w.writeString(v1)
+        w.writeString(v2)
     }
-
-    /// Initial count
-    @discardableResult
-    public func withCount(_ value: Int32) -> Self {
-        self._count = value
-        return self
+    if let v3 = value.parent {
+        w.writeOptionFlag(true)
+        w.writeInt64(v3)
+    } else {
+        w.writeOptionFlag(false)
     }
+    wvWriteToken(value.token, into: &w)
+    w.writeInt32(Int32(bitPattern: value.priority.rawValue))
+}
 
-    /// Whether the item is enabled
-    @discardableResult
-    public func withEnabled(_ value: Bool) -> Self {
-        self._enabled = value
-        return self
+/// Deserializes a `Item` from the value-buffer wire format.
+func wvReadItem(_ r: inout WvReader) -> Item {
+    let v4 = r.readInt64()
+    let v5 = r.readString()
+    let v6 = r.readInt32()
+    let v7 = r.readBool()
+    let v8 = r.readDouble()
+    let v9 = r.readUInt32()
+    let v10 = r.readBytes()
+    let n12 = r.readLen()
+    var v11: [String] = []
+    v11.reserveCapacity(n12)
+    for _ in 0..<n12 {
+        let v13 = r.readString()
+        v11.append(v13)
     }
-
-    /// Scaling ratio
-    @discardableResult
-    public func withRatio(_ value: Double) -> Self {
-        self._ratio = value
-        return self
+    let n15 = r.readLen()
+    var v14: [String: String] = [:]
+    v14.reserveCapacity(n15)
+    for _ in 0..<n15 {
+        let v16 = r.readString()
+        let v17 = r.readString()
+        v14[v16] = v17
     }
-
-    @discardableResult
-    public func withNick(_ value: UInt32) -> Self {
-        self._nick = value
-        return self
+    var v18: Int64? = nil
+    if r.readOptionFlag() {
+        let v19 = r.readInt64()
+        v18 = v19
     }
-
-    @discardableResult
-    public func withPayload(_ value: Data) -> Self {
-        self._payload = value
-        return self
-    }
-
-    @discardableResult
-    public func withTags(_ value: [String]) -> Self {
-        self._tags = value
-        return self
-    }
-
-    @discardableResult
-    public func withAttrs(_ value: [String: String]) -> Self {
-        self._attrs = value
-        return self
-    }
-
-    @discardableResult
-    public func withParent(_ value: Int64?) -> Self {
-        self._parent = value
-        return self
-    }
-
-    /// Cross-module struct reference
-    @discardableResult
-    public func withToken(_ value: Token) -> Self {
-        self._token = value
-        return self
-    }
-
-    @discardableResult
-    public func withPriority(_ value: Priority) -> Self {
-        self._priority = value
-        return self
-    }
-
-    public func build() throws -> Item {
-        guard let id = _id else { throw WeaveFFIError.error(code: -1, message: "missing field: id") }
-        guard let name = _name else { throw WeaveFFIError.error(code: -1, message: "missing field: name") }
-        guard let count = _count else { throw WeaveFFIError.error(code: -1, message: "missing field: count") }
-        guard let enabled = _enabled else { throw WeaveFFIError.error(code: -1, message: "missing field: enabled") }
-        guard let ratio = _ratio else { throw WeaveFFIError.error(code: -1, message: "missing field: ratio") }
-        guard let nick = _nick else { throw WeaveFFIError.error(code: -1, message: "missing field: nick") }
-        guard let payload = _payload else { throw WeaveFFIError.error(code: -1, message: "missing field: payload") }
-        guard let tags = _tags else { throw WeaveFFIError.error(code: -1, message: "missing field: tags") }
-        guard let attrs = _attrs else { throw WeaveFFIError.error(code: -1, message: "missing field: attrs") }
-        guard let parent = _parent else { throw WeaveFFIError.error(code: -1, message: "missing field: parent") }
-        guard let token = _token else { throw WeaveFFIError.error(code: -1, message: "missing field: token") }
-        guard let priority = _priority else { throw WeaveFFIError.error(code: -1, message: "missing field: priority") }
-        var err = weaveffi_error(code: 0, message: nil)
-        let payload_bytes = Array(payload)
-        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
-        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
-        let attrs_keys = Array(attrs.keys)
-        let attrs_values = attrs_keys.map { attrs[$0]! }
-        let attrs_keysCstrs: [UnsafePointer<CChar>?] = attrs_keys.map { UnsafePointer(strdup($0)) }
-        defer { attrs_keysCstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
-        let attrs_valuesCstrs: [UnsafePointer<CChar>?] = attrs_values.map { UnsafePointer(strdup($0)) }
-        defer { attrs_valuesCstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
-        let result: OpaquePointer? = name.withCString { name_ptr in
-            return payload_bytes.withUnsafeBufferPointer { payload_buf in
-                let payload_ptr = payload_buf.baseAddress!
-                let payload_len = payload_buf.count
-                return tags_cstrs.withUnsafeBufferPointer { tags_buf in
-                    let tags_ptr = tags_buf.baseAddress
-                    let tags_len = tags_buf.count
-                    return attrs_keysCstrs.withUnsafeBufferPointer { attrs_keys_buf in
-                        let attrs_keys_ptr = attrs_keys_buf.baseAddress
-                        return attrs_valuesCstrs.withUnsafeBufferPointer { attrs_values_buf in
-                            let attrs_values_ptr = attrs_values_buf.baseAddress
-                            let attrs_len = attrs_values_buf.count
-                            return withOptionalPointer(to: parent) { parent_ptr in
-                                    return weaveffi_kitchen_Item_create(id, name_ptr, count, enabled, ratio, nick, payload_ptr, payload_len, tags_ptr, tags_len, attrs_keys_ptr, attrs_values_ptr, attrs_len, parent_ptr, token.ptr, weaveffi_kitchen_Priority(priority.rawValue), &err)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        try check(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Item(ptr: result)
-    }
+    let v20 = wvReadToken(&r)
+    let v21 = Priority(rawValue: UInt32(bitPattern: r.readInt32()))!
+    return Item(id: v4, name: v5, count: v6, enabled: v7, ratio: v8, nick: v9, payload: v10, tags: v11, attrs: v14, parent: v18, token: v20, priority: v21)
 }
 
 /// A pocket-sized interface exercising the object surface
@@ -417,7 +377,7 @@ public final class Gadget {
     }
     /// Create a gadget with the given id
     public init(id: Int64) {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_Gadget_new(id, &err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null pointer") }
@@ -425,7 +385,7 @@ public final class Gadget {
     }
     /// Render the gadget as a human-readable string
     public func describe() -> String {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_Gadget_describe(ptr, &err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null string") }
@@ -434,14 +394,14 @@ public final class Gadget {
     }
     /// Poke the gadget a number of times, failing on a negative count
     public func poke(times: Int32) throws -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_Gadget_poke(ptr, times, &err)
         try checkKitchen(&err)
         return rv
     }
     /// The gadget subsystem version string
     public static func version() -> String {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_Gadget_version(&err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null string") }
@@ -476,9 +436,10 @@ public final class KitchenStreamItemsIterator: Sequence, IteratorProtocol {
     /// stream is exhausted (destroying the underlying iterator).
     public func next() -> Item? {
         guard let handle = handle else { return nil }
-        var item: OpaquePointer? = nil
-        var err = weaveffi_error(code: 0, message: nil)
-        if weaveffi_kitchen_StreamItemsIterator_next(handle, &item, &err) == 0 {
+        var item: UnsafePointer<UInt8>? = nil
+        var itemLen: Int = 0
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        if weaveffi_kitchen_StreamItemsIterator_next(handle, &item, &itemLen, &err) == 0 {
             if err.code != 0 {
                 let code = err.code
                 let message = err.message.flatMap { String(cString: $0) } ?? ""
@@ -488,8 +449,12 @@ public final class KitchenStreamItemsIterator: Sequence, IteratorProtocol {
             destroyHandle()
             return nil
         }
-        let element = Item(ptr: item!)
-        return element
+        let itemBytes = [UInt8](UnsafeBufferPointer(start: item, count: itemLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: item), itemLen)
+        var itemReader = WvReader(bytes: itemBytes)
+        let v0 = wvReadItem(&itemReader)
+        itemReader.finish()
+        return v0
     }
 }
 
@@ -520,148 +485,182 @@ public enum Kitchen {
     }
     /// Identity for bool
     public static func boolId(x: Bool) -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_bool_id(x, &err)
         trap(&err)
         return rv
     }
     public static func i32Id(x: Int32) -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_i32_id(x, &err)
         trap(&err)
         return rv
     }
     public static func u32Id(x: UInt32) -> UInt32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_u32_id(x, &err)
         trap(&err)
         return rv
     }
     public static func i64Id(x: Int64) -> Int64 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_i64_id(x, &err)
         trap(&err)
         return rv
     }
     public static func f64Id(x: Double) -> Double {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_f64_id(x, &err)
         trap(&err)
         return rv
     }
     public static func echoString(s: String) -> String {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: String = s.withCString { s_ptr in
-                let rv = weaveffi_kitchen_echo_string(s_ptr, &err)
-                trap(&err)
-                guard let rv = rv else { fatalError("-1: null string") }
-                defer { weaveffi_free_string(rv) }
-                return String(cString: rv)
-        }
-        return result
-    }
-    public static func echoBytes(b: Data) -> Data {
-        var err = weaveffi_error(code: 0, message: nil)
-        let b_bytes = Array(b)
-        let result: Data = b_bytes.withUnsafeBufferPointer { b_buf in
-            let b_ptr = b_buf.baseAddress!
-            let b_len = b_buf.count
-                return weaveffi_kitchen_echo_bytes(b_ptr, b_len, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let rv: UnsafePointer<CChar>? = s.withCString { s_ptr in
+            return weaveffi_kitchen_echo_string(s_ptr, &err)
         }
         trap(&err)
-        return result
+        guard let rv = rv else { fatalError("-1: null string") }
+        defer { weaveffi_free_string(rv) }
+        return String(cString: rv)
+    }
+    public static func echoBytes(b: Data) -> Data {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let bBytes = Array(b)
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = bBytes.withUnsafeBufferPointer { b_buf in
+            let b_ptr = b_buf.baseAddress
+            let b_len = b_buf.count
+            return weaveffi_kitchen_echo_bytes(b_ptr, b_len, &outLen, &err)
+        }
+        trap(&err)
+        guard let rv = rv else { return Data() }
+        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }
+        return Data(bytes: rv, count: outLen)
     }
     /// Borrowed string parameter
     public static func echoBorrowedStr(s: String) -> String {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: String = s.withCString { s_ptr in
-                let rv = weaveffi_kitchen_echo_borrowed_str(s_ptr, &err)
-                trap(&err)
-                guard let rv = rv else { fatalError("-1: null string") }
-                defer { weaveffi_free_string(rv) }
-                return String(cString: rv)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let rv: UnsafePointer<CChar>? = s.withCString { s_ptr in
+            return weaveffi_kitchen_echo_borrowed_str(s_ptr, &err)
         }
-        return result
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null string") }
+        defer { weaveffi_free_string(rv) }
+        return String(cString: rv)
     }
     /// Borrowed bytes parameter
     public static func echoBorrowedBytes(b: Data) -> Data {
-        var err = weaveffi_error(code: 0, message: nil)
-        let b_bytes = Array(b)
-        let result: Data = b_bytes.withUnsafeBufferPointer { b_buf in
-            let b_ptr = b_buf.baseAddress!
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let bBytes = Array(b)
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = bBytes.withUnsafeBufferPointer { b_buf in
+            let b_ptr = b_buf.baseAddress
             let b_len = b_buf.count
-                return weaveffi_kitchen_echo_borrowed_bytes(b_ptr, b_len, &err)
+            return weaveffi_kitchen_echo_borrowed_bytes(b_ptr, b_len, &outLen, &err)
         }
         trap(&err)
-        return result
+        guard let rv = rv else { return Data() }
+        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }
+        return Data(bytes: rv, count: outLen)
     }
     /// Returns an opaque handle
     public static func openHandle() -> UInt64 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_open_handle(&err)
         trap(&err)
         return rv
     }
     /// Returns a typed handle
-    public static func openTypedHandle() -> Token {
-        var err = weaveffi_error(code: 0, message: nil)
+    public static func openTypedHandle() -> UInt64 {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_open_typed_handle(&err)
         trap(&err)
-        guard let rv = rv else { fatalError("-1: null pointer") }
-        return Token(ptr: rv)
+        return UInt64(UInt(bitPattern: rv))
     }
     /// Optional struct return
     public static func maybeItem(id: Int64) throws -> Item? {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_kitchen_maybe_item(id, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_kitchen_maybe_item(id, &outLen, &err)
         try checkKitchen(&err)
-        return rv.map { Item(ptr: $0) }
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        var v0: Item? = nil
+        if rvReader.readOptionFlag() {
+            let v1 = wvReadItem(&rvReader)
+            v0 = v1
+        }
+        rvReader.finish()
+        return v0
     }
     /// List of structs
     public static func listItems() -> [Item] {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         var outLen: Int = 0
         let rv = weaveffi_kitchen_list_items(&outLen, &err)
         trap(&err)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        return (0..<outLen).map { Item(ptr: rv[$0]!) }
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let n1 = rvReader.readLen()
+        var v0: [Item] = []
+        v0.reserveCapacity(n1)
+        for _ in 0..<n1 {
+            let v2 = wvReadItem(&rvReader)
+            v0.append(v2)
+        }
+        rvReader.finish()
+        return v0
     }
     /// Map return type
     public static func getAttrs() -> [String: Int32] {
-        var err = weaveffi_error(code: 0, message: nil)
-        var outKeysPtr: UnsafeMutablePointer<UnsafePointer<CChar>?>? = nil
-        var outValuesPtr: UnsafeMutablePointer<Int32>? = nil
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         var outLen: Int = 0
-        weaveffi_kitchen_get_attrs(&outKeysPtr, &outValuesPtr, &outLen, &err)
+        let rv = weaveffi_kitchen_get_attrs(&outLen, &err)
         trap(&err)
-        guard let outKeys = outKeysPtr, let outValues = outValuesPtr else { return [:] }
-        defer { wvFreeArray(outKeys, outLen); wvFreeArray(outValues, outLen) }
-        var result: [String: Int32] = [:]
-        for i in 0..<outLen {
-            result[String(cString: outKeys[i]!)] = outValues[i]
-            weaveffi_free_string(outKeys[i])
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let n1 = rvReader.readLen()
+        var v0: [String: Int32] = [:]
+        v0.reserveCapacity(n1)
+        for _ in 0..<n1 {
+            let v2 = rvReader.readString()
+            let v3 = rvReader.readInt32()
+            v0[v2] = v3
         }
-        return result
+        rvReader.finish()
+        return v0
     }
     /// Iterator return type
     /// - Returns: A lazy sequence that pulls one element per step from the
     ///   producer; the underlying iterator is destroyed when the sequence is
     ///   exhausted or deinitialized.
     public static func streamItems() -> KitchenStreamItemsIterator {
-        var err = weaveffi_error(code: 0, message: nil)
-        let iter = weaveffi_kitchen_stream_items(&err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let rv = weaveffi_kitchen_stream_items(&err)
         trap(&err)
-        guard let iter = iter else { fatalError("-1: null iterator") }
-        return KitchenStreamItemsIterator(handle: iter)
+        guard let rv = rv else { fatalError("-1: null iterator") }
+        return KitchenStreamItemsIterator(handle: rv)
     }
     /// Returns the shared Token type from another module
     public static func crossModuleToken() -> Token {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_kitchen_cross_module_token(&err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_kitchen_cross_module_token(&outLen, &err)
         trap(&err)
-        guard let rv = rv else { fatalError("-1: null pointer") }
-        return Token(ptr: rv)
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadToken(&rvReader)
+        rvReader.finish()
+        return v0
     }
     /// Async operation
     public static func doAsync(input: String) async -> String {
@@ -708,14 +707,14 @@ public enum Kitchen {
     /// Legacy operation kept for compatibility
     @available(*, deprecated, message: "Use new_op instead")
     public static func legacyOp() -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_legacy_op(&err)
         trap(&err)
         return rv
     }
     /// Replacement for legacy_op
     public static func newOp() -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_kitchen_new_op(&err)
         trap(&err)
         return rv
@@ -723,7 +722,7 @@ public enum Kitchen {
     public enum Nested {
         /// Trivial nested-module function
         public static func hello() -> String {
-            var err = weaveffi_error(code: 0, message: nil)
+            var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
             let rv = weaveffi_kitchen_nested_hello(&err)
             trap(&err)
             guard let rv = rv else { fatalError("-1: null string") }

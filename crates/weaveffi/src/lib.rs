@@ -39,11 +39,10 @@
 //! * [`macro@module`] - the driver attribute on an exported `mod`.
 //! * [`macro@export`] - export a function (`async fn` is asynchronous; a
 //!   `Result`-returning fn is fallible).
-//! * [`macro@record`] - a by-value struct with generated create/getters.
+//! * [`macro@record`] - a by-value struct serialized across the ABI.
 //! * [`macro@enumeration`] - a `#[repr(i32)]` C-style enum.
 //! * [`macro@callback`] / [`macro@listener`] - a callback and an event listener.
-//! * [`macro@cancellable`] - mark an `async fn` as accepting a cancel token;
-//!   [`macro@builder`] - opt a record into a fluent builder.
+//! * [`macro@cancellable`] - mark an `async fn` as accepting a cancel token.
 //! * [`abi`] - the C ABI runtime: the error struct, memory helpers, the
 //!   marshalling converters the expansion calls, and [`export_runtime!`].
 
@@ -80,5 +79,5 @@ pub use weaveffi_abi::CancelToken;
 pub use weaveffi_abi::ErrorReport;
 
 pub use weaveffi_macros::{
-    builder, callback, cancellable, enumeration, error, export, interface, listener, module, record,
+    callback, cancellable, enumeration, error, export, interface, listener, module, record,
 };

@@ -36,8 +36,9 @@ namespace WeaveFFI
         }
 
         /// <summary>Wraps a raw error slot in the typed exception, falling
-        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
-        internal static WeaveFFIException FromCode(int code, string message)
+        /// back to <see cref="WeaveFFIException"/> for unknown codes. Codes
+        /// declaring payload fields decode them into Data.</summary>
+        internal static WeaveFFIException FromCode(int code, string message, byte[]? payload)
         {
             switch (code)
             {
@@ -64,8 +65,9 @@ namespace WeaveFFI
         }
 
         /// <summary>Wraps a raw error slot in the typed exception, falling
-        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
-        internal static WeaveFFIException FromCode(int code, string message)
+        /// back to <see cref="WeaveFFIException"/> for unknown codes. Codes
+        /// declaring payload fields decode them into Data.</summary>
+        internal static WeaveFFIException FromCode(int code, string message, byte[]? payload)
         {
             switch (code)
             {
@@ -84,13 +86,28 @@ namespace WeaveFFI
     {
         public int Code;
         public IntPtr Message;
+        public IntPtr PayloadPtr;
+        public UIntPtr PayloadLen;
+
+        internal static byte[]? CopyPayload(WeaveFFIError err)
+        {
+            if (err.PayloadPtr == IntPtr.Zero || (int)err.PayloadLen == 0)
+            {
+                return null;
+            }
+            var payload = new byte[(int)err.PayloadLen];
+            Marshal.Copy(err.PayloadPtr, payload, 0, (int)err.PayloadLen);
+            return payload;
+        }
 
         internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveFFIException(err.Code, msg);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw new WeaveFFIException(code, msg);
             }
         }
 
@@ -98,8 +115,11 @@ namespace WeaveFFI
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw ProductsException.FromCode(err.Code, msg);
+                var payload = CopyPayload(err);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw ProductsException.FromCode(code, msg, payload);
             }
         }
 
@@ -107,8 +127,11 @@ namespace WeaveFFI
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw OrdersException.FromCode(err.Code, msg);
+                var payload = CopyPayload(err);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw OrdersException.FromCode(code, msg, payload);
             }
         }
     }
@@ -131,6 +154,274 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Serializes values into the WeaveFFI value-buffer wire
+    /// format (little-endian, packed).</summary>
+    internal sealed class WeaveFFIBufferWriter
+    {
+        private byte[] _buf = new byte[64];
+        private int _len;
+
+        private void Ensure(int extra)
+        {
+            if (_len + extra <= _buf.Length)
+            {
+                return;
+            }
+            var size = _buf.Length * 2;
+            while (size < _len + extra)
+            {
+                size *= 2;
+            }
+            Array.Resize(ref _buf, size);
+        }
+
+        internal void WriteBool(bool v)
+        {
+            Ensure(1);
+            _buf[_len++] = v ? (byte)1 : (byte)0;
+        }
+
+        internal void WriteI8(sbyte v)
+        {
+            Ensure(1);
+            _buf[_len++] = (byte)v;
+        }
+
+        internal void WriteU8(byte v)
+        {
+            Ensure(1);
+            _buf[_len++] = v;
+        }
+
+        internal void WriteU16(ushort v)
+        {
+            Ensure(2);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+        }
+
+        internal void WriteI16(short v)
+        {
+            WriteU16((ushort)v);
+        }
+
+        internal void WriteU32(uint v)
+        {
+            Ensure(4);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+            _buf[_len++] = (byte)(v >> 16);
+            _buf[_len++] = (byte)(v >> 24);
+        }
+
+        internal void WriteI32(int v)
+        {
+            WriteU32((uint)v);
+        }
+
+        internal void WriteU64(ulong v)
+        {
+            WriteU32((uint)v);
+            WriteU32((uint)(v >> 32));
+        }
+
+        internal void WriteI64(long v)
+        {
+            WriteU64((ulong)v);
+        }
+
+        internal void WriteF32(float v)
+        {
+            WriteU32((uint)BitConverter.SingleToInt32Bits(v));
+        }
+
+        internal void WriteF64(double v)
+        {
+            WriteU64((ulong)BitConverter.DoubleToInt64Bits(v));
+        }
+
+        internal void WriteLen(int len)
+        {
+            WriteU32((uint)len);
+        }
+
+        internal void WriteOptionFlag(bool present)
+        {
+            WriteBool(present);
+        }
+
+        internal void WriteString(string v)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(v);
+            WriteLen(bytes.Length);
+            Ensure(bytes.Length);
+            Array.Copy(bytes, 0, _buf, _len, bytes.Length);
+            _len += bytes.Length;
+        }
+
+        internal void WriteBytes(byte[] v)
+        {
+            WriteLen(v.Length);
+            Ensure(v.Length);
+            Array.Copy(v, 0, _buf, _len, v.Length);
+            _len += v.Length;
+        }
+
+        internal byte[] ToArray()
+        {
+            var outBuf = new byte[_len];
+            Array.Copy(_buf, outBuf, _len);
+            return outBuf;
+        }
+    }
+
+    /// <summary>Decodes values from the WeaveFFI value-buffer wire format.
+    /// A malformed buffer indicates a producer/consumer contract violation and
+    /// throws <see cref="InvalidOperationException"/>.</summary>
+    internal sealed class WeaveFFIBufferReader
+    {
+        private static readonly System.Text.Encoding Utf8Strict =
+            new System.Text.UTF8Encoding(false, true);
+
+        private readonly byte[] _data;
+        private int _pos;
+
+        internal WeaveFFIBufferReader(byte[] data)
+        {
+            _data = data;
+        }
+
+        private void Require(int n)
+        {
+            if (_data.Length - _pos < n)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: buffer exhausted");
+            }
+        }
+
+        internal bool ReadBool()
+        {
+            Require(1);
+            var b = _data[_pos++];
+            if (b > 1)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: invalid bool byte");
+            }
+            return b == 1;
+        }
+
+        internal sbyte ReadI8()
+        {
+            Require(1);
+            return (sbyte)_data[_pos++];
+        }
+
+        internal byte ReadU8()
+        {
+            Require(1);
+            return _data[_pos++];
+        }
+
+        internal ushort ReadU16()
+        {
+            Require(2);
+            var v = (ushort)(_data[_pos] | (_data[_pos + 1] << 8));
+            _pos += 2;
+            return v;
+        }
+
+        internal short ReadI16()
+        {
+            return (short)ReadU16();
+        }
+
+        internal uint ReadU32()
+        {
+            Require(4);
+            var v = (uint)_data[_pos]
+                | ((uint)_data[_pos + 1] << 8)
+                | ((uint)_data[_pos + 2] << 16)
+                | ((uint)_data[_pos + 3] << 24);
+            _pos += 4;
+            return v;
+        }
+
+        internal int ReadI32()
+        {
+            return (int)ReadU32();
+        }
+
+        internal ulong ReadU64()
+        {
+            var lo = (ulong)ReadU32();
+            var hi = (ulong)ReadU32();
+            return lo | (hi << 32);
+        }
+
+        internal long ReadI64()
+        {
+            return (long)ReadU64();
+        }
+
+        internal float ReadF32()
+        {
+            return BitConverter.Int32BitsToSingle(ReadI32());
+        }
+
+        internal double ReadF64()
+        {
+            return BitConverter.Int64BitsToDouble(ReadI64());
+        }
+
+        internal int ReadLen()
+        {
+            var len = ReadU32();
+            if (len > (uint)(_data.Length - _pos))
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: length prefix exceeds remaining bytes");
+            }
+            return (int)len;
+        }
+
+        internal bool ReadOptionFlag()
+        {
+            return ReadBool();
+        }
+
+        internal string ReadString()
+        {
+            var len = ReadLen();
+            string s;
+            try
+            {
+                s = Utf8Strict.GetString(_data, _pos, len);
+            }
+            catch (ArgumentException)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: string is not valid UTF-8");
+            }
+            _pos += len;
+            return s;
+        }
+
+        internal byte[] ReadBytes()
+        {
+            var len = ReadLen();
+            var outBuf = new byte[len];
+            Array.Copy(_data, _pos, outBuf, 0, len);
+            _pos += len;
+            return outBuf;
+        }
+
+        internal void ExpectEnd()
+        {
+            if (_pos != _data.Length)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
+            }
+        }
+    }
+
     public enum Category
     {
         Electronics = 0,
@@ -139,97 +430,72 @@ namespace WeaveFFI
         Books = 3,
     }
 
-    public class Product : IDisposable
+    public sealed class Product
     {
-        private IntPtr _handle;
-        private bool _disposed;
+        public long Id { get; }
 
-        internal Product(IntPtr handle)
+        public string Name { get; }
+
+        public string? Description { get; }
+
+        public double Price { get; }
+
+        public Category Category { get; }
+
+        public string[] Tags { get; }
+
+        public Product(long id, string name, string? description, double price, Category category, string[] tags)
         {
-            _handle = handle;
+            Id = id;
+            Name = name;
+            Description = description;
+            Price = price;
+            Category = category;
+            Tags = tags;
         }
 
-        internal IntPtr Handle => _handle;
-
-        public long Id
+        internal void WriteTo(WeaveFFIBufferWriter writer)
         {
-            get
+            writer.WriteI64(Id);
+            writer.WriteString(Name);
+            if (Description != null)
             {
-                return NativeMethods.weaveffi_products_Product_get_id(_handle);
+                writer.WriteOptionFlag(true);
+                writer.WriteString(Description!);
+            }
+            else
+            {
+                writer.WriteOptionFlag(false);
+            }
+            writer.WriteF64(Price);
+            writer.WriteI32((int)Category);
+            writer.WriteLen(Tags.Length);
+            foreach (var item0 in Tags)
+            {
+                writer.WriteString(item0);
             }
         }
 
-        public string Name
+        internal static Product ReadFrom(WeaveFFIBufferReader reader)
         {
-            get
+            var fId = reader.ReadI64();
+            var fName = reader.ReadString();
+            string? fDescription = null;
+            if (reader.ReadOptionFlag())
             {
-                var ptr = NativeMethods.weaveffi_products_Product_get_name(_handle);
-                var str = WeaveFFIHelpers.PtrToString(ptr);
-                NativeMethods.weaveffi_free_string(ptr);
-                return str ?? "";
+                var fDescriptionValue = reader.ReadString();
+                fDescription = fDescriptionValue;
             }
-        }
-
-        public string? Description
-        {
-            get
+            var fPrice = reader.ReadF64();
+            var fCategory = (Category)reader.ReadI32();
+            var fTagsCount = reader.ReadLen();
+            var fTags = new string[fTagsCount];
+            for (int i0 = 0; i0 < fTagsCount; i0++)
             {
-                var ptr = NativeMethods.weaveffi_products_Product_get_description(_handle);
-                if (ptr == IntPtr.Zero) return null;
-                var str = WeaveFFIHelpers.PtrToString(ptr);
-                NativeMethods.weaveffi_free_string(ptr);
-                return str;
+                var fTagsItem = reader.ReadString();
+                fTags[i0] = fTagsItem;
             }
-        }
-
-        public double Price
-        {
-            get
-            {
-                return NativeMethods.weaveffi_products_Product_get_price(_handle);
-            }
-        }
-
-        public Category Category
-        {
-            get
-            {
-                return (Category)NativeMethods.weaveffi_products_Product_get_category(_handle);
-            }
-        }
-
-        public string[] Tags
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_products_Product_get_tags(_handle, out var len);
-                if (ptr == IntPtr.Zero) return Array.Empty<string>();
-                var arr = new string[(int)len];
-                for (int i = 0; i < (int)len; i++)
-                {
-                    var itemPtr = Marshal.ReadIntPtr(ptr, i * IntPtr.Size);
-                    var item = Marshal.PtrToStringUTF8(itemPtr) ?? "";
-                    NativeMethods.weaveffi_free_string(itemPtr);
-                    arr[i] = item;
-                }
-                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
-                return arr;
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_products_Product_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        ~Product()
-        {
-            Dispose();
+            return new Product(fId, fName, fDescription, fPrice, fCategory, fTags);
         }
     }
 
@@ -261,9 +527,15 @@ namespace WeaveFFI
             var namePtr = Marshal.StringToCoTaskMemUTF8(name);
             try
             {
-                var result = NativeMethods.weaveffi_products_Catalog_add_product(_handle, namePtr, price, (int)category, ref err);
+                var result = NativeMethods.weaveffi_products_Catalog_add_product(_handle, namePtr, price, (int)category, out var outLen, ref err);
                 WeaveFFIError.CheckProducts(err);
-                return new Product(result);
+                var resultBuf = new byte[(int)outLen];
+                if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+                NativeMethods.weaveffi_free_bytes(result, outLen);
+                var valueReader = new WeaveFFIBufferReader(resultBuf);
+                var value = Product.ReadFrom(valueReader);
+                valueReader.ExpectEnd();
+                return value;
             }
             finally
             {
@@ -275,9 +547,15 @@ namespace WeaveFFI
         public Product GetProduct(long id)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_products_Catalog_get_product(_handle, id, ref err);
+            var result = NativeMethods.weaveffi_products_Catalog_get_product(_handle, id, out var outLen, ref err);
             WeaveFFIError.CheckProducts(err);
-            return new Product(result);
+            var resultBuf = new byte[(int)outLen];
+            if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+            NativeMethods.weaveffi_free_bytes(result, outLen);
+            var valueReader = new WeaveFFIBufferReader(resultBuf);
+            var value = Product.ReadFrom(valueReader);
+            valueReader.ExpectEnd();
+            return value;
         }
 
         public Product[] Search(Category category)
@@ -285,15 +563,19 @@ namespace WeaveFFI
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_products_Catalog_search(_handle, (int)category, out var outLen, ref err);
             WeaveFFIError.Check(err);
-            if (result == IntPtr.Zero) return Array.Empty<Product>();
-            var arr = new Product[(int)outLen];
-            for (int i = 0; i < (int)outLen; i++)
+            var resultBuf = new byte[(int)outLen];
+            if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+            NativeMethods.weaveffi_free_bytes(result, outLen);
+            var valueReader = new WeaveFFIBufferReader(resultBuf);
+            var valueCount = valueReader.ReadLen();
+            var value = new Product[valueCount];
+            for (int i0 = 0; i0 < valueCount; i0++)
             {
-                var item = new Product(Marshal.ReadIntPtr(result, i * IntPtr.Size));
-                arr[i] = item;
+                var valueItem = Product.ReadFrom(valueReader);
+                value[i0] = valueItem;
             }
-            NativeMethods.weaveffi_free_bytes(result, (UIntPtr)((int)outLen * IntPtr.Size));
-            return arr;
+            valueReader.ExpectEnd();
+            return value;
         }
 
         /// <exception cref="ProductsException">Thrown when the call reports a ProductsError code.</exception>
@@ -329,127 +611,80 @@ namespace WeaveFFI
         }
     }
 
-    public class OrderItem : IDisposable
+    public sealed class OrderItem
     {
-        private IntPtr _handle;
-        private bool _disposed;
+        public long ProductId { get; }
 
-        internal OrderItem(IntPtr handle)
+        public int Quantity { get; }
+
+        public double UnitPrice { get; }
+
+        public OrderItem(long productId, int quantity, double unitPrice)
         {
-            _handle = handle;
+            ProductId = productId;
+            Quantity = quantity;
+            UnitPrice = unitPrice;
         }
 
-        internal IntPtr Handle => _handle;
-
-        public long ProductId
+        internal void WriteTo(WeaveFFIBufferWriter writer)
         {
-            get
-            {
-                return NativeMethods.weaveffi_orders_OrderItem_get_product_id(_handle);
-            }
+            writer.WriteI64(ProductId);
+            writer.WriteI32(Quantity);
+            writer.WriteF64(UnitPrice);
         }
 
-        public int Quantity
+        internal static OrderItem ReadFrom(WeaveFFIBufferReader reader)
         {
-            get
-            {
-                return NativeMethods.weaveffi_orders_OrderItem_get_quantity(_handle);
-            }
-        }
-
-        public double UnitPrice
-        {
-            get
-            {
-                return NativeMethods.weaveffi_orders_OrderItem_get_unit_price(_handle);
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_orders_OrderItem_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        ~OrderItem()
-        {
-            Dispose();
+            var fProductId = reader.ReadI64();
+            var fQuantity = reader.ReadI32();
+            var fUnitPrice = reader.ReadF64();
+            return new OrderItem(fProductId, fQuantity, fUnitPrice);
         }
     }
 
-    public class Order : IDisposable
+    public sealed class Order
     {
-        private IntPtr _handle;
-        private bool _disposed;
+        public long Id { get; }
 
-        internal Order(IntPtr handle)
+        public OrderItem[] Items { get; }
+
+        public double Total { get; }
+
+        public string Status { get; }
+
+        public Order(long id, OrderItem[] items, double total, string status)
         {
-            _handle = handle;
+            Id = id;
+            Items = items;
+            Total = total;
+            Status = status;
         }
 
-        internal IntPtr Handle => _handle;
-
-        public long Id
+        internal void WriteTo(WeaveFFIBufferWriter writer)
         {
-            get
+            writer.WriteI64(Id);
+            writer.WriteLen(Items.Length);
+            foreach (var item0 in Items)
             {
-                return NativeMethods.weaveffi_orders_Order_get_id(_handle);
+                item0.WriteTo(writer);
             }
+            writer.WriteF64(Total);
+            writer.WriteString(Status);
         }
 
-        public OrderItem[] Items
+        internal static Order ReadFrom(WeaveFFIBufferReader reader)
         {
-            get
+            var fId = reader.ReadI64();
+            var fItemsCount = reader.ReadLen();
+            var fItems = new OrderItem[fItemsCount];
+            for (int i0 = 0; i0 < fItemsCount; i0++)
             {
-                var ptr = NativeMethods.weaveffi_orders_Order_get_items(_handle, out var len);
-                if (ptr == IntPtr.Zero) return Array.Empty<OrderItem>();
-                var arr = new OrderItem[(int)len];
-                for (int i = 0; i < (int)len; i++)
-                {
-                    var item = new OrderItem(Marshal.ReadIntPtr(ptr, i * IntPtr.Size));
-                    arr[i] = item;
-                }
-                NativeMethods.weaveffi_free_bytes(ptr, (UIntPtr)((int)len * IntPtr.Size));
-                return arr;
+                var fItemsItem = OrderItem.ReadFrom(reader);
+                fItems[i0] = fItemsItem;
             }
-        }
-
-        public double Total
-        {
-            get
-            {
-                return NativeMethods.weaveffi_orders_Order_get_total(_handle);
-            }
-        }
-
-        public string Status
-        {
-            get
-            {
-                var ptr = NativeMethods.weaveffi_orders_Order_get_status(_handle);
-                var str = WeaveFFIHelpers.PtrToString(ptr);
-                NativeMethods.weaveffi_free_string(ptr);
-                return str ?? "";
-            }
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_orders_Order_destroy(_handle);
-                _disposed = true;
-            }
-            GC.SuppressFinalize(this);
-        }
-
-        ~Order()
-        {
-            Dispose();
+            var fTotal = reader.ReadF64();
+            var fStatus = reader.ReadString();
+            return new Order(fId, fItems, fTotal, fStatus);
         }
     }
 
@@ -463,29 +698,8 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_Product_create(long id, IntPtr name, IntPtr description, double price, int category, IntPtr tags, UIntPtr tags_len, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_products_Product_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_products_Product_get_id(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_name", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_Product_get_name(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_description", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_Product_get_description(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_price", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_products_Product_get_price(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_category", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_products_Product_get_category(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_products_Product_get_tags", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_Product_get_tags(IntPtr ptr, out UIntPtr out_len);
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_products_Catalog_destroy(IntPtr self);
@@ -494,10 +708,10 @@ namespace WeaveFFI
         internal static extern IntPtr weaveffi_products_Catalog_new(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_add_product", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_Catalog_add_product(IntPtr self, IntPtr name, double price, int category, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_products_Catalog_add_product(IntPtr self, IntPtr name, double price, int category, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_get_product", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_products_Catalog_get_product(IntPtr self, long id, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_products_Catalog_get_product(IntPtr self, long id, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_search", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_products_Catalog_search(IntPtr self, int category, out UIntPtr out_len, ref WeaveFFIError err);
@@ -508,50 +722,17 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_products_Catalog_remove", CallingConvention = CallingConvention.Cdecl)]
         internal static extern byte weaveffi_products_Catalog_remove(IntPtr self, long id, ref WeaveFFIError err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_orders_OrderItem_create(long product_id, int quantity, double unit_price, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_orders_OrderItem_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_get_product_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_orders_OrderItem_get_product_id(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_get_quantity", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_orders_OrderItem_get_quantity(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_OrderItem_get_unit_price", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_orders_OrderItem_get_unit_price(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_Order_create", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_orders_Order_create(long id, IntPtr items, UIntPtr items_len, double total, IntPtr status, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_Order_destroy", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_orders_Order_destroy(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_Order_get_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_orders_Order_get_id(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_Order_get_items", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_orders_Order_get_items(IntPtr ptr, out UIntPtr out_len);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_Order_get_total", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_orders_Order_get_total(IntPtr ptr);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_orders_Order_get_status", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_orders_Order_get_status(IntPtr ptr);
-
         [DllImport(LibName, EntryPoint = "weaveffi_orders_create_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_orders_create_order(IntPtr items, UIntPtr items_len, ref WeaveFFIError err);
+        internal static extern long weaveffi_orders_create_order(IntPtr items_ptr, UIntPtr items_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_get_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_orders_get_order(long id, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_orders_get_order(long id, out UIntPtr out_len, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_cancel_order", CallingConvention = CallingConvention.Cdecl)]
         internal static extern byte weaveffi_orders_cancel_order(long id, ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_orders_add_product_to_order", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern byte weaveffi_orders_add_product_to_order(long order_id, IntPtr product, ref WeaveFFIError err);
+        internal static extern byte weaveffi_orders_add_product_to_order(long order_id, IntPtr product_ptr, UIntPtr product_len, ref WeaveFFIError err);
 
     }
 
@@ -565,12 +746,17 @@ namespace WeaveFFI
         public static long CreateOrder(OrderItem[] items)
         {
             var err = new WeaveFFIError();
-            var itemsArr = new IntPtr[items.Length];
-            for (var itemsIt = 0; itemsIt < items.Length; itemsIt++) itemsArr[itemsIt] = IntPtr.Zero;
-            var itemsPin = GCHandle.Alloc(itemsArr, GCHandleType.Pinned);
+            var itemsWriter = new WeaveFFIBufferWriter();
+            itemsWriter.WriteLen(items.Length);
+            foreach (var item0 in items)
+            {
+                item0.WriteTo(itemsWriter);
+            }
+            var itemsBuf = itemsWriter.ToArray();
+            var itemsPin = GCHandle.Alloc(itemsBuf, GCHandleType.Pinned);
             try
             {
-                var result = NativeMethods.weaveffi_orders_create_order(items.Length == 0 ? IntPtr.Zero : itemsPin.AddrOfPinnedObject(), (UIntPtr)items.Length, ref err);
+                var result = NativeMethods.weaveffi_orders_create_order(itemsPin.AddrOfPinnedObject(), (UIntPtr)itemsBuf.Length, ref err);
                 WeaveFFIError.CheckOrders(err);
                 return result;
             }
@@ -584,9 +770,15 @@ namespace WeaveFFI
         public static Order GetOrder(long id)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_orders_get_order(id, ref err);
+            var result = NativeMethods.weaveffi_orders_get_order(id, out var outLen, ref err);
             WeaveFFIError.CheckOrders(err);
-            return new Order(result);
+            var resultBuf = new byte[(int)outLen];
+            if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+            NativeMethods.weaveffi_free_bytes(result, outLen);
+            var valueReader = new WeaveFFIBufferReader(resultBuf);
+            var value = Order.ReadFrom(valueReader);
+            valueReader.ExpectEnd();
+            return value;
         }
 
         public static bool CancelOrder(long id)
@@ -600,9 +792,20 @@ namespace WeaveFFI
         public static bool AddProductToOrder(long orderId, Product product)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_orders_add_product_to_order(orderId, product.Handle, ref err);
-            WeaveFFIError.Check(err);
-            return result != 0;
+            var productWriter = new WeaveFFIBufferWriter();
+            product.WriteTo(productWriter);
+            var productBuf = productWriter.ToArray();
+            var productPin = GCHandle.Alloc(productBuf, GCHandleType.Pinned);
+            try
+            {
+                var result = NativeMethods.weaveffi_orders_add_product_to_order(orderId, productPin.AddrOfPinnedObject(), (UIntPtr)productBuf.Length, ref err);
+                WeaveFFIError.Check(err);
+                return result != 0;
+            }
+            finally
+            {
+                productPin.Free();
+            }
         }
 
     }

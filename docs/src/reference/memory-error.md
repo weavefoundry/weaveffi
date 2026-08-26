@@ -6,7 +6,7 @@ ownership across the FFI boundary.
 ## Error handling
 
 - Every generated C function ends with an `out_err` parameter of type
-  `weaveffi_error*`, except `_destroy` symbols and struct field getters.
+  `weaveffi_error*`, except `_destroy` symbols.
 - On success: `out_err->code == 0` and `out_err->message == NULL`.
 - On failure: `out_err->code != 0` and `out_err->message` points to a Rust-allocated
   NUL-terminated UTF-8 string that must be cleared.
@@ -14,11 +14,20 @@ ownership across the FFI boundary.
   domain codes (the header emits an enum constant per code, such as
   `weaveffi_kv_KvError_KeyNotFound`); on a non-throwing function a non-zero
   code only ever reports a producer bug such as a panic.
+- When the matched error code declares payload `fields:`, `payload_ptr` and
+  `payload_len` hold those fields serialized in the
+  [value-buffer format](value-buffers.md#structured-errors); both are null
+  and zero for a code without fields.
 
 Relevant declarations (from the generated header):
 
 ```c
-typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
+} weaveffi_error;
 void weaveffi_error_clear(weaveffi_error* err);
 ```
 
@@ -32,8 +41,8 @@ if (err.code) { fprintf(stderr, "%s\n", err.message ? err.message : ""); weaveff
 
 Notes:
 - The default unspecified error code used by the runtime is `-1`.
-- `weaveffi_error_clear` is idempotent: it frees the message and nulls the
-  pointer, so clearing an already-cleared struct is safe.
+- `weaveffi_error_clear` is idempotent: it frees the message and the payload
+  and nulls both pointers, so clearing an already-cleared struct is safe.
 - Module error domains declare their own codes in the IDL; see the
   [Error Handling Guide](../guides/errors.md) for the typed error model,
   including the Throws versus Trap interpretation of non-zero codes.
@@ -64,25 +73,38 @@ void weaveffi_free_string(const char* ptr);
 void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 ```
 
+## Buffered values
+
+Records, rich enums, optionals (except `Interface?`), lists, and maps cross
+the boundary by value as serialized
+[value buffers](value-buffers.md). A buffered parameter is a borrowed
+`(const uint8_t* {name}_ptr, size_t {name}_len)` pair the caller keeps
+alive for the duration of the call and remains responsible for freeing. A
+buffered return follows the bytes convention exactly: the producer
+allocates the encoding, hands it back as the return value plus a
+`size_t* out_len` out-parameter, and the caller releases it with
+`weaveffi_free_bytes(ptr, len)` after decoding.
+
 ## Iterators
 
 An `iter<T>` return yields an opaque iterator handle. Each `_next` call
 writes an element the caller now owns: free string elements with
-`weaveffi_free_string` and record or rich-enum elements with their
-`_destroy` symbol after copying; by-value elements need nothing. Call the
-iterator's `_destroy` exactly once, whether iteration ran to exhaustion or
-was abandoned early.
+`weaveffi_free_string` and buffered elements (records, rich enums,
+composites) with `weaveffi_free_bytes` after decoding; by-value elements
+need nothing. Call the iterator's `_destroy` exactly once, whether
+iteration ran to exhaustion or was abandoned early.
 
 ## Async completion callbacks
 
 Result buffers passed to an async completion callback (strings, bytes,
-arrays, boxed optional scalars) are borrowed: the producer owns them, they
-are valid only for the callback's duration, and the producer frees them
-after the callback returns. Copy inside the callback; do not free them.
-Owned-object results (records, rich enums, interfaces) are the exception:
-the callback receives ownership and must eventually call `_destroy`. The
-`err` struct is likewise borrowed; copy its code and message inside the
-callback (clearing it anyway is safe because the clear is idempotent).
+and serialized value buffers for buffered results) are borrowed: the
+producer owns them, they are valid only for the callback's duration, and
+the producer frees them after the callback returns. Copy or decode inside
+the callback; do not free them. Owned interface results are the exception:
+the callback receives ownership of the object pointer and must eventually
+call `_destroy`. The `err` struct is likewise borrowed; copy its code,
+message, and payload inside the callback (clearing it anyway is safe
+because the clear is idempotent).
 
 ## Handles and interfaces
 

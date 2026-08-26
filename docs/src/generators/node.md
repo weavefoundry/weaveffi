@@ -8,8 +8,9 @@ definitions, and the complete N-API addon C source (plus a
 `WEAVEFFI_ADDON` environment override, then prefers the node-gyp build
 output (`./build/Release/weaveffi.node`), and falls back to a prebuilt
 binary placed next to it as `index.node`. On top of the raw native
-bindings it layers the idiomatic wrappers: error classes, interface and
-rich-enum classes, and camelCased function wrappers.
+bindings it layers the idiomatic wrappers: error classes, interface
+classes, plain-object records and tagged-union rich enums, and
+camelCased function wrappers.
 
 ## What gets generated
 
@@ -39,9 +40,9 @@ rich-enum classes, and camelCased function wrappers.
 | `string`      | `string`             |
 | `bytes`       | `Buffer`             |
 | `handle`      | `bigint`             |
-| `StructName`  | `StructName`         |
+| `StructName`  | `StructName` (a plain object interface) |
 | `EnumName` (plain, C-style)   | `enum EnumName`                |
-| `EnumName` (rich / algebraic) | wrapper `class` (e.g. `Shape`) |
+| `EnumName` (rich / algebraic) | discriminated union type (e.g. `Shape`) |
 | `T?`          | `T \| null`          |
 | `[T]`         | `T[]`                |
 | `{K: V}`      | `Record<K, V>`       |
@@ -50,7 +51,7 @@ rich-enum classes, and camelCased function wrappers.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -88,8 +89,10 @@ modules:
         return: "[string]"
 ```
 
-Structs become TypeScript interfaces and enums become explicit numeric
-TypeScript enums:
+Structs become TypeScript interfaces backed by plain JS objects (the
+loader packs and unpacks them from value buffers with generated private
+codec functions; there are no per-struct native symbols), and enums
+become explicit numeric TypeScript enums:
 
 ```typescript
 export interface Contact {
@@ -239,127 +242,47 @@ handle in a fresh instance. Call `destroy()` when you're done; the
 
 A *rich* (algebraic) enum is a sum type whose variants carry associated
 data. A plain C-style enum stays a numeric TypeScript `enum`, but a rich
-enum lowers to an **opaque object handle** at the C ABI, exactly like a
-struct. The loader layers an idiomatic wrapper `class` on top of the raw
-native bindings, and that class owns the native pointer.
+enum crosses the ABI as a serialized value buffer (`i32` tag, then the
+active variant's fields) and surfaces in JS as a plain **tagged-union
+object** with a string `tag` property naming the active variant. No
+native handles, no classes, no destructors.
 
 Take a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }`. The generated `index.js` builds
-a `Shape` class with one static factory per variant, a `tag()`
-discriminant reader, a camelCased getter per variant field, and a
-`destroy()` method, backed by a `FinalizationRegistry`:
-
-```js
-class Shape {
-  static empty() {
-    return new Shape(__invoke(addon.Shape_empty_new, [], __generic));
-  }
-  static circle(radius) {
-    return new Shape(__invoke(addon.Shape_circle_new, [radius], __generic));
-  }
-  static rectangle(width, height) {
-    return new Shape(__invoke(addon.Shape_rectangle_new, [width, height], __generic));
-  }
-  static labeled(label, count) {
-    return new Shape(__invoke(addon.Shape_labeled_new, [label, count], __generic));
-  }
-  tag() {
-    return addon.Shape_tag(this._handle);
-  }
-  get circleRadius() {
-    return addon.Shape_circle_get_radius(this._handle);
-  }
-  get rectangleWidth() {
-    return addon.Shape_rectangle_get_width(this._handle);
-  }
-  get rectangleHeight() {
-    return addon.Shape_rectangle_get_height(this._handle);
-  }
-  get labeledLabel() {
-    return addon.Shape_labeled_get_label(this._handle);
-  }
-  get labeledCount() {
-    return addon.Shape_labeled_get_count(this._handle);
-  }
-  destroy() {
-    if (this._handle) {
-      Shape._cleanup.unregister(this);
-      addon.Shape_destroy(this._handle);
-      this._handle = 0;
-    }
-  }
-}
-Shape._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.Shape_destroy(handle); }
-});
-Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 });
-```
-
-The active variant is read with `tag()` and compared against the frozen
-`Shape.Tag` map (`{ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 }`).
-Each variant field is a getter named `<variant><Field>`
-(`circleRadius`, `rectangleWidth`, `rectangleHeight`, `labeledLabel`,
-`labeledCount`), delegating to the matching native accessor (e.g.
-`addon.Shape_circle_get_radius(this._handle)`). Free functions
-that take or return the enum accept the wrapper directly:
-`describe(shape)` unwraps `shape._handle`, and
-`scale(shape, factor)` wraps its result back into a new `Shape`.
-
-The generated `types.d.ts` types the wrapper as a real `export class`,
-with the `Shape.Tag` constants in a companion namespace:
+`Labeled { label: string, count: u8 }`. The generated `types.d.ts`
+declares a discriminated union:
 
 ```typescript
-export class Shape {
-  static empty(): Shape;
-  static circle(radius: number): Shape;
-  static rectangle(width: number, height: number): Shape;
-  static labeled(label: string, count: number): Shape;
-  tag(): number;
-  get circleRadius(): number;
-  get rectangleWidth(): number;
-  get rectangleHeight(): number;
-  get labeledLabel(): string;
-  get labeledCount(): number;
-  destroy(): void;
-}
-export namespace Shape {
-  const Tag: Readonly<{
-    Empty: 0,
-    Circle: 1,
-    Rectangle: 2,
-    Labeled: 3,
-  }>;
-}
+export type Shape =
+  | { tag: 'Empty' }
+  | { tag: 'Circle'; radius: number }
+  | { tag: 'Rectangle'; width: number; height: number }
+  | { tag: 'Labeled'; label: string; count: number };
 ```
 
-A short round-trip that constructs a couple of variants, reads the tag and a
-field, calls `describe` / `scale`, then releases the handles:
+The loader carries one private pack and one unpack function per rich
+enum: packing switches on the string `tag`, writes the `i32`
+discriminant, then the variant's fields; unpacking reads the tag and
+builds the matching object. Consumers construct and match variants as
+ordinary JS values:
 
 ```js
-const { Shape, describe, scale } = require('./index.js');
+const { describe, scale } = require('./index.js');
 
-const circle = Shape.circle(2.0);
-const label = Shape.labeled('unit', 3);
+const circle = { tag: 'Circle', radius: 2.0 };
+const labeled = { tag: 'Labeled', label: 'unit', count: 3 };
 
-if (circle.tag() === Shape.Tag.Circle) {
-  console.log(circle.circleRadius); // 2
+console.log(describe(circle));      // native-rendered description
+const bigger = scale(circle, 3.0);  // a fresh Shape value
+
+if (bigger.tag === 'Circle') {
+  console.log(bigger.radius);       // 6
 }
-
-console.log(describe(circle)); // native-rendered description
-const bigger = scale(circle, 3.0); // a fresh Shape
-
-// Done with the handles, release the native objects.
-circle.destroy();
-label.destroy();
-bigger.destroy();
 ```
 
-**Ownership:** each `Shape` owns its native object. Call `destroy()` when
-you are finished to free it deterministically; if you forget, the
-`FinalizationRegistry` calls the native destroy once the wrapper is
-garbage-collected, but GC timing isn't guaranteed, so prefer an
-explicit `destroy()`.
+There is nothing to release: values are copied across the boundary, and
+the loader frees each returned native buffer immediately after decoding
+it.
 
 ## Build instructions
 
@@ -392,12 +315,13 @@ env var can point the loader at any built addon (the
 - The N-API addon is responsible for all conversions between JS values
   and C ABI types. Strings and byte buffers are copied into JS-managed
   storage, so consumers never need to think about freeing memory.
-- Struct values are returned as plain JS objects: the addon copies the
-  fields out and destroys the native struct before the call returns, so
+- Buffered values (structs, rich enums, optionals, lists, maps) are
+  returned as plain JS values: the loader decodes the returned value
+  buffer and frees it with the native free before the call returns, so
   there is nothing to dispose on the JS side.
-- Interface and rich-enum wrappers own their native pointer; release it
-  with `destroy()` (a `FinalizationRegistry` backstops forgotten
-  handles at GC time).
+- Interface wrappers own their native pointer; release it with
+  `destroy()` (a `FinalizationRegistry` backstops forgotten handles at
+  GC time).
 - Typed handles (`handle<Struct>`) pass through as opaque values;
   release them through the API's own teardown function.
 - `iter<T>` returns are lazy JS iterables; see
@@ -423,25 +347,29 @@ callback only stashes the result (or error) and posts it through a
 loop and calls `napi_resolve_deferred` / `napi_reject_deferred` there:
 
 ```c
-static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err, weaveffi_tasks_TaskResult* result) {
+static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err,
+                                            const uint8_t* result_ptr, size_t result_len) {
     weaveffi_tasks_run_task_napi_actx* ctx = (weaveffi_tasks_run_task_napi_actx*)context;
     if (err != NULL && err->code != 0) {
         ctx->err_code = err->code;
         ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
-    } else {
-        ctx->result = (void*)result;
+    } else if (result_ptr != NULL && result_len > 0) {
+        ctx->result = (uint8_t*)malloc(result_len);
+        memcpy(ctx->result, result_ptr, result_len);
+        ctx->result_len = result_len;
     }
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 ```
 
 The completion callback fires exactly once, on the producer thread.
-Result buffers passed to it (strings, byte buffers, arrays) are
-borrowed for the callback's duration, so the callback deep-copies them
-(note the `strdup` on the error message above) before returning and
-never frees them. Owned-object results are the exception: the callback
-receives ownership of the pointer (`ctx->result = (void*)result`
-above) and the settle callback wraps it into the JS-side owner.
+Result buffers passed to it (strings, byte buffers, and the serialized
+value buffers of buffered results such as the `TaskResult` record here)
+are borrowed for the callback's duration, so the callback deep-copies
+them (note the `strdup` and `memcpy` above) before returning and never
+frees them. Owned interface results are the exception: the callback
+receives ownership of the object pointer, which the settle callback
+wraps into the JS-side owner.
 
 Rejected promises carry the C error message plus a numeric `code`
 property; the loader rebrands the rejection into the module's typed
@@ -505,10 +433,9 @@ binding pulls one element, copies it into a JS value (freeing the
 native string), and destroys the iterator eagerly when the producer
 reports exhaustion; the external's N-API finalizer backstops abandoned
 iterators at GC time, nulling the stored handle so a double destroy is
-impossible. Struct elements are copied into plain JS objects (and the
-native struct destroyed) per step; rich-enum elements arrive as owned
-raw handles that the loader adopts into their wrapper class via the
-`wrapElem` hook.
+impossible. Buffered elements (structs, rich enums, composites) arrive
+as producer-allocated value buffers: the addon decodes each one into a
+plain JS value and frees the buffer per step.
 
 Errors from the launcher and each `next` step follow the function's
 error strategy: `Store.listKeys` (throws) rebrands a failing step

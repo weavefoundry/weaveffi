@@ -15,13 +15,11 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type, pascal_case, DocCommentStyle,
-};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, pascal_case, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FieldBinding, FnBinding,
-    InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding, RichVariantBinding,
+    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, ErrorCodeBinding,
+    FieldBinding, FnBinding, InterfaceBinding, ListenerBinding, ModuleBinding, ParamBinding,
     StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
@@ -196,9 +194,6 @@ impl LanguageBackend for PythonGenerator {
         _config: &Self::Config,
     ) {
         render_struct(out, s);
-        if s.builder.is_some() {
-            render_builder(out, s);
-        }
     }
 
     fn render_callback(
@@ -477,6 +472,11 @@ from {import_name} import *
 
 // ── Type helpers ──
 
+/// The `ctypes` spelling of one *direct* (non-buffered) type's C slot.
+///
+/// Buffered types (records, rich enums, lists, maps, and non-interface
+/// optionals) never occupy a scalar slot: they cross the ABI as one value
+/// buffer and are handled by the buffer codec paths instead.
 fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I8 => "ctypes.c_int8",
@@ -492,29 +492,18 @@ fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
         TypeRef::Bool => "ctypes.c_int32",
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "ctypes.c_char_p",
         TypeRef::Handle => "ctypes.c_uint64",
-        TypeRef::TypedHandle(_) => "ctypes.c_void_p",
+        // Typed handles, interfaces, and iterators cross as opaque pointers.
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Iterator(_) => "ctypes.c_void_p",
         TypeRef::Bytes | TypeRef::BorrowedBytes => "ctypes.c_uint8",
-        // Records, rich enums, and interfaces all cross the ABI as opaque
-        // object pointers.
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::Interface(_) => "ctypes.c_void_p",
         TypeRef::Enum(_) => "ctypes.c_int32",
-        TypeRef::Optional(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Iterator(_) => {
-            "ctypes.c_void_p"
+        TypeRef::Record(_)
+        | TypeRef::RichEnum(_)
+        | TypeRef::Optional(_)
+        | TypeRef::List(_)
+        | TypeRef::Map(_, _) => {
+            unreachable!("buffered types have no scalar ctypes slot")
         }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-}
-
-/// The `ctypes` element type for a slot the wrapper *owns and must free*
-/// (list returns, map buffers, iterator `next` slots). Owned string elements
-/// stay raw `c_void_p` addresses so the pointer survives long enough to be
-/// copied and passed to `weaveffi_free_string`; a `c_char_p` slot would be
-/// auto-converted to `bytes` by ctypes, losing the pointer and leaking the
-/// producer allocation.
-fn py_owned_elem_scalar(ty: &TypeRef) -> &'static str {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "ctypes.c_void_p",
-        _ => py_ctypes_scalar(ty),
     }
 }
 
@@ -529,15 +518,17 @@ fn py_type_hint(ty: &TypeRef) -> String {
         | TypeRef::I64
         | TypeRef::U64
         | TypeRef::Handle => "int".into(),
-        // Structs, enums, and typed handles all surface as bare local class names
-        // in the generated module. A cross-module reference (e.g. `handle<Store>`
-        // resolved to `kv.Store`) must still annotate the *local* `Store`, not the
-        // qualified IR name, which is not a symbol in this module.
-        TypeRef::TypedHandle(name) => format!("\"{}\"", local_type_name(name)),
+        // A typed handle is an opaque pointer-sized token; Python surfaces it
+        // as a plain integer address, exactly like an untyped handle.
+        TypeRef::TypedHandle(_) => "int".into(),
         TypeRef::F32 | TypeRef::F64 => "float".into(),
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
+        // Records, rich enums, plain enums, and interfaces surface as bare
+        // local class names in the generated module. A cross-module reference
+        // (e.g. `types.Contact`) must still annotate the *local* `Contact`,
+        // not the qualified IR name, which is not a symbol in this module.
         TypeRef::Enum(name) => format!("\"{}\"", local_type_name(name)),
         TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::Interface(name) => {
             format!("\"{}\"", local_type_name(name))
@@ -587,6 +578,12 @@ fn py_ctype(ty: &CType) -> String {
 }
 
 fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
+    // A buffered parameter is passed as an immutable Python `bytes` object;
+    // `c_char_p` (rather than `POINTER(c_uint8)`) is the ctypes argtype that
+    // accepts `bytes` directly for a `const uint8_t*` slot.
+    if abi::is_buffered(ty) {
+        return vec!["ctypes.c_char_p".into(), "ctypes.c_size_t".into()];
+    }
     abi::lower_param("_", ty, "", false)
         .iter()
         .map(|p| py_ctype(&p.ty))
@@ -595,23 +592,12 @@ fn py_param_argtypes(ty: &TypeRef) -> Vec<String> {
 
 /// Returns `(restype, out_param_argtypes)` for a return type.
 fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
-    // Map returns marshal via `byref` out-params, which ctypes models with an
-    // extra `POINTER` level beyond the shared C ABI shape. This convention is
-    // Python-specific, so it stays local rather than in the shared model.
-    if let Some((k, v)) = get_map_kv(ty) {
+    // A buffered return keeps its raw address (`c_void_p`) so the wrapper can
+    // copy the encoded bytes and release them with `weaveffi_free_bytes`.
+    if abi::is_buffered(ty) {
         return (
-            "None".into(),
-            vec![
-                format!(
-                    "ctypes.POINTER(ctypes.POINTER({}))",
-                    py_owned_elem_scalar(k)
-                ),
-                format!(
-                    "ctypes.POINTER(ctypes.POINTER({}))",
-                    py_owned_elem_scalar(v)
-                ),
-                "ctypes.POINTER(ctypes.c_size_t)".into(),
-            ],
+            "ctypes.c_void_p".into(),
+            vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
         );
     }
     match ty {
@@ -622,11 +608,6 @@ fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
         // copy it and pass it back to `weaveffi_free_string`; a `c_char_p`
         // restype would be auto-converted to `bytes`, losing the pointer.
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("ctypes.c_void_p".into(), vec![]),
-        TypeRef::List(inner) => (
-            format!("ctypes.POINTER({})", py_owned_elem_scalar(inner)),
-            vec!["ctypes.POINTER(ctypes.c_size_t)".into()],
-        ),
-        TypeRef::Optional(inner) if is_c_pointer_type(inner) => py_return_info(inner),
         _ => {
             let r = abi::lower_return(ty, "");
             let out = r.out_params.iter().map(|p| py_ctype(&p.ty)).collect();
@@ -635,11 +616,178 @@ fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
     }
 }
 
-fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
+// ── Value-buffer codecs ──
+
+/// `_write_{Name}`, the statement-level field writer for a record or rich
+/// enum. `name` may be a qualified IR reference; the emitted function uses
+/// the bare local class name.
+fn py_write_fn_name(name: &str) -> String {
+    format!("_write_{}", local_type_name(name))
+}
+
+/// `_read_{Name}`, the reader consuming one encoded value from a
+/// `_BufferReader`.
+fn py_read_fn_name(name: &str) -> String {
+    format!("_read_{}", local_type_name(name))
+}
+
+/// `_pack_{Name}`, encoding one value to standalone `bytes`.
+fn py_pack_fn_name(name: &str) -> String {
+    format!("_pack_{}", local_type_name(name))
+}
+
+/// `_unpack_{Name}`, decoding one value from standalone `bytes` (rejecting
+/// trailing data).
+fn py_unpack_fn_name(name: &str) -> String {
+    format!("_unpack_{}", local_type_name(name))
+}
+
+/// The Python expression reading one `ty` value from the reader `_r`,
+/// following the value-buffer wire format. `depth` uniquifies comprehension
+/// loop variables when composites nest.
+///
+/// Expressions are used (rather than statements) so composite reads compose:
+/// Python evaluates a comprehension's `range(_r.read_len())` before its body
+/// and a conditional expression's test before its arms, which matches the
+/// wire order exactly.
+fn py_read_expr(ty: &TypeRef, depth: usize) -> String {
     match ty {
-        TypeRef::Map(k, v) => Some((k, v)),
-        TypeRef::Optional(inner) => get_map_kv(inner),
-        _ => None,
+        TypeRef::Bool => "_r.read_bool()".into(),
+        TypeRef::I8 => "_r.read_i8()".into(),
+        TypeRef::I16 => "_r.read_i16()".into(),
+        TypeRef::I32 => "_r.read_i32()".into(),
+        TypeRef::I64 => "_r.read_i64()".into(),
+        TypeRef::U8 => "_r.read_u8()".into(),
+        TypeRef::U16 => "_r.read_u16()".into(),
+        TypeRef::U32 => "_r.read_u32()".into(),
+        TypeRef::U64 => "_r.read_u64()".into(),
+        TypeRef::F32 => "_r.read_f32()".into(),
+        TypeRef::F64 => "_r.read_f64()".into(),
+        // Handles serialize as u64 tokens inside buffers.
+        TypeRef::Handle | TypeRef::TypedHandle(_) => "_r.read_u64()".into(),
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "_r.read_string()".into(),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "_r.read_bytes()".into(),
+        TypeRef::Enum(name) => format!("{}(_r.read_i32())", local_type_name(name)),
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            format!("{}(_r)", py_read_fn_name(name))
+        }
+        TypeRef::Optional(inner) => format!(
+            "({} if _r.read_option_flag() else None)",
+            py_read_expr(inner, depth)
+        ),
+        TypeRef::List(inner) => format!(
+            "[{} for _i{depth} in range(_r.read_len())]",
+            py_read_expr(inner, depth + 1)
+        ),
+        TypeRef::Map(k, v) => format!(
+            "dict(({}, {}) for _i{depth} in range(_r.read_len()))",
+            py_read_expr(k, depth + 1),
+            py_read_expr(v, depth + 1)
+        ),
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("object references cannot appear inside value buffers")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// Append the statements writing `expr` (one `ty` value) into the
+/// `_BufferWriter` named `writer`, following the value-buffer wire format.
+/// `depth` uniquifies loop variables when composites nest.
+fn py_write_stmts(w: &mut CodeWriter, writer: &str, expr: &str, ty: &TypeRef, depth: usize) {
+    match ty {
+        TypeRef::Bool => {
+            w.line(format!("{writer}.write_bool({expr})"));
+        }
+        TypeRef::I8 => {
+            w.line(format!("{writer}.write_i8({expr})"));
+        }
+        TypeRef::I16 => {
+            w.line(format!("{writer}.write_i16({expr})"));
+        }
+        TypeRef::I32 => {
+            w.line(format!("{writer}.write_i32({expr})"));
+        }
+        TypeRef::I64 => {
+            w.line(format!("{writer}.write_i64({expr})"));
+        }
+        TypeRef::U8 => {
+            w.line(format!("{writer}.write_u8({expr})"));
+        }
+        TypeRef::U16 => {
+            w.line(format!("{writer}.write_u16({expr})"));
+        }
+        TypeRef::U32 => {
+            w.line(format!("{writer}.write_u32({expr})"));
+        }
+        TypeRef::U64 => {
+            w.line(format!("{writer}.write_u64({expr})"));
+        }
+        TypeRef::F32 => {
+            w.line(format!("{writer}.write_f32({expr})"));
+        }
+        TypeRef::F64 => {
+            w.line(format!("{writer}.write_f64({expr})"));
+        }
+        TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            w.line(format!("{writer}.write_u64({expr})"));
+        }
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+            w.line(format!("{writer}.write_string({expr})"));
+        }
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            w.line(format!("{writer}.write_bytes({expr})"));
+        }
+        // IntEnum members are ints, so the discriminant packs directly.
+        TypeRef::Enum(_) => {
+            w.line(format!("{writer}.write_i32({expr})"));
+        }
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            w.line(format!("{}({writer}, {expr})", py_write_fn_name(name)));
+        }
+        TypeRef::Optional(inner) => {
+            w.line(format!("if {expr} is None:"));
+            w.scope(|w| {
+                w.line(format!("{writer}.write_option_flag(False)"));
+            });
+            w.line("else:");
+            w.scope(|w| {
+                w.line(format!("{writer}.write_option_flag(True)"));
+                py_write_stmts(w, writer, expr, inner, depth);
+            });
+        }
+        TypeRef::List(inner) => {
+            w.line(format!("{writer}.write_len(len({expr}))"));
+            w.line(format!("for _e{depth} in {expr}:"));
+            w.scope(|w| {
+                py_write_stmts(w, writer, &format!("_e{depth}"), inner, depth + 1);
+            });
+        }
+        TypeRef::Map(k, v) => {
+            w.line(format!("{writer}.write_len(len({expr}))"));
+            w.line(format!("for _k{depth}, _v{depth} in {expr}.items():"));
+            w.scope(|w| {
+                py_write_stmts(w, writer, &format!("_k{depth}"), k, depth + 1);
+                py_write_stmts(w, writer, &format!("_v{depth}"), v, depth + 1);
+            });
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("object references cannot appear inside value buffers")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// The expression decoding a borrowed `(ptr, len)` buffer pair (a callback
+/// or listener argument) into its idiomatic value. The producer owns the
+/// buffer for the dispatch, so the bytes are copied before decoding.
+fn py_decode_borrowed_expr(ptr: &str, len: &str, ty: &TypeRef) -> String {
+    let data = format!("ctypes.string_at({ptr}, {len}) if {ptr} else b\"\"");
+    match ty {
+        TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+            format!("{}({data})", py_unpack_fn_name(name))
+        }
+        _ => format!("_decode_buffer({data}, lambda _r: {})", py_read_expr(ty, 0)),
     }
 }
 
@@ -647,11 +795,6 @@ fn get_map_kv(ty: &TypeRef) -> Option<(&TypeRef, &TypeRef)> {
 fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
     match ret {
         None => vec![],
-        // Optional peeling stays local so `Optional<bytes>`/`<list>`/`<map>`
-        // still surface their trailing `result_len`, matching the inner type.
-        Some(TypeRef::Optional(inner)) if is_c_pointer_type(inner) => {
-            py_async_cb_trailing_fields(&Some((**inner).clone()))
-        }
         Some(ty) => abi::callback_result_params(ty, "")
             .into_iter()
             .map(|p| (p.name, py_ctype(&p.ty)))
@@ -661,33 +804,45 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
 
 /// Append the success branch of an async completion trampoline: convert the
 /// borrowed `result` slots into the idiomatic value and store it in
-/// `_state["val"]`. Borrowed buffers (strings, bytes, arrays, map buffers)
-/// are copied and never freed; owned object pointers (records, rich enums,
-/// interfaces) are adopted by their wrapper class, which destroys them.
+/// `_state["val"]`. Borrowed buffers (strings, bytes, value buffers) are
+/// copied and never freed; the producer releases them after the callback
+/// returns. An owned interface pointer is adopted by its wrapper class.
 fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
-    match ret {
-        None => {
-            out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
-        }
-        Some(
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Handle,
-        ) => {
+    let Some(ty) = ret else {
+        out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
+        return;
+    };
+    if abi::is_buffered(ty) {
+        // The borrowed `(result_ptr, result_len)` pair holds one encoded
+        // value; copy and decode it before the producer reclaims it.
+        out.push_str(&format!(
+            "{ind}_state[\"val\"] = {}\n",
+            py_decode_borrowed_expr("result_ptr", "result_len", ty)
+        ));
+        return;
+    }
+    match ty {
+        TypeRef::I8
+        | TypeRef::I16
+        | TypeRef::I32
+        | TypeRef::U8
+        | TypeRef::U16
+        | TypeRef::U32
+        | TypeRef::I64
+        | TypeRef::U64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Handle => {
             out.push_str(&format!("{ind}_state[\"val\"] = result\n"));
         }
-        Some(TypeRef::Bool) => {
+        // A typed handle's `c_void_p` slot surfaces as `int | None`.
+        TypeRef::TypedHandle(_) => {
+            out.push_str(&format!("{ind}_state[\"val\"] = result or 0\n"));
+        }
+        TypeRef::Bool => {
             out.push_str(&format!("{ind}_state[\"val\"] = bool(result)\n"));
         }
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             // `result` arrives as `bytes` (ctypes copies `c_char_p` callback
             // arguments), so decoding is already a deep copy of the borrowed
             // producer buffer. The producer frees it; the wrapper must not.
@@ -695,24 +850,13 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                 "{ind}_state[\"val\"] = _bytes_to_string(result) or \"\"\n"
             ));
         }
-        Some(TypeRef::Enum(name)) => {
+        TypeRef::Enum(name) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
         }
-        Some(TypeRef::Record(name))
-        | Some(TypeRef::RichEnum(name))
-        | Some(TypeRef::TypedHandle(name)) => {
-            let name = local_type_name(name);
-            out.push_str(&format!("{ind}if result is None:\n"));
-            out.push_str(&format!(
-                "{ind}    _state[\"err\"] = WeaveFFIError(-1, \"null pointer\")\n"
-            ));
-            out.push_str(&format!("{ind}else:\n"));
-            out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
-        }
         // A returned interface transfers ownership of a new object reference;
         // wrap it without re-running the class's FFI constructor.
-        Some(TypeRef::Interface(name)) => {
+        TypeRef::Interface(name) => {
             let name = local_type_name(name);
             out.push_str(&format!("{ind}if result is None:\n"));
             out.push_str(&format!(
@@ -723,7 +867,7 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
                 "{ind}    _state[\"val\"] = {name}._from_ptr(result)\n"
             ));
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
             // Copy the borrowed buffer; the producer owns and frees it.
             out.push_str(&format!("{ind}if not result:\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = b\"\"\n"));
@@ -731,113 +875,27 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
             out.push_str(&format!("{ind}    _n = int(result_len)\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
         }
-        Some(TypeRef::List(inner)) => {
-            let elem = py_read_element("result[_i]", inner);
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable owned object pointer, null meaning none.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(name) = inner.as_ref() else {
+                unreachable!("only optional interfaces escape buffering")
+            };
+            let name = local_type_name(name);
             out.push_str(&format!("{ind}if not result:\n"));
-            out.push_str(&format!("{ind}    _state[\"val\"] = []\n"));
+            out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
             out.push_str(&format!("{ind}else:\n"));
-            out.push_str(&format!("{ind}    _rl = int(result_len)\n"));
             out.push_str(&format!(
-                "{ind}    _state[\"val\"] = [{elem} for _i in range(_rl)]\n"
+                "{ind}    _state[\"val\"] = {name}._from_ptr(result)\n"
             ));
         }
-        Some(TypeRef::Map(k, v)) => {
-            let kread = py_read_element("result_keys[_i]", k);
-            let vread = py_read_element("result_values[_i]", v);
-            out.push_str(&format!("{ind}if not result_keys or not result_values:\n"));
-            out.push_str(&format!("{ind}    _state[\"val\"] = {{}}\n"));
-            out.push_str(&format!("{ind}else:\n"));
-            out.push_str(&format!("{ind}    _ml = int(result_len)\n"));
-            out.push_str(&format!(
-                "{ind}    _state[\"val\"] = {{{kread}: {vread} for _i in range(_ml)}}\n"
-            ));
-        }
-        Some(TypeRef::Optional(inner)) => {
-            if is_c_pointer_type(inner) {
-                match inner.as_ref() {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        // Borrowed; `bytes` conversion already copied it.
-                        out.push_str(&format!(
-                            "{ind}_state[\"val\"] = _bytes_to_string(result)\n"
-                        ));
-                    }
-                    TypeRef::Record(name)
-                    | TypeRef::RichEnum(name)
-                    | TypeRef::TypedHandle(name) => {
-                        let name = local_type_name(name);
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result)\n"));
-                    }
-                    TypeRef::Interface(name) => {
-                        let name = local_type_name(name);
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!(
-                            "{ind}    _state[\"val\"] = {name}._from_ptr(result)\n"
-                        ));
-                    }
-                    TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                        // Copy the borrowed buffer; the producer frees it.
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _n = int(result_len)\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
-                    }
-                    TypeRef::List(elem) => {
-                        let read = py_read_element("result[_i]", elem);
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _rl = int(result_len)\n"));
-                        out.push_str(&format!(
-                            "{ind}    _state[\"val\"] = [{read} for _i in range(_rl)]\n"
-                        ));
-                    }
-                    TypeRef::Map(k, v) => {
-                        let kread = py_read_element("result_keys[_i]", k);
-                        let vread = py_read_element("result_values[_i]", v);
-                        out.push_str(&format!("{ind}if not result_keys or not result_values:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _ml = int(result_len)\n"));
-                        out.push_str(&format!(
-                            "{ind}    _state[\"val\"] = {{{kread}: {vread} for _i in range(_ml)}}\n"
-                        ));
-                    }
-                    _ => append_async_success_handler(out, &Some(*inner.clone()), ind),
-                }
-            } else {
-                match inner.as_ref() {
-                    TypeRef::Bool => {
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = bool(result[0])\n"));
-                    }
-                    TypeRef::Enum(name) => {
-                        let name = local_type_name(name);
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = {name}(result[0])\n"));
-                    }
-                    _ => {
-                        out.push_str(&format!("{ind}if not result:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = None\n"));
-                        out.push_str(&format!("{ind}else:\n"));
-                        out.push_str(&format!("{ind}    _state[\"val\"] = result[0]\n"));
-                    }
-                }
-            }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered results handled above")
         }
         // Validation rejects `async` + `iter<T>` (AsyncIteratorReturn), so an
         // iterator can never reach an async completion handler.
-        Some(TypeRef::Iterator(_)) => unreachable!("async iterator returns are rejected upstream"),
-        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
+        TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -865,9 +923,16 @@ fn render_async_ffi_call_body(
     let CallShape::Async(a) = &f.shape else {
         unreachable!("render_async_ffi_call_body requires an async call shape");
     };
-    let err_expr = match (f.error_strategy(), error) {
-        (ErrorStrategy::Throws, Some(eb)) => format!("{}(_code, _msg)", py_error_factory_name(eb)),
-        _ => "WeaveFFIError(_code, _msg)".to_string(),
+    // A throwing callable routes the completion error through the domain
+    // factory, including the borrowed payload buffer (copied before the
+    // producer reclaims it). Traps carry no payload, so the generic error
+    // skips it.
+    let (err_expr, wants_payload) = match (f.error_strategy(), error) {
+        (ErrorStrategy::Throws, Some(eb)) => (
+            format!("{}(_code, _msg, _payload)", py_error_factory_name(eb)),
+            true,
+        ),
+        _ => ("WeaveFFIError(_code, _msg)".to_string(), false),
     };
 
     out.push_str(&format!("{ind}_fn = _lib.{}\n", a.launch.symbol));
@@ -895,12 +960,22 @@ fn render_async_ffi_call_body(
     out.push_str(&format!(
         "{ind}        _msg = err.contents.message.decode(\"utf-8\") if err.contents.message else \"\"\n"
     ));
+    if wants_payload {
+        out.push_str(&format!(
+            "{ind}        _payload = ctypes.string_at(err.contents.payload_ptr, err.contents.payload_len) if err.contents.payload_ptr else b\"\"\n"
+        ));
+    }
     out.push_str(&format!(
         "{ind}        _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
     ));
     out.push_str(&format!("{ind}        _state[\"err\"] = {err_expr}\n"));
     out.push_str(&format!("{ind}    else:\n"));
-    append_async_success_handler(out, &f.ret, &format!("{ind}        "));
+    // Decoding a malformed result buffer raises; surface that through the
+    // future rather than letting the exception escape the C callback.
+    out.push_str(&format!("{ind}        try:\n"));
+    append_async_success_handler(out, &f.ret, &format!("{ind}            "));
+    out.push_str(&format!("{ind}        except Exception as _exc:\n"));
+    out.push_str(&format!("{ind}            _state[\"err\"] = _exc\n"));
     out.push('\n');
     out.push_str(&format!("{ind}    def _resolve():\n"));
     out.push_str(&format!("{ind}        _async_pending.pop(_token, None)\n"));
@@ -1132,6 +1207,8 @@ import contextlib
 import ctypes
 import os
 import platform
+import struct
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable, Dict, Iterator, List, Optional
 
@@ -1147,6 +1224,8 @@ class _WeaveFFIErrorStruct(ctypes.Structure):
     _fields_ = [
         ("code", ctypes.c_int32),
         ("message", ctypes.c_char_p),
+        ("payload_ptr", ctypes.c_void_p),
+        ("payload_len", ctypes.c_size_t),
     ]
 
 
@@ -1216,6 +1295,167 @@ def _take_string(ptr) -> Optional[str]:
     _s = ctypes.string_at(ptr).decode("utf-8")
     _lib.weaveffi_free_string(ptr)
     return _s
+
+
+class _BufferWriter:
+    """Encodes values into the WeaveFFI value-buffer wire format:
+    little-endian, packed, no alignment."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def finish(self) -> bytes:
+        return bytes(self._buf)
+
+    def write_bool(self, v) -> None:
+        self._buf.append(1 if v else 0)
+
+    def write_i8(self, v: int) -> None:
+        self._buf += struct.pack("<b", v)
+
+    def write_u8(self, v: int) -> None:
+        self._buf += struct.pack("<B", v)
+
+    def write_i16(self, v: int) -> None:
+        self._buf += struct.pack("<h", v)
+
+    def write_u16(self, v: int) -> None:
+        self._buf += struct.pack("<H", v)
+
+    def write_i32(self, v: int) -> None:
+        self._buf += struct.pack("<i", v)
+
+    def write_u32(self, v: int) -> None:
+        self._buf += struct.pack("<I", v)
+
+    def write_i64(self, v: int) -> None:
+        self._buf += struct.pack("<q", v)
+
+    def write_u64(self, v: int) -> None:
+        self._buf += struct.pack("<Q", v)
+
+    def write_f32(self, v: float) -> None:
+        self._buf += struct.pack("<f", v)
+
+    def write_f64(self, v: float) -> None:
+        self._buf += struct.pack("<d", v)
+
+    def write_len(self, n: int) -> None:
+        self._buf += struct.pack("<I", n)
+
+    def write_option_flag(self, present) -> None:
+        self._buf.append(1 if present else 0)
+
+    def write_string(self, v: str) -> None:
+        _b = v.encode("utf-8")
+        self.write_len(len(_b))
+        self._buf += _b
+
+    def write_bytes(self, v: bytes) -> None:
+        self.write_len(len(v))
+        self._buf += bytes(v)
+
+
+class _BufferReader:
+    """Decodes values from the WeaveFFI value-buffer wire format, rejecting
+    truncated buffers, invalid flag bytes, invalid UTF-8, and oversized
+    length prefixes."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = memoryview(data)
+        self._pos = 0
+
+    def _take(self, n: int, what: str) -> memoryview:
+        if len(self._data) - self._pos < n:
+            raise WeaveFFIError(-1, f"malformed value buffer: truncated {what}")
+        _view = self._data[self._pos:self._pos + n]
+        self._pos += n
+        return _view
+
+    def read_bool(self) -> bool:
+        _b = self._take(1, "bool")[0]
+        if _b > 1:
+            raise WeaveFFIError(-1, "malformed value buffer: invalid bool byte")
+        return _b == 1
+
+    def read_i8(self) -> int:
+        return struct.unpack("<b", self._take(1, "i8"))[0]
+
+    def read_u8(self) -> int:
+        return struct.unpack("<B", self._take(1, "u8"))[0]
+
+    def read_i16(self) -> int:
+        return struct.unpack("<h", self._take(2, "i16"))[0]
+
+    def read_u16(self) -> int:
+        return struct.unpack("<H", self._take(2, "u16"))[0]
+
+    def read_i32(self) -> int:
+        return struct.unpack("<i", self._take(4, "i32"))[0]
+
+    def read_u32(self) -> int:
+        return struct.unpack("<I", self._take(4, "u32"))[0]
+
+    def read_i64(self) -> int:
+        return struct.unpack("<q", self._take(8, "i64"))[0]
+
+    def read_u64(self) -> int:
+        return struct.unpack("<Q", self._take(8, "u64"))[0]
+
+    def read_f32(self) -> float:
+        return struct.unpack("<f", self._take(4, "f32"))[0]
+
+    def read_f64(self) -> float:
+        return struct.unpack("<d", self._take(8, "f64"))[0]
+
+    def read_len(self) -> int:
+        _n = struct.unpack("<I", self._take(4, "length prefix"))[0]
+        if _n > len(self._data) - self._pos:
+            raise WeaveFFIError(
+                -1, "malformed value buffer: length prefix exceeds remaining bytes"
+            )
+        return _n
+
+    def read_option_flag(self) -> bool:
+        _b = self._take(1, "option flag")[0]
+        if _b > 1:
+            raise WeaveFFIError(-1, "malformed value buffer: invalid option flag")
+        return _b == 1
+
+    def read_string(self) -> str:
+        _n = self.read_len()
+        try:
+            return str(self._take(_n, "string data"), "utf-8")
+        except UnicodeDecodeError as _e:
+            raise WeaveFFIError(
+                -1, "malformed value buffer: string is not valid UTF-8"
+            ) from _e
+
+    def read_bytes(self) -> bytes:
+        _n = self.read_len()
+        return bytes(self._take(_n, "bytes data"))
+
+    def expect_end(self) -> None:
+        if self._pos != len(self._data):
+            raise WeaveFFIError(-1, "malformed value buffer: trailing bytes")
+
+
+def _decode_buffer(data: bytes, read_fn):
+    """Decode exactly one value from `data` using `read_fn(reader)`."""
+    _r = _BufferReader(data)
+    _v = read_fn(_r)
+    _r.expect_end()
+    return _v
+
+
+def _take_buffer(ptr, length) -> bytes:
+    """Copy an owned value buffer (a raw address) and release it with
+    weaveffi_free_bytes."""
+    if not ptr:
+        return b""
+    _data = ctypes.string_at(ptr, length) if length else b""
+    _lib.weaveffi_free_bytes(ptr, ctypes.c_size_t(length))
+    return _data
 "#,
     );
 }
@@ -1264,17 +1504,30 @@ fn py_code_class_name(name: &str) -> String {
     weaveffi_core::errors::pascal(name)
 }
 
+/// `_{stem}_payload_{code}`: decodes one code's payload fields onto an
+/// exception instance.
+fn py_payload_decoder_name(eb: &ErrorBinding, code: &ErrorCodeBinding) -> String {
+    format!(
+        "_{}_payload_{}",
+        py_error_stem(eb),
+        code.name.to_snake_case()
+    )
+}
+
 /// Render one module's declared error domain: a base exception named after
 /// the domain (subclassing the generic `WeaveFFIError`), one exception
 /// subclass per code carrying its stable `CODE` and default message, the
-/// code-to-class table, and the factory/checker helpers throwing wrappers
-/// route their out-err slots through. Each code class is also attached to
-/// the domain class, so consumers can catch `KvError.KeyNotFound`.
+/// code-to-class table, per-code payload decoders, and the factory/checker
+/// helpers throwing wrappers route their out-err slots through. Each code
+/// class is also attached to the domain class, so consumers can catch
+/// `KvError.KeyNotFound`.
 fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     let domain = &eb.type_name;
     let factory = py_error_factory_name(eb);
     let checker = py_error_checker_name(eb);
     let table = format!("_{}_CODES", eb.type_name.to_shouty_snake_case());
+    let payloads = format!("_{}_PAYLOADS", eb.type_name.to_shouty_snake_case());
+    let has_payloads = eb.codes.iter().any(|c| !c.fields.is_empty());
 
     let mut w = CodeWriter::four_space();
     w.blank().blank();
@@ -1328,9 +1581,45 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     });
     w.line("}");
 
+    // Payload decoders: one per code that declares structured fields. Each
+    // reads the code's fields (in declaration order) from the payload buffer
+    // and attaches them as attributes on the exception instance.
+    if has_payloads {
+        for c in &eb.codes {
+            if c.fields.is_empty() {
+                continue;
+            }
+            let decoder = py_payload_decoder_name(eb, c);
+            let class = py_code_class_name(&c.name);
+            w.blank().blank();
+            w.line(format!(
+                "def {decoder}(_exc: WeaveFFIError, _r: _BufferReader) -> None:"
+            ));
+            w.scope(|w| {
+                w.line(format!(
+                    "\"\"\"Decode the {class} payload fields onto `_exc`.\"\"\""
+                ));
+                for f in &c.fields {
+                    w.line(format!("_exc.{} = {}", f.name, py_read_expr(&f.ty, 0)));
+                }
+            });
+        }
+        w.blank().blank();
+        w.line(format!("{payloads}: Dict[int, Callable] = {{"));
+        w.scope(|w| {
+            for c in &eb.codes {
+                if c.fields.is_empty() {
+                    continue;
+                }
+                w.line(format!("{}: {},", c.value, py_payload_decoder_name(eb, c)));
+            }
+        });
+        w.line("}");
+    }
+
     w.blank().blank();
     w.line(format!(
-        "def {factory}(code: int, message: str) -> WeaveFFIError:"
+        "def {factory}(code: int, message: str, payload: bytes = b\"\") -> WeaveFFIError:"
     ));
     w.scope(|w| {
         w.line(format!(
@@ -1342,7 +1631,17 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
         w.scope(|w| {
             w.line("return WeaveFFIError(code, message)");
         });
-        w.line("return _cls(message) if message else _cls()");
+        w.line("_exc = _cls(message) if message else _cls()");
+        if has_payloads {
+            w.line(format!("_decoder = {payloads}.get(code)"));
+            w.line("if _decoder is not None and payload:");
+            w.scope(|w| {
+                w.line("_r = _BufferReader(payload)");
+                w.line("_decoder(_exc, _r)");
+                w.line("_r.expect_end()");
+            });
+        }
+        w.line("return _exc");
     });
 
     w.blank().blank();
@@ -1352,8 +1651,13 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
         w.scope(|w| {
             w.line("code = err.code");
             w.line("message = err.message.decode(\"utf-8\") if err.message else \"\"");
+            // The payload is copied before `weaveffi_error_clear` frees it.
+            w.line(
+                "payload = ctypes.string_at(err.payload_ptr, err.payload_len) \
+if err.payload_ptr else b\"\"",
+            );
             w.line("_lib.weaveffi_error_clear(ctypes.byref(err))");
-            w.line(format!("raise {factory}(code, message)"));
+            w.line(format!("raise {factory}(code, message, payload)"));
         });
     });
 
@@ -1361,8 +1665,8 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
 }
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
-    // Rich (algebraic) enums cross the ABI as opaque objects, so they are
-    // emitted as wrapper classes (like structs), not plain `IntEnum`s.
+    // Rich (algebraic) enums are value sum types serialized into value
+    // buffers; they are emitted as dataclass hierarchies, not `IntEnum`s.
     if e.is_rich() {
         render_rich_enum(out, e);
         return;
@@ -1388,239 +1692,324 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
-/// Render a rich (algebraic) enum as an opaque-object wrapper class, mirroring
-/// the Python struct wrapper: it owns the C handle and frees it once in
-/// `__del__` (matching [`render_struct`]), exposes a nested `Tag` `IntEnum`
-/// plus a `tag` property reading the active discriminant, one `@classmethod`
-/// factory per variant (`Shape.circle(radius)`), and per-variant field
-/// accessors namespaced by variant (`circle_radius`). The opaque-object surface
-/// (tag/destroy symbols, per-variant constructors and field getters) is
-/// precomputed in the binding model exactly like a struct's.
+/// Render a rich (algebraic) enum as an idiomatic Python sum type: a base
+/// class holding the nested `Tag` discriminant enum and a `tag` property,
+/// one module-level `@dataclass` subclass per variant carrying its fields,
+/// scoped aliases (`Shape.Circle` is `ShapeCircle`), and the buffer codec
+/// functions implementing the wire shape `i32 tag + active variant's
+/// fields`. Consumers construct variants directly and discriminate with
+/// `isinstance` (or the `tag` property); no FFI symbols are involved.
 fn render_rich_enum(out: &mut String, e: &EnumBinding) {
-    let rich = e
-        .rich
-        .as_ref()
-        .expect("render_rich_enum requires a rich (algebraic) enum");
     let name = &e.name;
-    let destroy = &rich.destroy_symbol;
-    let tag_symbol = &rich.tag_symbol;
+    let mut w = CodeWriter::four_space();
+    w.blank().blank();
+    w.line(format!("class {name}:"));
+    w.indent();
+    let mut doc = String::new();
+    emit_docstring(&mut doc, &e.doc, &w.indent_str());
+    if !doc.is_empty() {
+        w.raw(doc);
+        w.blank();
+    }
+    // Nested discriminant enum (`Shape.Tag.Circle == 1`, ...).
+    w.line("class Tag(IntEnum):");
+    w.scope(|w| {
+        for v in &e.variants {
+            if let Some(d) = &v.doc {
+                let trimmed = d.trim();
+                if !trimmed.is_empty() {
+                    for line in trimmed.lines() {
+                        w.line(format!("# {}", line));
+                    }
+                }
+            }
+            w.line(format!("{} = {}", v.name, v.value));
+        }
+    });
+    w.blank();
+    w.line("@property");
+    w.line(format!("def tag(self) -> \"{name}.Tag\":"));
+    w.scope(|w| {
+        w.line("\"\"\"The discriminant of this value's active variant.\"\"\"");
+        w.line("return type(self).TAG");
+    });
+    w.dedent();
 
-    out.push_str(&format!("\n\nclass {}:\n", name));
-    emit_docstring(out, &e.doc, "    ");
-
-    // Nested discriminant enum (`Shape.Tag.Circle == 1`, …).
-    out.push_str("\n    class Tag(IntEnum):\n");
+    // One module-level dataclass per variant, subclassing the base.
     for v in &e.variants {
-        if let Some(d) = &v.doc {
+        let class = format!("{name}{}", v.name);
+        w.blank().blank();
+        w.line("@dataclass");
+        w.line(format!("class {class}({name}):"));
+        w.indent();
+        let mut doc = String::new();
+        emit_docstring(&mut doc, &v.doc, &w.indent_str());
+        if !doc.is_empty() {
+            w.raw(doc);
+            w.blank();
+        }
+        w.line(format!("TAG = {name}.Tag.{}", v.name));
+        if !v.fields.is_empty() {
+            w.blank();
+            render_dataclass_fields(&mut w, &v.fields);
+        }
+        w.dedent();
+    }
+
+    // Scoped aliases (`Shape.Circle`), assigned once every variant class
+    // exists.
+    w.blank().blank();
+    for v in &e.variants {
+        w.line(format!("{name}.{} = {name}{}", v.name, v.name));
+    }
+
+    render_rich_enum_codecs(&mut w, e);
+    out.push_str(&w.finish());
+}
+
+/// Append a rich enum's buffer codec functions: the statement writer, the
+/// reader, and the standalone pack/unpack pair.
+fn render_rich_enum_codecs(w: &mut CodeWriter, e: &EnumBinding) {
+    let name = &e.name;
+    let write_fn = py_write_fn_name(name);
+    let read_fn = py_read_fn_name(name);
+    let pack_fn = py_pack_fn_name(name);
+    let unpack_fn = py_unpack_fn_name(name);
+
+    w.blank().blank();
+    w.line(format!(
+        "def {write_fn}(_w: _BufferWriter, value: \"{name}\") -> None:"
+    ));
+    w.scope(|w| {
+        for v in &e.variants {
+            let class = format!("{name}{}", v.name);
+            w.line(format!("if isinstance(value, {class}):"));
+            w.scope(|w| {
+                w.line(format!("_w.write_i32({})", v.value));
+                for f in &v.fields {
+                    py_write_stmts(w, "_w", &format!("value.{}", f.name), &f.ty, 0);
+                }
+                w.line("return");
+            });
+        }
+        w.line(format!(
+            "raise WeaveFFIError(-1, \"unknown {name} variant\")"
+        ));
+    });
+
+    w.blank().blank();
+    w.line(format!("def {read_fn}(_r: _BufferReader) -> \"{name}\":"));
+    w.scope(|w| {
+        w.line("_tag = _r.read_i32()");
+        for v in &e.variants {
+            let class = format!("{name}{}", v.name);
+            w.line(format!("if _tag == {}:", v.value));
+            w.scope(|w| {
+                if v.fields.is_empty() {
+                    w.line(format!("return {class}()"));
+                } else {
+                    // Keyword arguments evaluate left to right, matching the
+                    // wire order of the variant's fields.
+                    w.line(format!("return {class}("));
+                    w.scope(|w| {
+                        for f in &v.fields {
+                            w.line(format!("{}={},", f.name, py_read_expr(&f.ty, 0)));
+                        }
+                    });
+                    w.line(")");
+                }
+            });
+        }
+        w.line(format!(
+            "raise WeaveFFIError(-1, f\"malformed value buffer: unknown {name} tag {{_tag}}\")"
+        ));
+    });
+
+    render_pack_unpack(w, name, &write_fn, &read_fn, &pack_fn, &unpack_fn);
+}
+
+/// Render a record as a plain `@dataclass` value class plus its buffer codec
+/// functions. Records have no C symbols: construction, equality, and repr
+/// all come from the dataclass, and instances cross the ABI serialized in
+/// value buffers.
+fn render_struct(out: &mut String, s: &StructBinding) {
+    let mut w = CodeWriter::four_space();
+    w.blank().blank();
+    w.line("@dataclass");
+    w.line(format!("class {}:", s.name));
+    w.indent();
+    let mut doc = String::new();
+    emit_docstring(&mut doc, &s.doc, &w.indent_str());
+    let has_doc = !doc.is_empty();
+    w.raw(doc);
+    if s.fields.is_empty() {
+        if !has_doc {
+            w.line("pass");
+        }
+    } else {
+        if has_doc {
+            w.blank();
+        }
+        render_dataclass_fields(&mut w, &s.fields);
+    }
+    w.dedent();
+    render_record_codecs(&mut w, s);
+    out.push_str(&w.finish());
+}
+
+/// Emit dataclass field lines (`name: hint` or `name: hint = default`), with
+/// field docs as leading comments. Declared defaults apply only to the
+/// longest trailing run of fields that all have representable literals, so a
+/// defaulted field never precedes a required one (which Python rejects).
+fn render_dataclass_fields(w: &mut CodeWriter, fields: &[FieldBinding]) {
+    let literals: Vec<Option<String>> = fields
+        .iter()
+        .map(|f| {
+            f.default
+                .as_ref()
+                .and_then(|d| py_default_literal(&f.ty, d))
+        })
+        .collect();
+    let start = py_default_suffix_start(fields);
+    for (i, f) in fields.iter().enumerate() {
+        if let Some(d) = &f.doc {
             let trimmed = d.trim();
             if !trimmed.is_empty() {
                 for line in trimmed.lines() {
-                    out.push_str(&format!("        # {}\n", line));
+                    w.line(format!("# {}", line));
                 }
             }
         }
-        out.push_str(&format!("        {} = {}\n", v.name, v.value));
-    }
-
-    // Ownership: keep the raw pointer and free it exactly once (no double-free).
-    out.push_str("\n    def __init__(self, _ptr: int) -> None:");
-    out.push_str("\n        self._ptr = _ptr");
-
-    out.push_str("\n\n    def __del__(self) -> None:");
-    out.push_str("\n        if self._ptr is not None:");
-    out.push_str(&format!(
-        "\n            _lib.{destroy}.argtypes = [ctypes.c_void_p]"
-    ));
-    out.push_str(&format!("\n            _lib.{destroy}.restype = None"));
-    out.push_str(&format!("\n            _lib.{destroy}(self._ptr)"));
-    out.push_str("\n            self._ptr = None");
-
-    // tag: read the active variant's discriminant (an `int`, comparable to the
-    // nested `Tag` members).
-    out.push_str("\n\n    @property\n    def tag(self) -> int:");
-    out.push_str(&format!("\n        _fn = _lib.{tag_symbol}"));
-    out.push_str("\n        _fn.argtypes = [ctypes.c_void_p]");
-    out.push_str("\n        _fn.restype = ctypes.c_int32");
-    out.push_str("\n        return _fn(self._ptr)");
-
-    // One factory classmethod per variant (`Shape.circle(2.5)`).
-    for v in &rich.variants {
-        render_rich_variant_factory(out, name, v);
-    }
-
-    // Per-variant field accessors, namespaced by variant to avoid collisions.
-    // Reuse the struct getter renderer (identical marshalling: string decode,
-    // bytes/list length out-params, wrapper construction, …) by projecting the
-    // namespaced Python name onto the field's precomputed getter symbol.
-    for v in &rich.variants {
-        let variant_snake = v.name.to_snake_case();
-        for f in &v.fields {
-            let mut namespaced = f.clone();
-            namespaced.name = format!("{variant_snake}_{}", f.name);
-            render_getter(out, &namespaced);
-        }
-    }
-    out.push('\n');
-}
-
-/// One variant constructor as a `@classmethod` factory. Mirrors the struct
-/// builder's `build()` marshalling: each variant field lowers to the same ABI
-/// argument slots, the call threads an `out_err` and is checked with
-/// `_check_error`, and the returned handle is wrapped (`return cls(_result)`).
-fn render_rich_variant_factory(out: &mut String, enum_name: &str, v: &RichVariantBinding) {
-    let factory = v.name.to_snake_case();
-    let ind = "        ";
-
-    let params_sig: Vec<String> = v
-        .fields
-        .iter()
-        .map(|f| format!("{}: {}", f.name, py_type_hint(&f.ty)))
-        .collect();
-    let sig = if params_sig.is_empty() {
-        "cls".to_string()
-    } else {
-        format!("cls, {}", params_sig.join(", "))
-    };
-    out.push_str(&format!(
-        "\n\n    @classmethod\n    def {factory}({sig}) -> \"{enum_name}\":\n"
-    ));
-    emit_docstring(out, &v.doc, ind);
-
-    out.push_str(&format!("{ind}_fn = _lib.{}\n", v.create.symbol));
-    let mut argtypes: Vec<String> = Vec::new();
-    for f in &v.fields {
-        argtypes.extend(py_param_argtypes(&f.ty));
-    }
-    argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
-    out.push_str(&format!("{ind}_fn.argtypes = [{}]\n", argtypes.join(", ")));
-    out.push_str(&format!("{ind}_fn.restype = ctypes.c_void_p\n"));
-
-    for f in &v.fields {
-        for line in py_param_conversion(&f.name, &f.ty, ind) {
-            out.push_str(&line);
-            out.push('\n');
-        }
-    }
-
-    out.push_str(&format!("{ind}_err = _WeaveFFIErrorStruct()\n"));
-    let mut call_args: Vec<String> = Vec::new();
-    for f in &v.fields {
-        call_args.extend(py_param_call_args(&f.name, &f.ty));
-    }
-    call_args.push("ctypes.byref(_err)".into());
-    out.push_str(&format!("{ind}_result = _fn({})\n", call_args.join(", ")));
-    out.push_str(&format!("{ind}_check_error(_err)\n"));
-    out.push_str(&format!("{ind}if _result is None:\n"));
-    out.push_str(&format!(
-        "{ind}    raise WeaveFFIError(-1, \"null pointer\")\n"
-    ));
-    out.push_str(&format!("{ind}return cls(_result)\n"));
-}
-
-fn render_struct(out: &mut String, s: &StructBinding) {
-    let destroy = &s.destroy_symbol;
-
-    out.push_str(&format!("\n\nclass {}:\n", s.name));
-    emit_docstring(out, &s.doc, "    ");
-
-    out.push_str("\n    def __init__(self, _ptr: int) -> None:");
-    out.push_str("\n        self._ptr = _ptr");
-
-    out.push_str("\n\n    def __del__(self) -> None:");
-    out.push_str("\n        if self._ptr is not None:");
-    out.push_str(&format!(
-        "\n            _lib.{destroy}.argtypes = [ctypes.c_void_p]"
-    ));
-    out.push_str(&format!("\n            _lib.{destroy}.restype = None"));
-    out.push_str(&format!("\n            _lib.{destroy}(self._ptr)"));
-    out.push_str("\n            self._ptr = None");
-
-    for field in &s.fields {
-        render_getter(out, field);
-    }
-    out.push('\n');
-}
-
-fn render_builder(out: &mut String, s: &StructBinding) {
-    let builder_name = format!("{}Builder", s.name);
-    out.push_str(&format!("\n\nclass {}:\n", builder_name));
-    emit_docstring(out, &s.doc, "    ");
-    out.push_str("    def __init__(self) -> None:");
-    // Zero-value defaults (the same contract as the other backends): scalars
-    // start at 0/False/""/b"", collections empty, optionals absent. Unset
-    // fields therefore lower to valid C arguments instead of raising.
-    for field in &s.fields {
-        let (default, hint) = py_field_default(&field.ty);
-        out.push_str(&format!(
-            "\n        self._{}: {} = {}",
-            field.name, hint, default
-        ));
-    }
-    for field in &s.fields {
-        let py_ty = py_type_hint(&field.ty);
-        out.push_str(&format!(
-            "\n\n    def with_{}(self, value: {}) -> \"{}\":",
-            field.name, py_ty, builder_name
-        ));
-        if let Some(d) = &field.doc {
-            let trimmed = d.trim();
-            if !trimmed.is_empty() {
-                if trimmed.contains('\n') {
-                    out.push_str("\n        \"\"\"\n");
-                    for line in trimmed.lines() {
-                        if line.is_empty() {
-                            out.push('\n');
-                        } else {
-                            out.push_str("        ");
-                            out.push_str(line);
-                            out.push('\n');
-                        }
-                    }
-                    out.push_str("        \"\"\"");
-                } else {
-                    out.push_str(&format!("\n        \"\"\"{}\"\"\"", trimmed));
-                }
+        let hint = py_type_hint(&f.ty);
+        match &literals[i] {
+            Some(lit) if i >= start => {
+                w.line(format!("{}: {} = {}", f.name, hint, lit));
+            }
+            _ => {
+                w.line(format!("{}: {}", f.name, hint));
             }
         }
-        out.push_str(&format!("\n        self._{} = value", field.name));
-        out.push_str("\n        return self");
     }
-    let ret_ty = py_type_hint(&TypeRef::Record(s.name.clone()));
-    out.push_str(&format!("\n\n    def build(self) -> {}:", ret_ty));
-    // Marshal every field into the struct's C `create` call with the same
-    // lowering used for function parameters, then wrap the returned handle.
-    let ind = "        ";
-    for field in &s.fields {
-        out.push_str(&format!("\n{ind}{} = self._{}", field.name, field.name));
-    }
-    out.push_str(&format!("\n{ind}_fn = _lib.{}", s.create.symbol));
-    let mut argtypes: Vec<String> = Vec::new();
-    for field in &s.fields {
-        argtypes.extend(py_param_argtypes(&field.ty));
-    }
-    argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
-    out.push_str(&format!("\n{ind}_fn.argtypes = [{}]", argtypes.join(", ")));
-    out.push_str(&format!("\n{ind}_fn.restype = ctypes.c_void_p"));
-    for field in &s.fields {
-        for line in py_param_conversion(&field.name, &field.ty, ind) {
-            out.push('\n');
-            out.push_str(&line);
+}
+
+/// The index where the trailing run of defaulted dataclass fields starts:
+/// every field at or past it carries a representable default literal, so
+/// only that suffix receives defaults (Python rejects a defaulted field
+/// ahead of a required one).
+fn py_default_suffix_start(fields: &[FieldBinding]) -> usize {
+    let mut start = fields.len();
+    while start > 0 {
+        let f = &fields[start - 1];
+        let has_literal = f
+            .default
+            .as_ref()
+            .and_then(|d| py_default_literal(&f.ty, d))
+            .is_some();
+        if !has_literal {
+            break;
         }
+        start -= 1;
     }
-    out.push_str(&format!("\n{ind}_err = _WeaveFFIErrorStruct()"));
-    let mut call_args: Vec<String> = Vec::new();
-    for field in &s.fields {
-        call_args.extend(py_param_call_args(&field.name, &field.ty));
+    start
+}
+
+/// The Python literal for one declared field default, or `None` when the
+/// value has no simple literal spelling (in which case the dataclass field
+/// stays required).
+fn py_default_literal(ty: &TypeRef, value: &serde_yaml::Value) -> Option<String> {
+    match (ty, value) {
+        (TypeRef::Bool, serde_yaml::Value::Bool(b)) => {
+            Some(if *b { "True" } else { "False" }.to_string())
+        }
+        (
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Handle,
+            serde_yaml::Value::Number(n),
+        ) => Some(n.to_string()),
+        (TypeRef::StringUtf8 | TypeRef::BorrowedStr, serde_yaml::Value::String(s)) => {
+            Some(format!("\"{}\"", py_str_literal(s)))
+        }
+        (TypeRef::Optional(_), serde_yaml::Value::Null) => Some("None".to_string()),
+        _ => None,
     }
-    call_args.push("ctypes.byref(_err)".into());
-    out.push_str(&format!("\n{ind}_result = _fn({})", call_args.join(", ")));
-    out.push_str(&format!("\n{ind}_check_error(_err)"));
-    out.push_str(&format!("\n{ind}if _result is None:"));
-    out.push_str(&format!(
-        "\n{ind}    raise WeaveFFIError(-1, \"null pointer\")"
+}
+
+/// Append a record's buffer codec functions: the statement writer, the
+/// reader, and the standalone pack/unpack pair.
+fn render_record_codecs(w: &mut CodeWriter, s: &StructBinding) {
+    let name = &s.name;
+    let write_fn = py_write_fn_name(name);
+    let read_fn = py_read_fn_name(name);
+    let pack_fn = py_pack_fn_name(name);
+    let unpack_fn = py_unpack_fn_name(name);
+
+    w.blank().blank();
+    w.line(format!(
+        "def {write_fn}(_w: _BufferWriter, value: \"{name}\") -> None:"
     ));
-    out.push_str(&format!("\n{ind}return {}(_result)", s.name));
-    out.push('\n');
+    w.scope(|w| {
+        if s.fields.is_empty() {
+            w.line("pass");
+        } else {
+            for f in &s.fields {
+                py_write_stmts(w, "_w", &format!("value.{}", f.name), &f.ty, 0);
+            }
+        }
+    });
+
+    w.blank().blank();
+    w.line(format!("def {read_fn}(_r: _BufferReader) -> \"{name}\":"));
+    w.scope(|w| {
+        if s.fields.is_empty() {
+            w.line(format!("return {name}()"));
+        } else {
+            // Keyword arguments evaluate left to right, matching the wire
+            // order of the record's fields.
+            w.line(format!("return {name}("));
+            w.scope(|w| {
+                for f in &s.fields {
+                    w.line(format!("{}={},", f.name, py_read_expr(&f.ty, 0)));
+                }
+            });
+            w.line(")");
+        }
+    });
+
+    render_pack_unpack(w, name, &write_fn, &read_fn, &pack_fn, &unpack_fn);
+}
+
+/// Append the standalone `_pack_X`/`_unpack_X` pair bridging one value type
+/// to and from `bytes`.
+fn render_pack_unpack(
+    w: &mut CodeWriter,
+    name: &str,
+    write_fn: &str,
+    read_fn: &str,
+    pack_fn: &str,
+    unpack_fn: &str,
+) {
+    w.blank().blank();
+    w.line(format!("def {pack_fn}(value: \"{name}\") -> bytes:"));
+    w.scope(|w| {
+        w.line("_w = _BufferWriter()");
+        w.line(format!("{write_fn}(_w, value)"));
+        w.line("return _w.finish()");
+    });
+
+    w.blank().blank();
+    w.line(format!("def {unpack_fn}(data: bytes) -> \"{name}\":"));
+    w.scope(|w| {
+        w.line(format!("return _decode_buffer(data, {read_fn})"));
+    });
 }
 
 // ── Interfaces ──
@@ -1697,31 +2086,6 @@ fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBindi
     out.push('\n');
 }
 
-/// The zero-value default (and matching type hint) for one builder slot.
-fn py_field_default(ty: &TypeRef) -> (String, String) {
-    let hint = py_type_hint(ty);
-    match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::Handle => ("0".into(), hint),
-        TypeRef::F32 | TypeRef::F64 => ("0.0".into(), hint),
-        TypeRef::Bool => ("False".into(), hint),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("\"\"".into(), hint),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => ("b\"\"".into(), hint),
-        TypeRef::List(_) => ("[]".into(), hint),
-        TypeRef::Map(_, _) => ("{}".into(), hint),
-        TypeRef::Optional(_) => ("None".into(), hint),
-        // No synthesizable zero value; the with_ setter is the only path.
-        _ => ("None".into(), format!("Optional[{hint}]")),
-    }
-}
-
 // ── Callbacks & listeners ──
 
 /// The module-level `ctypes.CFUNCTYPE` alias for one callback type. Listener
@@ -1758,6 +2122,12 @@ fn py_callable_hint(params: &[ParamBinding]) -> String {
 /// the idiomatic value passed to the user callback. `n` is the IR parameter
 /// name (slot names derive from it, mirroring [`abi::lower_param`]).
 fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
+    // A buffered argument arrives as a borrowed `({n}_ptr, {n}_len)` pair,
+    // valid only during the dispatch; copy and decode before invoking the
+    // user callable.
+    if abi::is_buffered(ty) {
+        return py_decode_borrowed_expr(&format!("{n}_ptr"), &format!("{n}_len"), ty);
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1777,43 +2147,13 @@ fn py_cb_param_expr(n: &str, ty: &TypeRef) -> String {
         }
         TypeRef::Enum(name) => format!("{}({n})", local_type_name(name)),
         // Borrowed by contract: the producer owns callback arguments for the
-        // duration of the call, so opaque pointers (including interface
-        // references) pass through raw rather than being wrapped in an owning
-        // class whose __del__ would free them.
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => n.into(),
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({n})"),
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else None")
-            }
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => n.into(),
-            TypeRef::List(elem) => {
-                let read = py_read_element(&format!("{n}[_i]"), elem);
-                format!("[{read} for _i in range({n}_len)] if {n} else None")
-            }
-            TypeRef::Map(k, v) => {
-                let kread = py_read_element(&format!("{n}_keys[_i]"), k);
-                let vread = py_read_element(&format!("{n}_values[_i]"), v);
-                format!("{{{kread}: {vread} for _i in range({n}_len)}} if {n}_keys else None")
-            }
-            TypeRef::Bool => format!("bool({n}[0]) if {n} else None"),
-            TypeRef::Enum(name) => format!("{}({n}[0]) if {n} else None", local_type_name(name)),
-            _ => format!("{n}[0] if {n} else None"),
-        },
-        TypeRef::List(inner) => {
-            let read = py_read_element(&format!("{n}[_i]"), inner);
-            format!("[{read} for _i in range({n}_len)] if {n} else []")
-        }
-        TypeRef::Map(k, v) => {
-            let kread = py_read_element(&format!("{n}_keys[_i]"), k);
-            let vread = py_read_element(&format!("{n}_values[_i]"), v);
-            format!("{{{kread}: {vread} for _i in range({n}_len)}} if {n}_keys else {{}}")
+        // duration of the call, so opaque pointers (typed handles, interface
+        // references, and nullable `Interface?` slots) pass through raw
+        // rather than being wrapped in an owning class whose `__del__` would
+        // free them.
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Optional(_) => n.into(),
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered callback arguments handled above")
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -1915,54 +2255,6 @@ fn render_listener(
     w.line("_fn(ctypes.c_uint64(listener_id))");
     w.line("_listener_refs.pop(listener_id, None)");
     out.push_str(&w.finish());
-}
-
-fn render_getter(out: &mut String, field: &FieldBinding) {
-    let getter = &field.getter_symbol;
-    let py_ty = py_type_hint(&field.ty);
-    let ind = "        ";
-
-    let mut w = CodeWriter::four_space();
-    w.blank().blank().indent();
-    w.line("@property");
-    w.line(format!("def {}(self) -> {}:", field.name, py_ty));
-    w.indent();
-    let mut doc = String::new();
-    emit_docstring(&mut doc, &field.doc, ind);
-    w.raw(doc);
-    w.line(format!("_fn = _lib.{getter}"));
-
-    let (restype, out_argtypes) = py_return_info(&field.ty);
-    let mut argtypes = vec!["ctypes.c_void_p".to_string()];
-    argtypes.extend(out_argtypes.iter().cloned());
-
-    w.line(format!("_fn.argtypes = [{}]", argtypes.join(", ")));
-    w.line(format!("_fn.restype = {restype}"));
-
-    if out_argtypes.is_empty() {
-        w.line("_result = _fn(self._ptr)");
-    } else if let Some((k, v)) = get_map_kv(&field.ty) {
-        // The locals must match the `py_return_info` argtypes exactly: owned
-        // string elements stay `c_void_p` so their raw addresses survive for
-        // `weaveffi_free_string` (ctypes rejects a `c_char_p` local against a
-        // `POINTER(POINTER(c_void_p))` argtype).
-        w.line(format!(
-            "_out_keys = ctypes.POINTER({})()",
-            py_owned_elem_scalar(k)
-        ));
-        w.line(format!(
-            "_out_values = ctypes.POINTER({})()",
-            py_owned_elem_scalar(v)
-        ));
-        w.line("_out_len = ctypes.c_size_t(0)");
-        w.line("_fn(self._ptr, ctypes.byref(_out_keys), ctypes.byref(_out_values), ctypes.byref(_out_len))");
-    } else {
-        w.line("_out_len = ctypes.c_size_t(0)");
-        w.line("_result = _fn(self._ptr, ctypes.byref(_out_len))");
-    }
-    out.push_str(&w.finish());
-
-    render_return_value(out, &field.ty, ind);
 }
 
 /// How a rendered callable is scoped and spelled in the generated Python.
@@ -2185,20 +2477,10 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
 
         w.line("_err = _WeaveFFIErrorStruct()");
 
-        let is_map_ret = f.ret.as_ref().and_then(get_map_kv).is_some();
-        let has_out_len = !out_ret_argtypes.is_empty() && !is_map_ret;
-
-        if let Some((k, v)) = f.ret.as_ref().and_then(get_map_kv) {
-            w.line(format!(
-                "_out_keys = ctypes.POINTER({})()",
-                py_owned_elem_scalar(k)
-            ));
-            w.line(format!(
-                "_out_values = ctypes.POINTER({})()",
-                py_owned_elem_scalar(v)
-            ));
-            w.line("_out_len = ctypes.c_size_t(0)");
-        } else if has_out_len {
+        // Both bytes and buffered returns carry one trailing `size_t*
+        // out_len` slot beside the returned pointer.
+        let has_out_len = !out_ret_argtypes.is_empty();
+        if has_out_len {
             w.line("_out_len = ctypes.c_size_t(0)");
         }
 
@@ -2209,17 +2491,13 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
         for p in &f.params {
             call_args.extend(py_param_call_args(&py_name(&p.name), &p.ty));
         }
-        if is_map_ret {
-            call_args.push("ctypes.byref(_out_keys)".into());
-            call_args.push("ctypes.byref(_out_values)".into());
-            call_args.push("ctypes.byref(_out_len)".into());
-        } else if has_out_len {
+        if has_out_len {
             call_args.push("ctypes.byref(_out_len)".into());
         }
         call_args.push("ctypes.byref(_err)".into());
 
         let call_expr = format!("_fn({})", call_args.join(", "));
-        if f.ret.is_some() && !is_map_ret {
+        if f.ret.is_some() {
             w.line(format!("_result = {call_expr}"));
         } else {
             w.line(call_expr);
@@ -2266,123 +2544,46 @@ fn render_callable(out: &mut String, f: &FnBinding, error: Option<&ErrorBinding>
 
 // ── Param helpers ──
 
-fn py_list_convert_expr(name: &str, elem: &TypeRef) -> String {
-    match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("*[_string_to_bytes(v) for v in {name}]")
-        }
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
-            format!("*[v._ptr for v in {name}]")
-        }
-        TypeRef::Enum(_) => format!("*[v.value for v in {name}]"),
-        TypeRef::Bool => format!("*[1 if v else 0 for v in {name}]"),
-        _ => format!("*{name}"),
-    }
-}
-
-fn py_map_elem_convert(list_name: &str, ty: &TypeRef, var: &str) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            format!("*[_string_to_bytes({var}) for {var} in {list_name}]")
-        }
-        TypeRef::Enum(_) => format!("*[{var}.value for {var} in {list_name}]"),
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
-            format!("*[{var}._ptr for {var} in {list_name}]")
-        }
-        TypeRef::Bool => format!("*[1 if {var} else 0 for {var} in {list_name}]"),
-        _ => format!("*{list_name}"),
-    }
-}
-
+/// The statements preparing one parameter's locals ahead of the C call: a
+/// packed `_{name}_buf` for buffered types, a `_{name}_arr` element array
+/// for bytes. Direct types need no preparation.
 fn py_param_conversion(name: &str, ty: &TypeRef, ind: &str) -> Vec<String> {
+    if abi::is_buffered(ty) {
+        // Records and rich enums pack through their dedicated helpers; other
+        // buffered shapes (optionals, lists, maps) inline their write
+        // statements through a per-parameter writer (so several buffered
+        // parameters in one call never collide).
+        return match ty {
+            TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+                vec![format!("{ind}_{name}_buf = {}({name})", py_pack_fn_name(n))]
+            }
+            _ => {
+                let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
+                let writer = format!("_{name}_w");
+                w.line(format!("{writer} = _BufferWriter()"));
+                py_write_stmts(&mut w, &writer, name, ty, 0);
+                w.line(format!("_{name}_buf = {writer}.finish()"));
+                w.finish().lines().map(str::to_string).collect()
+            }
+        };
+    }
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let s = py_ctypes_scalar(&TypeRef::Bytes);
-            vec![format!("{ind}_{name}_arr = ({s} * len({name}))(*{name})")]
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Handle => {
-                let s = py_ctypes_scalar(inner);
-                vec![format!(
-                    "{ind}_{name}_c = ctypes.byref({s}({name})) if {name} is not None else None"
-                )]
-            }
-            TypeRef::Bool => {
-                vec![format!(
-                    "{ind}_{name}_c = ctypes.byref(ctypes.c_int32(1 if {name} else 0)) if {name} is not None else None"
-                )]
-            }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                vec![format!("{ind}_{name}_c = _string_to_bytes({name})")]
-            }
-            TypeRef::Enum(_) => {
-                vec![format!(
-                    "{ind}_{name}_c = ctypes.byref(ctypes.c_int32({name}.value)) if {name} is not None else None"
-                )]
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let s = py_ctypes_scalar(&TypeRef::Bytes);
-                vec![
-                    format!("{ind}if {name} is not None:"),
-                    format!("{ind}    _{name}_arr = ({s} * len({name}))(*{name})"),
-                    format!("{ind}    _{name}_len = len({name})"),
-                    format!("{ind}else:"),
-                    format!("{ind}    _{name}_arr = None"),
-                    format!("{ind}    _{name}_len = 0"),
-                ]
-            }
-            TypeRef::List(elem) => {
-                let s = py_ctypes_scalar(elem);
-                let convert = py_list_convert_expr(name, elem);
-                vec![
-                    format!("{ind}if {name} is not None:"),
-                    format!("{ind}    _{name}_arr = ({s} * len({name}))({convert})"),
-                    format!("{ind}    _{name}_len = len({name})"),
-                    format!("{ind}else:"),
-                    format!("{ind}    _{name}_arr = None"),
-                    format!("{ind}    _{name}_len = 0"),
-                ]
-            }
-            _ => vec![],
-        },
-        TypeRef::List(inner) => {
-            let s = py_ctypes_scalar(inner);
-            let convert = py_list_convert_expr(name, inner);
-            vec![format!("{ind}_{name}_arr = ({s} * len({name}))({convert})")]
-        }
-        TypeRef::Map(k, v) => {
-            let ks = py_ctypes_scalar(k);
-            let vs = py_ctypes_scalar(v);
-            let kconv = py_map_elem_convert(&format!("_{name}_keys"), k, "_k");
-            let vconv = py_map_elem_convert(&format!("_{name}_vals"), v, "_v");
-            vec![
-                format!("{ind}_{name}_keys = list({name}.keys())"),
-                format!("{ind}_{name}_vals = [{name}[_k] for _k in _{name}_keys]"),
-                format!("{ind}_{name}_ka = ({ks} * len(_{name}_keys))({kconv})"),
-                format!("{ind}_{name}_va = ({vs} * len(_{name}_vals))({vconv})"),
-            ]
+            vec![format!(
+                "{ind}_{name}_arr = (ctypes.c_uint8 * len({name}))(*{name})"
+            )]
         }
         _ => vec![],
     }
 }
 
+/// The C argument expressions one parameter contributes, in slot order.
 fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
+    // A buffered parameter fills its `(ptr, len)` slot pair with the packed
+    // bytes; ctypes passes `bytes` directly for a `c_char_p` argtype.
+    if abi::is_buffered(ty) {
+        return vec![format!("_{name}_buf"), format!("len(_{name}_buf)")];
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2394,7 +2595,10 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         | TypeRef::U64
         | TypeRef::F32
         | TypeRef::F64
-        | TypeRef::Handle => {
+        | TypeRef::Handle
+        // A typed handle is already the raw pointer-sized integer the
+        // `c_void_p` slot wants.
+        | TypeRef::TypedHandle(_) => {
             vec![name.to_string()]
         }
         TypeRef::Bool => vec![format!("1 if {name} else 0")],
@@ -2402,40 +2606,16 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             vec![format!("_{name}_arr"), format!("len({name})")]
         }
-        // Object parameters are borrowed: pass the wrapper's raw pointer;
+        // Interface parameters are borrowed: pass the wrapper's raw pointer;
         // the callee never takes ownership.
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
-            vec![format!("{name}._ptr")]
-        }
+        TypeRef::Interface(_) => vec![format!("{name}._ptr")],
         TypeRef::Enum(_) => vec![format!("{name}.value")],
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => vec![format!("_{name}_c")],
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => {
-                vec![format!("{name}._ptr if {name} is not None else None")]
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) => {
-                vec![format!("_{name}_arr"), format!("_{name}_len")]
-            }
-            TypeRef::Map(_, _) => vec![
-                format!("_{name}_ka"),
-                format!("_{name}_va"),
-                format!("_{name}_len"),
-            ],
-            _ if !is_c_pointer_type(inner) => vec![format!("_{name}_c")],
-            _ => py_param_call_args(name, inner),
-        },
-        TypeRef::List(_) => vec![format!("_{name}_arr"), format!("len({name})")],
-        TypeRef::Map(_, _) => vec![
-            format!("_{name}_ka"),
-            format!("_{name}_va"),
-            format!("len(_{name}_keys)"),
-        ],
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable borrowed object pointer.
+        TypeRef::Optional(_) => vec![format!("{name}._ptr if {name} is not None else None")],
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered parameters handled above")
+        }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
@@ -2443,40 +2623,26 @@ fn py_param_call_args(name: &str, ty: &TypeRef) -> Vec<String> {
 
 // ── Return helpers ──
 
-fn py_read_element(expr: &str, ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_bytes_to_string({expr})"),
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Enum(name) => {
-            let name = local_type_name(name);
-            format!("{name}({expr})")
-        }
-        // Owned interface references wrap without re-running the class's FFI
-        // constructor.
-        TypeRef::Interface(name) => {
-            format!("{}._from_ptr({expr})", local_type_name(name))
-        }
-        TypeRef::Bool => format!("bool({expr})"),
-        _ => expr.to_string(),
-    }
-}
-
-/// The read expression for one element the wrapper *owns* (list returns, map
-/// buffers, iterator `next` slots): string elements are copied and released
-/// through `_take_string` per [`weaveffi_core::plan::ElemFree::String`];
-/// object pointers are adopted by their wrapper class, whose disposal calls
-/// the `_destroy` symbol ([`weaveffi_core::plan::ElemFree::Object`]).
-fn py_read_owned_element(expr: &str, ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("_take_string({expr})"),
-        _ => py_read_element(expr, ty),
-    }
-}
-
 fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
     let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
+    // A buffered return hands over one owned encoded value: copy the bytes,
+    // release them with `weaveffi_free_bytes`, then decode.
+    if abi::is_buffered(ty) {
+        w.line("_data = _take_buffer(_result, _out_len.value)");
+        match ty {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+                w.line(format!("return {}(_data)", py_unpack_fn_name(name)));
+            }
+            _ => {
+                w.line(format!(
+                    "return _decode_buffer(_data, lambda _r: {})",
+                    py_read_expr(ty, 0)
+                ));
+            }
+        }
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2490,6 +2656,11 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         | TypeRef::F64
         | TypeRef::Handle => {
             w.line("return _result");
+        }
+        // The `c_void_p` restype surfaces null as `None`; normalize to the
+        // integer handle representation.
+        TypeRef::TypedHandle(_) => {
+            w.line("return _result or 0");
         }
         TypeRef::Bool => {
             w.line("return bool(_result)");
@@ -2508,16 +2679,6 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             w.line("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))");
             w.line("return _val");
         }
-        // An owned object pointer is adopted by the wrapper class, whose
-        // disposal calls the type's `_destroy` symbol.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let name = local_type_name(name);
-            w.line("if _result is None:");
-            w.scope(|w| {
-                w.line("raise WeaveFFIError(-1, \"null pointer\")");
-            });
-            w.line(format!("return {name}(_result)"));
-        }
         // A returned interface is a new owned reference: wrap it without
         // re-running the class's FFI constructor.
         TypeRef::Interface(name) => {
@@ -2532,45 +2693,12 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
             let name = local_type_name(name);
             w.line(format!("return {name}(_result)"));
         }
-        // Compound returns delegate to their own helpers, which append directly.
-        TypeRef::Optional(inner) => return render_optional_return(out, inner, ind),
-        TypeRef::List(inner) => return render_list_return(out, inner, ind, "[]"),
-        TypeRef::Map(k, v) => return render_map_return(out, k, v, ind, "{}"),
-        TypeRef::Iterator(_) => unreachable!("iterator return handled in render_function"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-    out.push_str(&w.finish());
-}
-
-fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
-    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
-    // Every branch but the first guards a `None` early-return, so factor the
-    // shared `if not _result: return None` shape out of each arm.
-    let guard_none = |w: &mut CodeWriter, none_value: &str| {
-        w.line("if not _result:");
-        w.scope(|w| {
-            w.line(format!("return {none_value}"));
-        });
-    };
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("return _take_string(_result)");
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            guard_none(&mut w, "None");
-            w.line("_val = bytes(_result[:_out_len.value])");
-            w.line("_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))");
-            w.line("return _val");
-        }
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::TypedHandle(name) => {
-            let name = local_type_name(name);
-            w.line("if _result is None:");
-            w.scope(|w| {
-                w.line("return None");
-            });
-            w.line(format!("return {name}(_result)"));
-        }
-        TypeRef::Interface(name) => {
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable owned object pointer, null meaning none.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(name) = inner.as_ref() else {
+                unreachable!("only optional interfaces escape buffering")
+            };
             let name = local_type_name(name);
             w.line("if _result is None:");
             w.scope(|w| {
@@ -2578,99 +2706,65 @@ fn render_optional_return(out: &mut String, inner: &TypeRef, ind: &str) {
             });
             w.line(format!("return {name}._from_ptr(_result)"));
         }
-        // Optional list and map returns share the non-optional copy-and-free
-        // path with a `None` empty value.
-        TypeRef::List(elem) => return render_list_return(out, elem, ind, "None"),
-        TypeRef::Map(k, v) => return render_map_return(out, k, v, ind, "None"),
-        // Boxed optional scalars: dereference, then release the box with
-        // `weaveffi_free_bytes(ptr, sizeof(T))`.
-        _ if !is_c_pointer_type(inner) => {
-            guard_none(&mut w, "None");
-            let read = match inner {
-                TypeRef::Enum(name) => format!("{}(_result[0])", local_type_name(name)),
-                TypeRef::Bool => "bool(_result[0])".to_string(),
-                _ => "_result[0]".to_string(),
-            };
-            w.line(format!("_val = {read}"));
-            w.line(format!(
-                "_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(ctypes.sizeof({})))",
-                py_ctypes_scalar(inner)
-            ));
-            w.line("return _val");
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered returns handled above")
         }
-        _ => {
-            w.line("return _result");
-        }
+        TypeRef::Iterator(_) => unreachable!("iterator return handled in render_callable"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
-    out.push_str(&w.finish());
-}
-
-/// Render a list return: copy each element out of the producer array (owed
-/// per-element releases included), then release the array buffer itself with
-/// `weaveffi_free_bytes(ptr, len * sizeof(elem))`. `empty` is the value
-/// returned for a null array (`[]`, or `None` for an optional list).
-fn render_list_return(out: &mut String, inner: &TypeRef, ind: &str, empty: &str) {
-    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
-    w.line("if not _result:");
-    w.scope(|w| {
-        w.line(format!("return {empty}"));
-    });
-    let elem = py_read_owned_element("_result[_i]", inner);
-    w.line(format!("_items = [{elem} for _i in range(_out_len.value)]"));
-    w.line(format!(
-        "_lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
-        py_owned_elem_scalar(inner)
-    ));
-    w.line("return _items");
-    out.push_str(&w.finish());
-}
-
-/// Render a map return: copy each key and value out of the parallel producer
-/// arrays (owed per-element releases included), then release both arrays with
-/// `weaveffi_free_bytes`. `empty` is the value returned for null buffers
-/// (`{}`, or `None` for an optional map).
-fn render_map_return(out: &mut String, k: &TypeRef, v: &TypeRef, ind: &str, empty: &str) {
-    let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
-    w.line("if not _out_keys or not _out_values:");
-    w.scope(|w| {
-        w.line(format!("return {empty}"));
-    });
-    let key_read = py_read_owned_element("_out_keys[_i]", k);
-    let val_read = py_read_owned_element("_out_values[_i]", v);
-    w.line(format!(
-        "_map = {{{key_read}: {val_read} for _i in range(_out_len.value)}}"
-    ));
-    w.line(format!(
-        "_lib.weaveffi_free_bytes(_out_keys, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
-        py_owned_elem_scalar(k)
-    ));
-    w.line(format!(
-        "_lib.weaveffi_free_bytes(_out_values, ctypes.c_size_t(_out_len.value * ctypes.sizeof({})))",
-        py_owned_elem_scalar(v)
-    ));
-    w.line("return _map");
     out.push_str(&w.finish());
 }
 
 // ── Iterator helpers ──
 
+/// The `_out_item` ctypes local for one iterator element slot, plus whether
+/// the `next` signature carries a trailing `size_t* out_len`. Owned pointer
+/// elements (strings, bytes, buffered values) stay raw `c_void_p` addresses
+/// so they survive to be freed.
+fn py_iter_slots(inner: &TypeRef) -> (String, bool) {
+    if abi::is_buffered(inner) {
+        return ("ctypes.c_void_p".into(), true);
+    }
+    match inner {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ("ctypes.c_void_p".into(), false),
+        TypeRef::Bytes | TypeRef::BorrowedBytes => ("ctypes.c_void_p".into(), true),
+        _ => (py_ctypes_scalar(inner).into(), false),
+    }
+}
+
+/// The Python expression converting a pulled `_out_item` slot into the
+/// element the consumer receives, honoring the owed per-element release
+/// ([`weaveffi_core::plan::elem_free`]).
 fn py_read_iter_item(inner: &TypeRef) -> String {
+    // Buffered element: copy the encoded bytes, free them, decode.
+    if abi::is_buffered(inner) {
+        return match inner {
+            TypeRef::Record(name) | TypeRef::RichEnum(name) => format!(
+                "{}(_take_buffer(_out_item.value, _out_len.value))",
+                py_unpack_fn_name(name)
+            ),
+            _ => format!(
+                "_decode_buffer(_take_buffer(_out_item.value, _out_len.value), lambda _r: {})",
+                py_read_expr(inner, 0)
+            ),
+        };
+    }
     match inner {
         // Owned string element: copy, then `weaveffi_free_string`. The out
         // slot is a raw `c_void_p`, so the address survives to be freed.
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "_take_string(_out_item.value)".into(),
-        // Owned object element: adopted by the wrapper class, whose disposal
-        // calls the type's `_destroy` symbol.
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Enum(name) => {
-            let name = local_type_name(name);
-            format!("{name}(_out_item.value)")
+        // Owned bytes element: copy, then `weaveffi_free_bytes`.
+        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+            "_take_buffer(_out_item.value, _out_len.value)".into()
         }
+        TypeRef::Enum(name) => {
+            format!("{}(_out_item.value)", local_type_name(name))
+        }
+        // An owned interface element is adopted by its wrapper class.
         TypeRef::Interface(name) => {
             format!("{}._from_ptr(_out_item.value)", local_type_name(name))
         }
+        TypeRef::TypedHandle(_) => "_out_item.value or 0".into(),
         TypeRef::Bool => "bool(_out_item.value)".into(),
         _ => "_out_item.value".into(),
     }
@@ -2699,8 +2793,21 @@ fn render_iterator_class(
     checker: &str,
 ) {
     let class_name = py_iterator_class_name(func_name);
-    let item_scalar = py_owned_elem_scalar(inner);
+    let (item_scalar, has_out_len) = py_iter_slots(inner);
     let read_expr = py_read_iter_item(inner);
+    let mut next_argtypes = vec![
+        "ctypes.c_void_p".to_string(),
+        format!("ctypes.POINTER({item_scalar})"),
+    ];
+    if has_out_len {
+        next_argtypes.push("ctypes.POINTER(ctypes.c_size_t)".into());
+    }
+    next_argtypes.push("ctypes.POINTER(_WeaveFFIErrorStruct)".into());
+    let mut next_args = vec!["self._ptr".to_string(), "ctypes.byref(_out_item)".into()];
+    if has_out_len {
+        next_args.push("ctypes.byref(_out_len)".into());
+    }
+    next_args.push("ctypes.byref(_err)".into());
 
     out.push_str(&format!("\n\nclass {class_name}:"));
     out.push_str("\n    \"\"\"Lazy iterator over a producer stream: each step pulls one element");
@@ -2718,14 +2825,19 @@ fn render_iterator_class(
     out.push_str("\n            raise StopIteration");
     out.push_str(&format!("\n        _next_fn = _lib.{iter_tag}_next"));
     out.push_str(&format!(
-        "\n        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER({item_scalar}), ctypes.POINTER(_WeaveFFIErrorStruct)]"
+        "\n        _next_fn.argtypes = [{}]",
+        next_argtypes.join(", ")
     ));
     out.push_str("\n        _next_fn.restype = ctypes.c_int32");
     out.push_str(&format!("\n        _out_item = {item_scalar}()"));
+    if has_out_len {
+        out.push_str("\n        _out_len = ctypes.c_size_t(0)");
+    }
     out.push_str("\n        _err = _WeaveFFIErrorStruct()");
-    out.push_str(
-        "\n        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))",
-    );
+    out.push_str(&format!(
+        "\n        _has = _next_fn({})",
+        next_args.join(", ")
+    ));
     out.push_str(&format!("\n        {checker}(_err)"));
     out.push_str("\n        if not _has:");
     out.push_str("\n            self._done = True");
@@ -2902,7 +3014,7 @@ fn render_pyi_module(
 
 /// `.pyi` stub for one module's error domain: the domain base class (with
 /// its scoped per-code aliases) plus a per-code subclass carrying its stable
-/// `CODE`, mirroring [`render_error`].
+/// `CODE` and any structured payload fields, mirroring [`render_error`].
 fn render_pyi_error(out: &mut String, eb: &ErrorBinding) {
     let domain = &eb.type_name;
     out.push('\n');
@@ -2918,6 +3030,9 @@ fn render_pyi_error(out: &mut String, eb: &ErrorBinding) {
         emit_doc(out, &c.doc, "");
         out.push_str(&format!("class {class}({domain}):\n"));
         out.push_str("    CODE: int\n");
+        for f in &c.fields {
+            out.push_str(&format!("    {}: {}\n", f.name, py_type_hint(&f.ty)));
+        }
         out.push_str("    def __init__(self, message: str = ...) -> None: ...\n");
     }
 }
@@ -2996,51 +3111,52 @@ fn render_pyi_enum(out: &mut String, e: &EnumBinding) {
     }
 }
 
-/// `.pyi` stub for a rich (algebraic) enum: a class with a nested `Tag`
-/// `IntEnum`, the `tag` reader, a factory classmethod per variant, and the
-/// namespaced per-variant field properties, mirroring [`render_rich_enum`].
+/// `.pyi` stub for a rich (algebraic) enum: the base class with its nested
+/// `Tag` `IntEnum`, scoped variant aliases, and `tag` reader, plus one
+/// dataclass-shaped variant subclass with its fields and constructor,
+/// mirroring [`render_rich_enum`].
 fn render_pyi_rich_enum(out: &mut String, e: &EnumBinding) {
-    let Some(rich) = e.rich.as_ref() else {
-        return;
-    };
+    let name = &e.name;
     out.push('\n');
     emit_doc(out, &e.doc, "");
-    out.push_str(&format!("class {}:\n", e.name));
+    out.push_str(&format!("class {name}:\n"));
     out.push_str("    class Tag(IntEnum):\n");
     for v in &e.variants {
         emit_doc(out, &v.doc, "        ");
         out.push_str(&format!("        {}: int\n", v.name));
     }
-    out.push_str("    @property\n    def tag(self) -> int: ...\n");
-    for v in &rich.variants {
-        let factory = v.name.to_snake_case();
-        let params: Vec<String> = v
-            .fields
-            .iter()
-            .map(|f| format!("{}: {}", f.name, py_type_hint(&f.ty)))
-            .collect();
-        let sig = if params.is_empty() {
-            "cls".to_string()
-        } else {
-            format!("cls, {}", params.join(", "))
-        };
-        out.push_str(&format!(
-            "    @classmethod\n    def {factory}({sig}) -> \"{}\": ...\n",
-            e.name
-        ));
+    for v in &e.variants {
+        out.push_str(&format!("    {}: Type[\"{name}{}\"]\n", v.name, v.name));
     }
-    for v in &rich.variants {
-        let variant_snake = v.name.to_snake_case();
+    out.push_str(&format!(
+        "    @property\n    def tag(self) -> \"{name}.Tag\": ...\n"
+    ));
+    for v in &e.variants {
+        let class = format!("{name}{}", v.name);
+        out.push('\n');
+        emit_doc(out, &v.doc, "");
+        out.push_str(&format!("class {class}({name}):\n"));
+        out.push_str(&format!("    TAG: \"{name}.Tag\"\n"));
         for f in &v.fields {
-            out.push_str(&format!(
-                "    @property\n    def {variant_snake}_{}(self) -> {}: ...\n",
-                f.name,
-                py_type_hint(&f.ty)
-            ));
+            out.push_str(&format!("    {}: {}\n", f.name, py_type_hint(&f.ty)));
         }
+        let mut params = vec!["self".to_string()];
+        params.extend(
+            v.fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, py_type_hint(&f.ty))),
+        );
+        out.push_str(&format!(
+            "    def __init__({}) -> None: ...\n",
+            params.join(", ")
+        ));
     }
 }
 
+/// `.pyi` stub for a record: a dataclass-shaped value class with typed field
+/// attributes and the generated constructor, mirroring [`render_struct`].
+/// Declared defaults surface as `= ...` on the trailing constructor
+/// parameters that carry them.
 fn render_pyi_struct(out: &mut String, s: &StructBinding) {
     out.push('\n');
     emit_doc(out, &s.doc, "");
@@ -3048,11 +3164,22 @@ fn render_pyi_struct(out: &mut String, s: &StructBinding) {
     for field in &s.fields {
         let py_ty = py_type_hint(&field.ty);
         emit_doc(out, &field.doc, "    ");
-        out.push_str(&format!(
-            "    @property\n    def {}(self) -> {}: ...\n",
-            field.name, py_ty
-        ));
+        out.push_str(&format!("    {}: {}\n", field.name, py_ty));
     }
+    let start = py_default_suffix_start(&s.fields);
+    let mut params = vec!["self".to_string()];
+    params.extend(s.fields.iter().enumerate().map(|(i, f)| {
+        let hint = py_type_hint(&f.ty);
+        if i >= start {
+            format!("{}: {} = ...", f.name, hint)
+        } else {
+            format!("{}: {}", f.name, hint)
+        }
+    }));
+    out.push_str(&format!(
+        "    def __init__({}) -> None: ...\n",
+        params.join(", ")
+    ));
 }
 
 fn render_pyi_listener(
@@ -3126,7 +3253,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -3550,7 +3677,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_class_with_getters() {
+    fn struct_dataclass_value_type() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -3571,7 +3698,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3582,50 +3708,80 @@ mod tests {
         }]);
 
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
-        assert!(py.contains("class Contact:"), "missing class: {py}");
         assert!(
-            py.contains("def __init__(self, _ptr: int)"),
-            "missing __init__: {py}"
+            py.contains("@dataclass\nclass Contact:"),
+            "missing dataclass: {py}"
+        );
+        assert!(py.contains("name: str"), "missing name field: {py}");
+        assert!(py.contains("age: int"), "missing age field: {py}");
+        // Records are plain value types: no pointer wrapping, no destructor,
+        // and no C symbols at all.
+        assert!(!py.contains("self._ptr"), "no pointer wrapping: {py}");
+        assert!(
+            !py.contains("Contact_destroy"),
+            "no destroy symbol for records: {py}"
         );
         assert!(
-            py.contains("self._ptr = _ptr"),
-            "missing _ptr assignment: {py}"
+            !py.contains("Contact_get_"),
+            "no getter symbols for records: {py}"
         );
-        assert!(py.contains("def __del__(self)"), "missing __del__: {py}");
+        // The buffer codecs are generated beside the dataclass.
         assert!(
-            py.contains("weaveffi_contacts_Contact_destroy"),
-            "missing destroy call: {py}"
-        );
-        assert!(
-            py.contains("def name(self) -> str:"),
-            "missing name getter: {py}"
+            py.contains("def _write_Contact(_w: _BufferWriter, value: \"Contact\") -> None:"),
+            "missing field writer: {py}"
         );
         assert!(
-            py.contains("weaveffi_contacts_Contact_get_name"),
-            "missing name getter C call: {py}"
-        );
-        // The getter's owned string is copied and released via `_take_string`.
-        assert!(
-            py.contains("_take_string(_result)"),
-            "missing _take_string in getter: {py}"
+            py.contains("_w.write_string(value.name)"),
+            "missing string field write: {py}"
         );
         assert!(
-            py.contains("def age(self) -> int:"),
-            "missing age getter: {py}"
+            py.contains("_w.write_i32(value.age)"),
+            "missing i32 field write: {py}"
         );
         assert!(
-            py.contains("weaveffi_contacts_Contact_get_age"),
-            "missing age getter C call: {py}"
+            py.contains("def _read_Contact(_r: _BufferReader) -> \"Contact\":"),
+            "missing field reader: {py}"
+        );
+        assert!(
+            py.contains("name=_r.read_string(),"),
+            "missing string field read: {py}"
+        );
+        assert!(
+            py.contains("age=_r.read_i32(),"),
+            "missing i32 field read: {py}"
+        );
+        assert!(
+            py.contains("def _pack_Contact(value: \"Contact\") -> bytes:"),
+            "missing pack helper: {py}"
+        );
+        assert!(
+            py.contains("def _unpack_Contact(data: bytes) -> \"Contact\":"),
+            "missing unpack helper: {py}"
         );
     }
 
     #[test]
-    fn python_builder_generated() {
+    fn buffered_record_param_packs() {
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
-                functions: vec![],
+                functions: vec![Function {
+                    name: "save_contact".into(),
+                    params: vec![Param {
+                        name: "contact".into(),
+                        ty: TypeRef::Record("Contact".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: None,
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
                 structs: vec![StructDef {
                     name: "Contact".into(),
                     doc: None,
@@ -3643,7 +3799,6 @@ mod tests {
                             default: None,
                         },
                     ],
-                    builder: true,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -3661,32 +3816,29 @@ mod tests {
             .generate(&api, out, &PythonConfig::default())
             .unwrap();
         let py = std::fs::read_to_string(out.join("python/weaveffi/weaveffi.py")).unwrap();
+        // The caller packs the record to bytes and passes the (ptr, len)
+        // slot pair; `c_char_p` accepts the bytes directly.
         assert!(
-            py.contains("class ContactBuilder"),
-            "missing builder class: {py}"
-        );
-        assert!(py.contains("def with_name("), "missing with_name: {py}");
-        assert!(py.contains("def with_age("), "missing with_age: {py}");
-        assert!(py.contains("def build("), "missing build: {py}");
-        // Build is FFI-backed: it calls the C create symbol, checks the
-        // error, and wraps the returned handle. Unset fields default to zero
-        // values rather than raising.
-        assert!(
-            py.contains("_fn = _lib.weaveffi_contacts_Contact_create"),
-            "missing create call: {py}"
+            py.contains("def save_contact(contact: \"Contact\") -> None:"),
+            "missing wrapper signature: {py}"
         );
         assert!(
-            py.contains("return Contact(_result)"),
-            "missing handle wrap: {py}"
+            py.contains("_contact_buf = _pack_Contact(contact)"),
+            "missing pack call: {py}"
         );
         assert!(
-            py.contains("self._name: str = \"\"") && py.contains("self._age: int = 0"),
-            "missing zero defaults: {py}"
+            py.contains(
+                "_fn.argtypes = [ctypes.c_char_p, ctypes.c_size_t, \
+                 ctypes.POINTER(_WeaveFFIErrorStruct)]"
+            ),
+            "missing buffered argtypes: {py}"
         );
         assert!(
-            !py.contains("requires FFI backing"),
-            "stub must be gone: {py}"
+            py.contains("_fn(_contact_buf, len(_contact_buf), ctypes.byref(_err))"),
+            "missing buffered call args: {py}"
         );
+        // No builder class survives the migration.
+        assert!(!py.contains("ContactBuilder"), "builders are gone: {py}");
     }
 
     #[test]
@@ -3723,13 +3875,23 @@ mod tests {
             py.contains("-> \"Contact\":"),
             "missing struct return hint: {py}"
         );
+        // A buffered return keeps its raw address plus a trailing out_len.
         assert!(
-            py.contains("ctypes.c_void_p"),
-            "missing void_p for struct: {py}"
+            py.contains("_fn.restype = ctypes.c_void_p"),
+            "missing void_p restype for buffered return: {py}"
         );
         assert!(
-            py.contains("return Contact(_result)"),
-            "missing struct wrapping: {py}"
+            py.contains("_out_len = ctypes.c_size_t(0)"),
+            "missing out_len for buffered return: {py}"
+        );
+        // The owned encoded buffer is copied, freed, then decoded.
+        assert!(
+            py.contains("_data = _take_buffer(_result, _out_len.value)"),
+            "missing buffer take: {py}"
+        );
+        assert!(
+            py.contains("return _unpack_Contact(_data)"),
+            "missing record decode: {py}"
         );
     }
 
@@ -3868,28 +4030,46 @@ mod tests {
             py.contains("-> Optional[int]:"),
             "missing optional return: {py}"
         );
+        // The optional packs into a per-parameter value buffer: a flag byte,
+        // then the value when present.
         assert!(
-            py.contains("ctypes.POINTER(ctypes.c_int32)"),
-            "missing POINTER for optional: {py}"
+            py.contains("_id_w = _BufferWriter()"),
+            "missing param writer: {py}"
+        );
+        assert!(py.contains("if id is None:"), "missing None branch: {py}");
+        assert!(
+            py.contains("_id_w.write_option_flag(False)"),
+            "missing absent flag write: {py}"
         );
         assert!(
-            py.contains("ctypes.byref(ctypes.c_int32(id)) if id is not None else None"),
-            "missing optional param conversion: {py}"
+            py.contains("_id_w.write_option_flag(True)"),
+            "missing present flag write: {py}"
         );
-        assert!(py.contains("return None"), "missing None return path: {py}");
-        // The boxed scalar is dereferenced, then its box is released.
         assert!(
-            py.contains("_val = _result[0]"),
-            "missing pointer deref: {py}"
+            py.contains("_id_w.write_i32(id)"),
+            "missing value write: {py}"
+        );
+        assert!(
+            py.contains("_id_buf = _id_w.finish()"),
+            "missing buffer finish: {py}"
+        );
+        assert!(
+            py.contains("_fn(_id_buf, len(_id_buf), ctypes.byref(_out_len), ctypes.byref(_err))"),
+            "missing buffered call args: {py}"
+        );
+        // The buffered return is copied, freed, and decoded through the
+        // option flag.
+        assert!(
+            py.contains("_data = _take_buffer(_result, _out_len.value)"),
+            "missing buffer take: {py}"
         );
         assert!(
             py.contains(
-                "_lib.weaveffi_free_bytes(_result, \
-                 ctypes.c_size_t(ctypes.sizeof(ctypes.c_int32)))"
+                "return _decode_buffer(_data, \
+                 lambda _r: (_r.read_i32() if _r.read_option_flag() else None))"
             ),
-            "missing boxed scalar free: {py}"
+            "missing optional decode: {py}"
         );
-        assert!(py.contains("return _val"), "missing _val return: {py}");
     }
 
     #[test]
@@ -3921,11 +4101,18 @@ mod tests {
             py.contains("-> Optional[str]:"),
             "missing optional str return: {py}"
         );
-        // The optional owned string is copied and released via `_take_string`,
-        // which itself returns `None` for a null pointer.
+        // An optional string is buffered: the encoded value is copied,
+        // freed, and decoded through the option flag.
         assert!(
-            py.contains("return _take_string(_result)"),
-            "missing _take_string for optional string: {py}"
+            py.contains("_data = _take_buffer(_result, _out_len.value)"),
+            "missing buffer take for optional string: {py}"
+        );
+        assert!(
+            py.contains(
+                "return _decode_buffer(_data, \
+                 lambda _r: (_r.read_string() if _r.read_option_flag() else None))"
+            ),
+            "missing optional string decode: {py}"
         );
     }
 
@@ -3974,17 +4161,23 @@ mod tests {
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(py.contains("ids: List[int]"), "missing list param: {py}");
         assert!(py.contains("-> List[int]:"), "missing list return: {py}");
+        // The list packs into a value buffer: a count, then each element.
         assert!(
-            py.contains("ctypes.c_int32 * len(ids)"),
-            "missing ctypes array creation: {py}"
+            py.contains("_ids_w.write_len(len(ids))"),
+            "missing list length write: {py}"
+        );
+        assert!(py.contains("for _e0 in ids:"), "missing element loop: {py}");
+        assert!(
+            py.contains("_ids_w.write_i32(_e0)"),
+            "missing element write: {py}"
         );
         assert!(
             py.contains("_out_len"),
             "missing out_len for list return: {py}"
         );
         assert!(
-            py.contains("for _i in range(_out_len.value)"),
-            "missing list iteration: {py}"
+            py.contains("[_r.read_i32() for _i0 in range(_r.read_len())]"),
+            "missing list decode: {py}"
         );
     }
 
@@ -4042,16 +4235,32 @@ mod tests {
             py.contains("-> Dict[str, int]:"),
             "missing map return: {py}"
         );
+        // The map packs into a value buffer: a count, then alternating
+        // key and value.
         assert!(
-            py.contains("list(scores.keys())"),
-            "missing keys extraction: {py}"
+            py.contains("_scores_w.write_len(len(scores))"),
+            "missing map length write: {py}"
         );
-        assert!(py.contains("_out_keys"), "missing out_keys: {py}");
-        assert!(py.contains("_out_values"), "missing out_values: {py}");
+        assert!(
+            py.contains("for _k0, _v0 in scores.items():"),
+            "missing entry loop: {py}"
+        );
+        assert!(
+            py.contains("_scores_w.write_string(_k0)"),
+            "missing key write: {py}"
+        );
+        assert!(
+            py.contains("_scores_w.write_i32(_v0)"),
+            "missing value write: {py}"
+        );
+        assert!(
+            py.contains("dict((_r.read_string(), _r.read_i32()) for _i0 in range(_r.read_len()))"),
+            "missing map decode: {py}"
+        );
     }
 
     #[test]
-    fn struct_optional_string_getter() {
+    fn struct_optional_string_field() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -4064,7 +4273,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4076,18 +4284,30 @@ mod tests {
 
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
-            py.contains("def email(self) -> Optional[str]:"),
-            "missing optional getter: {py}"
+            py.contains("email: Optional[str]"),
+            "missing optional field annotation: {py}"
         );
-        // Copied and released via `_take_string` (which handles the null case).
+        // The codec writes a flag byte, then the value only when present.
         assert!(
-            py.contains("_take_string(_result)"),
-            "missing _take_string in optional getter: {py}"
+            py.contains("if value.email is None:"),
+            "missing None branch in writer: {py}"
+        );
+        assert!(
+            py.contains("_w.write_option_flag(False)"),
+            "missing absent flag write: {py}"
+        );
+        assert!(
+            py.contains("_w.write_string(value.email)"),
+            "missing present value write: {py}"
+        );
+        assert!(
+            py.contains("email=(_r.read_string() if _r.read_option_flag() else None),"),
+            "missing optional field read: {py}"
         );
     }
 
     #[test]
-    fn struct_enum_field_getter() {
+    fn struct_enum_field() {
         let api = make_api(vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -4100,7 +4320,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4112,12 +4331,17 @@ mod tests {
 
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
-            py.contains("def role(self) -> \"Role\":"),
-            "missing enum getter: {py}"
+            py.contains("role: \"Role\""),
+            "missing enum field annotation: {py}"
+        );
+        // C-style enum fields serialize as their i32 discriminant.
+        assert!(
+            py.contains("_w.write_i32(value.role)"),
+            "missing enum field write: {py}"
         );
         assert!(
-            py.contains("return Role(_result)"),
-            "missing enum wrapping in getter: {py}"
+            py.contains("role=Role(_r.read_i32()),"),
+            "missing enum field read: {py}"
         );
     }
 
@@ -4174,7 +4398,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             functions: vec![
                 Function {
@@ -4273,13 +4496,16 @@ mod tests {
         assert!(py.contains("Personal = 0"));
         assert!(py.contains("Work = 1"));
 
-        assert!(py.contains("class Contact:"));
-        assert!(py.contains("weaveffi_contacts_Contact_destroy"));
-        assert!(py.contains("def id(self) -> int:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_id"));
-        assert!(py.contains("def first_name(self) -> str:"));
-        assert!(py.contains("def email(self) -> Optional[str]:"));
-        assert!(py.contains("def contact_type(self) -> \"ContactType\":"));
+        assert!(py.contains("@dataclass\nclass Contact:"));
+        assert!(py.contains("id: int"));
+        assert!(py.contains("first_name: str"));
+        assert!(py.contains("email: Optional[str]"));
+        assert!(py.contains("contact_type: \"ContactType\""));
+        // Records carry no C symbols; only the buffer codecs exist.
+        assert!(!py.contains("Contact_destroy"));
+        assert!(!py.contains("Contact_get_"));
+        assert!(py.contains("def _pack_Contact("));
+        assert!(py.contains("def _unpack_Contact("));
 
         assert!(py.contains("def create_contact("));
         assert!(py.contains("weaveffi_contacts_create_contact"));
@@ -4302,15 +4528,16 @@ mod tests {
         assert_eq!(py_type_hint(&TypeRef::Handle), "int");
         assert_eq!(py_type_hint(&TypeRef::Record("Foo".into())), "\"Foo\"");
         assert_eq!(py_type_hint(&TypeRef::Enum("Bar".into())), "\"Bar\"");
-        assert_eq!(py_type_hint(&TypeRef::TypedHandle("Foo".into())), "\"Foo\"");
+        // A typed handle is an opaque pointer-sized token surfacing as a
+        // plain int, matching the untyped handle.
+        assert_eq!(py_type_hint(&TypeRef::TypedHandle("Foo".into())), "int");
+        assert_eq!(
+            py_type_hint(&TypeRef::TypedHandle("kv.Store".into())),
+            "int"
+        );
         // Cross-module references (resolved to a qualified IR name) must still
         // annotate the bare *local* class, which is the only symbol that exists
         // in the generated module.
-        assert_eq!(
-            py_type_hint(&TypeRef::TypedHandle("kv.Store".into())),
-            "\"Store\"",
-            "qualified typed handle must annotate the local class name"
-        );
         assert_eq!(
             py_type_hint(&TypeRef::Record("kv.Store".into())),
             "\"Store\""
@@ -4344,7 +4571,7 @@ mod tests {
         assert_eq!(py_ctypes_scalar(&TypeRef::Handle), "ctypes.c_uint64");
         assert_eq!(py_ctypes_scalar(&TypeRef::Bytes), "ctypes.c_uint8");
         assert_eq!(
-            py_ctypes_scalar(&TypeRef::Record("X".into())),
+            py_ctypes_scalar(&TypeRef::TypedHandle("X".into())),
             "ctypes.c_void_p"
         );
         assert_eq!(
@@ -4382,14 +4609,15 @@ mod tests {
             py.contains("-> List[\"Item\"]:"),
             "missing list struct return: {py}"
         );
+        // Each element decodes through the record's reader.
         assert!(
-            py.contains("Item(_result[_i])"),
-            "missing struct wrapping in list: {py}"
+            py.contains("[_read_Item(_r) for _i0 in range(_r.read_len())]"),
+            "missing record list decode: {py}"
         );
     }
 
     #[test]
-    fn struct_bytes_field_getter() {
+    fn struct_bytes_field() {
         let api = make_api(vec![Module {
             name: "storage".into(),
             functions: vec![],
@@ -4402,7 +4630,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4414,16 +4641,16 @@ mod tests {
 
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
         assert!(
-            py.contains("def data(self) -> bytes:"),
-            "missing bytes getter: {py}"
+            py.contains("data: bytes"),
+            "missing bytes field annotation: {py}"
         );
         assert!(
-            py.contains("_out_len = ctypes.c_size_t(0)"),
-            "missing out_len in bytes getter: {py}"
+            py.contains("_w.write_bytes(value.data)"),
+            "missing bytes field write: {py}"
         );
         assert!(
-            py.contains("_result[:_out_len.value]"),
-            "missing bytes slice: {py}"
+            py.contains("data=_r.read_bytes(),"),
+            "missing bytes field read: {py}"
         );
     }
 
@@ -4486,7 +4713,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             functions: vec![
                 Function {
@@ -4592,25 +4818,26 @@ mod tests {
         assert!(pyi.contains("    Work: int"), "missing enum variant Work");
 
         assert!(pyi.contains("class Contact:"), "missing struct stub");
+        assert!(pyi.contains("    id: int\n"), "missing id field: {pyi}");
+        assert!(pyi.contains("    name: str\n"), "missing name field: {pyi}");
         assert!(
-            pyi.contains("    def id(self) -> int: ..."),
-            "missing id property: {pyi}"
+            pyi.contains("    email: Optional[str]\n"),
+            "missing email field: {pyi}"
         );
         assert!(
-            pyi.contains("    def name(self) -> str: ..."),
-            "missing name property: {pyi}"
+            pyi.contains("    tags: List[str]\n"),
+            "missing tags field: {pyi}"
         );
         assert!(
-            pyi.contains("    def email(self) -> Optional[str]: ..."),
-            "missing email property: {pyi}"
+            pyi.contains("    metadata: Dict[str, int]\n"),
+            "missing metadata field: {pyi}"
         );
         assert!(
-            pyi.contains("    def tags(self) -> List[str]: ..."),
-            "missing tags property: {pyi}"
-        );
-        assert!(
-            pyi.contains("    def metadata(self) -> Dict[str, int]: ..."),
-            "missing metadata property: {pyi}"
+            pyi.contains(
+                "    def __init__(self, id: int, name: str, email: Optional[str], \
+                 tags: List[str], metadata: Dict[str, int]) -> None: ..."
+            ),
+            "missing dataclass constructor stub: {pyi}"
         );
 
         assert!(
@@ -4726,7 +4953,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -4738,28 +4964,29 @@ mod tests {
 
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
-        assert!(py.contains("class Contact:"), "missing class decl");
+        assert!(
+            py.contains("@dataclass\nclass Contact:"),
+            "missing dataclass decl"
+        );
         assert!(
             py.contains("\"\"\"A contact record\"\"\""),
             "missing doc: {py}"
         );
-        assert!(py.contains("def __init__(self, _ptr: int) -> None:"));
-        assert!(py.contains("self._ptr = _ptr"));
-        assert!(py.contains("def __del__(self) -> None:"));
-        assert!(py.contains("weaveffi_contacts_Contact_destroy"));
+        // Value type: no pointer wrapping, no destructor, no getters.
+        assert!(!py.contains("self._ptr = _ptr"));
+        assert!(!py.contains("weaveffi_contacts_Contact_destroy"));
+        assert!(!py.contains("weaveffi_contacts_Contact_get_id"));
 
-        assert!(py.contains("@property\n    def id(self) -> int:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_id"));
-        assert!(py.contains("_fn.restype = ctypes.c_int64"));
+        assert!(py.contains("    id: int"));
+        assert!(py.contains("    first_name: str"));
+        assert!(py.contains("    last_name: str"));
+        assert!(py.contains("    email: Optional[str]"));
 
-        assert!(py.contains("@property\n    def first_name(self) -> str:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_first_name"));
-
-        assert!(py.contains("@property\n    def last_name(self) -> str:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_last_name"));
-
-        assert!(py.contains("@property\n    def email(self) -> Optional[str]:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_email"));
+        // The codec functions serialize fields in declaration order.
+        assert!(py.contains("_w.write_i64(value.id)"));
+        assert!(py.contains("_w.write_string(value.first_name)"));
+        assert!(py.contains("id=_r.read_i64(),"));
+        assert!(py.contains("email=(_r.read_string() if _r.read_option_flag() else None),"));
     }
 
     #[test]
@@ -4919,13 +5146,14 @@ mod tests {
             py.contains("-> Optional[int]:"),
             "missing Optional[int] return"
         );
+        // Optional scalars pack into per-parameter value buffers.
         assert!(
-            py.contains("ctypes.byref(ctypes.c_int32(key)) if key is not None else None"),
-            "missing optional i32 conversion"
+            py.contains("_key_w.write_option_flag(False)"),
+            "missing absent flag write for key"
         );
         assert!(
-            py.contains("ctypes.POINTER(ctypes.c_int32)"),
-            "missing POINTER for optional i32"
+            py.contains("_key_w.write_i32(key)"),
+            "missing present value write for key"
         );
 
         assert!(
@@ -4937,8 +5165,8 @@ mod tests {
             "missing Optional[str] return"
         );
         assert!(
-            py.contains("_string_to_bytes(prefix)"),
-            "missing optional _string_to_bytes"
+            py.contains("_prefix_w.write_string(prefix)"),
+            "missing optional string write"
         );
 
         assert!(
@@ -4946,25 +5174,17 @@ mod tests {
             "missing Optional struct return"
         );
         assert!(
-            py.contains("if _result is None:\n        return None\n    return Contact(_result)"),
-            "missing optional struct None check"
+            py.contains("lambda _r: (_read_Contact(_r) if _r.read_option_flag() else None)"),
+            "missing optional struct decode"
         );
 
         assert!(
             py.contains("-> Optional[bool]:"),
             "missing Optional[bool] return"
         );
-        // The boxed bool is dereferenced, then its box is released.
         assert!(
-            py.contains("_val = bool(_result[0])"),
-            "missing optional bool deref"
-        );
-        assert!(
-            py.contains(
-                "_lib.weaveffi_free_bytes(_result, \
-                 ctypes.c_size_t(ctypes.sizeof(ctypes.c_int32)))"
-            ),
-            "missing boxed bool free"
+            py.contains("lambda _r: (_r.read_bool() if _r.read_option_flag() else None)"),
+            "missing optional bool decode"
         );
     }
 
@@ -5024,13 +5244,14 @@ mod tests {
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
         assert!(py.contains("ids: List[int]"), "missing List[int] param");
+        // The list packs into a value buffer passed as a (ptr, len) pair.
         assert!(
-            py.contains("(ctypes.c_int32 * len(ids))(*ids)"),
-            "missing list-to-array conversion"
+            py.contains("_ids_w.write_len(len(ids))"),
+            "missing list length write"
         );
         assert!(
-            py.contains("ctypes.POINTER(ctypes.c_int32)"),
-            "missing POINTER for list param"
+            py.contains("_ids_w.write_i32(_e0)"),
+            "missing list element write"
         );
         assert!(py.contains("ctypes.c_size_t"), "missing size_t for length");
 
@@ -5038,18 +5259,9 @@ mod tests {
             py.contains("-> List[str]:"),
             "missing List[str] return: {py}"
         );
-        // Each owned string element is copied and released, then the array
-        // buffer itself is released.
         assert!(
-            py.contains("_take_string(_result[_i]) for _i in range(_out_len.value)"),
-            "missing string list _take_string: {py}"
-        );
-        assert!(
-            py.contains(
-                "_lib.weaveffi_free_bytes(_result, \
-                 ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))"
-            ),
-            "missing string list array free: {py}"
+            py.contains("[_r.read_string() for _i0 in range(_r.read_len())]"),
+            "missing string list decode: {py}"
         );
 
         assert!(
@@ -5057,8 +5269,8 @@ mod tests {
             "missing List struct return"
         );
         assert!(
-            py.contains("Item(_result[_i]) for _i in range(_out_len.value)"),
-            "missing struct wrapping in list"
+            py.contains("[_read_Item(_r) for _i0 in range(_r.read_len())]"),
+            "missing record list decode"
         );
     }
 
@@ -5113,63 +5325,45 @@ mod tests {
             py.contains("settings: Dict[str, int]"),
             "missing Dict param hint"
         );
+        // The map packs into a single value buffer: count, then alternating
+        // key and value.
         assert!(
-            py.contains("list(settings.keys())"),
-            "missing keys extraction"
+            py.contains("_settings_w.write_len(len(settings))"),
+            "missing map length write"
         );
         assert!(
-            py.contains("_settings_vals = [settings[_k] for _k in _settings_keys]"),
-            "missing values extraction"
+            py.contains("for _k0, _v0 in settings.items():"),
+            "missing entry loop"
         );
         assert!(
-            py.contains("ctypes.c_char_p * len(_settings_keys)"),
-            "missing key array creation"
+            py.contains("_settings_w.write_string(_k0)"),
+            "missing key write"
         );
         assert!(
-            py.contains("ctypes.c_int32 * len(_settings_vals)"),
-            "missing value array creation"
+            py.contains("_settings_w.write_i32(_v0)"),
+            "missing value write"
+        );
+        assert!(
+            py.contains("_fn(_settings_buf, len(_settings_buf), ctypes.byref(_err))"),
+            "missing buffered call args"
         );
 
         assert!(
             py.contains("-> Dict[str, int]:"),
             "missing Dict return hint"
         );
-        // Owned string keys stay raw `c_void_p` addresses so each one can be
-        // copied and released; `c_char_p` would lose the pointer.
-        assert!(
-            py.contains("_out_keys = ctypes.POINTER(ctypes.c_void_p)()"),
-            "missing out_keys init"
-        );
-        assert!(
-            py.contains("_out_values = ctypes.POINTER(ctypes.c_int32)()"),
-            "missing out_values init"
-        );
         assert!(
             py.contains("_out_len = ctypes.c_size_t(0)"),
             "missing out_len init"
         );
+        // The returned buffer is copied, freed, then decoded into a dict.
         assert!(
-            py.contains("if not _out_keys or not _out_values:"),
-            "missing empty map check"
+            py.contains("_data = _take_buffer(_result, _out_len.value)"),
+            "missing buffer take"
         );
         assert!(
-            py.contains("_take_string(_out_keys[_i]): _out_values[_i]"),
-            "missing map comprehension"
-        );
-        // Both parallel buffers are released after copying.
-        assert!(
-            py.contains(
-                "_lib.weaveffi_free_bytes(_out_keys, \
-                 ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_void_p)))"
-            ),
-            "missing map key buffer free"
-        );
-        assert!(
-            py.contains(
-                "_lib.weaveffi_free_bytes(_out_values, \
-                 ctypes.c_size_t(_out_len.value * ctypes.sizeof(ctypes.c_int32)))"
-            ),
-            "missing map value buffer free"
+            py.contains("dict((_r.read_string(), _r.read_i32()) for _i0 in range(_r.read_len()))"),
+            "missing map decode"
         );
     }
 
@@ -5238,7 +5432,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             functions: vec![
                 Function {
@@ -5325,11 +5518,15 @@ mod tests {
         assert!(pyi.contains("    Other: int"));
 
         assert!(pyi.contains("class Contact:"));
-        assert!(pyi.contains("    def id(self) -> int: ..."));
-        assert!(pyi.contains("    def first_name(self) -> str: ..."));
-        assert!(pyi.contains("    def email(self) -> Optional[str]: ..."));
-        assert!(pyi.contains("    def tags(self) -> List[str]: ..."));
-        assert!(pyi.contains("    def scores(self) -> Dict[str, int]: ..."));
+        assert!(pyi.contains("    id: int"));
+        assert!(pyi.contains("    first_name: str"));
+        assert!(pyi.contains("    email: Optional[str]"));
+        assert!(pyi.contains("    tags: List[str]"));
+        assert!(pyi.contains("    scores: Dict[str, int]"));
+        assert!(pyi.contains(
+            "    def __init__(self, id: int, first_name: str, email: Optional[str], \
+             tags: List[str], scores: Dict[str, int]) -> None: ..."
+        ));
 
         assert!(pyi.contains("def create_contact(name: str, email: Optional[str]) -> int: ..."));
         assert!(pyi.contains("def get_contact(id: int) -> \"Contact\": ..."));
@@ -5402,7 +5599,6 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             functions: vec![
                 Function {
@@ -5525,19 +5721,17 @@ mod tests {
         assert!(py.contains("Work = 1"));
         assert!(py.contains("Other = 2"));
 
-        assert!(py.contains("class Contact:"));
-        assert!(py.contains("weaveffi_contacts_Contact_destroy"));
-        assert!(py.contains("@property\n    def id(self) -> int:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_id"));
-        assert!(py.contains("@property\n    def first_name(self) -> str:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_first_name"));
-        assert!(py.contains("@property\n    def last_name(self) -> str:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_last_name"));
-        assert!(py.contains("@property\n    def email(self) -> Optional[str]:"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_email"));
-        assert!(py.contains("@property\n    def contact_type(self) -> \"ContactType\":"));
-        assert!(py.contains("weaveffi_contacts_Contact_get_contact_type"));
-        assert!(py.contains("return ContactType(_result)"));
+        assert!(py.contains("@dataclass\nclass Contact:"));
+        assert!(!py.contains("weaveffi_contacts_Contact_destroy"));
+        assert!(!py.contains("weaveffi_contacts_Contact_get_id"));
+        assert!(py.contains("    id: int"));
+        assert!(py.contains("    first_name: str"));
+        assert!(py.contains("    last_name: str"));
+        assert!(py.contains("    email: Optional[str]"));
+        assert!(py.contains("    contact_type: \"ContactType\""));
+        assert!(py.contains("def _pack_Contact("));
+        assert!(py.contains("def _unpack_Contact("));
+        assert!(py.contains("contact_type=ContactType(_r.read_i32()),"));
 
         assert!(py.contains("def create_contact("));
         assert!(py.contains("first_name: str"));
@@ -5551,11 +5745,11 @@ mod tests {
 
         assert!(py.contains("def get_contact(id: int) -> \"Contact\":"));
         assert!(py.contains("weaveffi_contacts_get_contact"));
-        assert!(py.contains("return Contact(_result)"));
+        assert!(py.contains("return _unpack_Contact(_data)"));
 
         assert!(py.contains("def list_contacts() -> List[\"Contact\"]:"));
         assert!(py.contains("weaveffi_contacts_list_contacts"));
-        assert!(py.contains("Contact(_result[_i]) for _i in range(_out_len.value)"));
+        assert!(py.contains("[_read_Contact(_r) for _i0 in range(_r.read_len())]"));
 
         assert!(py.contains("def delete_contact(id: int) -> bool:"));
         assert!(py.contains("weaveffi_contacts_delete_contact"));
@@ -5878,7 +6072,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -5964,7 +6157,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".into(),
@@ -6006,7 +6198,7 @@ mod tests {
     #[test]
     fn python_typed_handle_type() {
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "contacts".into(),
                 functions: vec![Function {
@@ -6034,7 +6226,6 @@ mod tests {
                         doc: None,
                         default: None,
                     }],
-                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -6047,13 +6238,18 @@ mod tests {
             package: None,
         };
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+        // A typed handle is an opaque token: hinted as int, passed raw.
         assert!(
-            py.contains("contact: \"Contact\""),
-            "TypedHandle should use class type not int: {py}"
+            py.contains("def get_info(contact: int) -> None:"),
+            "TypedHandle should hint as int: {py}"
         );
         assert!(
-            py.contains("contact._ptr"),
-            "TypedHandle call arg should extract ._ptr: {py}"
+            !py.contains("contact._ptr"),
+            "TypedHandle call arg must pass the raw value: {py}"
+        );
+        assert!(
+            py.contains("_fn(contact, ctypes.byref(_err))"),
+            "TypedHandle should pass through unchanged: {py}"
         );
         assert!(
             py.contains("ctypes.c_void_p"),
@@ -6090,7 +6286,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6126,17 +6321,23 @@ mod tests {
             .map(|i| i + 1)
             .unwrap_or(rest.len());
         let body = &rest[..end_offset];
+        // The error check runs before the returned buffer is touched, so a
+        // trap never leaves a dangling decode.
         let err_pos = body
             .find("_check_error(_err)")
             .expect("_check_error should appear in find_contact");
+        let take_pos = body
+            .find("_data = _take_buffer(_result, _out_len.value)")
+            .expect("buffer take should appear in find_contact");
         let contact_pos = body
-            .find("return Contact(_result)")
-            .expect("return Contact(_result) should appear in find_contact");
+            .find("return _unpack_Contact(_data)")
+            .expect("return _unpack_Contact(_data) should appear in find_contact");
         assert!(
-            err_pos < contact_pos,
-            "_check_error(_err) should precede return Contact(_result): {body}"
+            err_pos < take_pos && take_pos < contact_pos,
+            "_check_error(_err) should precede the buffer take and decode: {body}"
         );
 
+        // Records are value types now: no destructor exists to double-free.
         let class_start = py
             .find("class Contact:")
             .expect("Contact class should be defined");
@@ -6148,12 +6349,12 @@ mod tests {
             .unwrap_or(after_class.len());
         let contact_class = &after_class[..class_end];
         assert!(
-            contact_class.contains("def __del__(self)"),
-            "Contact should define __del__: {contact_class}"
+            !contact_class.contains("def __del__(self)"),
+            "Contact must not define __del__: {contact_class}"
         );
         assert!(
-            contact_class.contains("_destroy"),
-            "Contact.__del__ should call _destroy: {contact_class}"
+            !contact_class.contains("_destroy"),
+            "Contact must not reference a destroy symbol: {contact_class}"
         );
     }
 
@@ -6188,7 +6389,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -6200,19 +6400,18 @@ mod tests {
 
         let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
+        // An optional record is buffered: the None case rides the option
+        // flag inside the value buffer rather than a null pointer check.
         assert!(
-            py.contains("if _result is None:\n        return None"),
-            "optional struct return should null-check before wrap: {py}"
+            py.contains("_data = _take_buffer(_result, _out_len.value)"),
+            "optional struct return should take the buffer: {py}"
         );
-        let none_check = py
-            .find("if _result is None:\n        return None")
-            .expect("null-check block");
-        let wrap = py
-            .find("return Contact(_result)")
-            .expect("Contact(_result) wrap");
         assert!(
-            wrap > none_check,
-            "Contact(_result) should appear after null check: {py}"
+            py.contains(
+                "return _decode_buffer(_data, \
+                 lambda _r: (_read_Contact(_r) if _r.read_option_flag() else None))"
+            ),
+            "optional struct return should decode through the flag: {py}"
         );
     }
 
@@ -6484,7 +6683,6 @@ mod tests {
                         doc: None,
                         default: None,
                     }],
-                    builder: false,
                 }],
                 enums: vec![],
                 callbacks: vec![],
@@ -6525,8 +6723,8 @@ mod tests {
         let stubs = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
 
         assert!(
-            code.contains("Name(_result)"),
-            "cross-module return should construct Name, not types.Name: {code}"
+            code.contains("return _unpack_Name(_data)"),
+            "cross-module return should decode via _unpack_Name: {code}"
         );
         assert!(
             !code.contains("types.Name"),
@@ -6777,7 +6975,6 @@ mod tests {
                     doc: Some("Stable id".into()),
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Kind".into(),
@@ -6819,7 +7016,8 @@ mod tests {
     #[test]
     fn python_emits_doc_on_field() {
         let py = render_python_module(&doc_api(), true, "weaveffi", "weaveffi.yml");
-        assert!(py.contains("\"\"\"Stable id\"\"\""), "{py}");
+        // Field docs surface as a comment above the dataclass field.
+        assert!(py.contains("# Stable id"), "{py}");
     }
 
     #[test]
@@ -6943,12 +7141,14 @@ mod tests {
                         code: 1,
                         message: "key not found".into(),
                         doc: Some("Raised when the key is absent.".into()),
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "IO_FAILURE".into(),
                         code: 2,
                         message: "io failure".into(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -7036,9 +7236,10 @@ mod tests {
             !py.contains("run_in_executor"),
             "executor-based async must be gone: {py}"
         );
-        // A throwing async member maps errors through the domain factory.
+        // A throwing async member maps errors through the domain factory,
+        // handing over the copied payload buffer.
         assert!(
-            py.contains("_state[\"err\"] = _kv_error_from(_code, _msg)"),
+            py.contains("_state[\"err\"] = _kv_error_from(_code, _msg, _payload)"),
             "throwing async member should build domain errors: {py}"
         );
 
@@ -7113,7 +7314,10 @@ mod tests {
             "missing code table entry: {py}"
         );
         assert!(
-            py.contains("def _kv_error_from(code: int, message: str) -> WeaveFFIError:"),
+            py.contains(
+                "def _kv_error_from(code: int, message: str, payload: bytes = b\"\") \
+                 -> WeaveFFIError:"
+            ),
             "missing factory: {py}"
         );
         assert!(
@@ -7121,7 +7325,7 @@ mod tests {
             "missing domain checker: {py}"
         );
         assert!(
-            py.contains("raise _kv_error_from(code, message)"),
+            py.contains("raise _kv_error_from(code, message, payload)"),
             "checker should raise through the factory: {py}"
         );
     }
@@ -7419,6 +7623,797 @@ mod tests {
         assert!(
             pyi.contains("def version() -> str: ..."),
             "stub should declare statics: {pyi}"
+        );
+    }
+
+    #[test]
+    fn preamble_includes_buffer_runtime() {
+        let api = make_api(vec![simple_module(vec![Function {
+            name: "noop".into(),
+            params: vec![],
+            returns: None,
+            doc: None,
+            throws: false,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+            since: None,
+        }])]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+        // The wire-format codec runtime ships in every generated module.
+        assert!(py.contains("import struct"), "missing struct import: {py}");
+        assert!(
+            py.contains("class _BufferWriter:"),
+            "missing buffer writer: {py}"
+        );
+        assert!(
+            py.contains("class _BufferReader:"),
+            "missing buffer reader: {py}"
+        );
+        assert!(
+            py.contains("def _decode_buffer(data: bytes, read_fn):"),
+            "missing decode helper: {py}"
+        );
+        assert!(
+            py.contains("def _take_buffer(ptr, length) -> bytes:"),
+            "missing take helper: {py}"
+        );
+        // Little-endian packed encodings.
+        assert!(
+            py.contains("struct.pack(\"<i\", v)"),
+            "missing little-endian i32 pack: {py}"
+        );
+        // Malformed-buffer rejection paths.
+        assert!(
+            py.contains("malformed value buffer: truncated"),
+            "missing truncation rejection: {py}"
+        );
+        assert!(
+            py.contains("malformed value buffer: trailing bytes"),
+            "missing trailing-bytes rejection: {py}"
+        );
+        assert!(
+            py.contains("length prefix exceeds remaining bytes"),
+            "missing length-prefix rejection: {py}"
+        );
+        // The error struct carries the structured payload slots.
+        assert!(
+            py.contains("(\"payload_ptr\", ctypes.c_void_p),"),
+            "missing payload_ptr field: {py}"
+        );
+        assert!(
+            py.contains("(\"payload_len\", ctypes.c_size_t),"),
+            "missing payload_len field: {py}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_sum_type() {
+        let api = make_api(vec![Module {
+            name: "shapes".into(),
+            functions: vec![Function {
+                name: "area".into(),
+                params: vec![Param {
+                    name: "shape".into(),
+                    ty: TypeRef::RichEnum("Shape".into()),
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::F64),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![EnumDef {
+                name: "Shape".into(),
+                doc: Some("A closed figure.".into()),
+                variants: vec![
+                    EnumVariant {
+                        name: "Circle".into(),
+                        value: 0,
+                        doc: None,
+                        fields: vec![StructField {
+                            name: "radius".into(),
+                            ty: TypeRef::F64,
+                            doc: None,
+                            default: None,
+                        }],
+                    },
+                    EnumVariant {
+                        name: "Rect".into(),
+                        value: 1,
+                        doc: None,
+                        fields: vec![
+                            StructField {
+                                name: "width".into(),
+                                ty: TypeRef::F64,
+                                doc: None,
+                                default: None,
+                            },
+                            StructField {
+                                name: "height".into(),
+                                ty: TypeRef::F64,
+                                doc: None,
+                                default: None,
+                            },
+                        ],
+                    },
+                ],
+            }],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        // Base class with the nested Tag discriminant and a tag property.
+        assert!(py.contains("class Shape:"), "missing base class: {py}");
+        assert!(
+            py.contains("class Tag(IntEnum):"),
+            "missing nested Tag enum: {py}"
+        );
+        assert!(py.contains("Circle = 0"), "missing tag value: {py}");
+        assert!(
+            py.contains("def tag(self) -> \"Shape.Tag\":"),
+            "missing tag property: {py}"
+        );
+
+        // One dataclass subclass per variant, with scoped aliases.
+        assert!(
+            py.contains("@dataclass\nclass ShapeCircle(Shape):"),
+            "missing Circle variant dataclass: {py}"
+        );
+        assert!(
+            py.contains("TAG = Shape.Tag.Circle"),
+            "missing Circle TAG: {py}"
+        );
+        assert!(py.contains("radius: float"), "missing Circle field: {py}");
+        assert!(
+            py.contains("@dataclass\nclass ShapeRect(Shape):"),
+            "missing Rect variant dataclass: {py}"
+        );
+        assert!(
+            py.contains("Shape.Circle = ShapeCircle"),
+            "missing scoped alias: {py}"
+        );
+
+        // No FFI symbols exist for rich enums.
+        assert!(
+            !py.contains("Shape_new_")
+                && !py.contains("Shape_tag")
+                && !py.contains("Shape_destroy"),
+            "rich enums must not call C symbols: {py}"
+        );
+
+        // The codec dispatches on isinstance and the i32 wire tag.
+        assert!(
+            py.contains("def _write_Shape(_w: _BufferWriter, value: \"Shape\") -> None:"),
+            "missing writer: {py}"
+        );
+        assert!(
+            py.contains("if isinstance(value, ShapeCircle):"),
+            "missing isinstance dispatch: {py}"
+        );
+        assert!(
+            py.contains("_w.write_f64(value.radius)"),
+            "missing variant field write: {py}"
+        );
+        assert!(
+            py.contains("def _read_Shape(_r: _BufferReader) -> \"Shape\":"),
+            "missing reader: {py}"
+        );
+        assert!(
+            py.contains("_tag = _r.read_i32()"),
+            "missing tag read: {py}"
+        );
+        assert!(
+            py.contains("radius=_r.read_f64(),"),
+            "missing variant field read: {py}"
+        );
+        assert!(
+            py.contains("unknown Shape tag"),
+            "missing unknown-tag rejection: {py}"
+        );
+
+        // The rich enum parameter packs like any buffered value.
+        assert!(
+            py.contains("_shape_buf = _pack_Shape(shape)"),
+            "missing param pack: {py}"
+        );
+        assert!(
+            py.contains("_fn(_shape_buf, len(_shape_buf), ctypes.byref(_err))"),
+            "missing buffered call args: {py}"
+        );
+    }
+
+    #[test]
+    fn error_payload_decoding() {
+        use weaveffi_ir::ir::{ErrorCode, ErrorDomain};
+        let api = make_api(vec![Module {
+            name: "kv".into(),
+            functions: vec![Function {
+                name: "get".into(),
+                params: vec![Param {
+                    name: "key".into(),
+                    ty: TypeRef::StringUtf8,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::StringUtf8),
+                doc: None,
+                throws: true,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KEY_NOT_FOUND".into(),
+                        code: 1,
+                        message: "key not found".into(),
+                        doc: None,
+                        fields: vec![
+                            StructField {
+                                name: "key".into(),
+                                ty: TypeRef::StringUtf8,
+                                doc: None,
+                                default: None,
+                            },
+                            StructField {
+                                name: "attempts".into(),
+                                ty: TypeRef::I32,
+                                doc: None,
+                                default: None,
+                            },
+                        ],
+                    },
+                    ErrorCode {
+                        name: "IO_FAILURE".into(),
+                        code: 2,
+                        message: "io failure".into(),
+                        doc: None,
+                        fields: vec![],
+                    },
+                ],
+            }),
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        // The payload decoder reads the code's fields in declaration order
+        // and attaches them as exception attributes.
+        assert!(
+            py.contains(
+                "def _kv_error_payload_key_not_found(_exc: WeaveFFIError, \
+                 _r: _BufferReader) -> None:"
+            ),
+            "missing payload decoder: {py}"
+        );
+        assert!(
+            py.contains("_exc.key = _r.read_string()"),
+            "missing key attribute decode: {py}"
+        );
+        assert!(
+            py.contains("_exc.attempts = _r.read_i32()"),
+            "missing attempts attribute decode: {py}"
+        );
+        // Only codes with fields enter the payload table.
+        assert!(
+            py.contains("_KV_ERROR_PAYLOADS: Dict[int, Callable] = {"),
+            "missing payload table: {py}"
+        );
+        assert!(
+            py.contains("1: _kv_error_payload_key_not_found,"),
+            "missing payload table entry: {py}"
+        );
+        assert!(
+            !py.contains("_kv_error_payload_io_failure"),
+            "field-less code must not get a decoder: {py}"
+        );
+        // The factory decodes the payload; the checker copies it before
+        // weaveffi_error_clear frees it.
+        assert!(
+            py.contains("_decoder = _KV_ERROR_PAYLOADS.get(code)"),
+            "factory should look up the decoder: {py}"
+        );
+        assert!(
+            py.contains(
+                "payload = ctypes.string_at(err.payload_ptr, err.payload_len) \
+                 if err.payload_ptr else b\"\""
+            ),
+            "checker should copy the payload before clearing: {py}"
+        );
+        assert!(
+            py.contains("raise _kv_error_from(code, message, payload)"),
+            "checker should raise through the factory with the payload: {py}"
+        );
+        // The stub declares the payload attributes on the code class.
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
+        assert!(
+            pyi.contains("class KeyNotFound(KvError):"),
+            "stub should declare the code class: {pyi}"
+        );
+        assert!(
+            pyi.contains("    key: str\n") && pyi.contains("    attempts: int\n"),
+            "stub should declare payload attributes: {pyi}"
+        );
+    }
+
+    #[test]
+    fn listener_buffered_record_param_decodes() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Event".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "kind".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnEvent".into(),
+                params: vec![Param {
+                    name: "event".into(),
+                    ty: TypeRef::Record("Event".into()),
+                    mutable: false,
+                    doc: None,
+                }],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "event_feed".into(),
+                event_callback: "OnEvent".into(),
+                doc: None,
+            }],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        // The borrowed (ptr, len) pair is copied and decoded before the
+        // user callable runs; nothing is freed on the consumer side.
+        assert!(
+            py.contains(
+                "_unpack_Event(ctypes.string_at(event_ptr, event_len) \
+                 if event_ptr else b\"\")"
+            ),
+            "listener trampoline should decode the borrowed record: {py}"
+        );
+        assert!(
+            py.contains("ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t"),
+            "trampoline CFUNCTYPE should carry the (ptr, len) slots: {py}"
+        );
+    }
+
+    #[test]
+    fn async_function_returns_buffered_record() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "fetch_contact".into(),
+                params: vec![Param {
+                    name: "id".into(),
+                    ty: TypeRef::I64,
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::Record("Contact".into())),
+                doc: None,
+                throws: false,
+                r#async: true,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        assert!(
+            py.contains("async def fetch_contact(id: int) -> \"Contact\":"),
+            "missing async wrapper: {py}"
+        );
+        // The borrowed result buffer is copied and decoded inside the
+        // completion trampoline; the producer frees it afterward.
+        assert!(
+            py.contains(
+                "_state[\"val\"] = _unpack_Contact(\
+                 ctypes.string_at(result_ptr, result_len) if result_ptr else b\"\")"
+            ),
+            "trampoline should decode the borrowed result buffer: {py}"
+        );
+        assert!(
+            !py.contains("weaveffi_free_bytes(result_ptr"),
+            "the consumer must not free the borrowed result: {py}"
+        );
+        // Decode failures surface through the future rather than escaping
+        // the C callback.
+        assert!(
+            py.contains("except Exception as _exc:"),
+            "decode errors should be trapped: {py}"
+        );
+        assert!(
+            py.contains("_state[\"err\"] = _exc"),
+            "trapped decode errors should resolve the future: {py}"
+        );
+    }
+
+    #[test]
+    fn iterator_buffered_record_elements() {
+        let api = make_api(vec![Module {
+            name: "contacts".into(),
+            functions: vec![Function {
+                name: "iter_contacts".into(),
+                params: vec![],
+                returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record(
+                    "Contact".into(),
+                )))),
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
+            }],
+            structs: vec![StructDef {
+                name: "Contact".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "name".into(),
+                    ty: TypeRef::StringUtf8,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        assert!(
+            py.contains("def iter_contacts() -> Iterator[\"Contact\"]:"),
+            "missing iterator wrapper: {py}"
+        );
+        // The `_next` signature carries the encoded item pointer plus its
+        // trailing out_len.
+        assert!(
+            py.contains(
+                "_next_fn.argtypes = [ctypes.c_void_p, \
+                 ctypes.POINTER(ctypes.c_void_p), \
+                 ctypes.POINTER(ctypes.c_size_t), \
+                 ctypes.POINTER(_WeaveFFIErrorStruct)]"
+            ),
+            "next should take out_item and out_len: {py}"
+        );
+        // Each element is copied, freed with weaveffi_free_bytes (via
+        // _take_buffer), then decoded.
+        assert!(
+            py.contains("return _unpack_Contact(_take_buffer(_out_item.value, _out_len.value))"),
+            "element should be taken then decoded: {py}"
+        );
+    }
+
+    #[test]
+    fn struct_field_defaults_become_dataclass_defaults() {
+        let api = make_api(vec![Module {
+            name: "inventory".into(),
+            functions: vec![],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    },
+                    StructField {
+                        name: "quantity".into(),
+                        ty: TypeRef::U32,
+                        doc: None,
+                        default: Some(serde_yaml::Value::Number(0.into())),
+                    },
+                    StructField {
+                        name: "active".into(),
+                        ty: TypeRef::Bool,
+                        doc: None,
+                        default: Some(serde_yaml::Value::Bool(true)),
+                    },
+                    StructField {
+                        name: "weight".into(),
+                        ty: TypeRef::F64,
+                        doc: None,
+                        default: Some(serde_yaml::Value::Number(1.5.into())),
+                    },
+                ],
+            }],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            interfaces: vec![],
+            errors: None,
+            modules: vec![],
+        }]);
+        let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
+
+        // The trailing defaulted run surfaces as dataclass defaults; the
+        // required leading field stays bare.
+        assert!(py.contains("name: str\n"), "missing required field: {py}");
+        assert!(
+            py.contains("quantity: int = 0"),
+            "missing int default: {py}"
+        );
+        assert!(
+            py.contains("active: bool = True"),
+            "missing bool default: {py}"
+        );
+        assert!(
+            py.contains("weight: float = 1.5"),
+            "missing float default: {py}"
+        );
+
+        // The stub marks defaulted constructor parameters with `= ...`.
+        let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
+        assert!(
+            pyi.contains(
+                "def __init__(self, name: str, quantity: int = ..., \
+                 active: bool = ..., weight: float = ...) -> None: ..."
+            ),
+            "stub should mark defaults: {pyi}"
+        );
+    }
+
+    /// A kitchen-sink API touching every buffered surface at once (record and
+    /// rich enum params and returns, nested optional/list/map fields, error
+    /// payloads, a buffered listener, an async buffered method, and a record
+    /// iterator) generates a complete package without panicking.
+    #[test]
+    fn kitchen_sink_api_generates() {
+        use weaveffi_ir::ir::{CallbackDef, ErrorCode, ErrorDomain, InterfaceDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "kitchen".into(),
+            functions: vec![
+                Function {
+                    name: "save".into(),
+                    params: vec![
+                        Param {
+                            name: "item".into(),
+                            ty: TypeRef::Record("Item".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "shape".into(),
+                            ty: TypeRef::RichEnum("Shape".into()),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "tags".into(),
+                            ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "scores".into(),
+                            ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+                            mutable: false,
+                            doc: None,
+                        },
+                        Param {
+                            name: "note".into(),
+                            ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
+                            mutable: false,
+                            doc: None,
+                        },
+                    ],
+                    returns: Some(TypeRef::Record("Item".into())),
+                    doc: None,
+                    throws: true,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "fetch".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::RichEnum("Shape".into())),
+                    doc: None,
+                    throws: false,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+                Function {
+                    name: "stream".into(),
+                    params: vec![],
+                    returns: Some(TypeRef::Iterator(Box::new(TypeRef::Record("Item".into())))),
+                    doc: None,
+                    throws: false,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                },
+            ],
+            structs: vec![StructDef {
+                name: "Item".into(),
+                doc: None,
+                fields: vec![
+                    StructField {
+                        name: "name".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    },
+                    StructField {
+                        name: "quantity".into(),
+                        ty: TypeRef::U32,
+                        doc: None,
+                        default: Some(serde_yaml::Value::Number(0.into())),
+                    },
+                    StructField {
+                        name: "data".into(),
+                        ty: TypeRef::Bytes,
+                        doc: None,
+                        default: None,
+                    },
+                    StructField {
+                        name: "nested".into(),
+                        ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Map(
+                            Box::new(TypeRef::StringUtf8),
+                            Box::new(TypeRef::F64),
+                        ))))),
+                        doc: None,
+                        default: None,
+                    },
+                ],
+            }],
+            enums: vec![EnumDef {
+                name: "Shape".into(),
+                doc: None,
+                variants: vec![
+                    EnumVariant {
+                        name: "Dot".into(),
+                        value: 0,
+                        doc: None,
+                        fields: vec![],
+                    },
+                    EnumVariant {
+                        name: "Circle".into(),
+                        value: 1,
+                        doc: None,
+                        fields: vec![StructField {
+                            name: "radius".into(),
+                            ty: TypeRef::F64,
+                            doc: None,
+                            default: None,
+                        }],
+                    },
+                ],
+            }],
+            callbacks: vec![CallbackDef {
+                name: "OnItem".into(),
+                params: vec![Param {
+                    name: "item".into(),
+                    ty: TypeRef::Record("Item".into()),
+                    mutable: false,
+                    doc: None,
+                }],
+                doc: None,
+            }],
+            listeners: vec![ListenerDef {
+                name: "item_feed".into(),
+                event_callback: "OnItem".into(),
+                doc: None,
+            }],
+            interfaces: vec![InterfaceDef {
+                name: "Store".into(),
+                doc: None,
+                constructors: vec![Function {
+                    name: "new".into(),
+                    params: vec![],
+                    returns: None,
+                    doc: None,
+                    throws: true,
+                    r#async: false,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                methods: vec![Function {
+                    name: "put".into(),
+                    params: vec![Param {
+                        name: "item".into(),
+                        ty: TypeRef::Record("Item".into()),
+                        mutable: false,
+                        doc: None,
+                    }],
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Record("Item".into())))),
+                    doc: None,
+                    throws: true,
+                    r#async: true,
+                    cancellable: false,
+                    deprecated: None,
+                    since: None,
+                }],
+                statics: vec![],
+            }],
+            errors: Some(ErrorDomain {
+                name: "KitchenError".into(),
+                codes: vec![ErrorCode {
+                    name: "BAD_ITEM".into(),
+                    code: 1,
+                    message: "bad item".into(),
+                    doc: None,
+                    fields: vec![StructField {
+                        name: "reason".into(),
+                        ty: TypeRef::StringUtf8,
+                        doc: None,
+                        default: None,
+                    }],
+                }],
+            }),
+            modules: vec![],
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let out = Utf8Path::from_path(dir.path()).unwrap();
+        PythonGenerator
+            .generate(&api, out, &PythonConfig::default())
+            .unwrap();
+        let py = std::fs::read_to_string(out.join("python/weaveffi/weaveffi.py")).unwrap();
+        assert!(py.contains("def _pack_Item("), "missing Item codec: {py}");
+        assert!(py.contains("def _read_Shape("), "missing Shape codec: {py}");
+        assert!(
+            py.contains("_kitchen_error_payload_bad_item"),
+            "missing payload decoder: {py}"
+        );
+        assert!(
+            std::fs::metadata(out.join("python/weaveffi/weaveffi.pyi")).is_ok(),
+            "missing stub file"
         );
     }
 }

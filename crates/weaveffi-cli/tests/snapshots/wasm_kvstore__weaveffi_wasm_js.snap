@@ -9,12 +9,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Handles   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
-//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
+//   Buffered  -> records, rich enums, optionals, lists, and maps cross
+//                as one value buffer: i32 pointer + i32 length
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
  * thrown directly for unknown codes, marshalling failures, and producer
@@ -75,10 +76,10 @@ const _KV_ERROR_CODES = Object.freeze({
 
 // Build the KvError subclass matching `code`, or a generic
 // WeaveFFIError for codes outside the domain (panics, marshalling).
-function _kvErrorFrom(code, message) {
+function _kvErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
   const _cls = _KV_ERROR_CODES[code];
-  if (!_cls) return new WeaveFFIError(code, message);
-  return message ? new _cls(message) : new _cls();
+  const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
+  return _e;
 }
 
 const _enc = new TextEncoder();
@@ -112,7 +113,8 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Stage a byte buffer; returns [ptr, len]; release with _free(ptr, len).
+// Stage a byte buffer (or an encoded value buffer); returns [ptr, len];
+// release with weaveffi_dealloc(ptr, len).
 function _bytes(wasm, data) {
   const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
   const ptr = wasm.weaveffi_alloc(u8.length);
@@ -120,7 +122,7 @@ function _bytes(wasm, data) {
   return [ptr, u8.length];
 }
 
-// Copy then free a producer-owned byte buffer.
+// Copy then free a producer-owned byte (or value) buffer.
 function _takeBytes(wasm, ptr, len) {
   if (ptr === 0 || len === 0) return new Uint8Array(0);
   const copy = new Uint8Array(wasm.memory.buffer, ptr, len).slice();
@@ -128,23 +130,125 @@ function _takeBytes(wasm, ptr, len) {
   return copy;
 }
 
-// Decode an array of `len` C strings at `base`, freeing each string
-// after copying (the consumer owns the elements); the caller releases
-// the array container separately.
-function _takeStrArray(wasm, base, len) {
-  const out = [];
-  if (base === 0) return out;
-  const dv = new DataView(wasm.memory.buffer);
-  const ptrs = [];
-  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));
-  for (const p of ptrs) out.push(_takeCStr(wasm, p));
-  return out;
+// Growable little-endian byte writer implementing the WeaveFFI value-buffer
+// wire format: values are packed back to back with no alignment; lengths and
+// counts are u32; strings are u32 byte length + UTF-8 bytes (no NUL).
+class _BufWriter {
+  constructor() {
+    this._u8 = new Uint8Array(64);
+    this._dv = new DataView(this._u8.buffer);
+    this._len = 0;
+  }
+  _need(n) {
+    if (this._len + n <= this._u8.length) return;
+    let cap = this._u8.length * 2;
+    while (cap < this._len + n) cap *= 2;
+    const u8 = new Uint8Array(cap);
+    u8.set(this._u8.subarray(0, this._len));
+    this._u8 = u8;
+    this._dv = new DataView(u8.buffer);
+  }
+  bool(v) { this._need(1); this._dv.setUint8(this._len, v ? 1 : 0); this._len += 1; }
+  i8(v) { this._need(1); this._dv.setInt8(this._len, v); this._len += 1; }
+  u8(v) { this._need(1); this._dv.setUint8(this._len, v); this._len += 1; }
+  i16(v) { this._need(2); this._dv.setInt16(this._len, v, true); this._len += 2; }
+  u16(v) { this._need(2); this._dv.setUint16(this._len, v, true); this._len += 2; }
+  i32(v) { this._need(4); this._dv.setInt32(this._len, v, true); this._len += 4; }
+  u32(v) { this._need(4); this._dv.setUint32(this._len, v, true); this._len += 4; }
+  i64(v) { this._need(8); this._dv.setBigInt64(this._len, BigInt(v), true); this._len += 8; }
+  u64(v) { this._need(8); this._dv.setBigUint64(this._len, BigInt(v), true); this._len += 8; }
+  f32(v) { this._need(4); this._dv.setFloat32(this._len, v, true); this._len += 4; }
+  f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }
+  len(n) { this.u32(n); }
+  flag(present) { this.u8(present ? 1 : 0); }
+  str(v) {
+    const b = _enc.encode(v);
+    this.len(b.length);
+    this._need(b.length);
+    this._u8.set(b, this._len);
+    this._len += b.length;
+  }
+  bytes(v) {
+    const b = v instanceof Uint8Array ? v : new Uint8Array(v);
+    this.len(b.length);
+    this._need(b.length);
+    this._u8.set(b, this._len);
+    this._len += b.length;
+  }
+  finish() { return this._u8.subarray(0, this._len); }
 }
 
-// Allocate a zeroed {i32 code, i32 message} error slot.
+const _bufDec = new TextDecoder('utf-8', { fatal: true });
+
+// Strict little-endian reader for the WeaveFFI value-buffer wire format. A
+// malformed buffer (truncation, invalid bool or flag bytes, an oversized
+// length prefix, invalid UTF-8, trailing bytes) is a producer/consumer
+// contract violation and throws the generic brand error; code -3 marks a
+// consumer-side marshalling failure.
+class _BufReader {
+  constructor(bytes) {
+    this._u8 = bytes;
+    this._dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    this._pos = 0;
+  }
+  _bad(what) {
+    throw new WeaveFFIError(-3, 'malformed value buffer: ' + what);
+  }
+  _take(n, what) {
+    if (this._pos + n > this._u8.length) this._bad('truncated ' + what);
+    const at = this._pos;
+    this._pos += n;
+    return at;
+  }
+  bool() {
+    const b = this._u8[this._take(1, 'bool')];
+    if (b > 1) this._bad('bool byte out of range');
+    return b === 1;
+  }
+  i8() { return this._dv.getInt8(this._take(1, 'i8')); }
+  u8() { return this._u8[this._take(1, 'u8')]; }
+  i16() { return this._dv.getInt16(this._take(2, 'i16'), true); }
+  u16() { return this._dv.getUint16(this._take(2, 'u16'), true); }
+  i32() { return this._dv.getInt32(this._take(4, 'i32'), true); }
+  u32() { return this._dv.getUint32(this._take(4, 'u32'), true); }
+  i64() { return this._dv.getBigInt64(this._take(8, 'i64'), true); }
+  u64() { return this._dv.getBigUint64(this._take(8, 'u64'), true); }
+  f32() { return this._dv.getFloat32(this._take(4, 'f32'), true); }
+  f64() { return this._dv.getFloat64(this._take(8, 'f64'), true); }
+  len() {
+    const n = this.u32();
+    if (n > this._u8.length - this._pos) this._bad('length prefix exceeds remaining buffer');
+    return n;
+  }
+  flag() {
+    const b = this._u8[this._take(1, 'option flag')];
+    if (b > 1) this._bad('option flag byte out of range');
+    return b === 1;
+  }
+  str() {
+    const n = this.len();
+    const at = this._take(n, 'string bytes');
+    try {
+      return _bufDec.decode(this._u8.subarray(at, at + n));
+    } catch (e) {
+      this._bad('string is not valid UTF-8');
+    }
+  }
+  bytes() {
+    const n = this.len();
+    const at = this._take(n, 'byte buffer');
+    return this._u8.subarray(at, at + n).slice();
+  }
+  end() {
+    if (this._pos !== this._u8.length) this._bad('trailing bytes after value');
+  }
+}
+
+// Allocate a zeroed 16-byte error slot:
+// { i32 code, char* message, uint8_t* payload_ptr, size_t payload_len }.
 function _allocErr(wasm) {
-  const ptr = wasm.weaveffi_alloc(8);
-  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  const ptr = wasm.weaveffi_alloc(16);
+  new Uint8Array(wasm.memory.buffer, ptr, 16).fill(0);
   return ptr;
 }
 
@@ -159,14 +263,14 @@ function _checkErr(wasm, errPtr) {
     const msgPtr = dv.getUint32(errPtr + 4, true);
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
+    wasm.weaveffi_dealloc(errPtr, 16);
     throw new WeaveFFIError(code, msg);
   }
 }
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
-  wasm.weaveffi_dealloc(errPtr, 8);
+  wasm.weaveffi_dealloc(errPtr, 16);
 }
 
 // Throw the `KvError` domain error (and free the slot) if the error slot
@@ -175,26 +279,81 @@ function _checkKvError(wasm, errPtr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
-    const msgPtr = dv.getUint32(errPtr + 4, true);
-    const msg = _readCStr(wasm, msgPtr) || '';
+    const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+    const _e = _kvErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
-    throw _kvErrorFrom(code, msg);
+    wasm.weaveffi_dealloc(errPtr, 16);
+    throw _e;
   }
 }
 
 // Throw if a borrowed (producer-owned) error carries a non-zero
 // code. Used by async callbacks: the producer owns and frees the
 // error struct, so the slot is read but never deallocated here.
-// `mkErr` maps domain codes for throwing callables; without it the
-// generic WeaveFFIError is thrown.
+// `mkErr` maps domain codes (and decodes payload fields) for
+// throwing callables; without it the generic WeaveFFIError is thrown.
 function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code === 0) return;
-  const msgPtr = dv.getUint32(errPtr + 4, true);
-  const msg = _readCStr(wasm, msgPtr) || '';
-  throw mkErr ? mkErr(code, msg) : new WeaveFFIError(code, msg);
+  const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+  if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
+  throw new WeaveFFIError(code, msg);
+}
+
+// Serialize a `kv.Entry` record into the value-buffer wire format.
+function _write_kv_Entry(w, v) {
+  w.i64(v.id);
+  w.str(v.key);
+  w.bytes(v.value);
+  w.i64(v.created_at);
+  if (v.expires_at === null || v.expires_at === undefined) {
+    w.flag(false);
+  } else {
+    w.flag(true);
+    w.i64(v.expires_at);
+  }
+  const _a1 = v.tags || [];
+  w.len(_a1.length);
+  for (const _e1 of _a1) {
+    w.str(_e1);
+  }
+  const _s2 = v.metadata || {};
+  const _m2 = _s2 instanceof Map ? [..._s2.entries()] : Object.entries(_s2);
+  w.len(_m2.length);
+  for (const [_k2, _v2] of _m2) {
+    w.str(_k2);
+    w.str(_v2);
+  }
+}
+
+// Decode a `kv.Entry` record from the value-buffer wire format.
+function _read_kv_Entry(r) {
+  const v = {};
+  v.id = r.i64();
+  v.key = r.str();
+  v.value = r.bytes();
+  v.created_at = r.i64();
+  v.expires_at = (r.flag() ? r.i64() : null);
+  v.tags = (() => { const _n = r.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(r.str()); return _arr; })();
+  v.metadata = (() => { const _n = r.len(); const _obj = {}; for (let _i = 0; _i < _n; _i++) { const _k = r.str(); _obj[_k] = r.str(); } return _obj; })();
+  return v;
+}
+
+// Serialize a `kv_stats.Stats` record into the value-buffer wire format.
+function _write_kv_stats_Stats(w, v) {
+  w.i64(v.total_entries);
+  w.i64(v.total_bytes);
+  w.i64(v.expired_entries);
+}
+
+// Decode a `kv_stats.Stats` record from the value-buffer wire format.
+function _read_kv_stats_Stats(r) {
+  const v = {};
+  v.total_entries = r.i64();
+  v.total_bytes = r.i64();
+  v.expired_entries = r.i64();
+  return v;
 }
 
 // Lazy wrapper over a producer iterator handle, implementing the JS
@@ -207,22 +366,22 @@ function _checkErrRef(wasm, errPtr, mkErr) {
 // producer handle: JS has no finalization hook that is reliable across
 // every target this loader supports.
 class _WeaveFFIIterator {
-  constructor(wasm, handle, stride, callNext, destroy, check, decode) {
+  constructor(wasm, handle, slotSize, callNext, destroy, check, decode) {
     this._wasm = wasm;
     this._handle = handle;
-    this._stride = stride;
+    this._slotSize = slotSize;
     this._callNext = callNext;
     this._destroyFn = destroy;
     this._check = check;
     this._decode = decode;
-    this._slot = wasm.weaveffi_alloc(stride);
+    this._slot = wasm.weaveffi_alloc(slotSize);
   }
   // Destroy the handle and release the element slot exactly once.
   _close() {
     if (this._handle === 0) return;
     this._destroyFn(this._handle);
     this._handle = 0;
-    this._wasm.weaveffi_dealloc(this._slot, this._stride);
+    this._wasm.weaveffi_dealloc(this._slot, this._slotSize);
     this._slot = 0;
   }
   next() {
@@ -270,278 +429,6 @@ export const EntryKind = Object.freeze({
   Encrypted: 2,
 });
 
-class Entry {
-  constructor(wasm, handle) {
-    this._wasm = wasm;
-    this._handle = handle;
-  }
-  get id() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_Entry_get_id(this._handle);
-    return _r;
-  }
-  get key() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_Entry_get_key(this._handle);
-    return _takeCStr(wasm, _r);
-  }
-  get value() {
-    const wasm = this._wasm;
-    const _lp = wasm.weaveffi_alloc(4);
-    const _r = wasm.weaveffi_kv_Entry_get_value(this._handle, _lp);
-    const _dv = new DataView(wasm.memory.buffer);
-    const _len = _dv.getUint32(_lp, true);
-    wasm.weaveffi_dealloc(_lp, 4);
-    return _takeBytes(wasm, _r, _len);
-  }
-  get created_at() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_Entry_get_created_at(this._handle);
-    return _r;
-  }
-  get expires_at() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_Entry_get_expires_at(this._handle);
-    if (_r === 0) return null;
-    const _dv = new DataView(wasm.memory.buffer);
-    const _v = _dv.getBigInt64(_r, true);
-    wasm.weaveffi_free_bytes(_r, 8);
-    return _v;
-  }
-  get tags() {
-    const wasm = this._wasm;
-    const _lp = wasm.weaveffi_alloc(4);
-    const _r = wasm.weaveffi_kv_Entry_get_tags(this._handle, _lp);
-    const _dv = new DataView(wasm.memory.buffer);
-    const _len = _dv.getUint32(_lp, true);
-    wasm.weaveffi_dealloc(_lp, 4);
-    const _out = _takeStrArray(wasm, _r, _len);
-    if (_r !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_r, _len * 4);
-    return _out;
-  }
-  get metadata() {
-    const wasm = this._wasm;
-    const _kp = wasm.weaveffi_alloc(4);
-    const _vp = wasm.weaveffi_alloc(4);
-    const _lp = wasm.weaveffi_alloc(4);
-    wasm.weaveffi_kv_Entry_get_metadata(this._handle, _kp, _vp, _lp);
-    const _dv = new DataView(wasm.memory.buffer);
-    const _ka = _dv.getUint32(_kp, true);
-    const _va = _dv.getUint32(_vp, true);
-    const _len = _dv.getUint32(_lp, true);
-    wasm.weaveffi_dealloc(_kp, 4);
-    wasm.weaveffi_dealloc(_vp, 4);
-    wasm.weaveffi_dealloc(_lp, 4);
-    const _out_k = _takeStrArray(wasm, _ka, _len);
-    const _out_v = _takeStrArray(wasm, _va, _len);
-    const _out = {};
-    for (let i = 0; i < _len; i++) _out[_out_k[i]] = _out_v[i];
-    if (_ka !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_ka, _len * 4);
-    if (_va !== 0 && _len !== 0) wasm.weaveffi_free_bytes(_va, _len * 4);
-    return _out;
-  }
-  static create(wasm, id, key, value, created_at, expires_at, tags, metadata) {
-    const [a1_p, a1_s] = _cstr(wasm, key);
-    const [a2_p, a2_l] = _bytes(wasm, value);
-    let a4_p = 0;
-    if (expires_at !== null && expires_at !== undefined) {
-      a4_p = wasm.weaveffi_alloc(8);
-      const a4_dv = new DataView(wasm.memory.buffer);
-      a4_dv.setBigInt64(a4_p, BigInt(expires_at), true);
-    }
-    const a5_arr = tags || [];
-    const a5_n = a5_arr.length;
-    const a5_base = wasm.weaveffi_alloc(a5_n ? a5_n * 4 : 1);
-    const a5_ep = [];
-    for (let i = 0; i < a5_n; i++) a5_ep.push(_cstr(wasm, a5_arr[i]));
-    {
-      const dv = new DataView(wasm.memory.buffer);
-      for (let i = 0; i < a5_n; i++) dv.setUint32(a5_base + i * 4, a5_ep[i][0], true);
-    }
-    const a6_m = metadata || {};
-    const a6_ks = (a6_m instanceof Map) ? [...a6_m.keys()] : Object.keys(a6_m);
-    const a6_vs = (a6_m instanceof Map) ? [...a6_m.values()] : Object.values(a6_m);
-    const a6_k_arr = a6_ks || [];
-    const a6_k_n = a6_k_arr.length;
-    const a6_k_base = wasm.weaveffi_alloc(a6_k_n ? a6_k_n * 4 : 1);
-    const a6_k_ep = [];
-    for (let i = 0; i < a6_k_n; i++) a6_k_ep.push(_cstr(wasm, a6_k_arr[i]));
-    {
-      const dv = new DataView(wasm.memory.buffer);
-      for (let i = 0; i < a6_k_n; i++) dv.setUint32(a6_k_base + i * 4, a6_k_ep[i][0], true);
-    }
-    const a6_v_arr = a6_vs || [];
-    const a6_v_n = a6_v_arr.length;
-    const a6_v_base = wasm.weaveffi_alloc(a6_v_n ? a6_v_n * 4 : 1);
-    const a6_v_ep = [];
-    for (let i = 0; i < a6_v_n; i++) a6_v_ep.push(_cstr(wasm, a6_v_arr[i]));
-    {
-      const dv = new DataView(wasm.memory.buffer);
-      for (let i = 0; i < a6_v_n; i++) dv.setUint32(a6_v_base + i * 4, a6_v_ep[i][0], true);
-    }
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_kv_Entry_create(BigInt(id), a1_p, a2_p, a2_l, BigInt(created_at), a4_p, a5_base, a5_n, a6_k_base, a6_v_base, a6_k_n, _err);
-    wasm.weaveffi_dealloc(a1_p, a1_s);
-    wasm.weaveffi_dealloc(a2_p, a2_l);
-    if (a4_p !== 0) wasm.weaveffi_dealloc(a4_p, 8);
-    for (const [ep, es] of a5_ep) wasm.weaveffi_dealloc(ep, es);
-    wasm.weaveffi_dealloc(a5_base, a5_n ? a5_n * 4 : 1);
-    for (const [ep, es] of a6_k_ep) wasm.weaveffi_dealloc(ep, es);
-    wasm.weaveffi_dealloc(a6_k_base, a6_k_n ? a6_k_n * 4 : 1);
-    for (const [ep, es] of a6_v_ep) wasm.weaveffi_dealloc(ep, es);
-    wasm.weaveffi_dealloc(a6_v_base, a6_v_n ? a6_v_n * 4 : 1);
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Entry(wasm, _r);
-  }
-  free() {
-    if (this._handle !== 0) {
-      this._wasm.weaveffi_kv_Entry_destroy(this._handle);
-      this._handle = 0;
-    }
-  }
-}
-
-class EntryBuilder {
-  constructor(wasm) {
-    this._wasm = wasm;
-    this._b = wasm.weaveffi_kv_Entry_Builder_new();
-  }
-  id(value) {
-    const wasm = this._wasm;
-    wasm.weaveffi_kv_Entry_Builder_set_id(this._b, BigInt(value));
-    return this;
-  }
-  key(value) {
-    const wasm = this._wasm;
-    const [a0_p, a0_s] = _cstr(wasm, value);
-    wasm.weaveffi_kv_Entry_Builder_set_key(this._b, a0_p);
-    wasm.weaveffi_dealloc(a0_p, a0_s);
-    return this;
-  }
-  value(value) {
-    const wasm = this._wasm;
-    const [a0_p, a0_l] = _bytes(wasm, value);
-    wasm.weaveffi_kv_Entry_Builder_set_value(this._b, a0_p, a0_l);
-    wasm.weaveffi_dealloc(a0_p, a0_l);
-    return this;
-  }
-  created_at(value) {
-    const wasm = this._wasm;
-    wasm.weaveffi_kv_Entry_Builder_set_created_at(this._b, BigInt(value));
-    return this;
-  }
-  expires_at(value) {
-    const wasm = this._wasm;
-    let a0_p = 0;
-    if (value !== null && value !== undefined) {
-      a0_p = wasm.weaveffi_alloc(8);
-      const a0_dv = new DataView(wasm.memory.buffer);
-      a0_dv.setBigInt64(a0_p, BigInt(value), true);
-    }
-    wasm.weaveffi_kv_Entry_Builder_set_expires_at(this._b, a0_p);
-    if (a0_p !== 0) wasm.weaveffi_dealloc(a0_p, 8);
-    return this;
-  }
-  tags(value) {
-    const wasm = this._wasm;
-    const a0_arr = value || [];
-    const a0_n = a0_arr.length;
-    const a0_base = wasm.weaveffi_alloc(a0_n ? a0_n * 4 : 1);
-    const a0_ep = [];
-    for (let i = 0; i < a0_n; i++) a0_ep.push(_cstr(wasm, a0_arr[i]));
-    {
-      const dv = new DataView(wasm.memory.buffer);
-      for (let i = 0; i < a0_n; i++) dv.setUint32(a0_base + i * 4, a0_ep[i][0], true);
-    }
-    wasm.weaveffi_kv_Entry_Builder_set_tags(this._b, a0_base, a0_n);
-    for (const [ep, es] of a0_ep) wasm.weaveffi_dealloc(ep, es);
-    wasm.weaveffi_dealloc(a0_base, a0_n ? a0_n * 4 : 1);
-    return this;
-  }
-  metadata(value) {
-    const wasm = this._wasm;
-    const a0_m = value || {};
-    const a0_ks = (a0_m instanceof Map) ? [...a0_m.keys()] : Object.keys(a0_m);
-    const a0_vs = (a0_m instanceof Map) ? [...a0_m.values()] : Object.values(a0_m);
-    const a0_k_arr = a0_ks || [];
-    const a0_k_n = a0_k_arr.length;
-    const a0_k_base = wasm.weaveffi_alloc(a0_k_n ? a0_k_n * 4 : 1);
-    const a0_k_ep = [];
-    for (let i = 0; i < a0_k_n; i++) a0_k_ep.push(_cstr(wasm, a0_k_arr[i]));
-    {
-      const dv = new DataView(wasm.memory.buffer);
-      for (let i = 0; i < a0_k_n; i++) dv.setUint32(a0_k_base + i * 4, a0_k_ep[i][0], true);
-    }
-    const a0_v_arr = a0_vs || [];
-    const a0_v_n = a0_v_arr.length;
-    const a0_v_base = wasm.weaveffi_alloc(a0_v_n ? a0_v_n * 4 : 1);
-    const a0_v_ep = [];
-    for (let i = 0; i < a0_v_n; i++) a0_v_ep.push(_cstr(wasm, a0_v_arr[i]));
-    {
-      const dv = new DataView(wasm.memory.buffer);
-      for (let i = 0; i < a0_v_n; i++) dv.setUint32(a0_v_base + i * 4, a0_v_ep[i][0], true);
-    }
-    wasm.weaveffi_kv_Entry_Builder_set_metadata(this._b, a0_k_base, a0_v_base, a0_k_n);
-    for (const [ep, es] of a0_k_ep) wasm.weaveffi_dealloc(ep, es);
-    wasm.weaveffi_dealloc(a0_k_base, a0_k_n ? a0_k_n * 4 : 1);
-    for (const [ep, es] of a0_v_ep) wasm.weaveffi_dealloc(ep, es);
-    wasm.weaveffi_dealloc(a0_v_base, a0_v_n ? a0_v_n * 4 : 1);
-    return this;
-  }
-  build() {
-    const wasm = this._wasm;
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_kv_Entry_Builder_build(this._b, _err);
-    wasm.weaveffi_kv_Entry_Builder_destroy(this._b);
-    this._b = 0;
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Entry(wasm, _r);
-  }
-  free() {
-    if (this._b !== 0) {
-      this._wasm.weaveffi_kv_Entry_Builder_destroy(this._b);
-      this._b = 0;
-    }
-  }
-}
-
-class Stats {
-  constructor(wasm, handle) {
-    this._wasm = wasm;
-    this._handle = handle;
-  }
-  get total_entries() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_stats_Stats_get_total_entries(this._handle);
-    return _r;
-  }
-  get total_bytes() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_stats_Stats_get_total_bytes(this._handle);
-    return _r;
-  }
-  get expired_entries() {
-    const wasm = this._wasm;
-    const _r = wasm.weaveffi_kv_stats_Stats_get_expired_entries(this._handle);
-    return _r;
-  }
-  static create(wasm, total_entries, total_bytes, expired_entries) {
-    const _err = _allocErr(wasm);
-    const _r = wasm.weaveffi_kv_stats_Stats_create(BigInt(total_entries), BigInt(total_bytes), BigInt(expired_entries), _err);
-    _checkErr(wasm, _err);
-    _freeErr(wasm, _err);
-    return new Stats(wasm, _r);
-  }
-  free() {
-    if (this._handle !== 0) {
-      this._wasm.weaveffi_kv_stats_Stats_destroy(this._handle);
-      this._handle = 0;
-    }
-  }
-}
-
 /**
  * Load a WeaveFFI Wasm module from the given URL.
  *
@@ -557,9 +444,8 @@ class Stats {
  * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct: returns a wrapper instance exposing field getters.
- * const person = api.contacts.create();
- * console.log(person.name);
+ * // Record: plain objects in and out (serialized automatically).
+ * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
@@ -634,29 +520,37 @@ export async function loadWeaveffiWasm(url) {
     put(key, value, kind, ttlSeconds) {
       const [a0_p, a0_s] = _cstr(wasm, key);
       const [a1_p, a1_l] = _bytes(wasm, value);
-      let a3_p = 0;
-      if (ttlSeconds !== null && ttlSeconds !== undefined) {
-        a3_p = wasm.weaveffi_alloc(8);
-        const a3_dv = new DataView(wasm.memory.buffer);
-        a3_dv.setBigInt64(a3_p, BigInt(ttlSeconds), true);
+      const a3_w = new _BufWriter();
+      if (ttlSeconds === null || ttlSeconds === undefined) {
+        a3_w.flag(false);
+      } else {
+        a3_w.flag(true);
+        a3_w.i64(ttlSeconds);
       }
+      const [a3_p, a3_l] = _bytes(wasm, a3_w.finish());
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_kv_Store_put(this._handle, a0_p, a1_p, a1_l, kind, a3_p, _err);
+      const _r = wasm.weaveffi_kv_Store_put(this._handle, a0_p, a1_p, a1_l, kind, a3_p, a3_l, _err);
       wasm.weaveffi_dealloc(a0_p, a0_s);
       wasm.weaveffi_dealloc(a1_p, a1_l);
-      if (a3_p !== 0) wasm.weaveffi_dealloc(a3_p, 8);
+      wasm.weaveffi_dealloc(a3_p, a3_l);
       _checkKvError(wasm, _err);
       _freeErr(wasm, _err);
       return _r !== 0;
     }
     get(key) {
       const [a0_p, a0_s] = _cstr(wasm, key);
+      const _lp = wasm.weaveffi_alloc(4);
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_kv_Store_get(this._handle, a0_p, _err);
+      const _r = wasm.weaveffi_kv_Store_get(this._handle, a0_p, _lp, _err);
       wasm.weaveffi_dealloc(a0_p, a0_s);
       _checkKvError(wasm, _err);
       _freeErr(wasm, _err);
-      return _r === 0 ? null : new Entry(wasm, _r);
+      const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
+      wasm.weaveffi_dealloc(_lp, 4);
+      const _rd = new _BufReader(_takeBytes(wasm, _r, _len));
+      const _out = (_rd.flag() ? _read_kv_Entry(_rd) : null);
+      _rd.end();
+      return _out;
     }
     delete(key) {
       const [a0_p, a0_s] = _cstr(wasm, key);
@@ -668,11 +562,17 @@ export async function loadWeaveffiWasm(url) {
       return _r !== 0;
     }
     listKeys(prefix) {
-      let a0_p = 0, a0_s = 0;
-      if (prefix !== null && prefix !== undefined) { [a0_p, a0_s] = _cstr(wasm, prefix); }
+      const a0_w = new _BufWriter();
+      if (prefix === null || prefix === undefined) {
+        a0_w.flag(false);
+      } else {
+        a0_w.flag(true);
+        a0_w.str(prefix);
+      }
+      const [a0_p, a0_l] = _bytes(wasm, a0_w.finish());
       const _err = _allocErr(wasm);
-      const _it = wasm.weaveffi_kv_Store_list_keys(this._handle, a0_p, _err);
-      if (a0_p !== 0) wasm.weaveffi_dealloc(a0_p, a0_s);
+      const _it = wasm.weaveffi_kv_Store_list_keys(this._handle, a0_p, a0_l, _err);
+      wasm.weaveffi_dealloc(a0_p, a0_l);
       _checkKvError(wasm, _err);
       _freeErr(wasm, _err);
       return new _WeaveFFIIterator(wasm, _it, 4,
@@ -738,20 +638,19 @@ export async function loadWeaveffiWasm(url) {
         wasm.weaveffi_kv_unregister_eviction_listener(_l.rid);
       },
       Store: Store,
-      Entry: {
-        create: (...args) => Entry.create(wasm, ...args),
-        builder: () => new EntryBuilder(wasm),
-      },
       stats: {
         getStats(store) {
+          const _lp = wasm.weaveffi_alloc(4);
           const _err = _allocErr(wasm);
-          const _r = wasm.weaveffi_kv_stats_get_stats(store._handle, _err);
+          const _r = wasm.weaveffi_kv_stats_get_stats(store._handle, _lp, _err);
           _checkKvError(wasm, _err);
           _freeErr(wasm, _err);
-          return new Stats(wasm, _r);
-        },
-        Stats: {
-          create: (...args) => Stats.create(wasm, ...args),
+          const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
+          wasm.weaveffi_dealloc(_lp, 4);
+          const _rd = new _BufReader(_takeBytes(wasm, _r, _len));
+          const _out = _read_kv_stats_Stats(_rd);
+          _rd.end();
+          return _out;
         },
       },
     },

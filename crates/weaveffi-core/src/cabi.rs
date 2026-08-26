@@ -9,14 +9,14 @@
 //! and listeners entirely. Routing both through one model-driven renderer makes
 //! that class of drift impossible.
 
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use crate::abi::AbiParam;
+use crate::abi::{AbiParam, CType};
 use crate::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use crate::codegen::CodeWriter;
 use crate::model::{
     AbiFn, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
-    StructBinding,
 };
 
 /// Emit a `/** ... */` doc comment at `indent`.
@@ -135,7 +135,16 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
     let _ = write!(
         out,
         "typedef uint64_t {prefix}_handle_t;\n\n\
-         typedef struct {prefix}_error {{ int32_t code; const char* message; }} {prefix}_error;\n\n\
+         /* Error slot written by every fallible call. `payload_ptr`/`payload_len`\n   \
+           hold the matched error code's fields serialized in the WeaveFFI value\n   \
+           buffer format (null when the code declares no fields); both the message\n   \
+           and the payload are released by {prefix}_error_clear. */\n\
+         typedef struct {prefix}_error {{\n    \
+           int32_t code;\n    \
+           const char* message;\n    \
+           const uint8_t* payload_ptr;\n    \
+           size_t payload_len;\n\
+         }} {prefix}_error;\n\n\
          {api} void {prefix}_error_clear({prefix}_error* err);\n\
          {api} void {prefix}_free_string(const char* ptr);\n\
          {api} void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
@@ -186,113 +195,12 @@ pub fn render_enum_decl(out: &mut String, e: &EnumBinding) {
     render_enum_constants(out, e, &e.c_tag);
 }
 
-/// Render the *discriminant* enum of a rich (algebraic) enum, named
-/// `{c_tag}_Tag`. The payload-carrying value itself is an opaque struct
-/// `{c_tag}` (forward-declared via [`render_module_type_tags`]); the tag getter
-/// returns one of these discriminant constants as `int32_t`.
+/// Render the *tag* enum of a rich (algebraic) enum, named `{c_tag}_Tag`.
+/// A rich enum value crosses the ABI serialized in a value buffer whose first
+/// field is an `int32_t` holding one of these discriminant constants.
 fn render_rich_enum_tag_decl(out: &mut String, e: &EnumBinding) {
     let tag_enum = format!("{}_Tag", e.c_tag);
     render_enum_constants(out, e, &tag_enum);
-}
-
-/// Render the function surface of a rich (algebraic) enum: the tag getter, each
-/// variant's constructor and field getters, then the destructor. Assumes the
-/// opaque object tag and every referenced type tag are already forward-declared.
-fn render_rich_enum_fn_decls(out: &mut String, e: &EnumBinding, prefix: &str) {
-    let Some(rich) = &e.rich else {
-        return;
-    };
-    let api = export_macro(prefix);
-    let tag = &e.c_tag;
-    emit_doc(out, &e.doc, "");
-    let _ = writeln!(out, "{api} int32_t {}(const {tag}* self);", rich.tag_symbol);
-    for v in &rich.variants {
-        emit_doc(out, &v.doc, "");
-        fn_decl(out, &v.create, prefix);
-        for field in &v.fields {
-            emit_doc(out, &field.doc, "");
-            let mut parts = vec![format!("const {tag}* self")];
-            parts.extend(
-                field
-                    .getter_out_params
-                    .iter()
-                    .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name)),
-            );
-            let _ = writeln!(
-                out,
-                "{api} {} {}({});",
-                field.getter_ret.render_c(prefix),
-                field.getter_symbol,
-                parts.join(", ")
-            );
-        }
-    }
-    let _ = writeln!(out, "{api} void {}({tag}* self);", rich.destroy_symbol);
-    out.push('\n');
-}
-
-/// Render the opaque struct/builder *tags* (forward typedefs) for one struct.
-///
-/// These reference no other types, so emitting every struct's tags before any
-/// function declaration lets a function in one module accept or return a struct
-/// declared in *another* module (a parent module referencing a child's type).
-fn render_struct_tags(out: &mut String, s: &StructBinding) {
-    let tag = &s.c_tag;
-    let _ = writeln!(out, "typedef struct {tag} {tag};");
-    if let Some(b) = &s.builder {
-        let bt = &b.builder_tag;
-        let _ = writeln!(out, "typedef struct {bt} {bt};");
-    }
-}
-
-/// Render the function declarations for one struct: create/destroy/getters and,
-/// if present, the fluent builder's new/setters/build/destroy. Assumes the
-/// struct (and every other struct it may reference) already has a forward
-/// typedef emitted via [`render_struct_tags`].
-fn render_struct_fn_decls(out: &mut String, s: &StructBinding, prefix: &str) {
-    let api = export_macro(prefix);
-    let tag = &s.c_tag;
-    emit_doc(out, &s.doc, "");
-    fn_decl(out, &s.create, prefix);
-    let _ = writeln!(out, "{api} void {}({tag}* ptr);", s.destroy_symbol);
-    for field in &s.fields {
-        emit_doc(out, &field.doc, "");
-        let mut parts = vec![format!("const {tag}* ptr")];
-        parts.extend(
-            field
-                .getter_out_params
-                .iter()
-                .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name)),
-        );
-        let _ = writeln!(
-            out,
-            "{api} {} {}({});",
-            field.getter_ret.render_c(prefix),
-            field.getter_symbol,
-            parts.join(", ")
-        );
-    }
-    out.push('\n');
-
-    if let Some(b) = &s.builder {
-        let bt = &b.builder_tag;
-        let _ = writeln!(out, "{api} {bt}* {}(void);", b.new_symbol);
-        for (field, (_, setter)) in s.fields.iter().zip(&b.setters) {
-            emit_doc(out, &field.doc, "");
-            let _ = writeln!(
-                out,
-                "{api} void {setter}({bt}* builder, {});",
-                params_str(&field.value_params, prefix)
-            );
-        }
-        let _ = writeln!(
-            out,
-            "{api} {tag}* {}({bt}* builder, {prefix}_error* out_err);",
-            b.build_symbol
-        );
-        let _ = writeln!(out, "{api} void {}({bt}* builder);", b.destroy_symbol);
-        out.push('\n');
-    }
 }
 
 /// Render an error domain's code constants as a C `typedef enum` named by the
@@ -348,20 +256,12 @@ pub fn render_module_enum_defs(out: &mut String, module: &ModuleBinding) {
     }
 }
 
-/// Phase 1b: opaque struct/builder/interface/iterator forward typedefs for one
-/// module. Pointers to these are all the C ABI ever uses, so a forward typedef
-/// is sufficient and lets declarations in any module reference any type.
+/// Phase 1b: opaque interface/iterator forward typedefs for one module.
+/// Pointers to these are all the C ABI ever uses, so a forward typedef is
+/// sufficient and lets declarations in any module reference any type. Records
+/// and rich enums declare no tags: they are value types crossing the ABI as
+/// serialized buffers.
 pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
-    // A rich (algebraic) enum is an opaque object, declared like a struct tag.
-    for e in &module.enums {
-        if e.is_rich() {
-            let t = &e.c_tag;
-            let _ = writeln!(out, "typedef struct {t} {t};");
-        }
-    }
-    for s in &module.structs {
-        render_struct_tags(out, s);
-    }
     for i in &module.interfaces {
         let t = &i.c_tag;
         let _ = writeln!(out, "typedef struct {t} {t};");
@@ -370,6 +270,55 @@ pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
         if let CallShape::Iterator(it) = &f.shape {
             let t = &it.iter_tag;
             let _ = writeln!(out, "typedef struct {t} {t};");
+        }
+    }
+}
+
+/// Record `ty`'s struct tag (if any) into `tags`, recursing through pointers.
+fn walk_struct_tags(ty: &CType, prefix: &str, tags: &mut BTreeSet<String>) {
+    match ty {
+        CType::StructTag { .. } => {
+            tags.insert(ty.render_c(prefix));
+        }
+        CType::Ptr { pointee, .. } => walk_struct_tags(pointee, prefix, tags),
+        _ => {}
+    }
+}
+
+/// Collect every struct tag reachable from one module's lowered ABI
+/// signatures. With records and rich enums crossing by value, the struct tags
+/// left in signatures are interface receivers and typed-handle targets; the
+/// latter have no other declaration site, so [`render_decls`] forward-declares
+/// any tag phase 1b did not already emit.
+fn collect_signature_struct_tags(
+    module: &ModuleBinding,
+    prefix: &str,
+    tags: &mut BTreeSet<String>,
+) {
+    let walk_fn = |f: &AbiFn, tags: &mut BTreeSet<String>| {
+        for p in &f.params {
+            walk_struct_tags(&p.ty, prefix, tags);
+        }
+        walk_struct_tags(&f.ret, prefix, tags);
+    };
+    for f in module.callables() {
+        match &f.shape {
+            CallShape::Sync(abi) => walk_fn(abi, tags),
+            CallShape::Async(a) => {
+                walk_fn(&a.launch, tags);
+                for p in &a.callback_params {
+                    walk_struct_tags(&p.ty, prefix, tags);
+                }
+            }
+            CallShape::Iterator(it) => {
+                walk_fn(&it.launch, tags);
+                walk_fn(&it.next, tags);
+            }
+        }
+    }
+    for cb in &module.callbacks {
+        for p in &cb.abi_params {
+            walk_struct_tags(&p.ty, prefix, tags);
         }
     }
 }
@@ -452,12 +401,6 @@ fn render_interface_fn_decls(out: &mut String, i: &InterfaceBinding, prefix: &st
 /// and any framing.
 pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
     let api = export_macro(prefix);
-    for e in &module.enums {
-        render_rich_enum_fn_decls(out, e, prefix);
-    }
-    for s in &module.structs {
-        render_struct_fn_decls(out, s, prefix);
-    }
     for i in &module.interfaces {
         render_interface_fn_decls(out, i, prefix);
     }
@@ -495,8 +438,27 @@ pub fn render_decls(
     for m in modules {
         render_module_enum_defs(out, m);
     }
+    let mut declared: BTreeSet<String> = BTreeSet::new();
     for m in modules {
         render_module_type_tags(out, m);
+        for i in &m.interfaces {
+            declared.insert(i.c_tag.clone());
+        }
+        for f in m.callables() {
+            if let CallShape::Iterator(it) = &f.shape {
+                declared.insert(it.iter_tag.clone());
+            }
+        }
+    }
+    // Typed-handle targets are the one struct tag left in signatures with no
+    // declaration of their own (records are value types now), so forward-
+    // declare any tag phase 1b did not cover, e.g. `handle<other.Type>`.
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for m in modules {
+        collect_signature_struct_tags(m, prefix, &mut used);
+    }
+    for t in used.difference(&declared) {
+        let _ = writeln!(out, "typedef struct {t} {t};");
     }
     for m in modules {
         render_module_callback_types(out, m, prefix);

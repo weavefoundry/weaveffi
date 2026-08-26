@@ -10,7 +10,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <stdlib.h>
 #include <string.h>
 
-static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message) {
+static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message, const uint8_t* payload_ptr, size_t payload_len) {
     napi_value msg;
     napi_create_string_utf8(env, message ? message : "", NAPI_AUTO_LENGTH, &msg);
     napi_value err;
@@ -18,6 +18,11 @@ static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const ch
     napi_value code_val;
     napi_create_int32(env, code, &code_val);
     napi_set_named_property(env, err, "code", code_val);
+    if (payload_ptr != NULL) {
+        napi_value payload_val;
+        napi_create_buffer_copy(env, payload_len, payload_ptr, NULL, &payload_val);
+        napi_set_named_property(env, err, "payload", payload_val);
+    }
     return err;
 }
 
@@ -27,7 +32,7 @@ static napi_value Napi_weaveffi_products_Catalog_new(napi_env env, napi_callback
   weaveffi_error err = {0};
   weaveffi_products_Catalog* result = weaveffi_products_Catalog_new(&err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -51,58 +56,17 @@ static napi_value Napi_weaveffi_products_Catalog_add_product(napi_env env, napi_
   int32_t category;
   napi_get_value_int32(env, args[3], &category);
   weaveffi_error err = {0};
-  weaveffi_products_Product* result = weaveffi_products_Catalog_add_product((const weaveffi_products_Catalog*)(intptr_t)self_raw, name, price, (weaveffi_products_Category)category, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_products_Catalog_add_product((const weaveffi_products_Catalog*)(intptr_t)self_raw, name, price, (weaveffi_products_Category)category, &out_len, &err);
   free(name);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  {
-    weaveffi_products_Product* ret_p = (weaveffi_products_Product*)result;
-    napi_create_object(env, &ret);
-    napi_value ret_id;
-    napi_create_int64(env, weaveffi_products_Product_get_id(ret_p), &ret_id);
-    napi_set_named_property(env, ret, "id", ret_id);
-    napi_value ret_name;
-    {
-      char* ret_name_s = (char*)weaveffi_products_Product_get_name(ret_p);
-      napi_create_string_utf8(env, ret_name_s, NAPI_AUTO_LENGTH, &ret_name);
-      weaveffi_free_string(ret_name_s);
-    }
-    napi_set_named_property(env, ret, "name", ret_name);
-    napi_value ret_description;
-    {
-      char* ret_description_s = (char*)weaveffi_products_Product_get_description(ret_p);
-      if (ret_description_s == NULL) { napi_get_null(env, &ret_description); }
-      else { napi_create_string_utf8(env, ret_description_s, NAPI_AUTO_LENGTH, &ret_description); weaveffi_free_string(ret_description_s); }
-    }
-    napi_set_named_property(env, ret, "description", ret_description);
-    napi_value ret_price;
-    napi_create_double(env, weaveffi_products_Product_get_price(ret_p), &ret_price);
-    napi_set_named_property(env, ret, "price", ret_price);
-    napi_value ret_category;
-    napi_create_int32(env, (int32_t)weaveffi_products_Product_get_category(ret_p), &ret_category);
-    napi_set_named_property(env, ret, "category", ret_category);
-    napi_value ret_tags;
-    {
-      size_t ret_tags_len;
-      const char** ret_tags_arr = weaveffi_products_Product_get_tags(ret_p, &ret_tags_len);
-      napi_create_array(env, &ret_tags);
-      if (ret_tags_arr != NULL) {
-        for (size_t ret_tags_i = 0; ret_tags_i < ret_tags_len; ret_tags_i++) {
-          napi_value ret_tags_e;
-          napi_create_string_utf8(env, ret_tags_arr[ret_tags_i], NAPI_AUTO_LENGTH, &ret_tags_e);
-          weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
-          napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
-        }
-        weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
-      }
-    }
-    napi_set_named_property(env, ret, "tags", ret_tags);
-    weaveffi_products_Product_destroy(ret_p);
-  }
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
@@ -115,57 +79,16 @@ static napi_value Napi_weaveffi_products_Catalog_get_product(napi_env env, napi_
   int64_t id;
   napi_get_value_int64(env, args[1], &id);
   weaveffi_error err = {0};
-  weaveffi_products_Product* result = weaveffi_products_Catalog_get_product((const weaveffi_products_Catalog*)(intptr_t)self_raw, id, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_products_Catalog_get_product((const weaveffi_products_Catalog*)(intptr_t)self_raw, id, &out_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  {
-    weaveffi_products_Product* ret_p = (weaveffi_products_Product*)result;
-    napi_create_object(env, &ret);
-    napi_value ret_id;
-    napi_create_int64(env, weaveffi_products_Product_get_id(ret_p), &ret_id);
-    napi_set_named_property(env, ret, "id", ret_id);
-    napi_value ret_name;
-    {
-      char* ret_name_s = (char*)weaveffi_products_Product_get_name(ret_p);
-      napi_create_string_utf8(env, ret_name_s, NAPI_AUTO_LENGTH, &ret_name);
-      weaveffi_free_string(ret_name_s);
-    }
-    napi_set_named_property(env, ret, "name", ret_name);
-    napi_value ret_description;
-    {
-      char* ret_description_s = (char*)weaveffi_products_Product_get_description(ret_p);
-      if (ret_description_s == NULL) { napi_get_null(env, &ret_description); }
-      else { napi_create_string_utf8(env, ret_description_s, NAPI_AUTO_LENGTH, &ret_description); weaveffi_free_string(ret_description_s); }
-    }
-    napi_set_named_property(env, ret, "description", ret_description);
-    napi_value ret_price;
-    napi_create_double(env, weaveffi_products_Product_get_price(ret_p), &ret_price);
-    napi_set_named_property(env, ret, "price", ret_price);
-    napi_value ret_category;
-    napi_create_int32(env, (int32_t)weaveffi_products_Product_get_category(ret_p), &ret_category);
-    napi_set_named_property(env, ret, "category", ret_category);
-    napi_value ret_tags;
-    {
-      size_t ret_tags_len;
-      const char** ret_tags_arr = weaveffi_products_Product_get_tags(ret_p, &ret_tags_len);
-      napi_create_array(env, &ret_tags);
-      if (ret_tags_arr != NULL) {
-        for (size_t ret_tags_i = 0; ret_tags_i < ret_tags_len; ret_tags_i++) {
-          napi_value ret_tags_e;
-          napi_create_string_utf8(env, ret_tags_arr[ret_tags_i], NAPI_AUTO_LENGTH, &ret_tags_e);
-          weaveffi_free_string((char*)(ret_tags_arr[ret_tags_i]));
-          napi_set_element(env, ret_tags, (uint32_t)ret_tags_i, ret_tags_e);
-        }
-        weaveffi_free_bytes((uint8_t*)ret_tags_arr, ret_tags_len * sizeof(*ret_tags_arr));
-      }
-    }
-    napi_set_named_property(env, ret, "tags", ret_tags);
-    weaveffi_products_Product_destroy(ret_p);
-  }
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
@@ -179,63 +102,15 @@ static napi_value Napi_weaveffi_products_Catalog_search(napi_env env, napi_callb
   napi_get_value_int32(env, args[1], &category);
   weaveffi_error err = {0};
   size_t out_len;
-  weaveffi_products_Product** result = weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)self_raw, (weaveffi_products_Category)category, &out_len, &err);
+  const uint8_t* result = weaveffi_products_Catalog_search((const weaveffi_products_Catalog*)(intptr_t)self_raw, (weaveffi_products_Category)category, &out_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  napi_create_array_with_length(env, out_len, &ret);
-  for (size_t ret_i = 0; ret_i < out_len; ret_i++) {
-    napi_value elem;
-    {
-      weaveffi_products_Product* elem_p = (weaveffi_products_Product*)result[ret_i];
-      napi_create_object(env, &elem);
-      napi_value elem_id;
-      napi_create_int64(env, weaveffi_products_Product_get_id(elem_p), &elem_id);
-      napi_set_named_property(env, elem, "id", elem_id);
-      napi_value elem_name;
-      {
-        char* elem_name_s = (char*)weaveffi_products_Product_get_name(elem_p);
-        napi_create_string_utf8(env, elem_name_s, NAPI_AUTO_LENGTH, &elem_name);
-        weaveffi_free_string(elem_name_s);
-      }
-      napi_set_named_property(env, elem, "name", elem_name);
-      napi_value elem_description;
-      {
-        char* elem_description_s = (char*)weaveffi_products_Product_get_description(elem_p);
-        if (elem_description_s == NULL) { napi_get_null(env, &elem_description); }
-        else { napi_create_string_utf8(env, elem_description_s, NAPI_AUTO_LENGTH, &elem_description); weaveffi_free_string(elem_description_s); }
-      }
-      napi_set_named_property(env, elem, "description", elem_description);
-      napi_value elem_price;
-      napi_create_double(env, weaveffi_products_Product_get_price(elem_p), &elem_price);
-      napi_set_named_property(env, elem, "price", elem_price);
-      napi_value elem_category;
-      napi_create_int32(env, (int32_t)weaveffi_products_Product_get_category(elem_p), &elem_category);
-      napi_set_named_property(env, elem, "category", elem_category);
-      napi_value elem_tags;
-      {
-        size_t elem_tags_len;
-        const char** elem_tags_arr = weaveffi_products_Product_get_tags(elem_p, &elem_tags_len);
-        napi_create_array(env, &elem_tags);
-        if (elem_tags_arr != NULL) {
-          for (size_t elem_tags_i = 0; elem_tags_i < elem_tags_len; elem_tags_i++) {
-            napi_value elem_tags_e;
-            napi_create_string_utf8(env, elem_tags_arr[elem_tags_i], NAPI_AUTO_LENGTH, &elem_tags_e);
-            weaveffi_free_string((char*)(elem_tags_arr[elem_tags_i]));
-            napi_set_element(env, elem_tags, (uint32_t)elem_tags_i, elem_tags_e);
-          }
-          weaveffi_free_bytes((uint8_t*)elem_tags_arr, elem_tags_len * sizeof(*elem_tags_arr));
-        }
-      }
-      napi_set_named_property(env, elem, "tags", elem_tags);
-      weaveffi_products_Product_destroy(elem_p);
-    }
-    napi_set_element(env, ret, (uint32_t)ret_i, elem);
-  }
-  weaveffi_free_bytes((uint8_t*)result, out_len * sizeof(*result));
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
@@ -252,7 +127,7 @@ static napi_value Napi_weaveffi_products_Catalog_update_price(napi_env env, napi
   weaveffi_error err = {0};
   bool result = weaveffi_products_Catalog_update_price((const weaveffi_products_Catalog*)(intptr_t)self_raw, id, price, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -272,7 +147,7 @@ static napi_value Napi_weaveffi_products_Catalog_remove(napi_env env, napi_callb
   weaveffi_error err = {0};
   bool result = weaveffi_products_Catalog_remove((const weaveffi_products_Catalog*)(intptr_t)self_raw, id, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -298,21 +173,13 @@ static napi_value Napi_weaveffi_orders_create_order(napi_env env, napi_callback_
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  uint32_t items_count;
-  napi_get_array_length(env, args[0], &items_count);
-  weaveffi_orders_OrderItem** items_arr = (weaveffi_orders_OrderItem**)malloc(sizeof(weaveffi_orders_OrderItem*) * (items_count + 1));
-  for (uint32_t items_i = 0; items_i < items_count; items_i++) {
-    napi_value items_el;
-    napi_get_element(env, args[0], items_i, &items_el);
-    int64_t items_sp;
-    napi_get_value_int64(env, items_el, &items_sp);
-    items_arr[items_i] = (weaveffi_orders_OrderItem*)(intptr_t)items_sp;
-  }
+  void* items_raw;
+  size_t items_len;
+  napi_get_buffer_info(env, args[0], &items_raw, &items_len);
   weaveffi_error err = {0};
-  int64_t result = weaveffi_orders_create_order(items_arr, (size_t)items_count, &err);
-  free(items_arr);
+  int64_t result = weaveffi_orders_create_order((const uint8_t*)items_raw, items_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -328,59 +195,16 @@ static napi_value Napi_weaveffi_orders_get_order(napi_env env, napi_callback_inf
   int64_t id;
   napi_get_value_int64(env, args[0], &id);
   weaveffi_error err = {0};
-  weaveffi_orders_Order* result = weaveffi_orders_get_order(id, &err);
+  size_t out_len;
+  const uint8_t* result = weaveffi_orders_get_order(id, &out_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  {
-    weaveffi_orders_Order* ret_p = (weaveffi_orders_Order*)result;
-    napi_create_object(env, &ret);
-    napi_value ret_id;
-    napi_create_int64(env, weaveffi_orders_Order_get_id(ret_p), &ret_id);
-    napi_set_named_property(env, ret, "id", ret_id);
-    napi_value ret_items;
-    {
-      size_t ret_items_len;
-      weaveffi_orders_OrderItem** ret_items_arr = weaveffi_orders_Order_get_items(ret_p, &ret_items_len);
-      napi_create_array(env, &ret_items);
-      if (ret_items_arr != NULL) {
-        for (size_t ret_items_i = 0; ret_items_i < ret_items_len; ret_items_i++) {
-          napi_value ret_items_e;
-          {
-            weaveffi_orders_OrderItem* ret_items_e_p = (weaveffi_orders_OrderItem*)ret_items_arr[ret_items_i];
-            napi_create_object(env, &ret_items_e);
-            napi_value ret_items_e_product_id;
-            napi_create_int64(env, weaveffi_orders_OrderItem_get_product_id(ret_items_e_p), &ret_items_e_product_id);
-            napi_set_named_property(env, ret_items_e, "product_id", ret_items_e_product_id);
-            napi_value ret_items_e_quantity;
-            napi_create_int32(env, weaveffi_orders_OrderItem_get_quantity(ret_items_e_p), &ret_items_e_quantity);
-            napi_set_named_property(env, ret_items_e, "quantity", ret_items_e_quantity);
-            napi_value ret_items_e_unit_price;
-            napi_create_double(env, weaveffi_orders_OrderItem_get_unit_price(ret_items_e_p), &ret_items_e_unit_price);
-            napi_set_named_property(env, ret_items_e, "unit_price", ret_items_e_unit_price);
-            weaveffi_orders_OrderItem_destroy(ret_items_e_p);
-          }
-          napi_set_element(env, ret_items, (uint32_t)ret_items_i, ret_items_e);
-        }
-        weaveffi_free_bytes((uint8_t*)ret_items_arr, ret_items_len * sizeof(*ret_items_arr));
-      }
-    }
-    napi_set_named_property(env, ret, "items", ret_items);
-    napi_value ret_total;
-    napi_create_double(env, weaveffi_orders_Order_get_total(ret_p), &ret_total);
-    napi_set_named_property(env, ret, "total", ret_total);
-    napi_value ret_status;
-    {
-      char* ret_status_s = (char*)weaveffi_orders_Order_get_status(ret_p);
-      napi_create_string_utf8(env, ret_status_s, NAPI_AUTO_LENGTH, &ret_status);
-      weaveffi_free_string(ret_status_s);
-    }
-    napi_set_named_property(env, ret, "status", ret_status);
-    weaveffi_orders_Order_destroy(ret_p);
-  }
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
   return ret;
 }
 
@@ -393,7 +217,7 @@ static napi_value Napi_weaveffi_orders_cancel_order(napi_env env, napi_callback_
   weaveffi_error err = {0};
   bool result = weaveffi_orders_cancel_order(id, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
@@ -408,12 +232,13 @@ static napi_value Napi_weaveffi_orders_add_product_to_order(napi_env env, napi_c
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
   int64_t order_id;
   napi_get_value_int64(env, args[0], &order_id);
-  int64_t product_raw;
-  napi_get_value_int64(env, args[1], &product_raw);
+  void* product_raw;
+  size_t product_len;
+  napi_get_buffer_info(env, args[1], &product_raw, &product_len);
   weaveffi_error err = {0};
-  bool result = weaveffi_orders_add_product_to_order(order_id, (const weaveffi_products_Product*)(intptr_t)product_raw, &err);
+  bool result = weaveffi_orders_add_product_to_order(order_id, (const uint8_t*)product_raw, product_len, &err);
   if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }

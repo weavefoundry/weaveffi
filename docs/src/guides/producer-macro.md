@@ -88,14 +88,13 @@ weaveffi generate src/lib.rs -o generated --target c,swift,python
 |-----------|---------------|--------|
 | `#[weaveffi::module]` | inline `mod foo { ... }` | Marks an exported namespace and drives the codegen. Modules may nest. |
 | `#[weaveffi::export]` | `fn` | Exports a function. A `Result<T, E>` return is `throws: true`; `()` (and `Result<(), E>`) is a `void` return. |
-| `#[weaveffi::record]` | named-field `struct` | A by-value record. Generates `create`, `destroy`, and a getter per field. |
+| `#[weaveffi::record]` | named-field `struct` | A by-value record. Generates a `BufferValue` implementation (encode and decode in the value-buffer format); no per-record C symbols. |
 | `#[weaveffi::interface]` | `struct` with an `impl` block | An opaque object type. The `impl` block's `pub fn`s become constructors (those returning `Self`), methods (`&self`), and statics; a `destroy` symbol is implicit. |
-| `#[weaveffi::error]` | unit-variant `enum` | Declares the module's error domain. Every variant needs an explicit `= N` discriminant; the doc comment is the code's default message. |
+| `#[weaveffi::error]` | `enum` with explicit discriminants | Declares the module's error domain. Every variant needs an explicit `= N` discriminant; the doc comment is the code's default message. A variant may carry named fields, which become the code's structured payload (this requires a primitive repr such as `#[repr(i32)]`). |
 | `#[weaveffi::enumeration]` | `#[repr(i32)]` `enum` | A C-style enum. Every variant needs an explicit `= N` discriminant. |
 | `#[weaveffi::callback]` | `fn` | Declares a callback signature (see [roadmap](#feature-support)). |
 | `#[weaveffi::listener(event = "Name")]` | `fn` | Declares an event listener bound to a callback (see [roadmap](#feature-support)). |
 | `#[weaveffi::cancellable]` | `async fn` | Marks an async function as accepting a cancel token (see [roadmap](#feature-support)). |
-| `#[weaveffi::builder]` | `#[weaveffi::record]` struct | Opts the record into a fluent builder (see [roadmap](#feature-support)). |
 
 Only items carrying a marker are exported. Private helpers, `use` items, the
 module's in-memory state, and free functions without `#[weaveffi::export]` are
@@ -122,10 +121,10 @@ You write ordinary Rust types; the macro picks the matching ABI shape:
 | `Vec<u8>`, `&[u8]` | `bytes` | `const uint8_t* ptr, size_t len` |
 | `u64` | `handle` | `weaveffi_handle_t` |
 | `*mut T`, `*const T` | `handle<T>` | opaque `T*` |
-| a `#[weaveffi::record]` struct | the record | opaque object pointer |
+| a `#[weaveffi::record]` struct | the record | serialized value buffer (`ptr` + `len`) |
 | a `#[weaveffi::enumeration]` enum | the enum | `int`-sized discriminant |
-| `Option<T>` | `T?` | nullable pointer or value slot |
-| `Vec<T>` | `[T]` | `ptr` + `len` (object pointers for record lists) |
+| `Option<T>` | `T?` | serialized value buffer (nullable pointer for `Option<Interface>`) |
+| `Vec<T>` | `[T]` | serialized value buffer (`ptr` + `len`) |
 
 A `u64` parameter or return is an opaque `handle`. Reach for the IDL directly
 if you need a real 64-bit scalar. See
@@ -133,10 +132,14 @@ if you need a real 64-bit scalar. See
 
 ## Records
 
-A `#[weaveffi::record]` struct that crosses the boundary by value must derive
-`Clone` (the macro clones it out of the caller's heap). The generated surface
-matches the canonical C ABI for a record: a `create` constructor over the
-fields, a `destroy`, and a getter per field.
+A `#[weaveffi::record]` struct crosses the boundary by value as a serialized
+[value buffer](../reference/value-buffers.md). The macro generates a
+`weaveffi::abi::BufferValue` implementation (an `encode` into a
+`BufferWriter` and a `decode` from a `BufferReader`, one field at a time in
+declaration order); the surrounding marshalling calls it to decode buffered
+parameters and encode buffered returns. No per-record C symbols are
+generated: consumers pack and unpack the bytes with their own generated
+routines.
 
 ```rust
 #[weaveffi::record]
@@ -207,10 +210,10 @@ pub mod orders {
 }
 ```
 
-Each module is expanded on its own, so the macro emits a pointer-passing thunk
-named for its own module while the CLI (which sees the whole crate) resolves
-the reference to `products.Product` in the IDL and header. Both spellings are
-the same opaque pointer at the ABI level, so the producer and the generated
+Each module is expanded on its own, so the macro emits a thunk named for its
+own module while the CLI (which sees the whole crate) resolves the reference
+to `products.Product` in the IDL and header. Both spellings are the same
+serialized value buffer at the ABI level, so the producer and the generated
 bindings agree. See `samples/inventory` for a complete two-module example.
 
 ## Feature support
@@ -226,15 +229,15 @@ straight to a `weaveffi_*` cdylib with no hand-written `extern "C"` layer.
 | Sync functions, `Result` errors | Supported | `calculator`, `contacts` |
 | Error domains (`#[weaveffi::error]`) | Supported | `calculator`, `contacts` |
 | Interfaces (constructors / methods / statics) | Supported | `contacts`, `inventory` |
-| Records (create / destroy / getters) | Supported | `contacts` |
+| Records (value-buffer encode / decode) | Supported | `contacts` |
 | C-style enums | Supported | `contacts`, `shapes` |
 | Scalars, `string`, `bytes`, handles, typed handles | Supported | `kvstore` |
-| Optionals, lists (scalar / string / record), maps | Supported | `inventory`, `kvstore` |
+| Optionals, lists, maps (nested composites included) | Supported | `inventory`, `kvstore` |
 | Async (and cancellable) functions | Supported | `async-demo`, `kvstore` |
 | Callbacks and event listeners | Supported | `events`, `kvstore` |
 | Iterator returns | Supported | `events`, `kvstore` |
 | Rich (data-carrying) enums | Supported | `shapes` |
-| Builder records | Supported | `kvstore` |
+| Structured error payloads | Supported | `weaveffi` crate's runtime tests |
 
 A few narrow shapes are still rejected at compile time with a clear message
 rather than emitting glue that disagrees with the header, notably iterator

@@ -50,7 +50,6 @@ fn build_large_api() -> Api {
                             default: None,
                         },
                     ],
-                    builder: false,
                 })
                 .collect();
 
@@ -134,7 +133,7 @@ fn build_large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.5.0".into(),
+        version: "0.6.0".into(),
         modules,
         generators: None,
         package: None,

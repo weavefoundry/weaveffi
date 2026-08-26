@@ -551,7 +551,6 @@ fn extract_struct(item: &syn::ItemStruct) -> syn::Result<StructDef> {
         name,
         doc: extract_doc(&item.attrs),
         fields,
-        builder: has_marker(&item.attrs, "builder"),
     })
 }
 
@@ -652,25 +651,32 @@ fn extract_enum(item: &syn::ItemEnum) -> syn::Result<EnumDef> {
 
 /// Extract a `#[weaveffi::error]` enum into the module's [`ErrorDomain`].
 ///
-/// The enum must consist of unit variants with explicit integer
-/// discriminants; each discriminant is the code's stable ABI value. A
-/// variant's doc comment becomes the code's default message (falling back to
-/// the variant name). The enum's name is the domain name, and the macro
-/// generates a matching `ErrorReport` implementation so `Err(KvError::...)`
-/// reports its declared code.
+/// Every variant needs an explicit integer discriminant: the code's stable
+/// ABI value. A variant may be a unit variant or carry named fields, which
+/// become the code's structured payload (serialized in the value-buffer
+/// format alongside the `(code, message)` pair). Note that Rust requires a
+/// primitive representation such as `#[repr(i32)]` on an enum that mixes
+/// explicit discriminants with data-carrying variants. A variant's doc
+/// comment becomes the code's default message (falling back to the variant
+/// name). The enum's name is the domain name, and the macro generates a
+/// matching `ErrorReport` implementation so `Err(KvError::...)` reports its
+/// declared code and payload.
 fn extract_error_domain(item: &syn::ItemEnum) -> syn::Result<ErrorDomain> {
     let codes = item
         .variants
         .iter()
         .map(|v| {
-            if !matches!(v.fields, syn::Fields::Unit) {
-                return Err(syn::Error::new(
-                    v.span(),
-                    "weaveffi: #[weaveffi::error] variants must be unit variants with \
-                     explicit discriminants (payload-carrying variants cannot cross the \
-                     ABI's (code, message) error slot)",
-                ));
-            }
+            let fields = match &v.fields {
+                syn::Fields::Unit => vec![],
+                syn::Fields::Named(named) => extract_variant_fields(named)?,
+                syn::Fields::Unnamed(_) => {
+                    return Err(syn::Error::new(
+                        v.span(),
+                        "weaveffi: #[weaveffi::error] payload variants must use named \
+                         fields (tuple-style variants are not supported)",
+                    ));
+                }
+            };
             let Some((_, expr)) = v.discriminant.as_ref() else {
                 return Err(syn::Error::new(
                     v.span(),
@@ -692,6 +698,7 @@ fn extract_error_domain(item: &syn::ItemEnum) -> syn::Result<ErrorDomain> {
                 code: parse_discriminant(expr)?,
                 message,
                 doc,
+                fields,
             })
         })
         .collect::<syn::Result<Vec<_>>>()?;

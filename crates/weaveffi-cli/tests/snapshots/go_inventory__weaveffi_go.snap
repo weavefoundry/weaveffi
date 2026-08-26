@@ -15,7 +15,10 @@ package weaveffi
 import "C"
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -42,18 +45,23 @@ func (e *WeaveFFIError) Error() string {
 }
 
 // wvTakeError reads and clears a non-zero C error slot, returning its
-// code and message.
-func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+// code, message, and a copy of its structured payload buffer (nil when
+// the code declares no payload fields).
+func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {
 	code := int32(cErr.code)
 	msg := ""
 	if cErr.message != nil {
 		msg = C.GoString(cErr.message)
 	}
+	var payload []byte
+	if cErr.payload_ptr != nil {
+		payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))
+	}
 	C.weaveffi_error_clear(cErr)
-	return code, msg
+	return code, msg, payload
 }
 
-func wvBrandError(code int32, message string) error {
+func wvBrandError(code int32, message string, _ []byte) error {
 	return &WeaveFFIError{Code: code, Message: message}
 }
 
@@ -62,9 +70,217 @@ func wvBrandError(code int32, message string) error {
 // a producer panic or a marshalling failure.
 func wvTrap(cErr *C.weaveffi_error) {
 	if cErr.code != 0 {
-		code, msg := wvTakeError(cErr)
+		code, msg, _ := wvTakeError(cErr)
 		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
 	}
+}
+
+// wvWriter serializes values into the WeaveFFI value-buffer format:
+// little-endian, packed, u32 length prefixes.
+type wvWriter struct {
+	buf []byte
+}
+
+func (w *wvWriter) writeBool(v bool) {
+	if v {
+		w.buf = append(w.buf, 1)
+	} else {
+		w.buf = append(w.buf, 0)
+	}
+}
+
+func (w *wvWriter) writeI8(v int8) {
+	w.buf = append(w.buf, byte(v))
+}
+
+func (w *wvWriter) writeU8(v uint8) {
+	w.buf = append(w.buf, v)
+}
+
+func (w *wvWriter) writeI16(v int16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, uint16(v))
+}
+
+func (w *wvWriter) writeU16(v uint16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, v)
+}
+
+func (w *wvWriter) writeI32(v int32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(v))
+}
+
+func (w *wvWriter) writeU32(v uint32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
+}
+
+func (w *wvWriter) writeI64(v int64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))
+}
+
+func (w *wvWriter) writeU64(v uint64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, v)
+}
+
+func (w *wvWriter) writeF32(v float32) {
+	w.writeU32(math.Float32bits(v))
+}
+
+func (w *wvWriter) writeF64(v float64) {
+	w.writeU64(math.Float64bits(v))
+}
+
+func (w *wvWriter) writeLen(n int) {
+	if n < 0 || uint64(n) > uint64(^uint32(0)) {
+		panic("weaveffi: value-buffer length exceeds u32 range")
+	}
+	w.writeU32(uint32(n))
+}
+
+func (w *wvWriter) writeString(v string) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeBytes(v []byte) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeOptionFlag(present bool) {
+	w.writeBool(present)
+}
+
+// wvReader decodes values from the WeaveFFI value-buffer format. A
+// malformed buffer is a producer/consumer contract violation, so every
+// read panics (the same channel a trapped producer error uses) instead
+// of returning a typed domain error.
+type wvReader struct {
+	buf []byte
+	pos int
+}
+
+func wvMalformed(context string) {
+	panic("weaveffi: malformed value buffer: " + context)
+}
+
+func (r *wvReader) take(n int, context string) []byte {
+	if n < 0 || len(r.buf)-r.pos < n {
+		wvMalformed(context)
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
+
+func (r *wvReader) readBool() bool {
+	switch r.take(1, "bool")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("bool byte out of range")
+	return false
+}
+
+func (r *wvReader) readI8() int8 {
+	return int8(r.take(1, "i8")[0])
+}
+
+func (r *wvReader) readU8() uint8 {
+	return r.take(1, "u8")[0]
+}
+
+func (r *wvReader) readI16() int16 {
+	return int16(binary.LittleEndian.Uint16(r.take(2, "i16")))
+}
+
+func (r *wvReader) readU16() uint16 {
+	return binary.LittleEndian.Uint16(r.take(2, "u16"))
+}
+
+func (r *wvReader) readI32() int32 {
+	return int32(binary.LittleEndian.Uint32(r.take(4, "i32")))
+}
+
+func (r *wvReader) readU32() uint32 {
+	return binary.LittleEndian.Uint32(r.take(4, "u32"))
+}
+
+func (r *wvReader) readI64() int64 {
+	return int64(binary.LittleEndian.Uint64(r.take(8, "i64")))
+}
+
+func (r *wvReader) readU64() uint64 {
+	return binary.LittleEndian.Uint64(r.take(8, "u64"))
+}
+
+func (r *wvReader) readF32() float32 {
+	return math.Float32frombits(r.readU32())
+}
+
+func (r *wvReader) readF64() float64 {
+	return math.Float64frombits(r.readU64())
+}
+
+func (r *wvReader) readLen() int {
+	n := int(r.readU32())
+	if n > len(r.buf)-r.pos {
+		wvMalformed("length prefix exceeds remaining buffer")
+	}
+	return n
+}
+
+func (r *wvReader) readString() string {
+	b := r.take(r.readLen(), "string bytes")
+	if !utf8.Valid(b) {
+		wvMalformed("string is not valid UTF-8")
+	}
+	return string(b)
+}
+
+func (r *wvReader) readBytes() []byte {
+	b := r.take(r.readLen(), "byte buffer")
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+func (r *wvReader) readOptionFlag() bool {
+	switch r.take(1, "option flag")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("option flag byte out of range")
+	return false
+}
+
+func (r *wvReader) expectEnd() {
+	if r.pos != len(r.buf) {
+		wvMalformed("trailing bytes after value")
+	}
+}
+
+// wvCopyBuffer copies an owned, producer-allocated value buffer into Go
+// memory and releases it with weaveffi_free_bytes.
+func wvCopyBuffer(ptr *C.uint8_t, length C.size_t) []byte {
+	if ptr == nil {
+		return nil
+	}
+	out := C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+	C.weaveffi_free_bytes(ptr, length)
+	return out
+}
+
+// wvBorrowBuffer copies a borrowed value buffer into Go memory. The
+// producer keeps ownership and frees it after the borrowing call returns.
+func wvBorrowBuffer(ptr *C.uint8_t, length C.size_t) []byte {
+	if ptr == nil {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length))
 }
 
 // ProductsError is a typed error reported by the `products` module.
@@ -89,7 +305,7 @@ const (
 
 // wvMapProducts converts a non-zero code from the `products` domain into a
 // *ProductsError, falling back to the generic *WeaveFFIError for unknown codes.
-func wvMapProducts(code int32, message string) error {
+func wvMapProducts(code int32, message string, payload []byte) error {
 	switch code {
 	case ProductsErrorInvalidPrice:
 		if message == "" {
@@ -102,7 +318,7 @@ func wvMapProducts(code int32, message string) error {
 		}
 		return &ProductsError{Code: code, Message: message}
 	default:
-		return wvBrandError(code, message)
+		return wvBrandError(code, message, payload)
 	}
 }
 
@@ -116,58 +332,50 @@ const (
 )
 
 type Product struct {
-	ptr *C.weaveffi_products_Product
+	Id int64
+	Name string
+	Description *string
+	Price float64
+	Category Category
+	Tags []string
 }
 
-func (s *Product) Id() int64 {
-	return int64(C.weaveffi_products_Product_get_id(s.ptr))
-}
-
-func (s *Product) Name() string {
-	cStr := C.weaveffi_products_Product_get_name(s.ptr)
-	goResult := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return goResult
-}
-
-func (s *Product) Description() *string {
-	cStr := C.weaveffi_products_Product_get_description(s.ptr)
-	if cStr == nil {
-		return nil
+// wvPackProduct appends v to w in the value-buffer wire format.
+func wvPackProduct(w *wvWriter, v Product) {
+	w.writeI64(v.Id)
+	w.writeString(v.Name)
+	if v.Description == nil {
+		w.writeOptionFlag(false)
+	} else {
+		w.writeOptionFlag(true)
+		w.writeString((*v.Description))
 	}
-	v := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return &v
-}
-
-func (s *Product) Price() float64 {
-	return float64(C.weaveffi_products_Product_get_price(s.ptr))
-}
-
-func (s *Product) Category() Category {
-	return Category(C.weaveffi_products_Product_get_category(s.ptr))
-}
-
-func (s *Product) Tags() []string {
-	var cOutLen C.size_t
-	result := C.weaveffi_products_Product_get_tags(s.ptr, &cOutLen)
-	count := int(cOutLen)
-	goResult := make([]string, count)
-	if count > 0 && result != nil {
-		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
-			goResult[i] = C.GoString(v)
-			C.weaveffi_free_string(v)
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
+	w.writeF64(v.Price)
+	w.writeI32(int32(v.Category))
+	w.writeLen(len(v.Tags))
+	for _, eTags0 := range v.Tags {
+		w.writeString(eTags0)
 	}
-	return goResult
 }
 
-func (s *Product) Close() {
-	if s.ptr != nil {
-		C.weaveffi_products_Product_destroy(s.ptr)
-		s.ptr = nil
+// wvUnpackProduct decodes one Product from r.
+func wvUnpackProduct(r *wvReader) Product {
+	var v Product
+	v.Id = r.readI64()
+	v.Name = r.readString()
+	if r.readOptionFlag() {
+		var oDescription0 string
+		oDescription0 = r.readString()
+		v.Description = &oDescription0
 	}
+	v.Price = r.readF64()
+	v.Category = Category(r.readI32())
+	nTags0 := r.readLen()
+	v.Tags = make([]string, nTags0)
+	for iTags0 := range v.Tags {
+		v.Tags[iTags0] = r.readString()
+	}
+	return v
 }
 
 // Catalog: A product catalog owning its products
@@ -182,39 +390,49 @@ func NewCatalog() *Catalog {
 	return &Catalog{ptr: result}
 }
 
-func (s *Catalog) AddProduct(name string, price float64, category Category) (*Product, error) {
+func (s *Catalog) AddProduct(name string, price float64, category Category) (Product, error) {
 	cName := C.CString(name)
 	defer C.free(unsafe.Pointer(cName))
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_products_Catalog_add_product(s.ptr, cName, C.double(price), C.weaveffi_products_Category(category), &cErr)
+	result := C.weaveffi_products_Catalog_add_product(s.ptr, cName, C.double(price), C.weaveffi_products_Category(category), &cOutLen, &cErr)
 	if cErr.code != 0 {
-		return nil, wvMapProducts(wvTakeError(&cErr))
+		return Product{}, wvMapProducts(wvTakeError(&cErr))
 	}
-	return &Product{ptr: result}, nil
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult Product
+	goResult = wvUnpackProduct(rRes)
+	rRes.expectEnd()
+	return goResult, nil
 }
 
-func (s *Catalog) GetProduct(id int64) (*Product, error) {
+func (s *Catalog) GetProduct(id int64) (Product, error) {
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_products_Catalog_get_product(s.ptr, C.int64_t(id), &cErr)
+	result := C.weaveffi_products_Catalog_get_product(s.ptr, C.int64_t(id), &cOutLen, &cErr)
 	if cErr.code != 0 {
-		return nil, wvMapProducts(wvTakeError(&cErr))
+		return Product{}, wvMapProducts(wvTakeError(&cErr))
 	}
-	return &Product{ptr: result}, nil
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult Product
+	goResult = wvUnpackProduct(rRes)
+	rRes.expectEnd()
+	return goResult, nil
 }
 
-func (s *Catalog) Search(category Category) []*Product {
+func (s *Catalog) Search(category Category) []Product {
 	var cOutLen C.size_t
 	var cErr C.weaveffi_error
 	result := C.weaveffi_products_Catalog_search(s.ptr, C.weaveffi_products_Category(category), &cOutLen, &cErr)
 	wvTrap(&cErr)
-	count := int(cOutLen)
-	goResult := make([]*Product, count)
-	if count > 0 && result != nil {
-		for i, v := range unsafe.Slice((**C.weaveffi_products_Product)(unsafe.Pointer(result)), count) {
-			goResult[i] = &Product{ptr: v}
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult []Product
+	nRes0 := rRes.readLen()
+	goResult = make([]Product, nRes0)
+	for iRes0 := range goResult {
+		goResult[iRes0] = wvUnpackProduct(rRes)
 	}
+	rRes.expectEnd()
 	return goResult
 }
 
@@ -263,7 +481,7 @@ const (
 
 // wvMapOrders converts a non-zero code from the `orders` domain into a
 // *OrdersError, falling back to the generic *WeaveFFIError for unknown codes.
-func wvMapOrders(code int32, message string) error {
+func wvMapOrders(code int32, message string, payload []byte) error {
 	switch code {
 	case OrdersErrorOrderNotFound:
 		if message == "" {
@@ -276,98 +494,94 @@ func wvMapOrders(code int32, message string) error {
 		}
 		return &OrdersError{Code: code, Message: message}
 	default:
-		return wvBrandError(code, message)
+		return wvBrandError(code, message, payload)
 	}
 }
 
 type OrderItem struct {
-	ptr *C.weaveffi_orders_OrderItem
+	ProductId int64
+	Quantity int32
+	UnitPrice float64
 }
 
-func (s *OrderItem) ProductId() int64 {
-	return int64(C.weaveffi_orders_OrderItem_get_product_id(s.ptr))
+// wvPackOrderItem appends v to w in the value-buffer wire format.
+func wvPackOrderItem(w *wvWriter, v OrderItem) {
+	w.writeI64(v.ProductId)
+	w.writeI32(v.Quantity)
+	w.writeF64(v.UnitPrice)
 }
 
-func (s *OrderItem) Quantity() int32 {
-	return int32(C.weaveffi_orders_OrderItem_get_quantity(s.ptr))
-}
-
-func (s *OrderItem) UnitPrice() float64 {
-	return float64(C.weaveffi_orders_OrderItem_get_unit_price(s.ptr))
-}
-
-func (s *OrderItem) Close() {
-	if s.ptr != nil {
-		C.weaveffi_orders_OrderItem_destroy(s.ptr)
-		s.ptr = nil
-	}
+// wvUnpackOrderItem decodes one OrderItem from r.
+func wvUnpackOrderItem(r *wvReader) OrderItem {
+	var v OrderItem
+	v.ProductId = r.readI64()
+	v.Quantity = r.readI32()
+	v.UnitPrice = r.readF64()
+	return v
 }
 
 type Order struct {
-	ptr *C.weaveffi_orders_Order
+	Id int64
+	Items []OrderItem
+	Total float64
+	Status string
 }
 
-func (s *Order) Id() int64 {
-	return int64(C.weaveffi_orders_Order_get_id(s.ptr))
-}
-
-func (s *Order) Items() []*OrderItem {
-	var cOutLen C.size_t
-	result := C.weaveffi_orders_Order_get_items(s.ptr, &cOutLen)
-	count := int(cOutLen)
-	goResult := make([]*OrderItem, count)
-	if count > 0 && result != nil {
-		for i, v := range unsafe.Slice((**C.weaveffi_orders_OrderItem)(unsafe.Pointer(result)), count) {
-			goResult[i] = &OrderItem{ptr: v}
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
+// wvPackOrder appends v to w in the value-buffer wire format.
+func wvPackOrder(w *wvWriter, v Order) {
+	w.writeI64(v.Id)
+	w.writeLen(len(v.Items))
+	for _, eItems0 := range v.Items {
+		wvPackOrderItem(w, eItems0)
 	}
-	return goResult
+	w.writeF64(v.Total)
+	w.writeString(v.Status)
 }
 
-func (s *Order) Total() float64 {
-	return float64(C.weaveffi_orders_Order_get_total(s.ptr))
-}
-
-func (s *Order) Status() string {
-	cStr := C.weaveffi_orders_Order_get_status(s.ptr)
-	goResult := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return goResult
-}
-
-func (s *Order) Close() {
-	if s.ptr != nil {
-		C.weaveffi_orders_Order_destroy(s.ptr)
-		s.ptr = nil
+// wvUnpackOrder decodes one Order from r.
+func wvUnpackOrder(r *wvReader) Order {
+	var v Order
+	v.Id = r.readI64()
+	nItems0 := r.readLen()
+	v.Items = make([]OrderItem, nItems0)
+	for iItems0 := range v.Items {
+		v.Items[iItems0] = wvUnpackOrderItem(r)
 	}
+	v.Total = r.readF64()
+	v.Status = r.readString()
+	return v
 }
 
-func CreateOrder(items []*OrderItem) (int64, error) {
-	cItemsLen := C.size_t(len(items))
-	cItemsArr := make([]*C.weaveffi_orders_OrderItem, len(items))
-	for i, item := range items {
-		cItemsArr[i] = item.ptr
+func CreateOrder(items []OrderItem) (int64, error) {
+	wItems := &wvWriter{}
+	wItems.writeLen(len(items))
+	for _, eItems0 := range items {
+		wvPackOrderItem(wItems, eItems0)
 	}
-	var cItemsPtr **C.weaveffi_orders_OrderItem
-	if len(cItemsArr) > 0 {
-		cItemsPtr = (**C.weaveffi_orders_OrderItem)(unsafe.Pointer(&cItemsArr[0]))
+	var cItemsPtr *C.uint8_t
+	if len(wItems.buf) > 0 {
+		cItemsPtr = (*C.uint8_t)(unsafe.Pointer(&wItems.buf[0]))
 	}
 	var cErr C.weaveffi_error
-	result := C.weaveffi_orders_create_order(cItemsPtr, cItemsLen, &cErr)
+	result := C.weaveffi_orders_create_order(cItemsPtr, C.size_t(len(wItems.buf)), &cErr)
 	if cErr.code != 0 {
 		return 0, wvMapOrders(wvTakeError(&cErr))
 	}
 	return int64(result), nil
 }
 
-func GetOrder(id int64) (*Order, error) {
+func GetOrder(id int64) (Order, error) {
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_orders_get_order(C.int64_t(id), &cErr)
+	result := C.weaveffi_orders_get_order(C.int64_t(id), &cOutLen, &cErr)
 	if cErr.code != 0 {
-		return nil, wvMapOrders(wvTakeError(&cErr))
+		return Order{}, wvMapOrders(wvTakeError(&cErr))
 	}
-	return &Order{ptr: result}, nil
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult Order
+	goResult = wvUnpackOrder(rRes)
+	rRes.expectEnd()
+	return goResult, nil
 }
 
 func CancelOrder(id int64) bool {
@@ -377,9 +591,15 @@ func CancelOrder(id int64) bool {
 	return cToBool(result)
 }
 
-func AddProductToOrder(orderId int64, product *Product) bool {
+func AddProductToOrder(orderId int64, product Product) bool {
+	wProduct := &wvWriter{}
+	wvPackProduct(wProduct, product)
+	var cProductPtr *C.uint8_t
+	if len(wProduct.buf) > 0 {
+		cProductPtr = (*C.uint8_t)(unsafe.Pointer(&wProduct.buf[0]))
+	}
 	var cErr C.weaveffi_error
-	result := C.weaveffi_orders_add_product_to_order(C.int64_t(orderId), product.ptr, &cErr)
+	result := C.weaveffi_orders_add_product_to_order(C.int64_t(orderId), cProductPtr, C.size_t(len(wProduct.buf)), &cErr)
 	wvTrap(&cErr)
 	return cToBool(result)
 }

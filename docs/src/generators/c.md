@@ -11,7 +11,7 @@ way to inspect what the IDL compiles to.
 
 | File | Purpose |
 |------|---------|
-| `generated/c/weaveffi.h` | Public header: opaque types, enums, interfaces, function prototypes, error/memory helpers |
+| `generated/c/weaveffi.h` | Public header: enums, interface types, function prototypes, error/memory helpers, and the value-buffer convention comment |
 | `generated/c/weaveffi.c` | Default `weaveffi_alloc`/`weaveffi_dealloc` implementations (used by the Wasm JS glue); producers that ship their own allocator can omit it |
 
 ## Type mapping
@@ -32,23 +32,25 @@ way to inspect what the IDL compiles to.
 | `string`     | `const char*` (NUL-terminated UTF-8)    | `const char*`                      |
 | `bytes`      | `const uint8_t* ptr, size_t len`        | `const uint8_t*` + `size_t* out_len`|
 | `handle`     | `weaveffi_handle_t`                     | `weaveffi_handle_t`                |
-| `Struct`     | `const weaveffi_m_S*`                   | `weaveffi_m_S*`                    |
+| `Struct`     | `const uint8_t* {name}_ptr, size_t {name}_len` (value buffer, borrowed) | `const uint8_t*` + `size_t* out_len` (value buffer, owned) |
 | `Interface`  | `const weaveffi_m_I*` (borrowed)        | `weaveffi_m_I*` (owned)            |
 | `Enum` (plain) | `weaveffi_m_E`                        | `weaveffi_m_E`                     |
-| `Enum` (rich)  | `const weaveffi_m_E*`                 | `weaveffi_m_E*`                    |
-| `T?` (value) | `const T*` (NULL = absent)              | `T*` (NULL = absent)               |
-| `[T]`        | `const T* items, size_t items_len`      | `T*` + `size_t* out_len`           |
+| `Enum` (rich)  | value buffer, like `Struct`           | value buffer, like `Struct`        |
+| `T?`         | value buffer (`Interface?` stays a nullable pointer) | value buffer          |
+| `[T]`        | value buffer                            | value buffer                       |
+| `{K:V}`      | value buffer                            | value buffer                       |
 | `iter<T>`    | n/a                                     | opaque iterator handle (see [Iterators](#iterators)) |
+
+Every buffered type (structs, rich enums, optionals, lists, maps) is one
+serialized `(ptr, len)` pair in the
+[value-buffer format](../reference/value-buffers.md): borrowed when passed
+in, producer-allocated and freed with `weaveffi_free_bytes` when returned.
 
 C ABI symbol naming follows a strict convention:
 
 | Kind              | Pattern                                           | Example                                       |
 |-------------------|---------------------------------------------------|-----------------------------------------------|
 | Function          | `weaveffi_{module}_{function}`                    | `weaveffi_contacts_create_contact`            |
-| Struct type       | `weaveffi_{module}_{Struct}`                      | `weaveffi_contacts_Contact`                   |
-| Struct create     | `weaveffi_{module}_{Struct}_create`               | `weaveffi_contacts_Contact_create`            |
-| Struct destroy    | `weaveffi_{module}_{Struct}_destroy`              | `weaveffi_contacts_Contact_destroy`           |
-| Struct getter     | `weaveffi_{module}_{Struct}_get_{field}`          | `weaveffi_contacts_Contact_get_name`          |
 | Enum type         | `weaveffi_{module}_{Enum}`                        | `weaveffi_contacts_ContactType`               |
 | Enum variant      | `weaveffi_{module}_{Enum}_{Variant}`              | `weaveffi_contacts_ContactType_Personal`      |
 | Interface type    | `weaveffi_{module}_{Interface}`                   | `weaveffi_kv_Store`                           |
@@ -77,7 +79,7 @@ helpers, is rewritten with the new prefix.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -135,6 +137,8 @@ typedef uint64_t weaveffi_handle_t;
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
 } weaveffi_error;
 
 void weaveffi_error_clear(weaveffi_error* err);
@@ -142,27 +146,30 @@ void weaveffi_free_string(const char* ptr);
 void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 ```
 
+A comment block near the top of the header states the value-buffer
+convention: a buffered parameter named `v` expands to a borrowed
+`const uint8_t* v_ptr, size_t v_len`, and a buffered return is a
+producer-allocated buffer returned as `const uint8_t*` with a trailing
+`size_t* out_len`, decoded by the caller and released with
+`weaveffi_free_bytes`.
+
 In the real output each prototype is prefixed with a `WEAVEFFI_API` visibility
 macro (and deprecated functions with `WEAVEFFI_DEPRECATED`), omitted here for
 brevity. See [Symbol visibility](#symbol-visibility) for what it does and when
 you need it.
 
-Structs become forward-declared opaque typedefs reached via
-create/destroy/getter functions:
+Structs generate no C symbols of their own: a struct crosses the ABI as a
+serialized value buffer, so a function that takes or returns one simply
+carries the buffer slots. The consumer packs and unpacks the bytes per the
+[value-buffer encoding](../reference/value-buffers.md):
 
 ```c
-typedef struct weaveffi_contacts_Contact weaveffi_contacts_Contact;
-
-weaveffi_contacts_Contact* weaveffi_contacts_Contact_create(
-    const char* name,
-    const char* email,
-    int32_t age,
+/* create_contact returns a Contact: a buffered return. */
+const uint8_t* weaveffi_contacts_create_contact(
+    const char* first_name,
+    const char* last_name,
+    size_t* out_len,
     weaveffi_error* out_err);
-
-void weaveffi_contacts_Contact_destroy(weaveffi_contacts_Contact* ptr);
-
-const char* weaveffi_contacts_Contact_get_name(
-    const weaveffi_contacts_Contact* ptr);
 ```
 
 Enums turn into typed `enum` declarations with prefixed variants:
@@ -175,12 +182,18 @@ typedef enum {
 } weaveffi_contacts_ContactType;
 ```
 
-Optionals and lists use pointer-with-sentinel and pointer+length pairs:
+Optionals and lists are buffered too, so they use the same two-slot shape
+(an optional encodes a flag byte, a list a `u32` count, then the elements):
 
 ```c
-int32_t* weaveffi_store_find(const int32_t* id, weaveffi_error* out_err);
+/* find_contact takes an i32? and returns a Contact?: both buffered. */
+const uint8_t* weaveffi_contacts_find_contact(
+    const uint8_t* id_ptr, size_t id_len,
+    size_t* out_len,
+    weaveffi_error* out_err);
 
-weaveffi_contacts_Contact** weaveffi_contacts_list_contacts(
+/* list_contacts returns [Contact]: one buffer holding every record. */
+const uint8_t* weaveffi_contacts_list_contacts(
     size_t* out_len,
     weaveffi_error* out_err);
 ```
@@ -190,7 +203,7 @@ Every function takes a trailing `weaveffi_error* out_err`. On failure
 Rust-allocated string the consumer must clear:
 
 ```c
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 int32_t total = weaveffi_contacts_count_contacts(&err);
 if (err.code != 0) {
     fprintf(stderr, "Error %d: %s\n", err.code, err.message);
@@ -311,61 +324,46 @@ colliding.
 
 An enum whose variants declare `fields` is a *rich* (algebraic) enum, a sum
 type with associated data. Unlike a plain C-style enum (a bare `int32_t`
-discriminant), a rich enum crosses the ABI as an **opaque object pointer**,
-exactly like a struct: the producer owns the payload and the consumer holds a
-handle. A plain `_Tag` enum names the discriminants, then constructors, a tag
-reader, per-variant getters, and a destructor operate on the handle. From the
-`shapes` sample (`Shape` = `Empty | Circle{radius} | Rectangle{width,height} |
-Labeled{label,count}`):
+discriminant), a rich enum crosses the ABI as a serialized **value buffer**:
+an `i32` tag (the variant's declared discriminant) followed by the active
+variant's fields in declaration order. No per-enum C symbols are generated;
+the consumer packs and unpacks the bytes. From the `shapes` sample
+(`Shape` = `Empty | Circle{radius} | Rectangle{width,height} |
+Labeled{label,count}`), a function taking and returning a `Shape` looks
+like any other buffered call:
 
 ```c
-typedef enum {
-    weaveffi_shapes_Shape_Empty = 0,
-    weaveffi_shapes_Shape_Circle = 1,
-    weaveffi_shapes_Shape_Rectangle = 2,
-    weaveffi_shapes_Shape_Labeled = 3
-} weaveffi_shapes_Shape_Tag;
-
-typedef struct weaveffi_shapes_Shape weaveffi_shapes_Shape;
-
-int32_t weaveffi_shapes_Shape_tag(const weaveffi_shapes_Shape* self);
-
-weaveffi_shapes_Shape* weaveffi_shapes_Shape_Empty_new(weaveffi_error* out_err);
-weaveffi_shapes_Shape* weaveffi_shapes_Shape_Circle_new(double radius, weaveffi_error* out_err);
-weaveffi_shapes_Shape* weaveffi_shapes_Shape_Rectangle_new(float width, float height, weaveffi_error* out_err);
-weaveffi_shapes_Shape* weaveffi_shapes_Shape_Labeled_new(const char* label, uint8_t count, weaveffi_error* out_err);
-
-double weaveffi_shapes_Shape_Circle_get_radius(const weaveffi_shapes_Shape* self);
-float weaveffi_shapes_Shape_Rectangle_get_width(const weaveffi_shapes_Shape* self);
-float weaveffi_shapes_Shape_Rectangle_get_height(const weaveffi_shapes_Shape* self);
-const char* weaveffi_shapes_Shape_Labeled_get_label(const weaveffi_shapes_Shape* self);
-uint8_t weaveffi_shapes_Shape_Labeled_get_count(const weaveffi_shapes_Shape* self);
-
-void weaveffi_shapes_Shape_destroy(weaveffi_shapes_Shape* self);
+/* scale(shape: Shape, factor: f64) -> Shape */
+const uint8_t* weaveffi_shapes_scale(
+    const uint8_t* shape_ptr, size_t shape_len,
+    double factor,
+    size_t* out_len,
+    weaveffi_error* out_err);
 ```
 
-Read `_tag`, then call only the matching variant's getters. A getter that
-returns a `const char*` hands back Rust-owned memory to free with
-`weaveffi_free_string`:
+To build a `Circle{radius: 2.0}`, encode the tag and the payload
+little-endian per the
+[value-buffer encoding](../reference/value-buffers.md); to read a result,
+decode the leading `i32` tag and then the matching variant's fields:
 
 ```c
-weaveffi_error err = {0, NULL};
-weaveffi_shapes_Shape* shape = weaveffi_shapes_Shape_Circle_new(2.0, &err);
+weaveffi_error err = {0};
 
-if (weaveffi_shapes_Shape_tag(shape) == weaveffi_shapes_Shape_Circle) {
-    printf("radius = %f\n", weaveffi_shapes_Shape_Circle_get_radius(shape));
-}
+/* Encode Circle (tag 1) with radius 2.0. */
+uint8_t shape[12];
+int32_t tag = 1;
+double radius = 2.0;
+memcpy(shape, &tag, 4);
+memcpy(shape + 4, &radius, 8);
 
-const char* text = weaveffi_shapes_describe(shape, &err);
-printf("%s\n", text);
-weaveffi_free_string(text);
-
-weaveffi_shapes_Shape_destroy(shape);
+size_t out_len = 0;
+const uint8_t* scaled = weaveffi_shapes_scale(shape, sizeof shape, 3.0, &out_len, &err);
+/* decode the returned tag and fields from `scaled` ... */
+weaveffi_free_bytes((uint8_t*)scaled, out_len);
 ```
 
-The consumer owns every `weaveffi_shapes_Shape*` returned by a constructor or by
-a function such as `weaveffi_shapes_scale`; release each one with
-`weaveffi_shapes_Shape_destroy`.
+The consumer owns every buffer a function returns; release each one with
+`weaveffi_free_bytes`. Buffers passed in stay owned by the caller.
 
 ## Build instructions
 
@@ -410,8 +408,8 @@ across the boundary must be freed by the consumer with the matching
 helper:
 
 ```c
-const char* name = weaveffi_contacts_Contact_get_name(contact);
-printf("Name: %s\n", name);
+const char* name = weaveffi_contacts_greet("Alice", &err);
+printf("%s\n", name);
 weaveffi_free_string(name);
 
 size_t len;
@@ -419,9 +417,12 @@ const uint8_t* data = weaveffi_storage_get_data(&len, &err);
 weaveffi_free_bytes((uint8_t*)data, len);
 ```
 
-For struct handles, call the matching `_destroy` symbol when the
-consumer is done. Borrowed parameters (`const T*`, `string`/`bytes`
-inputs) remain owned by the caller for the duration of the call only.
+Returned value buffers (structs, rich enums, optionals, lists, maps)
+follow the bytes rule: decode, then free once with
+`weaveffi_free_bytes(ptr, out_len)`. For interface objects, call the
+matching `_destroy` symbol when the consumer is done. Borrowed parameters
+(`const T*`, `string`/`bytes` inputs, buffered `(ptr, len)` pairs) remain
+owned by the caller for the duration of the call only.
 
 ## Callbacks and listeners
 
@@ -459,7 +460,7 @@ static void on_message(const char* message, void* context) {
     (*count)++;
 }
 
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 int count = 0;
 uint64_t id = weaveffi_events_register_message_listener(on_message, &count);
 weaveffi_events_send_message("hello", &err);   /* fires the listener */
@@ -474,10 +475,12 @@ weaveffi_error* err, <result slots>)`, and a launcher with the
 `_async` suffix. From the `async-demo` sample:
 
 ```c
+/* run_task returns a TaskResult record: a buffered async result. */
 typedef void (*weaveffi_tasks_run_task_callback)(
     void* context,
     weaveffi_error* err,
-    weaveffi_tasks_TaskResult* result);
+    const uint8_t* result_ptr,
+    size_t result_len);
 
 void weaveffi_tasks_run_task_async(
     const char* name,
@@ -490,14 +493,14 @@ exactly once, with either a result or a populated error, from the
 producer's worker thread.
 
 Ownership inside the callback follows the async contract. Result
-buffers (strings, bytes, arrays, map buffers, boxed optional scalars)
-are borrowed: they stay owned by the producer and are valid only for
-the callback's duration, so copy anything you need before returning
-and don't free them. Owned-object results (records, rich enums,
-interfaces, including optional ones) are the exception: the callback
-receives ownership of the pointer and must eventually pass it to the
-matching `_destroy`. The `err` struct is likewise borrowed; copy its
-code and message inside the callback.
+buffers (strings, bytes, and the serialized value buffers of buffered
+results) are borrowed: they stay owned by the producer and are valid
+only for the callback's duration, so copy or decode anything you need
+before returning and don't free them. Owned interface results are the
+exception: the callback receives ownership of the object pointer and
+must eventually pass it to the matching `_destroy`. The `err` struct is
+likewise borrowed; copy its code, message, and payload inside the
+callback.
 
 For `cancellable: true` functions the launcher gains a
 `weaveffi_cancel_token*` slot before the callback, and the runtime
@@ -553,7 +556,7 @@ the loop ends. Element ownership follows the usual return rules; each
 `_destroy` exactly once when done, even if iteration stopped early:
 
 ```c
-weaveffi_error err = {0, NULL};
+weaveffi_error err = {0};
 weaveffi_events_GetMessagesIterator* iter = weaveffi_events_get_messages(&err);
 const char* item = NULL;
 while (weaveffi_events_GetMessagesIterator_next(iter, &item, &err) == 1) {
@@ -563,6 +566,11 @@ while (weaveffi_events_GetMessagesIterator_next(iter, &item, &err) == 1) {
 if (err.code != 0) { /* a failing step ended the loop */ }
 weaveffi_events_GetMessagesIterator_destroy(iter);
 ```
+
+An iterator over a buffered element type (records, rich enums,
+composites) writes each element as a producer-allocated value buffer
+through `const uint8_t** out_item` plus a `size_t* out_len`; decode it,
+then free it with `weaveffi_free_bytes` per element.
 
 The higher-level targets wrap exactly these three symbols in their
 native lazy idioms; only the C surface exposes them raw.

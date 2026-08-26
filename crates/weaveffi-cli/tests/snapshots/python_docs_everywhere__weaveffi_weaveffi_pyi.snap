@@ -44,17 +44,14 @@ class Status(IntEnum):
 # Documents are persisted to disk and exposed via the public API.
 class Document:
     # Stable opaque identifier
-    @property
-    def id(self) -> int: ...
+    id: int
     # Human-readable title shown in lists
-    @property
-    def title(self) -> str: ...
+    title: str
     # Current lifecycle status
-    @property
-    def status(self) -> "Status": ...
+    status: "Status"
     # Free-form tags for grouping
-    @property
-    def tags(self) -> List[str]: ...
+    tags: List[str]
+    def __init__(self, id: int, title: str, status: "Status", tags: List[str]) -> None: ...
 
 # An ordered collection of documents.
 #

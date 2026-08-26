@@ -5,13 +5,14 @@
 // KvException IoError=1004 on an empty path, instance methods put/get/delete/
 // list_keys/count/clear, the deprecated legacy_put, the Task-returning
 // Compact settled from the producer's worker thread, and the DefaultCapacity
-// static), optional struct returns (Entry) with bytes / nullable-scalar /
-// array / dictionary getters, the fluent EntryBuilder (list + map *input*
-// marshalling), the IEnumerable-backed ListKeys iterator, the cross-module
-// KvStats.GetStats(store), the delegate + GCHandle eviction listener
-// (register -> fire synchronously on delete -> unregister), and the typed
-// KvException codes (KeyNotFound=1001). The producer cdylib is resolved by
-// absolute path via a DllImportResolver reading WEAVEFFI_LIBRARY.
+// static), the optional buffered `Entry?` return decoded into a plain value
+// class (bytes / nullable-scalar / array / dictionary properties), direct
+// value-class construction of Entry with non-empty list and map fields, the
+// IEnumerable-backed ListKeys iterator, the cross-module KvStats.GetStats
+// (Stats decoded from one value buffer), the delegate + GCHandle eviction
+// listener (register -> fire synchronously on delete -> unregister), and the
+// typed KvException codes (KeyNotFound=1001). The producer cdylib is resolved
+// by absolute path via a DllImportResolver reading WEAVEFFI_LIBRARY.
 
 using System;
 using System.Collections.Generic;
@@ -59,31 +60,32 @@ internal static class Program
         {
             var payload = new byte[] { 1, 2, 3 };
 
+            // The optional TTL crosses as a buffered `i64?` parameter.
             Expect(store.Put("alpha", payload, EntryKind.Persistent, null), "put alpha");
             Expect(store.Put("beta", payload, EntryKind.Volatile, 3600), "put beta with ttl");
             Expect(store.Count() == 2, "count == 2");
 
-            // Iterator-backed list-of-string return drained through IEnumerable.
+            // Iterator-backed list-of-string return drained through
+            // IEnumerable; the optional prefix is a buffered `string?`.
             var keys = store.ListKeys(null).OrderBy(k => k).ToList();
             Expect(keys.SequenceEqual(new[] { "alpha", "beta" }),
                 $"list_keys values (got [{string.Join(", ", keys)}])");
 
-            // Optional struct return + getters over every complex field type.
-            using (var alpha = store.Get("alpha"))
-            {
-                Expect(alpha != null, "get alpha present");
-                Expect(alpha.Id > 0, "entry id positive");
-                Expect(alpha.Key == "alpha", "entry key");
-                Expect(alpha.Value.SequenceEqual(payload), "entry value bytes");
-                Expect(alpha.ExpiresAt == null, "alpha ExpiresAt null");
-                Expect(alpha.Tags.Length == 0, "alpha tags empty");
-                Expect(alpha.Metadata.Count == 0, "alpha metadata empty");
-            }
-            using (var beta = store.Get("beta"))
-            {
-                Expect(beta != null && beta.ExpiresAt != null && beta.ExpiresAt > 0,
-                    "beta ExpiresAt present");
-            }
+            // Optional buffered `Entry?` return decoded into a plain value
+            // class covering every complex field type.
+            var alpha = store.Get("alpha");
+            Expect(alpha != null, "get alpha present");
+            Expect(alpha.Id > 0, "entry id positive");
+            Expect(alpha.Key == "alpha", "entry key");
+            Expect(alpha.Value.SequenceEqual(payload), "entry value bytes");
+            Expect(alpha.CreatedAt > 0, "entry created_at positive");
+            Expect(alpha.ExpiresAt == null, "alpha ExpiresAt null");
+            Expect(alpha.Tags.Length == 0, "alpha tags empty");
+            Expect(alpha.Metadata.Count == 0, "alpha metadata empty");
+
+            var beta = store.Get("beta");
+            Expect(beta != null && beta.ExpiresAt != null && beta.ExpiresAt > 0,
+                "beta ExpiresAt present");
 
             // Typed method error: a missing key reports KvError::KeyNotFound.
             try
@@ -98,29 +100,26 @@ internal static class Program
                 Expect(e is WeaveFFIException, "typed exception extends the brand exception");
             }
 
-            // Builder round-trips non-empty list/map inputs through the C `create`.
-            using (var built = new EntryBuilder()
-                .WithId(7)
-                .WithKey("built")
-                .WithValue(payload)
-                .WithCreatedAt(1000)
-                .WithExpiresAt(null)
-                .WithTags(new[] { "hot", "fast" })
-                .WithMetadata(new Dictionary<string, string> { ["source"] = "test", ["env"] = "prod" })
-                .Build())
-            {
-                Expect(built.Tags.OrderBy(t => t).SequenceEqual(new[] { "fast", "hot" }), "built tags");
-                Expect(built.Metadata["source"] == "test" && built.Metadata["env"] == "prod",
-                    "built metadata");
-                Expect(built.ExpiresAt == null, "built ExpiresAt null");
-            }
+            // Entry is a plain value class now (no builder, no handle):
+            // non-empty list and map fields live directly on the instance.
+            var built = new Entry(
+                7,
+                "built",
+                payload,
+                1000,
+                null,
+                new[] { "hot", "fast" },
+                new Dictionary<string, string> { ["source"] = "test", ["env"] = "prod" });
+            Expect(built.Tags.OrderBy(t => t).SequenceEqual(new[] { "fast", "hot" }), "built tags");
+            Expect(built.Metadata["source"] == "test" && built.Metadata["env"] == "prod",
+                "built metadata");
+            Expect(built.ExpiresAt == null, "built ExpiresAt null");
 
             // Cross-module call: Stats lives in kv.stats, store is a kv.Store.
-            using (var stats = KvStats.GetStats(store))
-            {
-                Expect(stats.TotalEntries == 2, "stats total entries == 2");
-                Expect(stats.ExpiredEntries == 0, "stats expired entries == 0");
-            }
+            var stats = KvStats.GetStats(store);
+            Expect(stats.TotalEntries == 2, "stats total entries == 2");
+            Expect(stats.TotalBytes == 6, "stats total bytes == 6");
+            Expect(stats.ExpiredEntries == 0, "stats expired entries == 0");
 
             // Eviction listener: delete fires the pinned delegate synchronously.
             var evicted = new List<string>();

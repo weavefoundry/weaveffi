@@ -59,24 +59,6 @@ export interface Entry {
   /** Arbitrary string-valued metadata pairs */
   metadata: Record<string, string>;
 }
-/** A single key-value entry persisted in the store */
-export interface EntryBuilder {
-  /** Stable monotonic identifier assigned on insert */
-  withId(value: number): EntryBuilder;
-  /** UTF-8 lookup key */
-  withKey(value: string): EntryBuilder;
-  /** Opaque binary payload */
-  withValue(value: Buffer): EntryBuilder;
-  /** Unix-timestamp seconds when the entry was created */
-  withCreatedAt(value: number): EntryBuilder;
-  /** Optional unix-timestamp seconds at which the entry expires */
-  withExpiresAt(value: number | null): EntryBuilder;
-  /** Free-form labels attached to the entry */
-  withTags(value: string[]): EntryBuilder;
-  /** Arbitrary string-valued metadata pairs */
-  withMetadata(value: Record<string, string>): EntryBuilder;
-  build(): Entry;
-}
 /** Persistence semantics applied to a stored entry */
 export enum EntryKind {
   /** In-memory only; lost on close */

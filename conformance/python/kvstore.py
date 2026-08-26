@@ -4,9 +4,10 @@ Full-surface drive of the generated ctypes wrapper: the `Store` interface
 (fallible `open` factory, instance methods passing the object pointer, the
 `default_capacity` static, the deprecated `legacy_put`), typed `KvError`
 subclasses (`KvError.KeyNotFound` / `KvError.IoError`) raised by throwing
-callables, optional struct returns (`Entry | None`) with bytes / optional-
-scalar / list / map getters, the fluent `EntryBuilder` (list + map *input*
-marshalling), the iterator-backed `list_keys` method, the cross-module
+callables, the optional-record return (`Entry | None`) decoded from a value
+buffer into a plain dataclass with bytes / optional-scalar / list / map
+fields, the buffered `i64?` and `string?` parameters (`ttl_seconds`,
+`prefix`), the iterator-backed `list_keys` method, the cross-module
 `get_stats` (parameter annotated as the bare local `Store`), the CFUNCTYPE
 eviction listener (register -> fire on delete -> unregister), and the
 asyncio-bridged `compact` coroutine. The generated package is placed on
@@ -43,12 +44,14 @@ def main() -> None:
     assert store.put("beta", payload, wv.EntryKind.Volatile, 3600) is True
     assert store.count() == 2
 
-    # Iterator-backed list-of-string return, with and without the prefix.
+    # Iterator-backed list-of-string return; the prefix is a buffered
+    # `string?`, exercised both absent and present.
     keys = sorted(store.list_keys(None))
     assert keys == ["alpha", "beta"], keys
     assert list(store.list_keys("al")) == ["alpha"]
 
-    # Optional struct return + getters over every complex field type.
+    # Optional-record return: one value buffer decodes to an Entry dataclass
+    # covering every complex field type.
     alpha = store.get("alpha")
     assert alpha is not None
     assert alpha.id > 0
@@ -81,21 +84,22 @@ def main() -> None:
     assert any(issubclass(w.category, DeprecationWarning) for w in caught)
     assert store.delete("legacy") is True
 
-    # Builder round-trips non-empty list/map inputs through the C `create`.
-    built = (
-        wv.EntryBuilder()
-        .with_id(7)
-        .with_key("built")
-        .with_value(payload)
-        .with_created_at(1000)
-        .with_expires_at(None)
-        .with_tags(["hot", "fast"])
-        .with_metadata({"source": "test", "env": "prod"})
-        .build()
+    # Records are plain value types now: an Entry constructs locally with
+    # native list/map/optional fields and compares by value.
+    built = wv.Entry(
+        id=7,
+        key="built",
+        value=payload,
+        created_at=1000,
+        expires_at=None,
+        tags=["hot", "fast"],
+        metadata={"source": "test", "env": "prod"},
     )
     assert set(built.tags) == {"hot", "fast"}
     assert built.metadata == {"source": "test", "env": "prod"}
     assert built.expires_at is None
+    assert built == wv.Entry(7, "built", payload, 1000, None, ["hot", "fast"],
+                             {"source": "test", "env": "prod"})
 
     # Cross-module call: get_stats lives in kv.stats and takes the parent
     # module's Store interface as a parameter.

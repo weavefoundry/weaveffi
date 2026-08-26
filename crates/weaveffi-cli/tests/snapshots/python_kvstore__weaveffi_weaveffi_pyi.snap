@@ -52,26 +52,20 @@ class EntryKind(IntEnum):
 # A single key-value entry persisted in the store
 class Entry:
     # Stable monotonic identifier assigned on insert
-    @property
-    def id(self) -> int: ...
+    id: int
     # UTF-8 lookup key
-    @property
-    def key(self) -> str: ...
+    key: str
     # Opaque binary payload
-    @property
-    def value(self) -> bytes: ...
+    value: bytes
     # Unix-timestamp seconds when the entry was created
-    @property
-    def created_at(self) -> int: ...
+    created_at: int
     # Optional unix-timestamp seconds at which the entry expires
-    @property
-    def expires_at(self) -> Optional[int]: ...
+    expires_at: Optional[int]
     # Free-form labels attached to the entry
-    @property
-    def tags(self) -> List[str]: ...
+    tags: List[str]
     # Arbitrary string-valued metadata pairs
-    @property
-    def metadata(self) -> Dict[str, str]: ...
+    metadata: Dict[str, str]
+    def __init__(self, id: int, key: str, value: bytes, created_at: int, expires_at: Optional[int], tags: List[str], metadata: Dict[str, str]) -> None: ...
 
 # An in-memory key-value store owning its entries; destroying the object releases all of its state
 class Store:
@@ -95,14 +89,12 @@ def unregister_eviction_listener(listener_id: int) -> None: ...
 # Aggregate store statistics
 class Stats:
     # Number of live entries
-    @property
-    def total_entries(self) -> int: ...
+    total_entries: int
     # Sum of all value byte lengths
-    @property
-    def total_bytes(self) -> int: ...
+    total_bytes: int
     # Number of entries past their TTL but not yet evicted
-    @property
-    def expired_entries(self) -> int: ...
+    expired_entries: int
+    def __init__(self, total_entries: int, total_bytes: int, expired_entries: int) -> None: ...
 
 # Snapshot the current store statistics
 def get_stats(store: "Store") -> "Stats": ...

@@ -1,11 +1,15 @@
 //! Node.js (N-API) binding generator for WeaveFFI.
 //!
 //! Emits a JavaScript loader plus TypeScript type definitions for the
-//! companion N-API addon. Async functions surface as `Promise`-returning
-//! functions, `iter<T>` functions surface as lazy `IterableIterator<T>`
-//! wrappers that pull one element per step, interfaces surface as JS classes
-//! over opaque native handles, and each declared error domain surfaces as an
-//! `Error` subclass extending the generic `WeaveFFIError` brand. Implements
+//! companion N-API addon. Records and rich enums are value types: they cross
+//! the ABI serialized in WeaveFFI value buffers, so records surface as plain
+//! JS objects, rich enums as tagged unions, and the loader carries a small
+//! private buffer writer/reader plus one pack and one unpack function per
+//! type. Async functions surface as `Promise`-returning functions, `iter<T>`
+//! functions surface as lazy `IterableIterator<T>` wrappers that pull one
+//! element per step, interfaces surface as JS classes over opaque native
+//! handles, and each declared error domain surfaces as an `Error` subclass
+//! extending the generic `WeaveFFIError` brand. Implements
 //! [`LanguageBackend`]; the shared driver bridges it into the generator
 //! pipeline.
 #![deny(missing_docs)]
@@ -13,26 +17,22 @@
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
-use std::collections::HashMap;
-
 use camino::Utf8Path;
-use heck::{ToLowerCamelCase, ToSnakeCase, ToUpperCamelCase};
+use heck::ToLowerCamelCase;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi;
+use weaveffi_core::abi::{self, is_buffered};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::codegen::common::{
-    emit_doc as common_emit_doc, is_c_pointer_type, DocCommentStyle,
-};
+use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::{type_name as error_type_name, ERROR_BRAND};
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
-    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
+    iterator_item_ctype, BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding,
+    FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg::{self, ResolvedPackage};
-use weaveffi_core::plan::ElemFree;
+use weaveffi_core::plan::{elem_free, ElemFree};
 use weaveffi_core::utils::{
     c_abi_struct_name, local_type_name, render_json_prelude, render_prelude, render_trailer,
     wrapper_name, CommentStyle,
@@ -390,8 +390,7 @@ fn js_param_name(name: &str) -> String {
 
 /// The addon-internal JS export base of an interface member
 /// (`{Interface}_{member}`). These names are wiring between the addon and the
-/// generated classes, not public API, so they keep the raw member spelling
-/// exactly like the rich-enum helper exports.
+/// generated classes, not public API, so they keep the raw member spelling.
 fn iface_member_base(iface: &str, member: &str) -> String {
     format!("{iface}_{member}")
 }
@@ -403,77 +402,31 @@ fn js_str_literal(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn c_elem_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
-    match ty {
-        TypeRef::I8 => "int8_t".into(),
-        TypeRef::I16 => "int16_t".into(),
-        TypeRef::I32 => "int32_t".into(),
-        TypeRef::I64 => "int64_t".into(),
-        TypeRef::U8 => "uint8_t".into(),
-        TypeRef::U16 => "uint16_t".into(),
-        TypeRef::U32 => "uint32_t".into(),
-        TypeRef::U64 => "uint64_t".into(),
-        TypeRef::F32 => "float".into(),
-        TypeRef::F64 => "double".into(),
-        TypeRef::Bool => "bool".into(),
-        // A generic `handle` is an opaque integer; a typed `handle<T>` is the C
-        // ABI struct pointer for T (same lowering as a struct value), so it must
-        // carry T's owner-qualified symbol, not the generic integer type.
-        TypeRef::Handle => "weaveffi_handle_t".into(),
-        TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        // Records, rich enums, and interfaces share the opaque-pointer
-        // lowering; only the ownership convention differs, which element
-        // contexts don't touch.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
-            format!("{}*", c_abi_struct_name(s, module, prefix))
-        }
-        TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            c_elem_type(inner, module, prefix)
-        }
-        TypeRef::Map(_, _) => "void*".into(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+/// The C return-type spelling of `ty` at a call site. Buffered values render
+/// as `const uint8_t*` (the encoded buffer); an iterator launcher's handle is
+/// held as `void*` so the shared state cell can adopt it.
+fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
+    if matches!(ty, TypeRef::Iterator(_)) {
+        return "void*".into();
     }
+    abi::lower_return(ty, module).ret.render_c(prefix)
 }
 
-fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
+/// The bare C type of a scalar (or C-enum-free leaf) parameter temporary.
+fn c_scalar_type(ty: &TypeRef) -> &'static str {
     match ty {
-        TypeRef::I8 => "int8_t".into(),
-        TypeRef::I16 => "int16_t".into(),
-        TypeRef::I32 => "int32_t".into(),
-        TypeRef::I64 => "int64_t".into(),
-        TypeRef::U8 => "uint8_t".into(),
-        TypeRef::U16 => "uint16_t".into(),
-        TypeRef::U32 => "uint32_t".into(),
-        TypeRef::U64 => "uint64_t".into(),
-        TypeRef::F32 => "float".into(),
-        TypeRef::F64 => "double".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "const char*".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "const uint8_t*".into(),
-        TypeRef::Handle => "weaveffi_handle_t".into(),
-        TypeRef::TypedHandle(s) => format!("{}*", c_abi_struct_name(s, module, prefix)),
-        // A returned interface transfers ownership of a new object reference;
-        // the pointer spelling matches a record return.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
-            format!("{}*", c_abi_struct_name(s, module, prefix))
-        }
-        TypeRef::Enum(e) => format!("{prefix}_{module}_{e}"),
-        TypeRef::Optional(inner) => {
-            // Pointer returns stay nullable pointers (null = none); scalar
-            // returns are boxed by the producer, matching the ABI lowering.
-            if is_c_pointer_type(inner) {
-                c_ret_type_str(inner, module, prefix)
-            } else {
-                format!("{}*", c_elem_type(inner, module, prefix))
-            }
-        }
-        TypeRef::List(inner) => format!("{}*", c_elem_type(inner, module, prefix)),
-        TypeRef::Map(_, _) => "void".into(),
-        TypeRef::Iterator(_) => "void*".into(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        TypeRef::I8 => "int8_t",
+        TypeRef::I16 => "int16_t",
+        TypeRef::I32 => "int32_t",
+        TypeRef::I64 => "int64_t",
+        TypeRef::U8 => "uint8_t",
+        TypeRef::U16 => "uint16_t",
+        TypeRef::U32 => "uint32_t",
+        TypeRef::U64 => "uint64_t",
+        TypeRef::F32 => "float",
+        TypeRef::F64 => "double",
+        TypeRef::Bool => "bool",
+        _ => unreachable!("not a scalar type"),
     }
 }
 
@@ -484,12 +437,9 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
         TypeRef::I8 | TypeRef::I16 | TypeRef::I32 | TypeRef::Enum(_) => "napi_get_value_int32",
         TypeRef::U8 | TypeRef::U16 | TypeRef::U32 => "napi_get_value_uint32",
         // u64 mirrors i64/handle: read as a 64-bit int, reinterpreted as needed.
-        TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::Handle
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_) => "napi_get_value_int64",
+        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            "napi_get_value_int64"
+        }
         // f32 is read as a double then narrowed to float at the use site.
         TypeRef::F32 | TypeRef::F64 => "napi_get_value_double",
         TypeRef::Bool => "napi_get_value_bool",
@@ -500,8 +450,8 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
 /// The C type of the temporary an N-API getter writes into for a scalar that is
 /// narrower than the getter's natural width. N-API only exposes 32/64-bit int
 /// and `double` getters, so `i8/i16/u8/u16/f32` must be read into a wider
-/// temporary and then narrowed with an explicit cast to the real ABI type
-/// returned by [`c_elem_type`]; `u64` is read as `int64_t` then reinterpreted.
+/// temporary and then narrowed with an explicit cast to the real ABI type;
+/// `u64` is read as `int64_t` then reinterpreted.
 fn napi_read_tmp_type(ty: &TypeRef) -> &'static str {
     match ty {
         TypeRef::I8 | TypeRef::I16 => "int32_t",
@@ -512,22 +462,15 @@ fn napi_read_tmp_type(ty: &TypeRef) -> &'static str {
     }
 }
 
-/// Whether `ty` is one of the numeric primitives narrower or wider than what an
-/// N-API number getter writes directly, requiring a temporary + cast on read.
-fn needs_narrowing_read(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::I8 | TypeRef::I16 | TypeRef::U8 | TypeRef::U16 | TypeRef::U64 | TypeRef::F32
-    )
-}
-
 /// Emit `{prefix}_napi_error_value`, the shared constructor of the JS error
 /// object every failure path produces: a plain `Error` carrying the numeric
-/// ABI code as a `code` property. The JS loader rebrands it as the generic
-/// `WeaveFFIError` or the module's typed domain class.
+/// ABI code as a `code` property and, when the producer attached one, the
+/// structured payload buffer as a `payload` property. The JS loader rebrands
+/// it as the generic `WeaveFFIError` or the module's typed domain class and
+/// decodes the payload fields there.
 fn render_error_value_helper_c(out: &mut String, prefix: &str) {
     out.push_str(&format!(
-        "static napi_value {prefix}_napi_error_value(napi_env env, int32_t code, const char* message) {{\n"
+        "static napi_value {prefix}_napi_error_value(napi_env env, int32_t code, const char* message, const uint8_t* payload_ptr, size_t payload_len) {{\n"
     ));
     out.push_str("    napi_value msg;\n");
     out.push_str(
@@ -538,17 +481,26 @@ fn render_error_value_helper_c(out: &mut String, prefix: &str) {
     out.push_str("    napi_value code_val;\n");
     out.push_str("    napi_create_int32(env, code, &code_val);\n");
     out.push_str("    napi_set_named_property(env, err, \"code\", code_val);\n");
+    out.push_str("    if (payload_ptr != NULL) {\n");
+    out.push_str("        napi_value payload_val;\n");
+    out.push_str(
+        "        napi_create_buffer_copy(env, payload_len, payload_ptr, NULL, &payload_val);\n",
+    );
+    out.push_str("        napi_set_named_property(env, err, \"payload\", payload_val);\n");
+    out.push_str("    }\n");
     out.push_str("    return err;\n");
     out.push_str("}\n\n");
 }
 
-/// Emit the post-call `out_err` check: throw the code-carrying JS error and
-/// bail on a non-zero slot. The JS loader maps the `code` property to the
-/// module's typed domain class (throwing callables) or the generic brand.
+/// Emit the post-call `out_err` check: throw the code-carrying JS error (with
+/// the borrowed payload buffer copied in) and bail on a non-zero slot, then
+/// clear the error, which releases both the message and the payload. The JS
+/// loader maps the `code` property to the module's typed domain class
+/// (throwing callables) or the generic brand.
 fn emit_error_check_c(out: &mut String, prefix: &str) {
     out.push_str("  if (err.code != 0) {\n");
     out.push_str(&format!(
-        "    napi_throw(env, {prefix}_napi_error_value(env, err.code, err.message));\n"
+        "    napi_throw(env, {prefix}_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));\n"
     ));
     out.push_str("    weaveffi_error_clear(&err);\n");
     out.push_str("    return NULL;\n");
@@ -587,22 +539,21 @@ fn emit_iter_state_read(out: &mut String, prefix: &str) {
 /// per-step fault then throws the code-carrying error, which the JS wrapper
 /// maps per the callable's error strategy. A produced element is converted
 /// and released per its element plan: strings are freed with
-/// `weaveffi_free_string` after the JS string is created, record pointers are
-/// adopted by the struct-object materialization (which destroys them), and
-/// rich-enum pointers surface as owned raw handles the JS class adopts.
+/// `weaveffi_free_string` after the JS string is created, and byte or
+/// buffered elements are copied into a JS `Buffer` and released with
+/// `weaveffi_free_bytes` (the JS wrapper decodes buffered elements).
 fn render_iterator_napi_fns(
     out: &mut String,
     f: &FnBinding,
     ib: &IteratorBinding,
     module: &str,
     prefix: &str,
-    structs: &HashMap<String, StructBinding>,
 ) {
     let c_name = &f.c_base;
     let tag = &ib.iter_tag;
     let next_sym = &ib.next.symbol;
     let destroy_sym = &ib.destroy_symbol;
-    let proto = ib.protocol(f, module, prefix);
+    let ef = elem_free(&ib.elem);
 
     // Finalizer: reclaim abandoned iterators when the external is collected.
     out.push_str(&format!(
@@ -630,17 +581,23 @@ fn render_iterator_napi_fns(
     out.push_str("    napi_get_undefined(env, &ret);\n");
     out.push_str("    return ret;\n");
     out.push_str("  }\n");
-    let et = c_elem_type(&ib.elem, module, prefix);
+    let et = iterator_item_ctype(&ib.elem, module).render_c(prefix);
     out.push_str(&format!("  {et} iter_item;\n"));
+    if ef == ElemFree::Bytes {
+        out.push_str("  size_t iter_item_len = 0;\n");
+    }
     out.push_str("  weaveffi_error iter_err = {0};\n");
-    out.push_str(&format!(
-        "  if (!{next_sym}(({tag}*)state->iter, &iter_item, &iter_err)) {{\n"
-    ));
+    let next_args = if ef == ElemFree::Bytes {
+        format!("({tag}*)state->iter, &iter_item, &iter_item_len, &iter_err")
+    } else {
+        format!("({tag}*)state->iter, &iter_item, &iter_err")
+    };
+    out.push_str(&format!("  if (!{next_sym}({next_args})) {{\n"));
     out.push_str(&format!("    {destroy_sym}(({tag}*)state->iter);\n"));
     out.push_str("    state->iter = NULL;\n");
     out.push_str("    if (iter_err.code != 0) {\n");
     out.push_str(&format!(
-        "      napi_throw(env, {prefix}_napi_error_value(env, iter_err.code, iter_err.message));\n"
+        "      napi_throw(env, {prefix}_napi_error_value(env, iter_err.code, iter_err.message, iter_err.payload_ptr, iter_err.payload_len));\n"
     ));
     out.push_str("      weaveffi_error_clear(&iter_err);\n");
     out.push_str("      return NULL;\n");
@@ -648,36 +605,21 @@ fn render_iterator_napi_fns(
     out.push_str("    napi_get_undefined(env, &ret);\n");
     out.push_str("    return ret;\n");
     out.push_str("  }\n");
-    match &ib.elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+    match ef {
+        ElemFree::String => {
             out.push_str(
                 "  napi_create_string_utf8(env, iter_item ? iter_item : \"\", NAPI_AUTO_LENGTH, &ret);\n",
             );
-            if matches!(proto.elem_free, ElemFree::String) {
-                out.push_str("  weaveffi_free_string((char*)iter_item);\n");
-            }
+            out.push_str("  weaveffi_free_string((char*)iter_item);\n");
         }
-        TypeRef::Record(name) => {
-            emit_struct_to_object(
-                out,
-                "env",
-                name,
-                "iter_item",
-                "ret",
-                module,
-                prefix,
-                structs,
-                "  ",
-                true,
-            );
+        ElemFree::Bytes => {
+            out.push_str("  napi_create_buffer_copy(env, iter_item_len, iter_item, NULL, &ret);\n");
+            out.push_str("  weaveffi_free_bytes((uint8_t*)iter_item, iter_item_len);\n");
         }
-        TypeRef::RichEnum(_) => {
-            out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)iter_item, &ret);\n");
-        }
-        other => {
+        ElemFree::None => {
             out.push_str(&format!(
                 "  {}\n",
-                napi_create_leaf("env", other, "iter_item", "ret")
+                napi_create_leaf("env", &ib.elem, "iter_item", "ret")
             ));
         }
     }
@@ -706,7 +648,6 @@ fn render_iterator_napi_fns(
 /// `args[0]`. An iterator-returning callable additionally exports its
 /// per-iterator `next`/`destroy` entry points under `{js_name}_iterNext` and
 /// `{js_name}_iterDestroy`, which the JS wrapper drives lazily.
-#[allow(clippy::too_many_arguments)]
 fn render_callable_napi(
     out: &mut String,
     all_exports: &mut Vec<(String, String)>,
@@ -714,17 +655,16 @@ fn render_callable_napi(
     js_name: String,
     module: &str,
     prefix: &str,
-    structs: &HashMap<String, StructBinding>,
     self_tag: Option<&str>,
 ) {
     let c_name = &f.c_base;
     let napi_name = format!("Napi_{c_name}");
 
     if f.is_async {
-        render_async_machinery(out, f, c_name, module, prefix, structs);
+        render_async_machinery(out, f, c_name, module, prefix);
     }
     if let CallShape::Iterator(ib) = &f.shape {
-        render_iterator_napi_fns(out, f, ib, module, prefix, structs);
+        render_iterator_napi_fns(out, f, ib, module, prefix);
         all_exports.push((
             format!("{js_name}_iterNext"),
             format!("Napi_{}", ib.next.symbol),
@@ -742,7 +682,7 @@ fn render_callable_napi(
     if f.is_async {
         render_async_napi_body(out, f, module, prefix, self_tag);
     } else {
-        render_napi_body(out, f, module, prefix, structs, self_tag);
+        render_napi_body(out, f, module, prefix, self_tag);
     }
     out.push_str("}\n\n");
 }
@@ -755,13 +695,13 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
     ));
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
-    let structs = struct_registry(model);
 
-    // Every error path (sync throws, async rejections, rich-enum constructor
-    // failures) funnels through one code-carrying error constructor.
-    let has_error_paths = model.modules.iter().any(|m| {
-        !m.functions.is_empty() || !m.interfaces.is_empty() || m.enums.iter().any(|e| e.is_rich())
-    });
+    // Every error path (sync throws, iterator faults, async rejections)
+    // funnels through one code-and-payload-carrying error constructor.
+    let has_error_paths = model
+        .modules
+        .iter()
+        .any(|m| !m.functions.is_empty() || !m.interfaces.is_empty());
     if has_error_paths {
         render_error_value_helper_c(&mut out, prefix);
     }
@@ -776,27 +716,13 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
     }
 
     for m in &model.modules {
-        // Rich (algebraic) enums cross the ABI as opaque objects, so they get a
-        // struct-like native surface: a tag reader, per-variant constructors and
-        // field getters, and a destructor. (Plain C-style enums cross by value
-        // as int32 and need no native helpers.)
-        for e in &m.enums {
-            if e.is_rich() {
-                render_rich_enum_napi_fns(
-                    &mut out,
-                    e,
-                    &m.path,
-                    prefix,
-                    strip_module_prefix,
-                    &structs,
-                    &mut all_exports,
-                );
-            }
-        }
-        // Interfaces get one native entry point per member (constructors and
-        // statics marshal like free functions; methods additionally read the
-        // wrapped pointer from the leading argument) plus the destructor the
-        // JS class's disposal path calls.
+        // Records and rich enums are value types crossing the ABI serialized
+        // in value buffers, so they need no native helpers here; the JS
+        // loader packs and unpacks them. Interfaces get one native entry
+        // point per member (constructors and statics marshal like free
+        // functions; methods additionally read the wrapped pointer from the
+        // leading argument) plus the destructor the JS class's disposal path
+        // calls.
         for i in &m.interfaces {
             for f in i.constructors.iter().chain(i.statics.iter()) {
                 render_callable_napi(
@@ -810,7 +736,6 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
                     ),
                     &m.path,
                     prefix,
-                    &structs,
                     None,
                 );
             }
@@ -826,7 +751,6 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
                     ),
                     &m.path,
                     prefix,
-                    &structs,
                     Some(&i.c_tag),
                 );
             }
@@ -850,7 +774,7 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
         for cb in &used_callbacks {
             render_cb_payload_struct(&mut out, cb, prefix);
             render_cb_tramp(&mut out, cb, prefix);
-            render_cb_calljs(&mut out, cb, prefix);
+            render_cb_calljs(&mut out, cb);
         }
         for l in &m.listeners {
             let Some(cb) = m.callback(&l.event_callback) else {
@@ -882,7 +806,6 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
                 js_fn_name(&m.path, &f.name, strip_module_prefix),
                 &m.path,
                 prefix,
-                &structs,
                 None,
             );
         }
@@ -912,36 +835,9 @@ fn render_addon_c(model: &BindingModel, strip_module_prefix: bool, input_basenam
     out
 }
 
-// --- Rich (algebraic) enum support -----------------------------------------
-//
-// A rich enum crosses the ABI exactly like a struct: an opaque object pointer
-// surfaced to JS as the same int64 handle structs use. The JS-export base names
-// below are shared by the addon (which exports the native helpers) and the JS
-// loader (whose `Shape` class calls them), so both halves agree by construction.
-
-/// `{Enum}_tag`, the JS-export base for a rich enum's discriminant reader.
-fn rich_tag_base(enum_name: &str) -> String {
-    format!("{enum_name}_tag")
-}
-
-/// `{Enum}_{variant}_new`, the JS-export base for a variant constructor.
-fn rich_ctor_base(enum_name: &str, variant: &str) -> String {
-    format!("{enum_name}_{}_new", variant.to_snake_case())
-}
-
-/// `{Enum}_{variant}_get_{field}`, the JS-export base for a field getter.
-fn rich_getter_base(enum_name: &str, variant: &str, field: &str) -> String {
-    format!("{enum_name}_{}_get_{field}", variant.to_snake_case())
-}
-
-/// `{Enum}_destroy`, the JS-export base for the destructor.
-fn rich_destroy_base(enum_name: &str) -> String {
-    format!("{enum_name}_destroy")
-}
-
 /// Read `args[0]` as the opaque handle and bind it to a typed `self` pointer.
-/// Shared by the tag reader, every field getter, and the destructor.
-fn emit_rich_self_read(out: &mut String, c_tag: &str) {
+/// Used by the interface destructor entry point.
+fn emit_self_handle_read(out: &mut String, c_tag: &str) {
     out.push_str("  size_t argc = 1;\n");
     out.push_str("  napi_value args[1];\n");
     out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
@@ -949,140 +845,6 @@ fn emit_rich_self_read(out: &mut String, c_tag: &str) {
     out.push_str("  napi_get_value_int64(env, args[0], &self_raw);\n");
     out.push_str(&format!(
         "  {c_tag}* self = ({c_tag}*)(intptr_t)self_raw;\n"
-    ));
-}
-
-/// Emit the native helpers for one rich enum and register their JS exports:
-/// the tag reader, one constructor per variant, one getter per variant field,
-/// and the destructor. Constructors reuse [`emit_param`] (the struct-create
-/// marshalling) for their arguments; getters reuse [`emit_struct_field_to_napi`]
-/// (the struct-field marshalling), so strings/numerics/bytes/lists are
-/// materialized identically to struct fields.
-#[allow(clippy::too_many_arguments)]
-fn render_rich_enum_napi_fns(
-    out: &mut String,
-    e: &EnumBinding,
-    module: &str,
-    prefix: &str,
-    strip: bool,
-    structs: &HashMap<String, StructBinding>,
-    all_exports: &mut Vec<(String, String)>,
-) {
-    let Some(rich) = &e.rich else {
-        return;
-    };
-    let c_tag = &e.c_tag;
-    let name = &e.name;
-
-    // tag reader: int32 discriminant of the active variant.
-    let napi_tag = format!("Napi_{}", rich.tag_symbol);
-    out.push_str(&format!(
-        "static napi_value {napi_tag}(napi_env env, napi_callback_info info) {{\n"
-    ));
-    emit_rich_self_read(out, c_tag);
-    out.push_str("  napi_value ret;\n");
-    out.push_str(&format!(
-        "  napi_create_int32(env, {}(self), &ret);\n",
-        rich.tag_symbol
-    ));
-    out.push_str("  return ret;\n}\n\n");
-    all_exports.push((wrapper_name(module, &rich_tag_base(name), strip), napi_tag));
-
-    // One constructor per variant: read each variant field as a JS argument
-    // (reusing the struct-create marshalling), call `{Enum}_{V}_new`, and return
-    // the resulting owned pointer as the int64 handle.
-    for v in &rich.variants {
-        let napi_ctor = format!("Napi_{}", v.create.symbol);
-        out.push_str(&format!(
-            "static napi_value {napi_ctor}(napi_env env, napi_callback_info info) {{\n"
-        ));
-        let n = v.fields.len();
-        if n > 0 {
-            out.push_str(&format!("  size_t argc = {n};\n"));
-            out.push_str(&format!("  napi_value args[{n}];\n"));
-            out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
-        } else {
-            out.push_str("  size_t argc = 0;\n");
-            out.push_str("  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);\n");
-        }
-        let mut c_args: Vec<String> = Vec::new();
-        let mut cleanups: Vec<String> = Vec::new();
-        for (i, f) in v.fields.iter().enumerate() {
-            emit_param(
-                out,
-                &mut c_args,
-                &mut cleanups,
-                &f.ty,
-                &f.name,
-                i,
-                module,
-                prefix,
-            );
-        }
-        out.push_str("  weaveffi_error err = {0};\n");
-        c_args.push("&err".to_string());
-        out.push_str(&format!(
-            "  {c_tag}* result = {}({});\n",
-            v.create.symbol,
-            c_args.join(", ")
-        ));
-        for cleanup in &cleanups {
-            out.push_str(cleanup);
-        }
-        emit_error_check_c(out, prefix);
-        out.push_str("  napi_value ret;\n");
-        out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
-        out.push_str("  return ret;\n}\n\n");
-        all_exports.push((
-            wrapper_name(module, &rich_ctor_base(name, &v.name), strip),
-            napi_ctor,
-        ));
-    }
-
-    // One getter per variant field, namespaced by variant. Reuses the struct
-    // field marshalling, so the active variant's payload surfaces exactly like
-    // a struct field would (string decode + free, Buffer copy, list/array, …).
-    for v in &rich.variants {
-        for f in &v.fields {
-            let napi_getter = format!("Napi_{}", f.getter_symbol);
-            out.push_str(&format!(
-                "static napi_value {napi_getter}(napi_env env, napi_callback_info info) {{\n"
-            ));
-            emit_rich_self_read(out, c_tag);
-            out.push_str("  napi_value ret;\n");
-            emit_struct_field_to_napi(
-                out,
-                "env",
-                &f.ty,
-                &f.getter_symbol,
-                "self",
-                "ret",
-                module,
-                prefix,
-                structs,
-                "  ",
-            );
-            out.push_str("  return ret;\n}\n\n");
-            all_exports.push((
-                wrapper_name(module, &rich_getter_base(name, &v.name, &f.name), strip),
-                napi_getter,
-            ));
-        }
-    }
-
-    // Destructor: free the opaque object behind the handle.
-    let napi_destroy = format!("Napi_{}", rich.destroy_symbol);
-    out.push_str(&format!(
-        "static napi_value {napi_destroy}(napi_env env, napi_callback_info info) {{\n"
-    ));
-    emit_rich_self_read(out, c_tag);
-    out.push_str(&format!("  {}(self);\n", rich.destroy_symbol));
-    out.push_str("  napi_value ret;\n");
-    out.push_str("  napi_get_undefined(env, &ret);\n");
-    out.push_str("  return ret;\n}\n\n");
-    all_exports.push((
-        wrapper_name(module, &rich_destroy_base(name), strip),
-        napi_destroy,
     ));
 }
 
@@ -1094,7 +856,7 @@ fn render_interface_destroy_napi(out: &mut String, i: &InterfaceBinding) {
     out.push_str(&format!(
         "static napi_value {napi_destroy}(napi_env env, napi_callback_info info) {{\n"
     ));
-    emit_rich_self_read(out, &i.c_tag);
+    emit_self_handle_read(out, &i.c_tag);
     out.push_str(&format!("  {}(self);\n", i.destroy_symbol));
     out.push_str("  napi_value ret;\n");
     out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -1138,8 +900,10 @@ fn cb_slot_decls(cb: &CallbackBinding, prefix: &str) -> Vec<String> {
 
 /// The deep-copy payload carried from the producer thread to the JS thread.
 /// Every pointer field is owned by the payload (strdup/memcpy in the
-/// trampoline, freed in the call-js marshaller); struct/handle pointers are
-/// shallow-copied and surface as numeric handles.
+/// trampoline, freed in the call-js marshaller). Buffered arguments arrive as
+/// borrowed `ptr` + `len` pairs valid only for the dispatch, so their bytes
+/// are copied exactly like a `bytes` argument; the JS loader decodes the
+/// copied buffer before invoking the user callback.
 fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str) {
     let mut w = CodeWriter::four_space();
     w.block(
@@ -1149,6 +913,11 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
             for p in &cb.params {
                 let slots = abi::lower_param(&p.name, &p.ty, "", false);
                 let n0 = &slots[0].name;
+                if is_buffered(&p.ty) || matches!(p.ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+                    w.line(format!("uint8_t* {n0};"));
+                    w.line(format!("size_t {};", slots[1].name));
+                    continue;
+                }
                 match &p.ty {
                     TypeRef::I8
                     | TypeRef::I16
@@ -1168,44 +937,21 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
                     TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                         w.line(format!("char* {n0};"));
                     }
-                    TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                        w.line(format!("uint8_t* {n0};"));
-                        w.line(format!("size_t {};", slots[1].name));
-                    }
-                    TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
+                    TypeRef::TypedHandle(_) => {
                         w.line(format!("void* {n0};"));
                     }
-                    TypeRef::Optional(inner) => match inner.as_ref() {
-                        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                            w.line(format!("char* {n0};"));
-                        }
-                        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                            w.line(format!("int {n0}_has;"));
-                            w.line(format!("uint8_t* {n0};"));
-                            w.line(format!("size_t {};", slots[1].name));
-                        }
-                        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
-                            w.line(format!("void* {n0};"));
-                        }
-                        other => {
-                            w.line(format!("int {n0}_has;"));
-                            w.line(format!(
-                                "{} {n0};",
-                                abi::element_ctype(other, "").render_c(prefix)
-                            ));
-                        }
-                    },
-                    TypeRef::List(inner) => {
-                        let elem = elem_payload_ctype(inner, prefix);
-                        w.line(format!("{elem}* {n0};"));
-                        w.line(format!("size_t {};", slots[1].name));
+                    // Only `Interface?` reaches here (every other optional is
+                    // buffered): a nullable borrowed object pointer.
+                    TypeRef::Optional(_) => {
+                        w.line(format!("void* {n0};"));
                     }
-                    TypeRef::Map(k, v) => {
-                        let kt = elem_payload_ctype(k, prefix);
-                        let vt = elem_payload_ctype(v, prefix);
-                        w.line(format!("{kt}* {n0};"));
-                        w.line(format!("{vt}* {};", slots[1].name));
-                        w.line(format!("size_t {};", slots[2].name));
+                    TypeRef::Record(_)
+                    | TypeRef::RichEnum(_)
+                    | TypeRef::List(_)
+                    | TypeRef::Map(_, _)
+                    | TypeRef::Bytes
+                    | TypeRef::BorrowedBytes => {
+                        unreachable!("buffered/bytes callback param handled above")
                     }
                     TypeRef::Iterator(_) => {
                         unreachable!("validated: iterator not a callback param")
@@ -1220,15 +966,6 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
     );
     w.blank();
     out.push_str(&w.finish());
-}
-
-/// The payload element type for list/map callback parameters. Strings own
-/// their copies (`char*`); scalar elements keep their C ABI type.
-fn elem_payload_ctype(ty: &TypeRef, prefix: &str) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "char*".into(),
-        other => abi::element_ctype(other, "").render_c(prefix),
-    }
 }
 
 /// The producer-thread trampoline: deep-copies the C arguments into a payload
@@ -1252,6 +989,14 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
     for p in &cb.params {
         let slots = abi::lower_param(&p.name, &p.ty, "", false);
         let n0 = &slots[0].name;
+        if is_buffered(&p.ty) || matches!(p.ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+            let n1 = &slots[1].name;
+            out.push_str(&format!("    p->{n1} = {n1};\n"));
+            out.push_str(&format!(
+                "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
+            ));
+            continue;
+        }
         match &p.ty {
             TypeRef::I8
             | TypeRef::I16
@@ -1271,72 +1016,15 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
             TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
                 out.push_str(&format!("    p->{n0} = {n0} ? strdup({n0}) : NULL;\n"));
             }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let n1 = &slots[1].name;
-                out.push_str(&format!("    p->{n1} = {n1};\n"));
-                out.push_str(&format!(
-                    "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
-                ));
-            }
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
+            TypeRef::TypedHandle(_) | TypeRef::Optional(_) => {
                 out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
             }
-            TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str(&format!("    p->{n0} = {n0} ? strdup({n0}) : NULL;\n"));
-                }
-                TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                    let n1 = &slots[1].name;
-                    out.push_str(&format!("    p->{n0}_has = {n0} != NULL;\n"));
-                    out.push_str(&format!("    p->{n1} = {n1};\n"));
-                    out.push_str(&format!(
-                        "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
-                    ));
-                }
-                TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
-                    out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
-                }
-                _ => {
-                    out.push_str(&format!("    p->{n0}_has = {n0} != NULL;\n"));
-                    out.push_str(&format!("    if ({n0} != NULL) p->{n0} = *{n0};\n"));
-                }
-            },
-            TypeRef::List(inner) => {
-                let n1 = &slots[1].name;
-                out.push_str(&format!("    p->{n1} = {n1};\n"));
-                match inner.as_ref() {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        out.push_str(&format!(
-                            "    if ({n0} != NULL && {n1} > 0) {{\n        p->{n0} = (char**)calloc({n1}, sizeof(char*));\n        for (size_t i = 0; i < {n1}; i++) p->{n0}[i] = {n0}[i] ? strdup({n0}[i]) : NULL;\n    }}\n"
-                        ));
-                    }
-                    _ => {
-                        out.push_str(&format!(
-                            "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = malloc({n1} * sizeof(*p->{n0})); memcpy(p->{n0}, {n0}, {n1} * sizeof(*p->{n0})); }}\n"
-                        ));
-                    }
-                }
-            }
-            TypeRef::Map(k, v) => {
-                let keys = n0;
-                let vals = &slots[1].name;
-                let len = &slots[2].name;
-                out.push_str(&format!("    p->{len} = {len};\n"));
-                for (base, ty) in [(keys, k), (vals, v)] {
-                    match ty.as_ref() {
-                        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                            out.push_str(&format!(
-                                "    if ({base} != NULL && {len} > 0) {{\n        p->{base} = (char**)calloc({len}, sizeof(char*));\n        for (size_t i = 0; i < {len}; i++) p->{base}[i] = {base}[i] ? strdup({base}[i]) : NULL;\n    }}\n"
-                            ));
-                        }
-                        _ => {
-                            out.push_str(&format!(
-                                "    if ({base} != NULL && {len} > 0) {{ p->{base} = malloc({len} * sizeof(*p->{base})); memcpy(p->{base}, {base}, {len} * sizeof(*p->{base})); }}\n"
-                            ));
-                        }
-                    }
-                }
-            }
+            TypeRef::Record(_)
+            | TypeRef::RichEnum(_)
+            | TypeRef::List(_)
+            | TypeRef::Map(_, _)
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes => unreachable!("buffered/bytes handled above"),
             TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
             TypeRef::Interface(_) => unreachable!("validated: interface not a callback param"),
             TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -1347,112 +1035,32 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
 }
 
 /// One payload field rendered to a `napi_value` in `argv[idx]` (call-js side).
-fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize, prefix: &str) {
+fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize) {
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = &slots[0].name;
     let target = format!("argv[{idx}]");
-    let _ = prefix;
+    if is_buffered(&p.ty) || matches!(p.ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+        let n1 = &slots[1].name;
+        out.push_str(&format!(
+            "        napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target});\n"
+        ));
+        return;
+    }
     match &p.ty {
-        TypeRef::I32 => out.push_str(&format!(
-            "        napi_create_int32(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::U32 => out.push_str(&format!(
-            "        napi_create_uint32(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::I64 => out.push_str(&format!(
-            "        napi_create_int64(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::F64 => out.push_str(&format!(
-            "        napi_create_double(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::I8 | TypeRef::I16 => out.push_str(&format!(
-            "        napi_create_int32(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::U8 | TypeRef::U16 => out.push_str(&format!(
-            "        napi_create_uint32(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::U64 => out.push_str(&format!(
-            "        napi_create_int64(env, (int64_t)p->{n0}, &{target});\n"
-        )),
-        TypeRef::F32 => out.push_str(&format!(
-            "        napi_create_double(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::Bool => out.push_str(&format!(
-            "        napi_get_boolean(env, p->{n0}, &{target});\n"
-        )),
-        TypeRef::Handle => out.push_str(&format!(
-            "        napi_create_int64(env, (int64_t)p->{n0}, &{target});\n"
-        )),
-        TypeRef::Enum(_) => out.push_str(&format!(
-            "        napi_create_int32(env, (int32_t)p->{n0}, &{target});\n"
-        )),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => out.push_str(&format!(
             "        napi_create_string_utf8(env, p->{n0} ? p->{n0} : \"\", NAPI_AUTO_LENGTH, &{target});\n"
         )),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            let n1 = &slots[1].name;
-            out.push_str(&format!(
-                "        napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target});\n"
-            ));
-        }
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
+        TypeRef::TypedHandle(_) => out.push_str(&format!(
             "        napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target});\n"
         )),
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => out.push_str(&format!(
-                "        if (p->{n0}) napi_create_string_utf8(env, p->{n0}, NAPI_AUTO_LENGTH, &{target}); else napi_get_null(env, &{target});\n"
-            )),
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                let n1 = &slots[1].name;
-                out.push_str(&format!(
-                    "        if (p->{n0}_has) napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target}); else napi_get_null(env, &{target});\n"
-                ));
-            }
-            TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => out.push_str(&format!(
-                "        if (p->{n0}) napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target}); else napi_get_null(env, &{target});\n"
-            )),
-            other => {
-                let leaf = payload_leaf_to_napi(other, &format!("p->{n0}"), &target);
-                out.push_str(&format!(
-                    "        if (p->{n0}_has) {{ {leaf} }} else napi_get_null(env, &{target});\n"
-                ));
-            }
-        },
-        TypeRef::List(inner) => {
-            let n1 = &slots[1].name;
-            out.push_str(&format!("        napi_create_array(env, &{target});\n"));
-            out.push_str(&format!(
-                "        for (size_t i = 0; p->{n0} != NULL && i < p->{n1}; i++) {{\n"
-            ));
-            out.push_str("            napi_value elem;\n");
-            let leaf = payload_elem_to_napi(inner, &format!("p->{n0}[i]"), "elem");
-            out.push_str(&format!("            {leaf}\n"));
-            out.push_str(&format!(
-                "            napi_set_element(env, {target}, (uint32_t)i, elem);\n"
-            ));
-            out.push_str("        }\n");
+        // Only `Interface?` reaches here: nullable object pointer.
+        TypeRef::Optional(_) => out.push_str(&format!(
+            "        if (p->{n0}) napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target}); else napi_get_null(env, &{target});\n"
+        )),
+        other => {
+            let leaf = payload_leaf_to_napi(other, &format!("p->{n0}"), &target);
+            out.push_str(&format!("        {leaf}\n"));
         }
-        TypeRef::Map(k, v) => {
-            let keys = n0;
-            let vals = &slots[1].name;
-            let len = &slots[2].name;
-            out.push_str(&format!("        napi_create_object(env, &{target});\n"));
-            out.push_str(&format!(
-                "        for (size_t i = 0; p->{keys} != NULL && p->{vals} != NULL && i < p->{len}; i++) {{\n"
-            ));
-            out.push_str("            napi_value mk; napi_value mv;\n");
-            let kc = payload_elem_to_napi(k, &format!("p->{keys}[i]"), "mk");
-            let vc = payload_elem_to_napi(v, &format!("p->{vals}[i]"), "mv");
-            out.push_str(&format!("            {kc}\n"));
-            out.push_str(&format!("            {vc}\n"));
-            out.push_str(&format!(
-                "            napi_set_property(env, {target}, mk, mv);\n"
-            ));
-            out.push_str("        }\n");
-        }
-        TypeRef::Iterator(_) => unreachable!("validated: iterator not a callback param"),
-        TypeRef::Interface(_) => unreachable!("validated: interface not a callback param"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
@@ -1474,65 +1082,23 @@ fn payload_leaf_to_napi(ty: &TypeRef, expr: &str, target: &str) -> String {
     }
 }
 
-/// One list/map element payload value to a napi_value (single statement).
-fn payload_elem_to_napi(ty: &TypeRef, expr: &str, target: &str) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!(
-            "napi_create_string_utf8(env, {expr} ? {expr} : \"\", NAPI_AUTO_LENGTH, &{target});"
-        ),
-        other => payload_leaf_to_napi(other, expr, target),
-    }
-}
-
 /// Frees one payload field after the JS call.
 fn emit_payload_free(out: &mut String, p: &ParamBinding) {
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = &slots[0].name;
-    match &p.ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!("    free(p->{n0});\n"));
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("    free(p->{n0});\n"));
-        }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes => {
-                out.push_str(&format!("    free(p->{n0});\n"));
-            }
-            _ => {}
-        },
-        TypeRef::List(inner) => {
-            let n1 = &slots[1].name;
-            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-                out.push_str(&format!(
-                    "    for (size_t i = 0; p->{n0} != NULL && i < p->{n1}; i++) free(p->{n0}[i]);\n"
-                ));
-            }
-            out.push_str(&format!("    free(p->{n0});\n"));
-        }
-        TypeRef::Map(k, v) => {
-            let keys = n0;
-            let vals = &slots[1].name;
-            let len = &slots[2].name;
-            for (base, ty) in [(keys, k), (vals, v)] {
-                if matches!(ty.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-                    out.push_str(&format!(
-                        "    for (size_t i = 0; p->{base} != NULL && i < p->{len}; i++) free(p->{base}[i]);\n"
-                    ));
-                }
-                out.push_str(&format!("    free(p->{base});\n"));
-            }
-        }
-        _ => {}
+    if is_buffered(&p.ty)
+        || matches!(
+            p.ty,
+            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::StringUtf8 | TypeRef::BorrowedStr
+        )
+    {
+        out.push_str(&format!("    free(p->{n0});\n"));
     }
 }
 
 /// The JS-thread marshaller invoked by the threadsafe function: converts the
 /// payload into JS arguments, calls the user callback, and frees the payload.
-fn render_cb_calljs(out: &mut String, cb: &CallbackBinding, prefix: &str) {
+fn render_cb_calljs(out: &mut String, cb: &CallbackBinding) {
     let payload = cb_payload_name(cb);
     out.push_str(&format!(
         "static void {}_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {{\n",
@@ -1547,7 +1113,7 @@ fn render_cb_calljs(out: &mut String, cb: &CallbackBinding, prefix: &str) {
     if argc > 0 {
         out.push_str(&format!("        napi_value argv[{argc}];\n"));
         for (i, p) in cb.params.iter().enumerate() {
-            emit_payload_to_napi(out, p, i, prefix);
+            emit_payload_to_napi(out, p, i);
         }
         out.push_str(&format!(
             "        napi_call_function(env, undefined, js_cb, {argc}, argv, NULL);\n"
@@ -1637,23 +1203,54 @@ fn render_listener_napi_fns(
     out.push_str("}\n\n");
 }
 
+/// The classified shape of an async function's result, driving what the
+/// completion callback copies and what the settle marshaller creates.
+enum AsyncResultShape {
+    /// No result: the promise resolves `undefined`.
+    None,
+    /// A by-value scalar, bool, C-style enum, or bare handle.
+    Value,
+    /// An owned `const char*` string (nullable).
+    Str,
+    /// A `ptr` + `len` pair: an owned `bytes` result (slot named `result`).
+    Bytes,
+    /// A borrowed value-buffer pair (slots `result_ptr` + `result_len`); the
+    /// callback must copy it before returning, and the JS wrapper decodes it.
+    Buffered,
+    /// An owned object pointer the callback adopts (interface, typed handle,
+    /// iterator, or nullable interface).
+    Object,
+}
+
+/// Classify an async result type into its marshalling shape.
+fn async_result_shape(ret: Option<&TypeRef>) -> AsyncResultShape {
+    let Some(ty) = ret else {
+        return AsyncResultShape::None;
+    };
+    if is_buffered(ty) {
+        return AsyncResultShape::Buffered;
+    }
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => AsyncResultShape::Str,
+        TypeRef::Bytes | TypeRef::BorrowedBytes => AsyncResultShape::Bytes,
+        TypeRef::TypedHandle(_)
+        | TypeRef::Interface(_)
+        | TypeRef::Iterator(_)
+        | TypeRef::Optional(_) => AsyncResultShape::Object,
+        _ => AsyncResultShape::Value,
+    }
+}
+
+/// The `, <c-type> <name>` suffix of an async completion callback's result
+/// slots, rendered from the shared ABI lowering so the signature matches the
+/// producer's typedef exactly.
 fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str, prefix: &str) -> String {
     match ret {
         None => String::new(),
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => ", const char* result".into(),
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
-            ", const uint8_t* result, size_t result_len".into()
-        }
-        Some(TypeRef::List(inner)) => {
-            let et = c_elem_type(inner, module, prefix);
-            format!(", {et}* result, size_t result_len")
-        }
-        Some(TypeRef::Map(k, v)) => {
-            let kt = c_elem_type(k, module, prefix);
-            let vt = c_elem_type(v, module, prefix);
-            format!(", {kt}* result_keys, {vt}* result_values, size_t result_len")
-        }
-        Some(t) => format!(", {} result", c_ret_type_str(t, module, prefix)),
+        Some(ty) => abi::callback_result_params(ty, module)
+            .iter()
+            .map(|p| format!(", {} {}", p.ty.render_c(prefix), p.name))
+            .collect(),
     }
 }
 
@@ -1664,19 +1261,22 @@ fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str, prefix: &str
 ///
 /// The completion callback may fire on any thread, so it must never touch
 /// `napi_env`; the ref'd threadsafe function also keeps the event loop alive
-/// until the promise settles.
+/// until the promise settles. Borrowed results (strings, bytes, and buffered
+/// values) are deep-copied inside the callback because the producer frees
+/// them after it returns; owned object results are adopted. The error's
+/// message and payload are copied for the same reason.
 fn render_async_machinery(
     out: &mut String,
     f: &FnBinding,
     c_name: &str,
     module: &str,
     prefix: &str,
-    structs: &HashMap<String, StructBinding>,
 ) {
     let actx = format!("{c_name}_napi_actx");
     let cb_name = format!("{c_name}_napi_cb");
     let calljs = format!("{c_name}_napi_settle");
     let cb_result = async_cb_result_params_node(f.ret.as_ref(), module, prefix);
+    let shape = async_result_shape(f.ret.as_ref());
 
     // -- context struct --
     out.push_str("typedef struct {\n");
@@ -1684,74 +1284,29 @@ fn render_async_machinery(
     out.push_str("    napi_threadsafe_function tsfn;\n");
     out.push_str("    int32_t err_code;\n");
     out.push_str("    char* err_msg;\n");
-    match f.ret.as_ref() {
-        None => {}
-        Some(TypeRef::I32) => out.push_str("    int32_t result;\n"),
-        Some(TypeRef::U32) => out.push_str("    uint32_t result;\n"),
-        Some(TypeRef::I64) => out.push_str("    int64_t result;\n"),
-        Some(TypeRef::F64) => out.push_str("    double result;\n"),
-        Some(TypeRef::I8) => out.push_str("    int8_t result;\n"),
-        Some(TypeRef::I16) => out.push_str("    int16_t result;\n"),
-        Some(TypeRef::U8) => out.push_str("    uint8_t result;\n"),
-        Some(TypeRef::U16) => out.push_str("    uint16_t result;\n"),
-        Some(TypeRef::U64) => out.push_str("    uint64_t result;\n"),
-        Some(TypeRef::F32) => out.push_str("    float result;\n"),
-        Some(TypeRef::Bool) => out.push_str("    bool result;\n"),
-        Some(TypeRef::Enum(_)) => out.push_str("    int32_t result;\n"),
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+    out.push_str("    uint8_t* err_payload;\n");
+    out.push_str("    size_t err_payload_len;\n");
+    match &shape {
+        AsyncResultShape::None => {}
+        AsyncResultShape::Value => {
+            let ct = c_ret_type_str(
+                f.ret.as_ref().expect("value shape has a type"),
+                module,
+                prefix,
+            );
+            out.push_str(&format!("    {ct} result;\n"));
+        }
+        AsyncResultShape::Str => {
             out.push_str("    char* result;\n");
             out.push_str("    int result_null;\n");
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+        AsyncResultShape::Bytes | AsyncResultShape::Buffered => {
             out.push_str("    uint8_t* result;\n");
             out.push_str("    size_t result_len;\n");
         }
-        Some(TypeRef::Handle) => out.push_str("    uint64_t result;\n"),
-        Some(
-            TypeRef::TypedHandle(_)
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::Iterator(_),
-        ) => out.push_str("    void* result;\n"),
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str("    char* result;\n");
-                out.push_str("    int result_null;\n");
-            }
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::TypedHandle(_) => {
-                out.push_str("    void* result;\n");
-            }
-            other => {
-                out.push_str("    int result_has;\n");
-                out.push_str(&format!(
-                    "    {} result;\n",
-                    c_elem_type(other, module, prefix)
-                ));
-            }
-        },
-        Some(TypeRef::List(inner)) => {
-            let elem = match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => "char*".to_string(),
-                other => c_elem_type(other, module, prefix),
-            };
-            out.push_str(&format!("    {elem}* result;\n"));
-            out.push_str("    size_t result_len;\n");
+        AsyncResultShape::Object => {
+            out.push_str("    void* result;\n");
         }
-        Some(TypeRef::Map(k, v)) => {
-            for (field, ty) in [("result_keys", k), ("result_values", v)] {
-                let elem = match ty.as_ref() {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => "char*".to_string(),
-                    other => c_elem_type(other, module, prefix),
-                };
-                out.push_str(&format!("    {elem}* {field};\n"));
-            }
-            out.push_str("    size_t result_len;\n");
-        }
-        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     out.push_str(&format!("}} {actx};\n\n"));
 
@@ -1765,102 +1320,41 @@ fn render_async_machinery(
     out.push_str(
         "        ctx->err_msg = err->message ? strdup(err->message) : strdup(\"unknown error\");\n",
     );
+    out.push_str("        ctx->err_payload_len = err->payload_len;\n");
+    out.push_str(
+        "        if (err->payload_ptr != NULL && err->payload_len > 0) { ctx->err_payload = (uint8_t*)malloc(err->payload_len); memcpy(ctx->err_payload, err->payload_ptr, err->payload_len); }\n",
+    );
     out.push_str("    } else {\n");
-    match f.ret.as_ref() {
-        None => {}
-        Some(
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::I64
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool
-            | TypeRef::Handle,
-        ) => {
+    match &shape {
+        AsyncResultShape::None => {}
+        AsyncResultShape::Value => {
             out.push_str("        ctx->result = result;\n");
         }
-        Some(TypeRef::Enum(_)) => {
-            out.push_str("        ctx->result = (int32_t)result;\n");
-        }
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+        AsyncResultShape::Str => {
             out.push_str("        ctx->result_null = result == NULL;\n");
             out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+        AsyncResultShape::Bytes => {
             out.push_str("        ctx->result_len = result_len;\n");
             out.push_str(
                 "        if (result != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result, result_len); }\n",
             );
         }
-        // Owned-object results (records, rich enums, interfaces, handles,
-        // iterators) are adopted by the receiver, so the pointer stays valid
-        // across the thread hop; everything borrowed is deep-copied above.
-        Some(
-            TypeRef::TypedHandle(_)
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::Iterator(_),
-        ) => {
+        // The buffer is borrowed for the callback's duration, so the bytes
+        // are copied here; the JS wrapper decodes them after the promise
+        // resolves.
+        AsyncResultShape::Buffered => {
+            out.push_str("        ctx->result_len = result_len;\n");
+            out.push_str(
+                "        if (result_ptr != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result_ptr, result_len); }\n",
+            );
+        }
+        // Owned-object results (interfaces, typed handles, iterators) are
+        // adopted by the receiver, so the pointer stays valid across the
+        // thread hop.
+        AsyncResultShape::Object => {
             out.push_str("        ctx->result = (void*)result;\n");
         }
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str("        ctx->result_null = result == NULL;\n");
-                out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
-            }
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::TypedHandle(_) => {
-                out.push_str("        ctx->result = (void*)result;\n");
-            }
-            _ => {
-                out.push_str("        ctx->result_has = result != NULL;\n");
-                out.push_str("        if (result != NULL) ctx->result = *result;\n");
-            }
-        },
-        Some(TypeRef::List(inner)) => {
-            out.push_str("        ctx->result_len = result_len;\n");
-            match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    out.push_str(
-                        "        if (result != NULL && result_len > 0) {\n            ctx->result = (char**)calloc(result_len, sizeof(char*));\n            for (size_t i = 0; i < result_len; i++) ctx->result[i] = result[i] ? strdup(result[i]) : NULL;\n        }\n",
-                    );
-                }
-                _ => {
-                    out.push_str(
-                        "        if (result != NULL && result_len > 0) { ctx->result = malloc(result_len * sizeof(*ctx->result)); memcpy(ctx->result, result, result_len * sizeof(*ctx->result)); }\n",
-                    );
-                }
-            }
-        }
-        Some(TypeRef::Map(k, v)) => {
-            out.push_str("        ctx->result_len = result_len;\n");
-            for (field, src, ty) in [
-                ("result_keys", "result_keys", k),
-                ("result_values", "result_values", v),
-            ] {
-                match ty.as_ref() {
-                    TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                        out.push_str(&format!(
-                            "        if ({src} != NULL && result_len > 0) {{\n            ctx->{field} = (char**)calloc(result_len, sizeof(char*));\n            for (size_t i = 0; i < result_len; i++) ctx->{field}[i] = {src}[i] ? strdup({src}[i]) : NULL;\n        }}\n"
-                        ));
-                    }
-                    _ => {
-                        out.push_str(&format!(
-                            "        if ({src} != NULL && result_len > 0) {{ ctx->{field} = malloc(result_len * sizeof(*ctx->{field})); memcpy(ctx->{field}, {src}, result_len * sizeof(*ctx->{field})); }}\n"
-                        ));
-                    }
-                }
-            }
-        }
-        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     out.push_str("    }\n");
     out.push_str("    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);\n");
@@ -1876,163 +1370,79 @@ fn render_async_machinery(
     out.push_str("    if (env != NULL) {\n");
     out.push_str("    if (ctx->err_code != 0) {\n");
     out.push_str(&format!(
-        "        napi_value err_obj = {prefix}_napi_error_value(env, ctx->err_code, ctx->err_msg);\n"
+        "        napi_value err_obj = {prefix}_napi_error_value(env, ctx->err_code, ctx->err_msg, ctx->err_payload, ctx->err_payload_len);\n"
     ));
     out.push_str("        napi_reject_deferred(env, ctx->deferred, err_obj);\n");
     out.push_str("    } else {\n");
     out.push_str("        napi_value val;\n");
-    match f.ret.as_ref() {
-        None => out.push_str("        napi_get_undefined(env, &val);\n"),
-        Some(TypeRef::I32) => out.push_str("        napi_create_int32(env, ctx->result, &val);\n"),
-        Some(TypeRef::U32) => out.push_str("        napi_create_uint32(env, ctx->result, &val);\n"),
-        Some(TypeRef::I64) => out.push_str("        napi_create_int64(env, ctx->result, &val);\n"),
-        Some(TypeRef::F64) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
-        Some(TypeRef::I8 | TypeRef::I16) => {
-            out.push_str("        napi_create_int32(env, ctx->result, &val);\n")
-        }
-        Some(TypeRef::U8 | TypeRef::U16) => {
-            out.push_str("        napi_create_uint32(env, ctx->result, &val);\n")
-        }
-        Some(TypeRef::U64) => {
-            out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n")
-        }
-        Some(TypeRef::F32) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
-        Some(TypeRef::Bool) => out.push_str("        napi_get_boolean(env, ctx->result, &val);\n"),
-        Some(TypeRef::Enum(_)) => {
-            out.push_str("        napi_create_int32(env, ctx->result, &val);\n");
-        }
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+    match &shape {
+        AsyncResultShape::None => out.push_str("        napi_get_undefined(env, &val);\n"),
+        AsyncResultShape::Value => match f.ret.as_ref() {
+            Some(TypeRef::I32) => {
+                out.push_str("        napi_create_int32(env, ctx->result, &val);\n")
+            }
+            Some(TypeRef::U32) => {
+                out.push_str("        napi_create_uint32(env, ctx->result, &val);\n")
+            }
+            Some(TypeRef::I64) => {
+                out.push_str("        napi_create_int64(env, ctx->result, &val);\n")
+            }
+            Some(TypeRef::F64) => {
+                out.push_str("        napi_create_double(env, ctx->result, &val);\n")
+            }
+            Some(TypeRef::I8 | TypeRef::I16) => {
+                out.push_str("        napi_create_int32(env, ctx->result, &val);\n");
+            }
+            Some(TypeRef::U8 | TypeRef::U16) => {
+                out.push_str("        napi_create_uint32(env, ctx->result, &val);\n");
+            }
+            Some(TypeRef::U64 | TypeRef::Handle) => {
+                out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
+            }
+            Some(TypeRef::F32) => {
+                out.push_str("        napi_create_double(env, ctx->result, &val);\n")
+            }
+            Some(TypeRef::Bool) => {
+                out.push_str("        napi_get_boolean(env, ctx->result, &val);\n")
+            }
+            Some(TypeRef::Enum(_)) => {
+                out.push_str("        napi_create_int32(env, (int32_t)ctx->result, &val);\n");
+            }
+            _ => unreachable!("value shape covers scalars, bools, enums, and handles"),
+        },
+        AsyncResultShape::Str => {
             out.push_str(
                 "        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : \"\", NAPI_AUTO_LENGTH, &val);\n",
             );
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+        AsyncResultShape::Bytes | AsyncResultShape::Buffered => {
             out.push_str(
                 "        napi_create_buffer_copy(env, ctx->result_len, ctx->result ? (const void*)ctx->result : (const void*)\"\", NULL, &val);\n",
             );
         }
-        Some(TypeRef::Handle) => {
-            out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
-        }
-        // An interface or rich-enum result stays the raw owned pointer here;
-        // the JS loader wraps the settled handle in its class, which owns
-        // disposal.
-        Some(
-            TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Iterator(_),
-        ) => {
-            out.push_str("        napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n");
-        }
-        Some(TypeRef::Record(name)) => {
-            emit_struct_to_object(
-                out,
-                "env",
-                name,
-                "ctx->result",
-                "val",
-                module,
-                prefix,
-                structs,
-                "        ",
-                true,
-            );
-        }
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                out.push_str(
-                    "        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : \"\", NAPI_AUTO_LENGTH, &val);\n",
-                );
-            }
-            TypeRef::Record(name) => {
-                out.push_str(
-                    "        if (ctx->result == NULL) { napi_get_null(env, &val); } else {\n",
-                );
-                emit_struct_to_object(
-                    out,
-                    "env",
-                    name,
-                    "ctx->result",
-                    "val",
-                    module,
-                    prefix,
-                    structs,
-                    "            ",
-                    true,
-                );
-                out.push_str("        }\n");
-            }
-            TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::RichEnum(_) => {
+        AsyncResultShape::Object => {
+            // A nullable interface result resolves `null` for the absent
+            // case; every other object pointer is surfaced as the raw
+            // handle the JS class adopts.
+            if matches!(f.ret.as_ref(), Some(TypeRef::Optional(_))) {
                 out.push_str(
                     "        if (ctx->result == NULL) napi_get_null(env, &val); else napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
                 );
+            } else {
+                out.push_str(
+                    "        napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
+                );
             }
-            other => {
-                let leaf = payload_leaf_to_napi(other, "ctx->result", "val");
-                out.push_str(&format!(
-                    "        if (ctx->result_has) {{ {leaf} }} else napi_get_null(env, &val);\n"
-                ));
-            }
-        },
-        Some(TypeRef::List(inner)) => {
-            out.push_str("        napi_create_array(env, &val);\n");
-            out.push_str(
-                "        for (size_t i = 0; ctx->result != NULL && i < ctx->result_len; i++) {\n",
-            );
-            out.push_str("            napi_value elem;\n");
-            let leaf = payload_elem_to_napi(inner, "ctx->result[i]", "elem");
-            out.push_str(&format!("            {leaf}\n"));
-            out.push_str("            napi_set_element(env, val, (uint32_t)i, elem);\n");
-            out.push_str("        }\n");
         }
-        Some(TypeRef::Map(k, v)) => {
-            out.push_str("        napi_create_object(env, &val);\n");
-            out.push_str(
-                "        for (size_t i = 0; ctx->result_keys != NULL && ctx->result_values != NULL && i < ctx->result_len; i++) {\n",
-            );
-            out.push_str("            napi_value mk; napi_value mv;\n");
-            let kc = payload_elem_to_napi(k, "ctx->result_keys[i]", "mk");
-            let vc = payload_elem_to_napi(v, "ctx->result_values[i]", "mv");
-            out.push_str(&format!("            {kc}\n"));
-            out.push_str(&format!("            {vc}\n"));
-            out.push_str("            napi_set_property(env, val, mk, mv);\n");
-            out.push_str("        }\n");
-        }
-        Some(TypeRef::Named(_)) => unreachable!("unresolved type reference"),
     }
     out.push_str("        napi_resolve_deferred(env, ctx->deferred, val);\n");
     out.push_str("    }\n");
     out.push_str("    }\n");
     out.push_str("    free(ctx->err_msg);\n");
-    match f.ret.as_ref() {
-        Some(
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr | TypeRef::Bytes | TypeRef::BorrowedBytes,
-        ) => {
+    out.push_str("    free(ctx->err_payload);\n");
+    match &shape {
+        AsyncResultShape::Str | AsyncResultShape::Bytes | AsyncResultShape::Buffered => {
             out.push_str("    free(ctx->result);\n");
-        }
-        Some(TypeRef::Optional(inner))
-            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
-        {
-            out.push_str("    free(ctx->result);\n");
-        }
-        Some(TypeRef::List(inner)) => {
-            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-                out.push_str(
-                    "    for (size_t i = 0; ctx->result != NULL && i < ctx->result_len; i++) free(ctx->result[i]);\n",
-                );
-            }
-            out.push_str("    free(ctx->result);\n");
-        }
-        Some(TypeRef::Map(k, v)) => {
-            for (field, ty) in [("result_keys", k), ("result_values", v)] {
-                if matches!(ty.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-                    out.push_str(&format!(
-                        "    for (size_t i = 0; ctx->{field} != NULL && i < ctx->result_len; i++) free(ctx->{field}[i]);\n"
-                    ));
-                }
-                out.push_str(&format!("    free(ctx->{field});\n"));
-            }
         }
         _ => {}
     }
@@ -2133,7 +1543,6 @@ fn render_napi_body(
     f: &FnBinding,
     module: &str,
     prefix: &str,
-    structs: &HashMap<String, StructBinding>,
     self_tag: Option<&str>,
 ) {
     // The launcher symbol comes from the lowered shape rather than being
@@ -2167,17 +1576,17 @@ fn render_napi_body(
     out.push_str("  weaveffi_error err = {0};\n");
 
     if let Some(ret) = &f.ret {
-        emit_ret_out_params(out, &mut c_args, ret, module, prefix);
+        emit_ret_out_params(out, &mut c_args, ret);
     }
     c_args.push("&err".to_string());
 
     let args_str = c_args.join(", ");
-    let ret_type = f.ret.as_ref().map(|r| c_ret_type_str(r, module, prefix));
-    match &ret_type {
-        Some(rt) if rt != "void" => {
+    match &f.ret {
+        Some(ret) => {
+            let rt = c_ret_type_str(ret, module, prefix);
             out.push_str(&format!("  {rt} result = {symbol}({args_str});\n"));
         }
-        _ => {
+        None => {
             out.push_str(&format!("  {symbol}({args_str});\n"));
         }
     }
@@ -2189,7 +1598,7 @@ fn render_napi_body(
     emit_error_check_c(out, prefix);
 
     match &f.ret {
-        Some(ret) => emit_ret_to_napi(out, ret, module, prefix, f, structs),
+        Some(ret) => emit_ret_to_napi(out, ret, prefix, f),
         None => {
             out.push_str("  napi_value ret;\n");
             out.push_str("  napi_get_undefined(env, &ret);\n");
@@ -2198,6 +1607,10 @@ fn render_napi_body(
     }
 }
 
+/// Marshal one incoming JS argument into its C ABI slot(s). A buffered
+/// parameter arrives as a `Buffer` the JS loader packed; it lowers to the
+/// borrowed `(const uint8_t*, size_t)` pair the callee decodes and never
+/// frees. Everything else keeps its direct slot lowering.
 #[allow(clippy::too_many_arguments)]
 fn emit_param(
     out: &mut String,
@@ -2209,9 +1622,19 @@ fn emit_param(
     module: &str,
     prefix: &str,
 ) {
+    if is_buffered(ty) {
+        out.push_str(&format!("  void* {name}_raw;\n"));
+        out.push_str(&format!("  size_t {name}_len;\n"));
+        out.push_str(&format!(
+            "  napi_get_buffer_info(env, args[{idx}], &{name}_raw, &{name}_len);\n"
+        ));
+        c_args.push(format!("(const uint8_t*){name}_raw"));
+        c_args.push(format!("{name}_len"));
+        return;
+    }
     match ty {
         TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
-            let ct = c_elem_type(ty, module, prefix);
+            let ct = c_scalar_type(ty);
             let getter = napi_getter(ty);
             out.push_str(&format!("  {ct} {name};\n"));
             out.push_str(&format!("  {getter}(env, args[{idx}], &{name});\n"));
@@ -2220,7 +1643,7 @@ fn emit_param(
         // N-API has no narrower-than-32-bit / float getter, so read into a
         // correctly-sized temporary and narrow to the real ABI type.
         TypeRef::I8 | TypeRef::I16 | TypeRef::U8 | TypeRef::U16 | TypeRef::U64 | TypeRef::F32 => {
-            let ct = c_elem_type(ty, module, prefix);
+            let ct = c_scalar_type(ty);
             let getter = napi_getter(ty);
             let raw = napi_read_tmp_type(ty);
             out.push_str(&format!("  {raw} {name}_raw;\n"));
@@ -2249,39 +1672,32 @@ fn emit_param(
             c_args.push(format!("(weaveffi_handle_t){name}_raw"));
         }
         TypeRef::TypedHandle(s) => {
-            let abi = c_abi_struct_name(s, module, prefix);
+            let abi_tag = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
                 "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
             ));
-            c_args.push(format!("({abi}*)(intptr_t){name}_raw"));
+            c_args.push(format!("({abi_tag}*)(intptr_t){name}_raw"));
         }
-        TypeRef::Enum(e) => {
+        TypeRef::Enum(_) => {
+            let etype = abi::lower_param(name, ty, module, false)[0]
+                .ty
+                .render_c(prefix);
             out.push_str(&format!("  int32_t {name};\n"));
             out.push_str(&format!(
                 "  napi_get_value_int32(env, args[{idx}], &{name});\n"
             ));
-            c_args.push(format!("({prefix}_{module}_{e}){name}"));
+            c_args.push(format!("({etype}){name}"));
         }
-        // Records, rich enums, and interfaces arrive as int64 handles wrapping
-        // the opaque pointer; rich enums and interfaces additionally get
-        // unwrapped from their JS class by the loader before reaching the
-        // addon (borrow: pointer only).
-        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
-            let abi = c_abi_struct_name(s, module, prefix);
+        // An interface arrives as the int64 handle the JS class unwrapped
+        // from its instance; the callee borrows the pointer for the call.
+        TypeRef::Interface(s) => {
+            let abi_tag = c_abi_struct_name(s, module, prefix);
             out.push_str(&format!("  int64_t {name}_raw;\n"));
             out.push_str(&format!(
                 "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
             ));
-            c_args.push(format!("(const {abi}*)(intptr_t){name}_raw"));
-        }
-        TypeRef::Optional(inner) => {
-            out.push_str(&format!("  napi_valuetype {name}_type;\n"));
-            out.push_str(&format!("  napi_typeof(env, args[{idx}], &{name}_type);\n"));
-            emit_optional_param(out, c_args, cleanups, inner, name, idx, module, prefix);
-        }
-        TypeRef::List(inner) => {
-            emit_list_param(out, c_args, cleanups, inner, name, idx, module, prefix);
+            c_args.push(format!("(const {abi_tag}*)(intptr_t){name}_raw"));
         }
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             out.push_str(&format!("  void* {name}_raw;\n"));
@@ -2292,129 +1708,15 @@ fn emit_param(
             c_args.push(format!("(const uint8_t*){name}_raw"));
             c_args.push(format!("{name}_len"));
         }
-        TypeRef::Map(k, v) => {
-            emit_map_param(out, c_args, cleanups, k, v, name, idx, module, prefix);
-        }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-}
-
-fn emit_opt_val(
-    out: &mut String,
-    c_args: &mut Vec<String>,
-    c_type: &str,
-    napi_fn: &str,
-    name: &str,
-    idx: usize,
-) {
-    out.push_str(&format!("  {c_type} {name}_val;\n"));
-    out.push_str(&format!("  const {c_type}* {name}_ptr = NULL;\n"));
-    out.push_str(&format!(
-        "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-    ));
-    out.push_str(&format!("    {napi_fn}(env, args[{idx}], &{name}_val);\n"));
-    out.push_str(&format!("    {name}_ptr = &{name}_val;\n"));
-    out.push_str("  }\n");
-    c_args.push(format!("{name}_ptr"));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_optional_param(
-    out: &mut String,
-    c_args: &mut Vec<String>,
-    cleanups: &mut Vec<String>,
-    inner: &TypeRef,
-    name: &str,
-    idx: usize,
-    module: &str,
-    prefix: &str,
-) {
-    match inner {
-        TypeRef::I32 => {
-            emit_opt_val(out, c_args, "int32_t", "napi_get_value_int32", name, idx);
-        }
-        TypeRef::U32 => {
-            emit_opt_val(out, c_args, "uint32_t", "napi_get_value_uint32", name, idx);
-        }
-        TypeRef::I64 => {
-            emit_opt_val(out, c_args, "int64_t", "napi_get_value_int64", name, idx);
-        }
-        TypeRef::F64 => {
-            emit_opt_val(out, c_args, "double", "napi_get_value_double", name, idx);
-        }
-        TypeRef::Bool => {
-            emit_opt_val(out, c_args, "bool", "napi_get_value_bool", name, idx);
-        }
-        TypeRef::Handle => {
-            out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
-            out.push_str(&format!("  weaveffi_handle_t {name}_val;\n"));
-            out.push_str(&format!("  const weaveffi_handle_t* {name}_ptr = NULL;\n"));
-            out.push_str(&format!(
-                "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-            ));
-            out.push_str(&format!(
-                "    napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
-            ));
-            out.push_str(&format!(
-                "    {name}_val = (weaveffi_handle_t){name}_raw;\n"
-            ));
-            out.push_str(&format!("    {name}_ptr = &{name}_val;\n"));
-            out.push_str("  }\n");
-            c_args.push(format!("{name}_ptr"));
-        }
-        // A typed handle is a nullable opaque pointer, so an optional one maps to
-        // the same pointer with NULL standing in for absence, mirroring structs.
-        TypeRef::TypedHandle(s) => {
-            let abi = c_abi_struct_name(s, module, prefix);
-            out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
-            out.push_str(&format!(
-                "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-            ));
-            out.push_str(&format!(
-                "    napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
-            ));
-            out.push_str("  }\n");
-            c_args.push(format!("{name}_raw ? ({abi}*)(intptr_t){name}_raw : NULL"));
-        }
-        TypeRef::Enum(e) => {
-            let etype = format!("{prefix}_{module}_{e}");
-            out.push_str(&format!("  int32_t {name}_raw;\n"));
-            out.push_str(&format!("  {etype} {name}_val;\n"));
-            out.push_str(&format!("  const {etype}* {name}_ptr = NULL;\n"));
-            out.push_str(&format!(
-                "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-            ));
-            out.push_str(&format!(
-                "    napi_get_value_int32(env, args[{idx}], &{name}_raw);\n"
-            ));
-            out.push_str(&format!("    {name}_val = ({etype}){name}_raw;\n"));
-            out.push_str(&format!("    {name}_ptr = &{name}_val;\n"));
-            out.push_str("  }\n");
-            c_args.push(format!("{name}_ptr"));
-        }
-        TypeRef::StringUtf8 => {
-            out.push_str(&format!("  char* {name} = NULL;\n"));
-            out.push_str(&format!(
-                "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-            ));
-            out.push_str(&format!("    size_t {name}_len;\n"));
-            out.push_str(&format!(
-                "    napi_get_value_string_utf8(env, args[{idx}], NULL, 0, &{name}_len);\n"
-            ));
-            out.push_str(&format!("    {name} = (char*)malloc({name}_len + 1);\n"));
-            out.push_str(&format!(
-                "    napi_get_value_string_utf8(env, args[{idx}], {name}, {name}_len + 1, &{name}_len);\n"
-            ));
-            out.push_str("  }\n");
-            c_args.push(name.into());
-            cleanups.push(format!("  free({name});\n"));
-        }
-        // An optional record, rich enum, or interface is a nullable opaque
-        // pointer: JS null/undefined passes NULL, anything else the wrapped
-        // handle.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Interface(s) => {
-            let abi = c_abi_struct_name(s, module, prefix);
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // JS null/undefined passes NULL, anything else the wrapped handle.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(s) = inner.as_ref() else {
+                unreachable!("non-interface optionals are buffered");
+            };
+            let abi_tag = c_abi_struct_name(s, module, prefix);
+            out.push_str(&format!("  napi_valuetype {name}_type;\n"));
+            out.push_str(&format!("  napi_typeof(env, args[{idx}], &{name}_type);\n"));
             out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
             out.push_str(&format!(
                 "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
@@ -2424,366 +1726,28 @@ fn emit_optional_param(
             ));
             out.push_str("  }\n");
             c_args.push(format!(
-                "{name}_raw ? (const {abi}*)(intptr_t){name}_raw : NULL"
+                "{name}_raw ? (const {abi_tag}*)(intptr_t){name}_raw : NULL"
             ));
         }
-        // Optional narrow numerics: read through a wider N-API getter into a
-        // temporary, narrow to the ABI type, then pass a pointer (NULL absent).
-        TypeRef::I8 | TypeRef::I16 | TypeRef::U8 | TypeRef::U16 | TypeRef::U64 | TypeRef::F32 => {
-            let ct = c_elem_type(inner, module, prefix);
-            let getter = napi_getter(inner);
-            let raw = napi_read_tmp_type(inner);
-            out.push_str(&format!("  {ct} {name}_val;\n"));
-            out.push_str(&format!("  const {ct}* {name}_ptr = NULL;\n"));
-            out.push_str(&format!(
-                "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-            ));
-            out.push_str(&format!("    {raw} {name}_raw;\n"));
-            out.push_str(&format!("    {getter}(env, args[{idx}], &{name}_raw);\n"));
-            out.push_str(&format!("    {name}_val = ({ct}){name}_raw;\n"));
-            out.push_str(&format!("    {name}_ptr = &{name}_val;\n"));
-            out.push_str("  }\n");
-            c_args.push(format!("{name}_ptr"));
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
-        _ => {
-            emit_param(out, c_args, cleanups, inner, name, idx, module, prefix);
-        }
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_list_param(
-    out: &mut String,
-    c_args: &mut Vec<String>,
-    cleanups: &mut Vec<String>,
-    inner: &TypeRef,
-    name: &str,
-    idx: usize,
-    module: &str,
-    prefix: &str,
-) {
-    let et = c_elem_type(inner, module, prefix);
-    out.push_str(&format!("  uint32_t {name}_count;\n"));
-    out.push_str(&format!(
-        "  napi_get_array_length(env, args[{idx}], &{name}_count);\n"
-    ));
-    out.push_str(&format!(
-        "  {et}* {name}_arr = ({et}*)malloc(sizeof({et}) * ({name}_count + 1));\n"
-    ));
-    out.push_str(&format!(
-        "  for (uint32_t {name}_i = 0; {name}_i < {name}_count; {name}_i++) {{\n"
-    ));
-    out.push_str(&format!("    napi_value {name}_el;\n"));
-    out.push_str(&format!(
-        "    napi_get_element(env, args[{idx}], {name}_i, &{name}_el);\n"
-    ));
-
-    match inner {
-        TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
-            let getter = napi_getter(inner);
-            out.push_str(&format!(
-                "    {getter}(env, {name}_el, &{name}_arr[{name}_i]);\n"
-            ));
-        }
-        // Narrow numerics need a wider read temporary, then a narrowing cast
-        // into the element slot so the 1/2/8-byte element is not overrun.
-        TypeRef::I8 | TypeRef::I16 | TypeRef::U8 | TypeRef::U16 | TypeRef::U64 | TypeRef::F32 => {
-            let getter = napi_getter(inner);
-            let raw = napi_read_tmp_type(inner);
-            out.push_str(&format!("    {raw} {name}_nv;\n"));
-            out.push_str(&format!("    {getter}(env, {name}_el, &{name}_nv);\n"));
-            out.push_str(&format!("    {name}_arr[{name}_i] = ({et}){name}_nv;\n"));
-        }
-        TypeRef::Handle => {
-            out.push_str(&format!("    int64_t {name}_h;\n"));
-            out.push_str(&format!(
-                "    napi_get_value_int64(env, {name}_el, &{name}_h);\n"
-            ));
-            out.push_str(&format!(
-                "    {name}_arr[{name}_i] = (weaveffi_handle_t){name}_h;\n"
-            ));
-        }
-        TypeRef::TypedHandle(s) => {
-            let abi = c_abi_struct_name(s, module, prefix);
-            out.push_str(&format!("    int64_t {name}_h;\n"));
-            out.push_str(&format!(
-                "    napi_get_value_int64(env, {name}_el, &{name}_h);\n"
-            ));
-            out.push_str(&format!(
-                "    {name}_arr[{name}_i] = ({abi}*)(intptr_t){name}_h;\n"
-            ));
-        }
-        TypeRef::Enum(_) => {
-            out.push_str(&format!("    int32_t {name}_ev;\n"));
-            out.push_str(&format!(
-                "    napi_get_value_int32(env, {name}_el, &{name}_ev);\n"
-            ));
-            out.push_str(&format!("    {name}_arr[{name}_i] = ({et}){name}_ev;\n"));
-        }
-        TypeRef::StringUtf8 => {
-            out.push_str(&format!("    size_t {name}_sl;\n"));
-            out.push_str(&format!(
-                "    napi_get_value_string_utf8(env, {name}_el, NULL, 0, &{name}_sl);\n"
-            ));
-            out.push_str(&format!(
-                "    char* {name}_s = (char*)malloc({name}_sl + 1);\n"
-            ));
-            out.push_str(&format!(
-                "    napi_get_value_string_utf8(env, {name}_el, {name}_s, {name}_sl + 1, &{name}_sl);\n"
-            ));
-            out.push_str(&format!("    {name}_arr[{name}_i] = {name}_s;\n"));
-        }
-        TypeRef::Record(_) | TypeRef::RichEnum(_) => {
-            out.push_str(&format!("    int64_t {name}_sp;\n"));
-            out.push_str(&format!(
-                "    napi_get_value_int64(env, {name}_el, &{name}_sp);\n"
-            ));
-            out.push_str(&format!(
-                "    {name}_arr[{name}_i] = ({et})(intptr_t){name}_sp;\n"
-            ));
-        }
-        _ => {
-            let getter = napi_getter(inner);
-            out.push_str(&format!(
-                "    {getter}(env, {name}_el, &{name}_arr[{name}_i]);\n"
-            ));
-        }
+/// Declare and thread the trailing out-parameters a return type needs. Bytes
+/// and buffered returns share the single `size_t* out_len` slot.
+fn emit_ret_out_params(out: &mut String, c_args: &mut Vec<String>, ty: &TypeRef) {
+    if is_buffered(ty) || matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+        out.push_str("  size_t out_len;\n");
+        c_args.push("&out_len".into());
     }
-
-    out.push_str("  }\n");
-    c_args.push(format!("{name}_arr"));
-    c_args.push(format!("(size_t){name}_count"));
-
-    if matches!(inner, TypeRef::StringUtf8) {
-        cleanups.push(format!(
-            "  for (uint32_t {name}_j = 0; {name}_j < {name}_count; {name}_j++) free((void*){name}_arr[{name}_j]);\n"
-        ));
-    }
-    cleanups.push(format!("  free({name}_arr);\n"));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_map_param(
-    out: &mut String,
-    c_args: &mut Vec<String>,
-    cleanups: &mut Vec<String>,
-    k: &TypeRef,
-    v: &TypeRef,
-    name: &str,
-    idx: usize,
-    module: &str,
-    prefix: &str,
-) {
-    let kt = c_elem_type(k, module, prefix);
-    let vt = c_elem_type(v, module, prefix);
-    out.push_str(&format!("  napi_value {name}_keys_napi;\n"));
-    out.push_str(&format!(
-        "  napi_get_property_names(env, args[{idx}], &{name}_keys_napi);\n"
-    ));
-    out.push_str(&format!("  uint32_t {name}_count;\n"));
-    out.push_str(&format!(
-        "  napi_get_array_length(env, {name}_keys_napi, &{name}_count);\n"
-    ));
-    out.push_str(&format!(
-        "  {kt}* {name}_keys = ({kt}*)malloc(sizeof({kt}) * ({name}_count + 1));\n"
-    ));
-    out.push_str(&format!(
-        "  {vt}* {name}_values = ({vt}*)malloc(sizeof({vt}) * ({name}_count + 1));\n"
-    ));
-    out.push_str(&format!(
-        "  for (uint32_t {name}_i = 0; {name}_i < {name}_count; {name}_i++) {{\n"
-    ));
-    out.push_str(&format!("    napi_value {name}_k;\n"));
-    out.push_str(&format!(
-        "    napi_get_element(env, {name}_keys_napi, {name}_i, &{name}_k);\n"
-    ));
-
-    if matches!(k, TypeRef::StringUtf8) {
-        out.push_str(&format!("    size_t {name}_kl;\n"));
-        out.push_str(&format!(
-            "    napi_get_value_string_utf8(env, {name}_k, NULL, 0, &{name}_kl);\n"
-        ));
-        out.push_str(&format!(
-            "    char* {name}_ks = (char*)malloc({name}_kl + 1);\n"
-        ));
-        out.push_str(&format!(
-            "    napi_get_value_string_utf8(env, {name}_k, {name}_ks, {name}_kl + 1, &{name}_kl);\n"
-        ));
-        out.push_str(&format!("    {name}_keys[{name}_i] = {name}_ks;\n"));
-    } else if needs_narrowing_read(k) {
-        out.push_str(&format!("    napi_value {name}_kn;\n"));
-        out.push_str(&format!(
-            "    napi_coerce_to_number(env, {name}_k, &{name}_kn);\n"
-        ));
-        let kgetter = napi_getter(k);
-        let raw = napi_read_tmp_type(k);
-        out.push_str(&format!("    {raw} {name}_kv;\n"));
-        out.push_str(&format!("    {kgetter}(env, {name}_kn, &{name}_kv);\n"));
-        out.push_str(&format!("    {name}_keys[{name}_i] = ({kt}){name}_kv;\n"));
-    } else {
-        out.push_str(&format!("    napi_value {name}_kn;\n"));
-        out.push_str(&format!(
-            "    napi_coerce_to_number(env, {name}_k, &{name}_kn);\n"
-        ));
-        let kgetter = napi_getter(k);
-        out.push_str(&format!(
-            "    {kgetter}(env, {name}_kn, &{name}_keys[{name}_i]);\n"
-        ));
-    }
-
-    out.push_str(&format!("    napi_value {name}_v;\n"));
-    out.push_str(&format!(
-        "    napi_get_property(env, args[{idx}], {name}_k, &{name}_v);\n"
-    ));
-
-    if matches!(v, TypeRef::StringUtf8) {
-        out.push_str(&format!("    size_t {name}_vl;\n"));
-        out.push_str(&format!(
-            "    napi_get_value_string_utf8(env, {name}_v, NULL, 0, &{name}_vl);\n"
-        ));
-        out.push_str(&format!(
-            "    char* {name}_vs = (char*)malloc({name}_vl + 1);\n"
-        ));
-        out.push_str(&format!(
-            "    napi_get_value_string_utf8(env, {name}_v, {name}_vs, {name}_vl + 1, &{name}_vl);\n"
-        ));
-        out.push_str(&format!("    {name}_values[{name}_i] = {name}_vs;\n"));
-    } else if needs_narrowing_read(v) {
-        let vgetter = napi_getter(v);
-        let raw = napi_read_tmp_type(v);
-        out.push_str(&format!("    {raw} {name}_vv;\n"));
-        out.push_str(&format!("    {vgetter}(env, {name}_v, &{name}_vv);\n"));
-        out.push_str(&format!("    {name}_values[{name}_i] = ({vt}){name}_vv;\n"));
-    } else {
-        let vgetter = napi_getter(v);
-        out.push_str(&format!(
-            "    {vgetter}(env, {name}_v, &{name}_values[{name}_i]);\n"
-        ));
-    }
-
-    out.push_str("  }\n");
-    c_args.push(format!("{name}_keys"));
-    c_args.push(format!("{name}_values"));
-    c_args.push(format!("(size_t){name}_count"));
-
-    if matches!(k, TypeRef::StringUtf8) {
-        cleanups.push(format!(
-            "  for (uint32_t {name}_j = 0; {name}_j < {name}_count; {name}_j++) free((void*){name}_keys[{name}_j]);\n"
-        ));
-    }
-    cleanups.push(format!("  free({name}_keys);\n"));
-    if matches!(v, TypeRef::StringUtf8) {
-        cleanups.push(format!(
-            "  for (uint32_t {name}_j = 0; {name}_j < {name}_count; {name}_j++) free((void*){name}_values[{name}_j]);\n"
-        ));
-    }
-    cleanups.push(format!("  free({name}_values);\n"));
-}
-
-fn emit_ret_out_params(
-    out: &mut String,
-    c_args: &mut Vec<String>,
-    ty: &TypeRef,
-    module: &str,
-    prefix: &str,
-) {
-    match ty {
-        TypeRef::Bytes | TypeRef::List(_) => {
-            out.push_str("  size_t out_len;\n");
-            c_args.push("&out_len".into());
-        }
-        TypeRef::Map(k, v) => {
-            // The C ABI hands back the base of each producer-allocated array,
-            // so the out-params are pointers to the array pointers.
-            let kt = c_elem_type(k, module, prefix);
-            let vt = c_elem_type(v, module, prefix);
-            out.push_str(&format!("  {kt}* out_keys = NULL;\n"));
-            out.push_str(&format!("  {vt}* out_values = NULL;\n"));
-            out.push_str("  size_t out_len = 0;\n");
-            c_args.push("&out_keys".into());
-            c_args.push("&out_values".into());
-            c_args.push("&out_len".into());
-        }
-        TypeRef::Optional(inner) if is_c_pointer_type(inner) => {
-            emit_ret_out_params(out, c_args, inner, module, prefix);
-        }
-        _ => {}
-    }
-}
-
-/// Build a `name -> StructDef` registry over every (possibly nested) module so
-/// that struct-returning functions can materialize a real JS object (matching
-/// the shape declared in `types.d.ts`) instead of leaking a raw handle number.
-fn struct_registry(model: &BindingModel) -> HashMap<String, StructBinding> {
-    model
-        .modules
-        .iter()
-        .flat_map(|m| m.structs.iter())
-        .map(|s| (s.name.clone(), s.clone()))
-        .collect()
-}
-
-/// Materialize an *owned* C struct pointer (`ptr_expr`) into a plain JS object
-/// assigned to `obj_var`, by invoking each generated field getter. The pointer
-/// is consumed: after the fields are read it is destroyed, because the C ABI
-/// hands back owned struct handles (the same ownership the other backends free).
-#[allow(clippy::too_many_arguments)]
-fn emit_struct_to_object(
-    out: &mut String,
-    env: &str,
-    struct_name: &str,
-    ptr_expr: &str,
-    obj_var: &str,
-    module: &str,
-    prefix: &str,
-    structs: &HashMap<String, StructBinding>,
-    indent: &str,
-    destroy: bool,
-) {
-    let Some(def) = structs.get(local_type_name(struct_name)).cloned() else {
-        // Unknown struct: fall back to the raw handle rather than emit broken C.
-        out.push_str(&format!(
-            "{indent}napi_create_int64({env}, (int64_t)(intptr_t){ptr_expr}, &{obj_var});\n"
-        ));
-        return;
-    };
-    let abi = &def.c_tag;
-    let p = format!("{obj_var}_p");
-    out.push_str(&format!("{indent}{{\n"));
-    out.push_str(&format!("{indent}  {abi}* {p} = ({abi}*){ptr_expr};\n"));
-    out.push_str(&format!(
-        "{indent}  napi_create_object({env}, &{obj_var});\n"
-    ));
-    for field in &def.fields {
-        let getter = &field.getter_symbol;
-        let fv = format!("{obj_var}_{}", field.name);
-        out.push_str(&format!("{indent}  napi_value {fv};\n"));
-        emit_struct_field_to_napi(
-            out,
-            env,
-            &field.ty,
-            getter,
-            &p,
-            &fv,
-            module,
-            prefix,
-            structs,
-            &format!("{indent}  "),
-        );
-        out.push_str(&format!(
-            "{indent}  napi_set_named_property({env}, {obj_var}, \"{}\", {fv});\n",
-            field.name
-        ));
-    }
-    if destroy {
-        out.push_str(&format!("{indent}  {}({p});\n", def.destroy_symbol));
-    }
-    out.push_str(&format!("{indent}}}\n"));
 }
 
 /// The C statement that creates a napi value `target` from a leaf C expression
-/// `expr` (scalars, bools, enums, handles). Strings/structs are handled by
-/// [`emit_elem_to_napi`], which needs surrounding context.
+/// `expr` (scalars, bools, enums, handles).
 fn napi_create_leaf(env: &str, ty: &TypeRef, expr: &str, target: &str) -> String {
     match ty {
         TypeRef::I32 => format!("napi_create_int32({env}, {expr}, &{target});"),
@@ -2803,381 +1767,18 @@ fn napi_create_leaf(env: &str, ty: &TypeRef, expr: &str, target: &str) -> String
     }
 }
 
-/// Convert a single collection *element* C expression `expr` (a list item or map
-/// value) into the napi value `target`. Owned elements are released after the
-/// copy per their element plan: strings via `weaveffi_free_string`, record
-/// elements via their `_destroy` (after materializing the JS object), and
-/// rich-enum pointers surface as raw handles the JS wrapper class adopts.
-#[allow(clippy::too_many_arguments)]
-fn emit_elem_to_napi(
-    out: &mut String,
-    env: &str,
-    ty: &TypeRef,
-    expr: &str,
-    target: &str,
-    module: &str,
-    prefix: &str,
-    structs: &HashMap<String, StructBinding>,
-    indent: &str,
-) {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}napi_create_string_utf8({env}, {expr}, NAPI_AUTO_LENGTH, &{target});\n"
-            ));
-            if matches!(ty, TypeRef::StringUtf8) {
-                out.push_str(&format!("{indent}weaveffi_free_string((char*)({expr}));\n"));
-            }
-        }
-        TypeRef::Record(name) => {
-            emit_struct_to_object(
-                out, env, name, expr, target, module, prefix, structs, indent, true,
-            );
-        }
-        TypeRef::RichEnum(_) => {
-            out.push_str(&format!(
-                "{indent}napi_create_int64({env}, (int64_t)(intptr_t)({expr}), &{target});\n"
-            ));
-        }
-        _ => out.push_str(&format!(
-            "{indent}{}\n",
-            napi_create_leaf(env, ty, expr, target)
-        )),
-    }
-}
-
-/// Marshal one struct field, read via `getter(pv)`, into the JS value `fv`.
-/// Scalars, enums, handles, owned strings, optional strings, nested structs,
-/// byte buffers, lists, maps, and optional scalars are all materialized.
-#[allow(clippy::too_many_arguments)]
-fn emit_struct_field_to_napi(
-    out: &mut String,
-    env: &str,
-    ty: &TypeRef,
-    getter: &str,
-    pv: &str,
-    fv: &str,
-    module: &str,
-    prefix: &str,
-    structs: &HashMap<String, StructBinding>,
-    indent: &str,
-) {
-    match ty {
-        TypeRef::I32 => out.push_str(&format!(
-            "{indent}napi_create_int32({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::U32 => out.push_str(&format!(
-            "{indent}napi_create_uint32({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::I64 => out.push_str(&format!(
-            "{indent}napi_create_int64({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::F64 => out.push_str(&format!(
-            "{indent}napi_create_double({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::I8 | TypeRef::I16 => out.push_str(&format!(
-            "{indent}napi_create_int32({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::U8 | TypeRef::U16 => out.push_str(&format!(
-            "{indent}napi_create_uint32({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::U64 => out.push_str(&format!(
-            "{indent}napi_create_int64({env}, (int64_t){getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::F32 => out.push_str(&format!(
-            "{indent}napi_create_double({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::Bool => out.push_str(&format!(
-            "{indent}napi_get_boolean({env}, {getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::Enum(_) => out.push_str(&format!(
-            "{indent}napi_create_int32({env}, (int32_t){getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::Handle | TypeRef::TypedHandle(_) => out.push_str(&format!(
-            "{indent}napi_create_int64({env}, (int64_t)(intptr_t){getter}({pv}), &{fv});\n"
-        )),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            let owned = matches!(ty, TypeRef::StringUtf8);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!(
-                "{indent}  char* {fv}_s = (char*){getter}({pv});\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  napi_create_string_utf8({env}, {fv}_s, NAPI_AUTO_LENGTH, &{fv});\n"
-            ));
-            if owned {
-                out.push_str(&format!("{indent}  weaveffi_free_string({fv}_s);\n"));
-            }
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        TypeRef::Record(name) => {
-            emit_struct_to_object(
-                out,
-                env,
-                name,
-                &format!("{getter}({pv})"),
-                fv,
-                module,
-                prefix,
-                structs,
-                indent,
-                true,
-            );
-        }
-        // A rich-enum field getter hands back an owned pointer surfaced as a
-        // raw handle; the JS side wraps it in the enum class, which owns
-        // disposal.
-        TypeRef::RichEnum(_) => {
-            out.push_str(&format!(
-                "{indent}napi_create_int64({env}, (int64_t)(intptr_t){getter}({pv}), &{fv});\n"
-            ));
-        }
-        TypeRef::Optional(inner)
-            if matches!(inner.as_ref(), TypeRef::StringUtf8 | TypeRef::BorrowedStr) =>
-        {
-            let owned = matches!(inner.as_ref(), TypeRef::StringUtf8);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!(
-                "{indent}  char* {fv}_s = (char*){getter}({pv});\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  if ({fv}_s == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  else {{ napi_create_string_utf8({env}, {fv}_s, NAPI_AUTO_LENGTH, &{fv});"
-            ));
-            if owned {
-                out.push_str(&format!(" weaveffi_free_string({fv}_s);"));
-            }
-            out.push_str(" }\n");
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Record(_)) => {
-            let TypeRef::Record(name) = inner.as_ref() else {
-                unreachable!()
-            };
-            let abi = c_abi_struct_name(name, module, prefix);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!("{indent}  {abi}* {fv}_sp = {getter}({pv});\n"));
-            out.push_str(&format!(
-                "{indent}  if ({fv}_sp == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
-            ));
-            out.push_str(&format!("{indent}  else {{\n"));
-            emit_struct_to_object(
-                out,
-                env,
-                name,
-                &format!("{fv}_sp"),
-                fv,
-                module,
-                prefix,
-                structs,
-                &format!("{indent}    "),
-                true,
-            );
-            out.push_str(&format!("{indent}  }}\n"));
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        // An optional typed handle or rich enum lowers to a nullable opaque
-        // pointer that the field surfaces as the integer handle (or null),
-        // like the non-optional case but guarded on NULL.
-        TypeRef::Optional(inner)
-            if matches!(
-                inner.as_ref(),
-                TypeRef::TypedHandle(_) | TypeRef::RichEnum(_)
-            ) =>
-        {
-            let (TypeRef::TypedHandle(name) | TypeRef::RichEnum(name)) = inner.as_ref() else {
-                unreachable!()
-            };
-            let abi = c_abi_struct_name(name, module, prefix);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!("{indent}  {abi}* {fv}_h = {getter}({pv});\n"));
-            out.push_str(&format!(
-                "{indent}  if ({fv}_h == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  else {{ napi_create_int64({env}, (int64_t)(intptr_t){fv}_h, &{fv}); }}\n"
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        // Remaining optionals (scalar/bool/enum/handle) lower to a nullable
-        // pointer-to-value the getter returns directly.
-        TypeRef::Optional(inner) => {
-            let ct = c_elem_type(inner, module, prefix);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!("{indent}  {ct}* {fv}_p = {getter}({pv});\n"));
-            out.push_str(&format!(
-                "{indent}  if ({fv}_p == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  else {{ {} }}\n",
-                napi_create_leaf(env, inner, &format!("*{fv}_p"), fv)
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
-            out.push_str(&format!(
-                "{indent}  const uint8_t* {fv}_data = (const uint8_t*){getter}({pv}, &{fv}_len);\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  if ({fv}_data == NULL) {{ napi_get_null({env}, &{fv}); }}\n"
-            ));
-            out.push_str(&format!(
-                "{indent}  else {{ void* {fv}_buf; napi_create_buffer_copy({env}, {fv}_len, {fv}_data, &{fv}_buf, &{fv}); weaveffi_free_bytes((uint8_t*){fv}_data, {fv}_len); }}\n"
-            ));
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        TypeRef::List(inner) => {
-            let et = c_elem_type(inner, module, prefix);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
-            out.push_str(&format!(
-                "{indent}  {et}* {fv}_arr = {getter}({pv}, &{fv}_len);\n"
-            ));
-            out.push_str(&format!("{indent}  napi_create_array({env}, &{fv});\n"));
-            out.push_str(&format!("{indent}  if ({fv}_arr != NULL) {{\n"));
-            out.push_str(&format!(
-                "{indent}    for (size_t {fv}_i = 0; {fv}_i < {fv}_len; {fv}_i++) {{\n"
-            ));
-            out.push_str(&format!("{indent}      napi_value {fv}_e;\n"));
-            emit_elem_to_napi(
-                out,
-                env,
-                inner,
-                &format!("{fv}_arr[{fv}_i]"),
-                &format!("{fv}_e"),
-                module,
-                prefix,
-                structs,
-                &format!("{indent}      "),
-            );
-            out.push_str(&format!(
-                "{indent}      napi_set_element({env}, {fv}, (uint32_t){fv}_i, {fv}_e);\n"
-            ));
-            out.push_str(&format!("{indent}    }}\n"));
-            out.push_str(&format!(
-                "{indent}    weaveffi_free_bytes((uint8_t*){fv}_arr, {fv}_len * sizeof(*{fv}_arr));\n"
-            ));
-            out.push_str(&format!("{indent}  }}\n"));
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        TypeRef::Map(k, v) => {
-            let kt = c_elem_type(k, module, prefix);
-            let vt = c_elem_type(v, module, prefix);
-            out.push_str(&format!("{indent}{{\n"));
-            out.push_str(&format!("{indent}  {kt}* {fv}_keys = NULL;\n"));
-            out.push_str(&format!("{indent}  {vt}* {fv}_vals = NULL;\n"));
-            out.push_str(&format!("{indent}  size_t {fv}_len;\n"));
-            out.push_str(&format!(
-                "{indent}  {getter}({pv}, &{fv}_keys, &{fv}_vals, &{fv}_len);\n"
-            ));
-            emit_map_pairs_to_napi(
-                out,
-                env,
-                k,
-                v,
-                &format!("{fv}_keys"),
-                &format!("{fv}_vals"),
-                &format!("{fv}_len"),
-                fv,
-                module,
-                prefix,
-                structs,
-                &format!("{indent}  "),
-            );
-            out.push_str(&format!("{indent}}}\n"));
-        }
-        _ => out.push_str(&format!("{indent}napi_get_null({env}, &{fv});\n")),
-    }
-}
-
-/// Build the JS object `target` from the parallel `keys`/`vals` arrays of a
-/// returned map, releasing what the consumer owes: each copied string key or
-/// value via `weaveffi_free_string`, then both producer-allocated arrays via
-/// `weaveffi_free_bytes`.
-#[allow(clippy::too_many_arguments)]
-fn emit_map_pairs_to_napi(
-    out: &mut String,
-    env: &str,
-    k: &TypeRef,
-    v: &TypeRef,
-    keys: &str,
-    vals: &str,
-    len: &str,
-    target: &str,
-    module: &str,
-    prefix: &str,
-    structs: &HashMap<String, StructBinding>,
-    indent: &str,
-) {
-    out.push_str(&format!("{indent}napi_create_object({env}, &{target});\n"));
-    out.push_str(&format!(
-        "{indent}if ({keys} != NULL && {vals} != NULL) {{\n"
-    ));
-    out.push_str(&format!(
-        "{indent}  for (size_t {target}_i = 0; {target}_i < {len}; {target}_i++) {{\n"
-    ));
-    out.push_str(&format!("{indent}    napi_value {target}_v;\n"));
-    emit_elem_to_napi(
-        out,
-        env,
-        v,
-        &format!("{vals}[{target}_i]"),
-        &format!("{target}_v"),
-        module,
-        prefix,
-        structs,
-        &format!("{indent}    "),
-    );
-    match k {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            out.push_str(&format!(
-                "{indent}    napi_set_named_property({env}, {target}, {keys}[{target}_i], {target}_v);\n"
-            ));
-            if matches!(k, TypeRef::StringUtf8) {
-                out.push_str(&format!(
-                    "{indent}    weaveffi_free_string((char*){keys}[{target}_i]);\n"
-                ));
-            }
-        }
-        other => {
-            out.push_str(&format!("{indent}    napi_value {target}_k;\n"));
-            out.push_str(&format!(
-                "{indent}    {}\n",
-                napi_create_leaf(
-                    env,
-                    other,
-                    &format!("{keys}[{target}_i]"),
-                    &format!("{target}_k")
-                )
-            ));
-            out.push_str(&format!(
-                "{indent}    napi_set_property({env}, {target}, {target}_k, {target}_v);\n"
-            ));
-        }
-    }
-    out.push_str(&format!("{indent}  }}\n"));
-    out.push_str(&format!("{indent}}}\n"));
-    out.push_str(&format!(
-        "{indent}weaveffi_free_bytes((uint8_t*){keys}, {len} * sizeof(*{keys}));\n"
-    ));
-    out.push_str(&format!(
-        "{indent}weaveffi_free_bytes((uint8_t*){vals}, {len} * sizeof(*{vals}));\n"
-    ));
-}
-
-fn emit_ret_to_napi(
-    out: &mut String,
-    ty: &TypeRef,
-    module: &str,
-    prefix: &str,
-    f: &FnBinding,
-    structs: &HashMap<String, StructBinding>,
-) {
+/// Convert the C `result` (plus `out_len` when present) into the JS return
+/// value and release what the consumer owes. A buffered return is copied into
+/// a JS `Buffer` and released with `weaveffi_free_bytes`; the JS loader
+/// decodes it into the idiomatic value.
+fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, prefix: &str, f: &FnBinding) {
     out.push_str("  napi_value ret;\n");
+    if is_buffered(ty) {
+        out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
+        out.push_str("  weaveffi_free_bytes((uint8_t*)result, out_len);\n");
+        out.push_str("  return ret;\n");
+        return;
+    }
     match ty {
         TypeRef::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
         TypeRef::U32 => out.push_str("  napi_create_uint32(env, result, &ret);\n"),
@@ -3195,19 +1796,11 @@ fn emit_ret_to_napi(
         TypeRef::BorrowedStr => {
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
         }
-        // A returned interface or rich enum is an owned object reference
-        // surfaced as the raw handle; the JS loader wraps it in its class
-        // (which owns disposal), so the addon must not destroy it here.
-        TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Interface(_)
-        | TypeRef::RichEnum(_) => {
+        // A returned interface is an owned object reference surfaced as the
+        // raw handle; the JS loader wraps it in its class (which owns
+        // disposal), so the addon must not destroy it here.
+        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Interface(_) => {
             out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
-        }
-        TypeRef::Record(name) => {
-            emit_struct_to_object(
-                out, "env", name, "result", "ret", module, prefix, structs, "  ", true,
-            );
         }
         TypeRef::Enum(_) => {
             out.push_str("  napi_create_int32(env, (int32_t)result, &ret);\n");
@@ -3219,29 +1812,13 @@ fn emit_ret_to_napi(
         TypeRef::BorrowedBytes => {
             out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
         }
-        TypeRef::Optional(inner) => {
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(_) => {
             out.push_str("  if (result == NULL) {\n");
             out.push_str("    napi_get_null(env, &ret);\n");
             out.push_str("  } else {\n");
-            emit_optional_ret_inner(out, inner, module, prefix, structs);
+            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
             out.push_str("  }\n");
-        }
-        TypeRef::List(inner) => emit_list_ret(out, inner, module, prefix, "  ", structs),
-        TypeRef::Map(k, v) => {
-            emit_map_pairs_to_napi(
-                out,
-                "env",
-                k,
-                v,
-                "out_keys",
-                "out_values",
-                "out_len",
-                "ret",
-                module,
-                prefix,
-                structs,
-                "  ",
-            );
         }
         TypeRef::Iterator(_) => {
             // Lazy: the launcher's owned iterator handle is boxed into a
@@ -3258,189 +1835,12 @@ fn emit_ret_to_napi(
                 "  napi_create_external(env, iter_state, {c_name}_napi_iter_finalize, NULL, &ret);\n"
             ));
         }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
+        }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     out.push_str("  return ret;\n");
-}
-
-/// Emit the present-case conversion of an optional return (the NULL case was
-/// already handled by the caller). Pointer-lowered optionals (`is_c_pointer_type`)
-/// reuse the inner type's return plan on `result` directly; everything else is
-/// a producer-boxed scalar that is dereferenced and then released per
-/// `ReturnFree::BoxedScalar` (`weaveffi_free_bytes(ptr, sizeof(T))`).
-fn emit_optional_ret_inner(
-    out: &mut String,
-    inner: &TypeRef,
-    module: &str,
-    prefix: &str,
-    structs: &HashMap<String, StructBinding>,
-) {
-    // The boxed-scalar release owed after dereferencing the producer's box.
-    let free_box = "    weaveffi_free_bytes((uint8_t*)result, sizeof(*result));\n";
-    match inner {
-        TypeRef::I32 => {
-            out.push_str("    napi_create_int32(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::U32 => {
-            out.push_str("    napi_create_uint32(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::I64 => {
-            out.push_str("    napi_create_int64(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::F64 => {
-            out.push_str("    napi_create_double(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::I8 | TypeRef::I16 => {
-            out.push_str("    napi_create_int32(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::U8 | TypeRef::U16 => {
-            out.push_str("    napi_create_uint32(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::U64 => {
-            out.push_str("    napi_create_int64(env, (int64_t)*result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::F32 => {
-            out.push_str("    napi_create_double(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::Bool => {
-            out.push_str("    napi_get_boolean(env, *result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::Handle => {
-            out.push_str("    napi_create_int64(env, (int64_t)*result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::Enum(_) => {
-            out.push_str("    napi_create_int32(env, (int32_t)*result, &ret);\n");
-            out.push_str(free_box);
-        }
-        TypeRef::StringUtf8 => {
-            out.push_str("    napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
-            out.push_str("    weaveffi_free_string(result);\n");
-        }
-        TypeRef::BorrowedStr => {
-            out.push_str("    napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
-        }
-        TypeRef::Bytes => {
-            out.push_str("    napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
-            out.push_str("    weaveffi_free_bytes((uint8_t*)result, out_len);\n");
-        }
-        TypeRef::BorrowedBytes => {
-            out.push_str("    napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
-        }
-        TypeRef::Record(name) => {
-            emit_struct_to_object(
-                out, "env", name, "result", "ret", module, prefix, structs, "    ", true,
-            );
-        }
-        // An optional interface, rich enum, or typed handle lowers to one
-        // nullable pointer, so `result` is the object itself: surface the raw
-        // handle without dereferencing or freeing it (the JS wrapper class
-        // adopts owned references and owns their disposal).
-        TypeRef::Interface(_) | TypeRef::RichEnum(_) | TypeRef::TypedHandle(_) => {
-            out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
-        }
-        TypeRef::List(li) => emit_list_ret(out, li, module, prefix, "    ", structs),
-        _ => out.push_str("    napi_get_null(env, &ret);\n"),
-    }
-}
-
-fn emit_list_ret(
-    out: &mut String,
-    inner: &TypeRef,
-    module: &str,
-    prefix: &str,
-    ind: &str,
-    structs: &HashMap<String, StructBinding>,
-) {
-    out.push_str(&format!(
-        "{ind}napi_create_array_with_length(env, out_len, &ret);\n"
-    ));
-    out.push_str(&format!(
-        "{ind}for (size_t ret_i = 0; ret_i < out_len; ret_i++) {{\n"
-    ));
-    out.push_str(&format!("{ind}  napi_value elem;\n"));
-    match inner {
-        TypeRef::I32 => out.push_str(&format!(
-            "{ind}  napi_create_int32(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::U32 => out.push_str(&format!(
-            "{ind}  napi_create_uint32(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::I64 => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::F64 => out.push_str(&format!(
-            "{ind}  napi_create_double(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::I8 | TypeRef::I16 => out.push_str(&format!(
-            "{ind}  napi_create_int32(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::U8 | TypeRef::U16 => out.push_str(&format!(
-            "{ind}  napi_create_uint32(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::U64 => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, (int64_t)result[ret_i], &elem);\n"
-        )),
-        TypeRef::F32 => out.push_str(&format!(
-            "{ind}  napi_create_double(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::Bool => out.push_str(&format!(
-            "{ind}  napi_get_boolean(env, result[ret_i], &elem);\n"
-        )),
-        TypeRef::TypedHandle(_) | TypeRef::Handle => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);\n"
-        )),
-        TypeRef::StringUtf8 => {
-            out.push_str(&format!(
-                "{ind}  napi_create_string_utf8(env, result[ret_i], NAPI_AUTO_LENGTH, &elem);\n"
-            ));
-            out.push_str(&format!("{ind}  weaveffi_free_string(result[ret_i]);\n"));
-        }
-        TypeRef::Enum(_) => out.push_str(&format!(
-            "{ind}  napi_create_int32(env, (int32_t)result[ret_i], &elem);\n"
-        )),
-        TypeRef::Record(name) => {
-            let elem_indent = format!("{ind}  ");
-            emit_struct_to_object(
-                out,
-                "env",
-                name,
-                "result[ret_i]",
-                "elem",
-                module,
-                prefix,
-                structs,
-                &elem_indent,
-                true,
-            );
-        }
-        // Rich-enum elements cross as owned raw handles; the consumer wraps
-        // them in the enum class, which owns disposal.
-        TypeRef::RichEnum(_) => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, (int64_t)(intptr_t)result[ret_i], &elem);\n"
-        )),
-        _ => out.push_str(&format!(
-            "{ind}  napi_create_int64(env, (int64_t)result[ret_i], &elem);\n"
-        )),
-    }
-    out.push_str(&format!(
-        "{ind}  napi_set_element(env, ret, (uint32_t)ret_i, elem);\n"
-    ));
-    out.push_str(&format!("{ind}}}\n"));
-    // The array buffer itself is producer-allocated; release it with the
-    // runtime's own deallocator, per `ReturnFree::Array`.
-    out.push_str(&format!(
-        "{ind}weaveffi_free_bytes((uint8_t*)result, out_len * sizeof(*result));\n"
-    ));
 }
 
 fn ts_type_for(ty: &TypeRef) -> String {
@@ -3554,111 +1954,372 @@ fn emit_fn_doc(
     out.push_str(" */\n");
 }
 
-/// `.d.ts` for a rich (algebraic) enum: a class with a static factory per
-/// variant (`Shape.circle(radius)`), a `tag()` discriminant reader, a frozen
-/// `Tag` discriminant map, per-variant namespaced field getters
-/// (`circleRadius`), and `destroy()`. Mirrors the JS class in [`render_node_index`].
-fn render_rich_enum_dts(out: &mut String, e: &EnumBinding) {
-    let Some(rich) = &e.rich else {
-        return;
-    };
-    let name = &e.name;
-    let mut w = CodeWriter::two_space();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &e.doc, "");
-        w.raw(d);
+// --- Value-buffer glue ------------------------------------------------------
+//
+// Buffered values (records, rich enums, optionals, lists, maps, and error
+// payloads) cross the addon boundary as `Buffer`s holding the WeaveFFI value
+// buffer encoding. The JS loader carries a small private writer/reader
+// implementing the wire format, generic combinators for optionals, lists, and
+// maps, and one generated pack/unpack function per record and rich enum. The
+// composition below is fixed at generation time from the IR; no runtime type
+// dispatch happens.
+
+/// The private buffer writer/reader runtime embedded in `index.js` whenever
+/// the model uses value buffers. Little-endian, packed, no alignment; decode
+/// failures throw the generic error brand (a malformed buffer is a contract
+/// violation, not a typed domain error).
+const BUFFER_RUNTIME_JS: &str = r#"// --- Private value-buffer runtime (WeaveFFI wire format) --------------------
+// Little-endian, packed, no alignment. Decoders reject truncated buffers,
+// invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
+const __utf8 = new TextDecoder('utf-8', { fatal: true });
+function __bufferError(what) {
+  return new WeaveFFIError(-2, 'malformed value buffer: ' + what);
+}
+class __Writer {
+  constructor() {
+    this._buf = Buffer.alloc(256);
+    this._len = 0;
+  }
+  _reserve(n) {
+    if (this._len + n <= this._buf.length) return;
+    let cap = this._buf.length;
+    while (cap < this._len + n) cap *= 2;
+    const grown = Buffer.alloc(cap);
+    this._buf.copy(grown, 0, 0, this._len);
+    this._buf = grown;
+  }
+  bool(v) { this._reserve(1); this._buf[this._len++] = v ? 1 : 0; }
+  i8(v) { this._reserve(1); this._buf.writeInt8(v, this._len); this._len += 1; }
+  u8(v) { this._reserve(1); this._buf.writeUInt8(v, this._len); this._len += 1; }
+  i16(v) { this._reserve(2); this._buf.writeInt16LE(v, this._len); this._len += 2; }
+  u16(v) { this._reserve(2); this._buf.writeUInt16LE(v, this._len); this._len += 2; }
+  i32(v) { this._reserve(4); this._buf.writeInt32LE(v, this._len); this._len += 4; }
+  u32(v) { this._reserve(4); this._buf.writeUInt32LE(v, this._len); this._len += 4; }
+  i64(v) { this._reserve(8); this._buf.writeBigInt64LE(BigInt(v), this._len); this._len += 8; }
+  u64(v) { this._reserve(8); this._buf.writeBigUInt64LE(BigInt(v), this._len); this._len += 8; }
+  f32(v) { this._reserve(4); this._buf.writeFloatLE(v, this._len); this._len += 4; }
+  f64(v) { this._reserve(8); this._buf.writeDoubleLE(v, this._len); this._len += 8; }
+  str(v) {
+    const b = Buffer.from(String(v), 'utf8');
+    this.u32(b.length);
+    this._reserve(b.length);
+    b.copy(this._buf, this._len);
+    this._len += b.length;
+  }
+  bytes(v) {
+    this.u32(v.length);
+    this._reserve(v.length);
+    this._buf.set(v, this._len);
+    this._len += v.length;
+  }
+  finish() { return this._buf.subarray(0, this._len); }
+}
+class __Reader {
+  constructor(buf) {
+    this._buf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    this._pos = 0;
+  }
+  _take(n, what) {
+    if (this._pos + n > this._buf.length) throw __bufferError(what);
+    const at = this._pos;
+    this._pos += n;
+    return at;
+  }
+  bool() {
+    const b = this._buf[this._take(1, 'bool')];
+    if (b > 1) throw __bufferError('bool byte out of range');
+    return b === 1;
+  }
+  i8() { return this._buf.readInt8(this._take(1, 'i8')); }
+  u8() { return this._buf.readUInt8(this._take(1, 'u8')); }
+  i16() { return this._buf.readInt16LE(this._take(2, 'i16')); }
+  u16() { return this._buf.readUInt16LE(this._take(2, 'u16')); }
+  i32() { return this._buf.readInt32LE(this._take(4, 'i32')); }
+  u32() { return this._buf.readUInt32LE(this._take(4, 'u32')); }
+  i64() { return this._buf.readBigInt64LE(this._take(8, 'i64')); }
+  u64() { return this._buf.readBigUInt64LE(this._take(8, 'u64')); }
+  f32() { return this._buf.readFloatLE(this._take(4, 'f32')); }
+  f64() { return this._buf.readDoubleLE(this._take(8, 'f64')); }
+  len() {
+    const n = this.u32();
+    if (n > this._buf.length - this._pos) throw __bufferError('length prefix exceeds remaining bytes');
+    return n;
+  }
+  str() {
+    const n = this.len();
+    const at = this._take(n, 'string bytes');
+    try {
+      return __utf8.decode(this._buf.subarray(at, at + n));
+    } catch (e) {
+      throw __bufferError('string is not valid UTF-8');
     }
-    w.block(format!("export class {name} {{"), "}", |w| {
-        for v in &rich.variants {
-            let factory = v.name.to_lower_camel_case();
-            let params: Vec<String> = v
-                .fields
+  }
+  bytes() {
+    const n = this.len();
+    const at = this._take(n, 'byte buffer');
+    return Buffer.from(this._buf.subarray(at, at + n));
+  }
+  end() {
+    if (this._pos !== this._buf.length) throw __bufferError('trailing bytes after value');
+  }
+}
+function __encode(f, v) { const w = new __Writer(); f(w, v); return w.finish(); }
+function __decode(f, b) { const r = new __Reader(b); const v = f(r); r.end(); return v; }
+function __wOpt(w, v, f) { if (v === null || v === undefined) { w.bool(false); } else { w.bool(true); f(w, v); } }
+function __rOpt(r, f) { return r.bool() ? f(r) : null; }
+function __wList(w, v, f) { w.u32(v.length); for (const e of v) f(w, e); }
+function __rList(r, f) {
+  const n = r.len();
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(f(r));
+  return out;
+}
+function __wMap(w, v, kf, vf) {
+  const keys = Object.keys(v);
+  w.u32(keys.length);
+  for (const k of keys) { kf(w, k); vf(w, v[k]); }
+}
+function __rMap(r, kf, vf) {
+  const n = r.len();
+  const out = {};
+  for (let i = 0; i < n; i++) {
+    const k = kf(r);
+    out[k] = vf(r);
+  }
+  return out;
+}
+
+"#;
+
+/// The writer method of the private buffer writer for a leaf type.
+fn js_leaf_writer_method(ty: &TypeRef) -> &'static str {
+    match ty {
+        TypeRef::Bool => "bool",
+        TypeRef::I8 => "i8",
+        TypeRef::U8 => "u8",
+        TypeRef::I16 => "i16",
+        TypeRef::U16 => "u16",
+        TypeRef::I32 => "i32",
+        TypeRef::U32 => "u32",
+        TypeRef::I64 => "i64",
+        TypeRef::U64 => "u64",
+        TypeRef::F32 => "f32",
+        TypeRef::F64 => "f64",
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str",
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes",
+        _ => unreachable!("not a leaf buffer type"),
+    }
+}
+
+/// A JS function expression `(w, v) => void` writing one value of `ty` in the
+/// wire format. Records and rich enums name their generated pack function;
+/// optionals, lists, and maps compose the generic combinators.
+fn js_writer_fn(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Enum(_) => "(w, v) => w.i32(v)".into(),
+        TypeRef::Handle | TypeRef::TypedHandle(_) => "(w, v) => w.u64(v)".into(),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => format!("__pack{}", local_type_name(n)),
+        TypeRef::Optional(inner) => format!("(w, v) => __wOpt(w, v, {})", js_writer_fn(inner)),
+        TypeRef::List(inner) => format!("(w, v) => __wList(w, v, {})", js_writer_fn(inner)),
+        TypeRef::Map(k, v) => format!(
+            "(w, v) => __wMap(w, v, {}, {})",
+            js_map_key_writer_fn(k),
+            js_writer_fn(v)
+        ),
+        leaf => format!("(w, v) => w.{}(v)", js_leaf_writer_method(leaf)),
+    }
+}
+
+/// A JS function expression `(w, k) => void` writing one *map key*. JS object
+/// keys arrive as strings from `Object.keys`, so numeric key types coerce
+/// through `Number` (or `BigInt`, inside the 64-bit writer methods) first.
+fn js_map_key_writer_fn(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "(w, k) => w.str(k)".into(),
+        TypeRef::Bool => "(w, k) => w.bool(k === true || k === 'true')".into(),
+        TypeRef::I64 => "(w, k) => w.i64(k)".into(),
+        TypeRef::U64 | TypeRef::Handle | TypeRef::TypedHandle(_) => "(w, k) => w.u64(k)".into(),
+        TypeRef::Enum(_) => "(w, k) => w.i32(Number(k))".into(),
+        leaf => format!("(w, k) => w.{}(Number(k))", js_leaf_writer_method(leaf)),
+    }
+}
+
+/// A JS function expression `(r) => value` reading one value of `ty` from the
+/// wire format. 64-bit integers surface as numbers (matching the TS surface);
+/// handles surface as `BigInt`s except typed handles, which keep the numeric
+/// handle spelling the addon uses.
+fn js_reader_fn(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I64 => "(r) => Number(r.i64())".into(),
+        TypeRef::U64 | TypeRef::TypedHandle(_) => "(r) => Number(r.u64())".into(),
+        TypeRef::Handle => "(r) => r.u64()".into(),
+        TypeRef::Enum(_) => "(r) => r.i32()".into(),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => format!("__unpack{}", local_type_name(n)),
+        TypeRef::Optional(inner) => format!("(r) => __rOpt(r, {})", js_reader_fn(inner)),
+        TypeRef::List(inner) => format!("(r) => __rList(r, {})", js_reader_fn(inner)),
+        TypeRef::Map(k, v) => format!("(r) => __rMap(r, {}, {})", js_reader_fn(k), js_reader_fn(v)),
+        leaf => format!("(r) => r.{}()", js_leaf_writer_method(leaf)),
+    }
+}
+
+/// The JS statement expression writing `val` of type `ty` onto writer `w`.
+/// Direct spellings for leaves and generated pack functions; combinator calls
+/// for optionals, lists, and maps.
+fn js_write_expr(ty: &TypeRef, val: &str) -> String {
+    match ty {
+        TypeRef::Enum(_) => format!("w.i32({val})"),
+        TypeRef::Handle | TypeRef::TypedHandle(_) => format!("w.u64({val})"),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            format!("__pack{}(w, {val})", local_type_name(n))
+        }
+        TypeRef::Optional(inner) => format!("__wOpt(w, {val}, {})", js_writer_fn(inner)),
+        TypeRef::List(inner) => format!("__wList(w, {val}, {})", js_writer_fn(inner)),
+        TypeRef::Map(k, v) => format!(
+            "__wMap(w, {val}, {}, {})",
+            js_map_key_writer_fn(k),
+            js_writer_fn(v)
+        ),
+        leaf => format!("w.{}({val})", js_leaf_writer_method(leaf)),
+    }
+}
+
+/// The JS expression reading one value of type `ty` from reader `r`.
+fn js_read_expr(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::I64 => "Number(r.i64())".into(),
+        TypeRef::U64 | TypeRef::TypedHandle(_) => "Number(r.u64())".into(),
+        TypeRef::Handle => "r.u64()".into(),
+        TypeRef::Enum(_) => "r.i32()".into(),
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            format!("__unpack{}(r)", local_type_name(n))
+        }
+        TypeRef::Optional(inner) => format!("__rOpt(r, {})", js_reader_fn(inner)),
+        TypeRef::List(inner) => format!("__rList(r, {})", js_reader_fn(inner)),
+        TypeRef::Map(k, v) => format!("__rMap(r, {}, {})", js_reader_fn(k), js_reader_fn(v)),
+        leaf => format!("r.{}()", js_leaf_writer_method(leaf)),
+    }
+}
+
+/// True when the loader must embed the buffer runtime: any record or rich
+/// enum is declared, any signature position carries a buffered type, or any
+/// error code declares payload fields.
+fn model_uses_buffers(model: &BindingModel) -> bool {
+    model.modules.iter().any(|m| {
+        !m.structs.is_empty()
+            || m.enums.iter().any(|e| e.is_rich())
+            || m.error
+                .as_ref()
+                .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
+            || m.callbacks
                 .iter()
-                .map(|f| format!("{}: {}", f.name, ts_type_for(&f.ty)))
-                .collect();
-            let mut d = String::new();
-            emit_doc(&mut d, &v.doc, "  ");
-            w.raw(d);
-            w.line(format!("static {factory}({}): {name};", params.join(", ")));
-        }
-        w.line("/** The active variant's discriminant. */");
-        w.line("tag(): number;");
-        for v in &rich.variants {
-            for f in &v.fields {
-                let getter = format!(
-                    "{}{}",
-                    v.name.to_lower_camel_case(),
-                    f.name.to_upper_camel_case()
-                );
-                let mut d = String::new();
-                emit_doc(&mut d, &f.doc, "  ");
-                w.raw(d);
-                w.line(format!("get {getter}(): {};", ts_type_for(&f.ty)));
-            }
-        }
-        w.line("/** Free the underlying native object. */");
-        w.line("destroy(): void;");
-    });
-    // The discriminant map, e.g. `Shape.Tag.Circle === 1`.
-    w.block(format!("export namespace {name} {{"), "}", |w| {
-        w.block("const Tag: Readonly<{", "}>;", |w| {
-            for v in &e.variants {
-                w.line(format!("{}: {},", v.name, v.value));
+                .any(|cb| cb.params.iter().any(|p| is_buffered(&p.ty)))
+            || m.callables().any(|f| {
+                f.params.iter().any(|p| is_buffered(&p.ty))
+                    || f.ret.as_ref().is_some_and(|t| {
+                        is_buffered(t)
+                            || matches!(t, TypeRef::Iterator(inner) if is_buffered(inner))
+                    })
+            })
+    })
+}
+
+/// Emit one module's pack/unpack functions: one pair per record and one pair
+/// per rich enum, with fields written and read in declaration (wire) order.
+fn render_pack_fns_js(out: &mut String, m: &ModuleBinding) {
+    let mut w = CodeWriter::two_space();
+    for s in &m.structs {
+        w.block(format!("function __pack{}(w, v) {{", s.name), "}", |w| {
+            for field in &s.fields {
+                w.line(format!(
+                    "{};",
+                    js_write_expr(&field.ty, &format!("v.{}", field.name))
+                ));
             }
         });
-    });
-    out.push_str(&w.finish());
-}
-
-fn render_struct_builder_dts(out: &mut String, s: &StructBinding) {
-    let name = &s.name;
-    let mut w = CodeWriter::two_space();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &s.doc, "");
-        w.raw(d);
+        w.block(format!("function __unpack{}(r) {{", s.name), "}", |w| {
+            if s.fields.is_empty() {
+                w.line("return {};");
+            } else {
+                w.line("return {");
+                for field in &s.fields {
+                    w.line(format!("  {}: {},", field.name, js_read_expr(&field.ty)));
+                }
+                w.line("};");
+            }
+        });
     }
-    w.block(format!("export interface {}Builder {{", s.name), "}", |w| {
-        for field in &s.fields {
-            let method = format!("with{}", field.name.to_upper_camel_case());
-            let ts = ts_type_for(&field.ty);
-            let mut d = String::new();
-            emit_doc(&mut d, &field.doc, "  ");
-            w.raw(d);
-            w.line(format!("{method}(value: {ts}): {name}Builder;"));
+    for e in &m.enums {
+        if !e.is_rich() {
+            continue;
         }
-        w.line(format!("build(): {name};"));
-    });
-    out.push_str(&w.finish());
+        let name = &e.name;
+        // Pack: string tag selects the variant; the i32 discriminant plus the
+        // variant's fields go on the wire.
+        w.block(format!("function __pack{name}(w, v) {{"), "}", |w| {
+            w.block("switch (v.tag) {", "}", |w| {
+                for v in &e.variants {
+                    w.line(format!("case '{}':", v.name));
+                    w.line(format!("  w.i32({});", v.value));
+                    for field in &v.fields {
+                        w.line(format!(
+                            "  {};",
+                            js_write_expr(&field.ty, &format!("v.{}", field.name))
+                        ));
+                    }
+                    w.line("  break;");
+                }
+                w.line("default:");
+                w.line(format!(
+                    "  throw new {ERROR_BRAND}(-2, 'unknown {name} tag: ' + (v && v.tag));"
+                ));
+            });
+        });
+        // Unpack: the i32 discriminant selects the variant; fields decode in
+        // order and land next to the string tag.
+        w.block(format!("function __unpack{name}(r) {{"), "}", |w| {
+            w.line("const tag = r.i32();");
+            w.block("switch (tag) {", "}", |w| {
+                for v in &e.variants {
+                    let fields: String = v
+                        .fields
+                        .iter()
+                        .map(|f| format!(", {}: {}", f.name, js_read_expr(&f.ty)))
+                        .collect();
+                    w.line(format!(
+                        "case {}: return {{ tag: '{}'{fields} }};",
+                        v.value, v.name
+                    ));
+                }
+                w.line(format!(
+                    "default: throw new {ERROR_BRAND}(-2, 'unknown {name} tag: ' + tag);"
+                ));
+            });
+        });
+    }
+    let text = w.finish();
+    if !text.is_empty() {
+        out.push_str(&text);
+        out.push('\n');
+    }
 }
 
-/// How a wrapper rebuilds a class-typed result from the raw addon value.
+/// Recognize an interface-typed return carried directly or as `Interface?`
+/// (the only optional that stays a nullable pointer). Buffered returns are
+/// handled separately by the wrapper body.
 struct RetWrap {
     /// The local JS class name.
     cls: String,
-    /// `true` for `T?`: the addon surfaces `null` for the absent case.
+    /// `true` for `Interface?`: the addon surfaces `null` for the absent case.
     optional: bool,
-    /// `true` for an interface (wrap via `_fromHandle`); `false` for a rich
-    /// enum (wrap via the class constructor).
-    iface: bool,
 }
 
-/// Recognize a class-typed return carried directly or as an `Optional`.
-/// Deeper nestings (list/map elements) are rejected by validation for
-/// interfaces and flow through unwrapped for rich enums.
+/// Recognize a class-typed (interface) return, direct or optional.
 fn js_ret_wrap(ret: Option<&TypeRef>) -> Option<RetWrap> {
     fn direct(ty: &TypeRef, optional: bool) -> Option<RetWrap> {
         match ty {
-            TypeRef::RichEnum(n) => Some(RetWrap {
-                cls: local_type_name(n).to_string(),
-                optional,
-                iface: false,
-            }),
             TypeRef::Interface(n) => Some(RetWrap {
                 cls: local_type_name(n).to_string(),
                 optional,
-                iface: true,
             }),
             _ => None,
         }
@@ -3669,19 +2330,21 @@ fn js_ret_wrap(ret: Option<&TypeRef>) -> Option<RetWrap> {
     }
 }
 
-/// The addon-argument expression for one logical parameter: interface and
-/// rich-enum instances are unwrapped to their raw `_handle` (a borrow; the
-/// callee never takes ownership), everything else passes through.
+/// The addon-argument expression for one logical parameter. Buffered values
+/// pack into a `Buffer` via the generated writer; interface instances unwrap
+/// to their raw `_handle` (a borrow; the callee never takes ownership);
+/// everything else passes through.
 fn js_arg_expr(js_name: &str, ty: &TypeRef) -> String {
-    fn wrapper_class(ty: &TypeRef) -> Option<&str> {
-        match ty {
-            TypeRef::RichEnum(n) | TypeRef::Interface(n) => Some(local_type_name(n)),
-            _ => None,
-        }
+    if is_buffered(ty) {
+        return format!("__encode({}, {js_name})", js_writer_fn(ty));
     }
     let cls = match ty {
-        TypeRef::Optional(inner) => wrapper_class(inner),
-        ty => wrapper_class(ty),
+        TypeRef::Interface(n) => Some(local_type_name(n)),
+        TypeRef::Optional(inner) => match inner.as_ref() {
+            TypeRef::Interface(n) => Some(local_type_name(n)),
+            _ => None,
+        },
+        _ => None,
     };
     match cls {
         Some(c) => format!("{js_name} instanceof {c} ? {js_name}._handle : {js_name}"),
@@ -3709,12 +2372,16 @@ fn js_error_factory_name(eb: &ErrorBinding) -> String {
 /// Emit one declaring module's typed error surface onto `wv`: the domain
 /// class extending the generic brand, one subclass per code carrying its
 /// stable `CODE` and default message, and the factory mapping a raw ABI code
-/// to the matching class (or the generic brand for codes outside the domain:
-/// panics and marshalling failures).
+/// (plus the raw payload buffer) to the matching class. Codes that declare
+/// payload fields get a decoder that unpacks the buffer and attaches the
+/// fields as properties on the error instance; unknown codes fall back to
+/// the generic brand (panics and marshalling failures).
 fn render_error_classes_js(out: &mut String, eb: &ErrorBinding) {
     let domain = &eb.type_name;
     let factory = js_error_factory_name(eb);
     let table = format!("__{}ErrorCodes", eb.owner_path.to_lower_camel_case());
+    let payloads = format!("__{}ErrorPayloads", eb.owner_path.to_lower_camel_case());
+    let has_payloads = eb.codes.iter().any(|c| !c.fields.is_empty());
 
     let mut w = CodeWriter::two_space();
     w.block(
@@ -3749,22 +2416,59 @@ fn render_error_classes_js(out: &mut String, eb: &ErrorBinding) {
         "const {table} = Object.freeze({{ {} }});",
         entries.join(", ")
     ));
-    w.block(format!("function {factory}(code, message) {{"), "}", |w| {
-        w.line(format!("const _cls = {table}[code];"));
+    if has_payloads {
+        // One payload decoder per code that declares fields, reading the
+        // code's fields in declaration (wire) order.
+        let decoders: Vec<String> = eb
+            .codes
+            .iter()
+            .filter(|c| !c.fields.is_empty())
+            .map(|c| {
+                let fields: Vec<String> = c
+                    .fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, js_read_expr(&f.ty)))
+                    .collect();
+                format!("{}: (r) => ({{ {} }})", c.value, fields.join(", "))
+            })
+            .collect();
         w.line(format!(
-            "return _cls === undefined ? new {ERROR_BRAND}(code, message) : new _cls(message);"
+            "const {payloads} = Object.freeze({{ {} }});",
+            decoders.join(", ")
         ));
-    });
+    }
+    w.block(
+        format!("function {factory}(code, message, payload) {{"),
+        "}",
+        |w| {
+            w.line(format!("const _cls = {table}[code];"));
+            w.line(format!(
+                "const _err = _cls === undefined ? new {ERROR_BRAND}(code, message) : new _cls(message);"
+            ));
+            if has_payloads {
+                w.line(format!("const _decode = {payloads}[code];"));
+                w.block(
+                    "if (_decode !== undefined && payload != null) {",
+                    "}",
+                    |w| {
+                        w.line("Object.assign(_err, __decode(_decode, payload));");
+                    },
+                );
+            }
+            w.line("return _err;");
+        },
+    );
     w.blank();
     out.push_str(&w.finish());
 }
 
-/// Emit one wrapper callable's body: unwrap class-typed arguments to raw
-/// handles, invoke the addon binding through the rebranding helper, and wrap
-/// a class-typed result. Iterator-returning callables launch the native
-/// iterator and hand its external to the shared lazy iterator class. Shared
-/// by free functions and interface members (`self_expr` supplies the leading
-/// handle of an instance method).
+/// Emit one wrapper callable's body: pack buffered arguments and unwrap
+/// class-typed ones, invoke the addon binding through the rebranding helper,
+/// then decode a buffered result or wrap an interface-typed one.
+/// Iterator-returning callables launch the native iterator and hand its
+/// external to the shared lazy iterator class, decoding buffered elements per
+/// step. Shared by free functions and interface members (`self_expr` supplies
+/// the leading handle of an instance method).
 fn emit_wrapper_body_js(
     w: &mut CodeWriter,
     f: &FnBinding,
@@ -3790,10 +2494,11 @@ fn emit_wrapper_body_js(
     if let Some(TypeRef::Iterator(inner)) = f.ret.as_ref() {
         // Launch, then wrap the external in the lazy iterator: one native
         // `next` per consumer step, `destroy` on exhaustion or early exit.
-        // Rich-enum elements arrive as owned raw handles the class adopts.
-        let wrap_elem = match inner.as_ref() {
-            TypeRef::RichEnum(n) => format!("(_e) => new {}(_e)", local_type_name(n)),
-            _ => "null".to_string(),
+        // Buffered elements arrive as encoded buffers decoded per step.
+        let wrap_elem = if is_buffered(inner) {
+            format!("(_e) => __decode({}, _e)", js_reader_fn(inner))
+        } else {
+            "null".to_string()
         };
         w.line(format!("const _it = {call};"));
         w.line(format!(
@@ -3802,16 +2507,27 @@ fn emit_wrapper_body_js(
         return;
     }
 
+    if let Some(ret) = f.ret.as_ref() {
+        if is_buffered(ret) {
+            let reader = js_reader_fn(ret);
+            if f.is_async {
+                w.line(format!(
+                    "return {call}.then((_r) => __decode({reader}, _r));"
+                ));
+            } else {
+                w.line(format!("const _r = {call};"));
+                w.line(format!("return __decode({reader}, _r);"));
+            }
+            return;
+        }
+    }
+
     let Some(wrap) = js_ret_wrap(f.ret.as_ref()) else {
         w.line(format!("return {call};"));
         return;
     };
     let cls = &wrap.cls;
-    let rewrap = if wrap.iface {
-        format!("{cls}._fromHandle(_r)")
-    } else {
-        format!("new {cls}(_r)")
-    };
+    let rewrap = format!("{cls}._fromHandle(_r)");
     match (f.is_async, wrap.optional) {
         (false, false) => {
             w.line(format!("const _r = {call};"));
@@ -3832,12 +2548,11 @@ fn emit_wrapper_body_js(
     }
 }
 
-/// Emit one interface's JS class onto `wv`, following the rich-enum wrapper
-/// pattern: the class owns the opaque handle and frees it once, via explicit
-/// `destroy()` or a `FinalizationRegistry` safety net. A sync constructor
-/// named `new` becomes the JS `constructor`; every other constructor becomes
-/// a static factory; methods pass the wrapped handle as the leading addon
-/// argument; statics are static methods.
+/// Emit one interface's JS class onto `wv`. The class owns the opaque handle
+/// and frees it once, via explicit `destroy()` or a `FinalizationRegistry`
+/// safety net. A sync constructor named `new` becomes the JS `constructor`;
+/// every other constructor becomes a static factory; methods pass the wrapped
+/// handle as the leading addon argument; statics are static methods.
 fn render_interface_class_js(
     out: &mut String,
     i: &InterfaceBinding,
@@ -4008,12 +2723,64 @@ fn render_iterator_class_js(out: &mut String) {
     out.push_str(&w.finish());
 }
 
+/// Emit the wrapping `wv.registerX` for a listener whose callback carries
+/// buffered arguments: the addon delivers those as borrowed-then-copied
+/// `Buffer`s, so the wrapper decodes them before invoking the user's
+/// callback. Listeners with only direct arguments keep the plain addon
+/// re-export.
+fn render_listener_wrapper_js(
+    out: &mut String,
+    m: &ModuleBinding,
+    l: &ListenerBinding,
+    strip: bool,
+) {
+    let Some(cb) = m.callback(&l.event_callback) else {
+        return;
+    };
+    if !cb.params.iter().any(|p| is_buffered(&p.ty)) {
+        return;
+    }
+    let register = js_fn_name(&m.path, &format!("register_{}", l.name), strip);
+    let params: Vec<String> = cb.params.iter().map(|p| js_param_name(&p.name)).collect();
+    let args: Vec<String> = cb
+        .params
+        .iter()
+        .map(|p| {
+            let n = js_param_name(&p.name);
+            if is_buffered(&p.ty) {
+                format!("__decode({}, {n})", js_reader_fn(&p.ty))
+            } else {
+                n
+            }
+        })
+        .collect();
+    let mut w = CodeWriter::two_space();
+    w.block(
+        format!("wv.{register} = function (callback) {{"),
+        "};",
+        |w| {
+            w.block(
+                format!(
+                    "return addon.{register}(function ({}) {{",
+                    params.join(", ")
+                ),
+                "});",
+                |w| {
+                    w.line(format!("callback({});", args.join(", ")));
+                },
+            );
+        },
+    );
+    out.push_str(&w.finish());
+}
+
 /// The JS loader (`index.js`). Re-exports the native addon's bindings, then
 /// layers the idiomatic surface on top: the generic error brand plus one
-/// typed error class per declared domain, wrapper classes for rich enums and
+/// typed error class per declared domain, the private value-buffer runtime
+/// with one pack/unpack pair per record and rich enum, wrapper classes for
 /// interfaces, and one wrapper per module function so failures rebrand as the
-/// right error class and class-typed values cross as instances rather than
-/// raw handles.
+/// right error class and value types cross as plain objects rather than raw
+/// buffers.
 fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) -> String {
     let dbl = CommentStyle::DoubleSlash;
     let mut out = render_prelude(dbl, input_basename);
@@ -4030,16 +2797,17 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
     // them by explicit own-name lookup before layering the idiomatic wrappers.
     out.push_str(
         "\n// Re-export every native binding, then layer the idiomatic wrappers\n\
-         // (error classes, interface and rich-enum classes, function wrappers)\n\
-         // on top.\n\
+         // (error classes, interface classes, buffer pack/unpack, function\n\
+         // wrappers) on top.\n\
          const wv = {};\n\
          for (const _name of Object.getOwnPropertyNames(addon)) {\n  wv[_name] = addon[_name];\n}\n\n",
     );
 
     // The generic brand and the shared invoke helpers. Every wrapper funnels
-    // addon failures (JS errors carrying the numeric ABI `code`) through a
-    // mapping factory: the module domain's for throwing callables, the
-    // generic constructor otherwise.
+    // addon failures (JS errors carrying the numeric ABI `code` and, for
+    // structured errors, the raw `payload` buffer) through a mapping factory:
+    // the module domain's for throwing callables, the generic constructor
+    // otherwise.
     out.push_str(&format!(
         "class {ERROR_BRAND} extends Error {{\n  \
            constructor(code, message) {{\n    \
@@ -4054,7 +2822,7 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
            return new {ERROR_BRAND}(code, message);\n\
          }}\n\
          function __rebrand(e, map) {{\n  \
-           return e && typeof e.code === 'number' ? map(e.code, e.message) : e;\n\
+           return e && typeof e.code === 'number' ? map(e.code, e.message, e.payload) : e;\n\
          }}\n\
          function __invoke(fn, args, map) {{\n  \
            try {{\n    \
@@ -4070,6 +2838,13 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
          }}\n\n"
     ));
 
+    if model_uses_buffers(model) {
+        out.push_str(BUFFER_RUNTIME_JS);
+        for m in &model.modules {
+            render_pack_fns_js(&mut out, m);
+        }
+    }
+
     if model_has_iterators(model) {
         render_iterator_class_js(&mut out);
     }
@@ -4078,18 +2853,16 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
         if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
             render_error_classes_js(&mut out, eb);
         }
-        for e in &m.enums {
-            if e.is_rich() {
-                render_rich_enum_class_js(&mut out, e, &m.path, strip);
-            }
-        }
         for i in &m.interfaces {
             render_interface_class_js(&mut out, i, m, strip);
+        }
+        for l in &m.listeners {
+            render_listener_wrapper_js(&mut out, m, l, strip);
         }
     }
 
     // One wrapper per module function, so every failure is rebranded and
-    // class-typed parameters and returns cross as instances.
+    // buffered or class-typed values cross as idiomatic values.
     for m in &model.modules {
         for f in &m.functions {
             let js = js_fn_name(&m.path, &f.name, strip);
@@ -4110,93 +2883,6 @@ fn render_node_index(model: &BindingModel, strip: bool, input_basename: &str) ->
     out.push_str("\nmodule.exports = wv;\n\n");
     out.push_str(&render_trailer(dbl, "index.js"));
     out
-}
-
-/// Emit one rich-enum wrapper class onto `wv`. The class owns the opaque handle
-/// and frees it once, via explicit `destroy()` or a `FinalizationRegistry`
-/// safety net, mirroring how the other backends free the same object.
-fn render_rich_enum_class_js(out: &mut String, e: &EnumBinding, module: &str, strip: bool) {
-    let Some(rich) = &e.rich else {
-        return;
-    };
-    let name = &e.name;
-    let destroy_js = wrapper_name(module, &rich_destroy_base(name), strip);
-
-    let mut w = CodeWriter::two_space();
-    w.block(format!("class {name} {{"), "}", |w| {
-        w.block("constructor(handle) {", "}", |w| {
-            w.line("this._handle = handle;");
-            w.line(format!("{name}._cleanup.register(this, handle, this);"));
-        });
-
-        // Per-variant factories (`Shape.circle(radius)`). A constructor
-        // failure can only be marshalling or a panic, so it rebrands generic.
-        for v in &rich.variants {
-            let factory = v.name.to_lower_camel_case();
-            let ctor_js = wrapper_name(module, &rich_ctor_base(name, &v.name), strip);
-            let params: Vec<String> = v.fields.iter().map(|f| f.name.clone()).collect();
-            let joined = params.join(", ");
-            w.block(format!("static {factory}({joined}) {{"), "}", |w| {
-                w.line(format!(
-                    "return new {name}(__invoke(addon.{ctor_js}, [{joined}], __generic));"
-                ));
-            });
-        }
-
-        // Discriminant reader.
-        let tag_js = wrapper_name(module, &rich_tag_base(name), strip);
-        w.block("tag() {", "}", |w| {
-            w.line(format!("return addon.{tag_js}(this._handle);"));
-        });
-
-        // Namespaced per-variant field getters (`circleRadius`).
-        for v in &rich.variants {
-            for f in &v.fields {
-                let getter = format!(
-                    "{}{}",
-                    v.name.to_lower_camel_case(),
-                    f.name.to_upper_camel_case()
-                );
-                let getter_js =
-                    wrapper_name(module, &rich_getter_base(name, &v.name, &f.name), strip);
-                w.block(format!("get {getter}() {{"), "}", |w| {
-                    w.line(format!("return addon.{getter_js}(this._handle);"));
-                });
-            }
-        }
-
-        // Explicit cleanup; guarded so a double `destroy()` (or destroy-then-GC) is
-        // a no-op rather than a double free.
-        w.block("destroy() {", "}", |w| {
-            w.block("if (this._handle) {", "}", |w| {
-                w.line(format!("{name}._cleanup.unregister(this);"));
-                w.line(format!("addon.{destroy_js}(this._handle);"));
-                w.line("this._handle = 0;");
-            });
-        });
-    });
-
-    w.block(
-        format!("{name}._cleanup = new FinalizationRegistry((handle) => {{"),
-        "});",
-        |w| {
-            w.line(format!("if (handle) {{ addon.{destroy_js}(handle); }}"));
-        },
-    );
-
-    // Frozen discriminant map (`Shape.Tag.Circle === 1`).
-    let consts: Vec<String> = e
-        .variants
-        .iter()
-        .map(|v| format!("{}: {}", v.name, v.value))
-        .collect();
-    w.line(format!(
-        "{name}.Tag = Object.freeze({{ {} }});",
-        consts.join(", ")
-    ));
-    w.line(format!("wv.{name} = {name};"));
-    w.blank();
-    out.push_str(&w.finish());
 }
 
 /// The TS parameter list of a callable, camel-cased.
@@ -4235,9 +2921,33 @@ fn ts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
     tags
 }
 
+/// `.d.ts` for a rich (algebraic) enum: a discriminated union with a string
+/// `tag` property naming the active variant, plus the variant's fields.
+/// Mirrors the tagged-union objects the loader's unpack function produces.
+fn render_rich_enum_dts(out: &mut String, e: &EnumBinding) {
+    emit_doc(out, &e.doc, "");
+    out.push_str(&format!("export type {} =", e.name));
+    for v in &e.variants {
+        out.push('\n');
+        if v.doc.is_some() {
+            let mut d = String::new();
+            emit_doc(&mut d, &v.doc, "  ");
+            out.push_str(&d);
+        }
+        let fields: String = v
+            .fields
+            .iter()
+            .map(|f| format!("; {}: {}", f.name, ts_type_for(&f.ty)))
+            .collect();
+        out.push_str(&format!("  | {{ tag: '{}'{fields} }}", v.name));
+    }
+    out.push_str(";\n");
+}
+
 /// `.d.ts` for one declaring module's error surface: the domain class
 /// extending the generic brand plus one subclass per code carrying its
-/// stable `CODE`.
+/// stable `CODE` and, for codes with structured payloads, the decoded
+/// payload fields as readonly properties.
 fn render_error_dts(out: &mut String, eb: &ErrorBinding) {
     let domain = &eb.type_name;
     out.push_str(&format!(
@@ -4252,6 +2962,14 @@ fn render_error_dts(out: &mut String, eb: &ErrorBinding) {
         emit_doc(out, &c.doc, "");
         out.push_str(&format!("export class {class} extends {domain} {{\n"));
         out.push_str(&format!("  static readonly CODE: {};\n", c.value));
+        for field in &c.fields {
+            emit_doc(out, &field.doc, "  ");
+            out.push_str(&format!(
+                "  readonly {}: {};\n",
+                field.name,
+                ts_type_for(&field.ty)
+            ));
+        }
         out.push_str("  constructor(message?: string);\n");
         out.push_str("}\n");
     }
@@ -4348,6 +3066,8 @@ fn render_node_dts(
         if let Some(eb) = m.error.as_ref().filter(|e| e.declared_here) {
             render_error_dts(&mut out, eb);
         }
+        // Records are plain value types: an interface with typed fields, no
+        // handle wrapping, no builders, no destroy.
         for s in &m.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
@@ -4356,13 +3076,10 @@ fn render_node_dts(
                 out.push_str(&format!("  {}: {};\n", field.name, ts_type_for(&field.ty)));
             }
             out.push_str("}\n");
-            if s.builder.is_some() {
-                render_struct_builder_dts(&mut out, s);
-            }
         }
         for e in &m.enums {
-            // A rich (algebraic) enum is an opaque-object wrapper class, not a
-            // plain numeric `enum`.
+            // A rich (algebraic) enum is a tagged union, not a plain numeric
+            // `enum`.
             if e.is_rich() {
                 render_rich_enum_dts(&mut out, e);
                 continue;
@@ -4491,7 +3208,7 @@ mod tests {
 
     fn make_api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -4509,6 +3226,50 @@ mod tests {
             errors: None,
             interfaces: vec![],
             modules: vec![],
+        }
+    }
+
+    fn field(name: &str, ty: TypeRef) -> StructField {
+        StructField {
+            name: name.into(),
+            ty,
+            doc: None,
+            default: None,
+        }
+    }
+
+    fn param(name: &str, ty: TypeRef) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        }
+    }
+
+    fn func(name: &str, params: Vec<Param>, returns: Option<TypeRef>, throws: bool) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            r#async: false,
+            cancellable: false,
+            throws,
+            deprecated: None,
+            since: None,
+        }
+    }
+
+    /// A `Contact { name: string, age: i32 }` record for buffered-type tests.
+    fn contact_struct() -> StructDef {
+        StructDef {
+            name: "Contact".into(),
+            doc: None,
+            fields: vec![
+                field("name", TypeRef::StringUtf8),
+                field("age", TypeRef::I32),
+            ],
         }
     }
 
@@ -4541,12 +3302,7 @@ mod tests {
             callbacks: vec![CallbackDef {
                 name: "OnMessage".into(),
                 doc: None,
-                params: vec![Param {
-                    name: "message".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("message", TypeRef::StringUtf8)],
             }],
             listeners: vec![ListenerDef {
                 name: "message_listener".into(),
@@ -4664,26 +3420,10 @@ mod tests {
             name: "Contact".into(),
             doc: None,
             fields: vec![
-                StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "age".into(),
-                    ty: TypeRef::I32,
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "active".into(),
-                    ty: TypeRef::Bool,
-                    doc: None,
-                    default: None,
-                },
+                field("name", TypeRef::StringUtf8),
+                field("age", TypeRef::I32),
+                field("active", TypeRef::Bool),
             ],
-            builder: false,
         });
         m.enums.push(EnumDef {
             name: "Color".into(),
@@ -4709,35 +3449,20 @@ mod tests {
                 },
             ],
         });
-        m.functions.push(Function {
-            name: "get_contact".into(),
-            params: vec![Param {
-                name: "id".into(),
-                ty: TypeRef::I32,
-                mutable: false,
-                doc: None,
-            }],
-            returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
+        m.functions.push(func(
+            "get_contact",
+            vec![param("id", TypeRef::I32)],
+            Some(TypeRef::Optional(Box::new(TypeRef::Record(
                 "Contact".into(),
             )))),
-            doc: None,
-            r#async: false,
-            cancellable: false,
-            throws: false,
-            deprecated: None,
-            since: None,
-        });
-        m.functions.push(Function {
-            name: "list_contacts".into(),
-            params: vec![],
-            returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
-            doc: None,
-            r#async: false,
-            cancellable: false,
-            throws: false,
-            deprecated: None,
-            since: None,
-        });
+            false,
+        ));
+        m.functions.push(func(
+            "list_contacts",
+            vec![],
+            Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
+            false,
+        ));
 
         let dts = dts_for(&make_api(vec![m]), true);
 
@@ -4766,30 +3491,12 @@ mod tests {
     fn node_generates_binding_gyp() {
         let api = make_api(vec![{
             let mut m = make_module("math");
-            m.functions.push(Function {
-                name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
             m
         }]);
 
@@ -4841,100 +3548,47 @@ mod tests {
         let api = make_api(vec![Module {
             name: "contacts".to_string(),
             functions: vec![
-                Function {
-                    name: "get_contact".to_string(),
-                    params: vec![Param {
-                        name: "id".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
+                func(
+                    "get_contact",
+                    vec![param("id", TypeRef::I32)],
+                    Some(TypeRef::Optional(Box::new(TypeRef::Record(
                         "Contact".into(),
                     )))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "list_contacts".to_string(),
-                    params: vec![],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "set_favorite_color".to_string(),
-                    params: vec![
-                        Param {
-                            name: "contact_id".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "color".to_string(),
-                            ty: TypeRef::Optional(Box::new(TypeRef::Enum("Color".into()))),
-                            mutable: false,
-                            doc: None,
-                        },
+                    false,
+                ),
+                func(
+                    "list_contacts",
+                    vec![],
+                    Some(TypeRef::List(Box::new(TypeRef::Record("Contact".into())))),
+                    false,
+                ),
+                func(
+                    "set_favorite_color",
+                    vec![
+                        param("contact_id", TypeRef::I32),
+                        param(
+                            "color",
+                            TypeRef::Optional(Box::new(TypeRef::Enum("Color".into()))),
+                        ),
                     ],
-                    returns: None,
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "get_tags".to_string(),
-                    params: vec![Param {
-                        name: "contact_id".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
+                    None,
+                    false,
+                ),
+                func(
+                    "get_tags",
+                    vec![param("contact_id", TypeRef::I32)],
+                    Some(TypeRef::List(Box::new(TypeRef::StringUtf8))),
+                    false,
+                ),
             ],
             structs: vec![StructDef {
                 name: "Contact".to_string(),
                 doc: None,
                 fields: vec![
-                    StructField {
-                        name: "name".to_string(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "email".to_string(),
-                        ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
-                        doc: None,
-                        default: None,
-                    },
-                    StructField {
-                        name: "tags".to_string(),
-                        ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
-                        doc: None,
-                        default: None,
-                    },
+                    field("name", TypeRef::StringUtf8),
+                    field("email", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
+                    field("tags", TypeRef::List(Box::new(TypeRef::StringUtf8))),
                 ],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Color".to_string(),
@@ -5070,54 +3724,18 @@ mod tests {
     fn node_dts_has_jsdoc() {
         let api = make_api(vec![{
             let mut m = make_module("math");
-            m.functions.push(Function {
-                name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
-            m.functions.push(Function {
-                name: "subtract".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
+            m.functions.push(func(
+                "subtract",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
             m
         }]);
 
@@ -5137,30 +3755,12 @@ mod tests {
     fn node_addon_has_no_todo() {
         let api = make_api(vec![{
             let mut m = make_module("math");
-            m.functions.push(Function {
-                name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
             m
         }]);
         let addon = addon_for(&api, true);
@@ -5174,30 +3774,12 @@ mod tests {
     fn node_addon_extracts_args() {
         let api = make_api(vec![{
             let mut m = make_module("math");
-            m.functions.push(Function {
-                name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
             m
         }]);
         let addon = addon_for(&api, true);
@@ -5211,22 +3793,12 @@ mod tests {
     fn node_addon_frees_strings() {
         let api = make_api(vec![{
             let mut m = make_module("greet");
-            m.functions.push(Function {
-                name: "hello".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::StringUtf8),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "hello",
+                vec![param("name", TypeRef::StringUtf8)],
+                Some(TypeRef::StringUtf8),
+                false,
+            ));
             m
         }]);
         let addon = addon_for(&api, true);
@@ -5252,22 +3824,12 @@ mod tests {
     fn node_custom_prefix_threads_to_user_symbols() {
         let api = make_api(vec![{
             let mut m = make_module("greet");
-            m.functions.push(Function {
-                name: "hello".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::StringUtf8),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "hello",
+                vec![param("name", TypeRef::StringUtf8)],
+                Some(TypeRef::StringUtf8),
+                false,
+            ));
             m
         }]);
 
@@ -5318,30 +3880,12 @@ mod tests {
     fn node_addon_checks_error() {
         let api = make_api(vec![{
             let mut m = make_module("math");
-            m.functions.push(Function {
-                name: "add".into(),
-                params: vec![
-                    Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
             m
         }]);
         let addon = addon_for(&api, true);
@@ -5355,22 +3899,12 @@ mod tests {
     fn node_strip_module_prefix() {
         let api = make_api(vec![{
             let mut m = make_module("contacts");
-            m.functions.push(Function {
-                name: "create_contact".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.functions.push(func(
+                "create_contact",
+                vec![param("name", TypeRef::StringUtf8)],
+                Some(TypeRef::I32),
+                false,
+            ));
             m
         }]);
 
@@ -5438,33 +3972,13 @@ mod tests {
     fn node_typed_handle_type() {
         let api = make_api(vec![{
             let mut m = make_module("contacts");
-            m.structs.push(StructDef {
-                name: "Contact".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
-            });
-            m.functions.push(Function {
-                name: "get_info".into(),
-                params: vec![Param {
-                    name: "contact".into(),
-                    ty: TypeRef::TypedHandle("Contact".into()),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "get_info",
+                vec![param("contact", TypeRef::TypedHandle("Contact".into()))],
+                None,
+                false,
+            ));
             m
         }]);
         let dts = dts_for(&api, true);
@@ -5476,43 +3990,21 @@ mod tests {
 
     #[test]
     fn node_deeply_nested_optional() {
-        let api = make_api(vec![Module {
-            name: "edge".into(),
-            functions: vec![Function {
-                name: "process".into(),
-                params: vec![Param {
-                    name: "data".into(),
-                    ty: TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
+        let api = make_api(vec![{
+            let mut m = make_module("edge");
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "process",
+                vec![param(
+                    "data",
+                    TypeRef::Optional(Box::new(TypeRef::List(Box::new(TypeRef::Optional(
                         Box::new(TypeRef::Record("Contact".into())),
                     ))))),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![StructDef {
-                name: "Contact".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
-            }],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+                )],
+                None,
+                false,
+            ));
+            m
         }]);
         let dts = dts_for(&api, true);
         assert!(
@@ -5523,34 +4015,21 @@ mod tests {
 
     #[test]
     fn node_map_of_lists() {
-        let api = make_api(vec![Module {
-            name: "edge".into(),
-            functions: vec![Function {
-                name: "process".into(),
-                params: vec![Param {
-                    name: "scores".into(),
-                    ty: TypeRef::Map(
+        let api = make_api(vec![{
+            let mut m = make_module("edge");
+            m.functions.push(func(
+                "process",
+                vec![param(
+                    "scores",
+                    TypeRef::Map(
                         Box::new(TypeRef::StringUtf8),
                         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
                     ),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![],
-            enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+                )],
+                None,
+                false,
+            ));
+            m
         }]);
         let dts = dts_for(&api, true);
         assert!(
@@ -5561,39 +4040,10 @@ mod tests {
 
     #[test]
     fn node_enum_keyed_map() {
-        let api = make_api(vec![Module {
-            name: "edge".into(),
-            functions: vec![Function {
-                name: "process".into(),
-                params: vec![Param {
-                    name: "contacts".into(),
-                    ty: TypeRef::Map(
-                        Box::new(TypeRef::Enum("Color".into())),
-                        Box::new(TypeRef::Record("Contact".into())),
-                    ),
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: None,
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            }],
-            structs: vec![StructDef {
-                name: "Contact".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
-            }],
-            enums: vec![EnumDef {
+        let api = make_api(vec![{
+            let mut m = make_module("edge");
+            m.structs.push(contact_struct());
+            m.enums.push(EnumDef {
                 name: "Color".into(),
                 doc: None,
                 variants: vec![
@@ -5609,24 +4059,36 @@ mod tests {
                         doc: None,
                         fields: vec![],
                     },
-                    EnumVariant {
-                        name: "Blue".into(),
-                        value: 2,
-                        doc: None,
-                        fields: vec![],
-                    },
                 ],
-            }],
-            callbacks: vec![],
-            listeners: vec![],
-            errors: None,
-            interfaces: vec![],
-            modules: vec![],
+            });
+            m.functions.push(func(
+                "process",
+                vec![param(
+                    "contacts",
+                    TypeRef::Map(
+                        Box::new(TypeRef::Enum("Color".into())),
+                        Box::new(TypeRef::Record("Contact".into())),
+                    ),
+                )],
+                None,
+                false,
+            ));
+            m
         }]);
         let dts = dts_for(&api, true);
         assert!(
             dts.contains("Record<Color, Contact>"),
             "should contain enum-keyed map type: {dts}"
+        );
+        // The wrapper packs the map with an enum key writer (JS object keys
+        // arrive as strings, so the key coerces through Number) and the
+        // record's pack function per value.
+        let index = index_for(&api, true);
+        assert!(
+            index.contains(
+                "__encode((w, v) => __wMap(w, v, (w, k) => w.i32(Number(k)), __packContact), contacts)"
+            ),
+            "map param must pack keys and values: {index}"
         );
     }
 
@@ -5634,33 +4096,13 @@ mod tests {
     fn node_no_double_free_on_error() {
         let api = make_api(vec![{
             let mut m = make_module("contacts");
-            m.structs.push(StructDef {
-                name: "Contact".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
-            });
-            m.functions.push(Function {
-                name: "find_contact".into(),
-                params: vec![Param {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Record("Contact".into())),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "find_contact",
+                vec![param("name", TypeRef::StringUtf8)],
+                Some(TypeRef::Record("Contact".into())),
+                false,
+            ));
             m
         }]);
         let addon = addon_for(&api, true);
@@ -5694,51 +4136,51 @@ mod tests {
             !err_block.contains("result"),
             "error path should not touch result before return NULL: {err_block}"
         );
+        // The buffered record return is copied into a JS Buffer, then the
+        // native encoding is released exactly once.
+        assert!(
+            addon.contains("weaveffi_free_bytes((uint8_t*)result, out_len);"),
+            "buffered return must be freed after copying: {addon}"
+        );
     }
 
     #[test]
-    fn node_null_check_on_optional_return() {
+    fn node_null_check_on_optional_interface_return() {
+        // `Interface?` is the one optional that stays a nullable pointer at
+        // the ABI (every other optional is buffered), so the addon must
+        // null-check before surfacing the handle.
         let api = make_api(vec![{
-            let mut m = make_module("contacts");
-            m.structs.push(StructDef {
-                name: "Contact".into(),
+            let mut m = make_module("kv");
+            m.interfaces.push(InterfaceDef {
+                name: "Store".into(),
                 doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
+                constructors: vec![func("new", vec![], None, false)],
+                methods: vec![],
+                statics: vec![],
             });
-            m.functions.push(Function {
-                name: "find_contact".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
-                returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(
-                    "Contact".into(),
+            m.functions.push(func(
+                "maybe_open",
+                vec![param("path", TypeRef::StringUtf8)],
+                Some(TypeRef::Optional(Box::new(TypeRef::Interface(
+                    "Store".into(),
                 )))),
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws: false,
-                deprecated: None,
-                since: None,
-            });
+                false,
+            ));
             m
         }]);
         let addon = addon_for(&api, true);
         assert!(
             addon.contains("if (result == NULL)"),
-            "optional struct return should null-check before wrapping: {addon}"
+            "optional interface return should null-check before wrapping: {addon}"
         );
         assert!(
             addon.contains("napi_get_null"),
             "optional absent should return JS null via napi_get_null: {addon}"
+        );
+        let index = index_for(&api, true);
+        assert!(
+            index.contains("return _r == null ? null : Store._fromHandle(_r);"),
+            "the wrapper must null-check before wrapping the handle: {index}"
         );
     }
 
@@ -5748,12 +4190,7 @@ mod tests {
             let mut m = make_module("tasks");
             m.functions.push(Function {
                 name: "run".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("id", TypeRef::I32)],
                 returns: Some(TypeRef::StringUtf8),
                 doc: None,
                 r#async: true,
@@ -5796,12 +4233,7 @@ mod tests {
             let mut m = make_module("tasks");
             m.functions.push(Function {
                 name: "run".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("id", TypeRef::I32)],
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: true,
@@ -5847,6 +4279,17 @@ mod tests {
             !addon.contains("napi_resolve_deferred(ctx->env"),
             "deferred must never be settled from the producer thread: {addon}"
         );
+        // A rejection carries the copied structured payload.
+        assert!(
+            addon.contains("ctx->err_payload = (uint8_t*)malloc(err->payload_len)"),
+            "the error payload must be copied inside the callback: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg, ctx->err_payload, ctx->err_payload_len)"
+            ),
+            "the rejection must carry the copied payload: {addon}"
+        );
     }
 
     /// The N-API deferred is created with `napi_create_promise` and settled
@@ -5860,12 +4303,7 @@ mod tests {
             let mut m = make_module("tasks");
             m.functions.push(Function {
                 name: "run".into(),
-                params: vec![Param {
-                    name: "id".into(),
-                    ty: TypeRef::I32,
-                    mutable: false,
-                    doc: None,
-                }],
+                params: vec![param("id", TypeRef::I32)],
                 returns: Some(TypeRef::I32),
                 doc: None,
                 r#async: true,
@@ -5937,7 +4375,6 @@ mod tests {
                     doc: Some("Stable id".into()),
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![EnumDef {
                 name: "Kind".into(),
@@ -5988,20 +4425,408 @@ mod tests {
         assert!(dts.contains("@param x the input value"), "{dts}");
     }
 
+    // --- Value buffers -------------------------------------------------------
+
+    #[test]
+    fn buffer_runtime_emitted_only_when_needed() {
+        // A scalar-only model carries no buffer runtime.
+        let plain = make_api(vec![{
+            let mut m = make_module("math");
+            m.functions.push(func(
+                "add",
+                vec![param("a", TypeRef::I32), param("b", TypeRef::I32)],
+                Some(TypeRef::I32),
+                false,
+            ));
+            m
+        }]);
+        let index = index_for(&plain, true);
+        assert!(
+            !index.contains("class __Writer"),
+            "scalar-only model must not embed the buffer runtime: {index}"
+        );
+
+        // Declaring a record pulls in the writer, reader, and combinators.
+        let buffered = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "save",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                None,
+                false,
+            ));
+            m
+        }]);
+        let index = index_for(&buffered, true);
+        for piece in [
+            "class __Writer",
+            "class __Reader",
+            "function __wOpt",
+            "function __rList",
+            "function __wMap",
+        ] {
+            assert!(
+                index.contains(piece),
+                "buffer runtime piece `{piece}` missing: {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_params_and_returns_use_value_buffers() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "save",
+                vec![param("contact", TypeRef::Record("Contact".into()))],
+                Some(TypeRef::Record("Contact".into())),
+                false,
+            ));
+            m
+        }]);
+
+        // Addon: the record param crosses as the borrowed (ptr, len) pair the
+        // JS layer packed; the return is an owned encoding freed after the
+        // copy into a JS Buffer.
+        let addon = addon_for(&api, true);
+        assert!(
+            addon.contains("napi_get_buffer_info(env, args[0], &contact_raw, &contact_len);"),
+            "buffered param must read the packed Buffer: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "const uint8_t* result = weaveffi_contacts_save((const uint8_t*)contact_raw, contact_len, &out_len, &err);"
+            ),
+            "the call must pass ptr+len and thread out_len: {addon}"
+        );
+        assert!(
+            addon.contains("napi_create_buffer_copy(env, out_len, result, NULL, &ret);"),
+            "the buffered return must be copied into a JS Buffer: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_free_bytes((uint8_t*)result, out_len);"),
+            "the owned encoding must be freed with weaveffi_free_bytes: {addon}"
+        );
+        // Records have no native helpers at all.
+        assert!(
+            !addon.contains("Contact_get_") && !addon.contains("Contact_destroy"),
+            "records must not have native getters or destructors: {addon}"
+        );
+
+        // Loader: generated pack/unpack write fields in declaration order and
+        // the wrapper encodes the argument and decodes the result.
+        let index = index_for(&api, true);
+        assert!(
+            index.contains("function __packContact(w, v) {"),
+            "missing pack function: {index}"
+        );
+        let name_write = index.find("w.str(v.name);").expect("pack writes name");
+        let age_write = index.find("w.i32(v.age);").expect("pack writes age");
+        assert!(
+            name_write < age_write,
+            "fields must pack in declaration order: {index}"
+        );
+        assert!(
+            index.contains("function __unpackContact(r) {")
+                && index.contains("name: r.str(),")
+                && index.contains("age: r.i32(),"),
+            "missing unpack function: {index}"
+        );
+        assert!(
+            index.contains(
+                "const _r = __invoke(addon.save, [__encode(__packContact, contact)], __generic);"
+            ),
+            "the wrapper must pack the record argument: {index}"
+        );
+        assert!(
+            index.contains("return __decode(__unpackContact, _r);"),
+            "the wrapper must decode the record result: {index}"
+        );
+    }
+
+    #[test]
+    fn optional_record_return_is_buffered() {
+        // `Contact?` is buffered (the absence flag lives inside the buffer),
+        // so the addon must not null-check the pointer; the JS layer decodes
+        // the flag byte instead.
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "find",
+                vec![param("id", TypeRef::I32)],
+                Some(TypeRef::Optional(Box::new(TypeRef::Record(
+                    "Contact".into(),
+                )))),
+                false,
+            ));
+            m
+        }]);
+        let addon = addon_for(&api, true);
+        assert!(
+            !addon.contains("if (result == NULL)"),
+            "buffered optional must not null-check the pointer: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_free_bytes((uint8_t*)result, out_len);"),
+            "buffered optional return must be freed: {addon}"
+        );
+        let index = index_for(&api, true);
+        assert!(
+            index.contains("return __decode((r) => __rOpt(r, __unpackContact), _r);"),
+            "the wrapper must decode through the optional combinator: {index}"
+        );
+    }
+
+    #[test]
+    fn async_buffered_result_copied_then_decoded() {
+        let api = make_api(vec![{
+            let mut m = make_module("tasks");
+            m.structs.push(contact_struct());
+            m.functions.push(Function {
+                name: "fetch_contact".into(),
+                params: vec![],
+                returns: Some(TypeRef::Record("Contact".into())),
+                doc: None,
+                r#async: true,
+                cancellable: false,
+                throws: false,
+                deprecated: None,
+                since: None,
+            });
+            m
+        }]);
+
+        // The completion callback receives a BORROWED buffer: it must copy
+        // the bytes before returning (the producer frees them afterwards).
+        let addon = addon_for(&api, true);
+        assert!(
+            addon.contains(
+                "static void weaveffi_tasks_fetch_contact_napi_cb(void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len) {"
+            ),
+            "callback must take the borrowed buffer slots: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result_ptr, result_len);"
+            ),
+            "callback must deep-copy the borrowed buffer: {addon}"
+        );
+        assert!(
+            addon.contains("napi_create_buffer_copy(env, ctx->result_len,"),
+            "settle must surface the copied bytes as a JS Buffer: {addon}"
+        );
+
+        // The JS wrapper decodes the resolved buffer.
+        let index = index_for(&api, true);
+        assert!(
+            index.contains(
+                "return __invokeAsync(addon.fetchContact, [], __generic).then((_r) => __decode(__unpackContact, _r));"
+            ),
+            "the async wrapper must decode the resolved buffer: {index}"
+        );
+    }
+
+    #[test]
+    fn iterator_buffered_elements_decoded_and_freed() {
+        let api = make_api(vec![{
+            let mut m = make_module("contacts");
+            m.structs.push(contact_struct());
+            m.functions.push(func(
+                "iter_contacts",
+                vec![],
+                Some(TypeRef::Iterator(Box::new(TypeRef::Record(
+                    "Contact".into(),
+                )))),
+                false,
+            ));
+            m
+        }]);
+
+        // Addon: `_next` pulls the encoded element plus its length, copies it
+        // into a JS Buffer, then releases it with weaveffi_free_bytes.
+        let addon = addon_for(&api, true);
+        assert!(
+            addon.contains("size_t iter_item_len = 0;"),
+            "buffered elements need the extra length slot: {addon}"
+        );
+        assert!(
+            addon.contains("&iter_item, &iter_item_len, &iter_err"),
+            "next must thread the element length out-param: {addon}"
+        );
+        assert!(
+            addon.contains("napi_create_buffer_copy(env, iter_item_len, iter_item, NULL, &ret);"),
+            "the element must be copied into a JS Buffer: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_free_bytes((uint8_t*)iter_item, iter_item_len);"),
+            "the element encoding must be freed after copying: {addon}"
+        );
+
+        // Loader: the lazy iterator decodes each element buffer per step.
+        let index = index_for(&api, true);
+        assert!(
+            index.contains(
+                "return new WeaveFFIIterator(_it, addon.iterContacts_iterNext, addon.iterContacts_iterDestroy, __generic, (_e) => __decode(__unpackContact, _e));"
+            ),
+            "the iterator wrapper must decode each element: {index}"
+        );
+    }
+
+    #[test]
+    fn error_payload_fields_decoded_and_attached() {
+        let api = make_api(vec![{
+            let mut m = make_module("kv");
+            m.functions.push(func(
+                "get",
+                vec![param("key", TypeRef::StringUtf8)],
+                Some(TypeRef::StringUtf8),
+                true,
+            ));
+            m.errors = Some(ErrorDomain {
+                name: "KvError".into(),
+                codes: vec![
+                    ErrorCode {
+                        name: "KeyNotFound".into(),
+                        code: 1001,
+                        message: "key not found".into(),
+                        doc: None,
+                        fields: vec![
+                            field("key", TypeRef::StringUtf8),
+                            field("attempts", TypeRef::I32),
+                        ],
+                    },
+                    ErrorCode {
+                        name: "StoreFull".into(),
+                        code: 1003,
+                        message: "store is full".into(),
+                        doc: None,
+                        fields: vec![],
+                    },
+                ],
+            });
+            m
+        }]);
+
+        // Addon: the native error helper attaches the raw payload buffer.
+        let addon = addon_for(&api, true);
+        assert!(
+            addon.contains("napi_set_named_property(env, err, \"payload\", payload_val);"),
+            "the error helper must attach the payload buffer: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));"
+            ),
+            "the sync throw must pass the payload slots: {addon}"
+        );
+
+        // Loader: codes with fields get a payload decoder; the factory
+        // attaches the decoded fields as properties on the error.
+        let index = index_for(&api, true);
+        assert!(
+            index.contains(
+                "const __kvErrorPayloads = Object.freeze({ 1001: (r) => ({ key: r.str(), attempts: r.i32() }) });"
+            ),
+            "missing the per-code payload decoders: {index}"
+        );
+        assert!(
+            index.contains("function __kvErrorFrom(code, message, payload) {"),
+            "the factory must accept the payload buffer: {index}"
+        );
+        assert!(
+            index.contains("Object.assign(_err, __decode(_decode, payload));"),
+            "decoded payload fields must land as error properties: {index}"
+        );
+
+        // Declarations: the payload fields surface as readonly properties on
+        // the code's error class.
+        let dts = dts_for(&api, true);
+        assert!(
+            dts.contains("export class KeyNotFoundError extends KvError {"),
+            "missing per-code class: {dts}"
+        );
+        assert!(
+            dts.contains("  readonly key: string;") && dts.contains("  readonly attempts: number;"),
+            "payload fields must be declared on the class: {dts}"
+        );
+    }
+
+    #[test]
+    fn listener_buffered_params_decoded() {
+        use weaveffi_ir::ir::{CallbackDef, ListenerDef};
+        let api = make_api(vec![Module {
+            name: "events".into(),
+            functions: vec![],
+            structs: vec![contact_struct()],
+            enums: vec![],
+            callbacks: vec![CallbackDef {
+                name: "OnContact".into(),
+                doc: None,
+                params: vec![param("contact", TypeRef::Record("Contact".into()))],
+            }],
+            listeners: vec![ListenerDef {
+                name: "contact_listener".into(),
+                event_callback: "OnContact".into(),
+                doc: None,
+            }],
+            errors: None,
+            interfaces: vec![],
+            modules: vec![],
+        }]);
+
+        // Addon: the borrowed (ptr, len) argument is deep-copied by the
+        // trampoline, surfaced as a JS Buffer by the marshaller, then freed.
+        let addon = addon_for(&api, true);
+        assert!(
+            addon.contains("uint8_t* contact_ptr;") && addon.contains("size_t contact_len;"),
+            "the payload struct must own the copied buffer: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "if (contact_ptr != NULL && contact_len > 0) { p->contact_ptr = (uint8_t*)malloc(contact_len); memcpy(p->contact_ptr, contact_ptr, contact_len); }"
+            ),
+            "the trampoline must deep-copy the borrowed buffer: {addon}"
+        );
+        assert!(
+            addon.contains("napi_create_buffer_copy(env, p->contact_len,"),
+            "the marshaller must surface the copied buffer: {addon}"
+        );
+        assert!(
+            addon.contains("free(p->contact_ptr);"),
+            "the payload copy must be freed after the JS call: {addon}"
+        );
+
+        // Loader: the register wrapper decodes the buffer before invoking the
+        // user's callback.
+        let index = index_for(&api, true);
+        assert!(
+            index.contains("wv.registerContactListener = function (callback) {"),
+            "missing the register wrapper: {index}"
+        );
+        assert!(
+            index.contains("callback(__decode(__unpackContact, contact));"),
+            "the wrapper must decode the buffered argument: {index}"
+        );
+
+        // Declarations type the callback in terms of the record.
+        let dts = dts_for(&api, true);
+        assert!(
+            dts.contains(
+                "export function registerContactListener(callback: (contact: Contact) => void): number"
+            ),
+            "register dts must type the record param: {dts}"
+        );
+    }
+
     // --- Rich (algebraic) enum support ------------------------------------
 
     /// A module mirroring `samples/shapes/shapes.yml`: a rich enum `Shape`
     /// (unit + f64 + two-f32 + string/u8 variants), a plain enum `Channel`, and
     /// the free functions that take/return the rich enum plus a numeric smoke.
     fn shapes_module() -> Module {
-        fn field(name: &str, ty: TypeRef) -> StructField {
-            StructField {
-                name: name.into(),
-                ty,
-                doc: None,
-                default: None,
-            }
-        }
         fn variant(name: &str, value: i32, fields: Vec<StructField>) -> EnumVariant {
             EnumVariant {
                 name: name.into(),
@@ -6013,62 +4838,27 @@ mod tests {
         Module {
             name: "shapes".into(),
             functions: vec![
-                Function {
-                    name: "describe".into(),
-                    params: vec![Param {
-                        name: "shape".into(),
-                        ty: TypeRef::RichEnum("Shape".into()),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::StringUtf8),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "scale".into(),
-                    params: vec![
-                        Param {
-                            name: "shape".into(),
-                            ty: TypeRef::RichEnum("Shape".into()),
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "factor".into(),
-                            ty: TypeRef::F64,
-                            mutable: false,
-                            doc: None,
-                        },
+                func(
+                    "describe",
+                    vec![param("shape", TypeRef::RichEnum("Shape".into()))],
+                    Some(TypeRef::StringUtf8),
+                    false,
+                ),
+                func(
+                    "scale",
+                    vec![
+                        param("shape", TypeRef::RichEnum("Shape".into())),
+                        param("factor", TypeRef::F64),
                     ],
-                    returns: Some(TypeRef::RichEnum("Shape".into())),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
-                Function {
-                    name: "sum_bytes".into(),
-                    params: vec![Param {
-                        name: "values".into(),
-                        ty: TypeRef::List(Box::new(TypeRef::U8)),
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::U64),
-                    doc: None,
-                    r#async: false,
-                    cancellable: false,
-                    throws: false,
-                    deprecated: None,
-                    since: None,
-                },
+                    Some(TypeRef::RichEnum("Shape".into())),
+                    false,
+                ),
+                func(
+                    "sum_bytes",
+                    vec![param("values", TypeRef::List(Box::new(TypeRef::U8)))],
+                    Some(TypeRef::U64),
+                    false,
+                ),
             ],
             structs: vec![],
             enums: vec![
@@ -6121,180 +4911,126 @@ mod tests {
     }
 
     #[test]
-    fn rich_enum_addon_exposes_native_helpers() {
+    fn rich_enum_addon_marshals_value_buffers() {
         let addon = addon_for(&make_api(vec![shapes_module()]), false);
 
-        // Tag reader, per-variant constructors, per-variant field getters, and
-        // the destructor are all defined as native functions over the C ABI.
-        for sym in [
-            "Napi_weaveffi_shapes_Shape_tag",
-            "Napi_weaveffi_shapes_Shape_Empty_new",
-            "Napi_weaveffi_shapes_Shape_Circle_new",
-            "Napi_weaveffi_shapes_Shape_Rectangle_new",
-            "Napi_weaveffi_shapes_Shape_Labeled_new",
-            "Napi_weaveffi_shapes_Shape_Circle_get_radius",
-            "Napi_weaveffi_shapes_Shape_Rectangle_get_width",
-            "Napi_weaveffi_shapes_Shape_Rectangle_get_height",
-            "Napi_weaveffi_shapes_Shape_Labeled_get_label",
-            "Napi_weaveffi_shapes_Shape_Labeled_get_count",
-            "Napi_weaveffi_shapes_Shape_destroy",
-        ] {
-            assert!(addon.contains(sym), "missing native helper {sym}: {addon}");
-        }
-
-        // Each is exported under an idiomatic JS name.
-        for js in [
-            "\"shapes_Shape_tag\"",
-            "\"shapes_Shape_empty_new\"",
-            "\"shapes_Shape_circle_new\"",
-            "\"shapes_Shape_rectangle_new\"",
-            "\"shapes_Shape_labeled_new\"",
-            "\"shapes_Shape_circle_get_radius\"",
-            "\"shapes_Shape_labeled_get_label\"",
-            "\"shapes_Shape_labeled_get_count\"",
-            "\"shapes_Shape_destroy\"",
-        ] {
-            assert!(addon.contains(js), "missing JS export {js}: {addon}");
-        }
-    }
-
-    #[test]
-    fn rich_enum_addon_calls_c_abi_correctly() {
-        let addon = addon_for(&make_api(vec![shapes_module()]), false);
-
-        // Constructors thread out_err and return the owned pointer as a handle.
-        assert!(
-            addon.contains(
-                "weaveffi_shapes_Shape* result = weaveffi_shapes_Shape_Circle_new(radius, &err);"
-            ),
-            "circle ctor must call the C constructor: {addon}"
-        );
-        // f32 variant fields narrow from the N-API double getter.
-        assert!(
-            addon.contains(
-                "weaveffi_shapes_Shape_Rectangle_new((float)width_raw, (float)height_raw, &err);"
-            ),
-            "rectangle ctor must narrow f32 args: {addon}"
-        );
-        // string + u8 variant: string copy freed after the call, u8 narrowed.
-        assert!(
-            addon.contains("weaveffi_shapes_Shape_Labeled_new(label, (uint8_t)count_raw, &err);"),
-            "labeled ctor must marshal string + u8: {addon}"
-        );
-        assert!(
-            addon.contains("free(label);"),
-            "labeled ctor must free its string copy: {addon}"
-        );
-        // tag reader returns the int32 discriminant.
-        assert!(
-            addon.contains("napi_create_int32(env, weaveffi_shapes_Shape_tag(self), &ret);"),
-            "tag reader must return the discriminant: {addon}"
-        );
-        // String getter frees the owned C string after copying it to JS.
-        assert!(
-            addon.contains("weaveffi_free_string(ret_s);"),
-            "string field getter must free the owned C string: {addon}"
-        );
-        // Destructor frees the opaque object.
-        assert!(
-            addon.contains("weaveffi_shapes_Shape_destroy(self);"),
-            "destructor must free the object: {addon}"
-        );
-
-        // Free functions marshal the rich enum as the opaque handle (no attempt
-        // to materialize it as a plain object), in and out.
-        assert!(
-            addon.contains(
-                "weaveffi_shapes_describe((const weaveffi_shapes_Shape*)(intptr_t)shape_raw, &err);"
-            ),
-            "describe must pass the opaque handle: {addon}"
-        );
-        assert!(
-            addon.contains(
-                "weaveffi_shapes_Shape* result = weaveffi_shapes_scale((const weaveffi_shapes_Shape*)(intptr_t)shape_raw, factor, &err);"
-            ),
-            "scale must take and return the opaque handle: {addon}"
-        );
-        assert!(
-            addon.contains("napi_create_int64(env, (int64_t)(intptr_t)result, &ret);"),
-            "scale must return the opaque handle as int64: {addon}"
-        );
-    }
-
-    #[test]
-    fn rich_enum_index_js_exposes_class() {
-        let index = index_for(&make_api(vec![shapes_module()]), false);
-
-        assert!(
-            index.contains("class Shape {"),
-            "missing Shape class: {index}"
-        );
-        // Per-variant static factories.
-        for factory in [
-            "static empty() {",
-            "static circle(radius) {",
-            "static rectangle(width, height) {",
-            "static labeled(label, count) {",
+        // Rich enums are value types: no tag reader, no per-variant
+        // constructors or getters, no destructor.
+        for gone in [
+            "Shape_tag",
+            "Shape_Empty_new",
+            "Shape_Circle_new",
+            "Shape_Circle_get_radius",
+            "Shape_destroy",
         ] {
             assert!(
-                index.contains(factory),
-                "missing factory `{factory}`: {index}"
+                !addon.contains(gone),
+                "rich enums must have no native helper {gone}: {addon}"
             );
         }
-        // The factories call the native constructors through the generic
-        // rebranding helper (a failure is marshalling or a panic).
+
+        // Free functions marshal the rich enum as a value buffer, in and out.
         assert!(
-            index.contains(
-                "return new Shape(__invoke(addon.shapes_Shape_circle_new, [radius], __generic));"
+            addon.contains("napi_get_buffer_info(env, args[0], &shape_raw, &shape_len);"),
+            "describe must read the packed shape buffer: {addon}"
+        );
+        assert!(
+            addon.contains("weaveffi_shapes_describe((const uint8_t*)shape_raw, shape_len, &err);"),
+            "describe must pass the borrowed ptr+len pair: {addon}"
+        );
+        assert!(
+            addon.contains(
+                "const uint8_t* result = weaveffi_shapes_scale((const uint8_t*)shape_raw, shape_len, factor, &out_len, &err);"
             ),
-            "circle factory must call the native ctor: {index}"
-        );
-        // tag reader + namespaced per-variant getters.
-        assert!(
-            index.contains("tag() {") && index.contains("addon.shapes_Shape_tag(this._handle)"),
-            "missing tag(): {index}"
-        );
-        for getter in [
-            "get circleRadius() {",
-            "get rectangleWidth() {",
-            "get rectangleHeight() {",
-            "get labeledLabel() {",
-            "get labeledCount() {",
-        ] {
-            assert!(index.contains(getter), "missing getter `{getter}`: {index}");
-        }
-        // Cleanup: explicit destroy + a FinalizationRegistry safety net.
-        assert!(
-            index.contains("destroy() {")
-                && index.contains("addon.shapes_Shape_destroy(this._handle)"),
-            "missing destroy(): {index}"
+            "scale must take a buffer and return an owned one: {addon}"
         );
         assert!(
-            index.contains("new FinalizationRegistry"),
-            "missing FinalizationRegistry cleanup: {index}"
+            addon.contains("weaveffi_free_bytes((uint8_t*)result, out_len);"),
+            "the returned encoding must be freed: {addon}"
         );
-        // Discriminant map.
+
+        // A list<u8> parameter is buffered too.
         assert!(
-            index.contains(
-                "Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Labeled: 3 });"
+            addon.contains(
+                "weaveffi_shapes_sum_bytes((const uint8_t*)values_raw, values_len, &err);"
             ),
-            "missing Tag discriminant map: {index}"
+            "list params must cross as value buffers: {addon}"
         );
-        // Module functions that carry the rich enum are rewrapped to speak the
-        // class; `scale` returns a wrapped instance, `describe` unwraps its arg.
+    }
+
+    #[test]
+    fn rich_enum_index_js_packs_tagged_unions() {
+        let index = index_for(&make_api(vec![shapes_module()]), false);
+
+        // Pack: the string tag selects the variant, then the i32 discriminant
+        // plus the variant's fields go on the wire in order.
+        assert!(
+            index.contains("function __packShape(w, v) {"),
+            "missing pack function: {index}"
+        );
+        assert!(
+            index.contains("case 'Circle':") && index.contains("w.i32(1);"),
+            "circle variant must pack its discriminant: {index}"
+        );
+        assert!(
+            index.contains("w.f64(v.radius);"),
+            "circle variant must pack its field: {index}"
+        );
+        assert!(
+            index.contains("w.f32(v.width);") && index.contains("w.f32(v.height);"),
+            "rectangle variant must pack both f32 fields: {index}"
+        );
+        assert!(
+            index.contains("w.str(v.label);") && index.contains("w.u8(v.count);"),
+            "labeled variant must pack string + u8: {index}"
+        );
+        // An unknown tag is a caller bug surfaced as the generic brand.
+        assert!(
+            index.contains("throw new WeaveFFIError(-2, 'unknown Shape tag: ' + (v && v.tag));"),
+            "pack must reject unknown tags: {index}"
+        );
+
+        // Unpack: the i32 discriminant selects the variant; fields land next
+        // to the string tag.
+        assert!(
+            index.contains("function __unpackShape(r) {"),
+            "missing unpack function: {index}"
+        );
+        assert!(
+            index.contains("case 0: return { tag: 'Empty' };"),
+            "unit variant must unpack to a bare tag: {index}"
+        );
+        assert!(
+            index.contains("case 1: return { tag: 'Circle', radius: r.f64() };"),
+            "circle variant must unpack its field: {index}"
+        );
+        assert!(
+            index.contains("case 3: return { tag: 'Labeled', label: r.str(), count: r.u8() };"),
+            "labeled variant must unpack in field order: {index}"
+        );
+        assert!(
+            index.contains("default: throw new WeaveFFIError(-2, 'unknown Shape tag: ' + tag);"),
+            "unpack must reject unknown discriminants: {index}"
+        );
+
+        // Wrappers pack arguments and decode results; no classes, no handles.
         assert!(
             index.contains("wv.shapesScale = function (shape, factor) {")
                 && index.contains(
-                    "__invoke(addon.shapesScale, [shape instanceof Shape ? shape._handle : shape, factor], __generic)"
+                    "const _r = __invoke(addon.shapesScale, [__encode(__packShape, shape), factor], __generic);"
                 )
-                && index.contains("return new Shape(_r);"),
-            "scale must be rewrapped to return a Shape: {index}"
+                && index.contains("return __decode(__unpackShape, _r);"),
+            "scale must pack its argument and decode its result: {index}"
         );
         assert!(
             index.contains(
-                "return __invoke(addon.shapesDescribe, [shape instanceof Shape ? shape._handle : shape], __generic);"
+                "return __invoke(addon.shapesDescribe, [__encode(__packShape, shape)], __generic);"
             ),
-            "describe must unwrap a Shape argument: {index}"
+            "describe must pack its argument: {index}"
+        );
+        assert!(
+            !index.contains("class Shape"),
+            "rich enums must not surface as classes: {index}"
         );
     }
 
@@ -6304,22 +5040,12 @@ mod tests {
         // function gets a wrapper so a non-zero error slot (panic or
         // marshalling failure) surfaces as the generic brand class.
         let mut m = make_module("math");
-        m.functions.push(Function {
-            name: "add".into(),
-            params: vec![Param {
-                name: "a".into(),
-                ty: TypeRef::I32,
-                mutable: false,
-                doc: None,
-            }],
-            returns: Some(TypeRef::I32),
-            doc: None,
-            r#async: false,
-            cancellable: false,
-            throws: false,
-            deprecated: None,
-            since: None,
-        });
+        m.functions.push(func(
+            "add",
+            vec![param("a", TypeRef::I32)],
+            Some(TypeRef::I32),
+            false,
+        ));
         let index = index_for(&make_api(vec![m]), false);
         assert!(
             index.contains("class WeaveFFIError extends Error {"),
@@ -6337,30 +5063,28 @@ mod tests {
     }
 
     #[test]
-    fn rich_enum_dts_emits_class_not_enum() {
+    fn rich_enum_dts_emits_tagged_union() {
         let dts = dts_for(&make_api(vec![shapes_module()]), false);
 
-        // Rich enum -> class with factories, tag(), getters, destroy().
+        // Rich enum -> a discriminated union keyed by a string tag.
         assert!(
-            dts.contains("export class Shape {"),
-            "rich enum must be a class: {dts}"
+            dts.contains("export type Shape ="),
+            "rich enum must be a union type: {dts}"
         );
         assert!(
-            !dts.contains("export enum Shape"),
-            "rich enum must not be a plain enum: {dts}"
+            !dts.contains("export enum Shape") && !dts.contains("export class Shape"),
+            "rich enum must not be a plain enum or a class: {dts}"
         );
+        assert!(dts.contains("| { tag: 'Empty' }"), "{dts}");
+        assert!(dts.contains("| { tag: 'Circle'; radius: number }"), "{dts}");
         assert!(
-            dts.contains("static circle(radius: number): Shape;"),
+            dts.contains("| { tag: 'Rectangle'; width: number; height: number }"),
             "{dts}"
         );
         assert!(
-            dts.contains("static labeled(label: string, count: number): Shape;"),
+            dts.contains("| { tag: 'Labeled'; label: string; count: number }"),
             "{dts}"
         );
-        assert!(dts.contains("tag(): number;"), "{dts}");
-        assert!(dts.contains("get circleRadius(): number;"), "{dts}");
-        assert!(dts.contains("get labeledLabel(): string;"), "{dts}");
-        assert!(dts.contains("destroy(): void;"), "{dts}");
 
         // Plain enum still surfaces as a numeric `enum`.
         assert!(
@@ -6368,7 +5092,7 @@ mod tests {
             "plain enum stays an enum: {dts}"
         );
 
-        // Free functions are typed in terms of the class; unstripped names
+        // Free functions are typed in terms of the union; unstripped names
         // keep the module prefix but are still lowerCamelCase.
         assert!(
             dts.contains("export function shapesDescribe(shape: Shape): string"),
@@ -6387,32 +5111,6 @@ mod tests {
     /// and non-throwing methods + an async method + a static), and free
     /// functions exercising the throws split and interface params/returns.
     fn kv_module() -> Module {
-        fn param(name: &str, ty: TypeRef) -> Param {
-            Param {
-                name: name.into(),
-                ty,
-                mutable: false,
-                doc: None,
-            }
-        }
-        fn func(
-            name: &str,
-            params: Vec<Param>,
-            returns: Option<TypeRef>,
-            throws: bool,
-        ) -> Function {
-            Function {
-                name: name.into(),
-                params,
-                returns,
-                doc: None,
-                r#async: false,
-                cancellable: false,
-                throws,
-                deprecated: None,
-                since: None,
-            }
-        }
         Module {
             name: "kv".into(),
             functions: vec![
@@ -6482,12 +5180,14 @@ mod tests {
                         code: 1001,
                         message: "key not found".into(),
                         doc: Some("The requested key does not exist.".into()),
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "StoreFull".into(),
                         code: 1003,
                         message: "store is full".into(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -6549,12 +5249,12 @@ mod tests {
             assert!(addon.contains(js), "missing JS export {js}: {addon}");
         }
 
-        // Every failure path throws the code-carrying error object.
+        // Every failure path throws the code-and-payload-carrying error object.
         assert!(
             addon.contains(
-                "napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message));"
+                "napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));"
             ),
-            "sync errors must carry the ABI code: {addon}"
+            "sync errors must carry the ABI code and payload: {addon}"
         );
         assert!(
             addon.contains("napi_set_named_property(env, err, \"code\", code_val);"),
@@ -6616,7 +5316,7 @@ mod tests {
         // `throws`, so the JS layer maps it to the domain class).
         assert!(
             addon.contains(
-                "napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message));"
+                "napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message, iter_err.payload_ptr, iter_err.payload_len));"
             ),
             "next must throw the per-step error: {addon}"
         );
@@ -6680,13 +5380,14 @@ mod tests {
             "return() must destroy the native handle: {index}"
         );
 
-        // The method wrapper launches, then hands the external to the class
-        // with its per-iterator next/destroy bindings and error mapping.
+        // The method wrapper launches (packing the optional prefix into a
+        // value buffer), then hands the external to the class with its
+        // per-iterator next/destroy bindings and error mapping.
         assert!(
             index.contains(
-                "const _it = __invoke(addon.Store_list_keys, [this._handle, prefix], __kvErrorFrom);"
+                "const _it = __invoke(addon.Store_list_keys, [this._handle, __encode((w, v) => __wOpt(w, v, (w, v) => w.str(v)), prefix)], __kvErrorFrom);"
             ),
-            "the wrapper must launch the native iterator: {index}"
+            "the wrapper must pack the optional param and launch: {index}"
         );
         assert!(
             index.contains(
@@ -6801,10 +5502,11 @@ mod tests {
             index.contains("super(1001, message || 'key not found');"),
             "per-code class must default its message: {index}"
         );
-        // The factory maps a raw code to the matching class and falls back to
-        // the generic brand for unknown codes (panics, marshalling).
+        // The factory maps a raw code (plus the raw payload buffer) to the
+        // matching class and falls back to the generic brand for unknown
+        // codes (panics, marshalling).
         assert!(
-            index.contains("function __kvErrorFrom(code, message) {"),
+            index.contains("function __kvErrorFrom(code, message, payload) {"),
             "missing domain factory: {index}"
         );
         assert!(
@@ -6813,7 +5515,7 @@ mod tests {
         );
         assert!(
             index.contains(
-                "return _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);"
+                "const _err = _cls === undefined ? new WeaveFFIError(code, message) : new _cls(message);"
             ),
             "factory must fall back to the generic brand: {index}"
         );

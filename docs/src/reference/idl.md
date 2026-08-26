@@ -26,7 +26,7 @@ and objects:
 
 ```text
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.5.0"
+version: "0.6.0"
 package:
   name: my_app
   version: "1.0.0"
@@ -50,7 +50,7 @@ A complete, validating example lives at the bottom of this page in the
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version; only the current version (`"0.5.0"`) is accepted |
+| `version`    | string                      | yes      | Schema version; only the current version (`"0.6.0"`) is accepted |
 | `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
@@ -144,7 +144,7 @@ spelling.
 ### Package example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 package:
   name: kvstore
   version: "1.0.0"
@@ -196,7 +196,7 @@ parameters and return types.
 ### Primitive examples
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: primitives
     structs:
@@ -276,7 +276,7 @@ knows how to spell the handle's type. At the C ABI level, `handle<T>` is
 still a `uint64_t`.
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: sessions
     structs:
@@ -318,11 +318,6 @@ signatures and other type positions.
 | `name`    | string           | yes      | Struct name (e.g. `Contact`)   |
 | `doc`     | string           | no       | Documentation string           |
 | `fields`  | array of Field   | yes      | Must have at least one field   |
-| `builder` | bool             | no       | Generate a builder class (default `false`) |
-
-When `builder: true`, generators emit a builder class with `with_*` setter
-methods and a `build()` method, enabling incremental construction of
-complex structs.
 
 Each field:
 
@@ -336,7 +331,7 @@ Each field:
 ### Struct example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: geometry
     structs:
@@ -360,7 +355,6 @@ modules:
             type: f64
 
       - name: Config
-        builder: true
         fields:
           - name: timeout
             type: i32
@@ -384,9 +378,17 @@ modules:
         return: Rect
 ```
 
-Struct fields may reference other structs, enums, optionals, lists, or maps.
-Interface references, borrowed types, and iterators are not valid field
-types (see [Type compatibility](#type-compatibility)).
+Struct fields may reference other structs, enums, optionals, lists, or maps,
+nested to any depth. Interface references, borrowed types, and iterators are
+not valid field types (see [Type compatibility](#type-compatibility)).
+
+A struct crosses the C ABI **by value** as a serialized value buffer: one
+`(const uint8_t*, size_t)` pair holding the fields packed in declaration
+order. Generators map it to an idiomatic value type (a data class, struct,
+or record) with a generated pack and unpack routine; no per-struct C
+functions exist. See the
+[Value Buffer Protocol](value-buffers.md) for the wire format and ownership
+rules.
 
 ---
 
@@ -415,7 +417,7 @@ Each variant:
 ### Enum example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -449,7 +451,7 @@ Swift `enum` with associated values). A *unit* variant (no `fields`) and a *data
 variant may coexist in the same enum.
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: shapes
     enums:
@@ -474,22 +476,19 @@ modules:
         return: f64
 ```
 
-Unlike a plain C-style enum (which crosses the ABI by value as an integer), a
-rich enum crosses as an **opaque object pointer**, exactly like a struct. The C
-ABI gains a tag reader, a per-variant constructor and field getters, and a
-destructor; each backend wraps these into an idiomatic owned type:
-
-| Backend     | Surface                                                            |
-|-------------|-------------------------------------------------------------------|
-| C           | `*_tag`, `*_{Variant}_new`, `*_{Variant}_get_{field}`, `*_destroy` |
-| C++         | RAII class with nested `Tag`, static factories, per-variant getters |
-| Python/Ruby | class with a `tag`, per-variant factory + accessor methods          |
-| C#/Go       | owned class/struct with `Tag`, per-variant factories + accessors    |
+A plain C-style enum crosses the ABI by value as an `int32_t`. A rich enum
+also crosses by value, but as a serialized value buffer: an `i32` tag (the
+variant's declared `value`) followed by the active variant's fields in
+declaration order, in one `(const uint8_t*, size_t)` pair. No per-enum C
+functions are generated; each backend maps the enum to its idiomatic sum
+type (a Rust-style enum, a Swift enum with associated values, a sealed class
+hierarchy, a tagged union class) with a generated pack and unpack routine.
+See the [Value Buffer Protocol](value-buffers.md) for the encoding.
 
 A variant `fields` entry uses the same shape as a struct field (`name`, `type`,
-`doc`), but obeys the positional rules of a *return-like* slot: no borrowed
-(`&str`/`&[u8]`) types and no iterators. Field names must be unique within a
-variant.
+`doc`), but obeys the positional rules of a buffered slot: no borrowed
+(`&str`/`&[u8]`) types, no iterators, and no interfaces. Field names must be
+unique within a variant.
 
 ---
 
@@ -564,7 +563,7 @@ positions.
 A trimmed version of the `kvstore` sample's `Store` interface:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: kv
     errors:
@@ -654,7 +653,7 @@ the default is null.
 ### Optional example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     structs:
@@ -696,7 +695,7 @@ Wrap a type in `[T]` brackets to declare a list (variable-length sequence).
 ### List example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: lists
     structs:
@@ -727,8 +726,9 @@ modules:
 ## Map types
 
 Wrap a key-value pair in `{K:V}` braces to declare a map (dictionary /
-associative array). Keys must be primitive types or enums; structs, lists,
-and maps are not valid key types. Values may be any valid `TypeRef`.
+associative array). Keys must be scalar, string, or enum types; composites,
+optionals, `bytes`, and handles are not valid key types. Values may be any
+valid `TypeRef`.
 
 | Syntax            | Meaning                               |
 |-------------------|---------------------------------------|
@@ -740,7 +740,7 @@ and maps are not valid key types. Values may be any valid `TypeRef`.
 ### Map example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: maps
     structs:
@@ -773,42 +773,45 @@ modules:
 
 ### C ABI convention
 
-Maps are passed across the FFI boundary as **parallel arrays** of keys and
-values, plus a shared length. A map parameter `{K:V}` named `m` expands to
-three C parameters:
+Maps cross the FFI boundary **by value** as a serialized value buffer: a
+`u32` entry count followed by alternating keys and values, all in one
+`(const uint8_t*, size_t)` pair. A map parameter `{K:V}` named `m` expands
+to two C parameters:
 
 ```c
-const K* m_keys, const V* m_values, size_t m_len
+const uint8_t* m_ptr, size_t m_len
 ```
 
-A map return value expands to out-parameters:
-
-```c
-K* out_keys, V* out_values, size_t* out_len
-```
-
-For example, a function `update_scores(scores: {string:i32})` generates:
+A map return comes back as a `const uint8_t*` return value plus a
+`size_t* out_len` out-parameter, freed by the consumer with
+`weaveffi_free_bytes`. For example, `update_scores(scores: {string:i32})`
+generates:
 
 ```c
 void weaveffi_mymod_update_scores(
-    const char* const* scores_keys,
-    const int32_t* scores_values,
+    const uint8_t* scores_ptr,
     size_t scores_len,
     weaveffi_error* out_err
 );
 ```
 
+See the [Value Buffer Protocol](value-buffers.md) for the encoding and
+ownership rules.
+
 ### Key type restrictions
 
-Only primitive types (`i32`, `u32`, `i64`, `f64`, `bool`, `string`, `bytes`,
-`handle`) and enum types are valid map keys. The validator rejects structs,
-lists, and maps as key types.
+Only scalar types (the integers, `f32`, `f64`, `bool`), `string`, and enum
+types are valid map keys, so every target language can use the key in its
+native dictionary idiom. The validator rejects structs, lists, maps,
+optionals, `bytes`, and handles as key types. Values may be any valid
+`TypeRef`, including nested composites.
 
 ---
 
 ## Nested types
 
-Optional and list modifiers compose freely:
+Optional, list, and map modifiers compose freely and nest to any depth,
+because every composite serializes into one value buffer:
 
 | Syntax           | Meaning                                            |
 |------------------|----------------------------------------------------|
@@ -821,7 +824,7 @@ Optional and list modifiers compose freely:
 ### Nested type example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: nested
     structs:
@@ -868,7 +871,7 @@ one at a time and are suitable for large or streaming result sets.
 ### Iterator example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: streaming
     structs:
@@ -922,7 +925,7 @@ invokes a caller-provided function.
 ### Callback example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: events
     functions: []
@@ -962,7 +965,7 @@ with subscribe/unsubscribe lifecycle management.
 ### Listener example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: events
     functions: []
@@ -990,7 +993,7 @@ modules.
 ### Nested module example
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: app
     functions:
@@ -1039,7 +1042,7 @@ For example, a nested `stats` module can take the parent `kv` module's
 `Store` interface as a parameter:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: kv
     errors:
@@ -1086,7 +1089,7 @@ Functions can be marked as asynchronous. See the
 behaviour.
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: net
     errors:
@@ -1125,7 +1128,7 @@ return a list instead or make the function synchronous.
 Mark a function as deprecated with a migration message:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: legacy
     functions:
@@ -1147,7 +1150,7 @@ Generators propagate the deprecation message to the target language
 Mark a parameter as mutable when the callee may modify it in-place:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: buffers
     functions:
@@ -1168,7 +1171,7 @@ directly in the IDL file. This is an alternative to using a separate
 TOML configuration file with `--config`.
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: math
     functions:
@@ -1218,8 +1221,8 @@ All types are valid in both parameter and return positions unless noted.
 | `bytes`        | yes    | yes     | yes           |                        |
 | `handle`       | yes    | yes     | yes           |                        |
 | `handle<T>`    | yes    | yes     | yes           | Typed handle           |
-| `&str`         | yes    | yes     | yes           | Borrowed, zero-copy    |
-| `&[u8]`        | yes    | yes     | yes           | Borrowed, zero-copy    |
+| `&str`         | yes    | no      | no            | Borrowed, zero-copy, param-only |
+| `&[u8]`        | yes    | no      | no            | Borrowed, zero-copy, param-only |
 | `StructName`   | yes    | yes     | yes           |                        |
 | `EnumName`     | yes    | yes     | yes           |                        |
 | `InterfaceName`| yes    | yes     | no            | Also `InterfaceName?`; not in collections |
@@ -1239,7 +1242,7 @@ A full IDL combining structs, enums, optionals, lists, an interface, and a
 typed error domain (a trimmed version of the `contacts` sample):
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -1343,13 +1346,20 @@ modules:
 
 ## ABI mapping
 
-- Parameters map to C ABI types; `string` and `bytes` are passed as
-  pointer + length.
+- Scalar parameters map to their C ABI types; `string` passes as a C string
+  and `bytes` as pointer + length.
+- Structs, rich enums, optionals (except `Interface?`), lists, and maps are
+  *buffered*: they cross by value as one serialized
+  `(const uint8_t* {name}_ptr, size_t {name}_len)` pair, borrowed for the
+  duration of the call (see the
+  [Value Buffer Protocol](value-buffers.md)).
 - Return values are direct scalars except:
   - `string`: returns `const char*` allocated by Rust; caller must free via
     `weaveffi_free_string`.
-  - `bytes`: returns `const uint8_t*` and requires an extra `size_t* out_len`
-    param; caller frees with `weaveffi_free_bytes`.
+  - `bytes` and every buffered type: returns `const uint8_t*` plus an extra
+    `size_t* out_len` param; caller frees with `weaveffi_free_bytes`.
+- Interfaces cross as opaque object pointers; `Interface?` as a nullable
+  object pointer.
 - Each function takes a trailing `weaveffi_error* out_err` for error reporting.
 
 ## Error domain
@@ -1370,15 +1380,43 @@ raw integers.
 
 Each code:
 
-| Field     | Type   | Required | Description                                     |
-|-----------|--------|----------|-------------------------------------------------|
-| `name`    | string | yes      | Code name, lowered to a case or subclass on the generated error type (e.g. `KeyNotFound`) |
-| `code`    | i32    | yes      | Stable numeric value carried across the C ABI   |
-| `message` | string | yes      | Default human-readable message                  |
-| `doc`     | string | no       | Documentation string                            |
+| Field     | Type           | Required | Description                                     |
+|-----------|----------------|----------|-------------------------------------------------|
+| `name`    | string         | yes      | Code name, lowered to a case or subclass on the generated error type (e.g. `KeyNotFound`) |
+| `code`    | i32            | yes      | Stable numeric value carried across the C ABI   |
+| `message` | string         | yes      | Default human-readable message                  |
+| `doc`     | string         | no       | Documentation string                            |
+| `fields`  | array of Field | no       | Structured payload fields this error carries (see [Structured error payloads](#structured-error-payloads)) |
 
 PascalCase code names (`KeyNotFound`, `StoreFull`) are the convention: each
 generator re-cases them into its own idiom.
+
+### Structured error payloads
+
+A code may declare `fields:` using the same shape as struct fields (`name`,
+`type`, `doc`; the `default` slot is ignored). When a matching error is
+raised, those fields are serialized into the `weaveffi_error` struct's
+`payload_ptr`/`payload_len` slots in the value-buffer format, and each
+generator decodes them into properties of the raised exception or returned
+error value, keyed by the field names:
+
+```yaml
+errors:
+  name: KvError
+  codes:
+    - name: KeyNotFound
+      code: 1001
+      message: "key not found"
+      fields:
+        - { name: key, type: string }
+        - { name: attempts, type: i32 }
+```
+
+Payload fields obey the buffered positional rules: no borrowed types, no
+iterators, no interfaces. A code without `fields` leaves the payload slots
+null. See the
+[Value Buffer Protocol](value-buffers.md#structured-errors) for the wire
+format and freeing rules.
 
 ### Opting in with `throws`
 
@@ -1386,7 +1424,7 @@ Declaring a domain reserves the codes; a function, method, or constructor
 joins the typed error path by declaring `throws: true`:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     errors:
@@ -1470,7 +1508,7 @@ Per-target syntax:
 Example IDL:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: docs
     structs:

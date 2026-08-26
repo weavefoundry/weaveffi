@@ -35,10 +35,10 @@ layer bridges them to the C ABI.
 | `string`       | `String`               | `String`              | `jstring`      |
 | `bytes`        | `ByteArray`            | `ByteArray`           | `jbyteArray`   |
 | `handle`       | `Long`                 | `Long`                | `jlong`        |
-| `StructName`   | `Long`                 | `StructName`          | `jlong`        |
+| `StructName`   | `ByteArray` (value buffer) | `StructName` (data class) | `jbyteArray` |
 | `EnumName` (plain) | `Int`              | `EnumName`            | `jint`         |
-| `EnumName` (rich)  | `Long`             | `EnumName`            | `jlong`        |
-| `T?`           | `T?`                   | `T?`                  | `jobject`      |
+| `EnumName` (rich)  | `ByteArray` (value buffer) | `EnumName` (sealed class) | `jbyteArray` |
+| `T?`           | `ByteArray` (value buffer; `Interface?` stays `Long`) | `T?` | `jbyteArray` |
 | `[i32]`        | `IntArray`             | `IntArray`            | `jintArray`    |
 | `[i64]`        | `LongArray`            | `LongArray`           | `jlongArray`   |
 | `[string]`     | `Array<String>`        | `Array<String>`       | `jobjectArray` |
@@ -47,7 +47,7 @@ layer bridges them to the C ABI.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -79,11 +79,12 @@ The Kotlin wrapper declares `external fun` entries inside a companion
 object and loads the JNI library on first use. Function names are
 lowerCamelCase with the module prefix stripped by default
 (`strip_module_prefix = false` in `[android]` restores prefixed names).
-Where a parameter or return value needs wrapping (enums, structs), the
-external entry is a private `...Jni` function with lowered types and a
-public wrapper converts at the boundary. Struct returns come back as
-handles and are wrapped in the struct class; `[Contact]` stays a
-`LongArray` of handles:
+Where a parameter or return value needs wrapping (enums, buffered
+values), the external entry is a private `...Jni` function with lowered
+types and a public wrapper converts at the boundary. A buffered value
+(a struct, rich enum, optional, list, or map) crosses JNI as a
+`ByteArray` copy of its value buffer, decoded or packed by the wrapper
+layer:
 
 ```kotlin
 package com.weaveffi
@@ -92,10 +93,12 @@ class WeaveFFI {
     companion object {
         init { System.loadLibrary("weaveffi") }
 
-        @JvmStatic private external fun getContactJni(id: Int): Long
-        @JvmStatic fun getContact(id: Int): Contact = Contact(getContactJni(id))
-        @JvmStatic private external fun findByTypeJni(contactType: Int): LongArray
-        @JvmStatic fun findByType(contactType: ContactType): LongArray = findByTypeJni(contactType.value)
+        @JvmStatic private external fun getContactJni(id: Int): ByteArray
+        @JvmStatic fun getContact(id: Int): Contact =
+            /* decode the value buffer into a Contact */
+        @JvmStatic private external fun findByTypeJni(contactType: Int): ByteArray
+        @JvmStatic fun findByType(contactType: ContactType): List<Contact> =
+            /* decode the value buffer into a List<Contact> */
     }
 }
 ```
@@ -114,36 +117,18 @@ enum class ContactType(val value: Int) {
 }
 ```
 
-Structs are wrapped in a Kotlin class implementing `Closeable`, with a
-`finalize()` safety net:
+Structs are plain Kotlin data classes with one typed property per field.
+They own no native resources: there's no handle, no `Closeable`, and no
+per-struct JNI symbols. A `Contact` crosses the boundary serialized in
+the [value-buffer format](../reference/value-buffers.md), packed and
+decoded by the generated wrapper layer:
 
 ```kotlin
-class Contact internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
-
-        @JvmStatic external fun nativeCreate(name: String, age: Int): Long
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeGetName(handle: Long): String
-        @JvmStatic external fun nativeGetAge(handle: Long): Int
-
-        fun create(name: String, age: Int): Contact = Contact(nativeCreate(name, age))
-    }
-
-    val name: String get() = nativeGetName(handle)
-    val age: Int get() = nativeGetAge(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
-}
+/** A contact record */
+data class Contact(
+    val name: String,
+    val age: Int,
+)
 ```
 
 The JNI shims (`weaveffi_jni.c`) bridge each Kotlin `external fun` into
@@ -163,14 +148,19 @@ static void throw_weaveffi_error(JNIEnv* env, weaveffi_error* err) {
     weaveffi_error_clear(err);
 }
 
-JNIEXPORT jlong JNICALL Java_com_weaveffi_WeaveFFI_getContactJni(JNIEnv* env, jclass clazz, jint id) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_contacts_Contact* rv = weaveffi_contacts_get_contact((int32_t)id, &err);
+JNIEXPORT jbyteArray JNICALL Java_com_weaveffi_WeaveFFI_getContactJni(JNIEnv* env, jclass clazz, jint id) {
+    weaveffi_error err = {0};
+    size_t out_len = 0;
+    const uint8_t* rv = weaveffi_contacts_get_contact((int32_t)id, &out_len, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);
-        return 0;
+        return NULL;
     }
-    return (jlong)(intptr_t)rv;
+    // Copy the value buffer into a Java byte[] and release the original.
+    jbyteArray out = (*env)->NewByteArray(env, (jsize)out_len);
+    (*env)->SetByteArrayRegion(env, out, 0, (jsize)out_len, (const jbyte*)rv);
+    weaveffi_free_bytes(rv, out_len);
+    return out;
 }
 ```
 
@@ -235,11 +225,15 @@ failures are producer bugs (a panic or a marshalling failure), which
 arrive as the generic `WeaveFFIException`. Unknown codes on the typed
 path fall back to `WeaveFFIException` too.
 
+An error code that declares payload `fields:` carries them serialized in
+the error's payload buffer; the JNI shim passes the bytes up and the
+typed exception exposes the decoded fields as properties before
+`weaveffi_error_clear` releases the buffer.
+
 ## Interfaces
 
 An `interfaces:` entry becomes a Kotlin class holding a `Long` handle and
-implementing `java.io.Closeable`, exactly like a struct wrapper. Its
-members live on the class: constructors become companion factories (a
+implementing `java.io.Closeable`. Its members live on the class: constructors become companion factories (a
 constructor named `new` becomes `operator fun invoke`, so `ContactBook()`
 reads like a real constructor), methods are instance functions, statics
 are companion functions, and `close()` calls the implicit destroy symbol.
@@ -302,122 +296,46 @@ an interface return wraps the new owned handle.
 ## Rich (algebraic) enums
 
 A *rich* (algebraic) enum, a sum type whose variants carry associated
-data, lowers to an **opaque object handle** at the C ABI, exactly like a
-struct, and shares the same ownership model as the struct wrappers above.
-The Kotlin wrapper is a `Closeable` class holding a `Long` handle, with
-one static factory per variant, a nested `Tag` discriminant `enum class`,
-and per-variant field getters. (A plain C-style enum with no payloads
-stays a Kotlin `enum class` backed by an `Int`; see above.)
+data, becomes an idiomatic Kotlin sealed class: one subclass (or object,
+for a unit variant) per variant carrying that variant's fields. Rich
+enums own no native resources and declare no JNI symbols. (A plain
+C-style enum with no payloads stays a Kotlin `enum class` backed by an
+`Int`; see above.)
 
 For the `shapes` module's `Shape` enum (`Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and
-`Labeled { label: string, count: u8 }`), the generator emits (abridged):
+`Labeled { label: string, count: u8 }`), the surface follows this shape:
 
 ```kotlin
 /** An algebraic shape (sum type with associated data) */
-class Shape internal constructor(internal var handle: Long) : java.io.Closeable {
-    companion object {
-        init { System.loadLibrary("weaveffi") }
-
-        @JvmStatic external fun nativeTag(handle: Long): Int
-        @JvmStatic external fun nativeDestroy(handle: Long)
-        @JvmStatic external fun nativeNewEmpty(): Long
-        @JvmStatic external fun nativeNewCircle(radius: Double): Long
-        @JvmStatic external fun nativeNewRectangle(width: Float, height: Float): Long
-        @JvmStatic external fun nativeNewLabeled(label: String, count: Byte): Long
-        @JvmStatic external fun nativeGetCircleRadius(handle: Long): Double
-        @JvmStatic external fun nativeGetLabeledCount(handle: Long): Byte
-
-        /** The empty shape */
-        fun empty(): Shape = Shape(nativeNewEmpty())
-        /** A circle with a radius */
-        fun circle(radius: Double): Shape = Shape(nativeNewCircle(radius))
-        /** An axis-aligned rectangle */
-        fun rectangle(width: Float, height: Float): Shape = Shape(nativeNewRectangle(width, height))
-        /** A labeled shape with a small count */
-        fun labeled(label: String, count: Byte): Shape = Shape(nativeNewLabeled(label, count))
-    }
-
-    enum class Tag(val value: Int) {
-        Empty(0),
-        Circle(1),
-        Rectangle(2),
-        Labeled(3);
-
-        companion object {
-            fun fromValue(value: Int): Tag = entries.first { it.value == value }
-        }
-    }
-
-    val tag: Tag get() = Tag.fromValue(nativeTag(handle))
-
-    /** Radius in points */
-    val circleRadius: Double get() = nativeGetCircleRadius(handle)
-    val labeledCount: Byte get() = nativeGetLabeledCount(handle)
-
-    override fun close() {
-        if (handle != 0L) {
-            nativeDestroy(handle)
-            handle = 0L
-        }
-    }
-
-    protected fun finalize() {
-        close()
-    }
+sealed class Shape {
+    /** The empty shape */
+    object Empty : Shape()
+    /** A circle with a radius */
+    data class Circle(val radius: Double) : Shape()
+    /** An axis-aligned rectangle */
+    data class Rectangle(val width: Float, val height: Float) : Shape()
+    /** A labeled shape with a small count */
+    data class Labeled(val label: String, val count: Byte) : Shape()
 }
 ```
 
-Each `nativeNew*` factory maps to a per-variant constructor
-(`weaveffi_shapes_Shape_<Variant>_new`), `nativeTag` reads the
-discriminant (`weaveffi_shapes_Shape_tag`), the `nativeGet*` getters read
-one variant field (`weaveffi_shapes_Shape_<Variant>_get_<field>`), and
-`nativeDestroy` frees the handle (`weaveffi_shapes_Shape_destroy`). The
-JNI shims that back these `external` methods are named
-`Java_com_weaveffi_Shape_native*`:
-
-```c
-JNIEXPORT jlong JNICALL Java_com_weaveffi_Shape_nativeNewCircle(JNIEnv* env, jclass clazz, jdouble radius) {
-    weaveffi_error err = {0, NULL};
-    weaveffi_shapes_Shape* rv = weaveffi_shapes_Shape_Circle_new((double)radius, &err);
-    if (err.code != 0) {
-        throw_weaveffi_error(env, &err);
-        return 0;
-    }
-    return (jlong)(intptr_t)rv;
-}
-
-JNIEXPORT jint JNICALL Java_com_weaveffi_Shape_nativeTag(JNIEnv* env, jclass clazz, jlong handle) {
-    return (jint)weaveffi_shapes_Shape_tag((const weaveffi_shapes_Shape*)(intptr_t)handle);
-}
-
-JNIEXPORT void JNICALL Java_com_weaveffi_Shape_nativeDestroy(JNIEnv* env, jclass clazz, jlong handle) {
-    weaveffi_shapes_Shape_destroy((weaveffi_shapes_Shape*)(intptr_t)handle);
-}
-```
-
-Free functions that take or return the enum pass the handle across the
-boundary; on the `WeaveFFI` companion they are
-`describe(shape: Shape): String` and
-`scale(shape: Shape, factor: Double): Shape`:
+On the wire a `Shape` is a value buffer holding the `i32` variant tag
+followed by the active variant's fields; the wrapper layer packs and
+decodes the `ByteArray` at the JNI boundary. Construct variants directly
+and branch with an exhaustive `when`:
 
 ```kotlin
-Shape.circle(2.0).use { c ->
-    println(c.tag)            // Tag.Circle
-    println(c.circleRadius)   // 2.0
-    val bigger = WeaveFFI.scale(c, 3.0)   // returns a new Shape
-    try {
-        println(WeaveFFI.describe(bigger))
-    } finally {
-        bigger.close()
-    }
+val c = Shape.Circle(2.0)
+when (c) {
+    is Shape.Circle -> println(c.radius)   // 2.0
+    else -> {}
 }
+val bigger = WeaveFFI.scale(c, 3.0)        // returns a new Shape value
+println(WeaveFFI.describe(bigger))
 ```
 
-**Ownership:** a `Shape` owns its native handle, so call `close()` (or use
-`use { ... }`) on every `Shape` you construct or receive, including the
-new `Shape` returned by `scale`. The `finalize()` safety net runs
-during GC but is not a substitute for deterministic cleanup.
+Values are plain Kotlin data: there's no handle and nothing to close.
 
 ## Build instructions
 
@@ -440,21 +358,20 @@ during GC but is not a substitute for deterministic cleanup.
 
 ## Memory and ownership
 
-- Struct and interface wrappers implement `Closeable`; either call
-  `.close()` explicitly or use `use { ... }`. The `finalize()` safety net
-  runs during GC but is not a substitute for deterministic cleanup.
+- Interface wrappers implement `Closeable`; either call `.close()`
+  explicitly or use `use { ... }`. The `finalize()` safety net runs
+  during GC but is not a substitute for deterministic cleanup. Structs
+  and rich enums are plain Kotlin values with nothing to close.
 - Strings returned from JNI are fresh Java strings; the JNI shim frees
   the underlying Rust pointer with `weaveffi_free_string` before
   returning.
 - Byte arrays returned from JNI are copied with `SetByteArrayRegion`,
   then the Rust buffer is freed with `weaveffi_free_bytes`.
-- Returned string arrays and maps free each element with
-  `weaveffi_free_string` after copying, then release the array buffer
-  (or both parallel key/value buffers) with `weaveffi_free_bytes`.
-- Optional values are passed as boxed wrappers (`Integer`, `Long`,
-  `Double`, `Boolean`); the JNI shim unboxes and forwards them to the C
-  ABI. A returned boxed optional scalar is read and its box freed with
-  `weaveffi_free_bytes`.
+- Buffered values (structs, rich enums, optionals, lists, maps) cross
+  JNI as `ByteArray` copies of their value buffers: the shim copies a
+  returned buffer with `SetByteArrayRegion` and releases the original
+  with `weaveffi_free_bytes`; a buffered parameter is packed by the
+  Kotlin layer and borrowed by the producer for the call.
 
 ## Async support
 
@@ -468,10 +385,10 @@ resume as raw handles and are re-wrapped after the await. From the
 ```kotlin
 @JvmStatic private external fun runTaskAsync(name: String, callback: Any)
 @JvmStatic suspend fun runTask(name: String): TaskResult {
-    val raw: Long = suspendCancellableCoroutine { cont ->
+    val raw: ByteArray = suspendCancellableCoroutine { cont ->
         runTaskAsync(name, WeaveContinuation(cont) { code, message -> TaskException.fromCode(code, message) })
     }
-    return TaskResult(raw)
+    return /* decode the value buffer into a TaskResult */
 }
 
 internal class WeaveContinuation<T>(
@@ -510,7 +427,8 @@ JNIEXPORT void JNICALL Java_com_weaveffi_WeaveFFI_runTaskAsync(JNIEnv* env, jcla
     (*env)->ReleaseStringUTFChars(env, name, name_chars);
 }
 
-static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, void* result) {
+static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err,
+                                           const uint8_t* result_ptr, size_t result_len) {
     weaveffi_jni_async_ctx* ctx = (weaveffi_jni_async_ctx*)context;
     JNIEnv* env = NULL;
     int attached = 0;
@@ -528,13 +446,14 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, v
 ```
 
 The completion callback fires exactly once, on a producer thread.
-Result buffers passed to it (strings, byte arrays, arrays) are
-borrowed from the producer for the callback's duration, so the shim
-copies them into Java objects (`NewStringUTF`, `SetByteArrayRegion`)
-inside the callback and never frees them. Owned-object results are the
-exception: the callback receives ownership, resumes the continuation
-with the raw handle, and the suspend wrapper adopts it into the
-wrapper class (`TaskResult(raw)` above). An exception thrown by the
+Result buffers passed to it (strings, byte arrays, and buffered values,
+which arrive as a `(result_ptr, result_len)` pair) are borrowed from
+the producer for the callback's duration, so the shim copies them into
+Java objects (`NewStringUTF`, `SetByteArrayRegion`) inside the callback
+and never frees them; the Kotlin layer then decodes buffered results
+into their value types. An owned interface result is the exception: the
+callback receives ownership, resumes the continuation with the raw
+handle, and the suspend wrapper adopts it. An exception thrown by the
 resumed coroutine goes through the same
 `weaveffi_jni_handle_uncaught` path as listener exceptions (see
 [Callbacks and listeners](#callbacks-and-listeners)).
@@ -715,16 +634,16 @@ class EventsGetMessagesIterator internal constructor(private var handle: Long) :
 The JNI `nativeNext` shim pulls one element and returns it in a
 one-slot `Object[]`; `null` means the stream is exhausted. Each string
 element is freed with `weaveffi_free_string` right after `NewStringUTF`
-copies it; when the element type is a struct, the raw handle is
-returned instead and the Kotlin `next()` adopts it into the owning
-wrapper class (`Contact(raw as Long)`), whose `close()` eventually
-destroys it:
+copies it; a buffered element (a record, rich enum, optional, list, or
+map) arrives as a value buffer that the shim copies into a `ByteArray`
+and releases with `weaveffi_free_bytes`, and the Kotlin `next()` decodes
+it into the value type:
 
 ```c
 JNIEXPORT jobjectArray JNICALL Java_com_weaveffi_EventsGetMessagesIterator_nativeNext(JNIEnv* env, jclass clazz, jlong handle) {
     weaveffi_events_GetMessagesIterator* _iter = (weaveffi_events_GetMessagesIterator*)(intptr_t)handle;
     const char* _item = (const char*)0;
-    weaveffi_error err = {0, NULL};
+    weaveffi_error err = {0};
     int32_t _has = weaveffi_events_GetMessagesIterator_next(_iter, &_item, &err);
     if (err.code != 0) {
         throw_weaveffi_error(env, &err);

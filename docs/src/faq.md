@@ -54,8 +54,8 @@ user-defined generics:
   types per resource).
 - `iter<T>`: lazy streaming sequences with `_next` / `_destroy` ABI.
 - `[T]`: homogeneous lists.
-- `{K:V}`: homogeneous maps (passed as parallel key/value arrays at
-  the C ABI).
+- `{K:V}`: homogeneous maps (serialized as value buffers at the
+  C ABI).
 - `T?`: optionals.
 - `&str`, `&[u8]`: borrowed views (no copy at the boundary).
 

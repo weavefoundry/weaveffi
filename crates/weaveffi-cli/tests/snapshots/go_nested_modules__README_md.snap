@@ -39,6 +39,8 @@ go build ./...
 The generated `weaveffi.go` file uses a CGo preamble to `#include "weaveffi.h"`
 and link against `-lweaveffi`. Each API function is exposed as an idiomatic Go
 function that marshals arguments to C types, calls the C ABI function, and
-converts the result back to Go types. Errors are returned as Go `error` values.
+converts the result back to Go types. Records, rich enums, optionals, lists,
+and maps cross the boundary serialized in the WeaveFFI value-buffer format.
+Errors are returned as Go `error` values.
 
 <!-- END README.md -->

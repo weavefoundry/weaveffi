@@ -17,8 +17,11 @@ extern void goWv_weaveffi_docs_publish_async_callback(void* context, weaveffi_er
 import "C"
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -45,18 +48,23 @@ func (e *WeaveFFIError) Error() string {
 }
 
 // wvTakeError reads and clears a non-zero C error slot, returning its
-// code and message.
-func wvTakeError(cErr *C.weaveffi_error) (int32, string) {
+// code, message, and a copy of its structured payload buffer (nil when
+// the code declares no payload fields).
+func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {
 	code := int32(cErr.code)
 	msg := ""
 	if cErr.message != nil {
 		msg = C.GoString(cErr.message)
 	}
+	var payload []byte
+	if cErr.payload_ptr != nil {
+		payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))
+	}
 	C.weaveffi_error_clear(cErr)
-	return code, msg
+	return code, msg, payload
 }
 
-func wvBrandError(code int32, message string) error {
+func wvBrandError(code int32, message string, _ []byte) error {
 	return &WeaveFFIError{Code: code, Message: message}
 }
 
@@ -65,9 +73,217 @@ func wvBrandError(code int32, message string) error {
 // a producer panic or a marshalling failure.
 func wvTrap(cErr *C.weaveffi_error) {
 	if cErr.code != 0 {
-		code, msg := wvTakeError(cErr)
+		code, msg, _ := wvTakeError(cErr)
 		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
 	}
+}
+
+// wvWriter serializes values into the WeaveFFI value-buffer format:
+// little-endian, packed, u32 length prefixes.
+type wvWriter struct {
+	buf []byte
+}
+
+func (w *wvWriter) writeBool(v bool) {
+	if v {
+		w.buf = append(w.buf, 1)
+	} else {
+		w.buf = append(w.buf, 0)
+	}
+}
+
+func (w *wvWriter) writeI8(v int8) {
+	w.buf = append(w.buf, byte(v))
+}
+
+func (w *wvWriter) writeU8(v uint8) {
+	w.buf = append(w.buf, v)
+}
+
+func (w *wvWriter) writeI16(v int16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, uint16(v))
+}
+
+func (w *wvWriter) writeU16(v uint16) {
+	w.buf = binary.LittleEndian.AppendUint16(w.buf, v)
+}
+
+func (w *wvWriter) writeI32(v int32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(v))
+}
+
+func (w *wvWriter) writeU32(v uint32) {
+	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
+}
+
+func (w *wvWriter) writeI64(v int64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))
+}
+
+func (w *wvWriter) writeU64(v uint64) {
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, v)
+}
+
+func (w *wvWriter) writeF32(v float32) {
+	w.writeU32(math.Float32bits(v))
+}
+
+func (w *wvWriter) writeF64(v float64) {
+	w.writeU64(math.Float64bits(v))
+}
+
+func (w *wvWriter) writeLen(n int) {
+	if n < 0 || uint64(n) > uint64(^uint32(0)) {
+		panic("weaveffi: value-buffer length exceeds u32 range")
+	}
+	w.writeU32(uint32(n))
+}
+
+func (w *wvWriter) writeString(v string) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeBytes(v []byte) {
+	w.writeLen(len(v))
+	w.buf = append(w.buf, v...)
+}
+
+func (w *wvWriter) writeOptionFlag(present bool) {
+	w.writeBool(present)
+}
+
+// wvReader decodes values from the WeaveFFI value-buffer format. A
+// malformed buffer is a producer/consumer contract violation, so every
+// read panics (the same channel a trapped producer error uses) instead
+// of returning a typed domain error.
+type wvReader struct {
+	buf []byte
+	pos int
+}
+
+func wvMalformed(context string) {
+	panic("weaveffi: malformed value buffer: " + context)
+}
+
+func (r *wvReader) take(n int, context string) []byte {
+	if n < 0 || len(r.buf)-r.pos < n {
+		wvMalformed(context)
+	}
+	b := r.buf[r.pos : r.pos+n]
+	r.pos += n
+	return b
+}
+
+func (r *wvReader) readBool() bool {
+	switch r.take(1, "bool")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("bool byte out of range")
+	return false
+}
+
+func (r *wvReader) readI8() int8 {
+	return int8(r.take(1, "i8")[0])
+}
+
+func (r *wvReader) readU8() uint8 {
+	return r.take(1, "u8")[0]
+}
+
+func (r *wvReader) readI16() int16 {
+	return int16(binary.LittleEndian.Uint16(r.take(2, "i16")))
+}
+
+func (r *wvReader) readU16() uint16 {
+	return binary.LittleEndian.Uint16(r.take(2, "u16"))
+}
+
+func (r *wvReader) readI32() int32 {
+	return int32(binary.LittleEndian.Uint32(r.take(4, "i32")))
+}
+
+func (r *wvReader) readU32() uint32 {
+	return binary.LittleEndian.Uint32(r.take(4, "u32"))
+}
+
+func (r *wvReader) readI64() int64 {
+	return int64(binary.LittleEndian.Uint64(r.take(8, "i64")))
+}
+
+func (r *wvReader) readU64() uint64 {
+	return binary.LittleEndian.Uint64(r.take(8, "u64"))
+}
+
+func (r *wvReader) readF32() float32 {
+	return math.Float32frombits(r.readU32())
+}
+
+func (r *wvReader) readF64() float64 {
+	return math.Float64frombits(r.readU64())
+}
+
+func (r *wvReader) readLen() int {
+	n := int(r.readU32())
+	if n > len(r.buf)-r.pos {
+		wvMalformed("length prefix exceeds remaining buffer")
+	}
+	return n
+}
+
+func (r *wvReader) readString() string {
+	b := r.take(r.readLen(), "string bytes")
+	if !utf8.Valid(b) {
+		wvMalformed("string is not valid UTF-8")
+	}
+	return string(b)
+}
+
+func (r *wvReader) readBytes() []byte {
+	b := r.take(r.readLen(), "byte buffer")
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out
+}
+
+func (r *wvReader) readOptionFlag() bool {
+	switch r.take(1, "option flag")[0] {
+	case 0:
+		return false
+	case 1:
+		return true
+	}
+	wvMalformed("option flag byte out of range")
+	return false
+}
+
+func (r *wvReader) expectEnd() {
+	if r.pos != len(r.buf) {
+		wvMalformed("trailing bytes after value")
+	}
+}
+
+// wvCopyBuffer copies an owned, producer-allocated value buffer into Go
+// memory and releases it with weaveffi_free_bytes.
+func wvCopyBuffer(ptr *C.uint8_t, length C.size_t) []byte {
+	if ptr == nil {
+		return nil
+	}
+	out := C.GoBytes(unsafe.Pointer(ptr), C.int(length))
+	C.weaveffi_free_bytes(ptr, length)
+	return out
+}
+
+// wvBorrowBuffer copies a borrowed value buffer into Go memory. The
+// producer keeps ownership and frees it after the borrowing call returns.
+func wvBorrowBuffer(ptr *C.uint8_t, length C.size_t) []byte {
+	if ptr == nil {
+		return nil
+	}
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length))
 }
 
 var (
@@ -128,7 +344,7 @@ const (
 
 // wvMapDocs converts a non-zero code from the `docs` domain into a
 // *DocsErrorsError, falling back to the generic *WeaveFFIError for unknown codes.
-func wvMapDocs(code int32, message string) error {
+func wvMapDocs(code int32, message string, payload []byte) error {
 	switch code {
 	case DocsErrorsErrorNotFound:
 		if message == "" {
@@ -141,7 +357,7 @@ func wvMapDocs(code int32, message string) error {
 		}
 		return &DocsErrorsError{Code: code, Message: message}
 	default:
-		return wvBrandError(code, message)
+		return wvBrandError(code, message, payload)
 	}
 }
 
@@ -163,115 +379,39 @@ const (
 //
 // Documents are persisted to disk and exposed via the public API.
 type Document struct {
-	ptr *C.weaveffi_docs_Document
+	// Id: Stable opaque identifier
+	Id int64
+	// Title: Human-readable title shown in lists
+	Title string
+	// Status: Current lifecycle status
+	Status Status
+	// Tags: Free-form tags for grouping
+	Tags []string
 }
 
-// Id: Stable opaque identifier
-func (s *Document) Id() int64 {
-	return int64(C.weaveffi_docs_Document_get_id(s.ptr))
-}
-
-// Title: Human-readable title shown in lists
-func (s *Document) Title() string {
-	cStr := C.weaveffi_docs_Document_get_title(s.ptr)
-	goResult := C.GoString(cStr)
-	C.weaveffi_free_string(cStr)
-	return goResult
-}
-
-// Status: Current lifecycle status
-func (s *Document) Status() Status {
-	return Status(C.weaveffi_docs_Document_get_status(s.ptr))
-}
-
-// Tags: Free-form tags for grouping
-func (s *Document) Tags() []string {
-	var cOutLen C.size_t
-	result := C.weaveffi_docs_Document_get_tags(s.ptr, &cOutLen)
-	count := int(cOutLen)
-	goResult := make([]string, count)
-	if count > 0 && result != nil {
-		for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer(result)), count) {
-			goResult[i] = C.GoString(v)
-			C.weaveffi_free_string(v)
-		}
-		C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))
-	}
-	return goResult
-}
-
-func (s *Document) Close() {
-	if s.ptr != nil {
-		C.weaveffi_docs_Document_destroy(s.ptr)
-		s.ptr = nil
+// wvPackDocument appends v to w in the value-buffer wire format.
+func wvPackDocument(w *wvWriter, v Document) {
+	w.writeI64(v.Id)
+	w.writeString(v.Title)
+	w.writeI32(int32(v.Status))
+	w.writeLen(len(v.Tags))
+	for _, eTags0 := range v.Tags {
+		w.writeString(eTags0)
 	}
 }
 
-// DocumentBuilder: Represents a single document tracked by the system.
-//
-// Documents are persisted to disk and exposed via the public API.
-type DocumentBuilder struct {
-	id int64
-	title string
-	status Status
-	tags []string
-}
-
-func NewDocumentBuilder() *DocumentBuilder {
-	return &DocumentBuilder{}
-}
-
-// WithId: Stable opaque identifier
-func (b *DocumentBuilder) WithId(value int64) *DocumentBuilder {
-	b.id = value
-	return b
-}
-
-// WithTitle: Human-readable title shown in lists
-func (b *DocumentBuilder) WithTitle(value string) *DocumentBuilder {
-	b.title = value
-	return b
-}
-
-// WithStatus: Current lifecycle status
-func (b *DocumentBuilder) WithStatus(value Status) *DocumentBuilder {
-	b.status = value
-	return b
-}
-
-// WithTags: Free-form tags for grouping
-func (b *DocumentBuilder) WithTags(value []string) *DocumentBuilder {
-	b.tags = value
-	return b
-}
-
-func (b *DocumentBuilder) Build() (*Document, error) {
-	id := b.id
-	title := b.title
-	cTitle := C.CString(title)
-	defer C.free(unsafe.Pointer(cTitle))
-	status := b.status
-	tags := b.tags
-	cTagsLen := C.size_t(len(tags))
-	cTagsArr := make([]*C.char, len(tags))
-	for i, s := range tags {
-		cTagsArr[i] = C.CString(s)
+// wvUnpackDocument decodes one Document from r.
+func wvUnpackDocument(r *wvReader) Document {
+	var v Document
+	v.Id = r.readI64()
+	v.Title = r.readString()
+	v.Status = Status(r.readI32())
+	nTags0 := r.readLen()
+	v.Tags = make([]string, nTags0)
+	for iTags0 := range v.Tags {
+		v.Tags[iTags0] = r.readString()
 	}
-	defer func() {
-		for _, p := range cTagsArr {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
-	var cTagsPtr **C.char
-	if len(cTagsArr) > 0 {
-		cTagsPtr = (**C.char)(unsafe.Pointer(&cTagsArr[0]))
-	}
-	var cErr C.weaveffi_error
-	result := C.weaveffi_docs_Document_create(C.int64_t(id), cTitle, C.weaveffi_docs_Status(status), cTagsPtr, cTagsLen, &cErr)
-	if cErr.code != 0 {
-		return nil, wvBrandError(wvTakeError(&cErr))
-	}
-	return &Document{ptr: result}, nil
+	return v
 }
 
 // Notebook: An ordered collection of documents.
@@ -293,9 +433,15 @@ func NewNotebook() *Notebook {
 //
 // Parameters:
 //   - document: The document to add
-func (s *Notebook) Insert(document *Document) int32 {
+func (s *Notebook) Insert(document Document) int32 {
+	wDocument := &wvWriter{}
+	wvPackDocument(wDocument, document)
+	var cDocumentPtr *C.uint8_t
+	if len(wDocument.buf) > 0 {
+		cDocumentPtr = (*C.uint8_t)(unsafe.Pointer(&wDocument.buf[0]))
+	}
 	var cErr C.weaveffi_error
-	result := C.weaveffi_docs_Notebook_insert(s.ptr, document.ptr, &cErr)
+	result := C.weaveffi_docs_Notebook_insert(s.ptr, cDocumentPtr, C.size_t(len(wDocument.buf)), &cErr)
 	wvTrap(&cErr)
 	return int32(result)
 }
@@ -304,13 +450,18 @@ func (s *Notebook) Insert(document *Document) int32 {
 //
 // Parameters:
 //   - id: Identifier of the document to find
-func (s *Notebook) Find(id int64) (*Document, error) {
+func (s *Notebook) Find(id int64) (Document, error) {
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_docs_Notebook_find(s.ptr, C.int64_t(id), &cErr)
+	result := C.weaveffi_docs_Notebook_find(s.ptr, C.int64_t(id), &cOutLen, &cErr)
 	if cErr.code != 0 {
-		return nil, wvMapDocs(wvTakeError(&cErr))
+		return Document{}, wvMapDocs(wvTakeError(&cErr))
 	}
-	return &Document{ptr: result}, nil
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult Document
+	goResult = wvUnpackDocument(rRes)
+	rRes.expectEnd()
+	return goResult, nil
 }
 
 // Size: The number of documents currently held
@@ -379,27 +530,27 @@ func UnregisterSavedListener(id uint64) {
 // Parameters:
 //   - title: Human-readable title for the new document
 //   - tags: Initial set of tags (may be empty)
-func CreateDocument(title string, tags []string) *Document {
+func CreateDocument(title string, tags []string) Document {
 	cTitle := C.CString(title)
 	defer C.free(unsafe.Pointer(cTitle))
-	cTagsLen := C.size_t(len(tags))
-	cTagsArr := make([]*C.char, len(tags))
-	for i, s := range tags {
-		cTagsArr[i] = C.CString(s)
+	wTags := &wvWriter{}
+	wTags.writeLen(len(tags))
+	for _, eTags0 := range tags {
+		wTags.writeString(eTags0)
 	}
-	defer func() {
-		for _, p := range cTagsArr {
-			C.free(unsafe.Pointer(p))
-		}
-	}()
-	var cTagsPtr **C.char
-	if len(cTagsArr) > 0 {
-		cTagsPtr = (**C.char)(unsafe.Pointer(&cTagsArr[0]))
+	var cTagsPtr *C.uint8_t
+	if len(wTags.buf) > 0 {
+		cTagsPtr = (*C.uint8_t)(unsafe.Pointer(&wTags.buf[0]))
 	}
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_docs_create_document(cTitle, cTagsPtr, cTagsLen, &cErr)
+	result := C.weaveffi_docs_create_document(cTitle, cTagsPtr, C.size_t(len(wTags.buf)), &cOutLen, &cErr)
 	wvTrap(&cErr)
-	return &Document{ptr: result}
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult Document
+	goResult = wvUnpackDocument(rRes)
+	rRes.expectEnd()
+	return goResult
 }
 
 // GetDocument: Look up a document by identifier
@@ -407,13 +558,19 @@ func CreateDocument(title string, tags []string) *Document {
 // Parameters:
 //   - id: Identifier returned from create_document
 func GetDocument(id int64) *Document {
+	var cOutLen C.size_t
 	var cErr C.weaveffi_error
-	result := C.weaveffi_docs_get_document(C.int64_t(id), &cErr)
+	result := C.weaveffi_docs_get_document(C.int64_t(id), &cOutLen, &cErr)
 	wvTrap(&cErr)
-	if result == nil {
-		return nil
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult *Document
+	if rRes.readOptionFlag() {
+		var oRes0 Document
+		oRes0 = wvUnpackDocument(rRes)
+		goResult = &oRes0
 	}
-	return &Document{ptr: result}
+	rRes.expectEnd()
+	return goResult
 }
 
 type wvOutcomeDocsPublishAsync struct {

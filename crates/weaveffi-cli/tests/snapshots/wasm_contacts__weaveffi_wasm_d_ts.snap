@@ -34,13 +34,11 @@ export declare class NotFound extends ContactsError {
 }
 
 export interface Contact {
-  readonly id: bigint;
-  readonly first_name: string;
-  readonly last_name: string;
-  readonly email: string | null;
-  readonly contact_type: ContactType;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  id: bigint;
+  first_name: string;
+  last_name: string;
+  email: string | null;
+  contact_type: ContactType;
 }
 
 export declare const ContactType: Readonly<{

@@ -17,50 +17,25 @@ export declare class WeaveFFIError extends Error {
 
 /** One field per supported numeric primitive */
 export interface Numerics {
-  readonly a: number;
-  readonly b: number;
-  readonly c: number;
-  readonly d: bigint;
-  readonly e: number;
-  readonly f: number;
-  readonly g: number;
-  readonly h: bigint;
-  readonly i: number;
-  readonly j: number;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  a: number;
+  b: number;
+  c: number;
+  d: bigint;
+  e: number;
+  f: number;
+  g: number;
+  h: bigint;
+  i: number;
+  j: number;
 }
 
 /** An algebraic shape (sum type with associated data) */
-export declare class Shape {
-  get tag(): number;
-  static readonly Tag: Readonly<{
-    Empty: 0;
-    Circle: 1;
-    Rectangle: 2;
-    Bounded: 3;
-    Labeled: 4;
-  }>;
-  /** The empty shape (a unit variant) */
-  static empty(): Shape;
-  /** A circle with a radius */
-  static circle(radius: number): Shape;
-  /** An axis-aligned rectangle */
-  static rectangle(width: number, height: number): Shape;
-  /** An integer-bounded shape (exercises narrow + wide ints) */
-  static bounded(min: number, max: number, weight: bigint): Shape;
-  /** A labeled shape with a small count */
-  static labeled(label: string, count: number): Shape;
-  get circleRadius(): number;
-  get rectangleWidth(): number;
-  get rectangleHeight(): number;
-  get boundedMin(): number;
-  get boundedMax(): number;
-  get boundedWeight(): bigint;
-  get labeledLabel(): string;
-  get labeledCount(): number;
-  free(): void;
-}
+export type Shape =
+  | { tag: "Empty" }
+  | { tag: "Circle"; radius: number }
+  | { tag: "Rectangle"; width: number; height: number }
+  | { tag: "Bounded"; min: number; max: number; weight: bigint }
+  | { tag: "Labeled"; label: string; count: number };
 
 /** A plain C-style enum (no payloads) */
 export declare const Channel: Readonly<{
@@ -86,7 +61,7 @@ export interface WeaveffiWasmModule {
      * Sum a list of bytes into a wide integer (numerics smoke)
      * @throws {WeaveFFIError} if the native call fails
      */
-    sumBytes(values: number[]): bigint;
+    sumBytes(values: Uint8Array): bigint;
     /**
      * Build a Numerics struct from every numeric primitive
      * @throws {WeaveFFIError} if the native call fails

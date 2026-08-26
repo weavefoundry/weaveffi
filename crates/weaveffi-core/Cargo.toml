@@ -16,6 +16,7 @@ thiserror = { workspace = true }
 camino = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 miette = { workspace = true }
 rayon = { workspace = true }

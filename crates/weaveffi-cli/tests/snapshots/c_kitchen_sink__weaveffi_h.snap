@@ -44,7 +44,16 @@ extern "C" {
 
 typedef uint64_t weaveffi_handle_t;
 
-typedef struct weaveffi_error { int32_t code; const char* message; } weaveffi_error;
+/* Error slot written by every fallible call. `payload_ptr`/`payload_len`
+   hold the matched error code's fields serialized in the WeaveFFI value
+   buffer format (null when the code declares no fields); both the message
+   and the payload are released by weaveffi_error_clear. */
+typedef struct weaveffi_error {
+    int32_t code;
+    const char* message;
+    const uint8_t* payload_ptr;
+    size_t payload_len;
+} weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
@@ -64,12 +73,15 @@ WEAVEFFI_API bool weaveffi_cancel_token_is_cancelled(const weaveffi_cancel_token
 WEAVEFFI_API void weaveffi_cancel_token_destroy(weaveffi_cancel_token* token);
 
 /*
- * Map convention: Maps are passed as parallel arrays of keys and values.
- * A map parameter {K:V} named "m" expands to:
- *   const K* m_keys, const V* m_values, size_t m_len
- * A map return value expands to out-parameters that receive callee-
- * allocated arrays; the caller passes the address of its own pointers:
- *   K** out_keys, V** out_values, size_t* out_len
+ * Value buffer convention: records, rich enums, lists, maps, and
+ * optionals cross the ABI serialized in the WeaveFFI value buffer
+ * format (little-endian; see the generated bindings or the WeaveFFI
+ * buffer protocol spec for the per-type encoding).
+ * A buffered parameter named "v" expands to a borrowed view:
+ *   const uint8_t* v_ptr, size_t v_len
+ * A buffered return is a producer-allocated buffer returned as
+ * `const uint8_t*` with a trailing `size_t* out_len`; the caller
+ * decodes it and then releases it with weaveffi_free_bytes.
  */
 
 /** Task priority levels */
@@ -83,71 +95,19 @@ typedef enum {
 } weaveffi_kitchen_Priority;
 /** Error codes reported by throwing functions in the `kitchen` module tree. */
 typedef enum { weaveffi_kitchen_KitchenErrors_NotFound = 1, weaveffi_kitchen_KitchenErrors_InvalidInput = 2 } weaveffi_kitchen_KitchenErrors;
-typedef struct weaveffi_shared_Token weaveffi_shared_Token;
-typedef struct weaveffi_kitchen_Item weaveffi_kitchen_Item;
-typedef struct weaveffi_kitchen_ItemBuilder weaveffi_kitchen_ItemBuilder;
 typedef struct weaveffi_kitchen_Gadget weaveffi_kitchen_Gadget;
 typedef struct weaveffi_kitchen_StreamItemsIterator weaveffi_kitchen_StreamItemsIterator;
+typedef struct weaveffi_shared_Token weaveffi_shared_Token;
 /** Fires when an item is ready */
 typedef void (*weaveffi_kitchen_OnReady_fn)(int32_t code, const char* msg, void* context);
 typedef void (*weaveffi_kitchen_do_async_callback)(void* context, weaveffi_error* err, const char* result);
 typedef void (*weaveffi_kitchen_do_cancellable_callback)(void* context, weaveffi_error* err, const char* result);
 
 // Module: shared
-/** A reusable token referenced across modules */
-WEAVEFFI_API weaveffi_shared_Token* weaveffi_shared_Token_create(int64_t id, const char* label, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_shared_Token_destroy(weaveffi_shared_Token* ptr);
-WEAVEFFI_API int64_t weaveffi_shared_Token_get_id(const weaveffi_shared_Token* ptr);
-WEAVEFFI_API const char* weaveffi_shared_Token_get_label(const weaveffi_shared_Token* ptr);
-
 /** Trivial cross-module helper */
 WEAVEFFI_API const char* weaveffi_shared_ping(weaveffi_error* out_err);
 
 // Module: kitchen
-/** Kitchen sink struct exercising every field feature */
-WEAVEFFI_API weaveffi_kitchen_Item* weaveffi_kitchen_Item_create(int64_t id, const char* name, int32_t count, bool enabled, double ratio, uint32_t nick, const uint8_t* payload_ptr, size_t payload_len, const char* const* tags, size_t tags_len, const char* const* attrs_keys, const char* const* attrs_values, size_t attrs_len, const int64_t* parent, const weaveffi_shared_Token* token, weaveffi_kitchen_Priority priority, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_kitchen_Item_destroy(weaveffi_kitchen_Item* ptr);
-/** Stable identifier */
-WEAVEFFI_API int64_t weaveffi_kitchen_Item_get_id(const weaveffi_kitchen_Item* ptr);
-/** Display name */
-WEAVEFFI_API const char* weaveffi_kitchen_Item_get_name(const weaveffi_kitchen_Item* ptr);
-/** Initial count */
-WEAVEFFI_API int32_t weaveffi_kitchen_Item_get_count(const weaveffi_kitchen_Item* ptr);
-/** Whether the item is enabled */
-WEAVEFFI_API bool weaveffi_kitchen_Item_get_enabled(const weaveffi_kitchen_Item* ptr);
-/** Scaling ratio */
-WEAVEFFI_API double weaveffi_kitchen_Item_get_ratio(const weaveffi_kitchen_Item* ptr);
-WEAVEFFI_API uint32_t weaveffi_kitchen_Item_get_nick(const weaveffi_kitchen_Item* ptr);
-WEAVEFFI_API const uint8_t* weaveffi_kitchen_Item_get_payload(const weaveffi_kitchen_Item* ptr, size_t* out_len);
-WEAVEFFI_API const char** weaveffi_kitchen_Item_get_tags(const weaveffi_kitchen_Item* ptr, size_t* out_len);
-WEAVEFFI_API void weaveffi_kitchen_Item_get_attrs(const weaveffi_kitchen_Item* ptr, const char*** out_keys, const char*** out_values, size_t* out_len);
-WEAVEFFI_API int64_t* weaveffi_kitchen_Item_get_parent(const weaveffi_kitchen_Item* ptr);
-/** Cross-module struct reference */
-WEAVEFFI_API weaveffi_shared_Token* weaveffi_kitchen_Item_get_token(const weaveffi_kitchen_Item* ptr);
-WEAVEFFI_API weaveffi_kitchen_Priority weaveffi_kitchen_Item_get_priority(const weaveffi_kitchen_Item* ptr);
-
-WEAVEFFI_API weaveffi_kitchen_ItemBuilder* weaveffi_kitchen_Item_Builder_new(void);
-/** Stable identifier */
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_id(weaveffi_kitchen_ItemBuilder* builder, int64_t id);
-/** Display name */
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_name(weaveffi_kitchen_ItemBuilder* builder, const char* name);
-/** Initial count */
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_count(weaveffi_kitchen_ItemBuilder* builder, int32_t count);
-/** Whether the item is enabled */
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_enabled(weaveffi_kitchen_ItemBuilder* builder, bool enabled);
-/** Scaling ratio */
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_ratio(weaveffi_kitchen_ItemBuilder* builder, double ratio);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_nick(weaveffi_kitchen_ItemBuilder* builder, uint32_t nick);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_payload(weaveffi_kitchen_ItemBuilder* builder, const uint8_t* payload_ptr, size_t payload_len);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_tags(weaveffi_kitchen_ItemBuilder* builder, const char* const* tags, size_t tags_len);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_attrs(weaveffi_kitchen_ItemBuilder* builder, const char* const* attrs_keys, const char* const* attrs_values, size_t attrs_len);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_parent(weaveffi_kitchen_ItemBuilder* builder, const int64_t* parent);
-/** Cross-module struct reference */
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_token(weaveffi_kitchen_ItemBuilder* builder, const weaveffi_shared_Token* token);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_set_priority(weaveffi_kitchen_ItemBuilder* builder, weaveffi_kitchen_Priority priority);
-WEAVEFFI_API weaveffi_kitchen_Item* weaveffi_kitchen_Item_Builder_build(weaveffi_kitchen_ItemBuilder* builder, weaveffi_error* out_err);
-WEAVEFFI_API void weaveffi_kitchen_Item_Builder_destroy(weaveffi_kitchen_ItemBuilder* builder);
-
 /** A pocket-sized interface exercising the object surface */
 /** Create a gadget with the given id */
 WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_Gadget_new(int64_t id, weaveffi_error* out_err);
@@ -180,17 +140,17 @@ WEAVEFFI_API weaveffi_handle_t weaveffi_kitchen_open_handle(weaveffi_error* out_
 /** Returns a typed handle */
 WEAVEFFI_API weaveffi_shared_Token* weaveffi_kitchen_open_typed_handle(weaveffi_error* out_err);
 /** Optional struct return */
-WEAVEFFI_API weaveffi_kitchen_Item* weaveffi_kitchen_maybe_item(int64_t id, weaveffi_error* out_err);
+WEAVEFFI_API const uint8_t* weaveffi_kitchen_maybe_item(int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** List of structs */
-WEAVEFFI_API weaveffi_kitchen_Item** weaveffi_kitchen_list_items(size_t* out_len, weaveffi_error* out_err);
+WEAVEFFI_API const uint8_t* weaveffi_kitchen_list_items(size_t* out_len, weaveffi_error* out_err);
 /** Map return type */
-WEAVEFFI_API void weaveffi_kitchen_get_attrs(const char*** out_keys, int32_t** out_values, size_t* out_len, weaveffi_error* out_err);
+WEAVEFFI_API const uint8_t* weaveffi_kitchen_get_attrs(size_t* out_len, weaveffi_error* out_err);
 /** Iterator return type */
 WEAVEFFI_API weaveffi_kitchen_StreamItemsIterator* weaveffi_kitchen_stream_items(weaveffi_error* out_err);
-WEAVEFFI_API int32_t weaveffi_kitchen_StreamItemsIterator_next(weaveffi_kitchen_StreamItemsIterator* iter, weaveffi_kitchen_Item** out_item, weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_kitchen_StreamItemsIterator_next(weaveffi_kitchen_StreamItemsIterator* iter, const uint8_t** out_item, size_t* out_len, weaveffi_error* out_err);
 WEAVEFFI_API void weaveffi_kitchen_StreamItemsIterator_destroy(weaveffi_kitchen_StreamItemsIterator* iter);
 /** Returns the shared Token type from another module */
-WEAVEFFI_API weaveffi_shared_Token* weaveffi_kitchen_cross_module_token(weaveffi_error* out_err);
+WEAVEFFI_API const uint8_t* weaveffi_kitchen_cross_module_token(size_t* out_len, weaveffi_error* out_err);
 /** Async operation */
 WEAVEFFI_API void weaveffi_kitchen_do_async_async(const char* input, weaveffi_kitchen_do_async_callback callback, void* context);
 /** Cancellable async operation */

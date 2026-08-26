@@ -1,15 +1,14 @@
 // Conformance consumer: shapes sample, Node (N-API) target.
 //
 // Drives the generated rich (algebraic) enum surface through the wrapper
-// layer (index.js): the Shape class with its per-variant static factories
-// (`Shape.circle(radius)`), the `tag()` reader against the frozen `Shape.Tag`
-// discriminant map, the namespaced per-variant getters (`circleRadius`), the
-// explicit `destroy()`, and the free functions that take and return the rich
-// enum as class instances (`describe`, `scale`) under the default
-// lowerCamelCase, module-prefix-stripped names. Also covers the expanded
-// numerics (f64 + f32 fields, u8 field, list<u8> in, u64 out). Mirrors
-// conformance/c/shapes.c and conformance/cpp/shapes.cpp. Exits non-zero on
-// any failed assertion; prints `node/shapes: OK` on success.
+// layer (index.js): shapes are plain tagged objects ({ tag: 'Circle',
+// radius: 2.5 }) that the wrapper packs into value buffers on the way in
+// and unpacks on the way out. Covers every variant round-tripping through
+// `scale` (unit, f64, f32 pair, and string + u8 payloads), `describe`
+// dispatching on the active variant, and the expanded numerics (bytes in,
+// u64 out) under the default lowerCamelCase, module-prefix-stripped names.
+// Mirrors conformance/c/shapes.c and conformance/cpp/shapes.cpp. Exits
+// non-zero on any failed assertion; prints `node/shapes: OK` on success.
 
 'use strict';
 
@@ -34,48 +33,39 @@ function approx(actual, expected, eps, msg) {
   expect(Math.abs(actual - expected) < eps, `${msg} (got ${actual}, want ${expected})`);
 }
 
-const Shape = wv.Shape;
-
-// Empty (unit variant): tag only, no payload.
-const empty = Shape.empty();
-expect(empty instanceof Shape, 'factory returns a Shape instance');
-expect(empty.tag() === Shape.Tag.Empty, 'empty tag is Empty');
+// Empty (unit variant): tag only, no payload. Round-tripping through scale
+// exercises pack and unpack of the bare tag.
+const empty = { tag: 'Empty' };
+expect(wv.describe(empty) === 'empty', 'describe(empty)');
+const emptyBack = wv.scale(empty, 2.0);
+expect(typeof emptyBack === 'object' && emptyBack !== null, 'scale returns an object');
+expect(emptyBack.tag === 'Empty', 'empty tag round-trips');
 
 // Circle (f64 payload).
-const circle = Shape.circle(2.5);
-expect(circle.tag() === Shape.Tag.Circle, 'circle tag is Circle');
-approx(circle.circleRadius, 2.5, 1e-9, 'circle radius');
+const circle = { tag: 'Circle', radius: 2.5 };
+expect(wv.describe(circle) === 'circle(r=2.5)', 'describe(circle)');
+const big = wv.scale(circle, 4.0);
+expect(big.tag === 'Circle', 'scaled tag is Circle');
+approx(big.radius, 10.0, 1e-9, 'scaled radius');
 
 // Rectangle (two f32 payloads).
-const rect = Shape.rectangle(3.0, 4.0);
-expect(rect.tag() === Shape.Tag.Rectangle, 'rectangle tag is Rectangle');
-approx(rect.rectangleWidth, 3.0, 1e-6, 'rectangle width');
-approx(rect.rectangleHeight, 4.0, 1e-6, 'rectangle height');
+const rect = { tag: 'Rectangle', width: 3.0, height: 4.0 };
+expect(wv.describe(rect) === 'rectangle(3x4)', 'describe(rectangle)');
+const grown = wv.scale(rect, 2.0);
+expect(grown.tag === 'Rectangle', 'scaled tag is Rectangle');
+approx(grown.width, 6.0, 1e-6, 'scaled rectangle width');
+approx(grown.height, 8.0, 1e-6, 'scaled rectangle height');
 
-// Labeled (string + u8 payload).
-const labeled = Shape.labeled('hex', 6);
-expect(labeled.tag() === Shape.Tag.Labeled, 'labeled tag is Labeled');
-expect(labeled.labeledLabel === 'hex', 'labeled label is "hex"');
-expect(Number(labeled.labeledCount) === 6, 'labeled count is 6');
+// Labeled (string + u8 payload): scale leaves the payload alone, so the
+// round trip checks both fields survive pack and unpack intact.
+const labeled = { tag: 'Labeled', label: 'hex', count: 6 };
+expect(wv.describe(labeled) === 'labeled(hex x6)', 'describe(labeled)');
+const labeledBack = wv.scale(labeled, 3.0);
+expect(labeledBack.tag === 'Labeled', 'labeled tag round-trips');
+expect(labeledBack.label === 'hex', 'labeled label is "hex"');
+expect(Number(labeledBack.count) === 6, 'labeled count is 6');
 
-// describe: dispatch on the active variant (rich enum in, string out).
-expect(wv.describe(circle) === 'circle(r=2.5)', 'describe(circle)');
-
-// scale: rich enum in and out (returns a new owned instance).
-const big = wv.scale(circle, 4.0);
-expect(big instanceof Shape, 'scale returns a Shape instance');
-expect(big.tag() === Shape.Tag.Circle, 'scaled tag is Circle');
-approx(big.circleRadius, 10.0, 1e-9, 'scaled radius');
-
-// Numerics: list<u8> in, u64 out.
-expect(Number(wv.sumBytes([250, 250, 250, 250])) === 1000, 'sumBytes == 1000');
-
-// Free every owned instance (destroy() is idempotent; the
-// FinalizationRegistry backstops anything missed).
-big.destroy();
-labeled.destroy();
-rect.destroy();
-circle.destroy();
-empty.destroy();
+// Numerics: bytes in ([u8] canonicalizes to bytes, so a Buffer), u64 out.
+expect(Number(wv.sumBytes(Buffer.from([250, 250, 250, 250]))) === 1000, 'sumBytes == 1000');
 
 console.log('node/shapes: OK');

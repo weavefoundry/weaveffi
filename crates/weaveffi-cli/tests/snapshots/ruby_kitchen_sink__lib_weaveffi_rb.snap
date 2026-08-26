@@ -31,7 +31,9 @@ module WeaveFFI
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
-           :message, :pointer
+           :message, :pointer,
+           :payload_ptr, :pointer,
+           :payload_len, :size_t
   end
 
   class Error < StandardError
@@ -40,6 +42,176 @@ module WeaveFFI
     def initialize(code, message)
       @code = code
       super(message)
+    end
+  end
+
+  # @api private
+  # Appends values in the WeaveFFI value-buffer wire format: little-endian,
+  # packed, no alignment.
+  class WvBufferWriter
+    def initialize
+      @buf = +''.b
+    end
+
+    # The encoded bytes as a binary String.
+    def data
+      @buf
+    end
+
+    def write_bool(v)
+      @buf << (v ? "\x01".b : "\x00".b)
+    end
+
+    def write_flag(v)
+      write_bool(v)
+    end
+
+    def write_i8(v)
+      @buf << [v].pack('c')
+    end
+
+    def write_u8(v)
+      @buf << [v].pack('C')
+    end
+
+    def write_i16(v)
+      @buf << [v].pack('s<')
+    end
+
+    def write_u16(v)
+      @buf << [v].pack('S<')
+    end
+
+    def write_i32(v)
+      @buf << [v].pack('l<')
+    end
+
+    def write_u32(v)
+      @buf << [v].pack('L<')
+    end
+
+    def write_len(v)
+      write_u32(v)
+    end
+
+    def write_i64(v)
+      @buf << [v].pack('q<')
+    end
+
+    def write_u64(v)
+      @buf << [v].pack('Q<')
+    end
+
+    def write_f32(v)
+      @buf << [v].pack('e')
+    end
+
+    def write_f64(v)
+      @buf << [v].pack('E')
+    end
+
+    def write_string(v)
+      b = v.to_s.encode(Encoding::UTF_8).b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+
+    def write_bytes(v)
+      b = v.to_s.b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+  end
+
+  # @api private
+  # Reads values in the WeaveFFI value-buffer wire format, raising Error on
+  # any malformed buffer.
+  class WvBufferReader
+    def initialize(data)
+      @data = data.to_s.b
+      @pos = 0
+    end
+
+    def take(n, what)
+      raise Error.new(-1, "malformed value buffer: #{what}") if @pos + n > @data.bytesize
+      s = @data.byteslice(@pos, n)
+      @pos += n
+      s
+    end
+
+    def read_bool
+      b = take(1, 'bool').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: bool byte out of range') if b > 1
+      b == 1
+    end
+
+    def read_flag
+      b = take(1, 'option flag').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: option flag out of range') if b > 1
+      b == 1
+    end
+
+    def read_i8
+      take(1, 'i8').unpack1('c')
+    end
+
+    def read_u8
+      take(1, 'u8').unpack1('C')
+    end
+
+    def read_i16
+      take(2, 'i16').unpack1('s<')
+    end
+
+    def read_u16
+      take(2, 'u16').unpack1('S<')
+    end
+
+    def read_i32
+      take(4, 'i32').unpack1('l<')
+    end
+
+    def read_u32
+      take(4, 'u32').unpack1('L<')
+    end
+
+    def read_len
+      len = read_u32
+      if len > @data.bytesize - @pos
+        raise Error.new(-1, 'malformed value buffer: length prefix exceeds remaining bytes')
+      end
+      len
+    end
+
+    def read_i64
+      take(8, 'i64').unpack1('q<')
+    end
+
+    def read_u64
+      take(8, 'u64').unpack1('Q<')
+    end
+
+    def read_f32
+      take(4, 'f32').unpack1('e')
+    end
+
+    def read_f64
+      take(8, 'f64').unpack1('E')
+    end
+
+    def read_string
+      s = take(read_len, 'string bytes').force_encoding(Encoding::UTF_8)
+      raise Error.new(-1, 'malformed value buffer: string is not valid UTF-8') unless s.valid_encoding?
+      s
+    end
+
+    def read_bytes
+      take(read_len, 'byte buffer')
+    end
+
+    def expect_end!
+      return if @pos == @data.bytesize
+      raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
@@ -63,49 +235,42 @@ module WeaveFFI
 
   # === Module: shared ===
 
-  attach_function :weaveffi_shared_Token_destroy, [:pointer], :void
-  attach_function :weaveffi_shared_Token_get_id, [:pointer], :int64
-  attach_function :weaveffi_shared_Token_get_label, [:pointer], :pointer
-  # Trivial cross-module helper
-  attach_function :weaveffi_shared_ping, [:pointer], :pointer
-
-  class TokenPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_shared_Token_destroy(ptr)
-    end
-  end
-
   # A reusable token referenced across modules
   class Token
-    attr_reader :handle
+    attr_reader :id
 
-    def initialize(handle)
-      @handle = TokenPtr.new(handle)
+    attr_reader :label
+
+    def initialize(id:, label:)
+      @id = id
+      @label = label
     end
 
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def id
-      result = WeaveFFI.weaveffi_shared_Token_get_id(@handle)
-      result
-    end
-
-    def label
-      result = WeaveFFI.weaveffi_shared_Token_get_label(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Token)
+      return false unless id == other.id
+      return false unless label == other.label
+      true
     end
   end
+
+  # @api private
+  # Packs a Token into the value-buffer wire format.
+  def self._wv_write_token(w, v)
+    w.write_i64(v.id)
+    w.write_string(v.label)
+  end
+
+  # @api private
+  # Unpacks a Token from the value-buffer wire format.
+  def self._wv_read_token(r)
+    _wv_id = r.read_i64
+    _wv_label = r.read_string
+    Token.new(id: _wv_id, label: _wv_label)
+  end
+  # Trivial cross-module helper
+  attach_function :weaveffi_shared_ping, [:pointer], :pointer
 
   # Trivial cross-module helper
   def self.ping()
@@ -147,9 +312,10 @@ module WeaveFFI
     2 => KitchenErrorsError::InvalidInput,
   }.freeze
 
-  # Builds the KitchenErrorsError subclass matching `code`, or a generic Error
-  # for codes outside the domain (panics, marshalling).
-  def self.kitchen_errors_error_from(code, message)
+  # Builds the KitchenErrorsError subclass matching `code`, decoding any payload
+  # fields the code declares, or a generic Error for codes outside
+  # the domain (panics, marshalling).
+  def self.kitchen_errors_error_from(code, message, payload = nil)
     cls = KITCHEN_ERRORS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
     message.empty? ? cls.new : cls.new(message)
@@ -161,8 +327,10 @@ module WeaveFFI
     code = err[:code]
     msg_ptr = err[:message]
     msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    payload_ptr = err[:payload_ptr]
+    payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
-    raise kitchen_errors_error_from(code, msg)
+    raise kitchen_errors_error_from(code, msg, payload)
   end
 
   # Task priority levels
@@ -175,26 +343,130 @@ module WeaveFFI
     HIGH = 2
   end
 
-  attach_function :weaveffi_kitchen_Item_destroy, [:pointer], :void
-  attach_function :weaveffi_kitchen_Item_create, [:int64, :string, :int32, :int32, :double, :uint32, :pointer, :size_t, :pointer, :size_t, :pointer, :pointer, :size_t, :pointer, :pointer, :int32, :pointer], :pointer
-  # Stable identifier
-  attach_function :weaveffi_kitchen_Item_get_id, [:pointer], :int64
-  # Display name
-  attach_function :weaveffi_kitchen_Item_get_name, [:pointer], :pointer
-  # Initial count
-  attach_function :weaveffi_kitchen_Item_get_count, [:pointer], :int32
-  # Whether the item is enabled
-  attach_function :weaveffi_kitchen_Item_get_enabled, [:pointer], :int32
-  # Scaling ratio
-  attach_function :weaveffi_kitchen_Item_get_ratio, [:pointer], :double
-  attach_function :weaveffi_kitchen_Item_get_nick, [:pointer], :uint32
-  attach_function :weaveffi_kitchen_Item_get_payload, [:pointer, :pointer], :pointer
-  attach_function :weaveffi_kitchen_Item_get_tags, [:pointer, :pointer], :pointer
-  attach_function :weaveffi_kitchen_Item_get_attrs, [:pointer, :pointer, :pointer, :pointer], :void
-  attach_function :weaveffi_kitchen_Item_get_parent, [:pointer], :pointer
-  # Cross-module struct reference
-  attach_function :weaveffi_kitchen_Item_get_token, [:pointer], :pointer
-  attach_function :weaveffi_kitchen_Item_get_priority, [:pointer], :int32
+  # Kitchen sink struct exercising every field feature
+  class Item
+    # Stable identifier
+    attr_reader :id
+
+    # Display name
+    attr_reader :name
+
+    # Initial count
+    attr_reader :count
+
+    # Whether the item is enabled
+    attr_reader :enabled
+
+    # Scaling ratio
+    attr_reader :ratio
+
+    attr_reader :nick
+
+    attr_reader :payload
+
+    attr_reader :tags
+
+    attr_reader :attrs
+
+    attr_reader :parent
+
+    # Cross-module struct reference
+    attr_reader :token
+
+    attr_reader :priority
+
+    def initialize(id:, name:, count:, enabled:, ratio:, nick:, payload:, tags:, attrs:, parent:, token:, priority:)
+      @id = id
+      @name = name
+      @count = count
+      @enabled = enabled
+      @ratio = ratio
+      @nick = nick
+      @payload = payload
+      @tags = tags
+      @attrs = attrs
+      @parent = parent
+      @token = token
+      @priority = priority
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Item)
+      return false unless id == other.id
+      return false unless name == other.name
+      return false unless count == other.count
+      return false unless enabled == other.enabled
+      return false unless ratio == other.ratio
+      return false unless nick == other.nick
+      return false unless payload == other.payload
+      return false unless tags == other.tags
+      return false unless attrs == other.attrs
+      return false unless parent == other.parent
+      return false unless token == other.token
+      return false unless priority == other.priority
+      true
+    end
+  end
+
+  # @api private
+  # Packs a Item into the value-buffer wire format.
+  def self._wv_write_item(w, v)
+    w.write_i64(v.id)
+    w.write_string(v.name)
+    w.write_i32(v.count)
+    w.write_bool(v.enabled)
+    w.write_f64(v.ratio)
+    w.write_u32(v.nick)
+    w.write_bytes(v.payload)
+    w.write_len(v.tags.length)
+    v.tags.each do |_wv_e0|
+      w.write_string(_wv_e0)
+    end
+    w.write_len(v.attrs.length)
+    v.attrs.each do |_wv_k0, _wv_v0|
+      w.write_string(_wv_k0)
+      w.write_string(_wv_v0)
+    end
+    if v.parent.nil?
+      w.write_flag(false)
+    else
+      w.write_flag(true)
+      w.write_i64(v.parent)
+    end
+    _wv_write_token(w, v.token)
+    w.write_i32(v.priority)
+  end
+
+  # @api private
+  # Unpacks a Item from the value-buffer wire format.
+  def self._wv_read_item(r)
+    _wv_id = r.read_i64
+    _wv_name = r.read_string
+    _wv_count = r.read_i32
+    _wv_enabled = r.read_bool
+    _wv_ratio = r.read_f64
+    _wv_nick = r.read_u32
+    _wv_payload = r.read_bytes
+    _wv_tags = Array.new(r.read_len) do
+      _wv_e0 = r.read_string
+      _wv_e0
+    end
+    _wv_attrs = {}
+    r.read_len.times do
+      _wv_k0 = r.read_string
+      _wv_v0 = r.read_string
+      _wv_attrs[_wv_k0] = _wv_v0
+    end
+    if r.read_flag
+      _wv_parent = r.read_i64
+    else
+      _wv_parent = nil
+    end
+    _wv_token = _wv_read_token(r)
+    _wv_priority = r.read_i32
+    Item.new(id: _wv_id, name: _wv_name, count: _wv_count, enabled: _wv_enabled, ratio: _wv_ratio, nick: _wv_nick, payload: _wv_payload, tags: _wv_tags, attrs: _wv_attrs, parent: _wv_parent, token: _wv_token, priority: _wv_priority)
+  end
 
   attach_function :weaveffi_kitchen_Gadget_destroy, [:pointer], :void
   # Create a gadget with the given id
@@ -226,17 +498,17 @@ module WeaveFFI
   # Returns a typed handle
   attach_function :weaveffi_kitchen_open_typed_handle, [:pointer], :pointer
   # Optional struct return
-  attach_function :weaveffi_kitchen_maybe_item, [:int64, :pointer], :pointer
+  attach_function :weaveffi_kitchen_maybe_item, [:int64, :pointer, :pointer], :pointer
   # List of structs
   attach_function :weaveffi_kitchen_list_items, [:pointer, :pointer], :pointer
   # Map return type
-  attach_function :weaveffi_kitchen_get_attrs, [:pointer, :pointer, :pointer, :pointer], :void
+  attach_function :weaveffi_kitchen_get_attrs, [:pointer, :pointer], :pointer
   # Iterator return type
   attach_function :weaveffi_kitchen_stream_items, [:pointer], :pointer
-  attach_function :weaveffi_kitchen_StreamItemsIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_kitchen_StreamItemsIterator_next, [:pointer, :pointer, :pointer, :pointer], :int32
   attach_function :weaveffi_kitchen_StreamItemsIterator_destroy, [:pointer], :void
   # Returns the shared Token type from another module
-  attach_function :weaveffi_kitchen_cross_module_token, [:pointer], :pointer
+  attach_function :weaveffi_kitchen_cross_module_token, [:pointer, :pointer], :pointer
   # Async operation
   callback :weaveffi_kitchen_do_async_callback, [:pointer, :pointer, :pointer], :void
   attach_function :weaveffi_kitchen_do_async_async, [:string, :weaveffi_kitchen_do_async_callback, :pointer], :void
@@ -247,248 +519,6 @@ module WeaveFFI
   attach_function :weaveffi_kitchen_legacy_op, [:pointer], :int32
   # Replacement for legacy_op
   attach_function :weaveffi_kitchen_new_op, [:pointer], :int32
-
-  class ItemPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_kitchen_Item_destroy(ptr)
-    end
-  end
-
-  # Kitchen sink struct exercising every field feature
-  class Item
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = ItemPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    # Stable identifier
-    def id
-      result = WeaveFFI.weaveffi_kitchen_Item_get_id(@handle)
-      result
-    end
-
-    # Display name
-    def name
-      result = WeaveFFI.weaveffi_kitchen_Item_get_name(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    # Initial count
-    def count
-      result = WeaveFFI.weaveffi_kitchen_Item_get_count(@handle)
-      result
-    end
-
-    # Whether the item is enabled
-    def enabled
-      result = WeaveFFI.weaveffi_kitchen_Item_get_enabled(@handle)
-      result != 0
-    end
-
-    # Scaling ratio
-    def ratio
-      result = WeaveFFI.weaveffi_kitchen_Item_get_ratio(@handle)
-      result
-    end
-
-    def nick
-      result = WeaveFFI.weaveffi_kitchen_Item_get_nick(@handle)
-      result
-    end
-
-    def payload
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_kitchen_Item_get_payload(@handle, out_len)
-      return ''.b if result.null?
-      len = out_len.read(:size_t)
-      data = result.read_string(len)
-      WeaveFFI.weaveffi_free_bytes(result, len)
-      data
-    end
-
-    def tags
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_kitchen_Item_get_tags(@handle, out_len)
-      return [] if result.null?
-      len = out_len.read(:size_t)
-      ptrs = result.read_array_of_pointer(len)
-      items = ptrs.map { |p| p.null? ? '' : p.read_string }
-      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-      items
-    end
-
-    def attrs
-      out_keys = FFI::MemoryPointer.new(:pointer)
-      out_values = FFI::MemoryPointer.new(:pointer)
-      out_len = FFI::MemoryPointer.new(:size_t)
-      WeaveFFI.weaveffi_kitchen_Item_get_attrs(@handle, out_keys, out_values, out_len)
-      len = out_len.read(:size_t)
-      keys_ptr = out_keys.read_pointer
-      vals_ptr = out_values.read_pointer
-      return {} if keys_ptr.null? || vals_ptr.null?
-      keys = keys_ptr.read_array_of_pointer(len)
-      vals = vals_ptr.read_array_of_pointer(len)
-      hash = keys.zip(vals).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v.null? ? '' : v.read_string }
-      keys.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      vals.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      WeaveFFI.weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))
-      WeaveFFI.weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:pointer))
-      hash
-    end
-
-    def parent
-      result = WeaveFFI.weaveffi_kitchen_Item_get_parent(@handle)
-      return nil if result.null?
-      value = result.read_int64
-      WeaveFFI.weaveffi_free_bytes(result, FFI.type_size(:int64))
-      value
-    end
-
-    # Cross-module struct reference
-    def token
-      result = WeaveFFI.weaveffi_kitchen_Item_get_token(@handle)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Token.new(result)
-    end
-
-    def priority
-      result = WeaveFFI.weaveffi_kitchen_Item_get_priority(@handle)
-      result
-    end
-  end
-
-  # Kitchen sink struct exercising every field feature
-  class ItemBuilder
-    def initialize
-      @id = 0
-      @name = ""
-      @count = 0
-      @enabled = false
-      @ratio = 0.0
-      @nick = 0
-      @payload = "".b
-      @tags = []
-      @attrs = {}
-      @parent = nil
-      @token = nil
-      @priority = 0
-    end
-
-    # Stable identifier
-    def with_id(value)
-      @id = value
-      self
-    end
-
-    # Display name
-    def with_name(value)
-      @name = value
-      self
-    end
-
-    # Initial count
-    def with_count(value)
-      @count = value
-      self
-    end
-
-    # Whether the item is enabled
-    def with_enabled(value)
-      @enabled = value
-      self
-    end
-
-    # Scaling ratio
-    def with_ratio(value)
-      @ratio = value
-      self
-    end
-
-    def with_nick(value)
-      @nick = value
-      self
-    end
-
-    def with_payload(value)
-      @payload = value
-      self
-    end
-
-    def with_tags(value)
-      @tags = value
-      self
-    end
-
-    def with_attrs(value)
-      @attrs = value
-      self
-    end
-
-    def with_parent(value)
-      @parent = value
-      self
-    end
-
-    # Cross-module struct reference
-    def with_token(value)
-      @token = value
-      self
-    end
-
-    def with_priority(value)
-      @priority = value
-      self
-    end
-
-    def build
-      err = WeaveFFI::ErrorStruct.new
-      id = @id
-      name = @name
-      count = @count
-      enabled = @enabled
-      enabled_c = enabled ? 1 : 0
-      ratio = @ratio
-      nick = @nick
-      payload = @payload
-      payload_buf = FFI::MemoryPointer.new(:uint8, payload.bytesize)
-      payload_buf.put_bytes(0, payload)
-      tags = @tags
-      tags_buf = FFI::MemoryPointer.new(:pointer, tags.length)
-      tags_ptrs = tags.map { |s| FFI::MemoryPointer.from_string(s) }
-      tags_buf.write_array_of_pointer(tags_ptrs)
-      attrs = @attrs
-      attrs_k = attrs.keys
-      attrs_v = attrs.values
-      attrs_keys_buf = FFI::MemoryPointer.new(:pointer, attrs_k.length)
-      attrs_vals_buf = FFI::MemoryPointer.new(:pointer, attrs_v.length)
-      attrs_keys_ptrs = attrs_k.map { |s| FFI::MemoryPointer.from_string(s) }
-      attrs_keys_buf.write_array_of_pointer(attrs_keys_ptrs)
-      attrs_vals_ptrs = attrs_v.map { |s| FFI::MemoryPointer.from_string(s) }
-      attrs_vals_buf.write_array_of_pointer(attrs_vals_ptrs)
-      parent = @parent
-      parent_c = parent.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(parent); p; end
-      token = @token
-      priority = @priority
-      result = WeaveFFI.weaveffi_kitchen_Item_create(id, name, count, enabled_c, ratio, nick, payload_buf, payload.bytesize, tags_buf, tags.length, attrs_keys_buf, attrs_vals_buf, attrs.length, parent_c, token.handle, priority, err)
-      WeaveFFI.check_error!(err)
-      Item.new(result)
-    end
-  end
 
   class GadgetPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -680,10 +710,20 @@ module WeaveFFI
   # Optional struct return
   def self.maybe_item(id)
     err = ErrorStruct.new
-    result = weaveffi_kitchen_maybe_item(id, err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_kitchen_maybe_item(id, out_len, err)
     check_kitchen_errors_error!(err)
-    return nil if result.null?
-    Item.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    if _wv_r.read_flag
+      _wv_value = _wv_read_item(_wv_r)
+    else
+      _wv_value = nil
+    end
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # List of structs
@@ -692,32 +732,36 @@ module WeaveFFI
     out_len = FFI::MemoryPointer.new(:size_t)
     result = weaveffi_kitchen_list_items(out_len, err)
     check_error!(err)
-    return [] if result.null?
     len = out_len.read(:size_t)
-    items = result.read_array_of_pointer(len).map { |p| Item.new(p) }
-    weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-    items
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = Array.new(_wv_r.read_len) do
+      _wv_e0 = _wv_read_item(_wv_r)
+      _wv_e0
+    end
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # Map return type
   def self.get_attrs()
     err = ErrorStruct.new
-    out_keys = FFI::MemoryPointer.new(:pointer)
-    out_values = FFI::MemoryPointer.new(:pointer)
     out_len = FFI::MemoryPointer.new(:size_t)
-    weaveffi_kitchen_get_attrs(out_keys, out_values, out_len, err)
+    result = weaveffi_kitchen_get_attrs(out_len, err)
     check_error!(err)
     len = out_len.read(:size_t)
-    keys_ptr = out_keys.read_pointer
-    vals_ptr = out_values.read_pointer
-    return {} if keys_ptr.null? || vals_ptr.null?
-    keys = keys_ptr.read_array_of_pointer(len)
-    vals = vals_ptr.read_array_of_int32(len)
-    hash = keys.zip(vals).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v }
-    keys.each { |p| weaveffi_free_string(p) unless p.null? }
-    weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))
-    weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:int32))
-    hash
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = {}
+    _wv_r.read_len.times do
+      _wv_k0 = _wv_r.read_string
+      _wv_v0 = _wv_r.read_i32
+      _wv_value[_wv_k0] = _wv_v0
+    end
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # Iterator return type
@@ -736,12 +780,19 @@ module WeaveFFI
         unless iter.null?
           loop do
             out_item = FFI::MemoryPointer.new(:pointer)
+            out_item_len = FFI::MemoryPointer.new(:size_t)
             item_err = ErrorStruct.new
-            has_item = weaveffi_kitchen_StreamItemsIterator_next(iter, out_item, item_err)
+            has_item = weaveffi_kitchen_StreamItemsIterator_next(iter, out_item, out_item_len, item_err)
             check_error!(item_err)
             break if has_item.zero?
             item_ptr = out_item.read_pointer
-            y << Item.new(item_ptr) unless item_ptr.null?
+            item_len = out_item_len.read(:size_t)
+            _wv_data = item_ptr.null? ? ''.b : item_ptr.read_string(item_len)
+            weaveffi_free_bytes(item_ptr, item_len) unless item_ptr.null?
+            _wv_r = WvBufferReader.new(_wv_data)
+            _wv_item = _wv_read_item(_wv_r)
+            _wv_r.expect_end!
+            y << _wv_item
           end
         end
       ensure
@@ -753,10 +804,16 @@ module WeaveFFI
   # Returns the shared Token type from another module
   def self.cross_module_token()
     err = ErrorStruct.new
-    result = weaveffi_kitchen_cross_module_token(err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_kitchen_cross_module_token(out_len, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Token.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_token(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # Async operation

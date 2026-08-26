@@ -42,26 +42,127 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 private final class ContinuationRef<T, E: Error> {
@@ -99,7 +200,7 @@ public enum DocsErrorsError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapDocs(code: Int32, message: String) -> Error {
+func mapDocs(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return DocsErrorsError.notFound(message: message.isEmpty ? "Document not found" : message)
     case 2: return DocsErrorsError.invalidStatus(message: message.isEmpty ? "Invalid status transition" : message)
@@ -112,8 +213,9 @@ func checkDocs(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapDocs(code: code, message: message)
+        throw mapDocs(code: code, message: message, payload: payload)
     }
 }
 
@@ -132,109 +234,49 @@ public enum Status: UInt32 {
 /// Represents a single document tracked by the system.
 ///
 /// Documents are persisted to disk and exposed via the public API.
-public class Document {
-    let ptr: OpaquePointer
-
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_docs_Document_destroy(ptr)
-    }
-
+public struct Document {
     /// Stable opaque identifier
-    public var id: Int64 {
-        return weaveffi_docs_Document_get_id(ptr)
-    }
-
+    public var id: Int64
     /// Human-readable title shown in lists
-    public var title: String {
-        let raw = weaveffi_docs_Document_get_title(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
-
+    public var title: String
     /// Current lifecycle status
-    public var status: Status {
-        return Status(rawValue: weaveffi_docs_Document_get_status(ptr).rawValue)!
-    }
-
+    public var status: Status
     /// Free-form tags for grouping
-    public var tags: [String] {
-        var outLen: Int = 0
-        let rv = weaveffi_docs_Document_get_tags(ptr, &outLen)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        var items: [String] = []
-        items.reserveCapacity(outLen)
-        for i in 0..<outLen {
-            items.append(String(cString: rv[i]!))
-            weaveffi_free_string(rv[i])
-        }
-        return items
+    public var tags: [String]
+
+    /// Creates a `Document` value.
+    public init(id: Int64, title: String, status: Status, tags: [String]) {
+        self.id = id
+        self.title = title
+        self.status = status
+        self.tags = tags
     }
 }
 
-/// Represents a single document tracked by the system.
-///
-/// Documents are persisted to disk and exposed via the public API.
-public class DocumentBuilder {
-    private var _id: Int64?
-    private var _title: String?
-    private var _status: Status?
-    private var _tags: [String]?
-
-    public init() {}
-
-    /// Stable opaque identifier
-    @discardableResult
-    public func withId(_ value: Int64) -> Self {
-        self._id = value
-        return self
+/// Serializes a `Document` into the value-buffer wire format.
+func wvWriteDocument(_ value: Document, into w: inout WvWriter) {
+    w.writeInt64(value.id)
+    w.writeString(value.title)
+    w.writeInt32(Int32(bitPattern: value.status.rawValue))
+    w.writeLen(value.tags.count)
+    for v0 in value.tags {
+        w.writeString(v0)
     }
+}
 
-    /// Human-readable title shown in lists
-    @discardableResult
-    public func withTitle(_ value: String) -> Self {
-        self._title = value
-        return self
+/// Deserializes a `Document` from the value-buffer wire format.
+func wvReadDocument(_ r: inout WvReader) -> Document {
+    let v1 = r.readInt64()
+    let v2 = r.readString()
+    let v3 = Status(rawValue: UInt32(bitPattern: r.readInt32()))!
+    let n5 = r.readLen()
+    var v4: [String] = []
+    v4.reserveCapacity(n5)
+    for _ in 0..<n5 {
+        let v6 = r.readString()
+        v4.append(v6)
     }
-
-    /// Current lifecycle status
-    @discardableResult
-    public func withStatus(_ value: Status) -> Self {
-        self._status = value
-        return self
-    }
-
-    /// Free-form tags for grouping
-    @discardableResult
-    public func withTags(_ value: [String]) -> Self {
-        self._tags = value
-        return self
-    }
-
-    public func build() throws -> Document {
-        guard let id = _id else { throw WeaveFFIError.error(code: -1, message: "missing field: id") }
-        guard let title = _title else { throw WeaveFFIError.error(code: -1, message: "missing field: title") }
-        guard let status = _status else { throw WeaveFFIError.error(code: -1, message: "missing field: status") }
-        guard let tags = _tags else { throw WeaveFFIError.error(code: -1, message: "missing field: tags") }
-        var err = weaveffi_error(code: 0, message: nil)
-        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
-        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
-        let result: OpaquePointer? = title.withCString { title_ptr in
-            return tags_cstrs.withUnsafeBufferPointer { tags_buf in
-                let tags_ptr = tags_buf.baseAddress
-                let tags_len = tags_buf.count
-                    return weaveffi_docs_Document_create(id, title_ptr, weaveffi_docs_Status(status.rawValue), tags_ptr, tags_len, &err)
-            }
-        }
-        try check(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Document(ptr: result)
-    }
+    return Document(id: v1, title: v2, status: v3, tags: v4)
 }
 
 /// An ordered collection of documents.
@@ -252,7 +294,7 @@ public final class Notebook {
     }
     /// Create an empty notebook
     public init() {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_docs_Notebook_new(&err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null pointer") }
@@ -261,30 +303,42 @@ public final class Notebook {
     /// Add a document, returning its position in the notebook
     /// - Parameter document: The document to add
     public func insert(document: Document) -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_docs_Notebook_insert(ptr, document.ptr, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var documentWriter = WvWriter()
+        wvWriteDocument(document, into: &documentWriter)
+        let rv: Int32 = documentWriter.bytes.withUnsafeBufferPointer { document_buf in
+            let document_ptr = document_buf.baseAddress
+            let document_len = document_buf.count
+            return weaveffi_docs_Notebook_insert(ptr, document_ptr, document_len, &err)
+        }
         trap(&err)
         return rv
     }
     /// Look up a document by identifier, failing when none matches
     /// - Parameter id: Identifier of the document to find
     public func find(id: Int64) throws -> Document {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_docs_Notebook_find(ptr, id, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_docs_Notebook_find(ptr, id, &outLen, &err)
         try checkDocs(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Document(ptr: rv)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadDocument(&rvReader)
+        rvReader.finish()
+        return v0
     }
     /// The number of documents currently held
     public func size() -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_docs_Notebook_size(ptr, &err)
         trap(&err)
         return rv
     }
     /// The largest number of documents one notebook will hold
     public static func maxDocuments() -> Int32 {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_docs_Notebook_max_documents(&err)
         trap(&err)
         return rv
@@ -323,27 +377,47 @@ public enum Docs {
     /// - Parameter title: Human-readable title for the new document
     /// - Parameter tags: Initial set of tags (may be empty)
     public static func createDocument(title: String, tags: [String]) -> Document {
-        var err = weaveffi_error(code: 0, message: nil)
-        let tags_cstrs: [UnsafePointer<CChar>?] = tags.map { UnsafePointer(strdup($0)) }
-        defer { tags_cstrs.forEach { if let s = $0 { free(UnsafeMutablePointer(mutating: s)) } } }
-        let result: OpaquePointer? = title.withCString { title_ptr in
-            return tags_cstrs.withUnsafeBufferPointer { tags_buf in
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var tagsWriter = WvWriter()
+        tagsWriter.writeLen(tags.count)
+        for v0 in tags {
+            tagsWriter.writeString(v0)
+        }
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = title.withCString { title_ptr in
+            return tagsWriter.bytes.withUnsafeBufferPointer { tags_buf in
                 let tags_ptr = tags_buf.baseAddress
                 let tags_len = tags_buf.count
-                    return weaveffi_docs_create_document(title_ptr, tags_ptr, tags_len, &err)
+                return weaveffi_docs_create_document(title_ptr, tags_ptr, tags_len, &outLen, &err)
             }
         }
         trap(&err)
-        guard let result = result else { fatalError("-1: null pointer") }
-        return Document(ptr: result)
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v1 = wvReadDocument(&rvReader)
+        rvReader.finish()
+        return v1
     }
     /// Look up a document by identifier
     /// - Parameter id: Identifier returned from create_document
     public static func getDocument(id: Int64) -> Document? {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_docs_get_document(id, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_docs_get_document(id, &outLen, &err)
         trap(&err)
-        return rv.map { Document(ptr: $0) }
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        var v0: Document? = nil
+        if rvReader.readOptionFlag() {
+            let v1 = wvReadDocument(&rvReader)
+            v0 = v1
+        }
+        rvReader.finish()
+        return v0
     }
     /// Publish a document in the background
     /// - Parameter id: Identifier of the document to publish

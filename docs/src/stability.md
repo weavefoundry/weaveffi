@@ -52,6 +52,15 @@ contract." Things that have already changed during 0.x:
   with constructors, methods, and statics) and per-function typed errors
   (`throws:`), and made bare type names unique across the whole API. The
   samples' handle-based resource surfaces were rewritten as interfaces.
+- Schema `0.6.0` moved records, rich enums, optionals, lists, and maps to
+  by-value crossing as serialized value buffers (one
+  `(const uint8_t*, size_t)` pair per value; see the
+  [Value Buffer Protocol](reference/value-buffers.md)), replacing opaque
+  record pointers, per-type create/destroy/getter symbols, and parallel-array
+  maps. Nested composites became fully supported. The struct `builder:` flag
+  and the `#[weaveffi::builder]` attribute were removed. Error codes gained
+  structured payload `fields:`, and `weaveffi_error` gained
+  `payload_ptr`/`payload_len` slots.
 - The `Generator` trait gained `generate_with_config` in `0.3.0`, then
   was reworked in `0.5.0` into an associated `Config` type (with an
   object-safe `DynGenerator` view) that replaced the
@@ -94,7 +103,7 @@ tied to `weaveffi-ir`'s minor version: each `weaveffi-ir` minor bump
 corresponds to at most one schema version bump.
 [`CURRENT_SCHEMA_VERSION`](https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs)
 in `crates/weaveffi-ir/src/ir.rs` is the source of truth; the current
-schema version is `0.5.0`.
+schema version is `0.6.0`.
 
 Pre-1.0, **only the current schema version is accepted**
 (`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`), so a

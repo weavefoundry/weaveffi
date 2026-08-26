@@ -9,12 +9,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Handles   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent)
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
-//   Optionals -> null handle / null pointer (0); scalars boxed by pointer
+//   Buffered  -> records, rich enums, optionals, lists, and maps cross
+//                as one value buffer: i32 pointer + i32 length
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
  * thrown directly for unknown codes, marshalling failures, and producer
@@ -58,23 +59,11 @@ function _takeCStr(wasm, ptr) {
   return s;
 }
 
-// Decode an array of `len` C strings at `base`, freeing each string
-// after copying (the consumer owns the elements); the caller releases
-// the array container separately.
-function _takeStrArray(wasm, base, len) {
-  const out = [];
-  if (base === 0) return out;
-  const dv = new DataView(wasm.memory.buffer);
-  const ptrs = [];
-  for (let i = 0; i < len; i++) ptrs.push(dv.getUint32(base + i * 4, true));
-  for (const p of ptrs) out.push(_takeCStr(wasm, p));
-  return out;
-}
-
-// Allocate a zeroed {i32 code, i32 message} error slot.
+// Allocate a zeroed 16-byte error slot:
+// { i32 code, char* message, uint8_t* payload_ptr, size_t payload_len }.
 function _allocErr(wasm) {
-  const ptr = wasm.weaveffi_alloc(8);
-  new Uint8Array(wasm.memory.buffer, ptr, 8).fill(0);
+  const ptr = wasm.weaveffi_alloc(16);
+  new Uint8Array(wasm.memory.buffer, ptr, 16).fill(0);
   return ptr;
 }
 
@@ -89,14 +78,14 @@ function _checkErr(wasm, errPtr) {
     const msgPtr = dv.getUint32(errPtr + 4, true);
     const msg = _readCStr(wasm, msgPtr) || '';
     wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 8);
+    wasm.weaveffi_dealloc(errPtr, 16);
     throw new WeaveFFIError(code, msg);
   }
 }
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
-  wasm.weaveffi_dealloc(errPtr, 8);
+  wasm.weaveffi_dealloc(errPtr, 16);
 }
 
 // Lazy wrapper over a producer iterator handle, implementing the JS
@@ -109,22 +98,22 @@ function _freeErr(wasm, errPtr) {
 // producer handle: JS has no finalization hook that is reliable across
 // every target this loader supports.
 class _WeaveFFIIterator {
-  constructor(wasm, handle, stride, callNext, destroy, check, decode) {
+  constructor(wasm, handle, slotSize, callNext, destroy, check, decode) {
     this._wasm = wasm;
     this._handle = handle;
-    this._stride = stride;
+    this._slotSize = slotSize;
     this._callNext = callNext;
     this._destroyFn = destroy;
     this._check = check;
     this._decode = decode;
-    this._slot = wasm.weaveffi_alloc(stride);
+    this._slot = wasm.weaveffi_alloc(slotSize);
   }
   // Destroy the handle and release the element slot exactly once.
   _close() {
     if (this._handle === 0) return;
     this._destroyFn(this._handle);
     this._handle = 0;
-    this._wasm.weaveffi_dealloc(this._slot, this._stride);
+    this._wasm.weaveffi_dealloc(this._slot, this._slotSize);
     this._slot = 0;
   }
   next() {
@@ -181,9 +170,8 @@ function _registerTrampoline(table, paramTypes, handler) {
  * // Primitive: plain numbers in, number out.
  * const sum = api.math.add(1, 2);
  *
- * // Struct: returns a wrapper instance exposing field getters.
- * const person = api.contacts.create();
- * console.log(person.name);
+ * // Record: plain objects in and out (serialized automatically).
+ * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant

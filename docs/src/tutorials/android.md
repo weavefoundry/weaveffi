@@ -24,7 +24,7 @@ emulator or a physical device.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: greeter
     errors:
@@ -124,7 +124,7 @@ abi::export_runtime!();
 ```
 
 Use `scaffold.rs` for the rest of the API (`weaveffi_greeter_greeting`,
-the `Greeting` lifecycle, getters, ...).
+which returns the `Greeting` record as a serialized value buffer).
 
 ### 4. Configure the NDK toolchain
 
@@ -212,9 +212,8 @@ class MainActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.textView).text = WeaveFFI.hello("Android")
 
         try {
-            WeaveFFI.greeting("Hi", "en").use { g ->
-                println("${g.message} (${g.lang})")
-            }
+            val g = WeaveFFI.greeting("Hi", "en")
+            println("${g.message} (${g.lang})")
         } catch (e: GreeterException) {
             println("greeting failed: ${e.message}")
         }
@@ -231,8 +230,8 @@ lazily and exposes:
   subclasses (a sealed class extending `WeaveFFIException`, one
   nested class per error code) on failure.
 
-`Greeting` implements `Closeable`; either call `.close()` or use
-`use { ... }` for deterministic cleanup.
+`Greeting` is a plain Kotlin data class decoded from the value buffer
+the C ABI returns; there's nothing to close.
 
 ## Verification
 

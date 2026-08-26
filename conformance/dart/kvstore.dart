@@ -4,14 +4,15 @@
 // (fallible `Store.open` named factory, instance methods passing the object
 // pointer, the `defaultCapacity` static, the deprecated `legacyPut`), the
 // typed KvException hierarchy (KeyNotFoundException = 1001,
-// IoException = 1004) thrown by throwing members, optional struct returns
-// (`Entry?`) with bytes / optional-scalar / list / map getters, the fluent
-// EntryBuilder (list + map *input* marshalling), the iterator-backed
-// `listKeys` method, the cross-module `getStats` (parameter typed as the
-// parent module's Store), the NativeCallable.isolateLocal eviction listener
-// (register -> fire synchronously on delete -> unregister), and the
-// Future-returning `compact` settled through a NativeCallable.listener from
-// the producer's worker thread. Throws (non-zero exit) on any mismatch.
+// IoException = 1004) thrown by throwing members, optional record returns
+// (`Entry?`) decoded from value buffers with bytes / optional-scalar / list /
+// map fields, the plain-value Entry class (list + map field construction),
+// the iterator-backed `listKeys` method, the cross-module `getStats`
+// (parameter typed as the parent module's Store), the
+// NativeCallable.isolateLocal eviction listener (register -> fire
+// synchronously on delete -> unregister), and the Future-returning `compact`
+// settled through a NativeCallable.listener from the producer's worker
+// thread. Throws (non-zero exit) on any mismatch.
 
 import 'package:__PKG__/__LIB__.dart' as wv;
 
@@ -50,20 +51,20 @@ Future<void> main() async {
   expect(filtered.length == 1 && filtered[0] == 'alpha',
       'listKeys prefix filter');
 
-  // Optional struct return + getters over every complex field type.
+  // Optional record return: the `Entry?` buffer decodes into a plain value
+  // class covering every complex field type.
   final alpha = store.get('alpha')!;
   expect(alpha.id > 0, 'entry id positive');
   expect(alpha.key == 'alpha', 'entry key');
   final value = alpha.value;
   expect(value.length == 3 && value[0] == 1 && value[2] == 3, 'entry value');
+  expect(alpha.createdAt > 0, 'entry createdAt positive');
   expect(alpha.expiresAt == null, 'entry expiresAt null');
   expect(alpha.tags.isEmpty, 'entry tags empty');
   expect(alpha.metadata.isEmpty, 'entry metadata empty');
-  alpha.dispose();
 
   final beta = store.get('beta')!;
   expect(beta.expiresAt != null && beta.expiresAt! > 0, 'beta expiresAt set');
-  beta.dispose();
 
   // Typed error: a missing key throws the KeyNotFoundException class of the
   // KvException domain, carrying its stable code.
@@ -79,16 +80,17 @@ Future<void> main() async {
   expect(store.legacyPut('legacy', payload), 'legacy put');
   expect(store.delete('legacy'), 'delete legacy');
 
-  // Builder input marshaling: scalars, bytes, optional, list, and map.
-  final entry = wv.EntryBuilder()
-      .withId(7)
-      .withKey('built')
-      .withValue(payload)
-      .withCreatedAt(1000)
-      .withExpiresAt(null)
-      .withTags(<String>['hot', 'fast'])
-      .withMetadata(<String, String>{'source': 'test', 'env': 'prod'})
-      .build();
+  // Record construction: scalars, bytes, optional, list, and map fields on
+  // the plain-value Entry class.
+  final entry = wv.Entry(
+    id: 7,
+    key: 'built',
+    value: payload,
+    createdAt: 1000,
+    expiresAt: null,
+    tags: <String>['hot', 'fast'],
+    metadata: <String, String>{'source': 'test', 'env': 'prod'},
+  );
   expect(entry.id == 7, 'entry id == 7');
   expect(entry.expiresAt == null, 'entry expiresAt null');
   final tags = entry.tags..sort();
@@ -97,28 +99,25 @@ Future<void> main() async {
   final md = entry.metadata;
   expect(md.length == 2 && md['source'] == 'test' && md['env'] == 'prod',
       'entry metadata');
-  entry.dispose();
 
-  // Empty list/map round-trip as zero-length.
-  final empty = wv.EntryBuilder()
-      .withId(8)
-      .withKey('k')
-      .withValue(payload)
-      .withCreatedAt(1000)
-      .withExpiresAt(null)
-      .withTags(<String>[])
-      .withMetadata(<String, String>{})
-      .build();
+  // Empty list/map fields hold as zero-length.
+  final empty = wv.Entry(
+    id: 8,
+    key: 'k',
+    value: payload,
+    createdAt: 1000,
+    expiresAt: null,
+    tags: <String>[],
+    metadata: <String, String>{},
+  );
   expect(empty.metadata.isEmpty, 'empty metadata');
   expect(empty.tags.isEmpty, 'empty tags');
-  empty.dispose();
 
   // Cross-module call: getStats lives in kv.stats and takes the parent
   // module's Store interface as a parameter.
   final st = wv.getStats(store);
   expect(st.totalEntries == 2, 'stats total entries == 2');
   expect(st.expiredEntries == 0, 'stats expired entries == 0');
-  st.dispose();
 
   // Eviction listener: delete fires the isolate-local NativeCallable
   // synchronously on the calling thread.

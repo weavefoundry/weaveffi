@@ -7,8 +7,11 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io' show Platform;
+import 'dart:typed_data';
+
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -28,6 +31,9 @@ final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
+  external Pointer<Uint8> payloadPtr;
+  @Size()
+  external int payloadLen;
 }
 
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
@@ -63,216 +69,328 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
-/// An algebraic shape (sum type with associated data)
-enum ShapeTag {
-  /// The empty shape (a unit variant)
-  empty(0),
-  /// A circle with a radius
-  circle(1),
-  /// An axis-aligned rectangle
-  rectangle(2),
-  /// An integer-bounded shape (exercises narrow + wide ints)
-  bounded(3),
-  /// A labeled shape with a small count
-  labeled(4),
-  ;
-  const ShapeTag(this.value);
-  final int value;
+// ── WeaveFFI value-buffer runtime ──
+// Records, rich enums, optionals, lists, maps, and error payloads cross the
+// C ABI serialized in this little-endian, packed format. A malformed buffer
+// is a producer/consumer contract violation, never a typed domain error.
 
-  static ShapeTag fromValue(int value) =>
-      ShapeTag.values.firstWhere((e) => e.value == value);
+Never _bufferError(String context) =>
+    throw StateError('malformed WeaveFFI value buffer: $context');
+
+// Copies a borrowed native (ptr, len) buffer into Dart-owned memory.
+Uint8List _copyNativeBytes(Pointer<Uint8> ptr, int len) =>
+    ptr == nullptr ? Uint8List(0) : Uint8List.fromList(ptr.asTypedList(len));
+
+// Stages an encoding into native memory for a borrowed (ptr, len) argument;
+// the caller frees the pointer after the call returns.
+Pointer<Uint8> _stageBytes(Uint8List bytes) {
+  final ptr = calloc<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+  if (bytes.isNotEmpty) ptr.asTypedList(bytes.length).setAll(0, bytes);
+  return ptr;
 }
 
-typedef _NativeWeaveffiShapesShapeDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeDestroy = void Function(Pointer<Void>);
-final _weaveffiShapesShapeDestroy = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeDestroy, _DartWeaveffiShapesShapeDestroy>('weaveffi_shapes_Shape_destroy');
+final class _BufferWriter {
+  Uint8List _buf = Uint8List(64);
+  ByteData? _view;
+  int _len = 0;
 
-typedef _NativeWeaveffiShapesShapeTag = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeTag = int Function(Pointer<Void>);
-final _weaveffiShapesShapeTag = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeTag, _DartWeaveffiShapesShapeTag>('weaveffi_shapes_Shape_tag');
+  ByteData get _data => _view ??= ByteData.sublistView(_buf);
 
-typedef _NativeWeaveffiShapesShapeEmptyNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesShapeEmptyNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
-final _weaveffiShapesShapeEmptyNew = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeEmptyNew, _DartWeaveffiShapesShapeEmptyNew>('weaveffi_shapes_Shape_Empty_new');
+  void _ensure(int extra) {
+    if (_len + extra <= _buf.length) return;
+    var cap = _buf.length * 2;
+    while (cap < _len + extra) {
+      cap *= 2;
+    }
+    final next = Uint8List(cap);
+    next.setRange(0, _len, _buf);
+    _buf = next;
+    _view = null;
+  }
 
-typedef _NativeWeaveffiShapesShapeCircleNew = Pointer<Void> Function(Double, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesShapeCircleNew = Pointer<Void> Function(double, Pointer<_WeaveFFIError>);
-final _weaveffiShapesShapeCircleNew = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeCircleNew, _DartWeaveffiShapesShapeCircleNew>('weaveffi_shapes_Shape_Circle_new');
+  Uint8List takeBytes() => Uint8List.sublistView(_buf, 0, _len);
 
-typedef _NativeWeaveffiShapesShapeRectangleNew = Pointer<Void> Function(Float, Float, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesShapeRectangleNew = Pointer<Void> Function(double, double, Pointer<_WeaveFFIError>);
-final _weaveffiShapesShapeRectangleNew = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeRectangleNew, _DartWeaveffiShapesShapeRectangleNew>('weaveffi_shapes_Shape_Rectangle_new');
+  void writeBool(bool v) => writeUint8(v ? 1 : 0);
 
-typedef _NativeWeaveffiShapesShapeBoundedNew = Pointer<Void> Function(Int16, Int16, Uint64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesShapeBoundedNew = Pointer<Void> Function(int, int, int, Pointer<_WeaveFFIError>);
-final _weaveffiShapesShapeBoundedNew = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeBoundedNew, _DartWeaveffiShapesShapeBoundedNew>('weaveffi_shapes_Shape_Bounded_new');
+  void writeOptionFlag(bool present) => writeUint8(present ? 1 : 0);
 
-typedef _NativeWeaveffiShapesShapeLabeledNew = Pointer<Void> Function(Pointer<Utf8>, Uint8, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesShapeLabeledNew = Pointer<Void> Function(Pointer<Utf8>, int, Pointer<_WeaveFFIError>);
-final _weaveffiShapesShapeLabeledNew = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeLabeledNew, _DartWeaveffiShapesShapeLabeledNew>('weaveffi_shapes_Shape_Labeled_new');
+  void writeInt8(int v) {
+    _ensure(1);
+    _data.setInt8(_len, v);
+    _len += 1;
+  }
 
-typedef _NativeWeaveffiShapesShapeCircleGetRadius = Double Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeCircleGetRadius = double Function(Pointer<Void>);
-final _weaveffiShapesShapeCircleGetRadius = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeCircleGetRadius, _DartWeaveffiShapesShapeCircleGetRadius>('weaveffi_shapes_Shape_Circle_get_radius');
+  void writeUint8(int v) {
+    _ensure(1);
+    _data.setUint8(_len, v);
+    _len += 1;
+  }
 
-typedef _NativeWeaveffiShapesShapeRectangleGetWidth = Float Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeRectangleGetWidth = double Function(Pointer<Void>);
-final _weaveffiShapesShapeRectangleGetWidth = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeRectangleGetWidth, _DartWeaveffiShapesShapeRectangleGetWidth>('weaveffi_shapes_Shape_Rectangle_get_width');
+  void writeInt16(int v) {
+    _ensure(2);
+    _data.setInt16(_len, v, Endian.little);
+    _len += 2;
+  }
 
-typedef _NativeWeaveffiShapesShapeRectangleGetHeight = Float Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeRectangleGetHeight = double Function(Pointer<Void>);
-final _weaveffiShapesShapeRectangleGetHeight = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeRectangleGetHeight, _DartWeaveffiShapesShapeRectangleGetHeight>('weaveffi_shapes_Shape_Rectangle_get_height');
+  void writeUint16(int v) {
+    _ensure(2);
+    _data.setUint16(_len, v, Endian.little);
+    _len += 2;
+  }
 
-typedef _NativeWeaveffiShapesShapeBoundedGetMin = Int16 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeBoundedGetMin = int Function(Pointer<Void>);
-final _weaveffiShapesShapeBoundedGetMin = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeBoundedGetMin, _DartWeaveffiShapesShapeBoundedGetMin>('weaveffi_shapes_Shape_Bounded_get_min');
+  void writeInt32(int v) {
+    _ensure(4);
+    _data.setInt32(_len, v, Endian.little);
+    _len += 4;
+  }
 
-typedef _NativeWeaveffiShapesShapeBoundedGetMax = Int16 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeBoundedGetMax = int Function(Pointer<Void>);
-final _weaveffiShapesShapeBoundedGetMax = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeBoundedGetMax, _DartWeaveffiShapesShapeBoundedGetMax>('weaveffi_shapes_Shape_Bounded_get_max');
+  void writeUint32(int v) {
+    _ensure(4);
+    _data.setUint32(_len, v, Endian.little);
+    _len += 4;
+  }
 
-typedef _NativeWeaveffiShapesShapeBoundedGetWeight = Uint64 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeBoundedGetWeight = int Function(Pointer<Void>);
-final _weaveffiShapesShapeBoundedGetWeight = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeBoundedGetWeight, _DartWeaveffiShapesShapeBoundedGetWeight>('weaveffi_shapes_Shape_Bounded_get_weight');
+  void writeInt64(int v) {
+    _ensure(8);
+    _data.setInt64(_len, v, Endian.little);
+    _len += 8;
+  }
 
-typedef _NativeWeaveffiShapesShapeLabeledGetLabel = Pointer<Utf8> Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeLabeledGetLabel = Pointer<Utf8> Function(Pointer<Void>);
-final _weaveffiShapesShapeLabeledGetLabel = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeLabeledGetLabel, _DartWeaveffiShapesShapeLabeledGetLabel>('weaveffi_shapes_Shape_Labeled_get_label');
+  void writeUint64(int v) {
+    _ensure(8);
+    _data.setUint64(_len, v, Endian.little);
+    _len += 8;
+  }
 
-typedef _NativeWeaveffiShapesShapeLabeledGetCount = Uint8 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesShapeLabeledGetCount = int Function(Pointer<Void>);
-final _weaveffiShapesShapeLabeledGetCount = _lib.lookupFunction<
-    _NativeWeaveffiShapesShapeLabeledGetCount, _DartWeaveffiShapesShapeLabeledGetCount>('weaveffi_shapes_Shape_Labeled_get_count');
+  void writeFloat32(double v) {
+    _ensure(4);
+    _data.setFloat32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeFloat64(double v) {
+    _ensure(8);
+    _data.setFloat64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeLength(int v) => writeUint32(v);
+
+  void writeString(String v) {
+    final bytes = utf8.encode(v);
+    writeLength(bytes.length);
+    _ensure(bytes.length);
+    _buf.setRange(_len, _len + bytes.length, bytes);
+    _len += bytes.length;
+  }
+
+  void writeBytes(List<int> v) {
+    writeLength(v.length);
+    _ensure(v.length);
+    _buf.setRange(_len, _len + v.length, v);
+    _len += v.length;
+  }
+}
+
+final class _BufferReader {
+  final Uint8List _buf;
+  final ByteData _data;
+  int _pos = 0;
+
+  _BufferReader(Uint8List buf)
+      : _buf = buf,
+        _data = ByteData.sublistView(buf);
+
+  int get _remaining => _buf.length - _pos;
+
+  void _require(int n, String context) {
+    if (_remaining < n) _bufferError(context);
+  }
+
+  bool readBool() {
+    _require(1, 'bool');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('bool byte out of range');
+    return b == 1;
+  }
+
+  bool readOptionFlag() {
+    _require(1, 'option flag');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('option flag byte out of range');
+    return b == 1;
+  }
+
+  int readInt8() {
+    _require(1, 'i8');
+    return _data.getInt8(_pos++);
+  }
+
+  int readUint8() {
+    _require(1, 'u8');
+    return _buf[_pos++];
+  }
+
+  int readInt16() {
+    _require(2, 'i16');
+    final v = _data.getInt16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readUint16() {
+    _require(2, 'u16');
+    final v = _data.getUint16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readInt32() {
+    _require(4, 'i32');
+    final v = _data.getInt32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readUint32() {
+    _require(4, 'u32');
+    final v = _data.getUint32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readInt64() {
+    _require(8, 'i64');
+    final v = _data.getInt64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readUint64() {
+    _require(8, 'u64');
+    final v = _data.getUint64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  double readFloat32() {
+    _require(4, 'f32');
+    final v = _data.getFloat32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  double readFloat64() {
+    _require(8, 'f64');
+    final v = _data.getFloat64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readLength() {
+    final n = readUint32();
+    if (n > _remaining) _bufferError('length prefix exceeds remaining buffer');
+    return n;
+  }
+
+  String readString() {
+    final n = readLength();
+    final s = utf8.decode(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return s;
+  }
+
+  Uint8List readBytes() {
+    final n = readLength();
+    final b = Uint8List.fromList(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return b;
+  }
+
+  void expectEnd() {
+    if (_remaining != 0) _bufferError('trailing bytes after value');
+  }
+}
 
 /// An algebraic shape (sum type with associated data)
-class Shape {
-  final Pointer<Void> _handle;
-  Shape._(this._handle);
+sealed class Shape {
+  const Shape();
+}
 
-  void dispose() {
-    _weaveffiShapesShapeDestroy(_handle);
-  }
+/// The empty shape (a unit variant)
+class ShapeEmpty extends Shape {}
 
-  ShapeTag get tag =>
-      ShapeTag.fromValue(_weaveffiShapesShapeTag(_handle));
-
-  /// The empty shape (a unit variant)
-  factory Shape.empty() {
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiShapesShapeEmptyNew(err);
-      _checkError(err);
-      return Shape._(result);
-    } finally {
-      calloc.free(err);
-    }
-  }
-
-  /// A circle with a radius
-  factory Shape.circle(double radius) {
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiShapesShapeCircleNew(radius, err);
-      _checkError(err);
-      return Shape._(result);
-    } finally {
-      calloc.free(err);
-    }
-  }
-
-  /// An axis-aligned rectangle
-  factory Shape.rectangle(double width, double height) {
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiShapesShapeRectangleNew(width, height, err);
-      _checkError(err);
-      return Shape._(result);
-    } finally {
-      calloc.free(err);
-    }
-  }
-
-  /// An integer-bounded shape (exercises narrow + wide ints)
-  factory Shape.bounded(int min, int max, int weight) {
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiShapesShapeBoundedNew(min, max, weight, err);
-      _checkError(err);
-      return Shape._(result);
-    } finally {
-      calloc.free(err);
-    }
-  }
-
-  /// A labeled shape with a small count
-  factory Shape.labeled(String label, int count) {
-  final labelPtr = label.toNativeUtf8();
-    final err = calloc<_WeaveFFIError>();
-    try {
-      final result = _weaveffiShapesShapeLabeledNew(labelPtr, count, err);
-      _checkError(err);
-      return Shape._(result);
-    } finally {
-      calloc.free(labelPtr);
-      calloc.free(err);
-    }
-  }
-
+/// A circle with a radius
+class ShapeCircle extends Shape {
   /// Radius in points
-  double get circleRadius {
-    final result = _weaveffiShapesShapeCircleGetRadius(_handle);
-    return result;
-  }
+  final double radius;
 
-  double get rectangleWidth {
-    final result = _weaveffiShapesShapeRectangleGetWidth(_handle);
-    return result;
-  }
+  ShapeCircle(this.radius);
+}
 
-  double get rectangleHeight {
-    final result = _weaveffiShapesShapeRectangleGetHeight(_handle);
-    return result;
-  }
+/// An axis-aligned rectangle
+class ShapeRectangle extends Shape {
+  final double width;
+  final double height;
 
-  int get boundedMin {
-    final result = _weaveffiShapesShapeBoundedGetMin(_handle);
-    return result;
-  }
+  ShapeRectangle(this.width, this.height);
+}
 
-  int get boundedMax {
-    final result = _weaveffiShapesShapeBoundedGetMax(_handle);
-    return result;
-  }
+/// An integer-bounded shape (exercises narrow + wide ints)
+class ShapeBounded extends Shape {
+  final int min;
+  final int max;
+  final int weight;
 
-  int get boundedWeight {
-    final result = _weaveffiShapesShapeBoundedGetWeight(_handle);
-    return result;
-  }
+  ShapeBounded(this.min, this.max, this.weight);
+}
 
-  String get labeledLabel {
-    final result = _weaveffiShapesShapeLabeledGetLabel(_handle);
-    final value = result.toDartString();
-    _weaveffiFreeString(result);
-    return value;
-  }
+/// A labeled shape with a small count
+class ShapeLabeled extends Shape {
+  final String label;
+  final int count;
 
-  int get labeledCount {
-    final result = _weaveffiShapesShapeLabeledGetCount(_handle);
-    return result;
+  ShapeLabeled(this.label, this.count);
+}
+
+void _packShape(_BufferWriter w, Shape v) {
+  switch (v) {
+    case ShapeEmpty():
+      w.writeInt32(0);
+    case final ShapeCircle t0:
+      w.writeInt32(1);
+      w.writeFloat64(t0.radius);
+    case final ShapeRectangle t1:
+      w.writeInt32(2);
+      w.writeFloat32(t1.width);
+      w.writeFloat32(t1.height);
+    case final ShapeBounded t2:
+      w.writeInt32(3);
+      w.writeInt16(t2.min);
+      w.writeInt16(t2.max);
+      w.writeUint64(t2.weight);
+    case final ShapeLabeled t3:
+      w.writeInt32(4);
+      w.writeString(t3.label);
+      w.writeUint8(t3.count);
+  }
+}
+
+Shape _unpackShape(_BufferReader r) {
+  final tag = r.readInt32();
+  switch (tag) {
+    case 0:
+      return ShapeEmpty();
+    case 1:
+      return ShapeCircle(r.readFloat64());
+    case 2:
+      return ShapeRectangle(r.readFloat32(), r.readFloat32());
+    case 3:
+      return ShapeBounded(r.readInt16(), r.readInt16(), r.readUint64());
+    case 4:
+      return ShapeLabeled(r.readString(), r.readUint8());
+    default:
+      _bufferError('unknown Shape tag $tag');
   }
 }
 
@@ -289,153 +407,100 @@ enum Channel {
       Channel.values.firstWhere((e) => e.value == value);
 }
 
-typedef _NativeWeaveffiShapesNumericsDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsDestroy = void Function(Pointer<Void>);
-final _weaveffiShapesNumericsDestroy = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsDestroy, _DartWeaveffiShapesNumericsDestroy>('weaveffi_shapes_Numerics_destroy');
-
-typedef _NativeWeaveffiShapesNumericsGetA = Int8 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetA = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetA = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetA, _DartWeaveffiShapesNumericsGetA>('weaveffi_shapes_Numerics_get_a');
-
-typedef _NativeWeaveffiShapesNumericsGetB = Int16 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetB = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetB = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetB, _DartWeaveffiShapesNumericsGetB>('weaveffi_shapes_Numerics_get_b');
-
-typedef _NativeWeaveffiShapesNumericsGetC = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetC = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetC = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetC, _DartWeaveffiShapesNumericsGetC>('weaveffi_shapes_Numerics_get_c');
-
-typedef _NativeWeaveffiShapesNumericsGetD = Int64 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetD = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetD = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetD, _DartWeaveffiShapesNumericsGetD>('weaveffi_shapes_Numerics_get_d');
-
-typedef _NativeWeaveffiShapesNumericsGetE = Uint8 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetE = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetE = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetE, _DartWeaveffiShapesNumericsGetE>('weaveffi_shapes_Numerics_get_e');
-
-typedef _NativeWeaveffiShapesNumericsGetF = Uint16 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetF = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetF = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetF, _DartWeaveffiShapesNumericsGetF>('weaveffi_shapes_Numerics_get_f');
-
-typedef _NativeWeaveffiShapesNumericsGetG = Uint32 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetG = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetG = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetG, _DartWeaveffiShapesNumericsGetG>('weaveffi_shapes_Numerics_get_g');
-
-typedef _NativeWeaveffiShapesNumericsGetH = Uint64 Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetH = int Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetH = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetH, _DartWeaveffiShapesNumericsGetH>('weaveffi_shapes_Numerics_get_h');
-
-typedef _NativeWeaveffiShapesNumericsGetI = Float Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetI = double Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetI = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetI, _DartWeaveffiShapesNumericsGetI>('weaveffi_shapes_Numerics_get_i');
-
-typedef _NativeWeaveffiShapesNumericsGetJ = Double Function(Pointer<Void>);
-typedef _DartWeaveffiShapesNumericsGetJ = double Function(Pointer<Void>);
-final _weaveffiShapesNumericsGetJ = _lib.lookupFunction<
-    _NativeWeaveffiShapesNumericsGetJ, _DartWeaveffiShapesNumericsGetJ>('weaveffi_shapes_Numerics_get_j');
-
 /// One field per supported numeric primitive
 class Numerics {
-  final Pointer<Void> _handle;
-  Numerics._(this._handle);
+  final int a;
+  final int b;
+  final int c;
+  final int d;
+  final int e;
+  final int f;
+  final int g;
+  final int h;
+  final double i;
+  final double j;
 
-  void dispose() {
-    _weaveffiShapesNumericsDestroy(_handle);
-  }
-
-  int get a {
-    final result = _weaveffiShapesNumericsGetA(_handle);
-    return result;
-  }
-
-  int get b {
-    final result = _weaveffiShapesNumericsGetB(_handle);
-    return result;
-  }
-
-  int get c {
-    final result = _weaveffiShapesNumericsGetC(_handle);
-    return result;
-  }
-
-  int get d {
-    final result = _weaveffiShapesNumericsGetD(_handle);
-    return result;
-  }
-
-  int get e {
-    final result = _weaveffiShapesNumericsGetE(_handle);
-    return result;
-  }
-
-  int get f {
-    final result = _weaveffiShapesNumericsGetF(_handle);
-    return result;
-  }
-
-  int get g {
-    final result = _weaveffiShapesNumericsGetG(_handle);
-    return result;
-  }
-
-  int get h {
-    final result = _weaveffiShapesNumericsGetH(_handle);
-    return result;
-  }
-
-  double get i {
-    final result = _weaveffiShapesNumericsGetI(_handle);
-    return result;
-  }
-
-  double get j {
-    final result = _weaveffiShapesNumericsGetJ(_handle);
-    return result;
-  }
+  Numerics({required this.a, required this.b, required this.c, required this.d, required this.e, required this.f, required this.g, required this.h, required this.i, required this.j});
 }
 
-typedef _NativeWeaveffiShapesDescribe = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesDescribe = Pointer<Utf8> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+void _packNumerics(_BufferWriter w, Numerics v) {
+  w.writeInt8(v.a);
+  w.writeInt16(v.b);
+  w.writeInt32(v.c);
+  w.writeInt64(v.d);
+  w.writeUint8(v.e);
+  w.writeUint16(v.f);
+  w.writeUint32(v.g);
+  w.writeUint64(v.h);
+  w.writeFloat32(v.i);
+  w.writeFloat64(v.j);
+}
+
+Numerics _unpackNumerics(_BufferReader r) {
+  return Numerics(
+    a: r.readInt8(),
+    b: r.readInt16(),
+    c: r.readInt32(),
+    d: r.readInt64(),
+    e: r.readUint8(),
+    f: r.readUint16(),
+    g: r.readUint32(),
+    h: r.readUint64(),
+    i: r.readFloat32(),
+    j: r.readFloat64(),
+  );
+}
+
+typedef _NativeWeaveffiShapesDescribe = Pointer<Utf8> Function(Pointer<Uint8>, Size, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiShapesDescribe = Pointer<Utf8> Function(Pointer<Uint8>, int, Pointer<_WeaveFFIError>);
 final _weaveffiShapesDescribe = _lib.lookupFunction<
     _NativeWeaveffiShapesDescribe, _DartWeaveffiShapesDescribe>('weaveffi_shapes_describe');
 
 /// Render a shape to a string
 String describe(Shape shape) {
+  final shapeWriter = _BufferWriter();
+  _packShape(shapeWriter, shape);
+  final shapeBuf = shapeWriter.takeBytes();
+  final shapePtr = _stageBytes(shapeBuf);
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiShapesDescribe(shape._handle, err);
+    final result = _weaveffiShapesDescribe(shapePtr, shapeBuf.length, err);
     _checkError(err);
     final value = result.toDartString();
     _weaveffiFreeString(result);
     return value;
   } finally {
+    calloc.free(shapePtr);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiShapesScale = Pointer<Void> Function(Pointer<Void>, Double, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesScale = Pointer<Void> Function(Pointer<Void>, double, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiShapesScale = Pointer<Uint8> Function(Pointer<Uint8>, Size, Double, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiShapesScale = Pointer<Uint8> Function(Pointer<Uint8>, int, double, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiShapesScale = _lib.lookupFunction<
     _NativeWeaveffiShapesScale, _DartWeaveffiShapesScale>('weaveffi_shapes_scale');
 
 /// Scale a shape by a factor, returning a new shape
 Shape scale(Shape shape, double factor) {
+  final shapeWriter = _BufferWriter();
+  _packShape(shapeWriter, shape);
+  final shapeBuf = shapeWriter.takeBytes();
+  final shapePtr = _stageBytes(shapeBuf);
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiShapesScale(shape._handle, factor, err);
+    final result = _weaveffiShapesScale(shapePtr, shapeBuf.length, factor, outLen, err);
     _checkError(err);
-    return Shape._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackShape(reader);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(shapePtr);
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
@@ -448,9 +513,7 @@ final _weaveffiShapesSumBytes = _lib.lookupFunction<
 /// Sum a list of bytes into a wide integer (numerics smoke)
 int sumBytes(List<int> values) {
   final valuesPtr = values.isEmpty ? nullptr : calloc<Uint8>(values.length);
-  for (var i = 0; i < values.length; i++) {
-    valuesPtr[i] = values[i];
-  }
+  for (var i = 0; i < values.length; i++) { valuesPtr[i] = values[i]; }
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiShapesSumBytes(valuesPtr, values.length, err);
@@ -462,19 +525,27 @@ int sumBytes(List<int> values) {
   }
 }
 
-typedef _NativeWeaveffiShapesMakeNumerics = Pointer<Void> Function(Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64, Float, Double, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiShapesMakeNumerics = Pointer<Void> Function(int, int, int, int, int, int, int, int, double, double, Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiShapesMakeNumerics = Pointer<Uint8> Function(Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64, Float, Double, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiShapesMakeNumerics = Pointer<Uint8> Function(int, int, int, int, int, int, int, int, double, double, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiShapesMakeNumerics = _lib.lookupFunction<
     _NativeWeaveffiShapesMakeNumerics, _DartWeaveffiShapesMakeNumerics>('weaveffi_shapes_make_numerics');
 
 /// Build a Numerics struct from every numeric primitive
 Numerics makeNumerics(int a, int b, int c, int d, int e, int f, int g, int h, double i, double j) {
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiShapesMakeNumerics(a, b, c, d, e, f, g, h, i, j, err);
+    final result = _weaveffiShapesMakeNumerics(a, b, c, d, e, f, g, h, i, j, outLen, err);
     _checkError(err);
-    return Numerics._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackNumerics(reader);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }

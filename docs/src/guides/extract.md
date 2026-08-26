@@ -153,8 +153,7 @@ macro consumes, and it reads unambiguously.
 | `#[weaveffi::export]`                           | free `fn`                           | Emits a [`Function`] in the enclosing module. `async fn` sets `async: true`; a `Result<T, E>` return sets `throws: true` (the IDL return type is `T`). |
 | `#[weaveffi::record]`                           | named-field `struct`                | Emits a [`StructDef`].                                                                    |
 | `#[weaveffi::interface]`                        | `struct` with an `impl` block       | Emits an [`InterfaceDef`]. The `impl` block's `pub fn`s become constructors (those returning `Self`), methods (`&self` receivers), and statics. |
-| `#[weaveffi::error]`                            | unit-variant `enum`                 | Emits the module's error domain. Every variant needs an explicit `= N` discriminant; the first doc line is the code's message. |
-| `#[weaveffi::builder]`                          | `struct` (with `#[weaveffi::record]`) | Sets `builder: true` on the emitted struct.                                            |
+| `#[weaveffi::error]`                            | `enum` with explicit discriminants  | Emits the module's error domain. Every variant needs an explicit `= N` discriminant; the first doc line is the code's message. Named-field variants emit the code's payload `fields:` (and require a primitive repr such as `#[repr(i32)]`). |
 | `#[weaveffi::enumeration]` + `#[repr(i32)]`     | `enum`                              | Emits an [`EnumDef`]. Every variant must have an explicit `= N` discriminant.            |
 | `#[weaveffi::cancellable]`                      | exported `async fn`                 | Sets `cancellable: true`.                                                                |
 | `#[weaveffi::callback]`                         | free `fn`                           | Emits a module-level [`CallbackDef`] using the function's name and parameters.           |
@@ -174,7 +173,7 @@ field in the IR.
 > **Macro versus extraction.** Both the CLI extractor and the
 > `#[weaveffi::module]` proc-macro understand the full annotation surface above,
 > including interfaces, error domains, async, callbacks, listeners, iterators,
-> rich enums, maps, and builders. A hand-authored IDL can additionally carry
+> rich enums, and maps. A hand-authored IDL can additionally carry
 > metadata that source can't yet express (package and per-generator
 > configuration, struct field defaults, and standalone `since` tags), which is
 > why the advanced samples keep a committed YAML IDL for generation. See
@@ -225,7 +224,7 @@ The `roundtrip_kitchen_sink` integration test in
 `crates/weaveffi-cli/tests/extract_roundtrip.rs` proves that the
 hand-annotated form of the kitchen-sink IDL round-trips through `weaveffi
 extract` and matches the original IR for every supported feature: modules,
-nested modules, structs (including builders), enums, interfaces, error
+nested modules, structs, enums, interfaces, error
 domains, per-function `throws`, callbacks, listeners, every primitive type,
 borrowed types, typed handles, optional/list/map composites, async,
 cancellable, and deprecated/since.

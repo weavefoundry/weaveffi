@@ -31,7 +31,9 @@ module WeaveFFI
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
-           :message, :pointer
+           :message, :pointer,
+           :payload_ptr, :pointer,
+           :payload_len, :size_t
   end
 
   class Error < StandardError
@@ -40,6 +42,176 @@ module WeaveFFI
     def initialize(code, message)
       @code = code
       super(message)
+    end
+  end
+
+  # @api private
+  # Appends values in the WeaveFFI value-buffer wire format: little-endian,
+  # packed, no alignment.
+  class WvBufferWriter
+    def initialize
+      @buf = +''.b
+    end
+
+    # The encoded bytes as a binary String.
+    def data
+      @buf
+    end
+
+    def write_bool(v)
+      @buf << (v ? "\x01".b : "\x00".b)
+    end
+
+    def write_flag(v)
+      write_bool(v)
+    end
+
+    def write_i8(v)
+      @buf << [v].pack('c')
+    end
+
+    def write_u8(v)
+      @buf << [v].pack('C')
+    end
+
+    def write_i16(v)
+      @buf << [v].pack('s<')
+    end
+
+    def write_u16(v)
+      @buf << [v].pack('S<')
+    end
+
+    def write_i32(v)
+      @buf << [v].pack('l<')
+    end
+
+    def write_u32(v)
+      @buf << [v].pack('L<')
+    end
+
+    def write_len(v)
+      write_u32(v)
+    end
+
+    def write_i64(v)
+      @buf << [v].pack('q<')
+    end
+
+    def write_u64(v)
+      @buf << [v].pack('Q<')
+    end
+
+    def write_f32(v)
+      @buf << [v].pack('e')
+    end
+
+    def write_f64(v)
+      @buf << [v].pack('E')
+    end
+
+    def write_string(v)
+      b = v.to_s.encode(Encoding::UTF_8).b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+
+    def write_bytes(v)
+      b = v.to_s.b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+  end
+
+  # @api private
+  # Reads values in the WeaveFFI value-buffer wire format, raising Error on
+  # any malformed buffer.
+  class WvBufferReader
+    def initialize(data)
+      @data = data.to_s.b
+      @pos = 0
+    end
+
+    def take(n, what)
+      raise Error.new(-1, "malformed value buffer: #{what}") if @pos + n > @data.bytesize
+      s = @data.byteslice(@pos, n)
+      @pos += n
+      s
+    end
+
+    def read_bool
+      b = take(1, 'bool').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: bool byte out of range') if b > 1
+      b == 1
+    end
+
+    def read_flag
+      b = take(1, 'option flag').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: option flag out of range') if b > 1
+      b == 1
+    end
+
+    def read_i8
+      take(1, 'i8').unpack1('c')
+    end
+
+    def read_u8
+      take(1, 'u8').unpack1('C')
+    end
+
+    def read_i16
+      take(2, 'i16').unpack1('s<')
+    end
+
+    def read_u16
+      take(2, 'u16').unpack1('S<')
+    end
+
+    def read_i32
+      take(4, 'i32').unpack1('l<')
+    end
+
+    def read_u32
+      take(4, 'u32').unpack1('L<')
+    end
+
+    def read_len
+      len = read_u32
+      if len > @data.bytesize - @pos
+        raise Error.new(-1, 'malformed value buffer: length prefix exceeds remaining bytes')
+      end
+      len
+    end
+
+    def read_i64
+      take(8, 'i64').unpack1('q<')
+    end
+
+    def read_u64
+      take(8, 'u64').unpack1('Q<')
+    end
+
+    def read_f32
+      take(4, 'f32').unpack1('e')
+    end
+
+    def read_f64
+      take(8, 'f64').unpack1('E')
+    end
+
+    def read_string
+      s = take(read_len, 'string bytes').force_encoding(Encoding::UTF_8)
+      raise Error.new(-1, 'malformed value buffer: string is not valid UTF-8') unless s.valid_encoding?
+      s
+    end
+
+    def read_bytes
+      take(read_len, 'byte buffer')
+    end
+
+    def expect_end!
+      return if @pos == @data.bytesize
+      raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
@@ -58,22 +230,113 @@ module WeaveFFI
 
   # === Module: shapes ===
 
-  attach_function :weaveffi_shapes_Shape_tag, [:pointer], :int32
-  attach_function :weaveffi_shapes_Shape_destroy, [:pointer], :void
-  attach_function :weaveffi_shapes_Shape_Empty_new, [:pointer], :pointer
-  attach_function :weaveffi_shapes_Shape_Circle_new, [:double, :pointer], :pointer
-  # Radius in points
-  attach_function :weaveffi_shapes_Shape_Circle_get_radius, [:pointer], :double
-  attach_function :weaveffi_shapes_Shape_Rectangle_new, [:float, :float, :pointer], :pointer
-  attach_function :weaveffi_shapes_Shape_Rectangle_get_width, [:pointer], :float
-  attach_function :weaveffi_shapes_Shape_Rectangle_get_height, [:pointer], :float
-  attach_function :weaveffi_shapes_Shape_Bounded_new, [:int16, :int16, :uint64, :pointer], :pointer
-  attach_function :weaveffi_shapes_Shape_Bounded_get_min, [:pointer], :int16
-  attach_function :weaveffi_shapes_Shape_Bounded_get_max, [:pointer], :int16
-  attach_function :weaveffi_shapes_Shape_Bounded_get_weight, [:pointer], :uint64
-  attach_function :weaveffi_shapes_Shape_Labeled_new, [:string, :uint8, :pointer], :pointer
-  attach_function :weaveffi_shapes_Shape_Labeled_get_label, [:pointer], :pointer
-  attach_function :weaveffi_shapes_Shape_Labeled_get_count, [:pointer], :uint8
+  # An algebraic shape (sum type with associated data)
+  class Shape
+    # The active variant's integer tag.
+    def tag
+      self.class::TAG
+    end
+
+    # The empty shape (a unit variant)
+    class Empty < Shape
+      TAG = 0
+
+      # Structural equality over the variant and its fields.
+      def ==(other)
+        return false unless other.is_a?(Empty)
+        true
+      end
+    end
+
+    # A circle with a radius
+    class Circle < Shape
+      TAG = 1
+
+      # Radius in points
+      attr_reader :radius
+
+      def initialize(radius:)
+        @radius = radius
+      end
+
+      # Structural equality over the variant and its fields.
+      def ==(other)
+        return false unless other.is_a?(Circle)
+        return false unless radius == other.radius
+        true
+      end
+    end
+
+    # An axis-aligned rectangle
+    class Rectangle < Shape
+      TAG = 2
+
+      attr_reader :width
+
+      attr_reader :height
+
+      def initialize(width:, height:)
+        @width = width
+        @height = height
+      end
+
+      # Structural equality over the variant and its fields.
+      def ==(other)
+        return false unless other.is_a?(Rectangle)
+        return false unless width == other.width
+        return false unless height == other.height
+        true
+      end
+    end
+
+    # An integer-bounded shape (exercises narrow + wide ints)
+    class Bounded < Shape
+      TAG = 3
+
+      attr_reader :min
+
+      attr_reader :max
+
+      attr_reader :weight
+
+      def initialize(min:, max:, weight:)
+        @min = min
+        @max = max
+        @weight = weight
+      end
+
+      # Structural equality over the variant and its fields.
+      def ==(other)
+        return false unless other.is_a?(Bounded)
+        return false unless min == other.min
+        return false unless max == other.max
+        return false unless weight == other.weight
+        true
+      end
+    end
+
+    # A labeled shape with a small count
+    class Labeled < Shape
+      TAG = 4
+
+      attr_reader :label
+
+      attr_reader :count
+
+      def initialize(label:, count:)
+        @label = label
+        @count = count
+      end
+
+      # Structural equality over the variant and its fields.
+      def ==(other)
+        return false unless other.is_a?(Labeled)
+        return false unless label == other.label
+        return false unless count == other.count
+        true
+      end
+    end
+  end
 
   # A plain C-style enum (no payloads)
   module Channel
@@ -82,229 +345,161 @@ module WeaveFFI
     BLUE = 2
   end
 
-  attach_function :weaveffi_shapes_Numerics_destroy, [:pointer], :void
-  attach_function :weaveffi_shapes_Numerics_get_a, [:pointer], :int8
-  attach_function :weaveffi_shapes_Numerics_get_b, [:pointer], :int16
-  attach_function :weaveffi_shapes_Numerics_get_c, [:pointer], :int32
-  attach_function :weaveffi_shapes_Numerics_get_d, [:pointer], :int64
-  attach_function :weaveffi_shapes_Numerics_get_e, [:pointer], :uint8
-  attach_function :weaveffi_shapes_Numerics_get_f, [:pointer], :uint16
-  attach_function :weaveffi_shapes_Numerics_get_g, [:pointer], :uint32
-  attach_function :weaveffi_shapes_Numerics_get_h, [:pointer], :uint64
-  attach_function :weaveffi_shapes_Numerics_get_i, [:pointer], :float
-  attach_function :weaveffi_shapes_Numerics_get_j, [:pointer], :double
+  # One field per supported numeric primitive
+  class Numerics
+    attr_reader :a
+
+    attr_reader :b
+
+    attr_reader :c
+
+    attr_reader :d
+
+    attr_reader :e
+
+    attr_reader :f
+
+    attr_reader :g
+
+    attr_reader :h
+
+    attr_reader :i
+
+    attr_reader :j
+
+    def initialize(a:, b:, c:, d:, e:, f:, g:, h:, i:, j:)
+      @a = a
+      @b = b
+      @c = c
+      @d = d
+      @e = e
+      @f = f
+      @g = g
+      @h = h
+      @i = i
+      @j = j
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Numerics)
+      return false unless a == other.a
+      return false unless b == other.b
+      return false unless c == other.c
+      return false unless d == other.d
+      return false unless e == other.e
+      return false unless f == other.f
+      return false unless g == other.g
+      return false unless h == other.h
+      return false unless i == other.i
+      return false unless j == other.j
+      true
+    end
+  end
+
+  # @api private
+  # Packs a Numerics into the value-buffer wire format.
+  def self._wv_write_numerics(w, v)
+    w.write_i8(v.a)
+    w.write_i16(v.b)
+    w.write_i32(v.c)
+    w.write_i64(v.d)
+    w.write_u8(v.e)
+    w.write_u16(v.f)
+    w.write_u32(v.g)
+    w.write_u64(v.h)
+    w.write_f32(v.i)
+    w.write_f64(v.j)
+  end
+
+  # @api private
+  # Unpacks a Numerics from the value-buffer wire format.
+  def self._wv_read_numerics(r)
+    _wv_a = r.read_i8
+    _wv_b = r.read_i16
+    _wv_c = r.read_i32
+    _wv_d = r.read_i64
+    _wv_e = r.read_u8
+    _wv_f = r.read_u16
+    _wv_g = r.read_u32
+    _wv_h = r.read_u64
+    _wv_i = r.read_f32
+    _wv_j = r.read_f64
+    Numerics.new(a: _wv_a, b: _wv_b, c: _wv_c, d: _wv_d, e: _wv_e, f: _wv_f, g: _wv_g, h: _wv_h, i: _wv_i, j: _wv_j)
+  end
+
+  # @api private
+  # Packs a Shape into the value-buffer wire format.
+  def self._wv_write_shape(w, v)
+    case v
+    when Shape::Empty
+      w.write_i32(0)
+    when Shape::Circle
+      w.write_i32(1)
+      w.write_f64(v.radius)
+    when Shape::Rectangle
+      w.write_i32(2)
+      w.write_f32(v.width)
+      w.write_f32(v.height)
+    when Shape::Bounded
+      w.write_i32(3)
+      w.write_i16(v.min)
+      w.write_i16(v.max)
+      w.write_u64(v.weight)
+    when Shape::Labeled
+      w.write_i32(4)
+      w.write_string(v.label)
+      w.write_u8(v.count)
+    else
+      raise Error.new(-1, 'unknown Shape variant')
+    end
+  end
+
+  # @api private
+  # Unpacks a Shape from the value-buffer wire format.
+  def self._wv_read_shape(r)
+    tag = r.read_i32
+    case tag
+    when 0
+      Shape::Empty.new
+    when 1
+      _wv_radius = r.read_f64
+      Shape::Circle.new(radius: _wv_radius)
+    when 2
+      _wv_width = r.read_f32
+      _wv_height = r.read_f32
+      Shape::Rectangle.new(width: _wv_width, height: _wv_height)
+    when 3
+      _wv_min = r.read_i16
+      _wv_max = r.read_i16
+      _wv_weight = r.read_u64
+      Shape::Bounded.new(min: _wv_min, max: _wv_max, weight: _wv_weight)
+    when 4
+      _wv_label = r.read_string
+      _wv_count = r.read_u8
+      Shape::Labeled.new(label: _wv_label, count: _wv_count)
+    else
+      raise Error.new(-1, "malformed value buffer: unknown Shape tag #{tag}")
+    end
+  end
   # Render a shape to a string
-  attach_function :weaveffi_shapes_describe, [:pointer, :pointer], :pointer
+  attach_function :weaveffi_shapes_describe, [:pointer, :size_t, :pointer], :pointer
   # Scale a shape by a factor, returning a new shape
-  attach_function :weaveffi_shapes_scale, [:pointer, :double, :pointer], :pointer
+  attach_function :weaveffi_shapes_scale, [:pointer, :size_t, :double, :pointer, :pointer], :pointer
   # Sum a list of bytes into a wide integer (numerics smoke)
   attach_function :weaveffi_shapes_sum_bytes, [:pointer, :size_t, :pointer], :uint64
   # Build a Numerics struct from every numeric primitive
-  attach_function :weaveffi_shapes_make_numerics, [:int8, :int16, :int32, :int64, :uint8, :uint16, :uint32, :uint64, :float, :double, :pointer], :pointer
-
-  class ShapePtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_shapes_Shape_destroy(ptr)
-    end
-  end
-
-  # An algebraic shape (sum type with associated data)
-  class Shape
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = ShapePtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    # The empty shape (a unit variant)
-    EMPTY = 0
-    # A circle with a radius
-    CIRCLE = 1
-    # An axis-aligned rectangle
-    RECTANGLE = 2
-    # An integer-bounded shape (exercises narrow + wide ints)
-    BOUNDED = 3
-    # A labeled shape with a small count
-    LABELED = 4
-
-    def tag
-      WeaveFFI.weaveffi_shapes_Shape_tag(@handle)
-    end
-
-    # The empty shape (a unit variant)
-    def self.empty
-      err = WeaveFFI::ErrorStruct.new
-      result = WeaveFFI.weaveffi_shapes_Shape_Empty_new(err)
-      WeaveFFI.check_error!(err)
-      new(result)
-    end
-
-    # A circle with a radius
-    def self.circle(radius)
-      err = WeaveFFI::ErrorStruct.new
-      result = WeaveFFI.weaveffi_shapes_Shape_Circle_new(radius, err)
-      WeaveFFI.check_error!(err)
-      new(result)
-    end
-
-    # An axis-aligned rectangle
-    def self.rectangle(width, height)
-      err = WeaveFFI::ErrorStruct.new
-      result = WeaveFFI.weaveffi_shapes_Shape_Rectangle_new(width, height, err)
-      WeaveFFI.check_error!(err)
-      new(result)
-    end
-
-    # An integer-bounded shape (exercises narrow + wide ints)
-    def self.bounded(min, max, weight)
-      err = WeaveFFI::ErrorStruct.new
-      result = WeaveFFI.weaveffi_shapes_Shape_Bounded_new(min, max, weight, err)
-      WeaveFFI.check_error!(err)
-      new(result)
-    end
-
-    # A labeled shape with a small count
-    def self.labeled(label, count)
-      err = WeaveFFI::ErrorStruct.new
-      result = WeaveFFI.weaveffi_shapes_Shape_Labeled_new(label, count, err)
-      WeaveFFI.check_error!(err)
-      new(result)
-    end
-
-    # Radius in points
-    def circle_radius
-      result = WeaveFFI.weaveffi_shapes_Shape_Circle_get_radius(@handle)
-      result
-    end
-
-    def rectangle_width
-      result = WeaveFFI.weaveffi_shapes_Shape_Rectangle_get_width(@handle)
-      result
-    end
-
-    def rectangle_height
-      result = WeaveFFI.weaveffi_shapes_Shape_Rectangle_get_height(@handle)
-      result
-    end
-
-    def bounded_min
-      result = WeaveFFI.weaveffi_shapes_Shape_Bounded_get_min(@handle)
-      result
-    end
-
-    def bounded_max
-      result = WeaveFFI.weaveffi_shapes_Shape_Bounded_get_max(@handle)
-      result
-    end
-
-    def bounded_weight
-      result = WeaveFFI.weaveffi_shapes_Shape_Bounded_get_weight(@handle)
-      result
-    end
-
-    def labeled_label
-      result = WeaveFFI.weaveffi_shapes_Shape_Labeled_get_label(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    def labeled_count
-      result = WeaveFFI.weaveffi_shapes_Shape_Labeled_get_count(@handle)
-      result
-    end
-  end
-
-  class NumericsPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_shapes_Numerics_destroy(ptr)
-    end
-  end
-
-  # One field per supported numeric primitive
-  class Numerics
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = NumericsPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def a
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_a(@handle)
-      result
-    end
-
-    def b
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_b(@handle)
-      result
-    end
-
-    def c
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_c(@handle)
-      result
-    end
-
-    def d
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_d(@handle)
-      result
-    end
-
-    def e
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_e(@handle)
-      result
-    end
-
-    def f
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_f(@handle)
-      result
-    end
-
-    def g
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_g(@handle)
-      result
-    end
-
-    def h
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_h(@handle)
-      result
-    end
-
-    def i
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_i(@handle)
-      result
-    end
-
-    def j
-      result = WeaveFFI.weaveffi_shapes_Numerics_get_j(@handle)
-      result
-    end
-  end
+  attach_function :weaveffi_shapes_make_numerics, [:int8, :int16, :int32, :int64, :uint8, :uint16, :uint32, :uint64, :float, :double, :pointer, :pointer], :pointer
 
   # Render a shape to a string
   def self.describe(shape)
     err = ErrorStruct.new
-    result = weaveffi_shapes_describe(shape.handle, err)
+    shape_w = WvBufferWriter.new
+    _wv_write_shape(shape_w, shape)
+    shape_data = shape_w.data
+    shape_buf = FFI::MemoryPointer.new(:uint8, shape_data.bytesize)
+    shape_buf.put_bytes(0, shape_data)
+    result = weaveffi_shapes_describe(shape_buf, shape_data.bytesize, err)
     check_error!(err)
     return '' if result.null?
     str = result.read_string
@@ -315,18 +510,29 @@ module WeaveFFI
   # Scale a shape by a factor, returning a new shape
   def self.scale(shape, factor)
     err = ErrorStruct.new
-    result = weaveffi_shapes_scale(shape.handle, factor, err)
+    shape_w = WvBufferWriter.new
+    _wv_write_shape(shape_w, shape)
+    shape_data = shape_w.data
+    shape_buf = FFI::MemoryPointer.new(:uint8, shape_data.bytesize)
+    shape_buf.put_bytes(0, shape_data)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_shapes_scale(shape_buf, shape_data.bytesize, factor, out_len, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Shape.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_shape(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 
   # Sum a list of bytes into a wide integer (numerics smoke)
   def self.sum_bytes(values)
     err = ErrorStruct.new
-    values_buf = FFI::MemoryPointer.new(:uint8, values.length)
-    values_buf.write_array_of_uint8(values)
-    result = weaveffi_shapes_sum_bytes(values_buf, values.length, err)
+    values_buf = FFI::MemoryPointer.new(:uint8, values.bytesize)
+    values_buf.put_bytes(0, values)
+    result = weaveffi_shapes_sum_bytes(values_buf, values.bytesize, err)
     check_error!(err)
     result
   end
@@ -334,10 +540,16 @@ module WeaveFFI
   # Build a Numerics struct from every numeric primitive
   def self.make_numerics(a, b, c, d, e, f, g, h, i, j)
     err = ErrorStruct.new
-    result = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_shapes_make_numerics(a, b, c, d, e, f, g, h, i, j, out_len, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Numerics.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_numerics(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 end
 

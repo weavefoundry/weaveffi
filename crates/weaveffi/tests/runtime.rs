@@ -100,7 +100,7 @@ pub mod demo {
         data.len() as i32
     }
 
-    /// Build a point by value (returned as an owning pointer).
+    /// Build a point by value (returned as a serialized value buffer).
     #[weaveffi::export]
     pub fn make_point(x: i32) -> Point {
         Point {
@@ -109,6 +109,12 @@ pub mod demo {
             nickname: None,
             color: Color::Green,
         }
+    }
+
+    /// Read a point's x coordinate (record parameter by value).
+    #[weaveffi::export]
+    pub fn point_x(p: Point) -> i32 {
+        p.x
     }
 }
 
@@ -171,10 +177,10 @@ pub mod maps {
 
 #[weaveffi::module]
 pub mod build {
-    /// A record that also exposes a fluent builder.
+    /// A record whose fields exercise strings, scalars, and optionals in the
+    /// value-buffer encoding.
     #[weaveffi::record]
-    #[weaveffi::builder]
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct Widget {
         /// Required display name.
         pub name: String,
@@ -188,9 +194,10 @@ pub mod build {
 #[weaveffi::module]
 pub mod geom {
     /// An algebraic shape: variants carry associated data, so it crosses the
-    /// ABI as an opaque object (tag reader + per-variant constructors/getters).
+    /// ABI as a value buffer (an `i32` tag followed by the active variant's
+    /// fields).
     #[weaveffi::enumeration]
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq)]
     pub enum Shape {
         /// The empty shape (a unit variant, tag 0).
         Empty,
@@ -293,6 +300,19 @@ fn ok_err() -> weaveffi_error {
     weaveffi_error::default()
 }
 
+/// Decode a buffered return `(ptr, out_len)` into an owned value and release
+/// the producer-allocated buffer, mirroring what every generated binding does.
+fn decode_ret<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
+    assert!(
+        !ptr.is_null(),
+        "buffered return must not be null on success"
+    );
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let value = abi::decode_value(bytes).expect("well-formed value buffer");
+    abi::free_bytes(ptr as *mut u8, len);
+    value
+}
+
 #[test]
 fn scalar_call_sets_ok() {
     let mut err = ok_err();
@@ -338,35 +358,46 @@ fn borrowed_str_param() {
 }
 
 #[test]
-fn optional_string_return() {
+fn optional_string_return_is_buffered() {
     let mut err = ok_err();
-    let some = demo::weaveffi_demo_maybe_name(true, &mut err);
-    assert_eq!(c_ptr_to_string(some).unwrap(), "present");
-    free_string(some);
+    let mut out_len: usize = 0;
+    let some = demo::weaveffi_demo_maybe_name(true, &mut out_len, &mut err);
+    assert_eq!(
+        decode_ret::<Option<String>>(some, out_len),
+        Some("present".to_string())
+    );
 
-    let none = demo::weaveffi_demo_maybe_name(false, &mut err);
-    assert!(none.is_null());
+    let none = demo::weaveffi_demo_maybe_name(false, &mut out_len, &mut err);
+    assert_eq!(decode_ret::<Option<String>>(none, out_len), None);
 }
 
 #[test]
-fn scalar_list_param() {
+fn scalar_list_param_is_buffered() {
     let mut err = ok_err();
-    let xs = [3i32, 4, 5];
+    let xs = abi::encode_value(&vec![3i32, 4, 5]);
     let total = demo::weaveffi_demo_sum(xs.as_ptr(), xs.len(), &mut err);
     assert_eq!(total, 12);
 }
 
 #[test]
-fn string_list_param() {
+fn string_list_param_is_buffered() {
     let mut err = ok_err();
-    let parts = ["a", "b", "c"];
-    let ptrs: Vec<*const c_char> = parts.iter().map(string_to_c_ptr).collect();
-    let out = demo::weaveffi_demo_join(ptrs.as_ptr(), ptrs.len(), &mut err);
+    let parts = abi::encode_value(&vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    let out = demo::weaveffi_demo_join(parts.as_ptr(), parts.len(), &mut err);
     assert_eq!(c_ptr_to_string(out).unwrap(), "a,b,c");
     free_string(out);
-    for p in ptrs {
-        free_string(p);
-    }
+}
+
+#[test]
+fn malformed_buffer_param_reports_error() {
+    let mut err = ok_err();
+    // A truncated encoding (length prefix with no elements) must be rejected
+    // through `out_err`, never decoded partially.
+    let bad = [9u8, 0, 0, 0];
+    let total = demo::weaveffi_demo_sum(bad.as_ptr(), bad.len(), &mut err);
+    assert_eq!(total, 0, "error path returns the zero sentinel");
+    assert_ne!(err.code, 0);
+    abi::error_clear(&mut err);
 }
 
 #[test]
@@ -380,216 +411,168 @@ fn byte_buffer_param() {
 }
 
 #[test]
-fn record_create_get_destroy() {
+fn record_buffer_round_trip() {
+    // A record is a value type: its whole generated surface is the
+    // `BufferValue` impl, so encoding and decoding must round-trip every
+    // field (including the optional and enum fields).
+    let original = demo::Point {
+        x: 7,
+        label: "corner".to_string(),
+        nickname: Some("nw".to_string()),
+        color: demo::Color::Blue,
+    };
+    let bytes = abi::encode_value(&original);
+    let back: demo::Point = abi::decode_value(&bytes).expect("round-trip");
+    assert_eq!(back.x, 7);
+    assert_eq!(back.label, "corner");
+    assert_eq!(back.nickname.as_deref(), Some("nw"));
+    assert_eq!(back.color, demo::Color::Blue);
+}
+
+#[test]
+fn record_param_is_buffered() {
     let mut err = ok_err();
-    let label = string_to_c_ptr("corner");
-    let nickname = string_to_c_ptr("nw");
-    // create(x, label, nickname, color, out_err)
-    let p = demo::weaveffi_demo_Point_create(7, label, nickname, 2, &mut err);
+    let p = demo::Point {
+        x: 41,
+        label: "in".to_string(),
+        nickname: None,
+        color: demo::Color::Red,
+    };
+    let bytes = abi::encode_value(&p);
+    let x = demo::weaveffi_demo_point_x(bytes.as_ptr(), bytes.len(), &mut err);
     assert_eq!(err.code, 0);
-    assert!(!p.is_null());
-    free_string(label);
-    free_string(nickname);
-
-    assert_eq!(demo::weaveffi_demo_Point_get_x(p), 7);
-    assert_eq!(demo::weaveffi_demo_Point_get_color(p), 2);
-    let got_label = demo::weaveffi_demo_Point_get_label(p);
-    assert_eq!(c_ptr_to_string(got_label).unwrap(), "corner");
-    free_string(got_label);
-    let got_nick = demo::weaveffi_demo_Point_get_nickname(p);
-    assert_eq!(c_ptr_to_string(got_nick).unwrap(), "nw");
-    free_string(got_nick);
-
-    demo::weaveffi_demo_Point_destroy(p);
+    assert_eq!(x, 41);
 }
 
 #[test]
-fn record_optional_field_null() {
+fn struct_return_is_buffered() {
     let mut err = ok_err();
-    let label = string_to_c_ptr("solo");
-    // nickname is null -> None
-    let p = demo::weaveffi_demo_Point_create(1, label, std::ptr::null(), 0, &mut err);
-    assert!(!p.is_null());
-    free_string(label);
-
-    let got_nick = demo::weaveffi_demo_Point_get_nickname(p);
-    assert!(got_nick.is_null(), "None lowers to a null string pointer");
-    demo::weaveffi_demo_Point_destroy(p);
-}
-
-#[test]
-fn struct_return_by_value() {
-    let mut err = ok_err();
-    let p = demo::weaveffi_demo_make_point(99, &mut err);
-    assert!(!p.is_null());
-    assert_eq!(demo::weaveffi_demo_Point_get_x(p), 99);
-    let label = demo::weaveffi_demo_Point_get_label(p);
-    assert_eq!(c_ptr_to_string(label).unwrap(), "origin");
-    free_string(label);
-    demo::weaveffi_demo_Point_destroy(p);
+    let mut out_len: usize = 0;
+    let ptr = demo::weaveffi_demo_make_point(99, &mut out_len, &mut err);
+    assert_eq!(err.code, 0);
+    let p: demo::Point = decode_ret(ptr, out_len);
+    assert_eq!(p.x, 99);
+    assert_eq!(p.label, "origin");
+    assert_eq!(p.nickname, None);
+    assert_eq!(p.color, demo::Color::Green);
 }
 
 #[test]
 fn cross_module_struct_param_and_return() {
     let mut err = ok_err();
     let label = string_to_c_ptr("widget");
-    let c = warehouse::weaveffi_warehouse_make_crate(7, label, &mut err);
+    let mut out_len: usize = 0;
+    let ptr = warehouse::weaveffi_warehouse_make_crate(7, label, &mut out_len, &mut err);
     assert_eq!(err.code, 0);
-    assert!(!c.is_null());
     free_string(label);
+    let c: warehouse::Crate = decode_ret(ptr, out_len);
+    assert_eq!(c.id, 7);
+    assert_eq!(c.label, "widget");
 
-    // `dispatch::crate_id` accepts `warehouse::Crate` as an opaque pointer.
-    let id = dispatch::weaveffi_dispatch_crate_id(c, &mut err);
+    // `dispatch::crate_id` accepts `warehouse::Crate` as a value buffer.
+    let bytes = abi::encode_value(&c);
+    let id = dispatch::weaveffi_dispatch_crate_id(bytes.as_ptr(), bytes.len(), &mut err);
     assert_eq!(id, 7);
     assert_eq!(err.code, 0);
 
-    // `dispatch::relabel` returns a fresh `warehouse::Crate`, freed by the
-    // owner module's destructor (same Rust type, same allocation).
+    // `dispatch::relabel` returns a fresh `warehouse::Crate` buffer decoded
+    // with the same impl (same Rust type, same wire format).
     let new_label = string_to_c_ptr("gadget");
-    let c2 = dispatch::weaveffi_dispatch_relabel(c, new_label, &mut err);
-    assert!(!c2.is_null());
-    free_string(new_label);
-    let got = warehouse::weaveffi_warehouse_Crate_get_label(c2);
-    assert_eq!(c_ptr_to_string(got).unwrap(), "gadget");
-    free_string(got);
-
-    warehouse::weaveffi_warehouse_Crate_destroy(c);
-    warehouse::weaveffi_warehouse_Crate_destroy(c2);
-}
-
-#[test]
-fn map_param_and_return() {
-    let mut err = ok_err();
-    // Pass {"b": 1, "a": 2} as parallel key/value arrays (unsorted on input).
-    let kb = string_to_c_ptr("b");
-    let ka = string_to_c_ptr("a");
-    let keys: [*const c_char; 2] = [kb, ka];
-    let values: [i32; 2] = [1, 2];
-
-    let mut out_keys: *mut *const c_char = std::ptr::null_mut();
-    let mut out_values: *mut i32 = std::ptr::null_mut();
-    let mut out_len: usize = 0;
-    maps::weaveffi_maps_double_scores(
-        keys.as_ptr(),
-        values.as_ptr(),
-        2,
-        &mut out_keys,
-        &mut out_values,
+    let ptr2 = dispatch::weaveffi_dispatch_relabel(
+        bytes.as_ptr(),
+        bytes.len(),
+        new_label,
         &mut out_len,
         &mut err,
     );
+    free_string(new_label);
+    let c2: warehouse::Crate = decode_ret(ptr2, out_len);
+    assert_eq!(c2.id, 7);
+    assert_eq!(c2.label, "gadget");
+}
+
+#[test]
+fn map_param_and_return_are_buffered() {
+    use std::collections::BTreeMap;
+    let mut err = ok_err();
+    let mut scores = BTreeMap::new();
+    scores.insert("a".to_string(), 2i32);
+    scores.insert("b".to_string(), 1i32);
+    let bytes = abi::encode_value(&scores);
+
+    let mut out_len: usize = 0;
+    let ptr =
+        maps::weaveffi_maps_double_scores(bytes.as_ptr(), bytes.len(), &mut out_len, &mut err);
     assert_eq!(err.code, 0);
-    assert_eq!(out_len, 2);
-
-    // The BTreeMap return is sorted: a, b with doubled values 4, 2.
-    let got_keys: Vec<String> = (0..out_len)
-        .map(|i| c_ptr_to_string(unsafe { *out_keys.add(i) }).unwrap())
-        .collect();
-    let got_vals: Vec<i32> = (0..out_len)
-        .map(|i| unsafe { *out_values.add(i) })
-        .collect();
-    assert_eq!(got_keys, vec!["a".to_string(), "b".to_string()]);
-    assert_eq!(got_vals, vec![4, 2]);
-
-    for i in 0..out_len {
-        free_string(unsafe { *out_keys.add(i) });
-    }
-    unsafe {
-        drop(Vec::from_raw_parts(out_keys, out_len, out_len));
-        drop(Vec::from_raw_parts(out_values, out_len, out_len));
-    }
-    free_string(kb);
-    free_string(ka);
+    let doubled: BTreeMap<String, i32> = decode_ret(ptr, out_len);
+    assert_eq!(doubled.get("a"), Some(&4));
+    assert_eq!(doubled.get("b"), Some(&2));
 }
 
 #[test]
 fn map_param_scalar_return() {
+    use std::collections::BTreeMap;
     let mut err = ok_err();
-    let ka = string_to_c_ptr("a");
-    let kb = string_to_c_ptr("b");
-    let keys: [*const c_char; 2] = [ka, kb];
-    let values: [i32; 2] = [10, 32];
-    let total = maps::weaveffi_maps_total(keys.as_ptr(), values.as_ptr(), 2, &mut err);
+    let mut scores = BTreeMap::new();
+    scores.insert("a".to_string(), 10i32);
+    scores.insert("b".to_string(), 32i32);
+    let bytes = abi::encode_value(&scores);
+    let total = maps::weaveffi_maps_total(bytes.as_ptr(), bytes.len(), &mut err);
     assert_eq!(err.code, 0);
     assert_eq!(total, 42);
-    free_string(ka);
-    free_string(kb);
 }
 
 #[test]
-fn builder_round_trip_and_required_field() {
-    let mut err = ok_err();
+fn widget_optional_field_round_trips() {
+    let with_note = build::Widget {
+        name: "bolt".to_string(),
+        qty: 7,
+        note: Some("aisle 4".to_string()),
+    };
+    let back: build::Widget = abi::decode_value(&abi::encode_value(&with_note)).unwrap();
+    assert_eq!(back, with_note);
 
-    // Happy path: set every field, then build.
-    let b = build::weaveffi_build_Widget_Builder_new();
-    assert!(!b.is_null());
-    let name = string_to_c_ptr("bolt");
-    build::weaveffi_build_Widget_Builder_set_name(b, name);
-    build::weaveffi_build_Widget_Builder_set_qty(b, 7);
-    let note = string_to_c_ptr("aisle 4");
-    build::weaveffi_build_Widget_Builder_set_note(b, note);
-    free_string(name);
-    free_string(note);
-
-    let w = build::weaveffi_build_Widget_Builder_build(b, &mut err);
-    assert_eq!(err.code, 0);
-    assert!(!w.is_null());
-    assert_eq!(build::weaveffi_build_Widget_get_qty(w), 7);
-    let got_name = build::weaveffi_build_Widget_get_name(w);
-    assert_eq!(c_ptr_to_string(got_name).unwrap(), "bolt");
-    free_string(got_name);
-    let got_note = build::weaveffi_build_Widget_get_note(w);
-    assert_eq!(c_ptr_to_string(got_note).unwrap(), "aisle 4");
-    free_string(got_note);
-    build::weaveffi_build_Widget_destroy(w);
-    build::weaveffi_build_Widget_Builder_destroy(b);
-
-    // A required field (name) left unset surfaces an error at build time, and
-    // an unset optional field (note) defaults to None.
-    let b2 = build::weaveffi_build_Widget_Builder_new();
-    build::weaveffi_build_Widget_Builder_set_qty(b2, 1);
-    let w2 = build::weaveffi_build_Widget_Builder_build(b2, &mut err);
-    assert!(w2.is_null());
-    assert_ne!(err.code, 0);
-    assert!(c_ptr_to_string(err.message).unwrap().contains("name"));
-    abi::error_clear(&mut err);
-    build::weaveffi_build_Widget_Builder_destroy(b2);
+    let without_note = build::Widget {
+        name: "nut".to_string(),
+        qty: 1,
+        note: None,
+    };
+    let back: build::Widget = abi::decode_value(&abi::encode_value(&without_note)).unwrap();
+    assert_eq!(back, without_note);
 }
 
 #[test]
-fn rich_enum_tag_constructors_and_getters() {
+fn rich_enum_encodes_tag_then_fields() {
+    // The wire format leads with the i32 tag (declaration order: Empty = 0,
+    // Circle = 1, Labeled = 2), then the active variant's fields.
+    let empty = abi::encode_value(&geom::Shape::Empty);
+    assert_eq!(empty, [0, 0, 0, 0]);
+
+    let circle = abi::encode_value(&geom::Shape::Circle { radius: 2.5 });
+    assert_eq!(&circle[..4], [1, 0, 0, 0]);
+    assert_eq!(circle.len(), 4 + 8, "tag + f64 radius");
+
+    let labeled = geom::Shape::Labeled {
+        label: "hex".to_string(),
+        count: 6,
+    };
+    let bytes = abi::encode_value(&labeled);
+    assert_eq!(&bytes[..4], [2, 0, 0, 0]);
+    let back: geom::Shape = abi::decode_value(&bytes).unwrap();
+    assert_eq!(back, labeled);
+
+    // An out-of-range tag is a decode error, not a silent default.
+    assert!(abi::decode_value::<geom::Shape>(&[9, 0, 0, 0]).is_err());
+}
+
+#[test]
+fn rich_enum_param_is_buffered() {
     let mut err = ok_err();
-
-    // Unit variant: tag 0, no fields.
-    let empty = geom::weaveffi_geom_Shape_Empty_new(&mut err);
+    let circle = abi::encode_value(&geom::Shape::Circle { radius: 2.5 });
+    let d = geom::weaveffi_geom_describe(circle.as_ptr(), circle.len(), &mut err);
     assert_eq!(err.code, 0);
-    assert_eq!(geom::weaveffi_geom_Shape_tag(empty), 0);
-
-    // Struct variant carrying a scalar.
-    let circle = geom::weaveffi_geom_Shape_Circle_new(2.5, &mut err);
-    assert_eq!(geom::weaveffi_geom_Shape_tag(circle), 1);
-    assert!((geom::weaveffi_geom_Shape_Circle_get_radius(circle) - 2.5).abs() < 1e-9);
-    // A getter for a non-active variant yields the zero sentinel.
-    assert_eq!(geom::weaveffi_geom_Shape_Labeled_get_count(circle), 0);
-
-    // Struct variant carrying a string and a u8.
-    let label = string_to_c_ptr("hex");
-    let labeled = geom::weaveffi_geom_Shape_Labeled_new(label, 6, &mut err);
-    free_string(label);
-    assert_eq!(geom::weaveffi_geom_Shape_tag(labeled), 2);
-    let got = geom::weaveffi_geom_Shape_Labeled_get_label(labeled);
-    assert_eq!(c_ptr_to_string(got).unwrap(), "hex");
-    free_string(got);
-    assert_eq!(geom::weaveffi_geom_Shape_Labeled_get_count(labeled), 6);
-
-    // A function taking the rich enum by reference.
-    let d = geom::weaveffi_geom_describe(circle, &mut err);
     assert_eq!(c_ptr_to_string(d).unwrap(), "circle(2.5)");
     free_string(d);
-
-    geom::weaveffi_geom_Shape_destroy(empty);
-    geom::weaveffi_geom_Shape_destroy(circle);
-    geom::weaveffi_geom_Shape_destroy(labeled);
 }
 
 #[test]
@@ -667,19 +650,24 @@ fn async_struct_result_completes_via_callback() {
     use std::time::Duration;
 
     type Msg = (bool, i64, String);
-    extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: *mut tasks::TaskResult) {
+    // The buffered result is borrowed for the callback's duration: decode
+    // inside the callback (the producer frees the encoding afterward).
+    extern "C" fn cb(
+        ctx: *mut c_void,
+        err: *mut weaveffi_error,
+        result_ptr: *const u8,
+        result_len: usize,
+    ) {
         let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
         let had_err = !err.is_null() && unsafe { (*err).code } != 0;
-        let payload = if result.is_null() {
+        let payload = if result_ptr.is_null() {
             (had_err, 0, String::new())
         } else {
-            let r = unsafe { &*result };
-            (had_err, r.id, r.value.clone())
+            let bytes = unsafe { std::slice::from_raw_parts(result_ptr, result_len) };
+            let r: tasks::TaskResult = abi::decode_value(bytes).expect("well-formed result");
+            (had_err, r.id, r.value)
         };
         tx.send(payload).unwrap();
-        if !result.is_null() {
-            tasks::weaveffi_tasks_TaskResult_destroy(result);
-        }
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
@@ -769,15 +757,12 @@ fn nested_module_symbols_and_parent_type_reference() {
     assert!(!session.is_null());
 
     // The nested function is reachable at `outer::inner::*` and its symbol
-    // carries the joined module path.
-    let report = outer::inner::weaveffi_outer_inner_summarize(session, &mut err);
+    // carries the joined module path; its record return is a value buffer.
+    let mut out_len: usize = 0;
+    let ptr = outer::inner::weaveffi_outer_inner_summarize(session, &mut out_len, &mut err);
     assert_eq!(err.code, 0);
-    assert!(!report.is_null());
-    assert_eq!(
-        outer::inner::weaveffi_outer_inner_Report_get_score(report),
-        70
-    );
-    outer::inner::weaveffi_outer_inner_Report_destroy(report);
+    let report: outer::inner::Report = decode_ret(ptr, out_len);
+    assert_eq!(report.score, 70);
 
     unsafe { drop(Box::from_raw(session)) };
 }
@@ -1087,4 +1072,70 @@ fn deprecated_export_thunk_compiles_and_runs() {
     let bumped = legacy::weaveffi_legacy_bump(41, &mut err);
     assert_eq!(bumped, 42);
     assert_eq!(err.code, 0);
+}
+
+/// A producer module whose error domain carries structured payload fields:
+/// the variant's named fields travel through the error slot's
+/// `payload_ptr`/`payload_len` serialized in the value-buffer format.
+#[weaveffi::module]
+pub mod quota {
+    /// The quota error domain. `Exceeded` carries a structured payload.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    #[repr(i32)]
+    pub enum QuotaError {
+        /// quota exceeded
+        Exceeded {
+            /// The configured limit.
+            limit: i64,
+            /// The amount actually used.
+            used: i64,
+        } = 3001,
+        /// quota service unavailable
+        Unavailable = 3002,
+    }
+
+    /// Consume `amount` units against a limit of 100.
+    #[weaveffi::export]
+    pub fn consume(amount: i64) -> Result<i64, QuotaError> {
+        match amount {
+            a if a < 0 => Err(QuotaError::Unavailable),
+            a if a > 100 => Err(QuotaError::Exceeded {
+                limit: 100,
+                used: a,
+            }),
+            a => Ok(100 - a),
+        }
+    }
+}
+
+#[test]
+fn error_payload_fields_cross_the_abi() {
+    let mut err = ok_err();
+
+    // Success leaves the payload slots empty.
+    assert_eq!(quota::weaveffi_quota_consume(30, &mut err), 70);
+    assert_eq!(err.code, 0);
+    assert!(err.payload_ptr.is_null());
+
+    // A payload-carrying variant serializes its fields in declaration order.
+    let r = quota::weaveffi_quota_consume(250, &mut err);
+    assert_eq!(r, 0, "error path returns the zero sentinel");
+    assert_eq!(err.code, 3001);
+    assert_eq!(c_ptr_to_string(err.message).unwrap(), "quota exceeded");
+    assert!(!err.payload_ptr.is_null());
+    let payload = unsafe { std::slice::from_raw_parts(err.payload_ptr, err.payload_len) };
+    let mut reader = abi::BufferReader::new(payload);
+    assert_eq!(reader.read_i64().unwrap(), 100, "limit field");
+    assert_eq!(reader.read_i64().unwrap(), 250, "used field");
+    reader.expect_end().unwrap();
+    abi::error_clear(&mut err);
+    assert!(err.payload_ptr.is_null(), "clear releases the payload");
+
+    // A unit variant reports code and message with no payload.
+    let r = quota::weaveffi_quota_consume(-1, &mut err);
+    assert_eq!(r, 0);
+    assert_eq!(err.code, 3002);
+    assert!(err.payload_ptr.is_null());
+    abi::error_clear(&mut err);
 }

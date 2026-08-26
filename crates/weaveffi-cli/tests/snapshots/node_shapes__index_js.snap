@@ -21,8 +21,8 @@ if (process.env.WEAVEFFI_ADDON) {
 }
 
 // Re-export every native binding, then layer the idiomatic wrappers
-// (error classes, interface and rich-enum classes, function wrappers)
-// on top.
+// (error classes, interface classes, buffer pack/unpack, function
+// wrappers) on top.
 const wv = {};
 for (const _name of Object.getOwnPropertyNames(addon)) {
   wv[_name] = addon[_name];
@@ -41,7 +41,7 @@ function __generic(code, message) {
   return new WeaveFFIError(code, message);
 }
 function __rebrand(e, map) {
-  return e && typeof e.code === 'number' ? map(e.code, e.message) : e;
+  return e && typeof e.code === 'number' ? map(e.code, e.message, e.payload) : e;
 }
 function __invoke(fn, args, map) {
   try {
@@ -56,79 +56,207 @@ function __invokeAsync(fn, args, map) {
   });
 }
 
-class Shape {
-  constructor(handle) {
-    this._handle = handle;
-    Shape._cleanup.register(this, handle, this);
+// --- Private value-buffer runtime (WeaveFFI wire format) --------------------
+// Little-endian, packed, no alignment. Decoders reject truncated buffers,
+// invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
+const __utf8 = new TextDecoder('utf-8', { fatal: true });
+function __bufferError(what) {
+  return new WeaveFFIError(-2, 'malformed value buffer: ' + what);
+}
+class __Writer {
+  constructor() {
+    this._buf = Buffer.alloc(256);
+    this._len = 0;
   }
-  static empty() {
-    return new Shape(__invoke(addon.Shape_empty_new, [], __generic));
+  _reserve(n) {
+    if (this._len + n <= this._buf.length) return;
+    let cap = this._buf.length;
+    while (cap < this._len + n) cap *= 2;
+    const grown = Buffer.alloc(cap);
+    this._buf.copy(grown, 0, 0, this._len);
+    this._buf = grown;
   }
-  static circle(radius) {
-    return new Shape(__invoke(addon.Shape_circle_new, [radius], __generic));
+  bool(v) { this._reserve(1); this._buf[this._len++] = v ? 1 : 0; }
+  i8(v) { this._reserve(1); this._buf.writeInt8(v, this._len); this._len += 1; }
+  u8(v) { this._reserve(1); this._buf.writeUInt8(v, this._len); this._len += 1; }
+  i16(v) { this._reserve(2); this._buf.writeInt16LE(v, this._len); this._len += 2; }
+  u16(v) { this._reserve(2); this._buf.writeUInt16LE(v, this._len); this._len += 2; }
+  i32(v) { this._reserve(4); this._buf.writeInt32LE(v, this._len); this._len += 4; }
+  u32(v) { this._reserve(4); this._buf.writeUInt32LE(v, this._len); this._len += 4; }
+  i64(v) { this._reserve(8); this._buf.writeBigInt64LE(BigInt(v), this._len); this._len += 8; }
+  u64(v) { this._reserve(8); this._buf.writeBigUInt64LE(BigInt(v), this._len); this._len += 8; }
+  f32(v) { this._reserve(4); this._buf.writeFloatLE(v, this._len); this._len += 4; }
+  f64(v) { this._reserve(8); this._buf.writeDoubleLE(v, this._len); this._len += 8; }
+  str(v) {
+    const b = Buffer.from(String(v), 'utf8');
+    this.u32(b.length);
+    this._reserve(b.length);
+    b.copy(this._buf, this._len);
+    this._len += b.length;
   }
-  static rectangle(width, height) {
-    return new Shape(__invoke(addon.Shape_rectangle_new, [width, height], __generic));
+  bytes(v) {
+    this.u32(v.length);
+    this._reserve(v.length);
+    this._buf.set(v, this._len);
+    this._len += v.length;
   }
-  static bounded(min, max, weight) {
-    return new Shape(__invoke(addon.Shape_bounded_new, [min, max, weight], __generic));
+  finish() { return this._buf.subarray(0, this._len); }
+}
+class __Reader {
+  constructor(buf) {
+    this._buf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+    this._pos = 0;
   }
-  static labeled(label, count) {
-    return new Shape(__invoke(addon.Shape_labeled_new, [label, count], __generic));
+  _take(n, what) {
+    if (this._pos + n > this._buf.length) throw __bufferError(what);
+    const at = this._pos;
+    this._pos += n;
+    return at;
   }
-  tag() {
-    return addon.Shape_tag(this._handle);
+  bool() {
+    const b = this._buf[this._take(1, 'bool')];
+    if (b > 1) throw __bufferError('bool byte out of range');
+    return b === 1;
   }
-  get circleRadius() {
-    return addon.Shape_circle_get_radius(this._handle);
+  i8() { return this._buf.readInt8(this._take(1, 'i8')); }
+  u8() { return this._buf.readUInt8(this._take(1, 'u8')); }
+  i16() { return this._buf.readInt16LE(this._take(2, 'i16')); }
+  u16() { return this._buf.readUInt16LE(this._take(2, 'u16')); }
+  i32() { return this._buf.readInt32LE(this._take(4, 'i32')); }
+  u32() { return this._buf.readUInt32LE(this._take(4, 'u32')); }
+  i64() { return this._buf.readBigInt64LE(this._take(8, 'i64')); }
+  u64() { return this._buf.readBigUInt64LE(this._take(8, 'u64')); }
+  f32() { return this._buf.readFloatLE(this._take(4, 'f32')); }
+  f64() { return this._buf.readDoubleLE(this._take(8, 'f64')); }
+  len() {
+    const n = this.u32();
+    if (n > this._buf.length - this._pos) throw __bufferError('length prefix exceeds remaining bytes');
+    return n;
   }
-  get rectangleWidth() {
-    return addon.Shape_rectangle_get_width(this._handle);
-  }
-  get rectangleHeight() {
-    return addon.Shape_rectangle_get_height(this._handle);
-  }
-  get boundedMin() {
-    return addon.Shape_bounded_get_min(this._handle);
-  }
-  get boundedMax() {
-    return addon.Shape_bounded_get_max(this._handle);
-  }
-  get boundedWeight() {
-    return addon.Shape_bounded_get_weight(this._handle);
-  }
-  get labeledLabel() {
-    return addon.Shape_labeled_get_label(this._handle);
-  }
-  get labeledCount() {
-    return addon.Shape_labeled_get_count(this._handle);
-  }
-  destroy() {
-    if (this._handle) {
-      Shape._cleanup.unregister(this);
-      addon.Shape_destroy(this._handle);
-      this._handle = 0;
+  str() {
+    const n = this.len();
+    const at = this._take(n, 'string bytes');
+    try {
+      return __utf8.decode(this._buf.subarray(at, at + n));
+    } catch (e) {
+      throw __bufferError('string is not valid UTF-8');
     }
   }
+  bytes() {
+    const n = this.len();
+    const at = this._take(n, 'byte buffer');
+    return Buffer.from(this._buf.subarray(at, at + n));
+  }
+  end() {
+    if (this._pos !== this._buf.length) throw __bufferError('trailing bytes after value');
+  }
 }
-Shape._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.Shape_destroy(handle); }
-});
-Shape.Tag = Object.freeze({ Empty: 0, Circle: 1, Rectangle: 2, Bounded: 3, Labeled: 4 });
-wv.Shape = Shape;
+function __encode(f, v) { const w = new __Writer(); f(w, v); return w.finish(); }
+function __decode(f, b) { const r = new __Reader(b); const v = f(r); r.end(); return v; }
+function __wOpt(w, v, f) { if (v === null || v === undefined) { w.bool(false); } else { w.bool(true); f(w, v); } }
+function __rOpt(r, f) { return r.bool() ? f(r) : null; }
+function __wList(w, v, f) { w.u32(v.length); for (const e of v) f(w, e); }
+function __rList(r, f) {
+  const n = r.len();
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(f(r));
+  return out;
+}
+function __wMap(w, v, kf, vf) {
+  const keys = Object.keys(v);
+  w.u32(keys.length);
+  for (const k of keys) { kf(w, k); vf(w, v[k]); }
+}
+function __rMap(r, kf, vf) {
+  const n = r.len();
+  const out = {};
+  for (let i = 0; i < n; i++) {
+    const k = kf(r);
+    out[k] = vf(r);
+  }
+  return out;
+}
+
+function __packNumerics(w, v) {
+  w.i8(v.a);
+  w.i16(v.b);
+  w.i32(v.c);
+  w.i64(v.d);
+  w.u8(v.e);
+  w.u16(v.f);
+  w.u32(v.g);
+  w.u64(v.h);
+  w.f32(v.i);
+  w.f64(v.j);
+}
+function __unpackNumerics(r) {
+  return {
+    a: r.i8(),
+    b: r.i16(),
+    c: r.i32(),
+    d: Number(r.i64()),
+    e: r.u8(),
+    f: r.u16(),
+    g: r.u32(),
+    h: Number(r.u64()),
+    i: r.f32(),
+    j: r.f64(),
+  };
+}
+function __packShape(w, v) {
+  switch (v.tag) {
+    case 'Empty':
+      w.i32(0);
+      break;
+    case 'Circle':
+      w.i32(1);
+      w.f64(v.radius);
+      break;
+    case 'Rectangle':
+      w.i32(2);
+      w.f32(v.width);
+      w.f32(v.height);
+      break;
+    case 'Bounded':
+      w.i32(3);
+      w.i16(v.min);
+      w.i16(v.max);
+      w.u64(v.weight);
+      break;
+    case 'Labeled':
+      w.i32(4);
+      w.str(v.label);
+      w.u8(v.count);
+      break;
+    default:
+      throw new WeaveFFIError(-2, 'unknown Shape tag: ' + (v && v.tag));
+  }
+}
+function __unpackShape(r) {
+  const tag = r.i32();
+  switch (tag) {
+    case 0: return { tag: 'Empty' };
+    case 1: return { tag: 'Circle', radius: r.f64() };
+    case 2: return { tag: 'Rectangle', width: r.f32(), height: r.f32() };
+    case 3: return { tag: 'Bounded', min: r.i16(), max: r.i16(), weight: Number(r.u64()) };
+    case 4: return { tag: 'Labeled', label: r.str(), count: r.u8() };
+    default: throw new WeaveFFIError(-2, 'unknown Shape tag: ' + tag);
+  }
+}
 
 wv.describe = function (shape) {
-  return __invoke(addon.describe, [shape instanceof Shape ? shape._handle : shape], __generic);
+  return __invoke(addon.describe, [__encode(__packShape, shape)], __generic);
 };
 wv.scale = function (shape, factor) {
-  const _r = __invoke(addon.scale, [shape instanceof Shape ? shape._handle : shape, factor], __generic);
-  return new Shape(_r);
+  const _r = __invoke(addon.scale, [__encode(__packShape, shape), factor], __generic);
+  return __decode(__unpackShape, _r);
 };
 wv.sumBytes = function (values) {
   return __invoke(addon.sumBytes, [values], __generic);
 };
 wv.makeNumerics = function (a, b, c, d, e, f, g, h, i, j) {
-  return __invoke(addon.makeNumerics, [a, b, c, d, e, f, g, h, i, j], __generic);
+  const _r = __invoke(addon.makeNumerics, [a, b, c, d, e, f, g, h, i, j], __generic);
+  return __decode(__unpackNumerics, _r);
 };
 
 module.exports = wv;

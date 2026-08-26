@@ -1,12 +1,14 @@
 // Conformance consumer: contacts sample, Swift target.
 //
-// Binds through the generated `Contacts` module and asserts the 0.5.0
+// Binds through the generated `Contacts` module and asserts the 0.6.0
 // interface surface: `ContactBook` as a final class whose `new` constructor is
 // a plain `init()`, throwing methods (`add`, `get`) that raise the typed
 // `ContactsError` domain enum, non-throwing methods (`list`, `remove`,
-// `count`) called without `try`, real argument labels, enum marshalling,
-// optional strings (nil email), and list-of-struct returns. The typed-error
-// asserts pin both the case and the numeric code carried by `errorCode`.
+// `count`) called without `try`, real argument labels, enum marshalling, and
+// `Contact` as a plain struct decoded from a value buffer: stored properties
+// (no getters), an optional string field (nil email), and a list-of-struct
+// return decoded to `[Contact]`. The typed-error asserts pin both the case
+// and the numeric code carried by `errorCode`.
 
 import Foundation
 import Contacts
@@ -28,23 +30,29 @@ do {
         email: "alice@example.com", contactType: .work)
     expect(alice.id > 0, "alice id positive")
 
+    // The record is a value type: `get` decodes a fresh Contact struct whose
+    // stored properties round-trip the producer's field values.
     let c = try book.get(id: alice.id)
-    expect(c.first_name == "Alice", "first_name")
-    expect(c.last_name == "Smith", "last_name")
+    expect(c.firstName == "Alice", "firstName")
+    expect(c.lastName == "Smith", "lastName")
     expect(c.email == "alice@example.com", "email")
-    expect(c.contact_type == .work, "contact_type")
+    expect(c.contactType == .work, "contactType")
 
     // Optional string: a missing email round-trips as nil.
     let bob = try book.add(firstName: "Bob", lastName: "Jones", email: nil, contactType: .personal)
     let cb = try book.get(id: bob.id)
     expect(cb.email == nil, "bob email nil")
-    expect(cb.contact_type == .personal, "bob contact_type")
+    expect(cb.contactType == .personal, "bob contactType")
+
+    // The memberwise init builds a local value without touching the ABI.
+    let local = Contact(id: 42, firstName: "Carol", lastName: "Doe", email: nil, contactType: .other)
+    expect(local.id == 42 && local.email == nil, "memberwise init")
 
     // Non-throwing methods need no `try`.
     expect(book.count() == 2, "count == 2")
     let everyone = book.list()
     expect(everyone.count == 2, "list count == 2")
-    let names = everyone.map { $0.first_name }.sorted()
+    let names = everyone.map { $0.firstName }.sorted()
     expect(names == ["Alice", "Bob"], "list names")
 
     expect(book.remove(id: alice.id) == true, "remove returns true")

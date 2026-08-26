@@ -1,17 +1,28 @@
 //! The structural lowering: how each [`TypeRef`] maps onto C ABI parameter
 //! and return slots. This is the single source of truth every generator
-//! shares; it replaces the per-generator `*_param_argtypes` / `*_return_info`
-//! / `*_element_type` copies that used to drift apart.
+//! shares.
+//!
+//! The lowering splits every type into one of two families:
+//!
+//! * **Direct** types occupy dedicated C slots: scalars, bools, and C-style
+//!   enums by value; strings as `const char*`; bytes as `ptr` + `len`;
+//!   handles as `uint64_t`; interfaces and iterators as opaque pointers.
+//! * **Buffered** types (records, rich enums, optionals, lists, and maps;
+//!   see [`is_buffered`]) cross as one serialized value buffer: a
+//!   `const uint8_t*` + `size_t` pair encoded in the WeaveFFI buffer format
+//!   (`weaveffi-abi`'s `buffer` module). A buffered parameter is borrowed for
+//!   the call; a buffered return is producer-allocated and released with
+//!   `{prefix}_free_bytes` after decoding. The single exception is an
+//!   optional interface, which stays a nullable object pointer.
 
 use weaveffi_ir::ir::TypeRef;
 
 use super::ctype::{CType, ConstPos};
-use crate::codegen::common::is_c_pointer_type;
 
 /// A named C parameter slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiParam {
-    /// The C parameter name (e.g. `out_err`, `data_ptr`, `m_keys`).
+    /// The C parameter name (e.g. `out_err`, `data_ptr`, `contact_len`).
     pub name: String,
     /// The C type of the slot.
     pub ty: CType,
@@ -28,8 +39,7 @@ impl AbiParam {
 }
 
 /// A lowered return: the C return type plus any trailing out-parameters
-/// (e.g. `size_t* out_len`, or the `out_keys`/`out_values`/`out_len` triple
-/// for maps).
+/// (e.g. `size_t* out_len` for a bytes or buffered return).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbiReturn {
     /// The C return type, or `void` when the value is delivered entirely
@@ -37,6 +47,20 @@ pub struct AbiReturn {
     pub ret: CType,
     /// Trailing out-parameter slots appended after the function's inputs.
     pub out_params: Vec<AbiParam>,
+}
+
+/// `true` when `ty` crosses the C ABI as a serialized value buffer
+/// (`const uint8_t*` + `size_t`) rather than as dedicated C slots.
+///
+/// Buffered types are records, rich enums, lists, maps, and optionals, with
+/// one exception: an optional *interface* stays a nullable object pointer
+/// (an object reference cannot be serialized by value).
+pub fn is_buffered(ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => true,
+        TypeRef::Optional(inner) => !matches!(inner.as_ref(), TypeRef::Interface(_)),
+        _ => false,
+    }
 }
 
 /// Split a (possibly qualified) type reference into its C module-path segment
@@ -58,7 +82,8 @@ pub fn split_qualified(name: &str, current_module: &str) -> (String, String) {
     }
 }
 
-/// Resolve a struct reference (possibly `module.Name`) to its C tag type.
+/// Resolve a struct/interface reference (possibly `module.Name`) to its C tag
+/// type.
 pub fn struct_tag(name: &str, current_module: &str) -> CType {
     let (module, name) = split_qualified(name, current_module);
     CType::StructTag { module, name }
@@ -78,42 +103,18 @@ fn typed_handle_ctype(name: &str, current_module: &str) -> CType {
 }
 
 /// Resolve an interface reference (possibly `module.Name`) to a pointer to its
-/// opaque C tag. Interfaces and structs share the tag spelling
-/// (`{prefix}_{module}_{Name}`); only the ownership convention differs.
+/// opaque C tag.
 fn interface_ptr_ctype(name: &str, current_module: &str) -> CType {
     CType::ptr(struct_tag(name, current_module))
 }
 
-/// The C "element" type used in pointer/array contexts. Composite shapes
-/// collapse to their innermost element; maps collapse to `void*`.
-pub fn element_ctype(ty: &TypeRef, module: &str) -> CType {
-    match ty {
-        TypeRef::I8 => CType::Int8,
-        TypeRef::I16 => CType::Int16,
-        TypeRef::I32 => CType::Int32,
-        TypeRef::I64 => CType::Int64,
-        TypeRef::U8 => CType::Uint8,
-        TypeRef::U16 => CType::Uint16,
-        TypeRef::U32 => CType::Uint32,
-        TypeRef::U64 => CType::Uint64,
-        TypeRef::F32 => CType::Float,
-        TypeRef::F64 => CType::Double,
-        TypeRef::Bool => CType::Bool,
-        TypeRef::Handle => CType::Handle,
-        TypeRef::TypedHandle(n) => typed_handle_ctype(n, module),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => CType::const_ptr(CType::Char),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => CType::const_ptr(CType::Uint8),
-        // A record or rich (algebraic) enum crosses the ABI as an opaque
-        // object pointer. An interface object uses the same pointer spelling.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) => CType::ptr(struct_tag(s, module)),
-        TypeRef::Interface(i) => interface_ptr_ctype(i, module),
-        TypeRef::Named(n) => unreachable!("unresolved type reference '{n}' reached ABI lowering"),
-        TypeRef::Enum(e) => enum_ctype(e, module),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            element_ctype(inner, module)
-        }
-        TypeRef::Map(_, _) => CType::ptr(CType::Void),
-    }
+/// The two slots of a borrowed buffered parameter: `const uint8_t* {name}_ptr`
+/// and `size_t {name}_len`.
+fn buffer_param_slots(name: &str) -> Vec<AbiParam> {
+    vec![
+        AbiParam::new(format!("{name}_ptr"), CType::const_ptr(CType::Uint8)),
+        AbiParam::new(format!("{name}_len"), CType::Size),
+    ]
 }
 
 /// Expand one IR parameter into its ordered C ABI slots.
@@ -123,6 +124,11 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
     } else {
         ConstPos::West
     };
+    if is_buffered(ty) {
+        // A buffered parameter is always an immutable borrow of the encoded
+        // value; validation rejects `mutable: true` on buffered types.
+        return buffer_param_slots(name);
+    }
     match ty {
         TypeRef::I8 => vec![AbiParam::new(name, CType::Int8)],
         TypeRef::I16 => vec![AbiParam::new(name, CType::Int16)],
@@ -154,14 +160,6 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
         ],
         TypeRef::Handle => vec![AbiParam::new(name, CType::Handle)],
         TypeRef::TypedHandle(n) => vec![AbiParam::new(name, typed_handle_ctype(n, module))],
-        // A record or rich enum is passed as a (const) pointer to its opaque tag.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) => vec![AbiParam::new(
-            name,
-            CType::Ptr {
-                konst: west_if_immut,
-                pointee: Box::new(struct_tag(s, module)),
-            },
-        )],
         TypeRef::Named(n) => unreachable!("unresolved type reference '{n}' reached ABI lowering"),
         // An interface parameter borrows the object for the call: the callee
         // reads through the const pointer and never takes ownership.
@@ -173,73 +171,11 @@ pub fn lower_param(name: &str, ty: &TypeRef, module: &str, mutable: bool) -> Vec
             },
         )],
         TypeRef::Enum(e) => vec![AbiParam::new(name, enum_ctype(e, module))],
-        TypeRef::Optional(inner) => {
-            if is_c_pointer_type(inner) {
-                lower_param(name, inner, module, mutable)
-            } else {
-                vec![AbiParam::new(
-                    name,
-                    CType::Ptr {
-                        konst: west_if_immut,
-                        pointee: Box::new(element_ctype(inner, module)),
-                    },
-                )]
-            }
-        }
-        TypeRef::List(inner) => {
-            let elem = element_ctype(inner, module);
-            let konst = if mutable {
-                ConstPos::None
-            } else if is_c_pointer_type(inner) {
-                ConstPos::East
-            } else {
-                ConstPos::West
-            };
-            vec![
-                AbiParam::new(
-                    name,
-                    CType::Ptr {
-                        konst,
-                        pointee: Box::new(elem),
-                    },
-                ),
-                AbiParam::new(format!("{name}_len"), CType::Size),
-            ]
-        }
-        TypeRef::Map(k, v) => {
-            let key_elem = element_ctype(k, module);
-            let val_elem = element_ctype(v, module);
-            let key_konst = if mutable {
-                ConstPos::None
-            } else if is_c_pointer_type(k) {
-                ConstPos::East
-            } else {
-                ConstPos::West
-            };
-            let val_konst = if mutable {
-                ConstPos::None
-            } else if is_c_pointer_type(v) {
-                ConstPos::East
-            } else {
-                ConstPos::West
-            };
-            vec![
-                AbiParam::new(
-                    format!("{name}_keys"),
-                    CType::Ptr {
-                        konst: key_konst,
-                        pointee: Box::new(key_elem),
-                    },
-                ),
-                AbiParam::new(
-                    format!("{name}_values"),
-                    CType::Ptr {
-                        konst: val_konst,
-                        pointee: Box::new(val_elem),
-                    },
-                ),
-                AbiParam::new(format!("{name}_len"), CType::Size),
-            ]
+        // Only `Interface?` reaches here (every other optional is buffered):
+        // a nullable borrowed object pointer, null meaning none.
+        TypeRef::Optional(inner) => lower_param(name, inner, module, mutable),
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
     }
@@ -251,6 +187,14 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
         ret,
         out_params: vec![],
     };
+    if is_buffered(ty) {
+        // A buffered return is producer-allocated, exactly like a bytes
+        // return: the caller decodes it and then calls `{prefix}_free_bytes`.
+        return AbiReturn {
+            ret: CType::const_ptr(CType::Uint8),
+            out_params: vec![AbiParam::new("out_len", CType::ptr(CType::Size))],
+        };
+    }
     match ty {
         TypeRef::I8 => no_out(CType::Int8),
         TypeRef::I16 => no_out(CType::Int16),
@@ -270,39 +214,15 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
         },
         TypeRef::Handle => no_out(CType::Handle),
         TypeRef::TypedHandle(n) => no_out(typed_handle_ctype(n, module)),
-        // A record or rich enum is returned as an owning pointer to its tag.
-        TypeRef::Record(s) | TypeRef::RichEnum(s) => no_out(CType::ptr(struct_tag(s, module))),
         TypeRef::Named(n) => unreachable!("unresolved type reference '{n}' reached ABI lowering"),
         // A returned interface transfers ownership of a new object reference.
         TypeRef::Interface(i) => no_out(interface_ptr_ctype(i, module)),
         TypeRef::Enum(e) => no_out(enum_ctype(e, module)),
-        TypeRef::Optional(inner) => {
-            if is_c_pointer_type(inner) {
-                lower_return(inner, module)
-            } else {
-                no_out(CType::ptr(element_ctype(inner, module)))
-            }
+        // Only `Interface?` reaches here: a nullable owned object pointer.
+        TypeRef::Optional(inner) => lower_return(inner, module),
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
-        TypeRef::List(inner) => AbiReturn {
-            ret: CType::ptr(element_ctype(inner, module)),
-            out_params: vec![AbiParam::new("out_len", CType::ptr(CType::Size))],
-        },
-        // A returned map is two producer-allocated parallel arrays. The
-        // function must hand back the *base* of each array, so the out-param is
-        // a pointer to the array pointer: `K** out_keys` / `V** out_values`
-        // (e.g. `const char*** out_keys`, `int32_t** out_values`). The caller
-        // declares `K* keys = NULL; fn(&keys, ...)` and indexes `keys[i]`.
-        TypeRef::Map(k, v) => AbiReturn {
-            ret: CType::Void,
-            out_params: vec![
-                AbiParam::new("out_keys", CType::ptr(CType::ptr(element_ctype(k, module)))),
-                AbiParam::new(
-                    "out_values",
-                    CType::ptr(CType::ptr(element_ctype(v, module))),
-                ),
-                AbiParam::new("out_len", CType::ptr(CType::Size)),
-            ],
-        },
         TypeRef::Iterator(_) => {
             unreachable!("iterator return handled specially by the function lowering")
         }
@@ -311,19 +231,20 @@ pub fn lower_return(ty: &TypeRef, module: &str) -> AbiReturn {
 
 /// The trailing result fields appended to an async callback after the
 /// `(context, err)` prefix.
+///
+/// Bytes and buffered results are passed as a borrowed `ptr` + `len` pair
+/// (the producer owns the buffer for the callback's duration); everything
+/// else reuses its return slot type by value.
 pub fn callback_result_params(ty: &TypeRef, module: &str) -> Vec<AbiParam> {
+    if is_buffered(ty) {
+        return vec![
+            AbiParam::new("result_ptr", CType::const_ptr(CType::Uint8)),
+            AbiParam::new("result_len", CType::Size),
+        ];
+    }
     match ty {
         TypeRef::Bytes | TypeRef::BorrowedBytes => vec![
             AbiParam::new("result", CType::const_ptr(CType::Uint8)),
-            AbiParam::new("result_len", CType::Size),
-        ],
-        TypeRef::List(inner) => vec![
-            AbiParam::new("result", CType::ptr(element_ctype(inner, module))),
-            AbiParam::new("result_len", CType::Size),
-        ],
-        TypeRef::Map(k, v) => vec![
-            AbiParam::new("result_keys", CType::ptr(element_ctype(k, module))),
-            AbiParam::new("result_values", CType::ptr(element_ctype(v, module))),
             AbiParam::new("result_len", CType::Size),
         ],
         _ => {
@@ -373,48 +294,71 @@ mod tests {
     }
 
     #[test]
-    fn list_of_scalar_uses_west_const() {
+    fn buffered_kinds_are_detected() {
+        assert!(is_buffered(&TypeRef::Record("Contact".into())));
+        assert!(is_buffered(&TypeRef::RichEnum("Shape".into())));
+        assert!(is_buffered(&TypeRef::List(Box::new(TypeRef::I32))));
+        assert!(is_buffered(&TypeRef::Map(
+            Box::new(TypeRef::StringUtf8),
+            Box::new(TypeRef::I32)
+        )));
+        assert!(is_buffered(&TypeRef::Optional(Box::new(TypeRef::I32))));
+        assert!(is_buffered(&TypeRef::Optional(Box::new(
+            TypeRef::StringUtf8
+        ))));
+        // The one optional exception: nullable interface pointers.
+        assert!(!is_buffered(&TypeRef::Optional(Box::new(
+            TypeRef::Interface("Store".into())
+        ))));
+        assert!(!is_buffered(&TypeRef::I32));
+        assert!(!is_buffered(&TypeRef::StringUtf8));
+        assert!(!is_buffered(&TypeRef::Bytes));
+        assert!(!is_buffered(&TypeRef::Interface("Store".into())));
+        assert!(!is_buffered(&TypeRef::Enum("Color".into())));
+    }
+
+    #[test]
+    fn list_param_is_one_buffer() {
         let xs = TypeRef::List(Box::new(TypeRef::I32));
         assert_eq!(
             render(&lower_param("xs", &xs, "m", false)),
-            ["const int32_t* xs", "size_t xs_len"]
+            ["const uint8_t* xs_ptr", "size_t xs_len"]
         );
     }
 
     #[test]
-    fn list_of_string_uses_east_const() {
-        let xs = TypeRef::List(Box::new(TypeRef::StringUtf8));
-        assert_eq!(
-            render(&lower_param("xs", &xs, "m", false)),
-            ["const char* const* xs", "size_t xs_len"]
-        );
+    fn record_param_is_one_buffer() {
+        let p = lower_param("c", &TypeRef::Record("other.Contact".into()), "ops", false);
+        assert_eq!(render(&p), ["const uint8_t* c_ptr", "size_t c_len"]);
     }
 
     #[test]
-    fn optional_scalar_is_pointer() {
+    fn optional_scalar_is_buffered() {
         let o = TypeRef::Optional(Box::new(TypeRef::I32));
         assert_eq!(
             render(&lower_param("x", &o, "m", false)),
-            ["const int32_t* x"]
+            ["const uint8_t* x_ptr", "size_t x_len"]
         );
     }
 
     #[test]
-    fn optional_string_is_just_the_pointer() {
-        let o = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
-        assert_eq!(render(&lower_param("s", &o, "m", false)), ["const char* s"]);
+    fn optional_interface_is_nullable_pointer() {
+        let o = TypeRef::Optional(Box::new(TypeRef::Interface("Store".into())));
+        assert_eq!(
+            render(&lower_param("s", &o, "kv", false)),
+            ["const weaveffi_kv_Store* s"]
+        );
+        let r = lower_return(&o, "kv");
+        assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_kv_Store*");
+        assert!(r.out_params.is_empty());
     }
 
     #[test]
-    fn map_param_is_parallel_arrays() {
+    fn map_param_is_one_buffer() {
         let m = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
         assert_eq!(
             render(&lower_param("m", &m, "mod", false)),
-            [
-                "const char* const* m_keys",
-                "const int32_t* m_values",
-                "size_t m_len"
-            ]
+            ["const uint8_t* m_ptr", "size_t m_len"]
         );
     }
 
@@ -426,30 +370,28 @@ mod tests {
     }
 
     #[test]
-    fn map_return_is_void_with_triple_out() {
-        let m = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
-        let r = lower_return(&m, "mod");
-        assert_eq!(r.ret, CType::Void);
+    fn buffered_returns_share_the_bytes_shape() {
+        for ty in [
+            TypeRef::Record("Contact".into()),
+            TypeRef::RichEnum("Shape".into()),
+            TypeRef::List(Box::new(TypeRef::Record("Contact".into()))),
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            TypeRef::Optional(Box::new(TypeRef::I64)),
+            TypeRef::List(Box::new(TypeRef::List(Box::new(TypeRef::I32)))),
+        ] {
+            let r = lower_return(&ty, "m");
+            assert_eq!(r.ret.render_c("weaveffi"), "const uint8_t*", "{ty:?}");
+            assert_eq!(render(&r.out_params), ["size_t* out_len"], "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn callback_buffered_result_is_borrowed_pair() {
+        let params = callback_result_params(&TypeRef::List(Box::new(TypeRef::StringUtf8)), "m");
         assert_eq!(
-            render(&r.out_params),
-            [
-                "const char*** out_keys",
-                "int32_t** out_values",
-                "size_t* out_len"
-            ]
+            render(&params),
+            ["const uint8_t* result_ptr", "size_t result_len"]
         );
-    }
-
-    #[test]
-    fn struct_return_is_pointer() {
-        let r = lower_return(&TypeRef::Record("Contact".into()), "contacts");
-        assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_contacts_Contact*");
-    }
-
-    #[test]
-    fn cross_module_struct_param_resolves_module() {
-        let p = lower_param("c", &TypeRef::Record("other.Contact".into()), "ops", false);
-        assert_eq!(render(&p), ["const weaveffi_other_Contact* c"]);
     }
 
     #[test]
@@ -495,12 +437,5 @@ mod tests {
             false,
         );
         assert_eq!(render(&p), ["weaveffi_auth_Session* h"]);
-    }
-
-    #[test]
-    fn nested_module_struct_return_flattens_path() {
-        // Multi-level nesting: `a.b.Widget` -> `weaveffi_a_b_Widget*`.
-        let r = lower_return(&TypeRef::Record("a.b.Widget".into()), "root");
-        assert_eq!(r.ret.render_c("weaveffi"), "weaveffi_a_b_Widget*");
     }
 }

@@ -52,14 +52,12 @@ export declare class EmptyOrder extends OrdersError {
 }
 
 export interface Product {
-  readonly id: bigint;
-  readonly name: string;
-  readonly description: string | null;
-  readonly price: number;
-  readonly category: Category;
-  readonly tags: string[];
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  id: bigint;
+  name: string;
+  description: string | null;
+  price: number;
+  category: Category;
+  tags: string[];
 }
 
 export declare const Category: Readonly<{
@@ -100,20 +98,16 @@ export declare class Catalog {
 }
 
 export interface OrderItem {
-  readonly product_id: bigint;
-  readonly quantity: number;
-  readonly unit_price: number;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  product_id: bigint;
+  quantity: number;
+  unit_price: number;
 }
 
 export interface Order {
-  readonly id: bigint;
-  readonly items: OrderItem[];
-  readonly total: number;
-  readonly status: string;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  id: bigint;
+  items: OrderItem[];
+  total: number;
+  status: string;
 }
 
 export interface WeaveffiWasmModule {

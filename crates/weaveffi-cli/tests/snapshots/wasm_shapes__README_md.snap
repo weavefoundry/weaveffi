@@ -21,21 +21,21 @@ Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
 
 Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). Complex types are encoded at the boundary as follows:
 
-### Structs
+### Records
 
-Structs are passed as **opaque handles** (`i64` pointers into linear memory). The host cannot inspect struct fields directly; use the generated accessor functions (`weaveffi_{module}_{struct}_get_{field}`) to read/write fields. A returned struct handle is owned by the consumer; the JS wrapper's `free()` releases it via the struct's `_destroy` symbol.
+Records are **plain JavaScript objects**. A record crosses the boundary serialized in the WeaveFFI value-buffer format as one pointer + length pair in linear memory; the glue packs and unpacks it automatically, so there are no handles, no accessor functions, and nothing to free.
 
 ### Enums
 
-Enums are passed as **`i32` values** corresponding to the variant's integer discriminant.
+C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. Rich (algebraic) enums are plain objects tagged by variant name (`{ tag: "Circle", radius: 2 }`) and cross the boundary serialized in a value buffer, exactly like records.
 
 ### Optionals
 
-Optional values use **`0` / `null`** to represent the absent case. Scalar optionals are boxed by pointer (a null pointer signals absence); handle-typed and string optionals pass a null pointer (`0`) directly.
+Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent).
 
-### Lists
+### Lists and Maps
 
-Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) referencing a contiguous region in linear memory. The caller is responsible for allocating and freeing the backing memory.
+Lists are JS arrays; maps are plain objects (a `Map` instance is also accepted on input). Both cross the boundary serialized in a value buffer as one pointer + length pair, recursing through element types.
 
 ### Iterators
 
@@ -44,8 +44,10 @@ Lists are passed as a **pointer + length** pair (`i32` pointer, `i32` length) re
 ### Error Handling
 
 The generated JS wrappers automatically handle errors by passing an error
-pointer as the last argument to each Wasm function. Your Wasm module must
-export the following functions:
+pointer as the last argument to each Wasm function. The error struct is
+16 bytes on wasm32: `{ i32 code, char* message, uint8_t* payload_ptr,
+size_t payload_len }`. Your Wasm module must export the following
+functions:
 
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
@@ -56,7 +58,9 @@ export the following functions:
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
-for producer panics and marshalling failures.
+for producer panics and marshalling failures. When the matched error code
+declares payload fields, the wrapper decodes them from the error's value
+buffer and attaches them as properties on the thrown error.
 
 ## API Reference
 
@@ -68,24 +72,24 @@ for producer panics and marshalling failures.
 
 Render a shape to a string
 
-`weaveffi_shapes_describe(shape: i64) -> i32, i32`
+`weaveffi_shapes_describe(shape: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `shape` | `Shape` | `i64` | opaque handle in linear memory |
-| _returns_ | `string` | `i32, i32` | ptr + len in linear memory |
+| `shape` | `Shape` | `i32, i32` | value buffer: ptr + len in linear memory |
+| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
 ##### `weaveffi_shapes_scale`
 
 Scale a shape by a factor, returning a new shape
 
-`weaveffi_shapes_scale(shape: i64, factor: f64) -> i64`
+`weaveffi_shapes_scale(shape: i32, i32, factor: f64) -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `shape` | `Shape` | `i64` | opaque handle in linear memory |
+| `shape` | `Shape` | `i32, i32` | value buffer: ptr + len in linear memory |
 | `factor` | `f64` | `f64` | native Wasm f64 |
-| _returns_ | `Shape` | `i64` | opaque handle in linear memory |
+| _returns_ | `Shape` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 ##### `weaveffi_shapes_sum_bytes`
 
@@ -95,14 +99,14 @@ Sum a list of bytes into a wide integer (numerics smoke)
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `values` | `[u8]` | `i32, i32` | ptr + len in linear memory |
+| `values` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `u64` | `i64` | unsigned mapped to i64 |
 
 ##### `weaveffi_shapes_make_numerics`
 
 Build a Numerics struct from every numeric primitive
 
-`weaveffi_shapes_make_numerics(a: i32, b: i32, c: i32, d: i64, e: i32, f: i32, g: i32, h: i64, i: f32, j: f64) -> i64`
+`weaveffi_shapes_make_numerics(a: i32, b: i32, c: i32, d: i64, e: i32, f: i32, g: i32, h: i64, i: f32, j: f64) -> i32, i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
@@ -116,7 +120,7 @@ Build a Numerics struct from every numeric primitive
 | `h` | `u64` | `i64` | unsigned mapped to i64 |
 | `i` | `f32` | `f32` | native Wasm f32 |
 | `j` | `f64` | `f64` | native Wasm f64 |
-| _returns_ | `Numerics` | `i64` | opaque handle in linear memory |
+| _returns_ | `Numerics` | `i32, i32` | value buffer: ptr + len in linear memory |
 
 #### Structs
 
@@ -124,20 +128,20 @@ Build a Numerics struct from every numeric primitive
 
 One field per supported numeric primitive
 
-Passed as opaque handle (`i64`).
+A plain JS object, serialized in a value buffer (`i32` ptr + `i32` len) at the boundary. Fields in declaration (wire) order:
 
-| Accessor | Wasm Return |
-|----------|-------------|
-| `weaveffi_shapes_Numerics_get_a` | `i32` |
-| `weaveffi_shapes_Numerics_get_b` | `i32` |
-| `weaveffi_shapes_Numerics_get_c` | `i32` |
-| `weaveffi_shapes_Numerics_get_d` | `i64` |
-| `weaveffi_shapes_Numerics_get_e` | `i32` |
-| `weaveffi_shapes_Numerics_get_f` | `i32` |
-| `weaveffi_shapes_Numerics_get_g` | `i32` |
-| `weaveffi_shapes_Numerics_get_h` | `i64` |
-| `weaveffi_shapes_Numerics_get_i` | `f32` |
-| `weaveffi_shapes_Numerics_get_j` | `f64` |
+| Field | Type |
+|-------|------|
+| `a` | `i8` |
+| `b` | `i16` |
+| `c` | `i32` |
+| `d` | `i64` |
+| `e` | `u8` |
+| `f` | `u16` |
+| `g` | `u32` |
+| `h` | `u64` |
+| `i` | `f32` |
+| `j` | `f64` |
 
 #### Enums
 
@@ -145,7 +149,7 @@ Passed as opaque handle (`i64`).
 
 An algebraic shape (sum type with associated data)
 
-Rich (algebraic) enum, passed as an **opaque handle** (`i64`). Construct one with a per-variant factory, read the active variant via the `tag` discriminant, and access associated data through the namespaced getters.
+Rich (algebraic) enum: a plain tagged object (`{ tag: "Variant", ...fields }`) serialized in a value buffer as an `i32` tag followed by the active variant's fields in declaration order.
 
 | Variant | Tag | Fields |
 |---------|-----|--------|

@@ -34,8 +34,9 @@ namespace WeaveFFI
         }
 
         /// <summary>Wraps a raw error slot in the typed exception, falling
-        /// back to <see cref="WeaveFFIException"/> for unknown codes.</summary>
-        internal static WeaveFFIException FromCode(int code, string message)
+        /// back to <see cref="WeaveFFIException"/> for unknown codes. Codes
+        /// declaring payload fields decode them into Data.</summary>
+        internal static WeaveFFIException FromCode(int code, string message, byte[]? payload)
         {
             switch (code)
             {
@@ -52,13 +53,28 @@ namespace WeaveFFI
     {
         public int Code;
         public IntPtr Message;
+        public IntPtr PayloadPtr;
+        public UIntPtr PayloadLen;
+
+        internal static byte[]? CopyPayload(WeaveFFIError err)
+        {
+            if (err.PayloadPtr == IntPtr.Zero || (int)err.PayloadLen == 0)
+            {
+                return null;
+            }
+            var payload = new byte[(int)err.PayloadLen];
+            Marshal.Copy(err.PayloadPtr, payload, 0, (int)err.PayloadLen);
+            return payload;
+        }
 
         internal static void Check(WeaveFFIError err)
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw new WeaveFFIException(err.Code, msg);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw new WeaveFFIException(code, msg);
             }
         }
 
@@ -66,8 +82,11 @@ namespace WeaveFFI
         {
             if (err.Code != 0)
             {
+                var code = err.Code;
                 var msg = Marshal.PtrToStringUTF8(err.Message) ?? "";
-                throw CalcException.FromCode(err.Code, msg);
+                var payload = CopyPayload(err);
+                NativeMethods.weaveffi_error_clear(ref err);
+                throw CalcException.FromCode(code, msg, payload);
             }
         }
     }
@@ -90,6 +109,274 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Serializes values into the WeaveFFI value-buffer wire
+    /// format (little-endian, packed).</summary>
+    internal sealed class WeaveFFIBufferWriter
+    {
+        private byte[] _buf = new byte[64];
+        private int _len;
+
+        private void Ensure(int extra)
+        {
+            if (_len + extra <= _buf.Length)
+            {
+                return;
+            }
+            var size = _buf.Length * 2;
+            while (size < _len + extra)
+            {
+                size *= 2;
+            }
+            Array.Resize(ref _buf, size);
+        }
+
+        internal void WriteBool(bool v)
+        {
+            Ensure(1);
+            _buf[_len++] = v ? (byte)1 : (byte)0;
+        }
+
+        internal void WriteI8(sbyte v)
+        {
+            Ensure(1);
+            _buf[_len++] = (byte)v;
+        }
+
+        internal void WriteU8(byte v)
+        {
+            Ensure(1);
+            _buf[_len++] = v;
+        }
+
+        internal void WriteU16(ushort v)
+        {
+            Ensure(2);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+        }
+
+        internal void WriteI16(short v)
+        {
+            WriteU16((ushort)v);
+        }
+
+        internal void WriteU32(uint v)
+        {
+            Ensure(4);
+            _buf[_len++] = (byte)v;
+            _buf[_len++] = (byte)(v >> 8);
+            _buf[_len++] = (byte)(v >> 16);
+            _buf[_len++] = (byte)(v >> 24);
+        }
+
+        internal void WriteI32(int v)
+        {
+            WriteU32((uint)v);
+        }
+
+        internal void WriteU64(ulong v)
+        {
+            WriteU32((uint)v);
+            WriteU32((uint)(v >> 32));
+        }
+
+        internal void WriteI64(long v)
+        {
+            WriteU64((ulong)v);
+        }
+
+        internal void WriteF32(float v)
+        {
+            WriteU32((uint)BitConverter.SingleToInt32Bits(v));
+        }
+
+        internal void WriteF64(double v)
+        {
+            WriteU64((ulong)BitConverter.DoubleToInt64Bits(v));
+        }
+
+        internal void WriteLen(int len)
+        {
+            WriteU32((uint)len);
+        }
+
+        internal void WriteOptionFlag(bool present)
+        {
+            WriteBool(present);
+        }
+
+        internal void WriteString(string v)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(v);
+            WriteLen(bytes.Length);
+            Ensure(bytes.Length);
+            Array.Copy(bytes, 0, _buf, _len, bytes.Length);
+            _len += bytes.Length;
+        }
+
+        internal void WriteBytes(byte[] v)
+        {
+            WriteLen(v.Length);
+            Ensure(v.Length);
+            Array.Copy(v, 0, _buf, _len, v.Length);
+            _len += v.Length;
+        }
+
+        internal byte[] ToArray()
+        {
+            var outBuf = new byte[_len];
+            Array.Copy(_buf, outBuf, _len);
+            return outBuf;
+        }
+    }
+
+    /// <summary>Decodes values from the WeaveFFI value-buffer wire format.
+    /// A malformed buffer indicates a producer/consumer contract violation and
+    /// throws <see cref="InvalidOperationException"/>.</summary>
+    internal sealed class WeaveFFIBufferReader
+    {
+        private static readonly System.Text.Encoding Utf8Strict =
+            new System.Text.UTF8Encoding(false, true);
+
+        private readonly byte[] _data;
+        private int _pos;
+
+        internal WeaveFFIBufferReader(byte[] data)
+        {
+            _data = data;
+        }
+
+        private void Require(int n)
+        {
+            if (_data.Length - _pos < n)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: buffer exhausted");
+            }
+        }
+
+        internal bool ReadBool()
+        {
+            Require(1);
+            var b = _data[_pos++];
+            if (b > 1)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: invalid bool byte");
+            }
+            return b == 1;
+        }
+
+        internal sbyte ReadI8()
+        {
+            Require(1);
+            return (sbyte)_data[_pos++];
+        }
+
+        internal byte ReadU8()
+        {
+            Require(1);
+            return _data[_pos++];
+        }
+
+        internal ushort ReadU16()
+        {
+            Require(2);
+            var v = (ushort)(_data[_pos] | (_data[_pos + 1] << 8));
+            _pos += 2;
+            return v;
+        }
+
+        internal short ReadI16()
+        {
+            return (short)ReadU16();
+        }
+
+        internal uint ReadU32()
+        {
+            Require(4);
+            var v = (uint)_data[_pos]
+                | ((uint)_data[_pos + 1] << 8)
+                | ((uint)_data[_pos + 2] << 16)
+                | ((uint)_data[_pos + 3] << 24);
+            _pos += 4;
+            return v;
+        }
+
+        internal int ReadI32()
+        {
+            return (int)ReadU32();
+        }
+
+        internal ulong ReadU64()
+        {
+            var lo = (ulong)ReadU32();
+            var hi = (ulong)ReadU32();
+            return lo | (hi << 32);
+        }
+
+        internal long ReadI64()
+        {
+            return (long)ReadU64();
+        }
+
+        internal float ReadF32()
+        {
+            return BitConverter.Int32BitsToSingle(ReadI32());
+        }
+
+        internal double ReadF64()
+        {
+            return BitConverter.Int64BitsToDouble(ReadI64());
+        }
+
+        internal int ReadLen()
+        {
+            var len = ReadU32();
+            if (len > (uint)(_data.Length - _pos))
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: length prefix exceeds remaining bytes");
+            }
+            return (int)len;
+        }
+
+        internal bool ReadOptionFlag()
+        {
+            return ReadBool();
+        }
+
+        internal string ReadString()
+        {
+            var len = ReadLen();
+            string s;
+            try
+            {
+                s = Utf8Strict.GetString(_data, _pos, len);
+            }
+            catch (ArgumentException)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: string is not valid UTF-8");
+            }
+            _pos += len;
+            return s;
+        }
+
+        internal byte[] ReadBytes()
+        {
+            var len = ReadLen();
+            var outBuf = new byte[len];
+            Array.Copy(_data, _pos, outBuf, 0, len);
+            _pos += len;
+            return outBuf;
+        }
+
+        internal void ExpectEnd()
+        {
+            if (_pos != _data.Length)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
+            }
+        }
+    }
+
     internal static class NativeMethods
     {
         private const string LibName = "weaveffi";
@@ -99,6 +386,9 @@ namespace WeaveFFI
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_bytes(IntPtr ptr, UIntPtr len);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_calculator_add", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int weaveffi_calculator_add(int a, int b, ref WeaveFFIError err);
@@ -155,7 +445,7 @@ namespace WeaveFFI
                 WeaveFFIError.Check(err);
                 var str = Marshal.PtrToStringUTF8(result);
                 NativeMethods.weaveffi_free_string(result);
-                return str;
+                return str ?? "";
             }
             finally
             {

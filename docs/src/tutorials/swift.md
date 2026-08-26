@@ -24,7 +24,7 @@ simulator.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: greeter
     errors:
@@ -123,7 +123,8 @@ abi::export_runtime!();
 ```
 
 Use `scaffold.rs` as the template for the rest of the API
-(`weaveffi_greeter_greeting`, the `Greeting` lifecycle, getters, ...).
+(`weaveffi_greeter_greeting`, which returns the `Greeting` record as a
+serialized value buffer).
 
 ### 4. Build for iOS targets
 
@@ -193,11 +194,11 @@ The generated `WeaveFFI` module exposes:
 - `Greeter.hello(name:)`: non-throwing, returns `String`.
 - `Greeter.greeting(name:lang:)`: declared `throws` in the IDL, so
   the Swift wrapper is `throws` and surfaces `GreeterError`; returns
-  a `Greeting` instance with `.message` and `.lang` properties, and
-  `deinit` calls the Rust destructor automatically.
+  a `Greeting` value with `.message` and `.lang` properties.
 - `GreeterError`: the module's error domain as a Swift `enum`
   conforming to `Error` and `LocalizedError`.
-- `Greeting`: the wrapper class around the opaque Rust pointer.
+- `Greeting`: a plain Swift struct decoded from the value buffer the
+  C ABI returns.
 
 ## Verification
 
@@ -231,6 +232,6 @@ edits.
 - See the [Swift generator reference](../generators/swift.md) for the
   full type mapping.
 - Read the [Memory Ownership](../guides/memory.md) guide to understand
-  struct lifecycle and `deinit` rules.
+  buffered value and interface lifetime rules.
 - Try the [Calculator tutorial](calculator.md) for a simpler
   end-to-end walkthrough or [Android](android.md) for a JVM target.

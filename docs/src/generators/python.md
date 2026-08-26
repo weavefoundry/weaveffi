@@ -44,14 +44,20 @@ The package directory follows the IDL `package.name` (a package named
 | `string`     | `str`                | `ctypes.c_char_p`                  |
 | `bytes`      | `bytes`              | `ctypes.POINTER(ctypes.c_uint8)` + `ctypes.c_size_t` |
 | `handle`     | `int`                | `ctypes.c_uint64`                  |
-| `Struct`     | `"StructName"`       | `ctypes.c_void_p`                  |
+| `Struct`     | `"StructName"` (a `@dataclass`) | value buffer: `ctypes.POINTER(ctypes.c_uint8)` + `ctypes.c_size_t` |
 | `Interface`  | `"InterfaceName"`    | `ctypes.c_void_p`                  |
 | `Enum` (plain) | `"EnumName"`       | `ctypes.c_int32`                   |
-| `Enum` (rich)  | `"EnumName"`       | `ctypes.c_void_p`                  |
-| `T?`         | `Optional[T]`        | `ctypes.POINTER(scalar)` for values; same pointer for strings/structs |
-| `[T]`        | `List[T]`            | `ctypes.POINTER(scalar)` + `ctypes.c_size_t` |
-| `{K: V}`     | `Dict[K, V]`         | key/value pointer arrays + `ctypes.c_size_t` |
+| `Enum` (rich)  | `"EnumName"` (variant dataclasses) | value buffer, like `Struct` |
+| `T?`         | `Optional[T]`        | value buffer (`Interface?` stays `ctypes.c_void_p`) |
+| `[T]`        | `List[T]`            | value buffer                       |
+| `{K: V}`     | `Dict[K, V]`         | value buffer                       |
 | `iter<T>`    | `Iterator[T]` (lazy) | opaque `ctypes.c_void_p` iterator handle |
+
+Buffered types (structs, rich enums, optionals, lists, maps) cross the
+boundary serialized in the
+[value-buffer format](../reference/value-buffers.md); the generated module
+ships a private `_BufferWriter`/`_BufferReader` pair plus one pack and one
+unpack function per record and rich enum.
 
 Booleans cross the boundary as `c_int32` (`0`/`1`) because C has no
 standard fixed-width boolean type across ABIs.
@@ -59,7 +65,7 @@ standard fixed-width boolean type across ABIs.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: contacts
     enums:
@@ -143,34 +149,25 @@ class ContactType(IntEnum):
     Other = 2
 ```
 
-Structs become Python classes that wrap a void pointer and expose
-`@property` getters; `__del__` calls the C destructor:
+Structs become plain `@dataclass` value classes. There are no C symbols
+per struct: construction, equality, and repr come from the dataclass, and
+instances cross the boundary serialized in value buffers by generated
+private codec functions (`_pack_Contact` / `_unpack_Contact`):
 
 ```python
+@dataclass
 class Contact:
     """A contact record"""
 
-    def __init__(self, _ptr: int) -> None:
-        self._ptr = _ptr
-
-    def __del__(self) -> None:
-        if self._ptr is not None:
-            _lib.weaveffi_contacts_Contact_destroy.argtypes = [ctypes.c_void_p]
-            _lib.weaveffi_contacts_Contact_destroy.restype = None
-            _lib.weaveffi_contacts_Contact_destroy(self._ptr)
-            self._ptr = None
-
-    @property
-    def name(self) -> str:
-        _fn = _lib.weaveffi_contacts_Contact_get_name
-        _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_void_p
-        return _take_string(_fn(self._ptr)) or ""
+    name: str
+    email: Optional[str]
+    age: int
 ```
 
-String getters return the C string as a raw address; `_take_string`
-copies it into a Python `str` and frees the producer's buffer with
-`weaveffi_free_string`, so the getter doesn't leak.
+A wrapper that returns a `Contact` calls the C function, unpacks the
+returned buffer with `_unpack_Contact`, and frees the buffer with
+`weaveffi_free_bytes`; a wrapper that takes one packs it with
+`_pack_Contact` and passes the borrowed `(ptr, len)` pair.
 
 The accompanying `.pyi` stub mirrors the public surface for IDE/mypy:
 
@@ -181,12 +178,10 @@ class ContactType(IntEnum):
     Other: int
 
 class Contact:
-    @property
-    def name(self) -> str: ...
-    @property
-    def email(self) -> Optional[str]: ...
-    @property
-    def age(self) -> int: ...
+    name: str
+    email: Optional[str]
+    age: int
+    def __init__(self, name: str, email: Optional[str], age: int) -> None: ...
 
 def create_contact(name: str, email: Optional[str], contact_type: "ContactType") -> int: ...
 ```
@@ -337,16 +332,15 @@ reclaimed = asyncio.run(store.compact())
 
 A rich (algebraic) enum is a sum type whose variants carry associated
 data. Unlike a plain C-style `Enum`, which crosses the boundary as a
-bare `ctypes.c_int32` discriminant, a rich enum lowers to an **opaque
-object handle**, so the generator emits a wrapper class with exactly the
-same ownership model as a struct wrapper: a `ctypes.c_void_p` held
-behind `@property` accessors and freed by `__del__`.
+bare `ctypes.c_int32` discriminant, a rich enum crosses as a serialized
+value buffer (`i32` tag, then the active variant's fields), and the
+generator emits an idiomatic Python sum type with no FFI symbols
+involved: a base class holding a nested `Tag` `IntEnum` and a `tag`
+property, plus one `@dataclass` subclass per variant.
 
 Given a `Shape` enum with variants `Empty`, `Circle { radius: f64 }`,
 `Rectangle { width: f32, height: f32 }`, and `Labeled { label: string,
-count: u8 }`, the generated class exposes a nested `Tag` `IntEnum`, one
-`@classmethod` constructor per variant, a `tag` property, and a
-per-variant field getter for each payload:
+count: u8 }`:
 
 ```python
 class Shape:
@@ -358,73 +352,45 @@ class Shape:
         Rectangle = 2
         Labeled = 3
 
-    def __del__(self) -> None:
-        if self._ptr is not None:
-            _lib.weaveffi_shapes_Shape_destroy.argtypes = [ctypes.c_void_p]
-            _lib.weaveffi_shapes_Shape_destroy.restype = None
-            _lib.weaveffi_shapes_Shape_destroy(self._ptr)
-            self._ptr = None
-
     @property
-    def tag(self) -> int:
-        _fn = _lib.weaveffi_shapes_Shape_tag
-        _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_int32
-        return _fn(self._ptr)
+    def tag(self) -> "Shape.Tag":
+        """The discriminant of this value's active variant."""
+        return type(self).TAG
 
-    @classmethod
-    def circle(cls, radius: float) -> "Shape":
-        """A circle with a radius"""
-        _fn = _lib.weaveffi_shapes_Shape_Circle_new
-        _fn.argtypes = [ctypes.c_double, ctypes.POINTER(_WeaveFFIErrorStruct)]
-        _fn.restype = ctypes.c_void_p
-        _err = _WeaveFFIErrorStruct()
-        _result = _fn(radius, ctypes.byref(_err))
-        _check_error(_err)
-        if _result is None:
-            raise WeaveFFIError(-1, "null pointer")
-        return cls(_result)
 
-    @property
-    def circle_radius(self) -> float:
-        """Radius in points"""
-        _fn = _lib.weaveffi_shapes_Shape_Circle_get_radius
-        _fn.argtypes = [ctypes.c_void_p]
-        _fn.restype = ctypes.c_double
-        return _fn(self._ptr)
+@dataclass
+class ShapeCircle(Shape):
+    """A circle with a radius"""
+
+    TAG = Shape.Tag.Circle
+
+    radius: float
 ```
 
-The full surface mirrors the variants: constructors `Shape.empty()`,
-`Shape.circle(radius)`, `Shape.rectangle(width, height)`, and
-`Shape.labeled(label, count)` (the last takes `ctypes.c_char_p` +
-`ctypes.c_uint8`); field getters `circle_radius`, `rectangle_width`,
-`rectangle_height`, `labeled_label`, and `labeled_count`. Each C symbol
-follows the `weaveffi_shapes_Shape_<Variant>_new` /
-`weaveffi_shapes_Shape_<Variant>_get_<field>` pattern, with
-`weaveffi_shapes_Shape_tag` reading the discriminant.
-
-Construct a couple of variants, read the tag and a field, then hand the
-wrapper to a free function:
+Each variant class is also aliased under the base class
+(`Shape.Circle` is `ShapeCircle`), so consumers construct variants
+directly and discriminate with `isinstance` or the `tag` property:
 
 ```python
 from weaveffi import Shape, describe, scale
 
-circle = Shape.circle(2.0)
-labeled = Shape.labeled("unit", 3)
+circle = Shape.Circle(2.0)
+labeled = Shape.Labeled("unit", 3)
 
-if circle.tag == Shape.Tag.Circle:
-    print(circle.circle_radius)      # 2.0
-print(labeled.labeled_count)         # 3
+if isinstance(circle, Shape.Circle):
+    print(circle.radius)             # 2.0
+print(labeled.count)                 # 3
 
 print(describe(circle))              # render via the C ABI
-bigger = scale(circle, 3.0)          # returns a brand-new Shape
+bigger = scale(circle, 3.0)          # returns a brand-new Shape value
 ```
 
-**Ownership:** each `Shape` owns its `ctypes.c_void_p`; `__del__` calls
-`weaveffi_shapes_Shape_destroy` once the last Python reference is
-dropped, and the `Shape` returned by `scale` is owned the same
-way. The `.pyi` stub mirrors the class (nested `Tag`, `@classmethod`
-constructors, and `@property` getters) for IDE and `mypy` support.
+Wrappers pack a `Shape` argument with the generated `_pack_Shape` codec
+and unpack a returned buffer with `_unpack_Shape`, freeing the returned
+buffer with `weaveffi_free_bytes`. Values are plain Python objects with
+no native handle and no destructor. The `.pyi` stub mirrors the class
+hierarchy (nested `Tag`, variant subclasses with typed fields) for IDE
+and `mypy` support.
 
 ## Build instructions
 
@@ -483,19 +449,19 @@ constructors, and `@property` getters) for IDE and `mypy` support.
 - **Bytes:** copied in via a ctypes array, copied out via slicing
   (`_result[:_out_len.value]`); the wrapper then releases the
   producer's buffer with `weaveffi_free_bytes`.
-- **Optional scalars out:** the producer boxes the value behind a
-  pointer (null means `None`); the wrapper dereferences it and frees
-  the box with `weaveffi_free_bytes`.
-- **Lists and maps out:** each element is copied (string elements
-  through `_take_string`, which frees them individually), then the
-  array buffer itself, or both parallel key/value buffers for a map,
-  is released with `weaveffi_free_bytes`.
-- **Structs:** wrappers hold an opaque `c_void_p`. `__del__` calls the
+- **Buffered values out (structs, rich enums, optionals, lists, maps):**
+  the wrapper decodes the returned value buffer into plain Python values
+  (dataclasses, `dict`s, `list`s, `None`), then releases the one buffer
+  with `weaveffi_free_bytes`. Nothing is freed per element.
+- **Buffered values in:** the wrapper packs the Python value with the
+  generated codec into a `bytes` object it owns for the duration of the
+  call; the producer never frees it.
+- **Interfaces:** wrappers hold an opaque `c_void_p`. `__del__` calls the
   matching `_destroy` C function. For deterministic cleanup, use the
   `_PointerGuard` context manager:
 
   ```python
-  with _PointerGuard(handle, _lib.weaveffi_contacts_Contact_destroy):
+  with _PointerGuard(ptr, _lib.weaveffi_kv_Store_destroy):
       ...
   ```
 
@@ -555,13 +521,13 @@ async def compact(self) -> int:
 ```
 
 The completion callback fires exactly once, on an arbitrary producer
-thread. Result buffers passed to it (strings, bytes, arrays) are owned
-by the producer and valid only for the callback's duration, so the
-wrapper deep-copies them inside the callback and never frees them.
-Owned-object results (structs, rich enums, interfaces, including
-optional ones) are the exception: the callback receives ownership and
-adopts the pointer into a wrapper class. Conversion happens on the
-producer thread; the wrapper then hops back to the event loop with
+thread. Result buffers passed to it (strings, bytes, and the serialized
+value buffers of buffered results) are owned by the producer and valid
+only for the callback's duration, so the wrapper copies or decodes them
+inside the callback and never frees them. Owned interface results are
+the exception: the callback receives ownership and adopts the pointer
+into a wrapper class. Conversion happens on the producer thread; the
+wrapper then hops back to the event loop with
 `loop.call_soon_threadsafe` to resolve the future, since asyncio
 futures must not be touched from foreign threads.
 
@@ -731,6 +697,6 @@ generic `WeaveFFIError` only for producer bugs.
 - **`AttributeError: ... has no attribute 'argtypes'`**: the wrapper
   sets `argtypes`/`restype` at the call site; ensure you're calling
   the generated function, not reaching into `_lib` directly.
-- **Garbage-collected struct still referenced from Rust**: keep a
-  Python reference until you're done; Python will call `__del__` only
+- **Garbage-collected interface object still referenced from Rust**: keep
+  a Python reference until you're done; Python will call `__del__` only
   after the last reference is dropped.

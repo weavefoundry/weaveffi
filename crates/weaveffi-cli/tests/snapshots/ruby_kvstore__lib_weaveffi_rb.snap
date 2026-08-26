@@ -31,7 +31,9 @@ module WeaveFFI
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
-           :message, :pointer
+           :message, :pointer,
+           :payload_ptr, :pointer,
+           :payload_len, :size_t
   end
 
   class Error < StandardError
@@ -40,6 +42,176 @@ module WeaveFFI
     def initialize(code, message)
       @code = code
       super(message)
+    end
+  end
+
+  # @api private
+  # Appends values in the WeaveFFI value-buffer wire format: little-endian,
+  # packed, no alignment.
+  class WvBufferWriter
+    def initialize
+      @buf = +''.b
+    end
+
+    # The encoded bytes as a binary String.
+    def data
+      @buf
+    end
+
+    def write_bool(v)
+      @buf << (v ? "\x01".b : "\x00".b)
+    end
+
+    def write_flag(v)
+      write_bool(v)
+    end
+
+    def write_i8(v)
+      @buf << [v].pack('c')
+    end
+
+    def write_u8(v)
+      @buf << [v].pack('C')
+    end
+
+    def write_i16(v)
+      @buf << [v].pack('s<')
+    end
+
+    def write_u16(v)
+      @buf << [v].pack('S<')
+    end
+
+    def write_i32(v)
+      @buf << [v].pack('l<')
+    end
+
+    def write_u32(v)
+      @buf << [v].pack('L<')
+    end
+
+    def write_len(v)
+      write_u32(v)
+    end
+
+    def write_i64(v)
+      @buf << [v].pack('q<')
+    end
+
+    def write_u64(v)
+      @buf << [v].pack('Q<')
+    end
+
+    def write_f32(v)
+      @buf << [v].pack('e')
+    end
+
+    def write_f64(v)
+      @buf << [v].pack('E')
+    end
+
+    def write_string(v)
+      b = v.to_s.encode(Encoding::UTF_8).b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+
+    def write_bytes(v)
+      b = v.to_s.b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+  end
+
+  # @api private
+  # Reads values in the WeaveFFI value-buffer wire format, raising Error on
+  # any malformed buffer.
+  class WvBufferReader
+    def initialize(data)
+      @data = data.to_s.b
+      @pos = 0
+    end
+
+    def take(n, what)
+      raise Error.new(-1, "malformed value buffer: #{what}") if @pos + n > @data.bytesize
+      s = @data.byteslice(@pos, n)
+      @pos += n
+      s
+    end
+
+    def read_bool
+      b = take(1, 'bool').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: bool byte out of range') if b > 1
+      b == 1
+    end
+
+    def read_flag
+      b = take(1, 'option flag').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: option flag out of range') if b > 1
+      b == 1
+    end
+
+    def read_i8
+      take(1, 'i8').unpack1('c')
+    end
+
+    def read_u8
+      take(1, 'u8').unpack1('C')
+    end
+
+    def read_i16
+      take(2, 'i16').unpack1('s<')
+    end
+
+    def read_u16
+      take(2, 'u16').unpack1('S<')
+    end
+
+    def read_i32
+      take(4, 'i32').unpack1('l<')
+    end
+
+    def read_u32
+      take(4, 'u32').unpack1('L<')
+    end
+
+    def read_len
+      len = read_u32
+      if len > @data.bytesize - @pos
+        raise Error.new(-1, 'malformed value buffer: length prefix exceeds remaining bytes')
+      end
+      len
+    end
+
+    def read_i64
+      take(8, 'i64').unpack1('q<')
+    end
+
+    def read_u64
+      take(8, 'u64').unpack1('Q<')
+    end
+
+    def read_f32
+      take(4, 'f32').unpack1('e')
+    end
+
+    def read_f64
+      take(8, 'f64').unpack1('E')
+    end
+
+    def read_string
+      s = take(read_len, 'string bytes').force_encoding(Encoding::UTF_8)
+      raise Error.new(-1, 'malformed value buffer: string is not valid UTF-8') unless s.valid_encoding?
+      s
+    end
+
+    def read_bytes
+      take(read_len, 'byte buffer')
+    end
+
+    def expect_end!
+      return if @pos == @data.bytesize
+      raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
@@ -110,9 +282,10 @@ module WeaveFFI
     1004 => KvError::IoError,
   }.freeze
 
-  # Builds the KvError subclass matching `code`, or a generic Error
-  # for codes outside the domain (panics, marshalling).
-  def self.kv_error_from(code, message)
+  # Builds the KvError subclass matching `code`, decoding any payload
+  # fields the code declares, or a generic Error for codes outside
+  # the domain (panics, marshalling).
+  def self.kv_error_from(code, message, payload = nil)
     cls = KV_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
     message.empty? ? cls.new : cls.new(message)
@@ -124,8 +297,10 @@ module WeaveFFI
     code = err[:code]
     msg_ptr = err[:message]
     msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    payload_ptr = err[:payload_ptr]
+    payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
-    raise kv_error_from(code, msg)
+    raise kv_error_from(code, msg, payload)
   end
 
   # Persistence semantics applied to a stored entry
@@ -138,34 +313,113 @@ module WeaveFFI
     ENCRYPTED = 2
   end
 
-  attach_function :weaveffi_kv_Entry_destroy, [:pointer], :void
-  attach_function :weaveffi_kv_Entry_create, [:int64, :string, :pointer, :size_t, :int64, :pointer, :pointer, :size_t, :pointer, :pointer, :size_t, :pointer], :pointer
-  # Stable monotonic identifier assigned on insert
-  attach_function :weaveffi_kv_Entry_get_id, [:pointer], :int64
-  # UTF-8 lookup key
-  attach_function :weaveffi_kv_Entry_get_key, [:pointer], :pointer
-  # Opaque binary payload
-  attach_function :weaveffi_kv_Entry_get_value, [:pointer, :pointer], :pointer
-  # Unix-timestamp seconds when the entry was created
-  attach_function :weaveffi_kv_Entry_get_created_at, [:pointer], :int64
-  # Optional unix-timestamp seconds at which the entry expires
-  attach_function :weaveffi_kv_Entry_get_expires_at, [:pointer], :pointer
-  # Free-form labels attached to the entry
-  attach_function :weaveffi_kv_Entry_get_tags, [:pointer, :pointer], :pointer
-  # Arbitrary string-valued metadata pairs
-  attach_function :weaveffi_kv_Entry_get_metadata, [:pointer, :pointer, :pointer, :pointer], :void
+  # A single key-value entry persisted in the store
+  class Entry
+    # Stable monotonic identifier assigned on insert
+    attr_reader :id
+
+    # UTF-8 lookup key
+    attr_reader :key
+
+    # Opaque binary payload
+    attr_reader :value
+
+    # Unix-timestamp seconds when the entry was created
+    attr_reader :created_at
+
+    # Optional unix-timestamp seconds at which the entry expires
+    attr_reader :expires_at
+
+    # Free-form labels attached to the entry
+    attr_reader :tags
+
+    # Arbitrary string-valued metadata pairs
+    attr_reader :metadata
+
+    def initialize(id:, key:, value:, created_at:, expires_at:, tags:, metadata:)
+      @id = id
+      @key = key
+      @value = value
+      @created_at = created_at
+      @expires_at = expires_at
+      @tags = tags
+      @metadata = metadata
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Entry)
+      return false unless id == other.id
+      return false unless key == other.key
+      return false unless value == other.value
+      return false unless created_at == other.created_at
+      return false unless expires_at == other.expires_at
+      return false unless tags == other.tags
+      return false unless metadata == other.metadata
+      true
+    end
+  end
+
+  # @api private
+  # Packs a Entry into the value-buffer wire format.
+  def self._wv_write_entry(w, v)
+    w.write_i64(v.id)
+    w.write_string(v.key)
+    w.write_bytes(v.value)
+    w.write_i64(v.created_at)
+    if v.expires_at.nil?
+      w.write_flag(false)
+    else
+      w.write_flag(true)
+      w.write_i64(v.expires_at)
+    end
+    w.write_len(v.tags.length)
+    v.tags.each do |_wv_e0|
+      w.write_string(_wv_e0)
+    end
+    w.write_len(v.metadata.length)
+    v.metadata.each do |_wv_k0, _wv_v0|
+      w.write_string(_wv_k0)
+      w.write_string(_wv_v0)
+    end
+  end
+
+  # @api private
+  # Unpacks a Entry from the value-buffer wire format.
+  def self._wv_read_entry(r)
+    _wv_id = r.read_i64
+    _wv_key = r.read_string
+    _wv_value = r.read_bytes
+    _wv_created_at = r.read_i64
+    if r.read_flag
+      _wv_expires_at = r.read_i64
+    else
+      _wv_expires_at = nil
+    end
+    _wv_tags = Array.new(r.read_len) do
+      _wv_e0 = r.read_string
+      _wv_e0
+    end
+    _wv_metadata = {}
+    r.read_len.times do
+      _wv_k0 = r.read_string
+      _wv_v0 = r.read_string
+      _wv_metadata[_wv_k0] = _wv_v0
+    end
+    Entry.new(id: _wv_id, key: _wv_key, value: _wv_value, created_at: _wv_created_at, expires_at: _wv_expires_at, tags: _wv_tags, metadata: _wv_metadata)
+  end
 
   attach_function :weaveffi_kv_Store_destroy, [:pointer], :void
   # Open (or create) a store backed by the given filesystem path
   attach_function :weaveffi_kv_Store_open, [:string, :pointer], :pointer
   # Insert or replace a value, returning true on success
-  attach_function :weaveffi_kv_Store_put, [:pointer, :string, :pointer, :size_t, :int32, :pointer, :pointer], :int32
+  attach_function :weaveffi_kv_Store_put, [:pointer, :string, :pointer, :size_t, :int32, :pointer, :size_t, :pointer], :int32
   # Look up an entry by key; returns null if missing or expired
-  attach_function :weaveffi_kv_Store_get, [:pointer, :string, :pointer], :pointer
+  attach_function :weaveffi_kv_Store_get, [:pointer, :string, :pointer, :pointer], :pointer
   # Remove the entry for the given key, returning true if it existed
   attach_function :weaveffi_kv_Store_delete, [:pointer, :string, :pointer], :int32
   # Stream every key, optionally filtered by a prefix
-  attach_function :weaveffi_kv_Store_list_keys, [:pointer, :string, :pointer], :pointer
+  attach_function :weaveffi_kv_Store_list_keys, [:pointer, :pointer, :size_t, :pointer], :pointer
   attach_function :weaveffi_kv_Store_ListKeysIterator_next, [:pointer, :pointer, :pointer], :int32
   attach_function :weaveffi_kv_Store_ListKeysIterator_destroy, [:pointer], :void
   # Return the number of live entries in the store
@@ -183,188 +437,6 @@ module WeaveFFI
   callback :weaveffi_kv_OnEvict_fn, [:string, :pointer], :void
   attach_function :weaveffi_kv_register_eviction_listener, [:weaveffi_kv_OnEvict_fn, :pointer], :uint64
   attach_function :weaveffi_kv_unregister_eviction_listener, [:uint64], :void
-
-  class EntryPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_kv_Entry_destroy(ptr)
-    end
-  end
-
-  # A single key-value entry persisted in the store
-  class Entry
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = EntryPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    # Stable monotonic identifier assigned on insert
-    def id
-      result = WeaveFFI.weaveffi_kv_Entry_get_id(@handle)
-      result
-    end
-
-    # UTF-8 lookup key
-    def key
-      result = WeaveFFI.weaveffi_kv_Entry_get_key(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    # Opaque binary payload
-    def value
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_kv_Entry_get_value(@handle, out_len)
-      return ''.b if result.null?
-      len = out_len.read(:size_t)
-      data = result.read_string(len)
-      WeaveFFI.weaveffi_free_bytes(result, len)
-      data
-    end
-
-    # Unix-timestamp seconds when the entry was created
-    def created_at
-      result = WeaveFFI.weaveffi_kv_Entry_get_created_at(@handle)
-      result
-    end
-
-    # Optional unix-timestamp seconds at which the entry expires
-    def expires_at
-      result = WeaveFFI.weaveffi_kv_Entry_get_expires_at(@handle)
-      return nil if result.null?
-      value = result.read_int64
-      WeaveFFI.weaveffi_free_bytes(result, FFI.type_size(:int64))
-      value
-    end
-
-    # Free-form labels attached to the entry
-    def tags
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_kv_Entry_get_tags(@handle, out_len)
-      return [] if result.null?
-      len = out_len.read(:size_t)
-      ptrs = result.read_array_of_pointer(len)
-      items = ptrs.map { |p| p.null? ? '' : p.read_string }
-      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-      items
-    end
-
-    # Arbitrary string-valued metadata pairs
-    def metadata
-      out_keys = FFI::MemoryPointer.new(:pointer)
-      out_values = FFI::MemoryPointer.new(:pointer)
-      out_len = FFI::MemoryPointer.new(:size_t)
-      WeaveFFI.weaveffi_kv_Entry_get_metadata(@handle, out_keys, out_values, out_len)
-      len = out_len.read(:size_t)
-      keys_ptr = out_keys.read_pointer
-      vals_ptr = out_values.read_pointer
-      return {} if keys_ptr.null? || vals_ptr.null?
-      keys = keys_ptr.read_array_of_pointer(len)
-      vals = vals_ptr.read_array_of_pointer(len)
-      hash = keys.zip(vals).each_with_object({}) { |(k, v), h| h[k.null? ? '' : k.read_string] = v.null? ? '' : v.read_string }
-      keys.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      vals.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      WeaveFFI.weaveffi_free_bytes(keys_ptr, len * FFI.type_size(:pointer))
-      WeaveFFI.weaveffi_free_bytes(vals_ptr, len * FFI.type_size(:pointer))
-      hash
-    end
-  end
-
-  # A single key-value entry persisted in the store
-  class EntryBuilder
-    def initialize
-      @id = 0
-      @key = ""
-      @value = "".b
-      @created_at = 0
-      @expires_at = nil
-      @tags = []
-      @metadata = {}
-    end
-
-    # Stable monotonic identifier assigned on insert
-    def with_id(value)
-      @id = value
-      self
-    end
-
-    # UTF-8 lookup key
-    def with_key(value)
-      @key = value
-      self
-    end
-
-    # Opaque binary payload
-    def with_value(value)
-      @value = value
-      self
-    end
-
-    # Unix-timestamp seconds when the entry was created
-    def with_created_at(value)
-      @created_at = value
-      self
-    end
-
-    # Optional unix-timestamp seconds at which the entry expires
-    def with_expires_at(value)
-      @expires_at = value
-      self
-    end
-
-    # Free-form labels attached to the entry
-    def with_tags(value)
-      @tags = value
-      self
-    end
-
-    # Arbitrary string-valued metadata pairs
-    def with_metadata(value)
-      @metadata = value
-      self
-    end
-
-    def build
-      err = WeaveFFI::ErrorStruct.new
-      id = @id
-      key = @key
-      value = @value
-      value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
-      value_buf.put_bytes(0, value)
-      created_at = @created_at
-      expires_at = @expires_at
-      expires_at_c = expires_at.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(expires_at); p; end
-      tags = @tags
-      tags_buf = FFI::MemoryPointer.new(:pointer, tags.length)
-      tags_ptrs = tags.map { |s| FFI::MemoryPointer.from_string(s) }
-      tags_buf.write_array_of_pointer(tags_ptrs)
-      metadata = @metadata
-      metadata_k = metadata.keys
-      metadata_v = metadata.values
-      metadata_keys_buf = FFI::MemoryPointer.new(:pointer, metadata_k.length)
-      metadata_vals_buf = FFI::MemoryPointer.new(:pointer, metadata_v.length)
-      metadata_keys_ptrs = metadata_k.map { |s| FFI::MemoryPointer.from_string(s) }
-      metadata_keys_buf.write_array_of_pointer(metadata_keys_ptrs)
-      metadata_vals_ptrs = metadata_v.map { |s| FFI::MemoryPointer.from_string(s) }
-      metadata_vals_buf.write_array_of_pointer(metadata_vals_ptrs)
-      result = WeaveFFI.weaveffi_kv_Entry_create(id, key, value_buf, value.bytesize, created_at, expires_at_c, tags_buf, tags.length, metadata_keys_buf, metadata_vals_buf, metadata.length, err)
-      WeaveFFI.check_error!(err)
-      Entry.new(result)
-    end
-  end
 
   class StorePtr < FFI::AutoPointer
     def self.release(ptr)
@@ -404,8 +476,17 @@ module WeaveFFI
       err = ErrorStruct.new
       value_buf = FFI::MemoryPointer.new(:uint8, value.bytesize)
       value_buf.put_bytes(0, value)
-      ttl_seconds_c = ttl_seconds.nil? ? FFI::Pointer::NULL : begin; p = FFI::MemoryPointer.new(:int64); p.write_int64(ttl_seconds); p; end
-      result = WeaveFFI.weaveffi_kv_Store_put(@handle, key, value_buf, value.bytesize, kind, ttl_seconds_c, err)
+      ttl_seconds_w = WvBufferWriter.new
+      if ttl_seconds.nil?
+        ttl_seconds_w.write_flag(false)
+      else
+        ttl_seconds_w.write_flag(true)
+        ttl_seconds_w.write_i64(ttl_seconds)
+      end
+      ttl_seconds_data = ttl_seconds_w.data
+      ttl_seconds_buf = FFI::MemoryPointer.new(:uint8, ttl_seconds_data.bytesize)
+      ttl_seconds_buf.put_bytes(0, ttl_seconds_data)
+      result = WeaveFFI.weaveffi_kv_Store_put(@handle, key, value_buf, value.bytesize, kind, ttl_seconds_buf, ttl_seconds_data.bytesize, err)
       WeaveFFI.check_kv_error!(err)
       result != 0
     end
@@ -413,10 +494,20 @@ module WeaveFFI
     # Look up an entry by key; returns null if missing or expired
     def get(key)
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_kv_Store_get(@handle, key, err)
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_kv_Store_get(@handle, key, out_len, err)
       WeaveFFI.check_kv_error!(err)
-      return nil if result.null?
-      Entry.new(result)
+      len = out_len.read(:size_t)
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      if _wv_r.read_flag
+        _wv_value = WeaveFFI._wv_read_entry(_wv_r)
+      else
+        _wv_value = nil
+      end
+      _wv_r.expect_end!
+      _wv_value
     end
 
     # Remove the entry for the given key, returning true if it existed
@@ -435,9 +526,19 @@ module WeaveFFI
     # released exactly once, when iteration finishes or is abandoned
     # early (for example by `break`).
     def list_keys(prefix)
+      prefix_w = WvBufferWriter.new
+      if prefix.nil?
+        prefix_w.write_flag(false)
+      else
+        prefix_w.write_flag(true)
+        prefix_w.write_string(prefix)
+      end
+      prefix_data = prefix_w.data
+      prefix_buf = FFI::MemoryPointer.new(:uint8, prefix_data.bytesize)
+      prefix_buf.put_bytes(0, prefix_data)
       Enumerator.new do |y|
         err = ErrorStruct.new
-        iter = WeaveFFI.weaveffi_kv_Store_list_keys(@handle, prefix, err)
+        iter = WeaveFFI.weaveffi_kv_Store_list_keys(@handle, prefix_buf, prefix_data.bytesize, err)
         begin
           WeaveFFI.check_kv_error!(err)
           unless iter.null?
@@ -488,8 +589,9 @@ module WeaveFFI
         if err && err[:code] != 0
           code = err[:code]
           msg = err[:message].null? ? '' : err[:message].read_string
+          payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
           WeaveFFI.weaveffi_error_clear(err_ptr)
-          queue << WeaveFFI.kv_error_from(code, msg)
+          queue << WeaveFFI.kv_error_from(code, msg, payload)
         else
           queue << result
         end
@@ -541,66 +643,65 @@ module WeaveFFI
 
   # === Module: kv_stats ===
 
-  attach_function :weaveffi_kv_stats_Stats_destroy, [:pointer], :void
-  # Number of live entries
-  attach_function :weaveffi_kv_stats_Stats_get_total_entries, [:pointer], :int64
-  # Sum of all value byte lengths
-  attach_function :weaveffi_kv_stats_Stats_get_total_bytes, [:pointer], :int64
-  # Number of entries past their TTL but not yet evicted
-  attach_function :weaveffi_kv_stats_Stats_get_expired_entries, [:pointer], :int64
-  # Snapshot the current store statistics
-  attach_function :weaveffi_kv_stats_get_stats, [:pointer, :pointer], :pointer
-
-  class StatsPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_kv_stats_Stats_destroy(ptr)
-    end
-  end
-
   # Aggregate store statistics
   class Stats
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = StatsPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
     # Number of live entries
-    def total_entries
-      result = WeaveFFI.weaveffi_kv_stats_Stats_get_total_entries(@handle)
-      result
-    end
+    attr_reader :total_entries
 
     # Sum of all value byte lengths
-    def total_bytes
-      result = WeaveFFI.weaveffi_kv_stats_Stats_get_total_bytes(@handle)
-      result
-    end
+    attr_reader :total_bytes
 
     # Number of entries past their TTL but not yet evicted
-    def expired_entries
-      result = WeaveFFI.weaveffi_kv_stats_Stats_get_expired_entries(@handle)
-      result
+    attr_reader :expired_entries
+
+    def initialize(total_entries:, total_bytes:, expired_entries:)
+      @total_entries = total_entries
+      @total_bytes = total_bytes
+      @expired_entries = expired_entries
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Stats)
+      return false unless total_entries == other.total_entries
+      return false unless total_bytes == other.total_bytes
+      return false unless expired_entries == other.expired_entries
+      true
     end
   end
+
+  # @api private
+  # Packs a Stats into the value-buffer wire format.
+  def self._wv_write_stats(w, v)
+    w.write_i64(v.total_entries)
+    w.write_i64(v.total_bytes)
+    w.write_i64(v.expired_entries)
+  end
+
+  # @api private
+  # Unpacks a Stats from the value-buffer wire format.
+  def self._wv_read_stats(r)
+    _wv_total_entries = r.read_i64
+    _wv_total_bytes = r.read_i64
+    _wv_expired_entries = r.read_i64
+    Stats.new(total_entries: _wv_total_entries, total_bytes: _wv_total_bytes, expired_entries: _wv_expired_entries)
+  end
+  # Snapshot the current store statistics
+  attach_function :weaveffi_kv_stats_get_stats, [:pointer, :pointer, :pointer], :pointer
 
   # Snapshot the current store statistics
   def self.get_stats(store)
     err = ErrorStruct.new
-    result = weaveffi_kv_stats_get_stats(store.handle, err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_kv_stats_get_stats(store.handle, out_len, err)
     check_kv_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Stats.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_stats(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 end
 

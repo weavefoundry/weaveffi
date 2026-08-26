@@ -1,16 +1,18 @@
 // Conformance consumer: kvstore sample, Swift target.
 //
-// Binds through the generated `Kvstore` module and exercises the 0.5.0
+// Binds through the generated `Kvstore` module and exercises the 0.6.0
 // interface surface: `Store` as a final class opened via the throwing static
 // factory `Store.open(path:)`, throwing methods raising the typed `KvError`
 // domain enum (put/get/delete/listKeys), non-throwing methods without `try`
-// (count/clear), the static `Store.defaultCapacity()`, the builder's list/map
-// input marshaling, the map return-by-value getter (`entry.metadata`), the
-// iterator lowering behind `listKeys`, the nested `Kv.Stats` submodule, the
-// context-boxed eviction listener, and the CheckedContinuation-backed
-// `compact()` async method (top-level await; resumed from the producer's
-// worker thread). Typed-error asserts pin the case and the numeric code
-// carried by `errorCode` (keyNotFound 1001, expired 1002, ioError 1004).
+// (count/clear), the static `Store.defaultCapacity()`, the buffered optional
+// parameter (`ttlSeconds`), `Entry` as a plain struct decoded from a value
+// buffer whose optional, list, and map fields land as Swift `Int64?`,
+// `[String]`, and `[String: String]` stored properties, the iterator lowering
+// behind `listKeys`, the nested `Kv.Stats` submodule, the context-boxed
+// eviction listener, and the CheckedContinuation-backed `compact()` async
+// method (top-level await; resumed from the producer's worker thread).
+// Typed-error asserts pin the case and the numeric code carried by
+// `errorCode` (keyNotFound 1001, expired 1002, ioError 1004).
 
 import Foundation
 import Kvstore
@@ -32,10 +34,15 @@ do {
     _ = try store.put(key: "beta", value: payload, kind: .volatile, ttlSeconds: nil)
     expect(store.count() == 2, "count == 2")
 
-    // A present key round-trips through the optional Entry return.
+    // A present key decodes the buffered `Entry?` into a struct value. The
+    // producer stores no tags or metadata, so the nested list and map fields
+    // decode as empty collections, and the absent TTL as nil.
     let fetched = try store.get(key: "alpha")
     expect(fetched?.key == "alpha", "get alpha key")
     expect(fetched?.value == payload, "get alpha value")
+    expect(fetched?.expiresAt == nil, "get alpha expiresAt nil")
+    expect(fetched?.tags == [], "get alpha tags empty")
+    expect(fetched?.metadata == [:], "get alpha metadata empty")
 
     // Iterator lowering: a lazy single-pass Sequence pulled one element per
     // step, drained here into [String] (the BTreeMap's sorted order). A
@@ -55,45 +62,35 @@ do {
         expect(e.errorCode == 1001, "keyNotFound code == 1001 (got \(e.errorCode))")
     }
 
-    // Builder marshals a [String] list and a [String: String] map in.
-    let entry = try EntryBuilder()
-        .withId(7)
-        .withKey("alpha")
-        .withValue(payload)
-        .withCreatedAt(1000)
-        .withExpiresAt(nil)
-        .withTags(["hot", "fast"])
-        .withMetadata(["source": "test", "env": "prod"])
-        .build()
+    // The memberwise init builds a local Entry value with its list and map
+    // fields populated; the struct's stored properties read straight back.
+    let entry = Entry(
+        id: 7, key: "alpha", value: payload, createdAt: 1000, expiresAt: nil,
+        tags: ["hot", "fast"], metadata: ["source": "test", "env": "prod"])
     expect(entry.id == 7, "entry id")
 
-    // List getter.
+    // List field.
     let tags = entry.tags
     expect(tags.count == 2 && tags.contains("hot") && tags.contains("fast"), "tags")
 
-    // Map getter over the triple-pointer out-params.
+    // Map field.
     let md = entry.metadata
     expect(md.count == 2, "metadata count")
     expect(md["source"] == "test", "metadata source")
     expect(md["env"] == "prod", "metadata env")
 
-    // Empty map round-trips as an empty dictionary.
-    let empty = try EntryBuilder()
-        .withId(8)
-        .withKey("k")
-        .withValue(payload)
-        .withCreatedAt(1)
-        .withExpiresAt(nil)
-        .withTags([])
-        .withMetadata([:])
-        .build()
-    expect(empty.metadata.isEmpty, "empty metadata")
+    // Empty collections stay empty.
+    let bare = Entry(
+        id: 8, key: "k", value: payload, createdAt: 1, expiresAt: nil,
+        tags: [], metadata: [:])
+    expect(bare.metadata.isEmpty, "empty metadata")
 
-    // Nested Kv.Stats submodule (name collides with the module-level Stats),
-    // passing the Store interface across the module boundary.
+    // Nested Kv.Stats submodule (name collides with the module-level Stats
+    // struct), passing the Store interface across the module boundary and
+    // decoding the Stats record from a value buffer.
     let stats = try Kv.Stats.getStats(store: store)
-    expect(stats.total_entries == 2, "stats total_entries")
-    expect(stats.total_bytes == 6, "stats total_bytes")
+    expect(stats.totalEntries == 2, "stats totalEntries")
+    expect(stats.totalBytes == 6, "stats totalBytes")
 
     // Eviction listener: delete fires the context-boxed trampoline
     // synchronously on the calling thread.

@@ -20,7 +20,7 @@ script.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.5.0"
+version: "0.6.0"
 modules:
   - name: greeter
     errors:
@@ -200,8 +200,8 @@ except GreeterError as e:
     print(f"Error {e.code}: {e.message}")
 ```
 
-Struct wrappers free the Rust allocation when garbage-collected; for
-deterministic cleanup, `del g` after you are done with the object.
+`Greeting` is a plain Python dataclass decoded from the value buffer
+the C ABI returns; there's no native allocation to manage.
 
 ## Verification
 

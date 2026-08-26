@@ -26,7 +26,7 @@ real-world pattern for a new generator.
   instance methods, a static (`default_capacity`), and implicit destroy
 - A struct (`Entry`) with every primitive: `i64`, `string`, `bytes`, optional
   field (`expires_at: i64?`), list field (`tags: [string]`), and map field
-  (`metadata: {string:string}`), plus per-field doc strings and `builder: true`
+  (`metadata: {string:string}`), plus per-field doc strings
 - A documented enum (`EntryKind` with `Volatile`, `Persistent`, `Encrypted`)
 - A documented error domain (`KvError` with `KeyNotFound`, `Expired`,
   `StoreFull`, `IoError`) and opt-in `throws: true` on the fallible methods
@@ -60,16 +60,15 @@ Path: `samples/shapes`
 
 The reference sample for **rich (algebraic) enums** (sum types whose variants
 carry associated data) and the **expanded numeric primitives**. Use it when
-learning how a tagged union crosses the C ABI as an opaque object and how each
-backend wraps it.
+learning how a tagged union crosses the C ABI serialized in a value buffer and
+how each backend surfaces it as an idiomatic sum type.
 
 **What it demonstrates:**
 
 - A rich enum (`Shape`) with a data-less variant (`Empty`) and three payload
   variants (`Circle { radius: f64 }`, `Rectangle { width: f32, height: f32 }`,
-  and `Labeled { label: string, count: u8 }`) lowered to an opaque object with
-  per-variant constructors, a `tag` reader, per-variant field getters, and a
-  destructor
+  and `Labeled { label: string, count: u8 }`), serialized on the wire as an
+  `i32` tag followed by the active variant's fields
 - A plain C-style enum (`Channel`) alongside the rich enum, showing both enum
   flavors in one module
 - The new numeric primitives (`f32`, `u8`, `u64`) as variant fields, parameters,
@@ -129,7 +128,8 @@ calculator while writing no `unsafe` glue.
 **What it demonstrates:**
 
 - A `#[weaveffi::enumeration]` (`ContactType` with `Personal`, `Work`, `Other`)
-- A `#[weaveffi::record]` (`Contact`) with generated create/destroy/getters
+- A `#[weaveffi::record]` (`Contact`) with a generated `BufferValue`
+  encode/decode impl
 - Optional fields (`Option<String>` for the email)
 - A `#[weaveffi::interface]` (`ContactBook`) with a `new` constructor,
   instance methods, and implicit destroy

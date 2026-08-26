@@ -42,7 +42,7 @@ fn simple_module(name: &str) -> Module {
 
 fn simple_api() -> Api {
     Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![simple_module("mymod")],
         generators: None,
         package: None,
@@ -58,7 +58,7 @@ fn valid_api_passes() {
 #[test]
 fn duplicate_module_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![simple_module("dup"), simple_module("dup")],
         generators: None,
         package: None,
@@ -72,7 +72,7 @@ fn duplicate_module_names_rejected() {
 #[test]
 fn duplicate_function_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("same"), simple_function("same")],
@@ -97,7 +97,7 @@ fn duplicate_function_names_rejected() {
 fn reserved_keywords_rejected() {
     for kw in ["type", "async"] {
         let mut api = Api {
-            version: "0.5.0".to_string(),
+            version: "0.6.0".to_string(),
             modules: vec![Module {
                 name: kw.to_string(),
                 functions: vec![simple_function("ok_fn")],
@@ -123,7 +123,7 @@ fn reserved_keywords_rejected() {
 fn invalid_identifiers_rejected() {
     for bad in ["123", "has spaces", ""] {
         let mut api = Api {
-            version: "0.5.0".to_string(),
+            version: "0.6.0".to_string(),
             modules: vec![Module {
                 name: bad.to_string(),
                 functions: vec![simple_function("ok_fn")],
@@ -148,7 +148,7 @@ fn invalid_identifiers_rejected() {
 #[test]
 fn async_function_passes_validation() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -179,7 +179,7 @@ fn async_function_passes_validation() {
 #[test]
 fn async_function_with_return_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -215,7 +215,7 @@ fn async_function_with_return_passes() {
 #[test]
 fn async_void_function_emits_warning() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -251,7 +251,7 @@ fn async_void_function_emits_warning() {
 #[test]
 fn async_function_with_return_no_void_warning() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -285,7 +285,7 @@ fn async_function_with_return_no_void_warning() {
 #[test]
 fn empty_module_name_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -309,7 +309,7 @@ fn empty_module_name_rejected() {
 #[test]
 fn doc_example_error_domain_validates() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "contacts".to_string(),
             functions: vec![
@@ -367,18 +367,21 @@ fn doc_example_error_domain_validates() {
                         code: 1,
                         message: "Contact not found".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "duplicate".to_string(),
                         code: 2,
                         message: "Contact already exists".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "invalid_email".to_string(),
                         code: 3,
                         message: "Email address is invalid".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -393,7 +396,7 @@ fn doc_example_error_domain_validates() {
 #[test]
 fn error_code_zero_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -409,6 +412,7 @@ fn error_code_zero_rejected() {
                     code: 0,
                     message: "should fail".to_string(),
                     doc: None,
+                    fields: vec![],
                 }],
             }),
             modules: vec![],
@@ -426,7 +430,7 @@ fn error_code_zero_rejected() {
 #[test]
 fn error_domain_name_collision_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("do_stuff")],
@@ -442,6 +446,7 @@ fn error_domain_name_collision_rejected() {
                     code: 1,
                     message: "failed".to_string(),
                     doc: None,
+                    fields: vec![],
                 }],
             }),
             modules: vec![],
@@ -459,7 +464,7 @@ fn error_domain_name_collision_rejected() {
 #[test]
 fn duplicate_error_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -476,12 +481,14 @@ fn duplicate_error_names_rejected() {
                         code: 1,
                         message: "failed".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "fail".to_string(),
                         code: 2,
                         message: "also failed".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -500,7 +507,7 @@ fn duplicate_error_names_rejected() {
 #[test]
 fn duplicate_error_codes_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -517,12 +524,14 @@ fn duplicate_error_codes_rejected() {
                         code: 1,
                         message: "not found".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                     ErrorCode {
                         name: "timeout".to_string(),
                         code: 1,
                         message: "timed out".to_string(),
                         doc: None,
+                        fields: vec![],
                     },
                 ],
             }),
@@ -547,6 +556,7 @@ fn duplicate_error_code_names_across_domains_rejected() {
                 code: 1,
                 message: "gone".to_string(),
                 doc: None,
+                fields: vec![],
             }],
         })
     };
@@ -562,7 +572,7 @@ fn duplicate_error_code_names_across_domains_rejected() {
         modules: vec![],
     };
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![
             module("products", domain("ProductsError", "NotFound")),
             module("orders", domain("OrdersError", "NotFound")),
@@ -580,7 +590,7 @@ fn duplicate_error_code_names_across_domains_rejected() {
 
     // Distinct code names across domains stay valid.
     let mut ok = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![
             module("products", domain("ProductsError", "ProductNotFound")),
             module("orders", domain("OrdersError", "OrderNotFound")),
@@ -601,14 +611,13 @@ fn simple_struct(name: &str) -> StructDef {
             doc: None,
             default: None,
         }],
-        builder: false,
     }
 }
 
 #[test]
 fn duplicate_struct_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -633,7 +642,7 @@ fn duplicate_struct_names_rejected() {
 #[test]
 fn empty_struct_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -642,7 +651,6 @@ fn empty_struct_rejected() {
                 name: "Empty".to_string(),
                 doc: None,
                 fields: vec![],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -663,7 +671,7 @@ fn empty_struct_rejected() {
 #[test]
 fn duplicate_struct_field_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -685,7 +693,6 @@ fn duplicate_struct_field_names_rejected() {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -727,7 +734,7 @@ fn simple_enum(name: &str) -> EnumDef {
 #[test]
 fn duplicate_enum_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -752,7 +759,7 @@ fn duplicate_enum_names_rejected() {
 #[test]
 fn empty_enum_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -781,7 +788,7 @@ fn empty_enum_rejected() {
 #[test]
 fn duplicate_enum_variant_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -823,7 +830,7 @@ fn duplicate_enum_variant_rejected() {
 #[test]
 fn duplicate_enum_value_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -865,7 +872,7 @@ fn duplicate_enum_value_rejected() {
 #[test]
 fn unknown_type_ref_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -904,7 +911,7 @@ fn unknown_type_ref_rejected() {
 #[test]
 fn valid_struct_ref_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -940,7 +947,7 @@ fn valid_struct_ref_passes() {
 #[test]
 fn unknown_type_ref_in_optional_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -979,7 +986,7 @@ fn unknown_type_ref_in_optional_rejected() {
 #[test]
 fn unknown_type_ref_in_list_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1013,7 +1020,7 @@ fn unknown_type_ref_in_list_rejected() {
 #[test]
 fn struct_field_referencing_unknown_type() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1027,7 +1034,6 @@ fn struct_field_referencing_unknown_type() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1047,7 +1053,7 @@ fn struct_field_referencing_unknown_type() {
 #[test]
 fn function_param_with_optional_struct() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1076,7 +1082,6 @@ fn function_param_with_optional_struct() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1093,7 +1098,7 @@ fn function_param_with_optional_struct() {
 #[test]
 fn function_param_with_list_of_enums() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1129,7 +1134,7 @@ fn function_param_with_list_of_enums() {
 #[test]
 fn nested_optional_list_validates() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1155,7 +1160,6 @@ fn nested_optional_list_validates() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1172,7 +1176,7 @@ fn nested_optional_list_validates() {
 #[test]
 fn list_of_list_param_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1202,22 +1206,14 @@ fn list_of_list_param_rejected() {
         generators: None,
         package: None,
     };
-    let err = validate_api(&mut api, None).unwrap_err();
-    assert!(
-        matches!(
-            &err.first().error,
-            ValidationError::UnsupportedElementType { location, .. }
-                if location == "param 'data' of function 'mymod::f'"
-        ),
-        "expected UnsupportedElementType, got: {:?}",
-        err.first().error
-    );
+    // Nested lists serialize recursively in the value-buffer format.
+    validate_api(&mut api, None).expect("nested lists are representable as buffers");
 }
 
 #[test]
 fn list_of_optional_scalar_return_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1244,21 +1240,15 @@ fn list_of_optional_scalar_return_rejected() {
         generators: None,
         package: None,
     };
-    let err = validate_api(&mut api, None).unwrap_err();
-    assert!(
-        matches!(
-            &err.first().error,
-            ValidationError::UnsupportedElementType { .. }
-        ),
-        "scalar arrays cannot express per-element null; got: {:?}",
-        err.first().error
-    );
+    // The buffer format carries per-element presence flags, so a list of
+    // optional scalars round-trips.
+    validate_api(&mut api, None).expect("optional scalars in lists are representable as buffers");
 }
 
 #[test]
 fn map_of_struct_value_field_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1275,7 +1265,6 @@ fn map_of_struct_value_field_rejected() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1286,22 +1275,15 @@ fn map_of_struct_value_field_rejected() {
         generators: None,
         package: None,
     };
-    let err = validate_api(&mut api, None).unwrap_err();
-    assert!(
-        matches!(
-            &err.first().error,
-            ValidationError::UnsupportedElementType { location, .. }
-                if location == "field 'parts' of struct 'Widget'"
-        ),
-        "expected UnsupportedElementType, got: {:?}",
-        err.first().error
-    );
+    // Records nest recursively in the value-buffer format, including as map
+    // values inside another record's field.
+    validate_api(&mut api, None).expect("maps of records are representable as buffers");
 }
 
 #[test]
 fn enum_variant_value_zero_allowed() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1339,7 +1321,7 @@ fn enum_variant_value_zero_allowed() {
 #[test]
 fn valid_enum_ref_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1370,7 +1352,7 @@ fn valid_enum_ref_passes() {
 #[test]
 fn resolve_enum_ref_in_function_param() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1410,7 +1392,7 @@ fn resolve_enum_ref_in_function_param() {
 #[test]
 fn resolve_enum_ref_in_optional() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1450,7 +1432,7 @@ fn resolve_enum_ref_in_optional() {
 #[test]
 fn struct_ref_not_changed() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1490,7 +1472,7 @@ fn struct_ref_not_changed() {
 #[test]
 fn map_with_string_key_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1524,7 +1506,7 @@ fn map_with_string_key_passes() {
 #[test]
 fn map_with_struct_key_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1561,7 +1543,7 @@ fn map_with_struct_key_rejected() {
 #[test]
 fn map_with_enum_key_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1603,7 +1585,7 @@ fn warning_large_enum_variant_count() {
         })
         .collect();
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1641,7 +1623,7 @@ fn warning_enum_at_100_no_warning() {
         })
         .collect();
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1672,7 +1654,7 @@ fn warning_deep_nesting_in_param() {
         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
     )))));
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1716,7 +1698,7 @@ fn warning_nesting_at_3_no_warning() {
         Box::new(TypeRef::I32),
     )))));
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -1758,7 +1740,7 @@ fn warning_deep_nesting_in_struct_field() {
         Box::new(TypeRef::List(Box::new(TypeRef::I32))),
     )))));
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1772,7 +1754,6 @@ fn warning_deep_nesting_in_struct_field() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -1794,7 +1775,7 @@ fn warning_deep_nesting_in_struct_field() {
 #[test]
 fn warning_empty_module_doc() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "undocumented".to_string(),
             functions: vec![
@@ -1842,7 +1823,7 @@ fn warning_empty_module_doc() {
 #[test]
 fn warning_partial_docs_no_warning() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "partial".to_string(),
             functions: vec![
@@ -1889,7 +1870,7 @@ fn warning_partial_docs_no_warning() {
 #[test]
 fn warning_no_functions_no_empty_doc_warning() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "empty".to_string(),
             functions: vec![],
@@ -1913,7 +1894,7 @@ fn warning_no_functions_no_empty_doc_warning() {
 #[test]
 fn warning_clean_api_no_warnings() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "clean".to_string(),
             functions: vec![Function {
@@ -1950,7 +1931,7 @@ fn warning_clean_api_no_warnings() {
 #[test]
 fn resolve_enum_ref_in_struct_field() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![simple_function("ok_fn")],
@@ -1964,7 +1945,6 @@ fn resolve_enum_ref_in_struct_field() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![simple_enum("Color")],
             callbacks: vec![],
@@ -1985,7 +1965,7 @@ fn resolve_enum_ref_in_struct_field() {
 #[test]
 fn typed_handle_valid_struct_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -2021,7 +2001,7 @@ fn typed_handle_valid_struct_passes() {
 #[test]
 fn typed_handle_unknown_struct_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "mymod".to_string(),
             functions: vec![Function {
@@ -2060,7 +2040,7 @@ fn typed_handle_unknown_struct_rejected() {
 #[test]
 fn borrowed_str_param_accepted() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "io".to_string(),
             functions: vec![Function {
@@ -2096,7 +2076,7 @@ fn borrowed_str_param_accepted() {
 #[test]
 fn borrowed_bytes_param_accepted() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "io".to_string(),
             functions: vec![Function {
@@ -2132,7 +2112,7 @@ fn borrowed_bytes_param_accepted() {
 #[test]
 fn borrowed_str_in_return_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "io".to_string(),
             functions: vec![Function {
@@ -2167,7 +2147,7 @@ fn borrowed_str_in_return_rejected() {
 #[test]
 fn borrowed_bytes_in_return_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "io".to_string(),
             functions: vec![Function {
@@ -2202,7 +2182,7 @@ fn borrowed_bytes_in_return_rejected() {
 #[test]
 fn borrowed_str_in_struct_field_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "data".to_string(),
             functions: vec![],
@@ -2215,7 +2195,6 @@ fn borrowed_str_in_struct_field_rejected() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
                 doc: None,
             }],
             enums: vec![],
@@ -2237,7 +2216,7 @@ fn borrowed_str_in_struct_field_rejected() {
 #[test]
 fn borrowed_bytes_in_struct_field_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "data".to_string(),
             functions: vec![],
@@ -2250,7 +2229,6 @@ fn borrowed_bytes_in_struct_field_rejected() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
                 doc: None,
             }],
             enums: vec![],
@@ -2272,7 +2250,7 @@ fn borrowed_bytes_in_struct_field_rejected() {
 #[test]
 fn borrowed_str_nested_in_optional_return_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "io".to_string(),
             functions: vec![Function {
@@ -2307,7 +2285,7 @@ fn borrowed_str_nested_in_optional_return_rejected() {
 #[test]
 fn cross_module_struct_ref_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![
             Module {
                 name: "orders".to_string(),
@@ -2360,7 +2338,7 @@ fn cross_module_struct_ref_passes() {
 #[test]
 fn cross_module_enum_ref_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![
             Module {
                 name: "orders".to_string(),
@@ -2408,7 +2386,7 @@ fn cross_module_enum_ref_passes() {
 #[test]
 fn cross_module_unknown_still_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![
             Module {
                 name: "orders".to_string(),
@@ -2460,7 +2438,7 @@ fn cross_module_unknown_still_rejected() {
 #[test]
 fn find_type_in_api_finds_struct() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "catalog".to_string(),
             functions: vec![],
@@ -2482,7 +2460,7 @@ fn find_type_in_api_finds_struct() {
 #[test]
 fn find_type_in_api_finds_enum() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "shared".to_string(),
             functions: vec![],
@@ -2504,7 +2482,7 @@ fn find_type_in_api_finds_enum() {
 #[test]
 fn find_type_in_api_returns_none_for_unknown() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![simple_module("mymod")],
         generators: None,
         package: None,
@@ -2515,7 +2493,7 @@ fn find_type_in_api_returns_none_for_unknown() {
 #[test]
 fn validate_nested_module_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "parent".to_string(),
             functions: vec![simple_function("top_fn")],
@@ -2560,7 +2538,7 @@ fn function_returning(name: &str, ret: TypeRef) -> Function {
 #[test]
 fn find_type_in_api_finds_nested_type() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "graphics".to_string(),
             functions: vec![],
@@ -2598,7 +2576,7 @@ fn resolve_qualifies_reference_to_nested_module_type() {
     // nested submodules by bare name; resolution must qualify it to the
     // full dotted path so codegen can mangle the right C symbol.
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "app".to_string(),
             functions: vec![function_returning(
@@ -2639,7 +2617,7 @@ fn resolve_qualifies_nested_module_reference_to_parent_type() {
     // the nested-aware resolver, refs inside submodules were never
     // qualified at all; now they resolve to the owner's dotted path.
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "lib".to_string(),
             functions: vec![],
@@ -2683,7 +2661,7 @@ fn resolve_qualifies_nested_module_typed_handle_to_parent_type() {
     // it to the *referrer's* prefix (e.g. `weaveffi_kv_stats_Store` instead
     // of `weaveffi_kv_Store`), producing an undeclared type.
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "kv".to_string(),
             functions: vec![],
@@ -2723,7 +2701,7 @@ fn resolve_keeps_same_module_typed_handle_unqualified() {
     // A `handle<T>` whose target is defined in the *same* module stays bare
     // so the lowering keeps using the current module's prefix.
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "sessions".to_string(),
             functions: vec![function_returning(
@@ -2754,7 +2732,7 @@ fn resolve_converts_nested_enum_reference_to_enum_variant() {
     // be rewritten as `TypeRef::Enum` (not `Struct`) with the dotted path,
     // using the global index's `is_enum` flag.
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![
             Module {
                 name: "consumer".to_string(),
@@ -2795,7 +2773,7 @@ fn resolve_converts_nested_enum_reference_to_enum_variant() {
 #[test]
 fn duplicate_callback_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "events".to_string(),
             functions: vec![],
@@ -2831,7 +2809,7 @@ fn duplicate_callback_names_rejected() {
 #[test]
 fn listener_referencing_undefined_callback_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "events".to_string(),
             functions: vec![],
@@ -2860,7 +2838,7 @@ fn listener_referencing_undefined_callback_rejected() {
 #[test]
 fn listener_referencing_defined_callback_passes() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "events".to_string(),
             functions: vec![],
@@ -2894,7 +2872,7 @@ fn listener_referencing_defined_callback_passes() {
 #[test]
 fn duplicate_listener_names_rejected() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "events".to_string(),
             functions: vec![],
@@ -2934,7 +2912,7 @@ fn duplicate_listener_names_rejected() {
 #[test]
 fn iterator_valid_as_return_type() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "data".to_string(),
             functions: vec![Function {
@@ -2965,7 +2943,7 @@ fn iterator_valid_as_return_type() {
 #[test]
 fn iterator_rejected_as_param() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "data".to_string(),
             functions: vec![Function {
@@ -3004,7 +2982,7 @@ fn iterator_rejected_as_param() {
 #[test]
 fn iterator_rejected_in_struct_field() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "data".to_string(),
             functions: vec![],
@@ -3018,7 +2996,6 @@ fn iterator_rejected_in_struct_field() {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
             enums: vec![],
             callbacks: vec![],
@@ -3036,19 +3013,29 @@ fn iterator_rejected_in_struct_field() {
 }
 
 #[test]
-fn builder_struct_empty_is_error() {
+fn mutable_buffered_param_is_error() {
     let mut api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "m".into(),
-            functions: vec![],
-            interfaces: vec![],
-            structs: vec![StructDef {
-                name: "Empty".into(),
+            functions: vec![Function {
+                name: "f".into(),
+                params: vec![Param {
+                    name: "xs".into(),
+                    ty: TypeRef::List(Box::new(TypeRef::I32)),
+                    mutable: true,
+                    doc: None,
+                }],
+                returns: None,
                 doc: None,
-                fields: vec![],
-                builder: true,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+                since: None,
             }],
+            interfaces: vec![],
+            structs: vec![],
             enums: vec![],
             callbacks: vec![],
             listeners: vec![],
@@ -3062,16 +3049,16 @@ fn builder_struct_empty_is_error() {
     assert!(
         matches!(
             err.first().error,
-            ValidationError::BuilderStructEmpty { .. }
+            ValidationError::MutableParamUnsupported { .. }
         ),
-        "expected BuilderStructEmpty, got: {err}"
+        "expected MutableParamUnsupported, got: {err}"
     );
 }
 
 #[test]
 fn warning_mutable_on_value_type() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
             functions: vec![Function {
@@ -3114,7 +3101,7 @@ fn warning_mutable_on_value_type() {
 #[test]
 fn no_warning_mutable_on_pointer_type() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "io".to_string(),
             functions: vec![Function {
@@ -3170,7 +3157,7 @@ fn no_warning_mutable_on_pointer_type() {
 #[test]
 fn no_warning_mutable_false_on_value_type() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
             functions: vec![Function {
@@ -3212,7 +3199,7 @@ fn no_warning_mutable_false_on_value_type() {
 #[test]
 fn warning_mutable_on_enum_type() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "paint".to_string(),
             functions: vec![Function {
@@ -3252,7 +3239,7 @@ fn warning_mutable_on_enum_type() {
 #[test]
 fn warning_deprecated_function() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
             functions: vec![Function {
@@ -3288,7 +3275,7 @@ fn warning_deprecated_function() {
 #[test]
 fn no_warning_for_non_deprecated_function() {
     let api = Api {
-        version: "0.5.0".to_string(),
+        version: "0.6.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
             functions: vec![Function {

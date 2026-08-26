@@ -31,7 +31,9 @@ module WeaveFFI
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
-           :message, :pointer
+           :message, :pointer,
+           :payload_ptr, :pointer,
+           :payload_len, :size_t
   end
 
   class Error < StandardError
@@ -40,6 +42,176 @@ module WeaveFFI
     def initialize(code, message)
       @code = code
       super(message)
+    end
+  end
+
+  # @api private
+  # Appends values in the WeaveFFI value-buffer wire format: little-endian,
+  # packed, no alignment.
+  class WvBufferWriter
+    def initialize
+      @buf = +''.b
+    end
+
+    # The encoded bytes as a binary String.
+    def data
+      @buf
+    end
+
+    def write_bool(v)
+      @buf << (v ? "\x01".b : "\x00".b)
+    end
+
+    def write_flag(v)
+      write_bool(v)
+    end
+
+    def write_i8(v)
+      @buf << [v].pack('c')
+    end
+
+    def write_u8(v)
+      @buf << [v].pack('C')
+    end
+
+    def write_i16(v)
+      @buf << [v].pack('s<')
+    end
+
+    def write_u16(v)
+      @buf << [v].pack('S<')
+    end
+
+    def write_i32(v)
+      @buf << [v].pack('l<')
+    end
+
+    def write_u32(v)
+      @buf << [v].pack('L<')
+    end
+
+    def write_len(v)
+      write_u32(v)
+    end
+
+    def write_i64(v)
+      @buf << [v].pack('q<')
+    end
+
+    def write_u64(v)
+      @buf << [v].pack('Q<')
+    end
+
+    def write_f32(v)
+      @buf << [v].pack('e')
+    end
+
+    def write_f64(v)
+      @buf << [v].pack('E')
+    end
+
+    def write_string(v)
+      b = v.to_s.encode(Encoding::UTF_8).b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+
+    def write_bytes(v)
+      b = v.to_s.b
+      write_u32(b.bytesize)
+      @buf << b
+    end
+  end
+
+  # @api private
+  # Reads values in the WeaveFFI value-buffer wire format, raising Error on
+  # any malformed buffer.
+  class WvBufferReader
+    def initialize(data)
+      @data = data.to_s.b
+      @pos = 0
+    end
+
+    def take(n, what)
+      raise Error.new(-1, "malformed value buffer: #{what}") if @pos + n > @data.bytesize
+      s = @data.byteslice(@pos, n)
+      @pos += n
+      s
+    end
+
+    def read_bool
+      b = take(1, 'bool').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: bool byte out of range') if b > 1
+      b == 1
+    end
+
+    def read_flag
+      b = take(1, 'option flag').unpack1('C')
+      raise Error.new(-1, 'malformed value buffer: option flag out of range') if b > 1
+      b == 1
+    end
+
+    def read_i8
+      take(1, 'i8').unpack1('c')
+    end
+
+    def read_u8
+      take(1, 'u8').unpack1('C')
+    end
+
+    def read_i16
+      take(2, 'i16').unpack1('s<')
+    end
+
+    def read_u16
+      take(2, 'u16').unpack1('S<')
+    end
+
+    def read_i32
+      take(4, 'i32').unpack1('l<')
+    end
+
+    def read_u32
+      take(4, 'u32').unpack1('L<')
+    end
+
+    def read_len
+      len = read_u32
+      if len > @data.bytesize - @pos
+        raise Error.new(-1, 'malformed value buffer: length prefix exceeds remaining bytes')
+      end
+      len
+    end
+
+    def read_i64
+      take(8, 'i64').unpack1('q<')
+    end
+
+    def read_u64
+      take(8, 'u64').unpack1('Q<')
+    end
+
+    def read_f32
+      take(4, 'f32').unpack1('e')
+    end
+
+    def read_f64
+      take(8, 'f64').unpack1('E')
+    end
+
+    def read_string
+      s = take(read_len, 'string bytes').force_encoding(Encoding::UTF_8)
+      raise Error.new(-1, 'malformed value buffer: string is not valid UTF-8') unless s.valid_encoding?
+      s
+    end
+
+    def read_bytes
+      take(read_len, 'byte buffer')
+    end
+
+    def expect_end!
+      return if @pos == @data.bytesize
+      raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
@@ -85,9 +257,10 @@ module WeaveFFI
     2 => ProductsError::ProductNotFound,
   }.freeze
 
-  # Builds the ProductsError subclass matching `code`, or a generic Error
-  # for codes outside the domain (panics, marshalling).
-  def self.products_error_from(code, message)
+  # Builds the ProductsError subclass matching `code`, decoding any payload
+  # fields the code declares, or a generic Error for codes outside
+  # the domain (panics, marshalling).
+  def self.products_error_from(code, message, payload = nil)
     cls = PRODUCTS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
     message.empty? ? cls.new : cls.new(message)
@@ -99,8 +272,10 @@ module WeaveFFI
     code = err[:code]
     msg_ptr = err[:message]
     msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    payload_ptr = err[:payload_ptr]
+    payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
-    raise products_error_from(code, msg)
+    raise products_error_from(code, msg, payload)
   end
 
   module Category
@@ -110,88 +285,86 @@ module WeaveFFI
     BOOKS = 3
   end
 
-  attach_function :weaveffi_products_Product_destroy, [:pointer], :void
-  attach_function :weaveffi_products_Product_get_id, [:pointer], :int64
-  attach_function :weaveffi_products_Product_get_name, [:pointer], :pointer
-  attach_function :weaveffi_products_Product_get_description, [:pointer], :pointer
-  attach_function :weaveffi_products_Product_get_price, [:pointer], :double
-  attach_function :weaveffi_products_Product_get_category, [:pointer], :int32
-  attach_function :weaveffi_products_Product_get_tags, [:pointer, :pointer], :pointer
+  class Product
+    attr_reader :id
+
+    attr_reader :name
+
+    attr_reader :description
+
+    attr_reader :price
+
+    attr_reader :category
+
+    attr_reader :tags
+
+    def initialize(id:, name:, description:, price:, category:, tags:)
+      @id = id
+      @name = name
+      @description = description
+      @price = price
+      @category = category
+      @tags = tags
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Product)
+      return false unless id == other.id
+      return false unless name == other.name
+      return false unless description == other.description
+      return false unless price == other.price
+      return false unless category == other.category
+      return false unless tags == other.tags
+      true
+    end
+  end
+
+  # @api private
+  # Packs a Product into the value-buffer wire format.
+  def self._wv_write_product(w, v)
+    w.write_i64(v.id)
+    w.write_string(v.name)
+    if v.description.nil?
+      w.write_flag(false)
+    else
+      w.write_flag(true)
+      w.write_string(v.description)
+    end
+    w.write_f64(v.price)
+    w.write_i32(v.category)
+    w.write_len(v.tags.length)
+    v.tags.each do |_wv_e0|
+      w.write_string(_wv_e0)
+    end
+  end
+
+  # @api private
+  # Unpacks a Product from the value-buffer wire format.
+  def self._wv_read_product(r)
+    _wv_id = r.read_i64
+    _wv_name = r.read_string
+    if r.read_flag
+      _wv_description = r.read_string
+    else
+      _wv_description = nil
+    end
+    _wv_price = r.read_f64
+    _wv_category = r.read_i32
+    _wv_tags = Array.new(r.read_len) do
+      _wv_e0 = r.read_string
+      _wv_e0
+    end
+    Product.new(id: _wv_id, name: _wv_name, description: _wv_description, price: _wv_price, category: _wv_category, tags: _wv_tags)
+  end
 
   attach_function :weaveffi_products_Catalog_destroy, [:pointer], :void
   attach_function :weaveffi_products_Catalog_new, [:pointer], :pointer
-  attach_function :weaveffi_products_Catalog_add_product, [:pointer, :string, :double, :int32, :pointer], :pointer
-  attach_function :weaveffi_products_Catalog_get_product, [:pointer, :int64, :pointer], :pointer
+  attach_function :weaveffi_products_Catalog_add_product, [:pointer, :string, :double, :int32, :pointer, :pointer], :pointer
+  attach_function :weaveffi_products_Catalog_get_product, [:pointer, :int64, :pointer, :pointer], :pointer
   attach_function :weaveffi_products_Catalog_search, [:pointer, :int32, :pointer, :pointer], :pointer
   attach_function :weaveffi_products_Catalog_update_price, [:pointer, :int64, :double, :pointer], :int32
   attach_function :weaveffi_products_Catalog_remove, [:pointer, :int64, :pointer], :int32
-
-  class ProductPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_products_Product_destroy(ptr)
-    end
-  end
-
-  class Product
-    attr_reader :handle
-
-    def initialize(handle)
-      @handle = ProductPtr.new(handle)
-    end
-
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def id
-      result = WeaveFFI.weaveffi_products_Product_get_id(@handle)
-      result
-    end
-
-    def name
-      result = WeaveFFI.weaveffi_products_Product_get_name(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    def description
-      result = WeaveFFI.weaveffi_products_Product_get_description(@handle)
-      return nil if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
-    end
-
-    def price
-      result = WeaveFFI.weaveffi_products_Product_get_price(@handle)
-      result
-    end
-
-    def category
-      result = WeaveFFI.weaveffi_products_Product_get_category(@handle)
-      result
-    end
-
-    def tags
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_products_Product_get_tags(@handle, out_len)
-      return [] if result.null?
-      len = out_len.read(:size_t)
-      ptrs = result.read_array_of_pointer(len)
-      items = ptrs.map { |p| p.null? ? '' : p.read_string }
-      ptrs.each { |p| WeaveFFI.weaveffi_free_string(p) unless p.null? }
-      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-      items
-    end
-  end
 
   class CatalogPtr < FFI::AutoPointer
     def self.release(ptr)
@@ -227,18 +400,30 @@ module WeaveFFI
 
     def add_product(name, price, category)
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_products_Catalog_add_product(@handle, name, price, category, err)
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_products_Catalog_add_product(@handle, name, price, category, out_len, err)
       WeaveFFI.check_products_error!(err)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Product.new(result)
+      len = out_len.read(:size_t)
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      _wv_value = WeaveFFI._wv_read_product(_wv_r)
+      _wv_r.expect_end!
+      _wv_value
     end
 
     def get_product(id)
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_products_Catalog_get_product(@handle, id, err)
+      out_len = FFI::MemoryPointer.new(:size_t)
+      result = WeaveFFI.weaveffi_products_Catalog_get_product(@handle, id, out_len, err)
       WeaveFFI.check_products_error!(err)
-      raise Error.new(-1, 'null pointer') if result.null?
-      Product.new(result)
+      len = out_len.read(:size_t)
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      _wv_value = WeaveFFI._wv_read_product(_wv_r)
+      _wv_r.expect_end!
+      _wv_value
     end
 
     def search(category)
@@ -246,11 +431,16 @@ module WeaveFFI
       out_len = FFI::MemoryPointer.new(:size_t)
       result = WeaveFFI.weaveffi_products_Catalog_search(@handle, category, out_len, err)
       WeaveFFI.check_error!(err)
-      return [] if result.null?
       len = out_len.read(:size_t)
-      items = result.read_array_of_pointer(len).map { |p| Product.new(p) }
-      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-      items
+      data = result.null? ? ''.b : result.read_string(len)
+      WeaveFFI.weaveffi_free_bytes(result, len) unless result.null?
+      _wv_r = WvBufferReader.new(data)
+      _wv_value = Array.new(_wv_r.read_len) do
+        _wv_e0 = WeaveFFI._wv_read_product(_wv_r)
+        _wv_e0
+      end
+      _wv_r.expect_end!
+      _wv_value
     end
 
     def update_price(id, price)
@@ -297,9 +487,10 @@ module WeaveFFI
     2 => OrdersError::EmptyOrder,
   }.freeze
 
-  # Builds the OrdersError subclass matching `code`, or a generic Error
-  # for codes outside the domain (panics, marshalling).
-  def self.orders_error_from(code, message)
+  # Builds the OrdersError subclass matching `code`, decoding any payload
+  # fields the code declares, or a generic Error for codes outside
+  # the domain (panics, marshalling).
+  def self.orders_error_from(code, message, payload = nil)
     cls = ORDERS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
     message.empty? ? cls.new : cls.new(message)
@@ -311,131 +502,135 @@ module WeaveFFI
     code = err[:code]
     msg_ptr = err[:message]
     msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    payload_ptr = err[:payload_ptr]
+    payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
-    raise orders_error_from(code, msg)
-  end
-
-  attach_function :weaveffi_orders_OrderItem_destroy, [:pointer], :void
-  attach_function :weaveffi_orders_OrderItem_get_product_id, [:pointer], :int64
-  attach_function :weaveffi_orders_OrderItem_get_quantity, [:pointer], :int32
-  attach_function :weaveffi_orders_OrderItem_get_unit_price, [:pointer], :double
-
-  attach_function :weaveffi_orders_Order_destroy, [:pointer], :void
-  attach_function :weaveffi_orders_Order_get_id, [:pointer], :int64
-  attach_function :weaveffi_orders_Order_get_items, [:pointer, :pointer], :pointer
-  attach_function :weaveffi_orders_Order_get_total, [:pointer], :double
-  attach_function :weaveffi_orders_Order_get_status, [:pointer], :pointer
-  attach_function :weaveffi_orders_create_order, [:pointer, :size_t, :pointer], :int64
-  attach_function :weaveffi_orders_get_order, [:int64, :pointer], :pointer
-  attach_function :weaveffi_orders_cancel_order, [:int64, :pointer], :int32
-  attach_function :weaveffi_orders_add_product_to_order, [:int64, :pointer, :pointer], :int32
-
-  class OrderItemPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_orders_OrderItem_destroy(ptr)
-    end
+    raise orders_error_from(code, msg, payload)
   end
 
   class OrderItem
-    attr_reader :handle
+    attr_reader :product_id
 
-    def initialize(handle)
-      @handle = OrderItemPtr.new(handle)
+    attr_reader :quantity
+
+    attr_reader :unit_price
+
+    def initialize(product_id:, quantity:, unit_price:)
+      @product_id = product_id
+      @quantity = quantity
+      @unit_price = unit_price
     end
 
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def product_id
-      result = WeaveFFI.weaveffi_orders_OrderItem_get_product_id(@handle)
-      result
-    end
-
-    def quantity
-      result = WeaveFFI.weaveffi_orders_OrderItem_get_quantity(@handle)
-      result
-    end
-
-    def unit_price
-      result = WeaveFFI.weaveffi_orders_OrderItem_get_unit_price(@handle)
-      result
-    end
-  end
-
-  class OrderPtr < FFI::AutoPointer
-    def self.release(ptr)
-      WeaveFFI.weaveffi_orders_Order_destroy(ptr)
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(OrderItem)
+      return false unless product_id == other.product_id
+      return false unless quantity == other.quantity
+      return false unless unit_price == other.unit_price
+      true
     end
   end
 
   class Order
-    attr_reader :handle
+    attr_reader :id
 
-    def initialize(handle)
-      @handle = OrderPtr.new(handle)
+    attr_reader :items
+
+    attr_reader :total
+
+    attr_reader :status
+
+    def initialize(id:, items:, total:, status:)
+      @id = id
+      @items = items
+      @total = total
+      @status = status
     end
 
-    def self.create(handle)
-      new(handle)
-    end
-
-    def destroy
-      return if @handle.nil?
-      @handle.free
-      @handle = nil
-    end
-
-    def id
-      result = WeaveFFI.weaveffi_orders_Order_get_id(@handle)
-      result
-    end
-
-    def items
-      out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_orders_Order_get_items(@handle, out_len)
-      return [] if result.null?
-      len = out_len.read(:size_t)
-      items = result.read_array_of_pointer(len).map { |p| OrderItem.new(p) }
-      WeaveFFI.weaveffi_free_bytes(result, len * FFI.type_size(:pointer))
-      items
-    end
-
-    def total
-      result = WeaveFFI.weaveffi_orders_Order_get_total(@handle)
-      result
-    end
-
-    def status
-      result = WeaveFFI.weaveffi_orders_Order_get_status(@handle)
-      return '' if result.null?
-      str = result.read_string
-      WeaveFFI.weaveffi_free_string(result)
-      str
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(Order)
+      return false unless id == other.id
+      return false unless items == other.items
+      return false unless total == other.total
+      return false unless status == other.status
+      true
     end
   end
 
+  # @api private
+  # Packs a OrderItem into the value-buffer wire format.
+  def self._wv_write_order_item(w, v)
+    w.write_i64(v.product_id)
+    w.write_i32(v.quantity)
+    w.write_f64(v.unit_price)
+  end
+
+  # @api private
+  # Unpacks a OrderItem from the value-buffer wire format.
+  def self._wv_read_order_item(r)
+    _wv_product_id = r.read_i64
+    _wv_quantity = r.read_i32
+    _wv_unit_price = r.read_f64
+    OrderItem.new(product_id: _wv_product_id, quantity: _wv_quantity, unit_price: _wv_unit_price)
+  end
+
+  # @api private
+  # Packs a Order into the value-buffer wire format.
+  def self._wv_write_order(w, v)
+    w.write_i64(v.id)
+    w.write_len(v.items.length)
+    v.items.each do |_wv_e0|
+      _wv_write_order_item(w, _wv_e0)
+    end
+    w.write_f64(v.total)
+    w.write_string(v.status)
+  end
+
+  # @api private
+  # Unpacks a Order from the value-buffer wire format.
+  def self._wv_read_order(r)
+    _wv_id = r.read_i64
+    _wv_items = Array.new(r.read_len) do
+      _wv_e0 = _wv_read_order_item(r)
+      _wv_e0
+    end
+    _wv_total = r.read_f64
+    _wv_status = r.read_string
+    Order.new(id: _wv_id, items: _wv_items, total: _wv_total, status: _wv_status)
+  end
+  attach_function :weaveffi_orders_create_order, [:pointer, :size_t, :pointer], :int64
+  attach_function :weaveffi_orders_get_order, [:int64, :pointer, :pointer], :pointer
+  attach_function :weaveffi_orders_cancel_order, [:int64, :pointer], :int32
+  attach_function :weaveffi_orders_add_product_to_order, [:int64, :pointer, :size_t, :pointer], :int32
+
   def self.create_order(items)
     err = ErrorStruct.new
-    items_buf = FFI::MemoryPointer.new(:pointer, items.length)
-    items_buf.write_array_of_pointer(items.map(&:handle))
-    result = weaveffi_orders_create_order(items_buf, items.length, err)
+    items_w = WvBufferWriter.new
+    items_w.write_len(items.length)
+    items.each do |_wv_e0|
+      _wv_write_order_item(items_w, _wv_e0)
+    end
+    items_data = items_w.data
+    items_buf = FFI::MemoryPointer.new(:uint8, items_data.bytesize)
+    items_buf.put_bytes(0, items_data)
+    result = weaveffi_orders_create_order(items_buf, items_data.bytesize, err)
     check_orders_error!(err)
     result
   end
 
   def self.get_order(id)
     err = ErrorStruct.new
-    result = weaveffi_orders_get_order(id, err)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_orders_get_order(id, out_len, err)
     check_orders_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Order.new(result)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_order(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
   end
 
   def self.cancel_order(id)
@@ -447,7 +642,12 @@ module WeaveFFI
 
   def self.add_product_to_order(order_id, product)
     err = ErrorStruct.new
-    result = weaveffi_orders_add_product_to_order(order_id, product.handle, err)
+    product_w = WvBufferWriter.new
+    _wv_write_product(product_w, product)
+    product_data = product_w.data
+    product_buf = FFI::MemoryPointer.new(:uint8, product_data.bytesize)
+    product_buf.put_bytes(0, product_data)
+    result = weaveffi_orders_add_product_to_order(order_id, product_buf, product_data.bytesize, err)
     check_error!(err)
     result != 0
   end

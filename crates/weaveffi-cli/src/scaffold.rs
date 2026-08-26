@@ -1,9 +1,7 @@
 use std::fmt::Write;
 
 use weaveffi_core::abi::AbiParam;
-use weaveffi_core::model::{
-    AbiFn, BindingModel, CallShape, EnumBinding, FieldBinding, ModuleBinding, StructBinding,
-};
+use weaveffi_core::model::{AbiFn, BindingModel, CallShape, ModuleBinding};
 use weaveffi_ir::ir::Api;
 
 /// The body every generated stub carries until the producer fills it in.
@@ -45,21 +43,6 @@ fn emit_abi_fn(out: &mut String, f: &AbiFn, prefix: &str, body: &str) {
     emit_stub(out, &f.symbol, &slots_decl(&f.params, prefix), &ret, body);
 }
 
-/// Emit a getter stub: an implicit `ptr: *const {tag}` receiver, any trailing
-/// `out_*` slots (e.g. `out_len`), and the field's C return type.
-fn emit_getter(out: &mut String, tag: &str, field: &FieldBinding, prefix: &str) {
-    let mut params = vec![format!("ptr: *const {tag}")];
-    params.extend(field.getter_out_params.iter().map(|p| slot_decl(p, prefix)));
-    let ret = format!(" -> {}", field.getter_ret.render_rust(prefix));
-    emit_stub(
-        out,
-        &field.getter_symbol,
-        &params.join(", "),
-        &ret,
-        TODO_BODY,
-    );
-}
-
 /// Render Rust `#[no_mangle] extern "C"` producer stubs for every symbol the
 /// generated C ABI exposes, with `todo!()` bodies for the author to fill in.
 ///
@@ -90,14 +73,9 @@ pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
 }
 
 fn render_module(out: &mut String, m: &ModuleBinding, prefix: &str) {
-    for e in &m.enums {
-        if e.is_rich() {
-            render_rich_enum_scaffold(out, e, prefix);
-        }
-    }
-    for s in &m.structs {
-        render_struct_scaffold(out, s, prefix);
-    }
+    // Records and rich enums are value types with no producer C surface:
+    // their encodings arrive and leave through the buffered `(ptr, len)`
+    // slots already present on the function stubs below.
     // Module-scope callback function-pointer typedefs the producer invokes.
     for cb in &m.callbacks {
         let _ = writeln!(
@@ -202,92 +180,6 @@ fn render_interface_scaffold(
     );
 }
 
-fn render_struct_scaffold(out: &mut String, s: &StructBinding, prefix: &str) {
-    let tag = &s.c_tag;
-    let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
-    out.push_str("    // TODO: add fields\n");
-    out.push_str("}\n\n");
-
-    emit_abi_fn(out, &s.create, prefix, TODO_BODY);
-    emit_stub(
-        out,
-        &s.destroy_symbol,
-        &format!("ptr: *mut {tag}"),
-        "",
-        TODO_BODY,
-    );
-    for field in &s.fields {
-        emit_getter(out, tag, field, prefix);
-    }
-
-    if let Some(b) = &s.builder {
-        let bt = &b.builder_tag;
-        let _ = writeln!(out, "#[repr(C)]\npub struct {bt} {{");
-        out.push_str("    // TODO: accumulate fields until build()\n");
-        out.push_str("}\n\n");
-        emit_stub(out, &b.new_symbol, "", &format!(" -> *mut {bt}"), TODO_BODY);
-        for (field, (_, setter)) in s.fields.iter().zip(&b.setters) {
-            let params = std::iter::once(format!("builder: *mut {bt}"))
-                .chain(field.value_params.iter().map(|p| slot_decl(p, prefix)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            emit_stub(out, setter, &params, "", TODO_BODY);
-        }
-        emit_stub(
-            out,
-            &b.build_symbol,
-            &format!("builder: *mut {bt}, out_err: *mut weaveffi_error"),
-            &format!(" -> *mut {tag}"),
-            TODO_BODY,
-        );
-        emit_stub(
-            out,
-            &b.destroy_symbol,
-            &format!("builder: *mut {bt}"),
-            "",
-            TODO_BODY,
-        );
-    }
-}
-
-/// Emit the producer surface for a rich (algebraic) enum: an opaque object type
-/// plus, for every variant, a `{tag}_{Variant}_new` constructor and one
-/// `{tag}_{Variant}_get_{field}` getter per associated field, followed by the
-/// shared `{tag}_tag` reader and `{tag}_destroy`. The symbol names and lowered
-/// signatures come straight from the [`BindingModel`], so they mirror the
-/// generated C header exactly.
-fn render_rich_enum_scaffold(out: &mut String, e: &EnumBinding, prefix: &str) {
-    let Some(rich) = &e.rich else {
-        return;
-    };
-    let tag = &e.c_tag;
-    let _ = writeln!(out, "#[repr(C)]\npub struct {tag} {{");
-    out.push_str("    // TODO: represent the active variant and its associated data\n");
-    out.push_str("}\n\n");
-
-    for v in &rich.variants {
-        emit_abi_fn(out, &v.create, prefix, TODO_BODY);
-        for field in &v.fields {
-            emit_getter(out, tag, field, prefix);
-        }
-    }
-
-    emit_stub(
-        out,
-        &rich.tag_symbol,
-        &format!("ptr: *const {tag}"),
-        " -> i32",
-        TODO_BODY,
-    );
-    emit_stub(
-        out,
-        &rich.destroy_symbol,
-        &format!("ptr: *mut {tag}"),
-        "",
-        TODO_BODY,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +187,7 @@ mod tests {
 
     fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
         Api {
-            version: "0.5.0".to_string(),
+            version: "0.6.0".to_string(),
             modules: vec![Module {
                 name: "calc".to_string(),
                 functions,
@@ -424,7 +316,6 @@ mod tests {
                     doc: None,
                     default: None,
                 }],
-                builder: false,
             }],
         );
         let out = render_scaffold(&api, "myffi");
@@ -433,20 +324,8 @@ mod tests {
             "user fn should adopt custom prefix: {out}"
         );
         assert!(
-            out.contains("pub struct myffi_calc_Point"),
-            "user struct should adopt custom prefix: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn myffi_calc_Point_create("),
-            "struct create stub should adopt custom prefix: {out}"
-        );
-        assert!(
             !out.contains("weaveffi_calc_add"),
             "user fn should not retain default prefix: {out}"
-        );
-        assert!(
-            !out.contains("weaveffi_calc_Point"),
-            "user struct should not retain default prefix: {out}"
         );
         assert!(
             out.contains("abi::export_runtime!();"),
@@ -576,7 +455,10 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_struct_stubs() {
+    fn scaffold_struct_emits_no_producer_surface() {
+        // Records are value types crossing the ABI as serialized buffers:
+        // there is no opaque object, create/destroy pair, or getter surface
+        // for the producer to implement.
         let api = minimal_api(
             vec![],
             vec![StructDef {
@@ -596,38 +478,61 @@ mod tests {
                         default: None,
                     },
                 ],
-                builder: false,
             }],
         );
         let out = render_scaffold(&api, "weaveffi");
-        assert!(out.contains("#[repr(C)]"), "struct should be repr(C)");
         assert!(
-            out.contains("pub struct weaveffi_calc_Point"),
-            "missing struct definition: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_calc_Point_create(x: f64, y: f64, out_err: *mut weaveffi_error) -> *mut weaveffi_calc_Point"),
-            "missing create stub: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_calc_Point_destroy(ptr: *mut weaveffi_calc_Point)"),
-            "missing destroy stub: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_calc_Point_get_x(ptr: *const weaveffi_calc_Point) -> f64"),
-            "missing x getter: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_calc_Point_get_y(ptr: *const weaveffi_calc_Point) -> f64"),
-            "missing y getter: {out}"
+            !out.contains("weaveffi_calc_Point"),
+            "records must not get producer stubs: {out}"
         );
     }
 
     #[test]
-    fn scaffold_rich_enum_emits_variant_surface() {
+    fn scaffold_record_param_and_return_are_buffered() {
+        let api = minimal_api(
+            vec![Function {
+                name: "save".into(),
+                params: vec![Param {
+                    name: "point".into(),
+                    ty: TypeRef::Record("Point".into()),
+                    mutable: false,
+                    doc: None,
+                }],
+                returns: Some(TypeRef::Record("Point".into())),
+                doc: None,
+                r#async: false,
+                cancellable: false,
+                throws: false,
+                deprecated: None,
+                since: None,
+            }],
+            vec![StructDef {
+                name: "Point".into(),
+                doc: None,
+                fields: vec![StructField {
+                    name: "x".into(),
+                    ty: TypeRef::F64,
+                    doc: None,
+                    default: None,
+                }],
+            }],
+        );
+        let out = render_scaffold(&api, "weaveffi");
+        assert!(
+            out.contains("point_ptr: *const u8, point_len: usize"),
+            "record param should be a borrowed value buffer: {out}"
+        );
+        assert!(
+            out.contains("out_len: *mut usize") && out.contains("-> *const u8"),
+            "record return should be a value buffer with out_len: {out}"
+        );
+    }
+
+    #[test]
+    fn scaffold_rich_enum_emits_no_producer_surface() {
         use weaveffi_ir::ir::{EnumDef, EnumVariant};
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "shapes".into(),
                 functions: vec![],
@@ -665,29 +570,12 @@ mod tests {
             package: None,
         };
         let out = render_scaffold(&api, "weaveffi");
+        // Rich enums are value types crossing the ABI as serialized buffers:
+        // no opaque object, per-variant constructors, getters, tag reader, or
+        // destructor for the producer to implement.
         assert!(
-            out.contains("pub struct weaveffi_shapes_Shape"),
-            "opaque enum object type missing: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_shapes_Shape_Empty_new(out_err: *mut weaveffi_error) -> *mut weaveffi_shapes_Shape"),
-            "unit-variant constructor missing: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_shapes_Shape_Circle_new(radius: f64, out_err: *mut weaveffi_error) -> *mut weaveffi_shapes_Shape"),
-            "data-variant constructor missing: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_shapes_Shape_Circle_get_radius(ptr: *const weaveffi_shapes_Shape) -> f64"),
-            "variant field getter missing: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_shapes_Shape_tag(ptr: *const weaveffi_shapes_Shape) -> i32"),
-            "tag reader missing: {out}"
-        );
-        assert!(
-            out.contains("fn weaveffi_shapes_Shape_destroy(ptr: *mut weaveffi_shapes_Shape)"),
-            "destructor missing: {out}"
+            !out.contains("weaveffi_shapes_Shape"),
+            "rich enums must not get producer stubs: {out}"
         );
     }
 
@@ -695,7 +583,7 @@ mod tests {
     fn scaffold_c_style_enum_emits_no_producer_surface() {
         use weaveffi_ir::ir::{EnumDef, EnumVariant};
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "shapes".into(),
                 functions: vec![],
@@ -735,30 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_struct_string_field_getter() {
-        let api = minimal_api(
-            vec![],
-            vec![StructDef {
-                name: "Contact".into(),
-                doc: None,
-                fields: vec![StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                }],
-                builder: false,
-            }],
-        );
-        let out = render_scaffold(&api, "weaveffi");
-        assert!(
-            out.contains("fn weaveffi_calc_Contact_get_name(ptr: *const weaveffi_calc_Contact) -> *const c_char"),
-            "string getter should return *const c_char: {out}"
-        );
-    }
-
-    #[test]
-    fn scaffold_optional_value_param() {
+    fn scaffold_optional_value_param_is_buffered() {
         let api = minimal_api(
             vec![Function {
                 name: "find".into(),
@@ -780,13 +645,13 @@ mod tests {
         );
         let out = render_scaffold(&api, "weaveffi");
         assert!(
-            out.contains("id: *const i32"),
-            "optional i32 param should be pointer: {out}"
+            out.contains("id_ptr: *const u8, id_len: usize"),
+            "optional param should be a borrowed value buffer: {out}"
         );
     }
 
     #[test]
-    fn scaffold_list_param() {
+    fn scaffold_list_param_is_buffered() {
         let api = minimal_api(
             vec![Function {
                 name: "sum".into(),
@@ -808,8 +673,8 @@ mod tests {
         );
         let out = render_scaffold(&api, "weaveffi");
         assert!(
-            out.contains("items: *const i32, items_len: usize"),
-            "list param should be ptr+len: {out}"
+            out.contains("items_ptr: *const u8, items_len: usize"),
+            "list param should be a borrowed value buffer: {out}"
         );
     }
 
@@ -912,35 +777,19 @@ mod tests {
             vec![],
         );
         let out = render_scaffold(&api, "weaveffi");
+        // Maps are value buffers in both directions: one borrowed `(ptr, len)`
+        // pair in, one owned buffer plus `out_len` back.
         assert!(
-            out.contains("grades_keys: *const *const c_char"),
-            "map param should have keys array: {out}"
-        );
-        assert!(
-            out.contains("grades_values: *const i32"),
-            "map param should have values array: {out}"
-        );
-        assert!(
-            out.contains("grades_len: usize"),
-            "map param should have length: {out}"
-        );
-        // A returned map is two callee-allocated parallel arrays handed back
-        // through pointer-to-pointer out-params. These now lower through the
-        // canonical `abi::lower_return`, so they match the header
-        // (`const char*** out_keys, int32_t** out_values, size_t* out_len`)
-        // exactly; the previous hand-rolled lowering dropped a level of
-        // indirection on `out_values` and renamed the length to `out_map_len`.
-        assert!(
-            out.contains("out_keys: *mut *mut *const c_char"),
-            "map return out_keys must match `const char***`: {out}"
-        );
-        assert!(
-            out.contains("out_values: *mut *mut i32"),
-            "map return out_values must match `int32_t**`: {out}"
+            out.contains("grades_ptr: *const u8, grades_len: usize"),
+            "map param should be a borrowed value buffer: {out}"
         );
         assert!(
             out.contains("out_len: *mut usize"),
             "map return should use the canonical out_len: {out}"
+        );
+        assert!(
+            out.contains("-> *const u8"),
+            "map return should be an owned value buffer: {out}"
         );
     }
 
@@ -1064,7 +913,7 @@ mod tests {
         // symbols must use the underscore-joined module path so they line up
         // with the generated bindings.
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "graphics".into(),
                 functions: vec![],
@@ -1096,7 +945,6 @@ mod tests {
                             doc: None,
                             default: None,
                         }],
-                        builder: false,
                     }],
                     enums: vec![],
                     interfaces: vec![],
@@ -1114,13 +962,10 @@ mod tests {
             out.contains("pub extern \"C\" fn weaveffi_graphics_shapes_make("),
             "nested fn should use joined path: {out}"
         );
+        // The nested record is a value type: no producer stubs of its own.
         assert!(
-            out.contains("pub struct weaveffi_graphics_shapes_Shape"),
-            "nested struct should use joined path: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn weaveffi_graphics_shapes_Shape_create("),
-            "nested struct create should use joined path: {out}"
+            !out.contains("weaveffi_graphics_shapes_Shape"),
+            "nested record must not get producer stubs: {out}"
         );
     }
 
@@ -1130,7 +975,7 @@ mod tests {
         // (e.g. `shared.Token`). The scaffold must flatten it to the owning
         // module's C symbol, never embed the dot or the referrer's module.
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "kitchen".into(),
                 functions: vec![Function {
@@ -1156,9 +1001,11 @@ mod tests {
             package: None,
         };
         let out = render_scaffold(&api, "weaveffi");
+        // A cross-module record return is a value buffer like any other; the
+        // stub must not leak the dotted name or invent a referrer-module tag.
         assert!(
-            out.contains("-> *mut weaveffi_shared_Token"),
-            "qualified struct ref should mangle to owner module: {out}"
+            out.contains("out_len: *mut usize") && out.contains("-> *const u8"),
+            "cross-module record return should be a value buffer: {out}"
         );
         assert!(
             !out.contains("weaveffi_kitchen_shared"),
@@ -1173,7 +1020,7 @@ mod tests {
     #[test]
     fn scaffold_multiple_modules() {
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![
                 Module {
                     name: "math".into(),
@@ -1232,7 +1079,7 @@ mod tests {
         listeners: Vec<weaveffi_ir::ir::ListenerDef>,
     ) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "events".into(),
                 functions,
@@ -1325,60 +1172,9 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_struct_builder_emits_full_surface() {
-        let api = Api {
-            version: "0.5.0".into(),
-            modules: vec![Module {
-                name: "contacts".into(),
-                functions: vec![],
-                structs: vec![StructDef {
-                    name: "Contact".into(),
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "name".into(),
-                        ty: TypeRef::StringUtf8,
-                        doc: None,
-                        default: None,
-                    }],
-                    builder: true,
-                }],
-                enums: vec![],
-                interfaces: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
-        };
-        let out = render_scaffold(&api, "weaveffi");
-        assert!(
-            out.contains("pub struct weaveffi_contacts_ContactBuilder {"),
-            "builder opaque type missing: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_new() -> *mut weaveffi_contacts_ContactBuilder {"),
-            "builder new missing/incorrect: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_set_name(builder: *mut weaveffi_contacts_ContactBuilder, name: *const c_char) {"),
-            "builder setter missing/incorrect: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_build(builder: *mut weaveffi_contacts_ContactBuilder, out_err: *mut weaveffi_error) -> *mut weaveffi_contacts_Contact {"),
-            "builder build missing/incorrect: {out}"
-        );
-        assert!(
-            out.contains("pub extern \"C\" fn weaveffi_contacts_Contact_Builder_destroy(builder: *mut weaveffi_contacts_ContactBuilder) {"),
-            "builder destroy missing/incorrect: {out}"
-        );
-    }
-
-    #[test]
     fn scaffold_cancellable_async_threads_cancel_token() {
         let api = Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules: vec![Module {
                 name: "net".into(),
                 functions: vec![Function {

@@ -2,11 +2,12 @@
 
 Exercises the generated ctypes wrapper end to end: the `ContactBook`
 interface (its `__init__` calls the C constructor and `__del__` the destroy
-symbol), enum marshalling, opaque struct handles with property getters,
-optional strings, list-of-struct returns, boolean returns, and the typed
-`ContactsError` subclasses (`InvalidName`, `NotFound`) raised by throwing
-methods. The generated module is placed on sys.path via WV_PY; the cdylib is
-selected with WEAVEFFI_LIBRARY.
+symbol), enum marshalling, the `Contact` record decoded from a value buffer
+into a plain dataclass with value equality, optional strings (a buffered
+`string?` parameter and field), list-of-record returns, boolean returns, and
+the typed `ContactsError` subclasses (`InvalidName`, `NotFound`) raised by
+throwing methods. The generated module is placed on sys.path via WV_PY; the
+cdylib is selected with WEAVEFFI_LIBRARY.
 """
 import os
 import sys
@@ -27,11 +28,20 @@ def main() -> None:
     assert alice.email == "alice@example.com"
     assert alice.contact_type == wv.ContactType.Work
 
-    # Optional string: a missing email round-trips as None.
+    # Optional string: a missing email round-trips as None. Records are
+    # plain dataclass values, so a fetched contact compares equal to a
+    # locally constructed one field by field.
     bob = book.add("Bob", "Jones", None, wv.ContactType.Personal)
     fetched = book.get(bob.id)
     assert fetched.email is None
     assert fetched.contact_type == wv.ContactType.Personal
+    assert fetched == wv.Contact(
+        id=bob.id,
+        first_name="Bob",
+        last_name="Jones",
+        email=None,
+        contact_type=wv.ContactType.Personal,
+    )
 
     assert book.count() == 2
     everyone = book.list()

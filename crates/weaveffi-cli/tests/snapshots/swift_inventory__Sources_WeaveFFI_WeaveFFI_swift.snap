@@ -42,26 +42,127 @@ func trap(_ err: inout weaveffi_error) {
     }
 }
 
-@inline(__always)
-func withOptionalPointer<T, R>(to value: T?, _ body: (UnsafePointer<T>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try withUnsafePointer(to: value) { try body($0) }
+/// Serializes values into the WeaveFFI value-buffer wire format
+/// (little-endian, packed, no alignment).
+struct WvWriter {
+    var bytes: [UInt8] = []
+
+    mutating func writeBool(_ v: Bool) { bytes.append(v ? 1 : 0) }
+    mutating func writeInt8(_ v: Int8) { bytes.append(UInt8(bitPattern: v)) }
+    mutating func writeUInt8(_ v: UInt8) { bytes.append(v) }
+    mutating func writeUInt16(_ v: UInt16) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+    }
+    mutating func writeInt16(_ v: Int16) { writeUInt16(UInt16(bitPattern: v)) }
+    mutating func writeUInt32(_ v: UInt32) {
+        bytes.append(UInt8(truncatingIfNeeded: v))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 8))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 16))
+        bytes.append(UInt8(truncatingIfNeeded: v >> 24))
+    }
+    mutating func writeInt32(_ v: Int32) { writeUInt32(UInt32(bitPattern: v)) }
+    mutating func writeUInt64(_ v: UInt64) {
+        writeUInt32(UInt32(truncatingIfNeeded: v))
+        writeUInt32(UInt32(truncatingIfNeeded: v >> 32))
+    }
+    mutating func writeInt64(_ v: Int64) { writeUInt64(UInt64(bitPattern: v)) }
+    mutating func writeFloat(_ v: Float) { writeUInt32(v.bitPattern) }
+    mutating func writeDouble(_ v: Double) { writeUInt64(v.bitPattern) }
+    mutating func writeLen(_ n: Int) {
+        precondition(n >= 0 && n <= Int(UInt32.max), "WeaveFFI buffer length exceeds UInt32.max")
+        writeUInt32(UInt32(n))
+    }
+    mutating func writeString(_ v: String) {
+        let utf8 = Array(v.utf8)
+        writeLen(utf8.count)
+        bytes.append(contentsOf: utf8)
+    }
+    mutating func writeBytes(_ v: Data) {
+        writeLen(v.count)
+        bytes.append(contentsOf: v)
+    }
+    mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
 }
 
-@inline(__always)
-func withOptionalCString<R>(_ value: String?, _ body: (UnsafePointer<CChar>?) throws -> R) rethrows -> R {
-    guard let value = value else { return try body(nil) }
-    return try value.withCString { try body($0) }
+/// Traps on a malformed value buffer. Per the wire-format spec, consumers
+/// surface decode failures through the same channel as a producer panic.
+func wvDecodeFailure(_ context: String) -> Never {
+    fatalError("malformed WeaveFFI value buffer: \(context)")
 }
 
-@inline(__always)
-func wvFreeArray<T>(_ ptr: UnsafeMutablePointer<T>, _ count: Int) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), count * MemoryLayout<T>.stride)
-}
+/// Deserializes values from the WeaveFFI value-buffer wire format, rejecting
+/// truncated buffers, invalid flag bytes, oversized length prefixes, and
+/// trailing bytes.
+struct WvReader {
+    let bytes: [UInt8]
+    var pos: Int = 0
 
-@inline(__always)
-func wvFreeBox<T>(_ ptr: UnsafeMutablePointer<T>) {
-    weaveffi_free_bytes(UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self), MemoryLayout<T>.size)
+    init(bytes: [UInt8]) { self.bytes = bytes }
+
+    var remaining: Int { bytes.count - pos }
+
+    mutating func take(_ n: Int, _ context: String) -> ArraySlice<UInt8> {
+        guard remaining >= n else { wvDecodeFailure(context) }
+        defer { pos += n }
+        return bytes[pos..<(pos + n)]
+    }
+
+    mutating func readBool() -> Bool {
+        switch take(1, "bool").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("bool byte out of range")
+        }
+    }
+    mutating func readUInt8() -> UInt8 { take(1, "u8").first! }
+    mutating func readInt8() -> Int8 { Int8(bitPattern: readUInt8()) }
+    mutating func readUInt16() -> UInt16 {
+        var v: UInt16 = 0
+        for (i, b) in take(2, "u16").enumerated() { v |= UInt16(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt16() -> Int16 { Int16(bitPattern: readUInt16()) }
+    mutating func readUInt32() -> UInt32 {
+        var v: UInt32 = 0
+        for (i, b) in take(4, "u32").enumerated() { v |= UInt32(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt32() -> Int32 { Int32(bitPattern: readUInt32()) }
+    mutating func readUInt64() -> UInt64 {
+        var v: UInt64 = 0
+        for (i, b) in take(8, "u64").enumerated() { v |= UInt64(b) << (8 * i) }
+        return v
+    }
+    mutating func readInt64() -> Int64 { Int64(bitPattern: readUInt64()) }
+    mutating func readFloat() -> Float { Float(bitPattern: readUInt32()) }
+    mutating func readDouble() -> Double { Double(bitPattern: readUInt64()) }
+    mutating func readLen() -> Int {
+        let n = Int(readUInt32())
+        guard n <= remaining else { wvDecodeFailure("length prefix exceeds remaining buffer") }
+        return n
+    }
+    mutating func readString() -> String {
+        let n = readLen()
+        guard let s = String(bytes: take(n, "string bytes"), encoding: .utf8) else {
+            wvDecodeFailure("string is not valid UTF-8")
+        }
+        return s
+    }
+    mutating func readBytes() -> Data {
+        let n = readLen()
+        return Data(take(n, "byte buffer"))
+    }
+    mutating func readOptionFlag() -> Bool {
+        switch take(1, "option flag").first! {
+        case 0: return false
+        case 1: return true
+        default: wvDecodeFailure("option flag byte out of range")
+        }
+    }
+    func finish() {
+        if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
+    }
 }
 
 /// Typed errors reported by the `products` module.
@@ -84,7 +185,7 @@ public enum ProductsError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapProducts(code: Int32, message: String) -> Error {
+func mapProducts(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return ProductsError.invalidPrice(message: message.isEmpty ? "price must be positive" : message)
     case 2: return ProductsError.productNotFound(message: message.isEmpty ? "product not found" : message)
@@ -97,8 +198,9 @@ func checkProducts(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapProducts(code: code, message: message)
+        throw mapProducts(code: code, message: message, payload: payload)
     }
 }
 
@@ -109,56 +211,62 @@ public enum Category: UInt32 {
     case books = 3
 }
 
-public class Product {
-    let ptr: OpaquePointer
+public struct Product {
+    public var id: Int64
+    public var name: String
+    public var description: String?
+    public var price: Double
+    public var category: Category
+    public var tags: [String]
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
+    /// Creates a `Product` value.
+    public init(id: Int64, name: String, description: String?, price: Double, category: Category, tags: [String]) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.price = price
+        self.category = category
+        self.tags = tags
     }
+}
 
-    deinit {
-        weaveffi_products_Product_destroy(ptr)
+/// Serializes a `Product` into the value-buffer wire format.
+func wvWriteProduct(_ value: Product, into w: inout WvWriter) {
+    w.writeInt64(value.id)
+    w.writeString(value.name)
+    if let v0 = value.description {
+        w.writeOptionFlag(true)
+        w.writeString(v0)
+    } else {
+        w.writeOptionFlag(false)
     }
+    w.writeDouble(value.price)
+    w.writeInt32(Int32(bitPattern: value.category.rawValue))
+    w.writeLen(value.tags.count)
+    for v1 in value.tags {
+        w.writeString(v1)
+    }
+}
 
-    public var id: Int64 {
-        return weaveffi_products_Product_get_id(ptr)
+/// Deserializes a `Product` from the value-buffer wire format.
+func wvReadProduct(_ r: inout WvReader) -> Product {
+    let v2 = r.readInt64()
+    let v3 = r.readString()
+    var v4: String? = nil
+    if r.readOptionFlag() {
+        let v5 = r.readString()
+        v4 = v5
     }
-
-    public var name: String {
-        let raw = weaveffi_products_Product_get_name(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
+    let v6 = r.readDouble()
+    let v7 = Category(rawValue: UInt32(bitPattern: r.readInt32()))!
+    let n9 = r.readLen()
+    var v8: [String] = []
+    v8.reserveCapacity(n9)
+    for _ in 0..<n9 {
+        let v10 = r.readString()
+        v8.append(v10)
     }
-
-    public var description: String? {
-        let p = weaveffi_products_Product_get_description(ptr)
-        guard let p = p else { return nil }
-        defer { weaveffi_free_string(p) }
-        return String(cString: p)
-    }
-
-    public var price: Double {
-        return weaveffi_products_Product_get_price(ptr)
-    }
-
-    public var category: Category {
-        return Category(rawValue: weaveffi_products_Product_get_category(ptr).rawValue)!
-    }
-
-    public var tags: [String] {
-        var outLen: Int = 0
-        let rv = weaveffi_products_Product_get_tags(ptr, &outLen)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        var items: [String] = []
-        items.reserveCapacity(outLen)
-        for i in 0..<outLen {
-            items.append(String(cString: rv[i]!))
-            weaveffi_free_string(rv[i])
-        }
-        return items
-    }
+    return Product(id: v2, name: v3, description: v4, price: v6, category: v7, tags: v8)
 }
 
 /// A product catalog owning its products
@@ -173,45 +281,67 @@ public final class Catalog {
         weaveffi_products_Catalog_destroy(ptr)
     }
     public init() {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_products_Catalog_new(&err)
         trap(&err)
         guard let rv = rv else { fatalError("-1: null pointer") }
         self.ptr = rv
     }
     public func addProduct(name: String, price: Double, category: Category) throws -> Product {
-        var err = weaveffi_error(code: 0, message: nil)
-        let result: OpaquePointer? = name.withCString { name_ptr in
-                return weaveffi_products_Catalog_add_product(ptr, name_ptr, price, weaveffi_products_Category(category.rawValue), &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = name.withCString { name_ptr in
+            return weaveffi_products_Catalog_add_product(ptr, name_ptr, price, weaveffi_products_Category(category.rawValue), &outLen, &err)
         }
         try checkProducts(&err)
-        guard let result = result else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Product(ptr: result)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadProduct(&rvReader)
+        rvReader.finish()
+        return v0
     }
     public func getProduct(id: Int64) throws -> Product {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_products_Catalog_get_product(ptr, id, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_products_Catalog_get_product(ptr, id, &outLen, &err)
         try checkProducts(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Product(ptr: rv)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadProduct(&rvReader)
+        rvReader.finish()
+        return v0
     }
     public func search(category: Category) -> [Product] {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         var outLen: Int = 0
         let rv = weaveffi_products_Catalog_search(ptr, weaveffi_products_Category(category.rawValue), &outLen, &err)
         trap(&err)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        return (0..<outLen).map { Product(ptr: rv[$0]!) }
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let n1 = rvReader.readLen()
+        var v0: [Product] = []
+        v0.reserveCapacity(n1)
+        for _ in 0..<n1 {
+            let v2 = wvReadProduct(&rvReader)
+            v0.append(v2)
+        }
+        rvReader.finish()
+        return v0
     }
     public func updatePrice(id: Int64, price: Double) throws -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_products_Catalog_update_price(ptr, id, price, &err)
         try checkProducts(&err)
         return rv
     }
     public func remove(id: Int64) -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_products_Catalog_remove(ptr, id, &err)
         trap(&err)
         return rv
@@ -241,7 +371,7 @@ public enum OrdersError: Error, LocalizedError {
 }
 
 @inline(__always)
-func mapOrders(code: Int32, message: String) -> Error {
+func mapOrders(code: Int32, message: String, payload: [UInt8]?) -> Error {
     switch code {
     case 1: return OrdersError.orderNotFound(message: message.isEmpty ? "order not found" : message)
     case 2: return OrdersError.emptyOrder(message: message.isEmpty ? "order must contain at least one item" : message)
@@ -254,98 +384,125 @@ func checkOrders(_ err: inout weaveffi_error) throws {
     if err.code != 0 {
         let code = err.code
         let message = err.message.flatMap { String(cString: $0) } ?? ""
+        let payload: [UInt8]? = err.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.payload_len)) }
         weaveffi_error_clear(&err)
-        throw mapOrders(code: code, message: message)
+        throw mapOrders(code: code, message: message, payload: payload)
     }
 }
 
-public class OrderItem {
-    let ptr: OpaquePointer
+public struct OrderItem {
+    public var productId: Int64
+    public var quantity: Int32
+    public var unitPrice: Double
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
-
-    deinit {
-        weaveffi_orders_OrderItem_destroy(ptr)
-    }
-
-    public var product_id: Int64 {
-        return weaveffi_orders_OrderItem_get_product_id(ptr)
-    }
-
-    public var quantity: Int32 {
-        return weaveffi_orders_OrderItem_get_quantity(ptr)
-    }
-
-    public var unit_price: Double {
-        return weaveffi_orders_OrderItem_get_unit_price(ptr)
+    /// Creates a `OrderItem` value.
+    public init(productId: Int64, quantity: Int32, unitPrice: Double) {
+        self.productId = productId
+        self.quantity = quantity
+        self.unitPrice = unitPrice
     }
 }
 
-public class Order {
-    let ptr: OpaquePointer
+/// Serializes a `OrderItem` into the value-buffer wire format.
+func wvWriteOrderItem(_ value: OrderItem, into w: inout WvWriter) {
+    w.writeInt64(value.productId)
+    w.writeInt32(value.quantity)
+    w.writeDouble(value.unitPrice)
+}
 
-    init(ptr: OpaquePointer) {
-        self.ptr = ptr
-    }
+/// Deserializes a `OrderItem` from the value-buffer wire format.
+func wvReadOrderItem(_ r: inout WvReader) -> OrderItem {
+    let v0 = r.readInt64()
+    let v1 = r.readInt32()
+    let v2 = r.readDouble()
+    return OrderItem(productId: v0, quantity: v1, unitPrice: v2)
+}
 
-    deinit {
-        weaveffi_orders_Order_destroy(ptr)
-    }
+public struct Order {
+    public var id: Int64
+    public var items: [OrderItem]
+    public var total: Double
+    public var status: String
 
-    public var id: Int64 {
-        return weaveffi_orders_Order_get_id(ptr)
+    /// Creates a `Order` value.
+    public init(id: Int64, items: [OrderItem], total: Double, status: String) {
+        self.id = id
+        self.items = items
+        self.total = total
+        self.status = status
     }
+}
 
-    public var items: [OrderItem] {
-        var outLen: Int = 0
-        let rv = weaveffi_orders_Order_get_items(ptr, &outLen)
-        guard let rv = rv else { return [] }
-        defer { wvFreeArray(rv, outLen) }
-        return (0..<outLen).map { OrderItem(ptr: rv[$0]!) }
+/// Serializes a `Order` into the value-buffer wire format.
+func wvWriteOrder(_ value: Order, into w: inout WvWriter) {
+    w.writeInt64(value.id)
+    w.writeLen(value.items.count)
+    for v0 in value.items {
+        wvWriteOrderItem(v0, into: &w)
     }
+    w.writeDouble(value.total)
+    w.writeString(value.status)
+}
 
-    public var total: Double {
-        return weaveffi_orders_Order_get_total(ptr)
+/// Deserializes a `Order` from the value-buffer wire format.
+func wvReadOrder(_ r: inout WvReader) -> Order {
+    let v1 = r.readInt64()
+    let n3 = r.readLen()
+    var v2: [OrderItem] = []
+    v2.reserveCapacity(n3)
+    for _ in 0..<n3 {
+        let v4 = wvReadOrderItem(&r)
+        v2.append(v4)
     }
-
-    public var status: String {
-        let raw = weaveffi_orders_Order_get_status(ptr)
-        guard let raw = raw else { return "" }
-        defer { weaveffi_free_string(raw) }
-        return String(cString: raw)
-    }
+    let v5 = r.readDouble()
+    let v6 = r.readString()
+    return Order(id: v1, items: v2, total: v5, status: v6)
 }
 
 public enum Orders {
     public static func createOrder(items: [OrderItem]) throws -> Int64 {
-        var err = weaveffi_error(code: 0, message: nil)
-        let items_ptrs = items.map { $0.ptr }
-        let result: Int64 = items_ptrs.withUnsafeBufferPointer { items_buf in
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var itemsWriter = WvWriter()
+        itemsWriter.writeLen(items.count)
+        for v0 in items {
+            wvWriteOrderItem(v0, into: &itemsWriter)
+        }
+        let rv: Int64 = itemsWriter.bytes.withUnsafeBufferPointer { items_buf in
             let items_ptr = items_buf.baseAddress
             let items_len = items_buf.count
-                return weaveffi_orders_create_order(items_ptr, items_len, &err)
+            return weaveffi_orders_create_order(items_ptr, items_len, &err)
         }
         try checkOrders(&err)
-        return result
+        return rv
     }
     public static func getOrder(id: Int64) throws -> Order {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_orders_get_order(id, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_orders_get_order(id, &outLen, &err)
         try checkOrders(&err)
-        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null pointer") }
-        return Order(ptr: rv)
+        guard let rv = rv else { throw WeaveFFIError.error(code: -1, message: "null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v0 = wvReadOrder(&rvReader)
+        rvReader.finish()
+        return v0
     }
     public static func cancelOrder(id: Int64) -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
         let rv = weaveffi_orders_cancel_order(id, &err)
         trap(&err)
         return rv
     }
     public static func addProductToOrder(orderId: Int64, product: Product) -> Bool {
-        var err = weaveffi_error(code: 0, message: nil)
-        let rv = weaveffi_orders_add_product_to_order(orderId, product.ptr, &err)
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var productWriter = WvWriter()
+        wvWriteProduct(product, into: &productWriter)
+        let rv: Bool = productWriter.bytes.withUnsafeBufferPointer { product_buf in
+            let product_ptr = product_buf.baseAddress
+            let product_len = product_buf.count
+            return weaveffi_orders_add_product_to_order(orderId, product_ptr, product_len, &err)
+        }
         trap(&err)
         return rv
     }

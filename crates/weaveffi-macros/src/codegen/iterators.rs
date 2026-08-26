@@ -11,14 +11,12 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use weaveffi_core::model::{FnBinding, IteratorBinding};
-use weaveffi_ir::ir::TypeRef;
 
 use super::helpers::{
     fn_slots, ident, param_is_ref, slot_tokens, typeref_to_rust, wrap_unwind, CallTarget,
 };
 use super::marshal::{lift_param, lower_value};
 use super::sync::throws;
-use super::unsupported;
 
 /// Generate the launcher / `_next` / `_destroy` trio for a function returning
 /// `iter<T>`. The producer returns a `weaveffi::Iter<T>` (optionally wrapped in
@@ -91,9 +89,6 @@ pub(crate) fn gen_iterator_function(
     // straight from the model.
     let rest_params: Vec<TokenStream> = it.next.params[1..].iter().map(slot_tokens).collect();
     let item_lowered = lower_value(&it.elem, quote!(__wv_item))?;
-    if matches!(it.elem, TypeRef::Map(_, _)) {
-        return Err(unsupported("iterator", "map element type"));
-    }
     let next_sentinel = quote!(0);
     let next_body = wrap_unwind(
         quote! {

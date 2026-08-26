@@ -3,24 +3,31 @@
 //! Emits a Go module (`go.mod` + package) with CGo bindings over the C
 //! ABI exposed by the underlying cdylib. Implements [`LanguageBackend`];
 //! the shared driver bridges it into the generator pipeline.
+//!
+//! Records, rich enums, optionals, lists, and maps are value types that
+//! cross the C ABI serialized in the WeaveFFI value-buffer format (one
+//! `const uint8_t*` + `size_t` pair). The generated package carries a small
+//! private writer/reader implementing the wire format, plus one pack and one
+//! unpack function per record and rich enum.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
+use std::collections::HashSet;
+
 use camino::Utf8Path;
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::{AbiParam, CType, ConstPos};
+use weaveffi_core::abi::{is_buffered, AbiParam, CType, ConstPos};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding,
-    FieldBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding,
-    ParamBinding, RichVariantBinding, StructBinding,
+    AsyncBinding, BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
@@ -251,6 +258,18 @@ alongside Go, for example `weaveffi package --target c,go`).
 
 // ── Type mapping ──
 
+/// The local Go type name (PascalCase) of a user-defined type reference,
+/// stripping any qualifying module path.
+fn go_local(n: &str) -> String {
+    local_type_name(n).to_upper_camel_case()
+}
+
+/// The Go wrapper type name for a typed-handle referent: `{Name}Handle`.
+/// The suffix keeps the wrapper distinct from the referent's value struct.
+fn handle_wrapper(n: &str) -> String {
+    format!("{}Handle", go_local(n))
+}
+
 fn go_type(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I8 => "int8".into(),
@@ -266,25 +285,23 @@ fn go_type(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
         TypeRef::Bytes | TypeRef::BorrowedBytes => "[]byte".into(),
-        // Structs, interfaces, enums, and typed handles surface as bare local
-        // Go types; a cross-module reference (resolved to e.g. `kv.Store`)
-        // must name the local `Store` type rather than the qualified `KvStore`.
-        TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) => {
-            format!("*{}", local_type_name(n).to_upper_camel_case())
+        // Records are plain value structs; rich enums are sealed interfaces
+        // (nil-able), so neither takes a pointer at the type site. A
+        // cross-module reference (resolved to e.g. `kv.Entry`) must name the
+        // local `Entry` type rather than the qualified `KvEntry`.
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => go_local(n),
+        TypeRef::Interface(n) => format!("*{}", go_local(n)),
+        TypeRef::TypedHandle(n) => format!("*{}", handle_wrapper(n)),
+        TypeRef::Enum(n) => go_local(n),
+        TypeRef::Optional(inner) => {
+            if optional_derefs(inner) {
+                format!("*{}", go_type(inner))
+            } else {
+                // Already nil-able in Go (interface, slice, map, byte slice,
+                // handle wrapper): nil is the none marker.
+                go_type(inner)
+            }
         }
-        TypeRef::Enum(n) => local_type_name(n).to_upper_camel_case(),
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => go_type(inner),
-            TypeRef::List(_) | TypeRef::Map(_, _) => go_type(inner),
-            TypeRef::Bytes | TypeRef::BorrowedBytes => go_type(inner),
-            _ => format!("*{}", go_type(inner)),
-        },
         TypeRef::List(inner) => format!("[]{}", go_type(inner)),
         // The bare (non-throwing) sequence type; a throwing iterator wrapper
         // spells `iter.Seq2[T, error]` at its signature site instead.
@@ -292,6 +309,23 @@ fn go_type(ty: &TypeRef) -> String {
         TypeRef::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
+}
+
+/// `true` when `T?` surfaces as `*T` in Go (the value must be dereferenced
+/// when present). Types that are already nil-able (rich enums, slices, maps,
+/// byte slices, typed handles, interfaces) use nil directly as the none
+/// marker instead.
+fn optional_derefs(inner: &TypeRef) -> bool {
+    !matches!(
+        inner,
+        TypeRef::RichEnum(_)
+            | TypeRef::List(_)
+            | TypeRef::Map(_, _)
+            | TypeRef::Bytes
+            | TypeRef::BorrowedBytes
+            | TypeRef::TypedHandle(_)
+            | TypeRef::Interface(_)
+    )
 }
 
 fn go_zero(ty: &TypeRef) -> String {
@@ -310,6 +344,8 @@ fn go_zero(ty: &TypeRef) -> String {
         TypeRef::Bool => "false".into(),
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "\"\"".into(),
         TypeRef::Enum(_) => "0".into(),
+        // A record is a value struct: its zero is the empty literal.
+        TypeRef::Record(n) => format!("{}{{}}", go_local(n)),
         _ => "nil".into(),
     }
 }
@@ -358,58 +394,29 @@ fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
         TypeRef::F32 => format!("float32({expr})"),
         TypeRef::F64 => format!("float64({expr})"),
         TypeRef::Bool => format!("cToBool({expr})"),
-        TypeRef::Enum(n) => format!("{}({expr})", local_type_name(n).to_upper_camel_case()),
+        TypeRef::Enum(n) => format!("{}({expr})", go_local(n)),
         _ => expr.to_string(),
     }
 }
 
-fn c_opaque_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
+/// The Go expression wrapping an opaque C pointer (`ptr_expr`) into the
+/// wrapper type for an interface or typed-handle reference.
+fn go_wrap_expr(ty: &TypeRef, ptr_expr: &str) -> String {
     match ty {
-        TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => c_abi_struct_name(n, module, prefix),
-        _ => String::new(),
+        TypeRef::Interface(n) => format!("&{}{{ptr: {ptr_expr}}}", go_local(n)),
+        TypeRef::TypedHandle(n) => format!("&{}{{ptr: {ptr_expr}}}", handle_wrapper(n)),
+        _ => unreachable!("only interfaces and typed handles wrap C pointers"),
     }
 }
 
 // ── Import scanning ──
 
-fn param_uses_unsafe(ty: &TypeRef) -> bool {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => true,
-        TypeRef::Bytes | TypeRef::BorrowedBytes => true,
-        TypeRef::List(_) | TypeRef::Map(_, _) => true,
-        TypeRef::Optional(inner) => param_uses_unsafe(inner),
-        _ => false,
-    }
-}
-
-fn return_uses_unsafe(ty: &TypeRef) -> bool {
-    match ty {
-        TypeRef::Bytes | TypeRef::BorrowedBytes => true,
-        TypeRef::List(_) | TypeRef::Map(_, _) => true,
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            // Pointer-shaped optionals reuse the inner conversion (null =
-            // none), so they only need what the inner type needs.
-            TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_) => return_uses_unsafe(inner),
-            TypeRef::Bytes | TypeRef::BorrowedBytes | TypeRef::List(_) | TypeRef::Map(_, _) => true,
-            // Boxed optional scalars are freed through an unsafe.Pointer cast.
-            _ => true,
-        },
-        _ => false,
-    }
-}
-
-fn type_has_bool(ty: &TypeRef) -> bool {
+/// `true` when `ty` is a bare bool in a returned position (including an
+/// iterator element), needing the `cToBool` helper.
+fn ret_direct_bool(ty: &TypeRef) -> bool {
     match ty {
         TypeRef::Bool => true,
-        TypeRef::Optional(inner) | TypeRef::List(inner) => type_has_bool(inner),
+        TypeRef::Iterator(inner) => matches!(inner.as_ref(), TypeRef::Bool),
         _ => false,
     }
 }
@@ -422,7 +429,7 @@ struct Imports {
     fmt: bool,
     /// `iter` (lazy sequences returned by `iter<T>` functions).
     iter: bool,
-    /// `unsafe` (pointer staging for strings/bytes/lists/maps, callback
+    /// `unsafe` (pointer staging for strings/bytes/buffers, callback
     /// contexts).
     unsafe_ptr: bool,
     /// The `boolToC`/`cToBool` helpers.
@@ -432,6 +439,9 @@ struct Imports {
     /// The shared error plumbing: the [`ERROR_BRAND`] type plus the
     /// `wvTakeError`/`wvBrandError`/`wvTrap` helpers.
     err_infra: bool,
+    /// The value-buffer runtime (`wvWriter`/`wvReader` and buffer copy
+    /// helpers), pulling in `encoding/binary`, `math`, and `unicode/utf8`.
+    buffer_runtime: bool,
 }
 
 /// Scan the lowered model for everything [`Imports`] tracks. Interface
@@ -442,66 +452,50 @@ fn scan_imports(model: &BindingModel) -> Imports {
     let mut has_async = false;
     let mut has_iter = false;
     let mut has_listeners = false;
-    let mut has_fallible_ctor = false;
     let mut has_domain = false;
-    let mut unsafe_ptr = false;
+    let mut any_callbacks = false;
     let mut bool_helpers = false;
+    let mut buffer_runtime = false;
 
     for m in &model.modules {
         has_listeners |= !m.listeners.is_empty();
         has_domain |= m.declares_error();
+        // Records and rich enums always carry pack/unpack functions; a
+        // declared domain with payload fields decodes them through a reader.
+        buffer_runtime |= !m.structs.is_empty();
+        buffer_runtime |= m.enums.iter().any(|e| e.is_rich());
+        if let Some(eb) = &m.error {
+            buffer_runtime |= eb.declared_here && eb.codes.iter().any(|c| !c.fields.is_empty());
+        }
         for f in m.callables() {
             any_callable = true;
             has_async |= f.is_async;
             has_iter |= matches!(f.shape, CallShape::Iterator(_));
-            unsafe_ptr |= f.params.iter().any(|p| param_uses_unsafe(&p.ty))
-                || f.ret.as_ref().is_some_and(return_uses_unsafe);
-            bool_helpers |= f.params.iter().any(|p| type_has_bool(&p.ty))
-                || f.ret.as_ref().is_some_and(type_has_bool);
-        }
-        for s in &m.structs {
-            // A builder's `Build` calls the C `create` symbol and returns
-            // `(*T, error)`, so it needs the error plumbing like a fallible
-            // function does; getters can materialize bytes/list/map, and a
-            // builder additionally marshals every field *in* (strings stage
-            // through unsafe.Pointer).
-            has_fallible_ctor |= s.builder.is_some();
-            unsafe_ptr |= s.fields.iter().any(|fld| return_uses_unsafe(&fld.ty))
-                || (s.builder.is_some() && s.fields.iter().any(|fld| param_uses_unsafe(&fld.ty)));
-            bool_helpers |= s.fields.iter().any(|fld| type_has_bool(&fld.ty));
-        }
-        for e in &m.enums {
-            // A rich (algebraic) enum emits a `New{Enum}{Variant}` constructor
-            // per variant that returns `(*T, error)`, and its per-variant field
-            // getters/constructor arguments marshal exactly like struct fields.
-            if let Some(rich) = &e.rich {
-                has_fallible_ctor = true;
-                unsafe_ptr |= rich.variants.iter().any(|v| {
-                    v.fields
-                        .iter()
-                        .any(|fld| return_uses_unsafe(&fld.ty) || param_uses_unsafe(&fld.ty))
-                });
-                bool_helpers |= rich
-                    .variants
-                    .iter()
-                    .any(|v| v.fields.iter().any(|fld| type_has_bool(&fld.ty)));
+            buffer_runtime |= f.params.iter().any(|p| is_buffered(&p.ty));
+            bool_helpers |= f.params.iter().any(|p| matches!(p.ty, TypeRef::Bool));
+            if let Some(ret) = &f.ret {
+                buffer_runtime |= is_buffered(ret);
+                bool_helpers |= ret_direct_bool(ret);
+            }
+            if let CallShape::Iterator(ib) = &f.shape {
+                // Bytes and buffered elements copy through wvCopyBuffer.
+                buffer_runtime |= matches!(elem_free(&ib.elem), ElemFree::Bytes);
             }
         }
         for cb in &m.callbacks {
-            // A callback trampoline's signature carries the `void* context`
-            // slot as unsafe.Pointer, and its parameters decode like returns.
-            unsafe_ptr = true;
-            bool_helpers |= cb.params.iter().any(|p| type_has_bool(&p.ty));
+            any_callbacks = true;
+            buffer_runtime |= cb.params.iter().any(|p| is_buffered(&p.ty));
+            bool_helpers |= cb.params.iter().any(|p| matches!(p.ty, TypeRef::Bool));
         }
     }
 
-    // Async launchers and listener registration thread the registry id through
-    // the C `void* context`, which always stages through unsafe.Pointer.
-    unsafe_ptr |= has_async || has_listeners;
     // Every callable checks its error slot (returning or trapping), so any
     // callable at all pulls in the error plumbing; a declared domain also
     // needs it for the brand-error fallback of its mapping helper.
-    let err_infra = any_callable || has_fallible_ctor || has_domain;
+    let err_infra = any_callable || has_domain;
+    // wvTakeError copies the payload through unsafe.Pointer; the buffer
+    // runtime copies C buffers; trampolines carry `void* context`.
+    let unsafe_ptr = err_infra || buffer_runtime || any_callbacks || has_listeners || has_async;
 
     Imports {
         fmt: err_infra,
@@ -510,6 +504,7 @@ fn scan_imports(model: &BindingModel) -> Imports {
         bool_helpers,
         sync: has_async || has_listeners,
         err_infra,
+        buffer_runtime,
     }
 }
 
@@ -561,7 +556,9 @@ go build ./...
 The generated `weaveffi.go` file uses a CGo preamble to `#include "weaveffi.h"`
 and link against `-lweaveffi`. Each API function is exposed as an idiomatic Go
 function that marshals arguments to C types, calls the C ABI function, and
-converts the result back to Go types. Errors are returned as Go `error` values.
+converts the result back to Go types. Records, rich enums, optionals, lists,
+and maps cross the boundary serialized in the WeaveFFI value-buffer format.
+Errors are returned as Go `error` values.
 
 {trailer}"#
     )
@@ -674,10 +671,10 @@ fn emit_fn_doc(
 ///
 /// A callable with `throws == true` returns `(T, error)` and maps codes
 /// through the declaring module's typed helper (`wvMapKv`), falling back to
-/// the generic [`ERROR_BRAND`] struct when no domain is in scope (builders and
-/// rich-enum constructors). A callable with `throws == false` has a plain
-/// signature and panics via `wvTrap` instead, since a reported error can only
-/// be a producer panic or an argument-marshalling failure.
+/// the generic [`ERROR_BRAND`] struct when no domain is in scope. A callable
+/// with `throws == false` has a plain signature and panics via `wvTrap`
+/// instead, since a reported error can only be a producer panic or an
+/// argument-marshalling failure.
 #[derive(Clone, Copy)]
 struct ErrCtx<'a> {
     /// `true` when the wrapper returns `(T, error)` and surfaces typed errors.
@@ -698,8 +695,8 @@ impl<'a> ErrCtx<'a> {
         }
     }
 
-    /// The Go expression converting a taken `(code, message)` pair into an
-    /// `error` value.
+    /// The Go expression converting a taken `(code, message, payload)` triple
+    /// into an `error` value.
     fn map_call(&self, args: &str) -> String {
         match self.stem {
             Some(stem) => format!("wvMap{stem}({args})"),
@@ -758,9 +755,10 @@ fn domain_stem(module: &ModuleBinding) -> Option<String> {
 }
 
 /// The shared error plumbing: the generic [`ERROR_BRAND`] struct implementing
-/// `error` (unknown codes, marshalling failures, builder/rich-enum failures),
-/// plus the `wvTakeError` slot reader, the `wvBrandError` constructor, and
-/// the `wvTrap` panic helper non-throwing wrappers check their slot with.
+/// `error` (unknown codes, marshalling failures), plus the `wvTakeError` slot
+/// reader (returning code, message, and a copy of the structured payload
+/// buffer), the `wvBrandError` constructor, and the `wvTrap` panic helper
+/// non-throwing wrappers check their slot with.
 fn render_error_infra(out: &mut String) {
     let mut w = CodeWriter::tabs();
     w.line(format!(
@@ -785,9 +783,10 @@ fn render_error_infra(out: &mut String) {
     w.blank();
 
     w.line("// wvTakeError reads and clears a non-zero C error slot, returning its");
-    w.line("// code and message.");
+    w.line("// code, message, and a copy of its structured payload buffer (nil when");
+    w.line("// the code declares no payload fields).");
     w.block(
-        "func wvTakeError(cErr *C.weaveffi_error) (int32, string) {",
+        "func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {",
         "}",
         |w| {
             w.line("code := int32(cErr.code)");
@@ -795,14 +794,20 @@ fn render_error_infra(out: &mut String) {
             w.block("if cErr.message != nil {", "}", |w| {
                 w.line("msg = C.GoString(cErr.message)");
             });
+            w.line("var payload []byte");
+            w.block("if cErr.payload_ptr != nil {", "}", |w| {
+                w.line(
+                    "payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))",
+                );
+            });
             w.line("C.weaveffi_error_clear(cErr)");
-            w.line("return code, msg");
+            w.line("return code, msg, payload");
         },
     );
     w.blank();
 
     w.block(
-        "func wvBrandError(code int32, message string) error {",
+        "func wvBrandError(code int32, message string, _ []byte) error {",
         "}",
         |w| {
             w.line(format!(
@@ -817,7 +822,7 @@ fn render_error_infra(out: &mut String) {
     w.line("// a producer panic or a marshalling failure.");
     w.block("func wvTrap(cErr *C.weaveffi_error) {", "}", |w| {
         w.block("if cErr.code != 0 {", "}", |w| {
-            w.line("code, msg := wvTakeError(cErr)");
+            w.line("code, msg, _ := wvTakeError(cErr)");
             w.line("panic(fmt.Sprintf(\"weaveffi: %s (code %d)\", msg, code))");
         });
     });
@@ -826,16 +831,18 @@ fn render_error_infra(out: &mut String) {
 }
 
 /// Render one declaring module's typed error surface: a
-/// `type {TypeName} struct {{ Code int32; Message string }}` implementing
-/// `error` (so `errors.As` selects on the domain), exported `int32` code
-/// constants in the plain-enum const style (`{TypeName}{CodePascal}`), and
-/// the `wvMap{Stem}` helper converting a non-zero slot's `(code, message)`
-/// into the typed error (default message when the slot carried none, generic
-/// [`ERROR_BRAND`] fallback for unknown codes).
-fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
+/// `type {TypeName} struct` implementing `error` (so `errors.As` selects on
+/// the domain), exported `int32` code constants in the plain-enum const style
+/// (`{TypeName}{CodePascal}`), one payload struct per code that declares
+/// fields, and the `wvMap{Stem}` helper converting a non-zero slot's
+/// `(code, message, payload)` into the typed error (default message when the
+/// slot carried none, decoded payload attached when the code declares fields,
+/// generic [`ERROR_BRAND`] fallback for unknown codes).
+fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding, prefix: &str) {
     let stem = eb.owner_path.to_upper_camel_case();
     let ty = &eb.type_name;
     let dotted = module.segments.join(".");
+    let has_payloads = eb.codes.iter().any(|c| !c.fields.is_empty());
 
     let mut w = CodeWriter::tabs();
     w.line(format!(
@@ -848,6 +855,11 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
         w.line("Code int32");
         w.line("// Message is the human-readable error message.");
         w.line("Message string");
+        if has_payloads {
+            w.line("// Payload holds the matched code's structured fields when that code");
+            w.line("// declares any (a pointer to the per-code payload struct), else nil.");
+            w.line("Payload any");
+        }
     });
     w.blank();
     w.block(format!("func (e *{ty}) Error() string {{"), "}", |w| {
@@ -870,6 +882,28 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     });
     w.blank();
 
+    // One payload struct per code that declares structured fields.
+    for c in &eb.codes {
+        if c.fields.is_empty() {
+            continue;
+        }
+        let cname = format!("{ty}{}", c.name.to_upper_camel_case());
+        let pname = format!("{cname}Payload");
+        w.line(format!(
+            "// {pname} carries the structured fields of {cname}."
+        ));
+        w.block(format!("type {pname} struct {{"), "}", |w| {
+            for f in &c.fields {
+                let fname = f.name.to_upper_camel_case();
+                let mut fd = String::new();
+                emit_doc(&mut fd, &f.doc, "\t", Some(&fname));
+                w.raw(fd);
+                w.line(format!("{fname} {}", go_type(&f.ty)));
+            }
+        });
+        w.blank();
+    }
+
     w.line(format!(
         "// wvMap{stem} converts a non-zero code from the `{dotted}` domain into a"
     ));
@@ -877,7 +911,7 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
         "// *{ty}, falling back to the generic *{ERROR_BRAND} for unknown codes."
     ));
     w.block(
-        format!("func wvMap{stem}(code int32, message string) error {{"),
+        format!("func wvMap{stem}(code int32, message string, payload []byte) error {{"),
         "}",
         |w| {
             w.line("switch code {");
@@ -888,12 +922,37 @@ fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
                 w.block("if message == \"\" {", "}", |w| {
                     w.line(format!("message = {}", go_str(&c.message)));
                 });
-                w.line(format!("return &{ty}{{Code: code, Message: message}}"));
+                if c.fields.is_empty() {
+                    w.line(format!("return &{ty}{{Code: code, Message: message}}"));
+                } else {
+                    let pname = format!("{cname}Payload");
+                    w.line(format!("e := &{ty}{{Code: code, Message: message}}"));
+                    w.block("if payload != nil {", "}", |w| {
+                        w.line("r := &wvReader{buf: payload}");
+                        w.line(format!("p := &{pname}{{}}"));
+                        for f in &c.fields {
+                            let fname = f.name.to_upper_camel_case();
+                            emit_buffer_read(
+                                w,
+                                "r",
+                                &format!("p.{fname}"),
+                                &f.ty,
+                                &fname,
+                                0,
+                                prefix,
+                                &eb.owner_path,
+                            );
+                        }
+                        w.line("r.expectEnd()");
+                        w.line("e.Payload = p");
+                    });
+                    w.line("return e");
+                }
                 w.dedent();
             }
             w.line("default:");
             w.indent();
-            w.line("return wvBrandError(code, message)");
+            w.line("return wvBrandError(code, message, payload)");
             w.dedent();
             w.line("}");
         },
@@ -918,6 +977,588 @@ fn go_str(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+// ── Value-buffer runtime ──
+
+/// The private writer/reader pair implementing the WeaveFFI value-buffer
+/// wire format (little-endian, packed, `u32` length prefixes), plus the two
+/// buffer copy helpers (`wvCopyBuffer` for owned returns released with
+/// `weaveffi_free_bytes`, `wvBorrowBuffer` for borrowed callback/async
+/// buffers the producer frees).
+///
+/// The reader panics on malformed input: a bad buffer is a producer bug (a
+/// contract violation), not a recoverable domain error, so it surfaces
+/// through the same panic channel a trapped producer error does.
+fn render_buffer_runtime(out: &mut String) {
+    let mut w = CodeWriter::tabs();
+    w.line("// wvWriter serializes values into the WeaveFFI value-buffer format:");
+    w.line("// little-endian, packed, u32 length prefixes.");
+    w.block("type wvWriter struct {", "}", |w| {
+        w.line("buf []byte");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeBool(v bool) {", "}", |w| {
+        w.line("if v {");
+        w.indent();
+        w.line("w.buf = append(w.buf, 1)");
+        w.dedent();
+        w.line("} else {");
+        w.indent();
+        w.line("w.buf = append(w.buf, 0)");
+        w.dedent();
+        w.line("}");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeI8(v int8) {", "}", |w| {
+        w.line("w.buf = append(w.buf, byte(v))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeU8(v uint8) {", "}", |w| {
+        w.line("w.buf = append(w.buf, v)");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeI16(v int16) {", "}", |w| {
+        w.line("w.buf = binary.LittleEndian.AppendUint16(w.buf, uint16(v))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeU16(v uint16) {", "}", |w| {
+        w.line("w.buf = binary.LittleEndian.AppendUint16(w.buf, v)");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeI32(v int32) {", "}", |w| {
+        w.line("w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(v))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeU32(v uint32) {", "}", |w| {
+        w.line("w.buf = binary.LittleEndian.AppendUint32(w.buf, v)");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeI64(v int64) {", "}", |w| {
+        w.line("w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeU64(v uint64) {", "}", |w| {
+        w.line("w.buf = binary.LittleEndian.AppendUint64(w.buf, v)");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeF32(v float32) {", "}", |w| {
+        w.line("w.writeU32(math.Float32bits(v))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeF64(v float64) {", "}", |w| {
+        w.line("w.writeU64(math.Float64bits(v))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeLen(n int) {", "}", |w| {
+        w.block("if n < 0 || uint64(n) > uint64(^uint32(0)) {", "}", |w| {
+            w.line("panic(\"weaveffi: value-buffer length exceeds u32 range\")");
+        });
+        w.line("w.writeU32(uint32(n))");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeString(v string) {", "}", |w| {
+        w.line("w.writeLen(len(v))");
+        w.line("w.buf = append(w.buf, v...)");
+    });
+    w.blank();
+    w.block("func (w *wvWriter) writeBytes(v []byte) {", "}", |w| {
+        w.line("w.writeLen(len(v))");
+        w.line("w.buf = append(w.buf, v...)");
+    });
+    w.blank();
+    w.block(
+        "func (w *wvWriter) writeOptionFlag(present bool) {",
+        "}",
+        |w| {
+            w.line("w.writeBool(present)");
+        },
+    );
+    w.blank();
+
+    w.line("// wvReader decodes values from the WeaveFFI value-buffer format. A");
+    w.line("// malformed buffer is a producer/consumer contract violation, so every");
+    w.line("// read panics (the same channel a trapped producer error uses) instead");
+    w.line("// of returning a typed domain error.");
+    w.block("type wvReader struct {", "}", |w| {
+        w.line("buf []byte");
+        w.line("pos int");
+    });
+    w.blank();
+    w.block("func wvMalformed(context string) {", "}", |w| {
+        w.line("panic(\"weaveffi: malformed value buffer: \" + context)");
+    });
+    w.blank();
+    w.block(
+        "func (r *wvReader) take(n int, context string) []byte {",
+        "}",
+        |w| {
+            w.block("if n < 0 || len(r.buf)-r.pos < n {", "}", |w| {
+                w.line("wvMalformed(context)");
+            });
+            w.line("b := r.buf[r.pos : r.pos+n]");
+            w.line("r.pos += n");
+            w.line("return b");
+        },
+    );
+    w.blank();
+    w.block("func (r *wvReader) readBool() bool {", "}", |w| {
+        w.line("switch r.take(1, \"bool\")[0] {");
+        w.line("case 0:");
+        w.indent();
+        w.line("return false");
+        w.dedent();
+        w.line("case 1:");
+        w.indent();
+        w.line("return true");
+        w.dedent();
+        w.line("}");
+        w.line("wvMalformed(\"bool byte out of range\")");
+        w.line("return false");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readI8() int8 {", "}", |w| {
+        w.line("return int8(r.take(1, \"i8\")[0])");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readU8() uint8 {", "}", |w| {
+        w.line("return r.take(1, \"u8\")[0]");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readI16() int16 {", "}", |w| {
+        w.line("return int16(binary.LittleEndian.Uint16(r.take(2, \"i16\")))");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readU16() uint16 {", "}", |w| {
+        w.line("return binary.LittleEndian.Uint16(r.take(2, \"u16\"))");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readI32() int32 {", "}", |w| {
+        w.line("return int32(binary.LittleEndian.Uint32(r.take(4, \"i32\")))");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readU32() uint32 {", "}", |w| {
+        w.line("return binary.LittleEndian.Uint32(r.take(4, \"u32\"))");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readI64() int64 {", "}", |w| {
+        w.line("return int64(binary.LittleEndian.Uint64(r.take(8, \"i64\")))");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readU64() uint64 {", "}", |w| {
+        w.line("return binary.LittleEndian.Uint64(r.take(8, \"u64\"))");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readF32() float32 {", "}", |w| {
+        w.line("return math.Float32frombits(r.readU32())");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readF64() float64 {", "}", |w| {
+        w.line("return math.Float64frombits(r.readU64())");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readLen() int {", "}", |w| {
+        w.line("n := int(r.readU32())");
+        w.block("if n > len(r.buf)-r.pos {", "}", |w| {
+            w.line("wvMalformed(\"length prefix exceeds remaining buffer\")");
+        });
+        w.line("return n");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readString() string {", "}", |w| {
+        w.line("b := r.take(r.readLen(), \"string bytes\")");
+        w.block("if !utf8.Valid(b) {", "}", |w| {
+            w.line("wvMalformed(\"string is not valid UTF-8\")");
+        });
+        w.line("return string(b)");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readBytes() []byte {", "}", |w| {
+        w.line("b := r.take(r.readLen(), \"byte buffer\")");
+        w.line("out := make([]byte, len(b))");
+        w.line("copy(out, b)");
+        w.line("return out");
+    });
+    w.blank();
+    w.block("func (r *wvReader) readOptionFlag() bool {", "}", |w| {
+        w.line("switch r.take(1, \"option flag\")[0] {");
+        w.line("case 0:");
+        w.indent();
+        w.line("return false");
+        w.dedent();
+        w.line("case 1:");
+        w.indent();
+        w.line("return true");
+        w.dedent();
+        w.line("}");
+        w.line("wvMalformed(\"option flag byte out of range\")");
+        w.line("return false");
+    });
+    w.blank();
+    w.block("func (r *wvReader) expectEnd() {", "}", |w| {
+        w.block("if r.pos != len(r.buf) {", "}", |w| {
+            w.line("wvMalformed(\"trailing bytes after value\")");
+        });
+    });
+    w.blank();
+
+    w.line("// wvCopyBuffer copies an owned, producer-allocated value buffer into Go");
+    w.line("// memory and releases it with weaveffi_free_bytes.");
+    w.block(
+        "func wvCopyBuffer(ptr *C.uint8_t, length C.size_t) []byte {",
+        "}",
+        |w| {
+            w.block("if ptr == nil {", "}", |w| {
+                w.line("return nil");
+            });
+            w.line("out := C.GoBytes(unsafe.Pointer(ptr), C.int(length))");
+            w.line("C.weaveffi_free_bytes(ptr, length)");
+            w.line("return out");
+        },
+    );
+    w.blank();
+    w.line("// wvBorrowBuffer copies a borrowed value buffer into Go memory. The");
+    w.line("// producer keeps ownership and frees it after the borrowing call returns.");
+    w.block(
+        "func wvBorrowBuffer(ptr *C.uint8_t, length C.size_t) []byte {",
+        "}",
+        |w| {
+            w.block("if ptr == nil {", "}", |w| {
+                w.line("return nil");
+            });
+            w.line("return C.GoBytes(unsafe.Pointer(ptr), C.int(length))");
+        },
+    );
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+// ── Value-buffer codegen ──
+
+/// Emit statements appending `expr` (a Go value of type `ty`) to the
+/// `wvWriter` named `writer`, following the wire format. `site` and `depth`
+/// uniquify the loop locals generated for nested lists and maps.
+fn emit_buffer_write(
+    w: &mut CodeWriter,
+    writer: &str,
+    expr: &str,
+    ty: &TypeRef,
+    site: &str,
+    depth: usize,
+) {
+    match ty {
+        TypeRef::Bool => {
+            w.line(format!("{writer}.writeBool({expr})"));
+        }
+        TypeRef::I8 => {
+            w.line(format!("{writer}.writeI8({expr})"));
+        }
+        TypeRef::I16 => {
+            w.line(format!("{writer}.writeI16({expr})"));
+        }
+        TypeRef::I32 => {
+            w.line(format!("{writer}.writeI32({expr})"));
+        }
+        TypeRef::I64 => {
+            w.line(format!("{writer}.writeI64({expr})"));
+        }
+        TypeRef::U8 => {
+            w.line(format!("{writer}.writeU8({expr})"));
+        }
+        TypeRef::U16 => {
+            w.line(format!("{writer}.writeU16({expr})"));
+        }
+        TypeRef::U32 => {
+            w.line(format!("{writer}.writeU32({expr})"));
+        }
+        TypeRef::U64 => {
+            w.line(format!("{writer}.writeU64({expr})"));
+        }
+        TypeRef::F32 => {
+            w.line(format!("{writer}.writeF32({expr})"));
+        }
+        TypeRef::F64 => {
+            w.line(format!("{writer}.writeF64({expr})"));
+        }
+        TypeRef::Handle => {
+            w.line(format!("{writer}.writeU64(uint64({expr}))"));
+        }
+        TypeRef::Enum(_) => {
+            w.line(format!("{writer}.writeI32(int32({expr}))"));
+        }
+        // A typed handle serializes as the u64 value of its opaque pointer.
+        TypeRef::TypedHandle(_) => {
+            w.line(format!(
+                "{writer}.writeU64(uint64(uintptr(unsafe.Pointer({expr}.ptr))))"
+            ));
+        }
+        TypeRef::StringUtf8 => {
+            w.line(format!("{writer}.writeString({expr})"));
+        }
+        TypeRef::Bytes => {
+            w.line(format!("{writer}.writeBytes({expr})"));
+        }
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            w.line(format!("wvPack{}({writer}, {expr})", go_local(n)));
+        }
+        TypeRef::Optional(inner) => {
+            w.line(format!("if {expr} == nil {{"));
+            w.indent();
+            w.line(format!("{writer}.writeOptionFlag(false)"));
+            w.dedent();
+            w.line("} else {");
+            w.indent();
+            w.line(format!("{writer}.writeOptionFlag(true)"));
+            let inner_expr = if optional_derefs(inner) {
+                format!("(*{expr})")
+            } else {
+                expr.to_string()
+            };
+            emit_buffer_write(w, writer, &inner_expr, inner, site, depth + 1);
+            w.dedent();
+            w.line("}");
+        }
+        TypeRef::List(inner) => {
+            let e = format!("e{site}{depth}");
+            w.line(format!("{writer}.writeLen(len({expr}))"));
+            w.block(format!("for _, {e} := range {expr} {{"), "}", |w| {
+                emit_buffer_write(w, writer, &e, inner, site, depth + 1);
+            });
+        }
+        TypeRef::Map(k, v) => {
+            let kv = format!("k{site}{depth}");
+            let vv = format!("v{site}{depth}");
+            w.line(format!("{writer}.writeLen(len({expr}))"));
+            w.block(format!("for {kv}, {vv} := range {expr} {{"), "}", |w| {
+                emit_buffer_write(w, writer, &kv, k, site, depth + 1);
+                emit_buffer_write(w, writer, &vv, v, site, depth + 1);
+            });
+        }
+        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => {
+            unreachable!("borrowed views are rejected in buffered positions")
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("object references cannot be serialized by value")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+/// Emit statements decoding one value of type `ty` from the `wvReader` named
+/// `reader` and assigning it into the pre-declared destination `dst`.
+/// `site` and `depth` uniquify the locals generated for nested containers.
+#[allow(clippy::too_many_arguments)]
+fn emit_buffer_read(
+    w: &mut CodeWriter,
+    reader: &str,
+    dst: &str,
+    ty: &TypeRef,
+    site: &str,
+    depth: usize,
+    prefix: &str,
+    module: &str,
+) {
+    match ty {
+        TypeRef::Bool => {
+            w.line(format!("{dst} = {reader}.readBool()"));
+        }
+        TypeRef::I8 => {
+            w.line(format!("{dst} = {reader}.readI8()"));
+        }
+        TypeRef::I16 => {
+            w.line(format!("{dst} = {reader}.readI16()"));
+        }
+        TypeRef::I32 => {
+            w.line(format!("{dst} = {reader}.readI32()"));
+        }
+        TypeRef::I64 => {
+            w.line(format!("{dst} = {reader}.readI64()"));
+        }
+        TypeRef::U8 => {
+            w.line(format!("{dst} = {reader}.readU8()"));
+        }
+        TypeRef::U16 => {
+            w.line(format!("{dst} = {reader}.readU16()"));
+        }
+        TypeRef::U32 => {
+            w.line(format!("{dst} = {reader}.readU32()"));
+        }
+        TypeRef::U64 => {
+            w.line(format!("{dst} = {reader}.readU64()"));
+        }
+        TypeRef::F32 => {
+            w.line(format!("{dst} = {reader}.readF32()"));
+        }
+        TypeRef::F64 => {
+            w.line(format!("{dst} = {reader}.readF64()"));
+        }
+        TypeRef::Handle => {
+            w.line(format!("{dst} = int64({reader}.readU64())"));
+        }
+        TypeRef::Enum(n) => {
+            w.line(format!("{dst} = {}({reader}.readI32())", go_local(n)));
+        }
+        TypeRef::TypedHandle(n) => {
+            let g = handle_wrapper(n);
+            let tag = c_abi_struct_name(n, module, prefix);
+            w.line(format!(
+                "{dst} = &{g}{{ptr: (*C.{tag})(unsafe.Pointer(uintptr({reader}.readU64())))}}"
+            ));
+        }
+        TypeRef::StringUtf8 => {
+            w.line(format!("{dst} = {reader}.readString()"));
+        }
+        TypeRef::Bytes => {
+            w.line(format!("{dst} = {reader}.readBytes()"));
+        }
+        TypeRef::Record(n) | TypeRef::RichEnum(n) => {
+            w.line(format!("{dst} = wvUnpack{}({reader})", go_local(n)));
+        }
+        TypeRef::Optional(inner) => {
+            let o = format!("o{site}{depth}");
+            w.block(format!("if {reader}.readOptionFlag() {{"), "}", |w| {
+                w.line(format!("var {o} {}", go_type(inner)));
+                emit_buffer_read(w, reader, &o, inner, site, depth + 1, prefix, module);
+                if optional_derefs(inner) {
+                    w.line(format!("{dst} = &{o}"));
+                } else {
+                    w.line(format!("{dst} = {o}"));
+                }
+            });
+        }
+        TypeRef::List(inner) => {
+            let n = format!("n{site}{depth}");
+            let i = format!("i{site}{depth}");
+            w.line(format!("{n} := {reader}.readLen()"));
+            w.line(format!("{dst} = make([]{}, {n})", go_type(inner)));
+            w.block(format!("for {i} := range {dst} {{"), "}", |w| {
+                emit_buffer_read(
+                    w,
+                    reader,
+                    &format!("{dst}[{i}]"),
+                    inner,
+                    site,
+                    depth + 1,
+                    prefix,
+                    module,
+                );
+            });
+        }
+        TypeRef::Map(k, v) => {
+            let n = format!("n{site}{depth}");
+            let i = format!("i{site}{depth}");
+            let kv = format!("k{site}{depth}");
+            let vv = format!("v{site}{depth}");
+            let gk = go_type(k);
+            let gv = go_type(v);
+            w.line(format!("{n} := {reader}.readLen()"));
+            w.line(format!("{dst} = make(map[{gk}]{gv}, {n})"));
+            w.block(format!("for {i} := 0; {i} < {n}; {i}++ {{"), "}", |w| {
+                w.line(format!("var {kv} {gk}"));
+                emit_buffer_read(w, reader, &kv, k, site, depth + 1, prefix, module);
+                w.line(format!("var {vv} {gv}"));
+                emit_buffer_read(w, reader, &vv, v, site, depth + 1, prefix, module);
+                w.line(format!("{dst}[{kv}] = {vv}"));
+            });
+        }
+        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => {
+            unreachable!("borrowed views are rejected in buffered positions")
+        }
+        TypeRef::Interface(_) | TypeRef::Iterator(_) => {
+            unreachable!("object references cannot be serialized by value")
+        }
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+    }
+}
+
+// ── Typed handles ──
+
+/// Collect every typed-handle referent reachable from the model's type
+/// positions, deduplicated by wrapper name in first-occurrence order (which
+/// keeps the emitted set deterministic).
+fn collect_typed_handles(model: &BindingModel, prefix: &str) -> Vec<(String, String)> {
+    fn visit(
+        ty: &TypeRef,
+        module: &str,
+        prefix: &str,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        match ty {
+            TypeRef::TypedHandle(n) => {
+                let name = handle_wrapper(n);
+                if seen.insert(name.clone()) {
+                    out.push((name, c_abi_struct_name(n, module, prefix)));
+                }
+            }
+            TypeRef::Optional(i) | TypeRef::List(i) | TypeRef::Iterator(i) => {
+                visit(i, module, prefix, seen, out);
+            }
+            TypeRef::Map(k, v) => {
+                visit(k, module, prefix, seen, out);
+                visit(v, module, prefix, seen, out);
+            }
+            _ => {}
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for m in &model.modules {
+        for s in &m.structs {
+            for f in &s.fields {
+                visit(&f.ty, &m.path, prefix, &mut seen, &mut out);
+            }
+        }
+        for e in &m.enums {
+            for v in &e.variants {
+                for f in &v.fields {
+                    visit(&f.ty, &m.path, prefix, &mut seen, &mut out);
+                }
+            }
+        }
+        if let Some(eb) = &m.error {
+            if eb.declared_here {
+                for c in &eb.codes {
+                    for f in &c.fields {
+                        visit(&f.ty, &m.path, prefix, &mut seen, &mut out);
+                    }
+                }
+            }
+        }
+        for cb in &m.callbacks {
+            for p in &cb.params {
+                visit(&p.ty, &m.path, prefix, &mut seen, &mut out);
+            }
+        }
+        for f in m.callables() {
+            for p in &f.params {
+                visit(&p.ty, &m.path, prefix, &mut seen, &mut out);
+            }
+            if let Some(ret) = &f.ret {
+                visit(ret, &m.path, prefix, &mut seen, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Render one wrapper struct per typed-handle referent. A typed handle is a
+/// borrowed opaque id with no destroy symbol, so the wrapper carries no
+/// `Close`.
+fn render_typed_handles(out: &mut String, handles: &[(String, String)]) {
+    let mut w = CodeWriter::tabs();
+    for (name, tag) in handles {
+        w.line(format!(
+            "// {name} is a typed handle naming a producer-owned resource. It wraps"
+        ));
+        w.line("// the opaque C pointer and owes no release call.");
+        w.block(format!("type {name} struct {{"), "}", |w| {
+            w.line(format!("ptr *C.{tag}"));
+        });
+        w.blank();
+    }
+    out.push_str(&w.finish());
 }
 
 fn render_go(
@@ -960,16 +1601,25 @@ fn render_go(
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if imports.fmt || imports.iter || imports.unsafe_ptr || imports.sync {
+    if imports.fmt || imports.iter || imports.unsafe_ptr || imports.sync || imports.buffer_runtime {
         out.push_str("\nimport (\n");
+        if imports.buffer_runtime {
+            out.push_str("\t\"encoding/binary\"\n");
+        }
         if imports.fmt {
             out.push_str("\t\"fmt\"\n");
         }
         if imports.iter {
             out.push_str("\t\"iter\"\n");
         }
+        if imports.buffer_runtime {
+            out.push_str("\t\"math\"\n");
+        }
         if imports.sync {
             out.push_str("\t\"sync\"\n");
+        }
+        if imports.buffer_runtime {
+            out.push_str("\t\"unicode/utf8\"\n");
         }
         if imports.unsafe_ptr {
             out.push_str("\t\"unsafe\"\n");
@@ -993,8 +1643,17 @@ fn render_go(
         render_error_infra(&mut out);
     }
 
+    if imports.buffer_runtime {
+        render_buffer_runtime(&mut out);
+    }
+
     if has_async || has_listeners {
         render_callback_registry(&mut out, has_listeners);
+    }
+
+    let handles = collect_typed_handles(model, prefix);
+    if !handles.is_empty() {
+        render_typed_handles(&mut out, &handles);
     }
 
     for m in &model.modules {
@@ -1003,21 +1662,18 @@ fn render_go(
             // Emit the typed domain once, in its declaring module; inheriting
             // submodules reference the ancestor's type through `wvMap{Stem}`.
             if eb.declared_here {
-                render_error(&mut out, m, eb);
+                render_error(&mut out, m, eb, prefix);
             }
         }
         for e in &m.enums {
             // A plain C-style enum becomes an `int32` + constants; a rich
-            // (algebraic) enum becomes an opaque-object wrapper. Each renderer
-            // skips the other kind, mirroring the C++ backend.
+            // (algebraic) enum becomes a sealed sum type. Each renderer skips
+            // the other kind.
             render_enum(&mut out, e);
             render_rich_enum(&mut out, prefix, &m.path, e);
         }
         for s in &m.structs {
             render_struct(&mut out, prefix, &m.path, s);
-            if s.builder.is_some() {
-                render_go_builder(&mut out, prefix, &m.path, s);
-            }
         }
         for i in &m.interfaces {
             render_interface(&mut out, prefix, m, i, stem.as_deref());
@@ -1192,6 +1848,10 @@ fn go_callback_sig(cb: &CallbackBinding) -> String {
 
 /// Emit statements converting one callback parameter's C slots into a Go
 /// value bound to `arg{idx}`, returning that local's name.
+///
+/// Every callback argument is borrowed for the dispatch: buffered values are
+/// decoded from the borrowed `(ptr, len)` pair, strings and bytes are copied,
+/// and object pointers are wrapped without adopting ownership.
 fn emit_cb_param_arg(
     out: &mut String,
     idx: usize,
@@ -1200,8 +1860,29 @@ fn emit_cb_param_arg(
     module: &str,
 ) -> String {
     let arg = format!("arg{idx}");
-    let n = &p.abi[0].name;
     let mut w = CodeWriter::tabs().with_depth(1);
+    if is_buffered(&p.ty) {
+        let ptr_slot = &p.abi[0].name;
+        let len_slot = &p.abi[1].name;
+        w.line(format!(
+            "rArg{idx} := &wvReader{{buf: wvBorrowBuffer({ptr_slot}, {len_slot})}}"
+        ));
+        w.line(format!("var {arg} {}", go_type(&p.ty)));
+        emit_buffer_read(
+            &mut w,
+            &format!("rArg{idx}"),
+            &arg,
+            &p.ty,
+            &format!("Arg{idx}"),
+            0,
+            prefix,
+            module,
+        );
+        w.line(format!("rArg{idx}.expectEnd()"));
+        out.push_str(&w.finish());
+        return arg;
+    }
+    let n = &p.abi[0].name;
     match &p.ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1213,14 +1894,12 @@ fn emit_cb_param_arg(
         | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::F32
-        | TypeRef::F64 => {
+        | TypeRef::F64
+        | TypeRef::Enum(_) => {
             w.line(format!("{arg} := {}", go_scalar_conv(n, &p.ty)));
         }
         TypeRef::Bool => {
             w.line(format!("{arg} := cToBool({n})"));
-        }
-        TypeRef::Enum(_) => {
-            w.line(format!("{arg} := {}", go_scalar_conv(n, &p.ty)));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             w.line(format!("{arg} := \"\""));
@@ -1239,89 +1918,23 @@ fn emit_cb_param_arg(
         }
         // Opaque pointers are borrowed for the duration of the callback; the
         // wrapper must not be Closed by the consumer.
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::TypedHandle(name)
-        | TypeRef::Interface(name) => {
-            let g = local_type_name(name).to_upper_camel_case();
-            w.line(format!("{arg} := &{g}{{ptr: {n}}}"));
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            w.line(format!("{arg} := {}", go_wrap_expr(&p.ty, n)));
         }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                w.line(format!("var {arg} *string"));
-                w.block(format!("if {n} != nil {{"), "}", |w| {
-                    w.line(format!("v{idx} := C.GoString({n})"));
-                    w.line(format!("{arg} = &v{idx}"));
-                });
-            }
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                w.line(format!("var {arg} []byte"));
-                w.block(format!("if {n} != nil {{"), "}", |w| {
-                    w.line(format!(
-                        "{arg} = C.GoBytes(unsafe.Pointer({n}), C.int({}_len))",
-                        p.name
-                    ));
-                });
-            }
-            TypeRef::Record(name)
-            | TypeRef::RichEnum(name)
-            | TypeRef::TypedHandle(name)
-            | TypeRef::Interface(name) => {
-                let g = local_type_name(name).to_upper_camel_case();
-                w.line(format!("var {arg} *{g}"));
-                w.block(format!("if {n} != nil {{"), "}", |w| {
-                    w.line(format!("{arg} = &{g}{{ptr: {n}}}"));
-                });
-            }
-            TypeRef::Bool => {
-                w.line(format!("var {arg} *bool"));
-                w.block(format!("if {n} != nil {{"), "}", |w| {
-                    w.line(format!("v{idx} := cToBool(*{n})"));
-                    w.line(format!("{arg} = &v{idx}"));
-                });
-            }
-            _ => {
-                let gt = go_type(inner);
-                w.line(format!("var {arg} *{gt}"));
-                w.block(format!("if {n} != nil {{"), "}", |w| {
-                    w.line(format!("v{idx} := {gt}(*{n})"));
-                    w.line(format!("{arg} = &v{idx}"));
-                });
-            }
-        },
-        TypeRef::List(inner) => {
-            w.line(format!("count{idx} := int({}_len)", p.name));
-            let mut body = String::new();
-            // Callback arrays are borrowed for the callback's duration.
-            decode_list(
-                &mut body,
-                &arg,
-                inner,
-                n,
-                &format!("count{idx}"),
-                prefix,
-                module,
-                false,
-            );
-            w.raw(body);
+        // Only an optional interface reaches here unbuffered: a nullable
+        // borrowed object pointer.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(name) = inner.as_ref() else {
+                unreachable!("every other optional is buffered")
+            };
+            let g = go_local(name);
+            w.line(format!("var {arg} *{g}"));
+            w.block(format!("if {n} != nil {{"), "}", |w| {
+                w.line(format!("{arg} = &{g}{{ptr: {n}}}"));
+            });
         }
-        TypeRef::Map(k, v) => {
-            w.line(format!("count{idx} := int({}_len)", p.name));
-            let mut body = String::new();
-            // Callback buffers are borrowed for the callback's duration.
-            decode_map(
-                &mut body,
-                &arg,
-                k,
-                v,
-                &format!("{}_keys", p.name),
-                &format!("{}_values", p.name),
-                &format!("count{idx}"),
-                prefix,
-                module,
-                false,
-            );
-            w.raw(body);
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
         TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -1445,10 +2058,10 @@ fn async_outcome_type(prefix: &str, f: &FnBinding) -> String {
 /// Send the converted async result over the outcome channel. Runs inside the
 /// completion trampoline after the error path has been handled.
 ///
-/// Result buffers (strings, bytes, arrays, boxed scalars) are borrowed for
-/// the callback's duration per the shared async protocol: they are deep
-/// copied here and never freed (the producer releases them after the
-/// callback returns). Owned-object results are the exception: the callback
+/// Result buffers (strings, bytes, value buffers) are borrowed for the
+/// callback's duration per the shared async protocol: they are decoded or
+/// deep copied here and never freed (the producer releases them after the
+/// callback returns). Owned interface results are the exception: the callback
 /// receives ownership and the wrapper adopts the pointer (its `Close` calls
 /// the destroy symbol).
 fn emit_async_result_send(
@@ -1464,6 +2077,16 @@ fn emit_async_result_send(
         out.push_str(&w.finish());
         return;
     };
+    if is_buffered(ty) {
+        // Borrowed for the callback's duration: decode, do not free.
+        w.line("rRes := &wvReader{buf: wvBorrowBuffer(result_ptr, result_len)}");
+        w.line(format!("var val {}", go_type(ty)));
+        emit_buffer_read(&mut w, "rRes", "val", ty, "Res", 0, prefix, module);
+        w.line("rRes.expectEnd()");
+        w.line(format!("ch <- {outcome}{{val: val}}"));
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -1475,7 +2098,8 @@ fn emit_async_result_send(
         | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::F32
-        | TypeRef::F64 => {
+        | TypeRef::F64
+        | TypeRef::Enum(_) => {
             w.line(format!(
                 "ch <- {outcome}{{val: {}}}",
                 go_scalar_conv("result", ty)
@@ -1483,12 +2107,6 @@ fn emit_async_result_send(
         }
         TypeRef::Bool => {
             w.line(format!("ch <- {outcome}{{val: cToBool(result)}}"));
-        }
-        TypeRef::Enum(_) => {
-            w.line(format!(
-                "ch <- {outcome}{{val: {}}}",
-                go_scalar_conv("result", ty)
-            ));
         }
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             // Borrowed for the callback's duration: copy, do not free.
@@ -1506,80 +2124,28 @@ fn emit_async_result_send(
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
-        TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::TypedHandle(n)
-        | TypeRef::Interface(n) => {
-            let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("ch <- {outcome}{{val: &{g}{{ptr: result}}}}"));
+        // An owned interface result is adopted by the wrapper (its Close
+        // calls the destroy symbol); a typed handle is a borrowed id.
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            w.line(format!(
+                "ch <- {outcome}{{val: {}}}",
+                go_wrap_expr(ty, "result")
+            ));
         }
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                // Borrowed for the callback's duration: copy, do not free.
-                w.line("var val *string");
-                w.block("if result != nil {", "}", |w| {
-                    w.line("v := C.GoString(result)");
-                    w.line("val = &v");
-                });
-                w.line(format!("ch <- {outcome}{{val: val}}"));
-            }
-            TypeRef::Record(n)
-            | TypeRef::RichEnum(n)
-            | TypeRef::TypedHandle(n)
-            | TypeRef::Interface(n) => {
-                let g = local_type_name(n).to_upper_camel_case();
-                w.line(format!("var val *{g}"));
-                w.block("if result != nil {", "}", |w| {
-                    w.line(format!("val = &{g}{{ptr: result}}"));
-                });
-                w.line(format!("ch <- {outcome}{{val: val}}"));
-            }
-            TypeRef::Bool => {
-                w.line("var val *bool");
-                w.block("if result != nil {", "}", |w| {
-                    w.line("v := cToBool(*result)");
-                    w.line("val = &v");
-                });
-                w.line(format!("ch <- {outcome}{{val: val}}"));
-            }
-            _ => {
-                let gt = go_type(inner);
-                w.line(format!("var val *{gt}"));
-                w.block("if result != nil {", "}", |w| {
-                    w.line(format!("v := {gt}(*result)"));
-                    w.line("val = &v");
-                });
-                w.line(format!("ch <- {outcome}{{val: val}}"));
-            }
-        },
-        TypeRef::List(inner) => {
-            w.line("count := int(result_len)");
-            let mut body = String::new();
-            // Borrowed for the callback's duration: copy, do not free.
-            decode_list(
-                &mut body, "val", inner, "result", "count", prefix, module, false,
-            );
-            w.raw(body);
+        // Only an optional interface reaches here unbuffered.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(name) = inner.as_ref() else {
+                unreachable!("every other optional is buffered")
+            };
+            let g = go_local(name);
+            w.line(format!("var val *{g}"));
+            w.block("if result != nil {", "}", |w| {
+                w.line(format!("val = &{g}{{ptr: result}}"));
+            });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
-        TypeRef::Map(k, v) => {
-            w.line("count := int(result_len)");
-            let mut body = String::new();
-            // Borrowed for the callback's duration: copy, do not free.
-            decode_map(
-                &mut body,
-                "val",
-                k,
-                v,
-                "result_keys",
-                "result_values",
-                "count",
-                prefix,
-                module,
-                false,
-            );
-            w.raw(body);
-            w.line(format!("ch <- {outcome}{{val: val}}"));
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
         TypeRef::Iterator(_) => unreachable!("async iterator returns are rejected upstream"),
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
@@ -1736,8 +2302,8 @@ fn render_async_function(
 // ── Enums ──
 
 fn render_enum(out: &mut String, e: &EnumBinding) {
-    // Rich (algebraic) enums cross the ABI as opaque objects and are rendered
-    // as wrappers by `render_rich_enum`; only plain C-style enums are int32s.
+    // Rich (algebraic) enums are value sum types rendered by
+    // `render_rich_enum`; only plain C-style enums are int32s.
     if e.is_rich() {
         return;
     }
@@ -1761,147 +2327,133 @@ fn render_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
-/// Render a rich (algebraic) enum as an opaque-object wrapper, mirroring the Go
-/// struct wrapper ([`render_struct`]): a value type owning the `*C.{tag}` handle
-/// freed by an explicit `Close`, an `int32` discriminant read by `Tag()` plus
-/// exported per-variant tag constants (reusing the plain-enum const style), one
-/// `New{Enum}{Variant}` constructor per variant calling `{tag}_{V}_new`, and
-/// per-variant field accessors (`{Variant}{Field}()`) reusing the struct getter
-/// marshalling. Because a rich enum crosses the ABI as an opaque object
-/// pointer (`TypeRef::RichEnum`), the existing function/param/return machinery
-/// shares the record paths unchanged.
+/// Render a rich (algebraic) enum as an idiomatic Go sum type: a sealed
+/// interface (`type Shape interface { isShape() }`) with one struct per
+/// variant (`ShapeCircle`, holding that variant's fields as exported struct
+/// fields), plus the pack/unpack pair serializing the `i32` tag followed by
+/// the active variant's fields in wire order. Rich enums have no C symbols;
+/// values only cross the ABI inside value buffers.
 ///
 /// A plain C-style enum is skipped here (it is handled by [`render_enum`]).
 fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: &EnumBinding) {
-    let Some(rich) = &e.rich else {
+    if !e.is_rich() {
         return;
-    };
+    }
     let name = e.name.to_upper_camel_case();
-    let c_tag = &e.c_tag;
 
     let mut w = CodeWriter::tabs();
-    // Opaque-object value type owning the C handle (identical to a struct).
-    let mut d = String::new();
-    emit_doc(&mut d, &e.doc, "", Some(&name));
-    w.raw(d);
-    w.block(format!("type {name} struct {{"), "}", |w| {
-        w.line(format!("ptr *C.{c_tag}"));
+    if e.doc.is_some() {
+        let mut d = String::new();
+        emit_doc(&mut d, &e.doc, "", Some(&name));
+        w.raw(d);
+        w.line("//");
+    }
+    w.line(format!(
+        "// {name} is a sealed sum type: exactly one of its variant structs is the"
+    ));
+    w.line("// value at a time.");
+    w.block(format!("type {name} interface {{"), "}", |w| {
+        w.line(format!("is{name}()"));
     });
     w.blank();
 
-    // Exported discriminant constants in the plain-enum const style. The wrapper
-    // type name is taken by the struct above, so these are typed `int32` to
-    // match what `Tag` returns (`shape.Tag() == ShapeCircle`).
-    w.block("const (", ")", |w| {
-        for v in &e.variants {
-            let vname = format!("{name}{}", v.name.to_upper_camel_case());
-            let mut vd = String::new();
-            emit_doc(&mut vd, &v.doc, "\t", Some(&vname));
+    for v in &e.variants {
+        let vn = format!("{name}{}", v.name.to_upper_camel_case());
+        let mut vd = String::new();
+        emit_doc(&mut vd, &v.doc, "", Some(&vn));
+        if vd.is_empty() {
+            w.line(format!("// {vn} is the `{}` variant of {name}.", v.name));
+        } else {
             w.raw(vd);
-            w.line(format!("{vname} int32 = {}", v.value));
         }
-    });
-    w.blank();
-
-    // Tag reader: the active variant's discriminant.
-    w.block(format!("func (s *{name}) Tag() int32 {{"), "}", |w| {
-        w.line(format!("return int32(C.{}(s.ptr))", rich.tag_symbol));
-    });
-    w.blank();
-
-    // One constructor per variant, calling `{tag}_{V}_new`.
-    for v in &rich.variants {
-        let mut c = String::new();
-        render_rich_enum_ctor(&mut c, prefix, module, &name, v);
-        w.raw(c);
-    }
-
-    // Per-variant field accessors, namespaced by variant to avoid collisions
-    // between same-named fields. Reuse `render_getter` so the marshalling is
-    // identical to a struct getter; the synthesized `{variant}_{field}` name
-    // lowers to a `{Variant}{Field}` method (e.g. `CircleRadius`).
-    for v in &rich.variants {
-        for f in &v.fields {
-            let mut nf = f.clone();
-            nf.name = format!("{}_{}", v.name, f.name);
-            let mut g = String::new();
-            render_getter(&mut g, prefix, module, &name, &nf);
-            w.raw(g);
+        if v.fields.is_empty() {
+            w.line(format!("type {vn} struct{{}}"));
+        } else {
+            w.block(format!("type {vn} struct {{"), "}", |w| {
+                for f in &v.fields {
+                    let fname = f.name.to_upper_camel_case();
+                    let mut fd = String::new();
+                    emit_doc(&mut fd, &f.doc, "\t", Some(&fname));
+                    w.raw(fd);
+                    w.line(format!("{fname} {}", go_type(&f.ty)));
+                }
+            });
         }
+        w.blank();
+        w.line(format!("func ({vn}) is{name}() {{}}"));
+        w.blank();
     }
 
-    // Cleanup: identical contract to a struct wrapper's `Close`.
-    w.block(format!("func (s *{name}) Close() {{"), "}", |w| {
-        w.block("if s.ptr != nil {", "}", |w| {
-            w.line(format!("C.{}(s.ptr)", rich.destroy_symbol));
-            w.line("s.ptr = nil");
-        });
-    });
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// One rich-enum variant constructor: `New{Enum}{Variant}(<fields>)
-/// (*{Enum}, error)`. Each field is marshaled with the same lowering used for a
-/// function parameter / struct-builder field, then `{tag}_{V}_new` is called and
-/// its `out_err` checked with the shared fallible-call convention. A unit
-/// variant takes no parameters (only `out_err`).
-fn render_rich_enum_ctor(
-    out: &mut String,
-    prefix: &str,
-    module: &str,
-    enum_name: &str,
-    v: &RichVariantBinding,
-) {
-    let ctor = format!("New{enum_name}{}", v.name.to_upper_camel_case());
-    let go_params: Vec<String> = v
-        .fields
-        .iter()
-        .map(|f| format!("{} {}", f.name.to_lower_camel_case(), go_type(&f.ty)))
-        .collect();
-
-    let mut w = CodeWriter::tabs();
-    let mut d = String::new();
-    emit_doc(&mut d, &v.doc, "", Some(&ctor));
-    w.raw(d);
-
-    let mut pre = String::new();
-    let mut c_args: Vec<String> = Vec::new();
-    for f in &v.fields {
-        emit_param(
-            &mut pre,
-            &mut c_args,
-            &f.name.to_lower_camel_case(),
-            &f.ty,
-            prefix,
-            module,
-        );
-    }
-    pre.push_str("\tvar cErr C.weaveffi_error\n");
-    c_args.push("&cErr".into());
-
-    // Variant construction is fallible plumbing (marshalling, producer
-    // allocation), not a typed domain failure, so it reports the generic
-    // brand error.
-    let err = ErrCtx {
-        throws: true,
-        stem: None,
-    };
+    w.line(format!(
+        "// wvPack{name} appends v to w in the value-buffer wire format."
+    ));
     w.block(
-        format!(
-            "func {ctor}({}) (*{enum_name}, error) {{",
-            go_params.join(", ")
-        ),
+        format!("func wvPack{name}(w *wvWriter, v {name}) {{"),
         "}",
         |w| {
-            w.raw(&pre);
+            w.line("switch x := v.(type) {");
+            for v in &e.variants {
+                let vn = format!("{name}{}", v.name.to_upper_camel_case());
+                w.line(format!("case {vn}:"));
+                w.indent();
+                w.line(format!("w.writeI32({})", v.value));
+                for f in &v.fields {
+                    let fname = f.name.to_upper_camel_case();
+                    let site = format!("{}{fname}", v.name.to_upper_camel_case());
+                    emit_buffer_write(w, "w", &format!("x.{fname}"), &f.ty, &site, 0);
+                }
+                w.dedent();
+            }
+            w.line("default:");
+            w.indent();
             w.line(format!(
-                "result := C.{}({})",
-                v.create.symbol,
-                c_args.join(", ")
+                "panic(\"weaveffi: {name} value is not one of its variants\")"
             ));
-            err.emit_check(w, "cErr", Some("nil"));
-            w.line(format!("return &{enum_name}{{ptr: result}}, nil"));
+            w.dedent();
+            w.line("}");
+        },
+    );
+    w.blank();
+
+    w.line(format!("// wvUnpack{name} decodes one {name} from r."));
+    w.block(
+        format!("func wvUnpack{name}(r *wvReader) {name} {{"),
+        "}",
+        |w| {
+            w.line("switch r.readI32() {");
+            for v in &e.variants {
+                let vn = format!("{name}{}", v.name.to_upper_camel_case());
+                w.line(format!("case {}:", v.value));
+                w.indent();
+                if v.fields.is_empty() {
+                    w.line(format!("return {vn}{{}}"));
+                } else {
+                    w.line(format!("var x {vn}"));
+                    for f in &v.fields {
+                        let fname = f.name.to_upper_camel_case();
+                        let site = format!("{}{fname}", v.name.to_upper_camel_case());
+                        emit_buffer_read(
+                            w,
+                            "r",
+                            &format!("x.{fname}"),
+                            &f.ty,
+                            &site,
+                            0,
+                            prefix,
+                            module,
+                        );
+                    }
+                    w.line("return x");
+                }
+                w.dedent();
+            }
+            w.line("default:");
+            w.indent();
+            w.line(format!(
+                "panic(\"weaveffi: malformed value buffer: {name} tag out of range\")"
+            ));
+            w.dedent();
+            w.line("}");
         },
     );
     w.blank();
@@ -1910,247 +2462,63 @@ fn render_rich_enum_ctor(
 
 // ── Structs ──
 
+/// Render one record as a plain Go value struct with exported, typed fields,
+/// plus its pack/unpack pair serializing the fields in declaration (wire)
+/// order. Records have no C symbols: no create, no destroy, no getters, no
+/// builders; instances only cross the ABI inside value buffers.
 fn render_struct(out: &mut String, prefix: &str, module: &str, s: &StructBinding) {
     let name = s.name.to_upper_camel_case();
-    // The opaque C tag and destroy symbol are precomputed in the shared model.
-    let c_tag = &s.c_tag;
 
     let mut w = CodeWriter::tabs();
     let mut d = String::new();
     emit_doc(&mut d, &s.doc, "", Some(&name));
     w.raw(d);
     w.block(format!("type {name} struct {{"), "}", |w| {
-        w.line(format!("ptr *C.{c_tag}"));
-    });
-    w.blank();
-
-    for field in &s.fields {
-        let mut g = String::new();
-        render_getter(&mut g, prefix, module, &name, field);
-        w.raw(g);
-    }
-
-    w.block(format!("func (s *{name}) Close() {{"), "}", |w| {
-        w.block("if s.ptr != nil {", "}", |w| {
-            w.line(format!("C.{}(s.ptr)", s.destroy_symbol));
-            w.line("s.ptr = nil");
-        });
-    });
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-fn render_go_builder(out: &mut String, prefix: &str, module: &str, s: &StructBinding) {
-    let name = s.name.to_upper_camel_case();
-    let builder_name = format!("{name}Builder");
-    // Typed fields (one per struct field) so `Build` can marshal each value into
-    // the C `create` call with the same lowering used for function parameters.
-    // Optionals/lists/maps default to nil (the C side reads that as "unset").
-    let mut w = CodeWriter::tabs();
-    let mut d = String::new();
-    emit_doc(&mut d, &s.doc, "", Some(&builder_name));
-    w.raw(d);
-    w.block(format!("type {name}Builder struct {{"), "}", |w| {
-        for field in &s.fields {
-            let fld = field.name.to_lower_camel_case();
-            w.line(format!("{fld} {}", go_type(&field.ty)));
+        for f in &s.fields {
+            let fname = f.name.to_upper_camel_case();
+            let mut fd = String::new();
+            emit_doc(&mut fd, &f.doc, "\t", Some(&fname));
+            w.raw(fd);
+            w.line(format!("{fname} {}", go_type(&f.ty)));
         }
     });
     w.blank();
+
+    w.line(format!(
+        "// wvPack{name} appends v to w in the value-buffer wire format."
+    ));
     w.block(
-        format!("func New{name}Builder() *{name}Builder {{"),
+        format!("func wvPack{name}(w *wvWriter, v {name}) {{"),
         "}",
         |w| {
-            w.line(format!("return &{name}Builder{{}}"));
+            for f in &s.fields {
+                let fname = f.name.to_upper_camel_case();
+                emit_buffer_write(w, "w", &format!("v.{fname}"), &f.ty, &fname, 0);
+            }
         },
     );
     w.blank();
 
-    for field in &s.fields {
-        let method = field.name.to_upper_camel_case();
-        let fld = field.name.to_lower_camel_case();
-        let gt = go_type(&field.ty);
-        let with_name = format!("With{method}");
-        let mut fd = String::new();
-        emit_doc(&mut fd, &field.doc, "", Some(&with_name));
-        w.raw(fd);
-        w.block(
-            format!("func (b *{name}Builder) With{method}(value {gt}) *{name}Builder {{"),
-            "}",
-            |w| {
-                w.line(format!("b.{fld} = value"));
-                w.line("return b");
-            },
-        );
-        w.blank();
-    }
-
-    // Build: marshal every field into the struct's `create` call.
-    let mut bd = String::new();
-    emit_doc(&mut bd, &None, "", Some("Build"));
-    w.raw(bd);
-    let mut pre = String::new();
-    let mut c_args: Vec<String> = Vec::new();
-    for field in &s.fields {
-        let fld = field.name.to_lower_camel_case();
-        pre.push_str(&format!("\t{fld} := b.{fld}\n"));
-        emit_param(&mut pre, &mut c_args, &fld, &field.ty, prefix, module);
-    }
-    pre.push_str("\tvar cErr C.weaveffi_error\n");
-    c_args.push("&cErr".into());
-    // Build failures (missing required fields, marshalling) are plumbing
-    // errors, not typed domain failures, so they report the generic brand
-    // error.
-    let err = ErrCtx {
-        throws: true,
-        stem: None,
-    };
+    w.line(format!("// wvUnpack{name} decodes one {name} from r."));
     w.block(
-        format!("func (b *{name}Builder) Build() (*{name}, error) {{"),
+        format!("func wvUnpack{name}(r *wvReader) {name} {{"),
         "}",
         |w| {
-            w.raw(&pre);
-            w.line(format!(
-                "result := C.{}({})",
-                s.create.symbol,
-                c_args.join(", ")
-            ));
-            err.emit_check(w, "cErr", Some("nil"));
-            w.line(format!("return &{name}{{ptr: result}}, nil"));
-        },
-    );
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-fn render_getter(
-    out: &mut String,
-    prefix: &str,
-    module: &str,
-    go_struct: &str,
-    field: &FieldBinding,
-) {
-    let method = field.name.to_upper_camel_case();
-    let ret = go_type(&field.ty);
-    let getter = format!("C.{}", field.getter_symbol);
-
-    let mut w = CodeWriter::tabs();
-    let mut d = String::new();
-    emit_doc(&mut d, &field.doc, "", Some(&method));
-    w.raw(d);
-    w.block(
-        format!("func (s *{go_struct}) {method}() {ret} {{"),
-        "}",
-        |w| match &field.ty {
-            TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::Handle | TypeRef::F64 => {
-                let conv = go_scalar_conv(&format!("{getter}(s.ptr)"), &field.ty);
-                w.line(format!("return {conv}"));
-            }
-            TypeRef::Bool => {
-                w.line(format!("return cToBool({getter}(s.ptr))"));
-            }
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                // The getter returns an owned string: copy, then free.
-                w.line(format!("cStr := {getter}(s.ptr)"));
-                w.line("goResult := C.GoString(cStr)");
-                w.line("C.weaveffi_free_string(cStr)");
-                w.line("return goResult");
-            }
-            TypeRef::Enum(_) => {
-                w.line(format!("return {ret}({getter}(s.ptr))"));
-            }
-            TypeRef::TypedHandle(n)
-            | TypeRef::Record(n)
-            | TypeRef::RichEnum(n)
-            | TypeRef::Interface(n) => {
-                let inner = local_type_name(n).to_upper_camel_case();
-                w.line(format!("return &{inner}{{ptr: {getter}(s.ptr)}}"));
-            }
-            TypeRef::Optional(inner) => match inner.as_ref() {
-                TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-                    w.line(format!("cStr := {getter}(s.ptr)"));
-                    w.block("if cStr == nil {", "}", |w| {
-                        w.line("return nil");
-                    });
-                    // The getter returns an owned string: copy, then free.
-                    w.line("v := C.GoString(cStr)");
-                    w.line("C.weaveffi_free_string(cStr)");
-                    w.line("return &v");
-                }
-                TypeRef::TypedHandle(n)
-                | TypeRef::Record(n)
-                | TypeRef::RichEnum(n)
-                | TypeRef::Interface(n) => {
-                    let inner_go = local_type_name(n).to_upper_camel_case();
-                    w.line(format!("cPtr := {getter}(s.ptr)"));
-                    w.block("if cPtr == nil {", "}", |w| {
-                        w.line("return nil");
-                    });
-                    w.line(format!("return &{inner_go}{{ptr: cPtr}}"));
-                }
-                TypeRef::Bool => {
-                    w.line(format!("cVal := {getter}(s.ptr)"));
-                    w.block("if cVal == nil {", "}", |w| {
-                        w.line("return nil");
-                    });
-                    // Dereference the producer-boxed scalar, then free it.
-                    w.line("v := cToBool(*cVal)");
-                    w.line(boxed_scalar_free("cVal"));
-                    w.line("return &v");
-                }
-                _ => {
-                    let inner_go = go_type(inner);
-                    w.line(format!("cVal := {getter}(s.ptr)"));
-                    w.block("if cVal == nil {", "}", |w| {
-                        w.line("return nil");
-                    });
-                    // Dereference the producer-boxed scalar, then free it.
-                    w.line(format!("v := {inner_go}(*cVal)"));
-                    w.line(boxed_scalar_free("cVal"));
-                    w.line("return &v");
-                }
-            },
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
-                w.line("var cOutLen C.size_t");
-                w.line(format!("result := {getter}(s.ptr, &cOutLen)"));
-                w.block("if result == nil {", "}", |w| {
-                    w.line("return nil");
-                });
-                // The getter returns an owned buffer: copy, then free.
-                w.line("goResult := C.GoBytes(unsafe.Pointer(result), C.int(cOutLen))");
-                w.line("C.weaveffi_free_bytes(result, cOutLen)");
-                w.line("return goResult");
-            }
-            TypeRef::List(inner) => {
-                w.line("var cOutLen C.size_t");
-                w.line(format!("result := {getter}(s.ptr, &cOutLen)"));
-                w.line("count := int(cOutLen)");
-                let mut body = String::new();
-                decode_list(
-                    &mut body, "goResult", inner, "result", "count", prefix, module, true,
+            w.line(format!("var v {name}"));
+            for f in &s.fields {
+                let fname = f.name.to_upper_camel_case();
+                emit_buffer_read(
+                    w,
+                    "r",
+                    &format!("v.{fname}"),
+                    &f.ty,
+                    &fname,
+                    0,
+                    prefix,
+                    module,
                 );
-                w.raw(body);
-                w.line("return goResult");
             }
-            TypeRef::Map(k, v) => {
-                let kt = go_cmap_ptr_type(k, prefix, module);
-                let vt = go_cmap_ptr_type(v, prefix, module);
-                w.line(format!("var cMapKeys {kt}"));
-                w.line(format!("var cMapVals {vt}"));
-                w.line("var cOutLen C.size_t");
-                w.line(format!("{getter}(s.ptr, &cMapKeys, &cMapVals, &cOutLen)"));
-                w.line("count := int(cOutLen)");
-                let mut body = String::new();
-                decode_map(
-                    &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module,
-                    true,
-                );
-                w.raw(body);
-                w.line("return goResult");
-            }
-            _ => {
-                w.line(format!("return {ret}({getter}(s.ptr))"));
-            }
+            w.line("return v");
         },
     );
     w.blank();
@@ -2159,9 +2527,9 @@ fn render_getter(
 
 // ── Interfaces ──
 
-/// Render one interface as an opaque-object wrapper following the struct
-/// pattern: a struct owning the `*C.{c_tag}` handle, freed by an explicit
-/// `Close` (idempotent, nils the pointer).
+/// Render one interface as an opaque-object wrapper: a struct owning the
+/// `*C.{c_tag}` handle, freed by an explicit `Close` (idempotent, nils the
+/// pointer).
 ///
 /// Constructors become package-level factory functions named
 /// `{PascalCtor}{Type}` (`new` gives `NewStore`, `open` gives `OpenStore`);
@@ -2293,19 +2661,18 @@ fn render_function(
     }
 
     if let Some(ref ret) = f.ret {
-        emit_return_out_params(&mut pre, &mut c_args, ret, prefix, module);
+        emit_return_out_params(&mut pre, &mut c_args, ret);
     }
 
     pre.push_str("\tvar cErr C.weaveffi_error\n");
     c_args.push("&cErr".into());
 
     let args = c_args.join(", ");
-    let c_returns_void = matches!(&f.ret, Some(TypeRef::Map(_, _)));
 
     w.block(header, "}", |w| {
         w.raw(pre.as_str());
 
-        if f.ret.is_some() && !c_returns_void {
+        if f.ret.is_some() {
             w.line(format!("result := C.{c_sym}({args})"));
         } else {
             w.line(format!("C.{c_sym}({args})"));
@@ -2327,13 +2694,15 @@ fn render_function(
 
 /// Go type of the `out_item` local whose address is passed to an iterator's
 /// `next` (the C slot is `T*`, so the local is one indirection less).
+/// Buffered and bytes elements arrive as a `const uint8_t*` buffer pointer.
 fn iter_out_item_type(inner: &TypeRef, prefix: &str, module: &str) -> String {
+    if is_buffered(inner) {
+        return "*C.uint8_t".into();
+    }
     match inner {
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => "*C.char".into(),
-        TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) => {
+        TypeRef::Bytes | TypeRef::BorrowedBytes => "*C.uint8_t".into(),
+        TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
             format!("*C.{}", c_abi_struct_name(n, module, prefix))
         }
         _ => c_scalar_type(inner, prefix, module).unwrap_or_else(|| "C.int64_t".into()),
@@ -2356,38 +2725,46 @@ fn indent_block(block: &str) -> String {
     out
 }
 
-/// Emit the statements converting one freshly-pulled `next` slot (`item`)
-/// into a Go value bound to `dst`, releasing the slot per the protocol's
-/// [`ElemFree`] plan: strings are freed after copying, object pointers are
-/// adopted by the wrapper type (its `Close` calls the plan's destroy symbol),
-/// and by-value elements owe nothing.
-fn emit_iter_elem_bind(w: &mut CodeWriter, dst: &str, inner: &TypeRef, item: &str, ef: &ElemFree) {
+/// Emit the statements converting one freshly-pulled `next` slot (`outItem`,
+/// plus `outLen` for bytes/buffered elements) into a Go value bound to
+/// `item`, releasing the slot per the protocol's [`ElemFree`] plan: strings
+/// are freed after copying, bytes and buffered elements are copied/decoded
+/// and released with `weaveffi_free_bytes` (via `wvCopyBuffer`), and by-value
+/// elements owe nothing.
+fn emit_iter_elem_bind(
+    w: &mut CodeWriter,
+    inner: &TypeRef,
+    ef: &ElemFree,
+    prefix: &str,
+    module: &str,
+) {
     match ef {
         ElemFree::String => {
-            w.line(format!("{dst} := C.GoString({item})"));
-            w.line(format!("C.weaveffi_free_string({item})"));
+            w.line("item := C.GoString(outItem)");
+            w.line("C.weaveffi_free_string(outItem)");
         }
-        ElemFree::Object { .. } => {
-            let name = inner
-                .user_name()
-                .expect("object element carries a user type name");
-            let gs = local_type_name(name).to_upper_camel_case();
-            w.line(format!("{dst} := &{gs}{{ptr: {item}}}"));
+        ElemFree::Bytes => {
+            if matches!(inner, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+                w.line("item := wvCopyBuffer(outItem, outLen)");
+            } else {
+                w.line("rItem := &wvReader{buf: wvCopyBuffer(outItem, outLen)}");
+                w.line(format!("var item {}", go_type(inner)));
+                emit_buffer_read(w, "rItem", "item", inner, "Item", 0, prefix, module);
+                w.line("rItem.expectEnd()");
+            }
         }
         ElemFree::None => match inner {
             TypeRef::Bool => {
-                w.line(format!("{dst} := cToBool({item})"));
+                w.line("item := cToBool(outItem)");
             }
-            // Typed handles and interfaces are also opaque pointers the
-            // consumer adopts, even though `elem_free` owes no runtime call
-            // for them here.
-            TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
-                let gs = local_type_name(n).to_upper_camel_case();
-                w.line(format!("{dst} := &{gs}{{ptr: {item}}}"));
+            // Typed handles and interfaces are opaque pointers the consumer
+            // adopts, even though `elem_free` owes no runtime call for them.
+            TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+                w.line(format!("item := {}", go_wrap_expr(inner, "outItem")));
             }
             _ => {
-                let conv = go_scalar_conv(item, inner);
-                w.line(format!("{dst} := {conv}"));
+                let conv = go_scalar_conv("outItem", inner);
+                w.line(format!("item := {conv}"));
             }
         },
     }
@@ -2421,11 +2798,12 @@ fn render_iterator_fn(
     receiver: Option<&str>,
     err: ErrCtx,
 ) {
-    let proto = ib.protocol(f, module, prefix);
+    let proto = ib.protocol(f);
     let throws = matches!(proto.error, ErrorStrategy::Throws);
     let elem = &ib.elem;
     let elem_go = go_type(elem);
     let item_ty = iter_out_item_type(elem, prefix, module);
+    let has_len = matches!(proto.elem_free, ElemFree::Bytes);
     let zero = go_zero(elem);
 
     let go_params: Vec<String> = f
@@ -2504,6 +2882,12 @@ fn render_iterator_fn(
         }
     };
 
+    let next_args = if has_len {
+        "it, &outItem, &outLen, &iterErr"
+    } else {
+        "it, &outItem, &iterErr"
+    };
+
     w.block(header, "}", |w| {
         w.block(format!("return func(yield {yield_ty}) {{"), "}", |w| {
             w.raw(indent_block(&pre));
@@ -2517,16 +2901,16 @@ fn render_iterator_fn(
             w.line(format!("defer C.{}(it)", ib.destroy_symbol));
             w.block("for {", "}", |w| {
                 w.line(format!("var outItem {item_ty}"));
+                if has_len {
+                    w.line("var outLen C.size_t");
+                }
                 w.line("var iterErr C.weaveffi_error");
-                w.line(format!(
-                    "ok := C.{}(it, &outItem, &iterErr) != 0",
-                    ib.next.symbol
-                ));
+                w.line(format!("ok := C.{}({next_args}) != 0", ib.next.symbol));
                 emit_err_check(w, "iterErr");
                 w.block("if !ok {", "}", |w| {
                     w.line("return");
                 });
-                emit_iter_elem_bind(w, "item", elem, "outItem", &proto.elem_free);
+                emit_iter_elem_bind(w, elem, &proto.elem_free, prefix, module);
                 let yield_call = if throws {
                     "if !yield(item, nil) {"
                 } else {
@@ -2544,6 +2928,10 @@ fn render_iterator_fn(
 
 // ── Parameter conversion ──
 
+/// Emit the staging statements and C argument expressions for one Go
+/// parameter. A buffered parameter is packed into a `wvWriter` and passed as
+/// a borrowed `(ptr, len)` pair; the C-owned encoding lives in Go memory kept
+/// alive for the duration of the call by cgo's argument-pinning rules.
 fn emit_param(
     pre: &mut String,
     args: &mut Vec<String>,
@@ -2553,6 +2941,21 @@ fn emit_param(
     module: &str,
 ) {
     let mut w = CodeWriter::tabs().with_depth(1);
+    if is_buffered(ty) {
+        let n = name.to_upper_camel_case();
+        w.line(format!("w{n} := &wvWriter{{}}"));
+        emit_buffer_write(&mut w, &format!("w{n}"), name, ty, &n, 0);
+        w.line(format!("var c{n}Ptr *C.uint8_t"));
+        w.block(format!("if len(w{n}.buf) > 0 {{"), "}", |w| {
+            w.line(format!(
+                "c{n}Ptr = (*C.uint8_t)(unsafe.Pointer(&w{n}.buf[0]))"
+            ));
+        });
+        args.push(format!("c{n}Ptr"));
+        args.push(format!("C.size_t(len(w{n}.buf))"));
+        pre.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2572,10 +2975,7 @@ fn emit_param(
             "C.{}({name})",
             c_abi_struct_name(n, module, prefix)
         )),
-        TypeRef::TypedHandle(_)
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_) => args.push(format!("{name}.ptr")),
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => args.push(format!("{name}.ptr")),
 
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
             let cv = format!("c{}", name.to_upper_camel_case());
@@ -2596,257 +2996,63 @@ fn emit_param(
             args.push(lv);
         }
 
+        // Only an optional interface reaches here unbuffered: a nullable
+        // borrowed object pointer, null meaning none.
         TypeRef::Optional(inner) => {
-            return emit_optional_param(pre, args, name, inner, prefix, module)
-        }
-        TypeRef::List(inner) => return emit_list_param(pre, args, name, inner, prefix, module),
-        TypeRef::Map(k, v) => return emit_map_param(pre, args, name, k, v, prefix, module),
-
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-    }
-    pre.push_str(&w.finish());
-}
-
-fn emit_optional_param(
-    pre: &mut String,
-    args: &mut Vec<String>,
-    name: &str,
-    inner: &TypeRef,
-    prefix: &str,
-    module: &str,
-) {
-    let cv = format!("c{}", name.to_upper_camel_case());
-
-    let mut w = CodeWriter::tabs().with_depth(1);
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line(format!("var {cv} *C.char"));
-            w.block(format!("if {name} != nil {{"), "}", |w| {
-                w.line(format!("{cv} = C.CString(*{name})"));
-                w.line(format!("defer C.free(unsafe.Pointer({cv}))"));
-            });
-            args.push(cv);
-        }
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Interface(_) => {
-            let ct = c_opaque_type(inner, prefix, module);
+            let TypeRef::Interface(n) = inner.as_ref() else {
+                unreachable!("every other optional is buffered")
+            };
+            let ct = c_abi_struct_name(n, module, prefix);
+            let cv = format!("c{}", name.to_upper_camel_case());
             w.line(format!("var {cv} *C.{ct}"));
             w.block(format!("if {name} != nil {{"), "}", |w| {
                 w.line(format!("{cv} = {name}.ptr"));
             });
             args.push(cv);
         }
-        _ => {
-            if let Some(ct) = c_scalar_type(inner, prefix, module) {
-                w.line(format!("var {cv} *{ct}"));
-                let conv = c_scalar_conv(&format!("*{name}"), inner, prefix, module);
-                w.block(format!("if {name} != nil {{"), "}", |w| {
-                    w.line(format!("tmp := {conv}"));
-                    w.line(format!("{cv} = &tmp"));
-                });
-                args.push(cv);
-            } else {
-                args.push(name.to_string());
-            }
+
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
         }
-    }
-    pre.push_str(&w.finish());
-}
-
-fn emit_list_param(
-    pre: &mut String,
-    args: &mut Vec<String>,
-    name: &str,
-    inner: &TypeRef,
-    prefix: &str,
-    module: &str,
-) {
-    let cn = name.to_upper_camel_case();
-    let pv = format!("c{cn}Ptr");
-    let lv = format!("c{cn}Len");
-
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.line(format!("{lv} := C.size_t(len({name}))"));
-
-    if let Some(ct) = c_scalar_type(inner, prefix, module) {
-        if matches!(inner, TypeRef::Bool) {
-            let arr = format!("c{cn}Arr");
-            w.line(format!("{arr} := make([]C._Bool, len({name}))"));
-            w.block(format!("for i, b := range {name} {{"), "}", |w| {
-                w.line(format!("{arr}[i] = boolToC(b)"));
-            });
-            w.line(format!("var {pv} *C._Bool"));
-            w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
-                w.line(format!("{pv} = &{arr}[0]"));
-            });
-        } else {
-            w.line(format!("var {pv} *{ct}"));
-            w.block(format!("if len({name}) > 0 {{"), "}", |w| {
-                w.line(format!("{pv} = (*{ct})(unsafe.Pointer(&{name}[0]))"));
-            });
-        }
-    } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        let arr = format!("c{cn}Arr");
-        w.line(format!("{arr} := make([]*C.char, len({name}))"));
-        w.block(format!("for i, s := range {name} {{"), "}", |w| {
-            w.line(format!("{arr}[i] = C.CString(s)"));
-        });
-        w.block("defer func() {", "}()", |w| {
-            w.block(format!("for _, p := range {arr} {{"), "}", |w| {
-                w.line("C.free(unsafe.Pointer(p))");
-            });
-        });
-        w.line(format!("var {pv} **C.char"));
-        w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
-            w.line(format!("{pv} = (**C.char)(unsafe.Pointer(&{arr}[0]))"));
-        });
-    } else if let TypeRef::Record(n)
-    | TypeRef::RichEnum(n)
-    | TypeRef::TypedHandle(n)
-    | TypeRef::Interface(n) = inner
-    {
-        let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
-        let arr = format!("c{cn}Arr");
-        w.line(format!("{arr} := make([]*{ct}, len({name}))"));
-        w.block(format!("for i, item := range {name} {{"), "}", |w| {
-            w.line(format!("{arr}[i] = item.ptr"));
-        });
-        w.line(format!("var {pv} **{ct}"));
-        w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
-            w.line(format!("{pv} = (**{ct})(unsafe.Pointer(&{arr}[0]))"));
-        });
-    } else {
-        w.line(format!("var {pv} unsafe.Pointer"));
-    }
-
-    pre.push_str(&w.finish());
-    args.push(pv);
-    args.push(lv);
-}
-
-fn emit_map_param(
-    pre: &mut String,
-    args: &mut Vec<String>,
-    name: &str,
-    k: &TypeRef,
-    v: &TypeRef,
-    prefix: &str,
-    module: &str,
-) {
-    let cn = name.to_upper_camel_case();
-    let lv = format!("c{cn}Len");
-    let go_k = go_type(k);
-    let go_v = go_type(v);
-
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.line(format!("{lv} := C.size_t(len({name}))"));
-    w.line(format!("keys{cn} := make([]{go_k}, 0, len({name}))"));
-    w.line(format!("vals{cn} := make([]{go_v}, 0, len({name}))"));
-    w.block(format!("for mk, mv := range {name} {{"), "}", |w| {
-        w.line(format!("keys{cn} = append(keys{cn}, mk)"));
-        w.line(format!("vals{cn} = append(vals{cn}, mv)"));
-    });
-    pre.push_str(&w.finish());
-
-    let kp = format!("c{cn}KeysPtr");
-    emit_map_array(pre, &kp, &format!("keys{cn}"), k, prefix, module);
-    args.push(kp);
-
-    let vp = format!("c{cn}ValsPtr");
-    emit_map_array(pre, &vp, &format!("vals{cn}"), v, prefix, module);
-    args.push(vp);
-
-    args.push(lv);
-}
-
-fn emit_map_array(
-    pre: &mut String,
-    ptr_var: &str,
-    slice_name: &str,
-    ty: &TypeRef,
-    prefix: &str,
-    module: &str,
-) {
-    let mut w = CodeWriter::tabs().with_depth(1);
-    if let Some(ct) = c_scalar_type(ty, prefix, module) {
-        w.line(format!("var {ptr_var} *{ct}"));
-        w.block(format!("if len({slice_name}) > 0 {{"), "}", |w| {
-            w.line(format!(
-                "{ptr_var} = (*{ct})(unsafe.Pointer(&{slice_name}[0]))"
-            ));
-        });
-    } else if matches!(ty, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-        let arr = format!("{ptr_var}Arr");
-        w.line(format!("{arr} := make([]*C.char, len({slice_name}))"));
-        w.block(format!("for i, s := range {slice_name} {{"), "}", |w| {
-            w.line(format!("{arr}[i] = C.CString(s)"));
-        });
-        w.block("defer func() {", "}()", |w| {
-            w.block(format!("for _, p := range {arr} {{"), "}", |w| {
-                w.line("C.free(unsafe.Pointer(p))");
-            });
-        });
-        w.line(format!("var {ptr_var} **C.char"));
-        w.block(format!("if len({arr}) > 0 {{"), "}", |w| {
-            w.line(format!("{ptr_var} = (**C.char)(unsafe.Pointer(&{arr}[0]))"));
-        });
-    } else {
-        w.line(format!("var {ptr_var} unsafe.Pointer"));
+        TypeRef::Iterator(_) => unreachable!("iterator not valid as parameter"),
+        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     pre.push_str(&w.finish());
 }
 
 // ── Return out-params ──
 
-fn emit_return_out_params(
-    pre: &mut String,
-    args: &mut Vec<String>,
-    ty: &TypeRef,
-    prefix: &str,
-    module: &str,
-) {
-    let mut w = CodeWriter::tabs().with_depth(1);
-    match ty {
-        TypeRef::List(_) | TypeRef::Bytes | TypeRef::BorrowedBytes => {
-            w.line("var cOutLen C.size_t");
-            args.push("&cOutLen".into());
-        }
-        TypeRef::Map(k, v) => {
-            let kt = go_cmap_ptr_type(k, prefix, module);
-            let vt = go_cmap_ptr_type(v, prefix, module);
-            w.line(format!("var cMapKeys {kt}"));
-            w.line(format!("var cMapVals {vt}"));
-            w.line("var cOutLen C.size_t");
-            args.push("&cMapKeys".into());
-            args.push("&cMapVals".into());
-            args.push("&cOutLen".into());
-        }
-        TypeRef::Optional(inner) => {
-            return emit_return_out_params(pre, args, inner, prefix, module)
-        }
-        _ => {}
+/// Emit the out-parameter locals a return type needs. Bytes and buffered
+/// returns carry one trailing `size_t* out_len` slot; everything else has
+/// none.
+fn emit_return_out_params(pre: &mut String, args: &mut Vec<String>, ty: &TypeRef) {
+    if is_buffered(ty) || matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+        let mut w = CodeWriter::tabs().with_depth(1);
+        w.line("var cOutLen C.size_t");
+        args.push("&cOutLen".into());
+        pre.push_str(&w.finish());
     }
-    pre.push_str(&w.finish());
 }
 
 // ── Return conversion ──
 
-/// The statement releasing a producer-boxed optional scalar (`T*`, null =
-/// none) after dereferencing, per [`weaveffi_core::plan::ReturnFree::BoxedScalar`]:
-/// `weaveffi_free_bytes(ptr, sizeof(T))`.
-fn boxed_scalar_free(ptr: &str) -> String {
-    format!(
-        "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({ptr})), C.size_t(unsafe.Sizeof(*{ptr})))"
-    )
-}
-
 /// Emit the success-path return conversion. `tail` is [`ErrCtx::ok_tail`]:
 /// `", nil"` when the wrapper also returns an error, empty when plain.
+///
+/// A buffered return is copied out of the producer-allocated buffer (which
+/// `wvCopyBuffer` releases with `weaveffi_free_bytes`), decoded, and checked
+/// for trailing bytes.
 fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail: &str) {
     let mut w = CodeWriter::tabs().with_depth(1);
+    if is_buffered(ty) {
+        w.line("rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}");
+        w.line(format!("var goResult {}", go_type(ty)));
+        emit_buffer_read(&mut w, "rRes", "goResult", ty, "Res", 0, prefix, module);
+        w.line("rRes.expectEnd()");
+        w.line(format!("return goResult{tail}"));
+        out.push_str(&w.finish());
+        return;
+    }
     match ty {
         TypeRef::I8
         | TypeRef::I16
@@ -2858,7 +3064,8 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
         | TypeRef::U64
         | TypeRef::Handle
         | TypeRef::F32
-        | TypeRef::F64 => {
+        | TypeRef::F64
+        | TypeRef::Enum(_) => {
             let conv = go_scalar_conv("result", ty);
             w.line(format!("return {conv}{tail}"));
         }
@@ -2870,19 +3077,9 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
             w.line("C.weaveffi_free_string(result)");
             w.line(format!("return goResult{tail}"));
         }
-        TypeRef::Enum(_) => {
-            let conv = go_scalar_conv("result", ty);
-            w.line(format!("return {conv}{tail}"));
+        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            w.line(format!("return {}{tail}", go_wrap_expr(ty, "result")));
         }
-        TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) => {
-            let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("return &{g}{{ptr: result}}{tail}"));
-        }
-        TypeRef::Optional(inner) => return emit_optional_return(out, inner, module, tail),
-        TypeRef::List(inner) => return emit_list_return(out, inner, prefix, module, tail),
         TypeRef::Bytes | TypeRef::BorrowedBytes => {
             w.block("if result == nil {", "}", |w| {
                 w.line(format!("return nil{tail}"));
@@ -2891,235 +3088,26 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
             w.line("C.weaveffi_free_bytes(result, cOutLen)");
             w.line(format!("return goResult{tail}"));
         }
-        TypeRef::Map(k, v) => return emit_map_return(out, k, v, prefix, module, tail),
+        // Only an optional interface reaches here unbuffered: a nullable
+        // owned object pointer.
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(n) = inner.as_ref() else {
+                unreachable!("every other optional is buffered")
+            };
+            let g = go_local(n);
+            w.block("if result == nil {", "}", |w| {
+                w.line(format!("return nil{tail}"));
+            });
+            w.line(format!("return &{g}{{ptr: result}}{tail}"));
+        }
+        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+            unreachable!("buffered type handled above")
+        }
         TypeRef::Iterator(_) => {
             unreachable!("iterator returns render through the lazy sequence path")
         }
         TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
-    out.push_str(&w.finish());
-}
-
-fn emit_optional_return(out: &mut String, inner: &TypeRef, _module: &str, tail: &str) {
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.block("if result == nil {", "}", |w| {
-        w.line(format!("return nil{tail}"));
-    });
-    match inner {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
-            w.line("v := C.GoString(result)");
-            w.line("C.weaveffi_free_string(result)");
-            w.line(format!("return &v{tail}"));
-        }
-        TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) => {
-            let g = local_type_name(n).to_upper_camel_case();
-            w.line(format!("return &{g}{{ptr: result}}{tail}"));
-        }
-        TypeRef::Bool => {
-            // Dereference the producer-boxed scalar, then free it.
-            w.line("v := cToBool(*result)");
-            w.line(boxed_scalar_free("result"));
-            w.line(format!("return &v{tail}"));
-        }
-        _ => {
-            // Dereference the producer-boxed scalar, then free it.
-            let gt = go_type(inner);
-            w.line(format!("v := {gt}(*result)"));
-            w.line(boxed_scalar_free("result"));
-            w.line(format!("return &v{tail}"));
-        }
-    }
-    out.push_str(&w.finish());
-}
-
-fn emit_list_return(out: &mut String, inner: &TypeRef, prefix: &str, module: &str, tail: &str) {
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.line("count := int(cOutLen)");
-    let mut body = String::new();
-    decode_list(
-        &mut body, "goResult", inner, "result", "count", prefix, module, true,
-    );
-    w.raw(body);
-    w.line(format!("return goResult{tail}"));
-    out.push_str(&w.finish());
-}
-
-fn emit_map_return(
-    out: &mut String,
-    k: &TypeRef,
-    v: &TypeRef,
-    prefix: &str,
-    module: &str,
-    tail: &str,
-) {
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.line("count := int(cOutLen)");
-    let mut body = String::new();
-    decode_map(
-        &mut body, "goResult", k, v, "cMapKeys", "cMapVals", "count", prefix, module, true,
-    );
-    w.raw(body);
-    w.line(format!("return goResult{tail}"));
-    out.push_str(&w.finish());
-}
-
-/// Go type of the local variable whose address is passed for an
-/// `out_keys`/`out_values` map out-parameter. The C parameter is `K**`/`V**`
-/// (e.g. `const char***` for string keys), so the variable is one indirection
-/// less because we pass its address.
-fn go_cmap_ptr_type(ty: &TypeRef, prefix: &str, module: &str) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "**C.char".into(),
-        _ => format!(
-            "*{}",
-            c_scalar_type(ty, prefix, module).unwrap_or_else(|| "C.int64_t".into())
-        ),
-    }
-}
-
-/// Read one map key/value from a typed cgo slice index expression.
-fn map_elem_read(expr: &str, ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("C.GoString({expr})"),
-        _ => go_scalar_conv(expr, ty),
-    }
-}
-
-/// Emit Go that materializes a C array (`src`, `count` elements of `inner`) into
-/// a fresh slice bound to `dst`. Shared by struct getters, function returns,
-/// async results, and callback parameters.
-///
-/// With `owned` set the array is a producer-allocated return the consumer
-/// must release after copying: each string element is freed per
-/// [`ElemFree::String`] (object elements are adopted by their wrapper, and
-/// by-value elements owe nothing), then the array buffer itself is released
-/// with `weaveffi_free_bytes`. Borrowed arrays (callback parameters, async
-/// completion results) pass `owned = false` and only copy.
-#[allow(clippy::too_many_arguments)]
-fn decode_list(
-    out: &mut String,
-    dst: &str,
-    inner: &TypeRef,
-    src: &str,
-    count: &str,
-    prefix: &str,
-    module: &str,
-    owned: bool,
-) {
-    let gi = go_type(inner);
-    let free_elem = owned && matches!(elem_free(inner, module, prefix), ElemFree::String);
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.line(format!("{dst} := make([]{gi}, {count})"));
-    w.block(format!("if {count} > 0 && {src} != nil {{"), "}", |w| {
-        if let Some(ct) = c_scalar_type(inner, prefix, module) {
-            w.block(
-                format!(
-                    "for i, v := range unsafe.Slice((*{ct})(unsafe.Pointer({src})), {count}) {{"
-                ),
-                "}",
-                |w| {
-                    let conv = go_scalar_conv("v", inner);
-                    w.line(format!("{dst}[i] = {conv}"));
-                },
-            );
-        } else if matches!(inner, TypeRef::StringUtf8 | TypeRef::BorrowedStr) {
-            w.block(
-                format!(
-                    "for i, v := range unsafe.Slice((**C.char)(unsafe.Pointer({src})), {count}) {{"
-                ),
-                "}",
-                |w| {
-                    w.line(format!("{dst}[i] = C.GoString(v)"));
-                    if free_elem {
-                        w.line("C.weaveffi_free_string(v)");
-                    }
-                },
-            );
-        } else if let TypeRef::TypedHandle(n)
-        | TypeRef::Record(n)
-        | TypeRef::RichEnum(n)
-        | TypeRef::Interface(n) = inner
-        {
-            let ct = format!("C.{}", c_abi_struct_name(n, module, prefix));
-            let gs = local_type_name(n).to_upper_camel_case();
-            w.block(
-                format!(
-                    "for i, v := range unsafe.Slice((**{ct})(unsafe.Pointer({src})), {count}) {{"
-                ),
-                "}",
-                |w| {
-                    // The consumer adopts each owned element pointer; the
-                    // wrapper's Close calls its destroy symbol.
-                    w.line(format!("{dst}[i] = &{gs}{{ptr: v}}"));
-                },
-            );
-        }
-        if owned {
-            w.line(format!(
-                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({src})), C.size_t({count})*C.size_t(unsafe.Sizeof(*{src})))"
-            ));
-        }
-    });
-    out.push_str(&w.finish());
-}
-
-/// Emit Go that materializes parallel C key/value arrays (`keys`/`vals`, already
-/// typed per [`go_cmap_ptr_type`]) into a fresh map bound to `dst`.
-///
-/// With `owned` set the buffers are producer-allocated returns the consumer
-/// must release after copying: each string key and value is freed per
-/// [`ElemFree::String`], then both parallel arrays are released with
-/// `weaveffi_free_bytes`. Borrowed buffers (callback parameters, async
-/// completion results) pass `owned = false` and only copy.
-#[allow(clippy::too_many_arguments)]
-fn decode_map(
-    out: &mut String,
-    dst: &str,
-    k: &TypeRef,
-    v: &TypeRef,
-    keys: &str,
-    vals: &str,
-    count: &str,
-    prefix: &str,
-    module: &str,
-    owned: bool,
-) {
-    let gk = go_type(k);
-    let gv = go_type(v);
-    let free_key = owned && matches!(elem_free(k, module, prefix), ElemFree::String);
-    let free_val = owned && matches!(elem_free(v, module, prefix), ElemFree::String);
-    let mut w = CodeWriter::tabs().with_depth(1);
-    w.line(format!("{dst} := make(map[{gk}]{gv}, {count})"));
-    w.block(
-        format!("if {count} > 0 && {keys} != nil && {vals} != nil {{"),
-        "}",
-        |w| {
-            w.line(format!("keySlice := unsafe.Slice({keys}, {count})"));
-            w.line(format!("valSlice := unsafe.Slice({vals}, {count})"));
-            w.block(format!("for i := 0; i < {count}; i++ {{"), "}", |w| {
-                let kr = map_elem_read("keySlice[i]", k);
-                let vr = map_elem_read("valSlice[i]", v);
-                w.line(format!("{dst}[{kr}] = {vr}"));
-                if free_key {
-                    w.line("C.weaveffi_free_string(keySlice[i])");
-                }
-                if free_val {
-                    w.line("C.weaveffi_free_string(valSlice[i])");
-                }
-            });
-            if owned {
-                w.line(format!(
-                    "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({keys})), C.size_t({count})*C.size_t(unsafe.Sizeof(*{keys})))"
-                ));
-                w.line(format!(
-                    "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer({vals})), C.size_t({count})*C.size_t(unsafe.Sizeof(*{vals})))"
-                ));
-            }
-        },
-    );
     out.push_str(&w.finish());
 }
 
@@ -3137,7 +3125,7 @@ mod tests {
 
     fn api_of(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             modules,
             generators: None,
             package: None,
@@ -3201,6 +3189,16 @@ mod tests {
             code: value,
             message: message.into(),
             doc: None,
+            fields: vec![],
+        }
+    }
+
+    fn variant(name: &str, value: i32, fields: Vec<StructField>) -> EnumVariant {
+        EnumVariant {
+            name: name.into(),
+            value,
+            doc: None,
+            fields,
         }
     }
 
@@ -3233,14 +3231,13 @@ mod tests {
 
     /// Mirrors `samples/kvstore/kvstore.yml`: the `Store` interface (ctor,
     /// sync/async/iterator methods, a static), the `KvError` domain, the
-    /// `Entry` builder record, the eviction listener, and the nested
-    /// `kv.stats` submodule taking a cross-module interface parameter.
+    /// `Entry` record, the eviction listener, and the nested `kv.stats`
+    /// submodule taking a cross-module interface parameter.
     fn kv_api() -> Api {
         let mut stats = module("stats");
         stats.structs = vec![StructDef {
             name: "Stats".into(),
             doc: None,
-            builder: false,
             fields: vec![field("total_entries", TypeRef::I64)],
         }];
         stats.functions = vec![throwing(func_of(
@@ -3264,7 +3261,6 @@ mod tests {
         kv.structs = vec![StructDef {
             name: "Entry".into(),
             doc: None,
-            builder: true,
             fields: vec![
                 field("id", TypeRef::I64),
                 field("key", TypeRef::StringUtf8),
@@ -3277,18 +3273,8 @@ mod tests {
             name: "EntryKind".into(),
             doc: None,
             variants: vec![
-                EnumVariant {
-                    name: "Volatile".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Persistent".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
+                variant("Volatile", 0, vec![]),
+                variant("Persistent", 1, vec![]),
             ],
         }];
         kv.callbacks = vec![CallbackDef {
@@ -3369,30 +3355,14 @@ mod tests {
             name: "ContactType".into(),
             doc: None,
             variants: vec![
-                EnumVariant {
-                    name: "Personal".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Work".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Other".into(),
-                    value: 2,
-                    doc: None,
-                    fields: vec![],
-                },
+                variant("Personal", 0, vec![]),
+                variant("Work", 1, vec![]),
+                variant("Other", 2, vec![]),
             ],
         }];
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![
                 field("id", TypeRef::I64),
                 field("first_name", TypeRef::StringUtf8),
@@ -3442,6 +3412,44 @@ mod tests {
             ],
             statics: vec![],
         }];
+        api_of(vec![m])
+    }
+
+    /// A module with one rich (algebraic) enum used across params and
+    /// returns.
+    fn shapes_api() -> Api {
+        let mut m = module("shapes");
+        m.enums = vec![EnumDef {
+            name: "Shape".into(),
+            doc: None,
+            variants: vec![
+                variant("Empty", 0, vec![]),
+                variant("Circle", 1, vec![field("radius", TypeRef::F64)]),
+                variant(
+                    "Labeled",
+                    3,
+                    vec![
+                        field("label", TypeRef::StringUtf8),
+                        field("count", TypeRef::U8),
+                    ],
+                ),
+            ],
+        }];
+        m.functions = vec![
+            func_of(
+                "describe",
+                vec![param("shape", TypeRef::RichEnum("Shape".into()))],
+                Some(TypeRef::StringUtf8),
+            ),
+            func_of(
+                "scale",
+                vec![
+                    param("shape", TypeRef::RichEnum("Shape".into())),
+                    param("factor", TypeRef::F64),
+                ],
+                Some(TypeRef::RichEnum("Shape".into())),
+            ),
+        ];
         api_of(vec![m])
     }
 
@@ -3667,12 +3675,7 @@ mod tests {
         m.enums = vec![EnumDef {
             name: "Color".into(),
             doc: None,
-            variants: vec![EnumVariant {
-                name: "Red".into(),
-                value: 0,
-                doc: None,
-                fields: vec![],
-            }],
+            variants: vec![variant("Red", 0, vec![])],
         }];
         let go = rg(&api_of(vec![m]));
         assert!(
@@ -3689,8 +3692,10 @@ mod tests {
         );
     }
 
+    // ── Buffered params and returns ──
+
     #[test]
-    fn struct_return() {
+    fn struct_return_decodes_buffer() {
         let mut m = module("contacts");
         m.functions = vec![func_of(
             "get_contact",
@@ -3700,17 +3705,70 @@ mod tests {
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![field("name", TypeRef::StringUtf8)],
         }];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func GetContact(id int64) *Contact {"),
-            "plain struct return should be bare *Contact: {go}"
+            go.contains("func GetContact(id int64) Contact {"),
+            "record return should be a bare value struct: {go}"
         );
         assert!(
-            go.contains("return &Contact{ptr: result}"),
-            "missing struct wrap: {go}"
+            go.contains("var cOutLen C.size_t"),
+            "missing out_len slot: {go}"
+        );
+        assert!(
+            go.contains("rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}"),
+            "buffered return must copy then free through wvCopyBuffer: {go}"
+        );
+        assert!(
+            go.contains("goResult = wvUnpackContact(rRes)"),
+            "missing record decode: {go}"
+        );
+        assert!(
+            go.contains("rRes.expectEnd()"),
+            "decoder must reject trailing bytes: {go}"
+        );
+        assert!(
+            !go.contains("&Contact{ptr:"),
+            "records no longer wrap C pointers: {go}"
+        );
+    }
+
+    #[test]
+    fn buffered_record_param_packs() {
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
+        m.functions = vec![func_of(
+            "save_contact",
+            vec![param("contact", TypeRef::Record("Contact".into()))],
+            None,
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func SaveContact(contact Contact) {"),
+            "record param should be a bare value struct: {go}"
+        );
+        assert!(
+            go.contains("wContact := &wvWriter{}"),
+            "missing writer staging: {go}"
+        );
+        assert!(
+            go.contains("wvPackContact(wContact, contact)"),
+            "missing record pack call: {go}"
+        );
+        assert!(
+            go.contains("cContactPtr = (*C.uint8_t)(unsafe.Pointer(&wContact.buf[0]))"),
+            "missing buffer pointer staging: {go}"
+        );
+        assert!(
+            go.contains(
+                "C.weaveffi_contacts_save_contact(cContactPtr, C.size_t(len(wContact.buf)), &cErr)"
+            ),
+            "buffered param must pass ptr + len: {go}"
         );
     }
 
@@ -3731,18 +3789,31 @@ mod tests {
             "optional string param should be *string: {go}"
         );
         assert!(
-            go.contains("if query != nil"),
+            go.contains("if query == nil {"),
             "missing nil check for optional: {go}"
         );
         assert!(
-            go.contains("C.CString(*query)"),
-            "missing CString dereference: {go}"
+            go.contains("wQuery.writeOptionFlag(false)"),
+            "missing absent flag write: {go}"
+        );
+        assert!(
+            go.contains("wQuery.writeString((*query))"),
+            "missing dereferenced string write: {go}"
+        );
+        assert!(
+            go.contains("C.size_t(len(wQuery.buf))"),
+            "optional param must pass the encoded length: {go}"
         );
     }
 
     #[test]
     fn optional_struct_return() {
         let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
         m.functions = vec![func_of(
             "find",
             vec![param("id", TypeRef::I32)],
@@ -3755,11 +3826,22 @@ mod tests {
             go.contains("func Find(id int32) *Contact {"),
             "optional struct return: {go}"
         );
-        assert!(go.contains("if result == nil"), "missing nil check: {go}");
+        assert!(
+            go.contains("if rRes.readOptionFlag() {"),
+            "missing option flag check: {go}"
+        );
+        assert!(
+            go.contains("oRes0 = wvUnpackContact(rRes)"),
+            "missing inner decode: {go}"
+        );
+        assert!(
+            go.contains("goResult = &oRes0"),
+            "present value must be pointer-wrapped: {go}"
+        );
     }
 
     #[test]
-    fn list_return() {
+    fn list_return_decodes_buffer() {
         let mut m = module("store");
         m.functions = vec![func_of(
             "list_ids",
@@ -3775,11 +3857,22 @@ mod tests {
             go.contains("var cOutLen C.size_t"),
             "missing out_len var: {go}"
         );
-        assert!(go.contains("unsafe.Slice("), "missing unsafe.Slice: {go}");
+        assert!(
+            go.contains("nRes0 := rRes.readLen()"),
+            "missing count read: {go}"
+        );
+        assert!(
+            go.contains("goResult = make([]int32, nRes0)"),
+            "missing slice allocation: {go}"
+        );
+        assert!(
+            go.contains("goResult[iRes0] = rRes.readI32()"),
+            "missing element decode: {go}"
+        );
     }
 
     #[test]
-    fn struct_list_return() {
+    fn struct_list_return_decodes_elements() {
         let mut m = module("contacts");
         m.functions = vec![func_of(
             "list_contacts",
@@ -3789,22 +3882,21 @@ mod tests {
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![field("name", TypeRef::StringUtf8)],
         }];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func ListContacts() []*Contact {"),
-            "missing struct list return: {go}"
+            go.contains("func ListContacts() []Contact {"),
+            "record lists hold values, not pointers: {go}"
         );
         assert!(
-            go.contains("C.weaveffi_contacts_Contact"),
-            "missing C struct type in list conversion: {go}"
+            go.contains("goResult[iRes0] = wvUnpackContact(rRes)"),
+            "missing per-element record decode: {go}"
         );
     }
 
     #[test]
-    fn optional_i32_param() {
+    fn optional_i32_param_and_return() {
         let mut m = module("store");
         m.functions = vec![func_of(
             "find",
@@ -3817,9 +3909,109 @@ mod tests {
             "optional i32 param should be *int32: {go}"
         );
         assert!(
-            go.contains("var cId *C.int32_t"),
-            "missing C var for optional: {go}"
+            go.contains("wId.writeI32((*id))"),
+            "missing dereferenced scalar write: {go}"
         );
+        assert!(
+            go.contains("var goResult *int32"),
+            "optional i32 return should be *int32: {go}"
+        );
+        assert!(
+            go.contains("oRes0 = rRes.readI32()"),
+            "missing scalar decode: {go}"
+        );
+    }
+
+    #[test]
+    fn map_return_decodes_buffer() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "counts",
+            vec![],
+            Some(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::I32),
+            )),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Counts() map[string]int32 {"),
+            "missing map return sig: {go}"
+        );
+        assert!(
+            go.contains("goResult = make(map[string]int32, nRes0)"),
+            "missing map allocation: {go}"
+        );
+        assert!(
+            go.contains("kRes0 = rRes.readString()"),
+            "missing key decode: {go}"
+        );
+        assert!(
+            go.contains("vRes0 = rRes.readI32()"),
+            "missing value decode: {go}"
+        );
+        assert!(
+            go.contains("goResult[kRes0] = vRes0"),
+            "missing map insert: {go}"
+        );
+    }
+
+    #[test]
+    fn map_param_packs() {
+        let mut m = module("metrics");
+        m.functions = vec![func_of(
+            "record_counts",
+            vec![param(
+                "counts",
+                TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
+            )],
+            None,
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func RecordCounts(counts map[string]int32) {"),
+            "missing map param sig: {go}"
+        );
+        assert!(
+            go.contains("wCounts.writeLen(len(counts))"),
+            "missing count write: {go}"
+        );
+        assert!(
+            go.contains("for kCounts0, vCounts0 := range counts {"),
+            "missing pair loop: {go}"
+        );
+        assert!(
+            go.contains("wCounts.writeString(kCounts0)"),
+            "missing key write: {go}"
+        );
+        assert!(
+            go.contains("wCounts.writeI32(vCounts0)"),
+            "missing value write: {go}"
+        );
+    }
+
+    #[test]
+    fn optional_scalar_return_decodes_buffer() {
+        let mut m = module("store");
+        m.functions = vec![func_of(
+            "capacity",
+            vec![],
+            Some(TypeRef::Optional(Box::new(TypeRef::I64))),
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Capacity() *int64 {"),
+            "optional scalar return should be a pointer: {go}"
+        );
+        assert!(
+            go.contains("wvCopyBuffer(result, cOutLen)"),
+            "buffered return must copy then free: {go}"
+        );
+        assert!(
+            go.contains("oRes0 = rRes.readI64()"),
+            "missing scalar decode: {go}"
+        );
+        assert!(go.contains("\t\"unsafe\"\n"), "unsafe import needed: {go}");
     }
 
     // ── Throwing functions ──
@@ -3896,7 +4088,7 @@ mod tests {
             "missing exported code constant: {go}"
         );
         assert!(
-            go.contains("func wvMapStore(code int32, message string) error {"),
+            go.contains("func wvMapStore(code int32, message string, payload []byte) error {"),
             "missing domain mapping helper: {go}"
         );
         assert!(
@@ -3904,7 +4096,7 @@ mod tests {
             "missing default message fill: {go}"
         );
         assert!(
-            go.contains("return wvBrandError(code, message)"),
+            go.contains("return wvBrandError(code, message, payload)"),
             "unknown codes must fall back to the brand error: {go}"
         );
         assert!(
@@ -3913,7 +4105,82 @@ mod tests {
         );
     }
 
-    // ── Enums, structs, builders ──
+    #[test]
+    fn wv_take_error_returns_payload() {
+        let go = rg(&store_api());
+        assert!(
+            go.contains("func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {"),
+            "wvTakeError must return the payload triple: {go}"
+        );
+        assert!(
+            go.contains(
+                "payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))"
+            ),
+            "wvTakeError must copy the payload before clearing: {go}"
+        );
+        assert!(
+            go.contains("code, msg, _ := wvTakeError(cErr)"),
+            "wvTrap discards the payload: {go}"
+        );
+    }
+
+    #[test]
+    fn error_payload_fields_decode() {
+        let mut m = module("store");
+        m.errors = Some(ErrorDomain {
+            name: "StoreError".into(),
+            codes: vec![
+                code("SaveFailed", 1, "save failed"),
+                ErrorCode {
+                    name: "Conflict".into(),
+                    code: 2,
+                    message: "write conflict".into(),
+                    doc: None,
+                    fields: vec![
+                        field("key", TypeRef::StringUtf8),
+                        field("attempts", TypeRef::I32),
+                    ],
+                },
+            ],
+        });
+        m.functions = vec![throwing(func_of(
+            "save",
+            vec![param("data", TypeRef::StringUtf8)],
+            None,
+        ))];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("Payload any"),
+            "domain with payload codes must expose Payload: {go}"
+        );
+        assert!(
+            go.contains("type StoreErrorConflictPayload struct {"),
+            "missing per-code payload struct: {go}"
+        );
+        assert!(
+            go.contains("Key string") && go.contains("Attempts int32"),
+            "payload struct must carry the declared fields: {go}"
+        );
+        assert!(
+            go.contains("p.Key = r.readString()") && go.contains("p.Attempts = r.readI32()"),
+            "payload fields must decode in wire order: {go}"
+        );
+        assert!(
+            go.contains("e.Payload = p"),
+            "decoded payload must attach to the error: {go}"
+        );
+        assert!(
+            go.contains("r.expectEnd()"),
+            "payload decode must reject trailing bytes: {go}"
+        );
+        // A code without fields keeps the simple construction.
+        assert!(
+            go.contains("return &StoreError{Code: code, Message: message}"),
+            "codes without fields skip payload plumbing: {go}"
+        );
+    }
+
+    // ── Enums, records, rich enums ──
 
     #[test]
     fn enum_generation() {
@@ -3922,24 +4189,9 @@ mod tests {
             name: "Color".into(),
             doc: None,
             variants: vec![
-                EnumVariant {
-                    name: "Red".into(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Green".into(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "Blue".into(),
-                    value: 2,
-                    doc: None,
-                    fields: vec![],
-                },
+                variant("Red", 0, vec![]),
+                variant("Green", 1, vec![]),
+                variant("Blue", 2, vec![]),
             ],
         }];
         let go = rg(&api_of(vec![m]));
@@ -3962,12 +4214,11 @@ mod tests {
     }
 
     #[test]
-    fn struct_with_getters_and_close() {
+    fn record_is_plain_value_struct() {
         let mut m = module("contacts");
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![
                 field("name", TypeRef::StringUtf8),
                 field("age", TypeRef::I32),
@@ -3976,76 +4227,51 @@ mod tests {
         let go = rg(&api_of(vec![m]));
         assert!(go.contains("type Contact struct {"), "missing struct: {go}");
         assert!(
-            go.contains("ptr *C.weaveffi_contacts_Contact"),
-            "missing ptr field: {go}"
+            go.contains("\tName string\n"),
+            "missing typed Name field: {go}"
         );
         assert!(
-            go.contains("func (s *Contact) Name() string"),
-            "missing Name getter: {go}"
+            go.contains("\tAge int32\n"),
+            "missing typed Age field: {go}"
         );
         assert!(
-            go.contains("func (s *Contact) Age() int32"),
-            "missing Age getter: {go}"
+            go.contains("func wvPackContact(w *wvWriter, v Contact) {"),
+            "missing pack function: {go}"
         );
         assert!(
-            go.contains("func (s *Contact) Close()"),
-            "missing Close: {go}"
+            go.contains("w.writeString(v.Name)") && go.contains("w.writeI32(v.Age)"),
+            "pack must serialize fields in order: {go}"
         );
         assert!(
-            go.contains("C.weaveffi_contacts_Contact_destroy(s.ptr)"),
-            "missing destroy call: {go}"
+            go.contains("func wvUnpackContact(r *wvReader) Contact {"),
+            "missing unpack function: {go}"
         );
         assert!(
-            go.contains("s.ptr = nil"),
-            "missing nil assignment after destroy: {go}"
+            go.contains("v.Name = r.readString()") && go.contains("v.Age = r.readI32()"),
+            "unpack must decode fields in order: {go}"
+        );
+        // Records have no C symbols: no handle wrapping, no destroy, no
+        // getters, no builders.
+        assert!(
+            !go.contains("ptr *C.weaveffi_contacts_Contact"),
+            "records must not wrap a C pointer: {go}"
+        );
+        assert!(
+            !go.contains("Contact_destroy") && !go.contains("func (s *Contact)"),
+            "records have no destroy or getters: {go}"
+        );
+        assert!(
+            !go.contains("ContactBuilder"),
+            "records have no builders: {go}"
         );
     }
 
     #[test]
-    fn struct_builder_type_and_setters() {
-        let mut m = module("geo");
-        m.structs = vec![StructDef {
-            name: "Point".into(),
-            doc: None,
-            builder: true,
-            fields: vec![field("x", TypeRef::F64)],
-        }];
-        let go = rg(&api_of(vec![m]));
-        assert!(
-            go.contains("type PointBuilder struct {"),
-            "builder type: {go}"
-        );
-        assert!(go.contains("\tx float64\n"), "typed builder field: {go}");
-        assert!(
-            go.contains("func NewPointBuilder() *PointBuilder"),
-            "constructor: {go}"
-        );
-        assert!(
-            go.contains("return &PointBuilder{}"),
-            "constructor body: {go}"
-        );
-        assert!(
-            go.contains("func (b *PointBuilder) WithX(value float64) *PointBuilder"),
-            "WithX: {go}"
-        );
-        assert!(go.contains("b.x = value"), "field assign: {go}");
-        assert!(
-            go.contains("func (b *PointBuilder) Build() (*Point, error)"),
-            "Build returns (*Point, error): {go}"
-        );
-        assert!(
-            go.contains("return nil, wvBrandError(wvTakeError(&cErr))"),
-            "Build failures are brand errors: {go}"
-        );
-    }
-
-    #[test]
-    fn struct_optional_string_field() {
+    fn record_optional_string_field() {
         let mut m = module("contacts");
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![field(
                 "email",
                 TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
@@ -4053,38 +4279,170 @@ mod tests {
         }];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func (s *Contact) Email() *string"),
-            "optional string getter should return *string: {go}"
+            go.contains("\tEmail *string\n"),
+            "optional string field should be *string: {go}"
         );
         assert!(
-            go.contains("if cStr == nil"),
-            "should check nil for optional string: {go}"
+            go.contains("if v.Email == nil {"),
+            "pack must branch on presence: {go}"
+        );
+        assert!(
+            go.contains("w.writeString((*v.Email))"),
+            "pack must dereference the present value: {go}"
+        );
+        assert!(
+            go.contains("oEmail0 = r.readString()") && go.contains("v.Email = &oEmail0"),
+            "unpack must pointer-wrap the present value: {go}"
         );
     }
 
     #[test]
-    fn struct_enum_field_getter() {
+    fn record_bytes_field_roundtrips() {
         let mut m = module("contacts");
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
+            fields: vec![
+                field("name", TypeRef::StringUtf8),
+                field("photo", TypeRef::Bytes),
+            ],
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("w.writeBytes(v.Photo)"),
+            "bytes fields pack as length-prefixed buffers: {go}"
+        );
+        assert!(
+            go.contains("v.Photo = r.readBytes()"),
+            "bytes fields decode as copies: {go}"
+        );
+    }
+
+    #[test]
+    fn record_enum_field() {
+        let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
             fields: vec![field("contact_type", TypeRef::Enum("ContactType".into()))],
         }];
         m.enums = vec![EnumDef {
             name: "ContactType".into(),
             doc: None,
-            variants: vec![EnumVariant {
-                name: "Personal".into(),
-                value: 0,
-                doc: None,
-                fields: vec![],
-            }],
+            variants: vec![variant("Personal", 0, vec![])],
         }];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func (s *Contact) ContactType() ContactType"),
-            "missing enum field getter: {go}"
+            go.contains("\tContactType ContactType\n"),
+            "missing enum-typed field: {go}"
+        );
+        assert!(
+            go.contains("w.writeI32(int32(v.ContactType))"),
+            "enum fields pack as i32: {go}"
+        );
+        assert!(
+            go.contains("v.ContactType = ContactType(r.readI32())"),
+            "enum fields decode through the enum type: {go}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_is_sealed_sum_type() {
+        let go = rg(&shapes_api());
+        assert!(
+            go.contains("type Shape interface {"),
+            "missing sealed interface: {go}"
+        );
+        assert!(go.contains("\tisShape()\n"), "missing sealing method: {go}");
+        assert!(
+            go.contains("type ShapeEmpty struct{}"),
+            "unit variant should be an empty struct: {go}"
+        );
+        assert!(
+            go.contains("type ShapeCircle struct {") && go.contains("\tRadius float64\n"),
+            "data variant carries typed fields: {go}"
+        );
+        assert!(
+            go.contains("type ShapeLabeled struct {")
+                && go.contains("\tLabel string\n")
+                && go.contains("\tCount uint8\n"),
+            "multi-field variant carries all fields: {go}"
+        );
+        assert!(
+            go.contains("func (ShapeEmpty) isShape() {}")
+                && go.contains("func (ShapeCircle) isShape() {}")
+                && go.contains("func (ShapeLabeled) isShape() {}"),
+            "every variant implements the sealing method: {go}"
+        );
+        // Rich enums have no C symbols.
+        assert!(
+            !go.contains("Shape_destroy")
+                && !go.contains("NewShapeCircle")
+                && !go.contains("Tag()"),
+            "rich enums have no constructors, tag readers, or destroy: {go}"
+        );
+    }
+
+    #[test]
+    fn rich_enum_pack_unpack() {
+        let go = rg(&shapes_api());
+        assert!(
+            go.contains("func wvPackShape(w *wvWriter, v Shape) {"),
+            "missing pack function: {go}"
+        );
+        assert!(
+            go.contains("switch x := v.(type) {"),
+            "pack switches on the variant type: {go}"
+        );
+        assert!(
+            go.contains("case ShapeCircle:")
+                && go.contains("w.writeI32(1)")
+                && go.contains("w.writeF64(x.Radius)"),
+            "pack writes the tag then the variant fields: {go}"
+        );
+        assert!(
+            go.contains("case ShapeLabeled:")
+                && go.contains("w.writeI32(3)")
+                && go.contains("w.writeString(x.Label)")
+                && go.contains("w.writeU8(x.Count)"),
+            "non-contiguous tags use the declared values: {go}"
+        );
+        assert!(
+            go.contains("panic(\"weaveffi: Shape value is not one of its variants\")"),
+            "pack rejects foreign implementations: {go}"
+        );
+        assert!(
+            go.contains("func wvUnpackShape(r *wvReader) Shape {"),
+            "missing unpack function: {go}"
+        );
+        assert!(
+            go.contains("return ShapeEmpty{}"),
+            "unit variants decode to the empty struct: {go}"
+        );
+        assert!(
+            go.contains("x.Radius = r.readF64()"),
+            "variant fields decode in order: {go}"
+        );
+        assert!(
+            go.contains("panic(\"weaveffi: malformed value buffer: Shape tag out of range\")"),
+            "unpack rejects unknown tags: {go}"
+        );
+        // The rich enum crosses the ABI as a buffer in both directions.
+        assert!(
+            go.contains("func Describe(shape Shape) string {"),
+            "rich enum param is the bare interface type: {go}"
+        );
+        assert!(
+            go.contains("wvPackShape(wShape, shape)"),
+            "rich enum param packs through the writer: {go}"
+        );
+        assert!(
+            go.contains("func Scale(shape Shape, factor float64) Shape {"),
+            "rich enum return is the bare interface type: {go}"
+        );
+        assert!(
+            go.contains("goResult = wvUnpackShape(rRes)"),
+            "rich enum return decodes from the buffer: {go}"
         );
     }
 
@@ -4100,6 +4458,131 @@ mod tests {
         assert!(
             !go.contains("boolToC"),
             "should not include bool helpers: {go}"
+        );
+    }
+
+    // ── The value-buffer runtime ──
+
+    #[test]
+    fn buffer_runtime_emitted_once() {
+        let mut a = module("alpha");
+        a.structs = vec![StructDef {
+            name: "A".into(),
+            doc: None,
+            fields: vec![field("x", TypeRef::I32)],
+        }];
+        let mut b = module("beta");
+        b.structs = vec![StructDef {
+            name: "B".into(),
+            doc: None,
+            fields: vec![field("y", TypeRef::F32)],
+        }];
+        let go = rg(&api_of(vec![a, b]));
+        assert_eq!(
+            go.matches("type wvWriter struct {").count(),
+            1,
+            "runtime must be emitted exactly once: {go}"
+        );
+        assert_eq!(
+            go.matches("type wvReader struct {").count(),
+            1,
+            "runtime must be emitted exactly once: {go}"
+        );
+        assert!(
+            go.contains("binary.LittleEndian"),
+            "wire format is little-endian: {go}"
+        );
+        assert!(
+            go.contains("if !utf8.Valid(b) {"),
+            "string decode must validate UTF-8: {go}"
+        );
+        assert!(
+            go.contains("wvMalformed(\"length prefix exceeds remaining buffer\")"),
+            "reader must reject oversized length prefixes: {go}"
+        );
+        assert!(
+            go.contains("wvMalformed(\"trailing bytes after value\")"),
+            "reader must reject trailing bytes: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_free_bytes(ptr, length)"),
+            "wvCopyBuffer must free the producer buffer: {go}"
+        );
+        assert!(
+            go.contains("\t\"encoding/binary\"\n")
+                && go.contains("\t\"math\"\n")
+                && go.contains("\t\"unicode/utf8\"\n"),
+            "runtime imports must be present: {go}"
+        );
+    }
+
+    #[test]
+    fn no_buffer_runtime_when_unneeded() {
+        let go = rg(&calculator_api());
+        assert!(
+            !go.contains("wvWriter"),
+            "scalar-only surfaces need no buffer runtime: {go}"
+        );
+        assert!(
+            !go.contains("\"encoding/binary\""),
+            "scalar-only surfaces must not import binary: {go}"
+        );
+    }
+
+    // ── Typed handles ──
+
+    #[test]
+    fn typed_handle_wrapper_and_flow() {
+        let mut m = module("vault");
+        m.structs = vec![StructDef {
+            name: "Session".into(),
+            doc: None,
+            fields: vec![field("token", TypeRef::TypedHandle("Token".into()))],
+        }];
+        m.functions = vec![
+            func_of("open", vec![], Some(TypeRef::TypedHandle("Token".into()))),
+            func_of(
+                "revoke",
+                vec![param("t", TypeRef::TypedHandle("Token".into()))],
+                None,
+            ),
+        ];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("type TokenHandle struct {"),
+            "missing handle wrapper: {go}"
+        );
+        assert!(
+            go.contains("ptr *C.weaveffi_vault_Token"),
+            "wrapper must hold the opaque C pointer: {go}"
+        );
+        assert!(
+            go.contains("func Open() *TokenHandle {"),
+            "handle return should be the wrapper pointer: {go}"
+        );
+        assert!(
+            go.contains("return &TokenHandle{ptr: result}"),
+            "missing handle wrap on return: {go}"
+        );
+        assert!(
+            go.contains("C.weaveffi_vault_revoke(t.ptr, &cErr)"),
+            "handle params pass the wrapped pointer: {go}"
+        );
+        // No destroy: a typed handle is a borrowed id.
+        assert!(
+            !go.contains("func (s *TokenHandle) Close()"),
+            "typed handles owe no release call: {go}"
+        );
+        // Inside buffers the handle serializes as the pointer's u64 value.
+        assert!(
+            go.contains("w.writeU64(uint64(uintptr(unsafe.Pointer(v.Token.ptr))))"),
+            "handle fields pack as u64: {go}"
+        );
+        assert!(
+            go.contains(
+                "v.Token = &TokenHandle{ptr: (*C.weaveffi_vault_Token)(unsafe.Pointer(uintptr(r.readU64())))}"
+            ),
+            "handle fields decode back into the wrapper: {go}"
         );
     }
 
@@ -4193,7 +4676,45 @@ mod tests {
         );
     }
 
-    // ── Listeners ──
+    #[test]
+    fn async_record_result_decodes_borrowed_buffer() {
+        let mut m = module("metrics");
+        m.structs = vec![StructDef {
+            name: "Stats".into(),
+            doc: None,
+            fields: vec![field("total", TypeRef::I64)],
+        }];
+        m.functions = vec![{
+            let mut f = func_of("load", vec![], Some(TypeRef::Record("Stats".into())));
+            f.r#async = true;
+            f
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains(
+                "extern void goWv_weaveffi_metrics_load_callback(void* context, weaveffi_error* err, uint8_t* result_ptr, size_t result_len);"
+            ),
+            "buffered async callback carries borrowed ptr + len slots: {go}"
+        );
+        assert!(
+            go.contains("rRes := &wvReader{buf: wvBorrowBuffer(result_ptr, result_len)}"),
+            "async result buffer is borrowed, never freed: {go}"
+        );
+        assert!(
+            go.contains("val = wvUnpackStats(rRes)"),
+            "async record result decodes inside the trampoline: {go}"
+        );
+        assert!(
+            !go.contains("wvCopyBuffer(result_ptr"),
+            "the producer frees the async result buffer, not the consumer: {go}"
+        );
+        assert!(
+            go.contains("func Load() Stats {"),
+            "async record wrapper returns the value struct: {go}"
+        );
+    }
+
+    // ── Listeners and callbacks ──
 
     #[test]
     fn listeners_generate_register_unregister() {
@@ -4234,6 +4755,35 @@ mod tests {
         assert!(
             go.contains("wvListenerCtx[id] = ctxID"),
             "subscription must retain the Go callback: {go}"
+        );
+    }
+
+    #[test]
+    fn callback_buffered_param_decodes_borrowed_buffer() {
+        let mut m = module("feed");
+        m.callbacks = vec![CallbackDef {
+            name: "OnBatch".into(),
+            doc: None,
+            params: vec![param("items", TypeRef::List(Box::new(TypeRef::StringUtf8)))],
+        }];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains(
+                "extern void goWv_weaveffi_feed_OnBatch_fn(uint8_t* items_ptr, size_t items_len, void* context);"
+            ),
+            "buffered callback param carries ptr + len slots: {go}"
+        );
+        assert!(
+            go.contains("rArg0 := &wvReader{buf: wvBorrowBuffer(items_ptr, items_len)}"),
+            "callback buffers are borrowed, never freed: {go}"
+        );
+        assert!(
+            go.contains("arg0 = make([]string, nArg00)"),
+            "list argument decodes before dispatch: {go}"
+        );
+        assert!(
+            go.contains("cb(arg0)"),
+            "decoded value is handed to the user callback: {go}"
         );
     }
 
@@ -4289,7 +4839,8 @@ mod tests {
     #[test]
     fn interface_methods_pass_self() {
         let go = rg(&kv_api());
-        // Throwing method: `(T, error)` with the receiver's ptr leading.
+        // Throwing method: `(T, error)` with the receiver's ptr leading. The
+        // optional scalar parameter is buffered now.
         assert!(
             go.contains(
                 "func (s *Store) Put(key string, value []byte, kind EntryKind, ttlSeconds *int64) (bool, error) {"
@@ -4297,17 +4848,25 @@ mod tests {
             "missing throwing method: {go}"
         );
         assert!(
-            go.contains("result := C.weaveffi_kv_Store_put(s.ptr, cKey, cValuePtr, cValueLen, C.weaveffi_kv_EntryKind(kind), cTtlSeconds, &cErr)"),
-            "method must pass s.ptr as the leading C argument: {go}"
+            go.contains("result := C.weaveffi_kv_Store_put(s.ptr, cKey, cValuePtr, cValueLen, C.weaveffi_kv_EntryKind(kind), cTtlSecondsPtr, C.size_t(len(wTtlSeconds.buf)), &cErr)"),
+            "method must pass s.ptr and the buffered optional's ptr + len: {go}"
+        );
+        assert!(
+            go.contains("wTtlSeconds.writeI64((*ttlSeconds))"),
+            "optional scalar param packs into the writer: {go}"
         );
         assert!(
             go.contains("return false, wvMapKv(wvTakeError(&cErr))"),
             "throwing bool method returns its zero value with the error: {go}"
         );
-        // Optional struct return through a method.
+        // Optional record return through a method decodes from the buffer.
         assert!(
             go.contains("func (s *Store) Get(key string) (*Entry, error) {"),
             "missing optional-return method: {go}"
+        );
+        assert!(
+            go.contains("oRes0 = wvUnpackEntry(rRes)"),
+            "optional record return decodes the present value: {go}"
         );
         // Plain method: bare return, traps.
         assert!(
@@ -4357,6 +4916,43 @@ mod tests {
     }
 
     #[test]
+    fn optional_interface_param_stays_pointer() {
+        let mut m = module("kv");
+        m.interfaces = vec![InterfaceDef {
+            name: "Store".into(),
+            doc: None,
+            constructors: vec![],
+            methods: vec![],
+            statics: vec![],
+        }];
+        m.functions = vec![func_of(
+            "inspect",
+            vec![param(
+                "store",
+                TypeRef::Optional(Box::new(TypeRef::Interface("Store".into()))),
+            )],
+            None,
+        )];
+        let go = rg(&api_of(vec![m]));
+        assert!(
+            go.contains("func Inspect(store *Store) {"),
+            "optional interface param stays a nullable wrapper pointer: {go}"
+        );
+        assert!(
+            go.contains("var cStore *C.weaveffi_kv_Store"),
+            "missing nullable C pointer staging: {go}"
+        );
+        assert!(
+            go.contains("cStore = store.ptr"),
+            "present value passes the wrapped pointer: {go}"
+        );
+        assert!(
+            !go.contains("wStore"),
+            "optional interfaces are never buffered: {go}"
+        );
+    }
+
+    #[test]
     fn interface_async_method_throws() {
         let go = rg(&kv_api());
         assert!(
@@ -4396,7 +4992,8 @@ mod tests {
         );
         assert!(go.contains("\t\"iter\"\n"), "iter import needed: {go}");
         // The launch runs lazily inside the returned closure (first pull),
-        // never in the wrapper body itself.
+        // never in the wrapper body itself. The optional string param is
+        // buffered and staged inside the closure.
         let fn_start = go
             .find("func (s *Store) ListKeys(")
             .expect("ListKeys wrapper");
@@ -4405,7 +5002,9 @@ mod tests {
             .find("return func(yield func(string, error) bool) {")
             .expect("sequence closure in ListKeys");
         let launch = fn_text
-            .find("it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefix, &cErr)")
+            .find(
+                "it := C.weaveffi_kv_Store_list_keys(s.ptr, cPrefixPtr, C.size_t(len(wPrefix.buf)), &cErr)",
+            )
             .expect("launch in ListKeys");
         assert!(
             closure < launch,
@@ -4489,12 +5088,11 @@ mod tests {
     }
 
     #[test]
-    fn iterator_object_elements_are_adopted() {
+    fn iterator_buffered_elements_decode_and_free() {
         let mut m = module("contacts");
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![field("name", TypeRef::StringUtf8)],
         }];
         m.functions = vec![func_of(
@@ -4506,12 +5104,28 @@ mod tests {
         )];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("func IterContacts() iter.Seq[*Contact] {"),
-            "object iterator yields wrapper pointers: {go}"
+            go.contains("func IterContacts() iter.Seq[Contact] {"),
+            "record iterator yields value structs: {go}"
         );
         assert!(
-            go.contains("item := &Contact{ptr: outItem}"),
-            "object elements are adopted by the wrapper: {go}"
+            go.contains("var outItem *C.uint8_t") && go.contains("var outLen C.size_t"),
+            "buffered elements arrive as ptr + len slots: {go}"
+        );
+        assert!(
+            go.contains("(it, &outItem, &outLen, &iterErr) != 0"),
+            "next must pass the element length slot: {go}"
+        );
+        assert!(
+            go.contains("rItem := &wvReader{buf: wvCopyBuffer(outItem, outLen)}"),
+            "each element must be copied and freed through wvCopyBuffer: {go}"
+        );
+        assert!(
+            go.contains("item = wvUnpackContact(rItem)"),
+            "each element decodes through the record unpack: {go}"
+        );
+        assert!(
+            go.contains("rItem.expectEnd()"),
+            "element decode must reject trailing bytes: {go}"
         );
     }
 
@@ -4519,16 +5133,20 @@ mod tests {
     fn cross_module_interface_param_borrows() {
         let go = rg(&kv_api());
         assert!(
-            go.contains("func GetStats(store *Store) (*Stats, error) {"),
-            "nested-module function takes the wrapper: {go}"
+            go.contains("func GetStats(store *Store) (Stats, error) {"),
+            "nested-module function takes the wrapper, returns the record value: {go}"
         );
         assert!(
-            go.contains("result := C.weaveffi_kv_stats_get_stats(store.ptr, &cErr)"),
+            go.contains("result := C.weaveffi_kv_stats_get_stats(store.ptr, &cOutLen, &cErr)"),
             "interface params borrow the wrapped pointer: {go}"
         );
         assert!(
-            go.contains("return nil, wvMapKv(wvTakeError(&cErr))"),
-            "inheriting submodule maps through the ancestor domain: {go}"
+            go.contains("return Stats{}, wvMapKv(wvTakeError(&cErr))"),
+            "inheriting submodule maps through the ancestor domain, zeroing the record: {go}"
+        );
+        assert!(
+            go.contains("goResult = wvUnpackStats(rRes)"),
+            "cross-module record return decodes from the buffer: {go}"
         );
     }
 
@@ -4545,7 +5163,7 @@ mod tests {
         assert!(go.contains("KvErrorStoreFull int32 = 1003"), "{go}");
         assert!(go.contains("KvErrorIoError int32 = 1004"), "{go}");
         assert!(
-            go.contains("func wvMapKv(code int32, message string) error {"),
+            go.contains("func wvMapKv(code int32, message string, payload []byte) error {"),
             "missing wvMapKv helper: {go}"
         );
         assert!(
@@ -4611,18 +5229,20 @@ mod tests {
         let go = rg(&contacts_api());
         assert!(go.contains("type ContactType int32"), "{go}");
         assert!(go.contains("type Contact struct {"), "{go}");
+        assert!(go.contains("\tFirstName string\n"), "{go}");
+        assert!(go.contains("\tEmail *string\n"), "{go}");
         assert!(go.contains("type ContactBook struct {"), "{go}");
         assert!(go.contains("ptr *C.weaveffi_contacts_ContactBook"), "{go}");
         assert!(
-            go.contains("func (s *ContactBook) Add(firstName string, lastName string, email *string, contactType ContactType) (*Contact, error) {"),
+            go.contains("func (s *ContactBook) Add(firstName string, lastName string, email *string, contactType ContactType) (Contact, error) {"),
             "{go}"
         );
         assert!(
-            go.contains("func (s *ContactBook) Get(id int64) (*Contact, error) {"),
+            go.contains("func (s *ContactBook) Get(id int64) (Contact, error) {"),
             "{go}"
         );
         assert!(
-            go.contains("func (s *ContactBook) List() []*Contact {"),
+            go.contains("func (s *ContactBook) List() []Contact {"),
             "{go}"
         );
         assert!(
@@ -4639,11 +5259,11 @@ mod tests {
         assert!(go.contains("ContactsErrorInvalidName int32 = 1"), "{go}");
         assert!(go.contains("ContactsErrorNotFound int32 = 2"), "{go}");
         assert!(
-            go.contains("func wvMapContacts(code int32, message string) error {"),
+            go.contains("func wvMapContacts(code int32, message string, payload []byte) error {"),
             "{go}"
         );
         assert!(
-            go.contains("return nil, wvMapContacts(wvTakeError(&cErr))"),
+            go.contains("return Contact{}, wvMapContacts(wvTakeError(&cErr))"),
             "{go}"
         );
     }
@@ -4785,7 +5405,6 @@ mod tests {
         m.structs = vec![StructDef {
             name: "Contact".into(),
             doc: None,
-            builder: false,
             fields: vec![field("name", TypeRef::StringUtf8)],
         }];
         m.functions = vec![func_of(
@@ -4808,24 +5427,23 @@ mod tests {
         let err_check = fn_text
             .find("wvTrap(&cErr)")
             .expect("trap check in FindContact");
-        let contact_wrap = fn_text
-            .find("&Contact{ptr: result}")
-            .expect("Contact wrap in FindContact");
+        let decode = fn_text
+            .find("wvCopyBuffer(result, cOutLen)")
+            .expect("buffered decode in FindContact");
         assert!(
-            err_check < contact_wrap,
-            "error must be checked before wrapping struct return: {fn_text}"
-        );
-
-        assert!(
-            go.contains("func (s *Contact) Close()")
-                && go.contains("weaveffi_contacts_Contact_destroy(s.ptr)"),
-            "struct return type should have Close calling destroy: {go}"
+            err_check < decode,
+            "error must be checked before decoding the return buffer: {fn_text}"
         );
     }
 
     #[test]
-    fn go_null_check_on_optional_return() {
+    fn go_flag_check_on_optional_return() {
         let mut m = module("contacts");
+        m.structs = vec![StructDef {
+            name: "Contact".into(),
+            doc: None,
+            fields: vec![field("name", TypeRef::StringUtf8)],
+        }];
         m.functions = vec![func_of(
             "find_contact",
             vec![param("id", TypeRef::I32)],
@@ -4840,20 +5458,20 @@ mod tests {
         let fn_end = fn_body.find("\n}\n").unwrap();
         let fn_text = &fn_body[..fn_end];
 
-        let null_check = fn_text
-            .find("if result == nil")
-            .expect("nil check in FindContact");
-        let contact_wrap = fn_text
-            .find("&Contact{ptr: result}")
-            .expect("Contact wrap in FindContact");
+        let flag_check = fn_text
+            .find("if rRes.readOptionFlag() {")
+            .expect("flag check in FindContact");
+        let decode = fn_text
+            .find("wvUnpackContact(rRes)")
+            .expect("Contact decode in FindContact");
         assert!(
-            null_check < contact_wrap,
-            "optional struct return should check nil before wrapping: {fn_text}"
+            flag_check < decode,
+            "optional record return must check the flag before decoding: {fn_text}"
         );
     }
 
     #[test]
-    fn string_list_return_frees_elements_and_buffer() {
+    fn string_list_return_decodes_from_buffer() {
         let mut m = module("store");
         m.functions = vec![func_of(
             "list_keys",
@@ -4862,90 +5480,17 @@ mod tests {
         )];
         let go = rg(&api_of(vec![m]));
         assert!(
-            go.contains("goResult[i] = C.GoString(v)\n\t\t\tC.weaveffi_free_string(v)"),
-            "each string element must be freed after copying: {go}"
+            go.contains("rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}"),
+            "list return decodes from one owned buffer: {go}"
         );
         assert!(
-            go.contains(
-                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(count)*C.size_t(unsafe.Sizeof(*result)))"
-            ),
-            "the array buffer must be released after the copy: {go}"
-        );
-    }
-
-    #[test]
-    fn map_return_frees_string_keys_and_both_buffers() {
-        let mut m = module("store");
-        m.functions = vec![func_of(
-            "counts",
-            vec![],
-            Some(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32),
-            )),
-        )];
-        let go = rg(&api_of(vec![m]));
-        assert!(
-            go.contains("C.weaveffi_free_string(keySlice[i])"),
-            "each string key must be freed after copying: {go}"
+            go.contains("goResult[iRes0] = rRes.readString()"),
+            "string elements decode in place: {go}"
         );
         assert!(
-            !go.contains("C.weaveffi_free_string(valSlice[i])"),
-            "by-value map values owe no release: {go}"
+            !go.contains("unsafe.Slice("),
+            "parallel-array decoding is gone: {go}"
         );
-        assert!(
-            go.contains(
-                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapKeys)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapKeys)))"
-            ) && go.contains(
-                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(cMapVals)), C.size_t(count)*C.size_t(unsafe.Sizeof(*cMapVals)))"
-            ),
-            "both parallel map buffers must be released: {go}"
-        );
-    }
-
-    #[test]
-    fn string_getter_frees_after_copy() {
-        let mut m = module("contacts");
-        m.structs = vec![StructDef {
-            name: "Contact".into(),
-            doc: None,
-            builder: false,
-            fields: vec![
-                field("name", TypeRef::StringUtf8),
-                field("photo", TypeRef::Bytes),
-            ],
-        }];
-        let go = rg(&api_of(vec![m]));
-        assert!(
-            go.contains("goResult := C.GoString(cStr)\n\tC.weaveffi_free_string(cStr)"),
-            "string getters must free the owned C string after copying: {go}"
-        );
-        assert!(
-            go.contains("C.weaveffi_free_bytes(result, cOutLen)"),
-            "bytes getters must free the owned buffer after copying: {go}"
-        );
-    }
-
-    #[test]
-    fn boxed_optional_scalar_return_is_freed() {
-        let mut m = module("store");
-        m.functions = vec![func_of(
-            "capacity",
-            vec![],
-            Some(TypeRef::Optional(Box::new(TypeRef::I64))),
-        )];
-        let go = rg(&api_of(vec![m]));
-        assert!(
-            go.contains("v := int64(*result)"),
-            "boxed scalar must be dereferenced: {go}"
-        );
-        assert!(
-            go.contains(
-                "C.weaveffi_free_bytes((*C.uint8_t)(unsafe.Pointer(result)), C.size_t(unsafe.Sizeof(*result)))"
-            ),
-            "the producer-boxed scalar must be freed after dereferencing: {go}"
-        );
-        assert!(go.contains("\t\"unsafe\"\n"), "unsafe import needed: {go}");
     }
 
     // ── Docs ──
@@ -4977,7 +5522,6 @@ mod tests {
                 doc: Some("Stable id".into()),
                 default: None,
             }],
-            builder: false,
         }];
         m.enums = vec![EnumDef {
             name: "Kind".into(),

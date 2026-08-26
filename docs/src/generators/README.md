@@ -7,7 +7,7 @@ artifacts they produce. Choose a target below to explore the details.
 
 Every generator implements the full IDL surface (structs, enums,
 interfaces, optionals, lists, maps, typed handles, borrowed parameters,
-builders, typed error domains with opt-in `throws`, and nested modules)
+typed error domains with opt-in `throws`, and nested modules)
 plus the call shapes below. A
 generator that cannot support a feature declares it in its
 `TargetCapabilities`, and `weaveffi generate` fails loudly when an IDL

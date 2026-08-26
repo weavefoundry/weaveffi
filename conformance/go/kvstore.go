@@ -6,8 +6,9 @@
 // Compact, the deprecated LegacyPut), the package-level static
 // (StoreDefaultCapacity), and the explicit Close. Asserts the typed KvError
 // domain via errors.As (IoError on an empty open path, KeyNotFound on a
-// missing get). Also covers the Entry builder's list/map input marshaling,
-// the []byte / []string / map[string]string getters, the eviction listener
+// missing get). Also covers the Entry record decoded from a value buffer
+// (bytes, optional present and absent, empty list, and empty map fields), the
+// buffered optional TTL and prefix parameters, the eviction listener
 // trampoline, and the nested kv.stats submodule borrowing the Store across
 // the module boundary. Exits 0 on success; aborts (non-zero) on any mismatch.
 
@@ -53,12 +54,18 @@ func main() {
 	// Non-throwing method: plain return.
 	expect(store.Count() == 2, "count == 2")
 
-	// Optional struct return through a throwing method.
+	// Optional record return through a throwing method: the value buffer
+	// decodes into a plain Entry struct (scalars, bytes, the absent optional,
+	// and the empty list and map fields).
 	e, err := store.Get("alpha")
 	expect(err == nil && e != nil, "get alpha")
-	expect(e.Key() == "alpha", "entry key")
-	expect(len(e.Value()) == 3 && e.Value()[0] == 1, "entry value bytes")
-	e.Close()
+	expect(e.Id > 0, "entry id positive")
+	expect(e.Key == "alpha", "entry key")
+	expect(len(e.Value) == 3 && e.Value[0] == 1, "entry value bytes")
+	expect(e.CreatedAt > 0, "entry created_at set")
+	expect(e.ExpiresAt == nil, "no ttl decodes as nil expires_at")
+	expect(len(e.Tags) == 0, "empty tags len 0")
+	expect(len(e.Metadata) == 0, "empty metadata len 0")
 
 	// Typed error: a missing key reports KvError KeyNotFound.
 	_, err = store.Get("missing")
@@ -68,7 +75,8 @@ func main() {
 		fmt.Sprintf("missing key code == 1001 (got %d)", kerr.Code))
 
 	// Iterator-backed method: a lazy iter.Seq2[string, error], with and
-	// without the prefix. Errors surface per step through the second value.
+	// without the buffered optional prefix. Errors surface per step through
+	// the second value.
 	var keys []string
 	for k, serr := range store.ListKeys(nil) {
 		expect(serr == nil, "list_keys step error")
@@ -92,50 +100,22 @@ func main() {
 	ok, err = store.Delete("legacy")
 	expect(err == nil && ok, "delete legacy")
 
-	// Builder input marshaling: scalars, bytes, optional, list, and map.
-	entry, err := wv.NewEntryBuilder().
-		WithId(7).
-		WithKey("alpha").
-		WithValue(payload).
-		WithCreatedAt(1000).
-		WithExpiresAt(nil).
-		WithTags([]string{"hot", "fast"}).
-		WithMetadata(map[string]string{"source": "test", "env": "prod"}).
-		Build()
-	expect(err == nil && entry != nil, "build entry")
-	expect(entry.Id() == 7, "entry id == 7")
+	// Present optional: a TTL'd put round-trips as a non-nil ExpiresAt
+	// pointing past CreatedAt.
+	ok, err = store.Put("gamma", payload, wv.EntryKindEncrypted, ptrInt64(3600))
+	expect(err == nil && ok, "put gamma with ttl")
+	g, err := store.Get("gamma")
+	expect(err == nil && g != nil, "get gamma")
+	expect(g.ExpiresAt != nil, "ttl decodes as non-nil expires_at")
+	expect(*g.ExpiresAt == g.CreatedAt+3600, "expires_at == created_at + ttl")
+	ok, err = store.Delete("gamma")
+	expect(err == nil && ok, "delete gamma")
 
-	// []byte getter.
-	expect(len(entry.Value()) == 3 && entry.Value()[0] == 1, "entry value bytes")
-
-	// []string list getter.
-	tags := entry.Tags()
-	sort.Strings(tags)
-	expect(len(tags) == 2 && tags[0] == "fast" && tags[1] == "hot", "entry tags")
-
-	// map[string]string getter over the triple-pointer out-params.
-	md := entry.Metadata()
-	expect(len(md) == 2 && md["source"] == "test" && md["env"] == "prod", "entry metadata")
-	entry.Close()
-
-	// Empty map round-trips as a zero-length map.
-	emptyEntry, err := wv.NewEntryBuilder().
-		WithId(8).
-		WithKey("k").
-		WithValue(payload).
-		WithCreatedAt(1000).
-		WithExpiresAt(nil).
-		Build()
-	expect(err == nil && emptyEntry != nil, "build empty entry")
-	expect(len(emptyEntry.Metadata()) == 0, "empty metadata len 0")
-	expect(len(emptyEntry.Tags()) == 0, "empty tags len 0")
-	emptyEntry.Close()
-
-	// kv.stats submodule borrows the Store across the module boundary.
+	// kv.stats submodule borrows the Store across the module boundary and
+	// returns the Stats record by value.
 	st, err := wv.GetStats(store)
-	expect(err == nil && st != nil, "get stats")
-	expect(st.TotalEntries() == 2, "stats total entries == 2")
-	st.Close()
+	expect(err == nil, "get stats")
+	expect(st.TotalEntries == 2, "stats total entries == 2")
 
 	// Eviction listener: delete fires the //export trampoline synchronously
 	// on the deleting goroutine's thread.

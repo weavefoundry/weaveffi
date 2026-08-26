@@ -7,8 +7,11 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 // ignore_for_file: non_constant_identifier_names, camel_case_types, unused_element
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io' show Platform;
+import 'dart:typed_data';
+
 import 'package:ffi/ffi.dart';
 
 DynamicLibrary _openLibrary() {
@@ -28,6 +31,9 @@ final class _WeaveFFIError extends Struct {
   @Int32()
   external int code;
   external Pointer<Utf8> message;
+  external Pointer<Uint8> payloadPtr;
+  @Size()
+  external int payloadLen;
 }
 
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
@@ -63,6 +69,249 @@ void _checkError(Pointer<_WeaveFFIError> err) {
   }
 }
 
+// ── WeaveFFI value-buffer runtime ──
+// Records, rich enums, optionals, lists, maps, and error payloads cross the
+// C ABI serialized in this little-endian, packed format. A malformed buffer
+// is a producer/consumer contract violation, never a typed domain error.
+
+Never _bufferError(String context) =>
+    throw StateError('malformed WeaveFFI value buffer: $context');
+
+// Copies a borrowed native (ptr, len) buffer into Dart-owned memory.
+Uint8List _copyNativeBytes(Pointer<Uint8> ptr, int len) =>
+    ptr == nullptr ? Uint8List(0) : Uint8List.fromList(ptr.asTypedList(len));
+
+// Stages an encoding into native memory for a borrowed (ptr, len) argument;
+// the caller frees the pointer after the call returns.
+Pointer<Uint8> _stageBytes(Uint8List bytes) {
+  final ptr = calloc<Uint8>(bytes.isEmpty ? 1 : bytes.length);
+  if (bytes.isNotEmpty) ptr.asTypedList(bytes.length).setAll(0, bytes);
+  return ptr;
+}
+
+final class _BufferWriter {
+  Uint8List _buf = Uint8List(64);
+  ByteData? _view;
+  int _len = 0;
+
+  ByteData get _data => _view ??= ByteData.sublistView(_buf);
+
+  void _ensure(int extra) {
+    if (_len + extra <= _buf.length) return;
+    var cap = _buf.length * 2;
+    while (cap < _len + extra) {
+      cap *= 2;
+    }
+    final next = Uint8List(cap);
+    next.setRange(0, _len, _buf);
+    _buf = next;
+    _view = null;
+  }
+
+  Uint8List takeBytes() => Uint8List.sublistView(_buf, 0, _len);
+
+  void writeBool(bool v) => writeUint8(v ? 1 : 0);
+
+  void writeOptionFlag(bool present) => writeUint8(present ? 1 : 0);
+
+  void writeInt8(int v) {
+    _ensure(1);
+    _data.setInt8(_len, v);
+    _len += 1;
+  }
+
+  void writeUint8(int v) {
+    _ensure(1);
+    _data.setUint8(_len, v);
+    _len += 1;
+  }
+
+  void writeInt16(int v) {
+    _ensure(2);
+    _data.setInt16(_len, v, Endian.little);
+    _len += 2;
+  }
+
+  void writeUint16(int v) {
+    _ensure(2);
+    _data.setUint16(_len, v, Endian.little);
+    _len += 2;
+  }
+
+  void writeInt32(int v) {
+    _ensure(4);
+    _data.setInt32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeUint32(int v) {
+    _ensure(4);
+    _data.setUint32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeInt64(int v) {
+    _ensure(8);
+    _data.setInt64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeUint64(int v) {
+    _ensure(8);
+    _data.setUint64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeFloat32(double v) {
+    _ensure(4);
+    _data.setFloat32(_len, v, Endian.little);
+    _len += 4;
+  }
+
+  void writeFloat64(double v) {
+    _ensure(8);
+    _data.setFloat64(_len, v, Endian.little);
+    _len += 8;
+  }
+
+  void writeLength(int v) => writeUint32(v);
+
+  void writeString(String v) {
+    final bytes = utf8.encode(v);
+    writeLength(bytes.length);
+    _ensure(bytes.length);
+    _buf.setRange(_len, _len + bytes.length, bytes);
+    _len += bytes.length;
+  }
+
+  void writeBytes(List<int> v) {
+    writeLength(v.length);
+    _ensure(v.length);
+    _buf.setRange(_len, _len + v.length, v);
+    _len += v.length;
+  }
+}
+
+final class _BufferReader {
+  final Uint8List _buf;
+  final ByteData _data;
+  int _pos = 0;
+
+  _BufferReader(Uint8List buf)
+      : _buf = buf,
+        _data = ByteData.sublistView(buf);
+
+  int get _remaining => _buf.length - _pos;
+
+  void _require(int n, String context) {
+    if (_remaining < n) _bufferError(context);
+  }
+
+  bool readBool() {
+    _require(1, 'bool');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('bool byte out of range');
+    return b == 1;
+  }
+
+  bool readOptionFlag() {
+    _require(1, 'option flag');
+    final b = _buf[_pos++];
+    if (b > 1) _bufferError('option flag byte out of range');
+    return b == 1;
+  }
+
+  int readInt8() {
+    _require(1, 'i8');
+    return _data.getInt8(_pos++);
+  }
+
+  int readUint8() {
+    _require(1, 'u8');
+    return _buf[_pos++];
+  }
+
+  int readInt16() {
+    _require(2, 'i16');
+    final v = _data.getInt16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readUint16() {
+    _require(2, 'u16');
+    final v = _data.getUint16(_pos, Endian.little);
+    _pos += 2;
+    return v;
+  }
+
+  int readInt32() {
+    _require(4, 'i32');
+    final v = _data.getInt32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readUint32() {
+    _require(4, 'u32');
+    final v = _data.getUint32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  int readInt64() {
+    _require(8, 'i64');
+    final v = _data.getInt64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readUint64() {
+    _require(8, 'u64');
+    final v = _data.getUint64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  double readFloat32() {
+    _require(4, 'f32');
+    final v = _data.getFloat32(_pos, Endian.little);
+    _pos += 4;
+    return v;
+  }
+
+  double readFloat64() {
+    _require(8, 'f64');
+    final v = _data.getFloat64(_pos, Endian.little);
+    _pos += 8;
+    return v;
+  }
+
+  int readLength() {
+    final n = readUint32();
+    if (n > _remaining) _bufferError('length prefix exceeds remaining buffer');
+    return n;
+  }
+
+  String readString() {
+    final n = readLength();
+    final s = utf8.decode(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return s;
+  }
+
+  Uint8List readBytes() {
+    final n = readLength();
+    final b = Uint8List.fromList(Uint8List.sublistView(_buf, _pos, _pos + n));
+    _pos += n;
+    return b;
+  }
+
+  void expectEnd() {
+    if (_remaining != 0) _bufferError('trailing bytes after value');
+  }
+}
+
 /// Typed error domain `GraphicsError` declared by module `graphics`.
 class GraphicsException extends WeaveFFIException {
   GraphicsException(super.code, super.message);
@@ -73,7 +322,7 @@ class OutOfBoundsException extends GraphicsException {
   OutOfBoundsException([String message = 'coordinate out of bounds']) : super(1, message);
 }
 
-WeaveFFIException _mapGraphicsException(int code, String message) {
+WeaveFFIException _mapGraphicsException(int code, String message, Uint8List payload) {
   switch (code) {
     case 1:
       return OutOfBoundsException(message);
@@ -86,8 +335,9 @@ void _checkGraphicsException(Pointer<_WeaveFFIError> err) {
   if (err.ref.code != 0) {
     final code = err.ref.code;
     final msg = err.ref.message.toDartString();
+    final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);
     _weaveffiErrorClear(err);
-    throw _mapGraphicsException(code, msg);
+    throw _mapGraphicsException(code, msg, payload);
   }
 }
 
@@ -103,167 +353,146 @@ enum Unit {
       Unit.values.firstWhere((e) => e.value == value);
 }
 
-typedef _NativeWeaveffiGraphicsCanvasDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsCanvasDestroy = void Function(Pointer<Void>);
-final _weaveffiGraphicsCanvasDestroy = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsCanvasDestroy, _DartWeaveffiGraphicsCanvasDestroy>('weaveffi_graphics_Canvas_destroy');
-
-typedef _NativeWeaveffiGraphicsCanvasGetWidth = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsCanvasGetWidth = int Function(Pointer<Void>);
-final _weaveffiGraphicsCanvasGetWidth = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsCanvasGetWidth, _DartWeaveffiGraphicsCanvasGetWidth>('weaveffi_graphics_Canvas_get_width');
-
-typedef _NativeWeaveffiGraphicsCanvasGetRoot = Pointer<Void> Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsCanvasGetRoot = Pointer<Void> Function(Pointer<Void>);
-final _weaveffiGraphicsCanvasGetRoot = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsCanvasGetRoot, _DartWeaveffiGraphicsCanvasGetRoot>('weaveffi_graphics_Canvas_get_root');
-
 /// Top-level struct that references a struct defined one level deeper.
 class Canvas {
-  final Pointer<Void> _handle;
-  Canvas._(this._handle);
-
-  void dispose() {
-    _weaveffiGraphicsCanvasDestroy(_handle);
-  }
-
-  int get width {
-    final result = _weaveffiGraphicsCanvasGetWidth(_handle);
-    return result;
-  }
-
+  final int width;
   /// Reference down into a nested module
-  Shape get root {
-    final result = _weaveffiGraphicsCanvasGetRoot(_handle);
-    return Shape._(result);
-  }
+  final Shape root;
+
+  Canvas({required this.width, required this.root});
 }
 
-typedef _NativeWeaveffiGraphicsNewCanvas = Pointer<Void> Function(Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiGraphicsNewCanvas = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
+void _packCanvas(_BufferWriter w, Canvas v) {
+  w.writeInt32(v.width);
+  _packShape(w, v.root);
+}
+
+Canvas _unpackCanvas(_BufferReader r) {
+  return Canvas(
+    width: r.readInt32(),
+    root: _unpackShape(r),
+  );
+}
+
+typedef _NativeWeaveffiGraphicsNewCanvas = Pointer<Uint8> Function(Int32, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsNewCanvas = Pointer<Uint8> Function(int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsNewCanvas = _lib.lookupFunction<
     _NativeWeaveffiGraphicsNewCanvas, _DartWeaveffiGraphicsNewCanvas>('weaveffi_graphics_new_canvas');
 
 /// Construct a Canvas.
 Canvas newCanvas(int width) {
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiGraphicsNewCanvas(width, err);
+    final result = _weaveffiGraphicsNewCanvas(width, outLen, err);
     _checkError(err);
-    return Canvas._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackCanvas(reader);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiGraphicsShapesShapeDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsShapesShapeDestroy = void Function(Pointer<Void>);
-final _weaveffiGraphicsShapesShapeDestroy = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsShapesShapeDestroy, _DartWeaveffiGraphicsShapesShapeDestroy>('weaveffi_graphics_shapes_Shape_destroy');
-
-typedef _NativeWeaveffiGraphicsShapesShapeGetSides = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsShapesShapeGetSides = int Function(Pointer<Void>);
-final _weaveffiGraphicsShapesShapeGetSides = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsShapesShapeGetSides, _DartWeaveffiGraphicsShapesShapeGetSides>('weaveffi_graphics_shapes_Shape_get_sides');
-
-typedef _NativeWeaveffiGraphicsShapesShapeGetUnit = Int32 Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsShapesShapeGetUnit = int Function(Pointer<Void>);
-final _weaveffiGraphicsShapesShapeGetUnit = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsShapesShapeGetUnit, _DartWeaveffiGraphicsShapesShapeGetUnit>('weaveffi_graphics_shapes_Shape_get_unit');
-
-typedef _NativeWeaveffiGraphicsShapesShapeGetDetail = Pointer<Void> Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsShapesShapeGetDetail = Pointer<Void> Function(Pointer<Void>);
-final _weaveffiGraphicsShapesShapeGetDetail = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsShapesShapeGetDetail, _DartWeaveffiGraphicsShapesShapeGetDetail>('weaveffi_graphics_shapes_Shape_get_detail');
-
 /// A struct one level deep that references both an ancestor enum and a deeper struct.
 class Shape {
-  final Pointer<Void> _handle;
-  Shape._(this._handle);
-
-  void dispose() {
-    _weaveffiGraphicsShapesShapeDestroy(_handle);
-  }
-
-  int get sides {
-    final result = _weaveffiGraphicsShapesShapeGetSides(_handle);
-    return result;
-  }
-
+  final int sides;
   /// Reference up to the parent module's enum
-  Unit get unit {
-    final result = _weaveffiGraphicsShapesShapeGetUnit(_handle);
-    return Unit.fromValue(result);
-  }
-
+  final Unit unit;
   /// Reference down into a deeper module
-  Detail get detail {
-    final result = _weaveffiGraphicsShapesShapeGetDetail(_handle);
-    return Detail._(result);
-  }
+  final Detail detail;
+
+  Shape({required this.sides, required this.unit, required this.detail});
 }
 
-typedef _NativeWeaveffiGraphicsShapesMakeShape = Pointer<Void> Function(Int32, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiGraphicsShapesMakeShape = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
+void _packShape(_BufferWriter w, Shape v) {
+  w.writeInt32(v.sides);
+  w.writeInt32(v.unit.value);
+  _packDetail(w, v.detail);
+}
+
+Shape _unpackShape(_BufferReader r) {
+  return Shape(
+    sides: r.readInt32(),
+    unit: Unit.fromValue(r.readInt32()),
+    detail: _unpackDetail(r),
+  );
+}
+
+typedef _NativeWeaveffiGraphicsShapesMakeShape = Pointer<Uint8> Function(Int32, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsShapesMakeShape = Pointer<Uint8> Function(int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsShapesMakeShape = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesMakeShape, _DartWeaveffiGraphicsShapesMakeShape>('weaveffi_graphics_shapes_make_shape');
 
 /// Construct a Shape.
 Shape makeShape(int sides) {
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiGraphicsShapesMakeShape(sides, err);
+    final result = _weaveffiGraphicsShapesMakeShape(sides, outLen, err);
     _checkError(err);
-    return Shape._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackShape(reader);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiGraphicsShapesDescribe = Pointer<Void> Function(Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiGraphicsShapesDescribe = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _NativeWeaveffiGraphicsShapesDescribe = Pointer<Uint8> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsShapesDescribe = Pointer<Uint8> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsShapesDescribe = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesDescribe, _DartWeaveffiGraphicsShapesDescribe>('weaveffi_graphics_shapes_describe');
 
 /// Nested function returning a struct owned by an ancestor module.
 Canvas describe() {
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiGraphicsShapesDescribe(err);
+    final result = _weaveffiGraphicsShapesDescribe(outLen, err);
     _checkError(err);
-    return Canvas._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackCanvas(reader);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
 
-typedef _NativeWeaveffiGraphicsShapesGeometryDetailDestroy = Void Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsShapesGeometryDetailDestroy = void Function(Pointer<Void>);
-final _weaveffiGraphicsShapesGeometryDetailDestroy = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsShapesGeometryDetailDestroy, _DartWeaveffiGraphicsShapesGeometryDetailDestroy>('weaveffi_graphics_shapes_geometry_Detail_destroy');
-
-typedef _NativeWeaveffiGraphicsShapesGeometryDetailGetArea = Double Function(Pointer<Void>);
-typedef _DartWeaveffiGraphicsShapesGeometryDetailGetArea = double Function(Pointer<Void>);
-final _weaveffiGraphicsShapesGeometryDetailGetArea = _lib.lookupFunction<
-    _NativeWeaveffiGraphicsShapesGeometryDetailGetArea, _DartWeaveffiGraphicsShapesGeometryDetailGetArea>('weaveffi_graphics_shapes_geometry_Detail_get_area');
-
 /// A struct two levels deep.
 class Detail {
-  final Pointer<Void> _handle;
-  Detail._(this._handle);
+  final double area;
 
-  void dispose() {
-    _weaveffiGraphicsShapesGeometryDetailDestroy(_handle);
-  }
-
-  double get area {
-    final result = _weaveffiGraphicsShapesGeometryDetailGetArea(_handle);
-    return result;
-  }
+  Detail({required this.area});
 }
 
-typedef _NativeWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiGraphicsShapesGeometryCompute = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+void _packDetail(_BufferWriter w, Detail v) {
+  w.writeFloat64(v.area);
+}
+
+Detail _unpackDetail(_BufferReader r) {
+  return Detail(
+    area: r.readFloat64(),
+  );
+}
+
+typedef _NativeWeaveffiGraphicsShapesGeometryCompute = Pointer<Uint8> Function(Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiGraphicsShapesGeometryCompute = Pointer<Uint8> Function(Pointer<Uint8>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
 final _weaveffiGraphicsShapesGeometryCompute = _lib.lookupFunction<
     _NativeWeaveffiGraphicsShapesGeometryCompute, _DartWeaveffiGraphicsShapesGeometryCompute>('weaveffi_graphics_shapes_geometry_compute');
 
@@ -271,12 +500,25 @@ final _weaveffiGraphicsShapesGeometryCompute = _lib.lookupFunction<
 ///
 /// Throws [GraphicsException] on domain errors.
 Detail compute(Shape shape) {
+  final shapeWriter = _BufferWriter();
+  _packShape(shapeWriter, shape);
+  final shapeBuf = shapeWriter.takeBytes();
+  final shapePtr = _stageBytes(shapeBuf);
+  final outLen = calloc<Size>();
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiGraphicsShapesGeometryCompute(shape._handle, err);
+    final result = _weaveffiGraphicsShapesGeometryCompute(shapePtr, shapeBuf.length, outLen, err);
     _checkGraphicsException(err);
-    return Detail._(result);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final value = _unpackDetail(reader);
+    reader.expectEnd();
+    return value;
   } finally {
+    calloc.free(shapePtr);
+    calloc.free(outLen);
     calloc.free(err);
   }
 }
