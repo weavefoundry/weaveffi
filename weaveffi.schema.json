@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.5.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.6.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "package": {
@@ -329,15 +329,11 @@
           ]
         },
         "fields": {
-          "description": "The fields in declaration order; order is preserved in the generated type and its constructors.",
+          "description": "The fields in declaration order; order is preserved in the generated type, its constructors, and its serialized buffer encoding.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/StructField"
           }
-        },
-        "builder": {
-          "description": "Whether to also emit a builder API for constructing the struct field by field, alongside the all-fields constructor. Defaults to `false`.",
-          "type": "boolean"
         }
       }
     },
@@ -536,6 +532,13 @@
             "string",
             "null"
           ]
+        },
+        "fields": {
+          "description": "Structured payload fields this error carries beyond its code and message, serialized across the ABI in the error's payload buffer. Empty for a plain code. Payload fields reuse [`StructField`] but ignore the `default` slot.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/StructField"
+          }
         }
       }
     }
