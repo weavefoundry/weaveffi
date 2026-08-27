@@ -384,8 +384,9 @@ public:
 
 namespace detail {
 
-/** Map a `graphics` error code and payload to its typed exception (GraphicsError for unknown codes). */
+/** Map a `graphics` error code and payload to its typed exception (WeaveFFIError for runtime codes, GraphicsError for unknown codes). */
 inline std::exception_ptr make_graphics_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
+    if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
     switch (code) {
     case 1: return std::make_exception_ptr(OutOfBoundsError(msg));
     default: return std::make_exception_ptr(GraphicsError(code, msg));

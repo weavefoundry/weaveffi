@@ -240,7 +240,11 @@ impl CallTarget {
         match self {
             CallTarget::Method(ty) => quote! {
                 if __wv_self.is_null() {
-                    ::weaveffi::abi::error_set(out_err, -1, "self is null");
+                    ::weaveffi::abi::error_set(
+                        out_err,
+                        ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                        "self is null",
+                    );
                     return #sentinel;
                 }
                 let __wv_obj: &#ty = unsafe { &*__wv_self };

@@ -424,8 +424,9 @@ public:
 
 namespace detail {
 
-/** Map a `docs` error code and payload to its typed exception (DocsErrorsError for unknown codes). */
+/** Map a `docs` error code and payload to its typed exception (WeaveFFIError for runtime codes, DocsErrorsError for unknown codes). */
 inline std::exception_ptr make_docs_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
+    if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
     switch (code) {
     case 1: return std::make_exception_ptr(NotFoundError(msg));
     case 2: return std::make_exception_ptr(InvalidStatusError(msg));

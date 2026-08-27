@@ -32,8 +32,9 @@
 //!   `#[weaveffi::listener(event = "Name")]` declares an event listener.
 //!
 //! The type mapping mirrors the IDL: `String`/`&str` are strings, `Vec<u8>` and
-//! `&[u8]` are byte buffers, `u64` is an opaque `handle`, `*mut T`/`*const T` is
-//! a typed handle, and other named paths are records, enums, or interfaces
+//! `&[u8]` are byte buffers, every integer primitive (including `u64`) is the
+//! matching scalar, `weaveffi::Handle` is an opaque `handle`, `*mut T`/`*const T`
+//! is a typed handle, and other named paths are records, enums, or interfaces
 //! resolved later.
 
 #![deny(missing_docs)]
@@ -215,8 +216,9 @@ fn is_cancel_token(ty: &syn::Type) -> bool {
 ///
 /// * `String` is an owned `string`, `&str` a borrowed one; `Vec<u8>` is owned
 ///   `bytes`, `&[u8]` borrowed.
-/// * a bare `u64` is an opaque `handle` (reach for the IR directly for a real
-///   `u64` scalar), and `*mut T` / `*const T` is a typed `handle<T>`.
+/// * every integer primitive maps to its matching scalar (`u64` included);
+///   `weaveffi::Handle` is the opaque `handle`, and `*mut T` / `*const T` is a
+///   typed `handle<T>`.
 /// * `Vec<T>`, `Option<T>`, and `HashMap`/`BTreeMap` map to list, optional, and
 ///   map types; any other named path is a record or enum reference.
 ///
@@ -268,7 +270,10 @@ pub fn type_ref_from_syn(ty: &syn::Type) -> syn::Result<TypeRef> {
                 "f64" => Ok(TypeRef::F64),
                 "bool" => Ok(TypeRef::Bool),
                 "String" => Ok(TypeRef::StringUtf8),
-                "u64" => Ok(TypeRef::Handle),
+                "u64" => Ok(TypeRef::U64),
+                // `weaveffi::Handle` (an alias of `u64`) is the explicit
+                // opaque-handle spelling; a bare `u64` is a real scalar.
+                "Handle" => Ok(TypeRef::Handle),
                 "Vec" => {
                     let inner = single_generic_arg(seg)?;
                     if is_ident(inner, "u8") {
@@ -909,7 +914,7 @@ mod tests {
             m.functions[0].returns,
             Some(TypeRef::Named("Contact".into()))
         );
-        assert_eq!(m.functions[0].params[0].ty, TypeRef::Handle);
+        assert_eq!(m.functions[0].params[0].ty, TypeRef::U64);
     }
 
     #[test]
@@ -992,7 +997,7 @@ mod tests {
             #[weaveffi::module]
             mod m {
                 #[weaveffi::export]
-                pub fn open() -> u64 { 0 }
+                pub fn open() -> weaveffi::Handle { 0 }
                 #[weaveffi::export]
                 pub fn close(token: *mut Token) {}
             }
@@ -1003,6 +1008,24 @@ mod tests {
             m.functions[1].params[0].ty,
             TypeRef::TypedHandle("Token".into())
         );
+    }
+
+    #[test]
+    fn bare_u64_is_a_scalar_not_a_handle() {
+        let m = one_module(
+            r#"
+            #[weaveffi::module]
+            mod m {
+                #[weaveffi::export]
+                pub fn sum(values: Vec<u8>) -> u64 { 0 }
+                #[weaveffi::export]
+                pub fn token(h: Handle) -> Handle { h }
+            }
+        "#,
+        );
+        assert_eq!(m.functions[0].returns, Some(TypeRef::U64));
+        assert_eq!(m.functions[1].params[0].ty, TypeRef::Handle);
+        assert_eq!(m.functions[1].returns, Some(TypeRef::Handle));
     }
 
     #[test]

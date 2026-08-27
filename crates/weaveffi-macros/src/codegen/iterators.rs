@@ -93,7 +93,11 @@ pub(crate) fn gen_iterator_function(
     let next_body = wrap_unwind(
         quote! {
             if iter.is_null() || out_item.is_null() {
-                ::weaveffi::abi::error_set(out_err, -1, "iterator or out_item is null");
+                ::weaveffi::abi::error_set(
+                    out_err,
+                    ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                    "iterator or out_item is null",
+                );
                 return 0;
             }
             let __wv_it = unsafe { &mut *iter };

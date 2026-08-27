@@ -207,7 +207,11 @@ pub(crate) fn gen_async_function(
         pre_spawn.extend(quote! {
             if __wv_self.is_null() {
                 let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
-                ::weaveffi::abi::error_set(&mut __wv_e, -1, "self is null");
+                ::weaveffi::abi::error_set(
+                    &mut __wv_e,
+                    ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                    "self is null",
+                );
                 callback(context, &mut __wv_e #(, #sentinels)*);
                 ::weaveffi::abi::error_clear(&mut __wv_e);
                 return;
