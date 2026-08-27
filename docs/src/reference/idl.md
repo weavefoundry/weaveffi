@@ -1335,9 +1335,10 @@ modules:
   namespace; two declarations lowering to the same symbol are rejected.
 - `throws: true` requires an error domain in scope: on the same module or an
   ancestor module.
-- Error codes must be non-zero (and not `-2`, which is reserved for producer
-  panics) and unique within their domain. Error code **names** must be
-  unique within their domain and across every domain in the API.
+- Error codes must be positive (`0` means success and negative codes are
+  reserved for the runtime) and unique within their domain. Error code
+  **names** must be unique within their domain and across every domain in
+  the API.
 - Error domain names must not collide with function names in the same
   module.
 - Async functions are allowed. Async void functions (no return type) emit a
@@ -1460,8 +1461,9 @@ Declaring `throws: true` with no domain in scope is a validation error.
 
 ### Validation
 
-- Codes must be non-zero (`0` means success) and must not be `-2` (reserved
-  for producer panics).
+- Codes must be positive: `0` means success, and the negative range is
+  reserved for the runtime (`-1` generic error, `-2` producer panic, `-3`
+  marshalling failure).
 - Numeric codes must be unique within a domain.
 - Code names must be unique within a domain **and across every domain in
   the API**: backends with flat namespaces derive one error class or

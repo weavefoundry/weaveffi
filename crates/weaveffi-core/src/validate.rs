@@ -100,9 +100,10 @@ pub enum ValidationError {
     },
     /// An error code uses a reserved value: `0` means success and `-2` is the
     /// panic code the runtime reports when a producer panics.
-    #[error("invalid error code in module '{module}' for '{name}': must not be 0 or -2")]
+    #[error("invalid error code in module '{module}' for '{name}': must be a positive integer")]
     #[diagnostic(help(
-        "0 means success and -2 is reserved for producer panics; use another integer"
+        "0 means success and negative codes are reserved for the runtime (-1 generic, \
+         -2 panic, -3 marshalling failure); use a positive integer"
     ))]
     InvalidErrorCode {
         /// Module that contains the error domain.

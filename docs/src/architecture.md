@@ -81,8 +81,8 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 | `weaveffi-bridge`    | The single Rust-to-IR extractor: maps `#[weaveffi::module]`-annotated source (`syn` AST) to an `Api`. Shared by the proc-macro and the CLI's `extract`/`generate <file.rs>`. |
 | `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro family. Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). Emission is decomposed into nine focused submodules under `src/codegen/` (sync calls, async launchers, iterators, records, enums, interfaces, callbacks, marshalling, and shared helpers), each stating which clause of the `weaveffi_core::plan` contracts it implements. |
 | `weaveffi`           | The producer facade a Rust cdylib depends on: re-exports the `weaveffi-macros` attributes, `export_runtime!`, and `weaveffi-abi` as `weaveffi::abi`. |
-| `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
-| `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata).                    |
+| `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `wire` classification of buffer contents, the `lang` per-language keyword tables, the `manifest` escaping helpers, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
+| `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata). Each follows a shared internal layout; see [Generator crate layout](#generator-crate-layout). |
 | `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry in `config.rs`), and dispatches the `Orchestrator`. Subcommands live under `commands/` (`generate`, `validate`, `diff`, `format`, `package`, `new`, `watch`); `doctor.rs`, `extract.rs`, and `scaffold.rs` sit beside `main.rs`; `config.rs` holds the target registry and config resolution; `report.rs` formats CLI output. |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
@@ -246,7 +246,8 @@ Errors enforced today:
 - `event_callback` on a listener must reference a callback in the same
   module.
 - Error domain name must not collide with a function name in the same
-  module; codes must be non-zero and unique within the domain; code names
+  module; codes must be positive (`0` means success and negative codes
+  are reserved for the runtime) and unique within the domain; code names
   must be unique across every domain in the API.
 
 Warnings emitted today:
@@ -414,6 +415,19 @@ managed by the `CodeWriter` toolkit (see below) rather than by hand-rolled
   doc-comment emission (`emit_doc`), and `pascal_case` naming.
 - `plan`: the marshalling plan, the language-neutral calling contracts
   every backend renders (see [The marshalling plan](#the-marshalling-plan)).
+- `wire`: the canonical classification of every IR type into its wire
+  shape inside a value buffer (`wire::classify` folds a `TypeRef` into a
+  `WireType`), so backend codec emitters dispatch on one closed alphabet
+  instead of each re-deriving the folds (handles encode as `u64` tokens,
+  borrowed views encode like their owned forms, records and rich enums
+  share one user-codec shape).
+- `lang`: per-language reserved-word tables (`PYTHON_KEYWORDS`,
+  `GO_KEYWORDS`, …) and the single `escape_ident` rule (a reserved name
+  gains a trailing underscore), so a field named `type` or a parameter
+  named `class` emits valid code in every target.
+- `manifest`: JSON and XML escaping plus an insertion-ordered
+  `JsonObject` builder for package manifests (`package.json`, `.nuspec`,
+  …), so user-supplied names and descriptions can't corrupt quoting.
 
 ### The `CodeWriter` emission toolkit
 
@@ -552,6 +566,12 @@ language-neutral statement of the calling contracts every backend
 renders, the questions the eleven generators used to answer
 independently (and inconsistently):
 
+- **Passing.** `ArgPass` (`ParamBinding::arg_pass()`) and `RetPass`
+  (`plan::ret_pass`): how one parameter or return crosses the boundary
+  (a direct scalar slot, a string pointer, a bytes or buffer
+  `ptr`/`len` pair, or an object handle), so marshalling code dispatches
+  on the plan instead of re-deriving the shape from `TypeRef` with local
+  `is_buffered` checks.
 - **Errors.** `ErrorStrategy` (`Throws` | `Trap`): when a call reports
   through `out_err`, is the non-zero code a typed domain error the
   caller can catch (`throws: true`), or a producer bug the wrapper must
@@ -584,6 +604,28 @@ yield one element per `_next`, and error dispatch follows
 by construction. When a generator needs a free/destroy or throws/trap
 decision, it should consume the plan rather than re-derive the fact
 with a local match.
+
+## Generator crate layout
+
+Every `weaveffi-gen-*` crate follows one internal layout so a reader who
+knows one backend can navigate the other ten. `lib.rs` stays small: the
+crate docs, the config struct, the generator type, and the
+`LanguageBackend` wiring. The rendering lives in focused modules, named
+consistently across the crates (a backend omits a module its target
+doesn't need):
+
+| Module        | Responsibility                                                    |
+| ------------- | ----------------------------------------------------------------- |
+| `types.rs`    | Target type mapping, identifier naming and keyword escaping       |
+| `docs.rs`     | Doc-comment emission in the target's comment syntax               |
+| `codec.rs`    | Value-buffer encode/decode emitters, dispatched on `wire::classify` |
+| `runtime.rs`  | The fixed runtime prelude the generated code relies on            |
+| `calls.rs`    | Sync/async/iterator wrappers, callbacks, listeners, marshalling   |
+| `entities.rs` | Enums, records, interfaces, typed error domains                   |
+| `package.rs`  | Ecosystem manifests and READMEs                                   |
+| `tests.rs`    | The crate's test module, via `#[cfg(test)] mod tests;`            |
+
+The Go backend (`weaveffi-gen-go`) is the reference layout.
 
 ## Determinism
 

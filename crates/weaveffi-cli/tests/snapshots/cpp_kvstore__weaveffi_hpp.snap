@@ -487,8 +487,9 @@ public:
 
 namespace detail {
 
-/** Map a `kv` error code and payload to its typed exception (KvError for unknown codes). */
+/** Map a `kv` error code and payload to its typed exception (WeaveFFIError for runtime codes, KvError for unknown codes). */
 inline std::exception_ptr make_kv_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
+    if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
     switch (code) {
     case 1001: return std::make_exception_ptr(KeyNotFoundError(msg));
     case 1002: return std::make_exception_ptr(ExpiredError(msg));

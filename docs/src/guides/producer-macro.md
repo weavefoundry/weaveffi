@@ -116,18 +116,19 @@ You write ordinary Rust types; the macro picks the matching ABI shape:
 
 | Rust type | IDL type | C ABI shape |
 |-----------|----------|-------------|
-| `i8`..`i64`, `u8`..`u32`, `f32`, `f64`, `bool` | same | the scalar |
+| `i8`..`i64`, `u8`..`u64`, `f32`, `f64`, `bool` | same | the scalar |
 | `String`, `&str` | `string` | `const char*` |
 | `Vec<u8>`, `&[u8]` | `bytes` | `const uint8_t* ptr, size_t len` |
-| `u64` | `handle` | `weaveffi_handle_t` |
+| `weaveffi::Handle` | `handle` | `weaveffi_handle_t` |
 | `*mut T`, `*const T` | `handle<T>` | opaque `T*` |
 | a `#[weaveffi::record]` struct | the record | serialized value buffer (`ptr` + `len`) |
 | a `#[weaveffi::enumeration]` enum | the enum | `int`-sized discriminant |
 | `Option<T>` | `T?` | serialized value buffer (nullable pointer for `Option<Interface>`) |
 | `Vec<T>` | `[T]` | serialized value buffer (`ptr` + `len`) |
 
-A `u64` parameter or return is an opaque `handle`. Reach for the IDL directly
-if you need a real 64-bit scalar. See
+Every integer primitive (including `u64`) is the matching scalar. Spell an
+opaque token as `weaveffi::Handle` (an alias of `u64`) to declare the IDL
+`handle` type. See
 [Annotated Rust Extraction](extract.md#type-mapping) for the exhaustive table.
 
 ## Records

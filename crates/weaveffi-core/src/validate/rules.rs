@@ -790,8 +790,10 @@ fn validate_error_domain(
     let mut by_name: BTreeSet<String> = BTreeSet::new();
     let mut by_code: BTreeMap<i32, String> = BTreeMap::new();
     for c in &domain.codes {
-        // 0 means success and -2 is the runtime's reserved panic code.
-        if c.code == 0 || c.code == -2 {
+        // 0 means success and the whole negative range is reserved for the
+        // runtime (-1 generic error, -2 panic, -3 marshalling failure, and
+        // room to grow), so domain codes must be positive.
+        if c.code <= 0 {
             errors.push(ValidationError::InvalidErrorCode {
                 module: module.name.clone(),
                 name: c.name.clone(),

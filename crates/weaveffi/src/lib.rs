@@ -72,11 +72,17 @@ pub use weaveffi_abi::CancelToken;
 
 /// Maps a producer error onto the ABI's `(code, message)` pair. A fallible
 /// `#[weaveffi::export]` function reports `Err(e)` through its trailing
-/// `out_err` slot using this trait, so every [`std::fmt::Display`] error gets
-/// the generic code `-1`, while a type that implements
-/// [`ErrorReport`] directly surfaces the named codes
-/// of an IDL error domain.
+/// `out_err` slot using this trait: `String` and `&str` errors get the
+/// generic code `-1` out of the box, while a `#[weaveffi::error]` enum (or a
+/// manual [`ErrorReport`] impl) surfaces the named codes of an IDL error
+/// domain.
 pub use weaveffi_abi::ErrorReport;
+
+/// The opaque `handle` type: a `u64` token whose value round-trips through
+/// consumers unchanged. Spell producer parameters and returns as
+/// `weaveffi::Handle` to extract them as the IDL `handle` type; a bare `u64`
+/// extracts as the `u64` scalar.
+pub use weaveffi_abi::Handle;
 
 pub use weaveffi_macros::{
     callback, cancellable, enumeration, error, export, interface, listener, module, record,

@@ -53,7 +53,8 @@ pub(crate) fn lift_param(
     // owned Rust value the producer's signature names; the concrete type
     // (including the map flavor `HashMap`/`BTreeMap`) is inferred from the
     // call site. A malformed buffer is a producer/consumer contract
-    // violation, reported through `out_err` like any invalid argument.
+    // violation, reported through `out_err` with the reserved marshalling
+    // code so it can't shadow a domain's typed codes.
     if is_buffered(&pb.ty) {
         let ptr = ident(&format!("{}_ptr", pb.name));
         let len = ident(&format!("{}_len", pb.name));
@@ -65,7 +66,11 @@ pub(crate) fn lift_param(
                 match ::weaveffi::abi::decode_value(__wv_buf) {
                     ::std::result::Result::Ok(__v) => __v,
                     ::std::result::Result::Err(_) => {
-                        ::weaveffi::abi::error_set(out_err, 1, #decode_msg);
+                        ::weaveffi::abi::error_set(
+                            out_err,
+                            ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                            #decode_msg,
+                        );
                         return #sentinel;
                     }
                 }
@@ -83,7 +88,11 @@ pub(crate) fn lift_param(
                 let #name = match #et::__weaveffi_from_i32(#name) {
                     ::std::option::Option::Some(__v) => __v,
                     ::std::option::Option::None => {
-                        ::weaveffi::abi::error_set(out_err, 1, #msg);
+                        ::weaveffi::abi::error_set(
+                            out_err,
+                            ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                            #msg,
+                        );
                         return #sentinel;
                     }
                 };
@@ -95,24 +104,37 @@ pub(crate) fn lift_param(
                 let #name = match ::weaveffi::abi::c_ptr_to_string(#name) {
                     ::std::option::Option::Some(__s) => __s,
                     ::std::option::Option::None => {
-                        ::weaveffi::abi::error_set(out_err, 1, #msg);
+                        ::weaveffi::abi::error_set(
+                            out_err,
+                            ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                            #msg,
+                        );
                         return #sentinel;
                     }
                 };
             };
             (pre, owned())
         }
+        // A borrowed string is lifted zero-copy: the thunk borrows the
+        // caller's NUL-terminated buffer for the duration of the call, which
+        // is the whole point of a producer taking `&str` over `String`.
         TypeRef::BorrowedStr => {
             let pre = quote! {
-                let #name = match ::weaveffi::abi::c_ptr_to_string(#name) {
+                // SAFETY: the C contract guarantees the argument is null or a
+                // NUL-terminated string valid for the duration of the call.
+                let #name = match unsafe { ::weaveffi::abi::c_ptr_to_str(#name) } {
                     ::std::option::Option::Some(__s) => __s,
                     ::std::option::Option::None => {
-                        ::weaveffi::abi::error_set(out_err, 1, #msg);
+                        ::weaveffi::abi::error_set(
+                            out_err,
+                            ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                            #msg,
+                        );
                         return #sentinel;
                     }
                 };
             };
-            (pre, by_ref())
+            (pre, owned())
         }
         TypeRef::Bytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
@@ -142,7 +164,11 @@ pub(crate) fn lift_param(
             }
             let pre = quote! {
                 if #name.is_null() {
-                    ::weaveffi::abi::error_set(out_err, 1, #msg);
+                    ::weaveffi::abi::error_set(
+                        out_err,
+                        ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                        #msg,
+                    );
                     return #sentinel;
                 }
                 let #name = unsafe { &*#name };

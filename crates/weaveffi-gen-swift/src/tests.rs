@@ -1,8 +1,9 @@
 use super::*;
+use crate::types::swift_type_for;
 use weaveffi_core::codegen::Generator;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
-    StructField,
+    StructField, TypeRef,
 };
 
 fn make_api(modules: Vec<Module>) -> Api {
@@ -3304,5 +3305,220 @@ fn strip_module_prefix_defaults_to_true() {
         !wrapper.contents.contains("contactsCreateContact"),
         "default must not emit prefixed names: {}",
         wrapper.contents
+    );
+}
+
+#[test]
+fn keyword_params_are_escaped() {
+    let api = make_api(vec![Module {
+        name: "kw".into(),
+        functions: vec![plain_fn(
+            "load",
+            vec![
+                p("import", TypeRef::StringUtf8),
+                p("class", TypeRef::I32),
+                p("normal", TypeRef::Bool),
+            ],
+            Some(TypeRef::I32),
+        )],
+        structs: vec![],
+        enums: vec![],
+        callbacks: vec![],
+        listeners: vec![],
+        interfaces: vec![],
+        errors: None,
+        modules: vec![],
+    }]);
+    let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+    // Reserved parameter names gain the shared trailing underscore in the
+    // signature, and every derived local follows the escaped spelling.
+    assert!(
+        out.contains(
+            "public static func load(import_: String, class_: Int32, normal: Bool) -> Int32 {"
+        ),
+        "reserved parameter names must be escaped: {out}"
+    );
+    assert!(
+        out.contains("import_.withCString { import__ptr in"),
+        "staged locals must derive from the escaped name: {out}"
+    );
+    assert!(
+        out.contains("weaveffi_kw_load(import__ptr, class_, normal, &err)"),
+        "the C call must pass the escaped bindings: {out}"
+    );
+}
+
+#[test]
+fn keyword_fields_are_escaped() {
+    let api = make_api(vec![Module {
+        name: "kw".into(),
+        functions: vec![plain_fn(
+            "configure",
+            vec![p("options", TypeRef::Record("Options".into()))],
+            Some(TypeRef::Record("Options".into())),
+        )],
+        structs: vec![StructDef {
+            name: "Options".into(),
+            doc: None,
+            fields: vec![
+                field("default", TypeRef::Bool),
+                field("in", TypeRef::StringUtf8),
+                field("plain", TypeRef::I32),
+            ],
+        }],
+        enums: vec![],
+        callbacks: vec![],
+        listeners: vec![],
+        interfaces: vec![],
+        errors: None,
+        modules: vec![],
+    }]);
+    let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+    // Reserved field names are escaped in the property, the initializer, and
+    // both codec directions.
+    assert!(
+        out.contains("public var default_: Bool") && out.contains("public var in_: String"),
+        "reserved field names must be escaped in properties: {out}"
+    );
+    assert!(
+        out.contains("public init(default_: Bool, in_: String, plain: Int32) {"),
+        "the memberwise init must use the escaped labels: {out}"
+    );
+    assert!(
+        out.contains("w.writeBool(value.default_)") && out.contains("w.writeString(value.in_)"),
+        "the pack codec must read the escaped properties: {out}"
+    );
+    assert!(
+        out.contains("return Options(default_: v0, in_: v1, plain: v2)"),
+        "the unpack codec must label the escaped fields: {out}"
+    );
+    // Non-reserved names pass through untouched.
+    assert!(
+        out.contains("public var plain: Int32"),
+        "plain names must not gain an underscore: {out}"
+    );
+}
+
+#[test]
+fn package_swift_escapes_quotes_in_module_name() {
+    let api = make_api(vec![empty_module("calc")]);
+    let model = BindingModel::build(&api, "weaveffi");
+    let files = LanguageBackend::files(
+        &SwiftGenerator,
+        &api,
+        &model,
+        Utf8Path::new("/out"),
+        &SwiftConfig {
+            module_name: Some("Weird\"Name\\".into()),
+            ..SwiftConfig::default()
+        },
+    );
+    let pkg = files
+        .iter()
+        .find(|f| f.path.as_str().ends_with("Package.swift"))
+        .expect("Package.swift present");
+    assert!(
+        pkg.contents.contains("name: \"Weird\\\"Name\\\\\""),
+        "quotes and backslashes in the module name must be escaped: {}",
+        pkg.contents
+    );
+    assert!(
+        !pkg.contents.contains("name: \"Weird\"Name"),
+        "an unescaped quote would corrupt the manifest: {}",
+        pkg.contents
+    );
+}
+
+/// Domain error codes are validated positive; the reserved negative runtime
+/// codes (`-1` generic, `-2` panic, `-3` marshalling) must never gain typed
+/// cases and must fall through to the generic brand error on throwing paths.
+#[test]
+fn negative_runtime_codes_fall_through_to_brand_error() {
+    let api = make_api(vec![Module {
+        name: "calc".into(),
+        functions: vec![
+            Function {
+                throws: true,
+                ..plain_fn(
+                    "div",
+                    vec![p("a", TypeRef::I32), p("b", TypeRef::I32)],
+                    Some(TypeRef::I32),
+                )
+            },
+            plain_fn("add", vec![p("a", TypeRef::I32)], Some(TypeRef::I32)),
+            Function {
+                r#async: true,
+                throws: true,
+                ..plain_fn("adiv", vec![], Some(TypeRef::I32))
+            },
+            Function {
+                r#async: true,
+                ..plain_fn("aadd", vec![], Some(TypeRef::I32))
+            },
+        ],
+        structs: vec![],
+        enums: vec![],
+        callbacks: vec![],
+        listeners: vec![],
+        interfaces: vec![],
+        errors: Some(ErrorDomain {
+            name: "CalcError".into(),
+            codes: vec![ErrorCode {
+                name: "DivByZero".into(),
+                code: 1,
+                message: "division by zero".into(),
+                doc: None,
+                fields: vec![],
+            }],
+        }),
+        modules: vec![],
+    }]);
+    let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
+
+    // The mapper carries one arm per declared (positive) code and nothing
+    // else: no negative arm can shadow the runtime's reserved range.
+    let map = &out[out.find("func mapCalc(").expect("mapCalc emitted")..];
+    let map = &map[..map.find("\n}").expect("mapCalc body ends")];
+    assert!(
+        map.contains("case 1: return CalcError.divByZero("),
+        "declared code must map to the typed case: {map}"
+    );
+    assert!(
+        !map.contains("case -"),
+        "no negative code may gain a typed case: {map}"
+    );
+    assert!(
+        map.contains("default: return WeaveFFIError.error(code: code, message: message)"),
+        "unknown (negative runtime) codes must fall through to the brand error: {map}"
+    );
+
+    // Throwing sync path: codes route through the domain checker, whose
+    // fallback is the brand error above.
+    let div = &out[out.find("func div(").expect("div body")..];
+    assert!(
+        div.contains("try checkCalc(&err)"),
+        "throwing fn must check through the domain mapper: {out}"
+    );
+    // Non-throwing sync path: any reported code (necessarily a runtime code)
+    // traps.
+    let add = &out[out.find("func add(").expect("add body")..];
+    assert!(
+        add[..add.find("\n    }").unwrap_or(add.len())].contains("trap(&err)"),
+        "non-throwing fn must trap: {out}"
+    );
+    // Throwing async path: the completion callback resumes with the mapped
+    // error (brand error for negative codes).
+    let adiv = &out[out.find("func adiv(").expect("adiv body")..];
+    assert!(
+        adiv.contains(
+            "contRef.value.resume(throwing: mapCalc(code: code, message: msg, payload: payload))"
+        ),
+        "throwing async fn must resume with the mapped error: {out}"
+    );
+    // Non-throwing async path: the completion callback traps.
+    let aadd = &out[out.find("func aadd(").expect("aadd body")..];
+    assert!(
+        aadd.contains("fatalError(\"\\(code): \\(msg)\")"),
+        "non-throwing async fn must trap on a reported error: {out}"
     );
 }

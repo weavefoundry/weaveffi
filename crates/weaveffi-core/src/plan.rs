@@ -5,6 +5,10 @@
 //! signatures are*. This module answers the questions one level up, the ones
 //! the eleven generators used to answer independently (and inconsistently):
 //!
+//! * **Passing** ([`ArgPass`], [`RetPass`]): how each argument crosses into
+//!   its ABI slots (by value, pinned string/bytes, serialized value buffer,
+//!   or borrowed object pointer) and what the wrapper does with the result
+//!   (use, copy, decode, or adopt) before any owed release.
 //! * **Errors** ([`ErrorStrategy`]): when a call reports through `out_err`,
 //!   is that a typed domain error the caller can catch, or a producer bug the
 //!   wrapper must trap on?
@@ -24,7 +28,8 @@
 use weaveffi_ir::ir::TypeRef;
 
 use crate::abi::lower::{is_buffered, split_qualified};
-use crate::model::{AsyncBinding, FnBinding, IteratorBinding};
+use crate::abi::AbiParam;
+use crate::model::{AsyncBinding, FnBinding, IteratorBinding, ParamBinding};
 
 /// How a callable's `out_err` slot is interpreted by idiomatic wrappers.
 ///
@@ -59,6 +64,183 @@ impl FnBinding {
         } else {
             ErrorStrategy::Trap
         }
+    }
+}
+
+/// How one parameter crosses the call boundary: the passing contract a
+/// wrapper renders when marshalling its native argument into ABI slots.
+///
+/// Exactly one variant applies to any parameter, and the borrowed
+/// [`AbiParam`] references point at the parameter's own precomputed slots,
+/// so a backend that dispatches on this enum cannot disagree with the C
+/// header about arity or slot order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgPass<'a> {
+    /// One slot passed by value: scalars, bools, C-style enums, and handles
+    /// (including typed handles, whose slot is an opaque pointer).
+    Direct {
+        /// The single ABI slot.
+        slot: &'a AbiParam,
+    },
+    /// One `char*` slot. The wrapper encodes UTF-8 plus a NUL terminator
+    /// and keeps the encoding alive for the duration of the call; the
+    /// producer copies what it needs.
+    String {
+        /// The single `char*` slot.
+        slot: &'a AbiParam,
+    },
+    /// A borrowed `(ptr, len)` byte pair. The wrapper pins its native byte
+    /// storage for the call; the producer copies what it needs.
+    Bytes {
+        /// The `uint8_t*` data slot.
+        ptr: &'a AbiParam,
+        /// The `size_t` length slot.
+        len: &'a AbiParam,
+    },
+    /// A buffered value (record, rich enum, optional, list, or map): the
+    /// wrapper serializes it into the value-buffer wire format
+    /// ([`crate::wire`]), passes the encoding as a borrowed `(ptr, len)`
+    /// pair, and releases its own encoding after the call returns.
+    Buffer {
+        /// The `const uint8_t*` data slot.
+        ptr: &'a AbiParam,
+        /// The `size_t` length slot.
+        len: &'a AbiParam,
+    },
+    /// A borrowed object pointer: the wrapper passes the wrapped object's
+    /// native handle and retains ownership. When `nullable`, the IDL type is
+    /// `Interface?` and null means none.
+    Object {
+        /// The single object-pointer slot.
+        slot: &'a AbiParam,
+        /// `true` for `Interface?`: null is a legal "none" argument.
+        nullable: bool,
+    },
+}
+
+impl ParamBinding {
+    /// The passing contract for this parameter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameter's precomputed ABI slots disagree with its IR
+    /// type's shape, which would be a bug in the model construction, not a
+    /// user error.
+    pub fn arg_pass(&self) -> ArgPass<'_> {
+        let pair = || {
+            assert!(
+                self.abi.len() == 2,
+                "two-slot parameter '{}' must have exactly two ABI slots",
+                self.name
+            );
+            (&self.abi[0], &self.abi[1])
+        };
+        let single = || {
+            assert!(
+                self.abi.len() == 1,
+                "single-slot parameter '{}' must have exactly one ABI slot",
+                self.name
+            );
+            &self.abi[0]
+        };
+        if is_buffered(&self.ty) {
+            let (ptr, len) = pair();
+            return ArgPass::Buffer { ptr, len };
+        }
+        match &self.ty {
+            TypeRef::StringUtf8 | TypeRef::BorrowedStr => ArgPass::String { slot: single() },
+            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+                let (ptr, len) = pair();
+                ArgPass::Bytes { ptr, len }
+            }
+            TypeRef::Interface(_) => ArgPass::Object {
+                slot: single(),
+                nullable: false,
+            },
+            // Only `Interface?` reaches here; every other optional is
+            // buffered.
+            TypeRef::Optional(_) => ArgPass::Object {
+                slot: single(),
+                nullable: true,
+            },
+            _ => ArgPass::Direct { slot: single() },
+        }
+    }
+}
+
+/// How a callable's result crosses back to the wrapper: the receiving
+/// contract, including the decode step and the release obligation.
+///
+/// This is [`ReturnFree`] completed with the *decode* dimension: a bytes
+/// return and a buffered return share a free obligation but differ in what
+/// the wrapper does before freeing (copy versus decode). Only the sync and
+/// async call shapes consult this; an iterator's result contract lives in
+/// [`IteratorProtocol`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetPass {
+    /// No return value.
+    Void,
+    /// By-value return (scalar, bool, C-style enum, handle): use directly,
+    /// nothing to free.
+    Direct,
+    /// Owned `const char*`: copy into the native string, then release with
+    /// `{runtime}_free_string`.
+    String,
+    /// Owned `(const uint8_t*, out_len)` raw bytes: copy, then release with
+    /// `{runtime}_free_bytes`.
+    Bytes,
+    /// Owned `(const uint8_t*, out_len)` value buffer: decode via the wire
+    /// format ([`crate::wire`]), then release with `{runtime}_free_bytes`.
+    Buffer,
+    /// An owned object reference the wrapper adopts into its disposal idiom.
+    /// When `nullable`, the IDL type is `Interface?` and a null return means
+    /// none.
+    Object {
+        /// The `{prefix}_{module}_{Name}_destroy` symbol the adopted
+        /// reference eventually owes.
+        destroy_symbol: String,
+        /// `true` for `Interface?`: a null return is a legal "none" result.
+        nullable: bool,
+    },
+}
+
+/// The receiving contract for a value of type `ty` returned from a callable
+/// declared inside `module` under `prefix`. `None` (a void return) is
+/// [`RetPass::Void`].
+///
+/// # Panics
+///
+/// Panics on an iterator return, whose contract is [`IteratorProtocol`], not
+/// a value-passing plan; backends dispatch on
+/// [`CallShape`](crate::model::CallShape) before consulting this.
+pub fn ret_pass(ty: Option<&TypeRef>, module: &str, prefix: &str) -> RetPass {
+    let Some(ty) = ty else {
+        return RetPass::Void;
+    };
+    if is_buffered(ty) {
+        return RetPass::Buffer;
+    }
+    match ty {
+        TypeRef::StringUtf8 | TypeRef::BorrowedStr => RetPass::String,
+        TypeRef::Bytes | TypeRef::BorrowedBytes => RetPass::Bytes,
+        TypeRef::Interface(name) => RetPass::Object {
+            destroy_symbol: destroy_symbol(name, module, prefix),
+            nullable: false,
+        },
+        // Only `Interface?` reaches here (every other optional is buffered).
+        TypeRef::Optional(inner) => {
+            let TypeRef::Interface(name) = inner.as_ref() else {
+                unreachable!("only optional interfaces escape buffering")
+            };
+            RetPass::Object {
+                destroy_symbol: destroy_symbol(name, module, prefix),
+                nullable: true,
+            }
+        }
+        TypeRef::Iterator(_) => {
+            panic!("iterator returns follow IteratorProtocol, not a RetPass")
+        }
+        _ => RetPass::Direct,
     }
 }
 
@@ -320,6 +502,103 @@ mod tests {
             ),
             ReturnFree::OwnedObject {
                 destroy_symbol: "weaveffi_kv_Store_destroy".into()
+            }
+        );
+    }
+
+    #[test]
+    fn arg_pass_classifies_every_family() {
+        use crate::abi::lower_param;
+        let pb = |name: &str, ty: TypeRef| ParamBinding {
+            abi: lower_param(name, &ty, "m", false),
+            name: name.into(),
+            ty,
+            mutable: false,
+            doc: None,
+        };
+
+        assert!(matches!(
+            pb("x", TypeRef::I32).arg_pass(),
+            ArgPass::Direct { slot } if slot.name == "x"
+        ));
+        assert!(matches!(
+            pb("h", TypeRef::Handle).arg_pass(),
+            ArgPass::Direct { .. }
+        ));
+        assert!(matches!(
+            pb("s", TypeRef::StringUtf8).arg_pass(),
+            ArgPass::String { slot } if slot.name == "s"
+        ));
+        assert!(matches!(
+            pb("data", TypeRef::Bytes).arg_pass(),
+            ArgPass::Bytes { ptr, len } if ptr.name == "data_ptr" && len.name == "data_len"
+        ));
+        assert!(matches!(
+            pb("c", TypeRef::Record("Contact".into())).arg_pass(),
+            ArgPass::Buffer { ptr, len } if ptr.name == "c_ptr" && len.name == "c_len"
+        ));
+        assert!(matches!(
+            pb("o", TypeRef::Optional(Box::new(TypeRef::I32))).arg_pass(),
+            ArgPass::Buffer { .. }
+        ));
+        assert!(matches!(
+            pb("store", TypeRef::Interface("Store".into())).arg_pass(),
+            ArgPass::Object {
+                nullable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            pb(
+                "store",
+                TypeRef::Optional(Box::new(TypeRef::Interface("Store".into())))
+            )
+            .arg_pass(),
+            ArgPass::Object { nullable: true, .. }
+        ));
+    }
+
+    #[test]
+    fn ret_pass_distinguishes_copy_decode_and_adopt() {
+        assert_eq!(ret_pass(None, "m", "weaveffi"), RetPass::Void);
+        assert_eq!(
+            ret_pass(Some(&TypeRef::I64), "m", "weaveffi"),
+            RetPass::Direct
+        );
+        assert_eq!(
+            ret_pass(Some(&TypeRef::StringUtf8), "m", "weaveffi"),
+            RetPass::String
+        );
+        assert_eq!(
+            ret_pass(Some(&TypeRef::Bytes), "m", "weaveffi"),
+            RetPass::Bytes
+        );
+        assert_eq!(
+            ret_pass(Some(&TypeRef::Record("Contact".into())), "m", "weaveffi"),
+            RetPass::Buffer
+        );
+        assert_eq!(
+            ret_pass(
+                Some(&TypeRef::Interface("kv.Store".into())),
+                "m",
+                "weaveffi"
+            ),
+            RetPass::Object {
+                destroy_symbol: "weaveffi_kv_Store_destroy".into(),
+                nullable: false,
+            }
+        );
+        assert_eq!(
+            ret_pass(
+                Some(&TypeRef::Optional(Box::new(TypeRef::Interface(
+                    "Store".into()
+                )))),
+                "kv",
+                "weaveffi"
+            ),
+            RetPass::Object {
+                destroy_symbol: "weaveffi_kv_Store_destroy".into(),
+                nullable: true,
             }
         );
     }

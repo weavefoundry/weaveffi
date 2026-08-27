@@ -105,6 +105,12 @@ c_contacts() {
         && "$OUT/c_contacts"
 }
 
+cpp_contacts() {
+    clang++ -std=c++17 -I "$GENROOT/contacts/cpp" "$ROOT/conformance/cpp/contacts.cpp" \
+        -L "$LIBDIR" -lcontacts -o "$OUT/cpp_contacts" \
+        && "$OUT/cpp_contacts"
+}
+
 c_events() {
     clang -I "$GENROOT/events/c" "$ROOT/conformance/c/events.c" \
         -L "$LIBDIR" -levents -o "$OUT/c_events" \
@@ -437,6 +443,7 @@ kotlin_consumer() {
         java -Djava.library.path="$b" -cp "$b/app.jar:$coro" Main
 }
 
+kotlin_contacts() { kotlin_consumer contacts contacts.kt; }
 kotlin_events()  { kotlin_consumer events events.kt; }
 kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
 kotlin_shapes()  { kotlin_consumer shapes shapes.kt; }
@@ -464,6 +471,7 @@ wasm_consumer() {
         node --experimental-wasm-type-reflection "$ROOT/conformance/wasm/$src"
 }
 
+wasm_contacts() { wasm_consumer contacts contacts.mjs; }
 wasm_events()  { wasm_consumer events events.mjs; }
 wasm_kvstore() { wasm_consumer kvstore kvstore.mjs; }
 wasm_shapes()  { wasm_consumer shapes shapes.mjs; }
@@ -490,6 +498,7 @@ generate calculator samples/calculator/calculator.yml
 check c-contacts c_contacts
 check c-events c_events
 check c-kvstore c_kvstore
+check cpp-contacts cpp_contacts
 check cpp-events cpp_events
 check cpp-kvstore cpp_kvstore
 check c-shapes c_shapes
@@ -525,8 +534,10 @@ check dotnet-kvstore dotnet_kvstore
 check node-contacts node_contacts
 check node-events node_events
 check node-kvstore node_kvstore
+check kotlin-contacts kotlin_contacts
 check kotlin-events kotlin_events
 check kotlin-kvstore kotlin_kvstore
+check wasm-contacts wasm_contacts
 check wasm-events wasm_events
 check wasm-kvstore wasm_kvstore
 

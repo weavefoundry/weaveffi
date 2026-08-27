@@ -171,7 +171,7 @@ mod kitchen {
 
     /// Returns an opaque handle
     #[weaveffi::export]
-    fn open_handle() -> u64 {
+    fn open_handle() -> weaveffi::Handle {
         0
     }
 

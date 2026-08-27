@@ -438,8 +438,9 @@ public:
 
 namespace detail {
 
-/** Map a `products` error code and payload to its typed exception (ProductsError for unknown codes). */
+/** Map a `products` error code and payload to its typed exception (WeaveFFIError for runtime codes, ProductsError for unknown codes). */
 inline std::exception_ptr make_products_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
+    if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
     switch (code) {
     case 1: return std::make_exception_ptr(InvalidPriceError(msg));
     case 2: return std::make_exception_ptr(ProductNotFoundError(msg));
@@ -478,8 +479,9 @@ public:
 
 namespace detail {
 
-/** Map a `orders` error code and payload to its typed exception (OrdersError for unknown codes). */
+/** Map a `orders` error code and payload to its typed exception (WeaveFFIError for runtime codes, OrdersError for unknown codes). */
 inline std::exception_ptr make_orders_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
+    if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
     switch (code) {
     case 1: return std::make_exception_ptr(OrderNotFoundError(msg));
     case 2: return std::make_exception_ptr(EmptyOrderError(msg));

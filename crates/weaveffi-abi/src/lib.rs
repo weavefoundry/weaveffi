@@ -25,6 +25,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Public opaque handle type exposed to foreign callers.
 pub type weaveffi_handle_t = u64;
 
+/// The producer-side spelling of the IDL's opaque `handle` type.
+///
+/// An alias of `u64`; the token's value is opaque to consumers and round-trips
+/// unchanged. Spell a parameter or return as `weaveffi::Handle` to extract it
+/// as `handle`; a bare `u64` extracts as the `u64` scalar instead.
+pub type Handle = u64;
+
 /// Error struct passed across the C ABI boundary.
 ///
 /// # Safety
@@ -135,13 +142,15 @@ pub fn error_set_with_payload(
 /// A fallible `#[weaveffi::export]` function returning `Result<T, E>` reports
 /// `Err(e)` through its trailing `out_err` slot by writing
 /// [`ErrorReport::code`] and [`ErrorReport::message`] into the caller's
-/// [`weaveffi_error`]. A blanket implementation covers every [`Display`] type,
-/// reporting the generic code `-1`, so `Result<T, String>` and
-/// `Result<T, MyDisplayError>` need no extra code.
+/// [`weaveffi_error`]. `String` and `&str` errors are covered out of the box
+/// with the generic code `-1`, so `Result<T, String>` needs no extra code.
 ///
-/// To surface the named codes of an IDL error domain so consumers can react to
-/// each case, implement this trait directly on your error type (and do not
-/// implement [`Display`] for it, which would collide with the blanket impl):
+/// The `#[weaveffi::error]` expansion implements this trait for an IDL error
+/// domain's enum, surfacing the domain's named codes so consumers can react
+/// to each case. Because there's no blanket implementation, your error type
+/// is free to also derive or implement [`Display`](std::fmt::Display) and
+/// [`std::error::Error`] (for example via `thiserror`). To implement the
+/// trait by hand:
 ///
 /// ```
 /// use weaveffi_abi::ErrorReport;
@@ -166,8 +175,6 @@ pub fn error_set_with_payload(
 ///     }
 /// }
 /// ```
-///
-/// [`Display`]: std::fmt::Display
 pub trait ErrorReport {
     /// The non-zero status code written to [`weaveffi_error::code`]. Defaults to
     /// the generic error code `-1`.
@@ -187,7 +194,25 @@ pub trait ErrorReport {
     }
 }
 
-impl<E: std::fmt::Display> ErrorReport for E {
+impl ErrorReport for String {
+    fn message(&self) -> String {
+        self.clone()
+    }
+}
+
+impl ErrorReport for &str {
+    fn message(&self) -> String {
+        (*self).to_string()
+    }
+}
+
+impl ErrorReport for Box<dyn std::error::Error> {
+    fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl ErrorReport for Box<dyn std::error::Error + Send + Sync> {
     fn message(&self) -> String {
         self.to_string()
     }
@@ -219,8 +244,21 @@ pub fn result_to_out_err<T, E: ErrorReport>(
 /// Generated thunks wrap the producer call in `catch_unwind`; a panic is
 /// reported through `out_err` with this code so the consumer can distinguish
 /// "the producer has a bug" from any declared domain error. Validation rejects
-/// error domains that try to claim this value (or `0`, which means success).
+/// error domains that try to claim a reserved code (`0`, which means success,
+/// or any negative value).
 pub const PANIC_ERROR_CODE: i32 = -2;
+
+/// The reserved error code reporting a **marshalling failure**: an argument
+/// that could not be lifted at the boundary (a null or invalid pointer, a
+/// non-UTF-8 string, an out-of-range enum discriminant, or a malformed value
+/// buffer).
+///
+/// Both sides are generated from the same IDL, so a marshalling failure is a
+/// producer/consumer contract violation, not a domain error; wrappers surface
+/// it through the same trap channel as [`PANIC_ERROR_CODE`]. Before this code
+/// existed, generated thunks reported lift failures with code `1`, which any
+/// error domain could legally claim as a typed code.
+pub const MARSHAL_ERROR_CODE: i32 = -3;
 
 /// Best-effort extraction of a panic payload's message (`&str` and `String`
 /// payloads; anything else yields a fixed placeholder).
@@ -506,6 +544,28 @@ pub fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
     c.to_str().ok().map(|s| s.to_owned())
 }
 
+/// Borrow a NUL-terminated C string as a `&str` without copying.
+/// Returns `None` if `ptr` is null or the bytes aren't valid UTF-8.
+///
+/// This is the zero-copy lift for a `&str` parameter: the generated thunk
+/// borrows the caller's buffer for the duration of the call instead of
+/// allocating an owned `String`.
+///
+/// # Safety
+///
+/// `ptr` must be null or point to a NUL-terminated string that stays valid
+/// (and unmodified) for the caller-chosen lifetime `'a`. Generated thunks
+/// bound that lifetime by the call, matching the C contract that string
+/// arguments are borrowed for the call's duration.
+pub unsafe fn c_ptr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees `ptr` is NUL-terminated and valid for 'a.
+    let c = unsafe { CStr::from_ptr(ptr) };
+    c.to_str().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,8 +665,9 @@ mod tests {
         error_clear(&mut err);
     }
 
-    // A domain error type that does *not* implement `Display`, so it can carry
-    // its own `ErrorReport` impl without colliding with the blanket one.
+    // A domain error type carrying its own `ErrorReport` impl. It could also
+    // implement `Display` and `std::error::Error` freely; there's no blanket
+    // impl to collide with.
     enum DomainError {
         NotFound,
         Io(String),
@@ -628,10 +689,44 @@ mod tests {
     }
 
     #[test]
-    fn error_report_blanket_display_uses_generic_code() {
+    fn error_report_string_uses_generic_code() {
         let e = "boom".to_string();
         assert_eq!(ErrorReport::code(&e), -1);
         assert_eq!(ErrorReport::message(&e), "boom");
+        assert_eq!(ErrorReport::code(&"boom"), -1);
+        assert_eq!(ErrorReport::message(&"boom"), "boom");
+    }
+
+    #[test]
+    fn error_report_coexists_with_display_impls() {
+        // The point of dropping the blanket impl: a domain error can derive
+        // or implement `Display`/`Error` and still carry its own codes.
+        #[derive(Debug)]
+        struct Both;
+        impl std::fmt::Display for Both {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "both")
+            }
+        }
+        impl std::error::Error for Both {}
+        impl ErrorReport for Both {
+            fn code(&self) -> i32 {
+                7
+            }
+            fn message(&self) -> String {
+                "both".to_string()
+            }
+        }
+        assert_eq!(ErrorReport::code(&Both), 7);
+    }
+
+    #[test]
+    fn c_ptr_to_str_borrows_without_copying() {
+        let owned = CString::new("borrowed").unwrap();
+        // SAFETY: `owned` outlives the borrow.
+        let s = unsafe { c_ptr_to_str(owned.as_ptr()) }.unwrap();
+        assert_eq!(s, "borrowed");
+        assert_eq!(unsafe { c_ptr_to_str(ptr::null()) }, None);
     }
 
     #[test]

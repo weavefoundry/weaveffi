@@ -196,7 +196,8 @@ field in the IR.
 | `bool`               | `Bool`                   | `bool`           |
 | `String`             | `StringUtf8`             | `string`         |
 | `Vec<u8>`            | `Bytes`                  | `bytes`          |
-| `u64`                | `Handle`                 | `handle`         |
+| `u64`                | `U64`                    | `u64`            |
+| `weaveffi::Handle`   | `Handle`                 | `handle`         |
 | `&str`               | `BorrowedStr`            | `&str`           |
 | `&[u8]`              | `BorrowedBytes`          | `&[u8]`          |
 | `*mut T` / `*const T`| `TypedHandle("T")`       | `handle<T>`      |

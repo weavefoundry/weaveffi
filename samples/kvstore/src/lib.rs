@@ -409,11 +409,11 @@ mod tests {
     fn open_null_path_errors() {
         let _g = setup();
         let mut err = new_err();
-        // A `string` parameter rejects a null pointer with the macro's generic
-        // input-validation code (1), before `open` ever runs.
+        // A `string` parameter rejects a null pointer with the reserved
+        // marshalling code, before `open` ever runs.
         let s = weaveffi_kv_Store_open(std::ptr::null(), &mut err);
         assert!(s.is_null());
-        assert_eq!(err.code, 1);
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
         abi::error_clear(&mut err);
     }
 
@@ -429,11 +429,11 @@ mod tests {
     fn null_self_method_call_reports_error() {
         let _g = setup();
         let mut err = new_err();
-        // A method thunk rejects a null object pointer with the generic
-        // code -1 before touching the producer.
+        // A method thunk rejects a null object pointer with the reserved
+        // marshalling code before touching the producer.
         let n = weaveffi_kv_Store_count(std::ptr::null(), &mut err);
         assert_eq!(n, 0);
-        assert_eq!(err.code, -1);
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
         abi::error_clear(&mut err);
     }
 
@@ -464,7 +464,7 @@ mod tests {
         let mut err = new_err();
         let key = CString::new("k").unwrap();
         // An out-of-range `EntryKind` discriminant is rejected by the macro's
-        // enum lift with the generic input code (1).
+        // enum lift with the reserved marshalling code.
         let ttl = abi::encode_value(&None::<i64>);
         let ok = weaveffi_kv_Store_put(
             s,
@@ -477,7 +477,7 @@ mod tests {
             &mut err,
         );
         assert!(!ok);
-        assert_eq!(err.code, 1);
+        assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
         abi::error_clear(&mut err);
         weaveffi_kv_Store_destroy(s);
     }

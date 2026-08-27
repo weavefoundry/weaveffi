@@ -96,8 +96,9 @@ for the wire format.
 
 The validator enforces:
 
-- `code = 0` is reserved for success and `-2` for producer panics;
-  any other non-zero value is allowed.
+- Codes must be positive. `0` is reserved for success and the whole
+  negative range belongs to the runtime (`-1` generic error, `-2`
+  producer panic, `-3` marshalling failure).
 - Numeric codes are unique within a domain.
 - Code names are unique within a domain **and across every domain in the
   API**. Backends with flat namespaces derive one error class or constant
@@ -176,7 +177,7 @@ pub extern "C" fn weaveffi_contacts_get_contact(
 | `error_set_ok(out_err)`                | Sets `code = 0`, frees any prior message and payload |
 | `error_set(out_err, code, msg)`        | Sets a non-zero code and allocates a message        |
 | `error_set_with_payload(out_err, code, msg, payload)` | Like `error_set`, plus an owned payload buffer (the code's fields in value-buffer format) |
-| `result_to_out_err(result, out_err)`   | Maps `Result<T, E>` through `ErrorReport` (domain code, message, and payload for implementors, generic `-1` for plain `Display` errors) |
+| `result_to_out_err(result, out_err)`   | Maps `Result<T, E>` through `ErrorReport` (domain code, message, and payload for implementors, generic `-1` for `String` and `&str` errors) |
 | `error_set_panic(out_err, payload)`    | Reports a caught panic with the reserved code `-2`  |
 
 Hand-written `ErrorReport` implementations can override the trait's
@@ -304,14 +305,16 @@ At the ABI level, `weaveffi_error.code` means:
 | Code               | Meaning                                              |
 |--------------------|------------------------------------------------------|
 | `0`                | Success                                              |
-| a declared code    | A typed producer error from the module's domain      |
-| `-1`               | Generic error (null self, bad input, string errors)  |
+| a declared code    | A typed producer error from the module's domain (always positive) |
+| `-1`               | Generic error (a `Result<T, String>` producer error) |
 | `-2`               | Producer panic (`PANIC_ERROR_CODE`)                  |
-| `1`                | Invalid argument from marshalling                    |
+| `-3`               | Marshalling failure (`MARSHAL_ERROR_CODE`): a null or invalid argument, a non-UTF-8 string, an out-of-range enum value, or a malformed value buffer |
 
-On the typed path, a wrapper maps a non-zero code to the matching declared
-case of the domain type and falls back to the generic branded error for
-any code the domain doesn't declare.
+Domain codes are validated positive-only, so the two ranges can't
+collide: on the typed path a wrapper maps a positive code to the
+matching declared case of the domain type and falls back to the generic
+branded error for any code the domain doesn't declare (including every
+negative runtime code).
 
 ### Per-target surface
 
@@ -319,7 +322,7 @@ Per target, the two strategies surface as:
 
 | Target   | Throws (`throws: true`)                     | Trap (producer bug)                      |
 |----------|----------------------------------------------|------------------------------------------|
-| C        | `weaveffi_error { code, message, payload }` struct | same struct (code `-2` or `1`)     |
+| C        | `weaveffi_error { code, message, payload }` struct | same struct (code `-2` or `-3`)    |
 | Swift    | `throws`, typed domain enum                  | `fatalError`                             |
 | Python   | `raise`, domain exception subclass           | `raise WeaveFFIError`                    |
 | Kotlin   | `throw`, typed domain exception              | `throw WeaveFFIException`                |
@@ -354,9 +357,9 @@ See the [Memory Ownership Guide](memory.md) for the freeing contract on
   payload are Rust-allocated. Skipping the clear leaks them.
 - **Reading `err.message` after clearing**: the pointer is invalid as
   soon as `weaveffi_error_clear` returns.
-- **Using `code = 0` or `code = -2` as a domain value**: the validator
-  rejects both; `0` always means success and `-2` is reserved for
-  producer panics.
+- **Using `0` or a negative number as a domain code**: the validator
+  rejects both; `0` always means success and negative codes are reserved
+  for the runtime (`-1` generic, `-2` panic, `-3` marshalling failure).
 - **Reusing a code name in two domains**: code names are unique across
   the whole API, so the validator rejects a second `NotFound`. Qualify
   one of them (`OrderNotFound`).
