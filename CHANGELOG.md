@@ -1,3 +1,13 @@
+## [0.19.0](https://github.com/weavefoundry/weaveffi/compare/v0.18.0...v0.19.0) (2026-08-27)
+
+### ⚠ BREAKING CHANGES
+
+* rebuild generators on a shared wire and marshalling core (#34)
+
+### Features
+
+* rebuild generators on a shared wire and marshalling core ([#34](https://github.com/weavefoundry/weaveffi/issues/34)) ([ec32618](https://github.com/weavefoundry/weaveffi/commit/ec326184756bed1d0bf88b3b788fd2c703911fd9))
+
 ## [0.18.0](https://github.com/weavefoundry/weaveffi/compare/v0.17.0...v0.18.0) (2026-08-26)
 
 ### ⚠ BREAKING CHANGES
