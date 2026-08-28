@@ -1,3 +1,13 @@
+## [0.20.0](https://github.com/weavefoundry/weaveffi/compare/v0.19.0...v0.20.0) (2026-08-28)
+
+### ⚠ BREAKING CHANGES
+
+* adopt consumer-owned async results and a resolved IR boundary (#35)
+
+### Features
+
+* adopt consumer-owned async results and a resolved IR boundary ([#35](https://github.com/weavefoundry/weaveffi/issues/35)) ([4dd3c85](https://github.com/weavefoundry/weaveffi/commit/4dd3c854581b90a82f7f3bae53a14df15d292d5d))
+
 ## [0.19.0](https://github.com/weavefoundry/weaveffi/compare/v0.18.0...v0.19.0) (2026-08-27)
 
 ### ⚠ BREAKING CHANGES
