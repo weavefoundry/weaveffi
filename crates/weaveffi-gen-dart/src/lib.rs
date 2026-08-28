@@ -28,6 +28,7 @@ mod tests;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{
@@ -37,7 +38,6 @@ use weaveffi_core::model::{
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::calls::{render_callback_typedef, render_function, render_listener};
 use crate::entities::{render_enum, render_error, render_interface, render_struct};
@@ -106,7 +106,12 @@ impl DartGenerator {
     /// [`LanguageBackend::emit_members`] walk over every module. Shared by the
     /// [`LanguageBackend::files`] and [`LanguageBackend::package`] hooks so
     /// there is one assembly path.
-    fn render_dart_source(&self, api: &Api, model: &BindingModel, config: &DartConfig) -> String {
+    fn render_dart_source(
+        &self,
+        api: &ResolvedApi,
+        model: &BindingModel,
+        config: &DartConfig,
+    ) -> String {
         let input_basename = config.input_basename();
         let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
         let has_async = model
@@ -252,7 +257,7 @@ impl LanguageBackend for DartGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -292,7 +297,7 @@ impl LanguageBackend for DartGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,

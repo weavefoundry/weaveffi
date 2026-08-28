@@ -56,6 +56,11 @@ typedef struct weaveffi_error {
 } weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
+
+/* Async completion callbacks receive a heap-boxed error the consumer
+   owns; weaveffi_error_free releases the message, the payload, and the
+   box itself. Passing NULL is a safe no-op. */
+WEAVEFFI_API void weaveffi_error_free(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
 WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 

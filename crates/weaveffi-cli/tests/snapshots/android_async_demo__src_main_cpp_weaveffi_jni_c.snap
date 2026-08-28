@@ -75,12 +75,15 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err, c
             jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
             if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
         }
+        jint jcode = (jint)err->code;
+        weaveffi_error_free(err);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;[B)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);
+        (*env)->CallVoidMethod(env, ctx->callback, mid, jcode, jmsg, jpayload);
     } else {
         jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);
         if (boxed && result_ptr) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result_ptr); }
+        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
@@ -117,12 +120,15 @@ static void weaveffi_tasks_run_batch_jni_cb(void* context, weaveffi_error* err, 
             jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
             if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
         }
+        jint jcode = (jint)err->code;
+        weaveffi_error_free(err);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;[B)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);
+        (*env)->CallVoidMethod(env, ctx->callback, mid, jcode, jmsg, jpayload);
     } else {
         jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);
         if (boxed && result_ptr) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result_ptr); }
+        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
@@ -170,9 +176,11 @@ static void weaveffi_tasks_run_n_tasks_jni_cb(void* context, weaveffi_error* err
             jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
             if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
         }
+        jint jcode = (jint)err->code;
+        weaveffi_error_free(err);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;[B)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);
+        (*env)->CallVoidMethod(env, ctx->callback, mid, jcode, jmsg, jpayload);
     } else {
         jclass boxCls = (*env)->FindClass(env, "java/lang/Integer");
         jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, "valueOf", "(I)Ljava/lang/Integer;");

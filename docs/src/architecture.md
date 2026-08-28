@@ -18,7 +18,8 @@ Parse        ── weaveffi-ir::parse (IDL) | weaveffi-bridge (.rs): builds an 
    │
    ▼
 Validate     ── weaveffi-core::validate: rejects errors, collects warnings,
-   │            and rewrites every parsed type reference to its resolved kind
+   │            rewrites every parsed type reference to its resolved kind,
+   │            and wraps the result in a `ResolvedApi` proof type
    │
    ▼
 Resolve      ── weaveffi-cli `CliConfig`: merges --config TOML and the
@@ -174,9 +175,14 @@ pass (`weaveffi_core::validate::resolve_type_refs`, run by
 `validate_api` after the rule checks pass) rewrites each occurrence
 into `Record` (a struct), `RichEnum` (an algebraic enum), `Enum` (a
 C-style enum), or `Interface`, and qualifies cross-module references
-with the owning module's dot-joined path. Generators run strictly
-post-resolution: no `Named` reference remains, and a generator may
-treat one as a bug (the core ABI lowering panics on it). `Record` and
+with the owning module's dot-joined path. The post-resolution
+guarantee is carried in the type system:
+`weaveffi_core::resolved::ResolvedApi` wraps an `Api` that has passed
+validation and resolution, and it is the only way to reach
+`BindingModel::build`, the `LanguageBackend` trait, and the
+`Orchestrator`. Generators therefore run strictly post-resolution: no
+`Named` reference remains, and a generator may treat one as a bug (the
+core ABI lowering panics on it). `Record` and
 `RichEnum` are *buffered* types (`weaveffi_core::abi::is_buffered`
 returns true for both, along with optionals, lists, and maps): they
 cross the ABI by value as one serialized `(const uint8_t*, size_t)`
@@ -184,10 +190,9 @@ pair (see the [Value Buffer Protocol](reference/value-buffers.md)),
 while `Enum` lowers by value as an integer.
 
 Every IR type derives `Debug`, `Clone`, `PartialEq`, `Serialize`, and
-`Deserialize`. `Eq` is derived where possible; a few types (`Api`,
-`Module`, `StructDef`, `StructField`) intentionally omit `Eq` because
-they transitively contain `f64` (in default values) or
-`serde_yaml::Value`.
+`Deserialize`. `Eq` is derived everywhere except `Api` itself, which
+omits it because its `generators` overrides hold `toml::Value`, which
+contains `f64`.
 
 `TypeRef` (de)serializes as a string with custom syntax (`i32`,
 `handle<T>`, `[T]`, `{K:V}`, `T?`, `&str`, `&[u8]`). The parser is
@@ -196,7 +201,7 @@ JSON Schema export rely on it.
 
 ### Schema versioning
 
-`CURRENT_SCHEMA_VERSION` (currently `"0.6.0"`) lives in
+`CURRENT_SCHEMA_VERSION` (currently `"0.7.0"`) lives in
 [`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
 contains exactly the current version; older schema revisions are rejected
 by validation with an actionable error. When you change the schema:
@@ -211,10 +216,15 @@ external contract; this section is the implementation note.
 
 ## Validation
 
-`weaveffi_core::validate::validate_api` is the single entry point.
-It returns a `Vec<ValidationError>` (errors that must be fixed before
-generation) and a separate `Vec<ValidationWarning>` (advisory; the
-`lint` subcommand surfaces these).
+`weaveffi_core::validate::validate_api` is the single entry point. It
+consumes the parsed `Api` and returns
+`Result<ResolvedApi, ValidationDiagnostics>`: on success the API has
+passed every rule check and type-reference resolution, and the
+`ResolvedApi` proof type is the only way into the generation stage; on
+failure the diagnostics carry every error found, each renderable as an
+actionable miette report. Advisory warnings are separate:
+`validate::collect_warnings` returns `Vec<ValidationWarning>`, which
+the `lint` subcommand surfaces.
 
 Errors enforced today:
 
@@ -339,10 +349,10 @@ pub trait Generator: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Render the bindings under `out_dir`.
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
+    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
 
     /// Files `generate` would write (used by `--dry-run` and `diff`).
-    fn output_files(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String>;
+    fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String>;
 }
 ```
 
@@ -370,7 +380,7 @@ pub trait LanguageBackend: Send + Sync {
 
     /// The single required hook: assemble every output file. Rendering is
     /// pure; the driver performs the actual writes.
-    fn files(&self, api: &Api, model: &BindingModel,
+    fn files(&self, api: &ResolvedApi, model: &BindingModel,
              out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile>;
 
     /// Canonical per-module walk (error → enums → structs → interfaces →
@@ -390,11 +400,13 @@ backend's `prefix`), calls `files`, and writes each `OutputFile`
 (creating parent directories). `backend::output_files` calls the same
 `files` and returns the sorted path list, so `generate` and
 `output_files` are derived from a single source and **cannot drift**.
-Python is the reference single-pass backend (it overrides the per-entity
-hooks and composes `emit_members`); Ruby, .NET, Node, and Android are
-multi-pass (their FFI declarations, wrapper classes, and secondary
-surfaces such as the JNI C shim are emitted in their own passes inside
-`files`).
+Python, Ruby, Go, Dart, and .NET are single-pass backends: they
+override the per-entity hooks and compose `emit_members` inside their
+module scoping. The rest build their layout directly in `files`: C and
+C++ order declarations by dependency, Swift splits types from the
+namespaced module body, and Android, Node, and Wasm each render
+parallel files (Kotlin + JNI C, addon C + JS, JS + `.d.ts`) in their
+own passes.
 
 Generators emit code into a `String`; there is no template-engine layer
 (an early Tera prototype intended for user template overrides was removed
@@ -411,8 +423,8 @@ managed by the `CodeWriter` toolkit (see below) rather than by hand-rolled
 - `codegen::writer::CodeWriter`: the structured code-emission toolkit
   (see [The `CodeWriter` emission toolkit](#the-codewriter-emission-toolkit)).
 - `codegen::common`: module-tree traversal (`walk_modules`,
-  `walk_modules_with_path`), the `is_c_pointer_type` ABI classifier,
-  doc-comment emission (`emit_doc`), and `pascal_case` naming.
+  `walk_modules_with_path`), doc-comment emission (`emit_doc`), and
+  `pascal_case` naming.
 - `plan`: the marshalling plan, the language-neutral calling contracts
   every backend renders (see [The marshalling plan](#the-marshalling-plan)).
 - `wire`: the canonical classification of every IR type into its wire
@@ -589,16 +601,17 @@ independently (and inconsistently):
   destroy-exactly-once handle lifecycle.
 - **Async.** `AsyncProtocol` (`AsyncBinding::protocol`): the
   completion-callback contract: the callback fires exactly once from an
-  arbitrary producer thread, borrowed result buffers are valid only for
-  the callback's duration, and owned-object results are adopted by the
-  consumer.
+  arbitrary producer thread, and everything it receives is owned by the
+  consumer: result buffers are released through the runtime free
+  symbols, a heap-boxed error through `{prefix}_error_free`, and
+  owned-object results are adopted.
 
 Generators are thin syntax backends over this shared plan: a backend
 that renders these plans in its own syntax cannot drift from the others
 on semantics; only the spelling differs. The producer side consumes the
 same contracts: each `weaveffi-macros` codegen submodule states which
-plan clause it implements (the generated `_async` launchers free
-borrowed result buffers after the callback returns, iterator thunks
+plan clause it implements (the generated `_async` launchers hand the
+callback owned results and a heap-boxed error, iterator thunks
 yield one element per `_next`, and error dispatch follows
 `ErrorStrategy`), so the emitted glue and every consumer wrapper agree
 by construction. When a generator needs a free/destroy or throws/trap

@@ -481,6 +481,9 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_free(IntPtr err);
+
         [DllImport(LibName, EntryPoint = "weaveffi_graphics_new_canvas", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_graphics_new_canvas(int width, out UIntPtr out_len, ref WeaveFFIError err);
 

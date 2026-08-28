@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # Conformance consumer: contacts sample, Ruby target.
 #
-# Drives the 0.6.0 value-type surface: Contact is a plain Ruby value class
+# Drives the 0.7.0 value-type surface: Contact is a plain Ruby value class
 # decoded from the value buffer the producer returns (the optional email is
 # nil-able and the list return is a native Array), while ContactBook stays an
 # owned interface handle released through FFI::AutoPointer. Throwing methods

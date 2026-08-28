@@ -22,7 +22,6 @@
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Serialize;
-use weaveffi_ir::ir::Api;
 
 use crate::capabilities::TargetCapabilities;
 use crate::model::{
@@ -30,6 +29,7 @@ use crate::model::{
     ListenerBinding, ModuleBinding, StructBinding,
 };
 use crate::package::{PackageContext, PackagedFile};
+use crate::resolved::ResolvedApi;
 
 /// A single generated file: its full path (under the output directory) and the
 /// rendered contents. Backends return these from [`LanguageBackend::files`];
@@ -61,14 +61,18 @@ impl OutputFile {
 /// [`OutputFile`] model (rendering is pure; the driver does the I/O), an
 /// automatically-derived `output_files`, and one uniform `Generator` bridge.
 ///
-/// Backends whose primary file is a straightforward per-module walk override
-/// the per-entity hooks (`render_enum`, `render_struct`, `render_function`, and
-/// optionally `render_callback`/`render_listener`) and call the provided
+/// Backends whose primary file is a straightforward per-module walk (Python,
+/// Ruby, Go, Dart, .NET) override the per-entity hooks (`render_enum`,
+/// `render_struct`, `render_function`, and optionally
+/// `render_callback`/`render_listener`) and call the provided
 /// [`emit_members`](Self::emit_members) from inside their module scoping; that
 /// is what removes the hand-rolled walk + call-shape dispatch each generator
-/// used to carry. Multi-pass backends (Ruby, .NET, Node, Android) instead build
-/// their own layout directly in [`files`](Self::files) and leave the hooks at
-/// their no-op defaults.
+/// used to carry. Backends whose output is not one linear pass leave the hooks
+/// at their no-op defaults and build their layout directly in
+/// [`files`](Self::files): C and C++ order declarations by dependency, Swift
+/// splits types from the namespaced module body, and Android, Node, and Wasm
+/// each render parallel files (Kotlin + JNI C, addon C + JS, JS + `.d.ts`)
+/// that would each need their own walk anyway.
 ///
 /// Each hook renders into a `String` (matching how generators accumulate
 /// output) and is responsible for emitting its own doc comments; doc-comment
@@ -224,14 +228,14 @@ pub trait LanguageBackend: Send + Sync {
 
     /// Assemble the complete output set. The driver has already built `model`
     /// (via [`BindingModel::build`] with [`prefix`](Self::prefix)) and passes
-    /// the source `api` too, for the rare file (e.g. a `.pyi` stub) that needs
-    /// the raw IR. Most backends render a primary source file by composing
-    /// [`emit_members`](Self::emit_members) over `model.modules`, then append
-    /// package manifests (`package.json`, `pyproject.toml`, `go.mod`, …) as
-    /// additional [`OutputFile`]s.
+    /// the resolved `api` too, for the rare file (e.g. a `.pyi` stub) that
+    /// needs the full resolved tree. Most backends render a primary source
+    /// file by composing [`emit_members`](Self::emit_members) over
+    /// `model.modules`, then append package manifests (`package.json`,
+    /// `pyproject.toml`, `go.mod`, …) as additional [`OutputFile`]s.
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -252,7 +256,7 @@ pub trait LanguageBackend: Send + Sync {
     /// tree, platform-tagged Python wheels, …). The default returns `None`.
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
@@ -274,7 +278,7 @@ pub trait LanguageBackend: Send + Sync {
 /// backend produced cannot be written.
 pub fn run<B: LanguageBackend>(
     backend: &B,
-    api: &Api,
+    api: &ResolvedApi,
     out_dir: &Utf8Path,
     config: &B::Config,
 ) -> Result<()> {
@@ -311,7 +315,7 @@ fn forward_slashes(path: Utf8PathBuf) -> String {
 /// identical across operating systems.
 pub fn output_files<B: LanguageBackend>(
     backend: &B,
-    api: &Api,
+    api: &ResolvedApi,
     out_dir: &Utf8Path,
     config: &B::Config,
 ) -> Vec<String> {
@@ -331,7 +335,7 @@ pub fn output_files<B: LanguageBackend>(
 /// generates. Returns `None` when the backend does not support packaging.
 pub fn package_files<B: LanguageBackend>(
     backend: &B,
-    api: &Api,
+    api: &ResolvedApi,
     ctx: &PackageContext,
     out_dir: &Utf8Path,
     config: &B::Config,
@@ -375,7 +379,7 @@ macro_rules! impl_generator_via_backend {
 
             fn generate(
                 &self,
-                api: &::weaveffi_ir::ir::Api,
+                api: &$crate::resolved::ResolvedApi,
                 out_dir: &::camino::Utf8Path,
                 config: &Self::Config,
             ) -> $crate::backend::__anyhow::Result<()> {
@@ -384,7 +388,7 @@ macro_rules! impl_generator_via_backend {
 
             fn output_files(
                 &self,
-                api: &::weaveffi_ir::ir::Api,
+                api: &$crate::resolved::ResolvedApi,
                 out_dir: &::camino::Utf8Path,
                 config: &Self::Config,
             ) -> ::std::vec::Vec<::std::string::String> {
@@ -393,7 +397,7 @@ macro_rules! impl_generator_via_backend {
 
             fn package(
                 &self,
-                api: &::weaveffi_ir::ir::Api,
+                api: &$crate::resolved::ResolvedApi,
                 ctx: &$crate::package::PackageContext,
                 out_dir: &::camino::Utf8Path,
                 config: &Self::Config,
@@ -408,7 +412,7 @@ macro_rules! impl_generator_via_backend {
 mod tests {
     use super::*;
     use crate::codegen::Generator;
-    use weaveffi_ir::ir::{Function, Module, Param, TypeRef};
+    use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
 
     #[derive(Default, Clone, serde::Serialize)]
     struct FakeConfig {
@@ -465,7 +469,7 @@ mod tests {
 
         fn files(
             &self,
-            _api: &Api,
+            _api: &ResolvedApi,
             model: &BindingModel,
             out_dir: &Utf8Path,
             config: &Self::Config,
@@ -498,9 +502,9 @@ mod tests {
         }
     }
 
-    fn api() -> Api {
-        Api {
-            version: "0.6.0".into(),
+    fn api() -> ResolvedApi {
+        ResolvedApi::assume_resolved(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
             modules: vec![Module {
                 name: "math".into(),
                 functions: vec![
@@ -517,7 +521,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        }
+        })
     }
 
     #[test]

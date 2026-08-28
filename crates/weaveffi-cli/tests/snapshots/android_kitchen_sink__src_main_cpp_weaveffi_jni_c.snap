@@ -371,11 +371,14 @@ static void weaveffi_kitchen_do_async_jni_cb(void* context, weaveffi_error* err,
             jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
             if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
         }
+        jint jcode = (jint)err->code;
+        weaveffi_error_free(err);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;[B)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);
+        (*env)->CallVoidMethod(env, ctx->callback, mid, jcode, jmsg, jpayload);
     } else {
         jobject boxed = result ? (jobject)(*env)->NewStringUTF(env, result) : (jobject)(*env)->NewStringUTF(env, "");
+        weaveffi_free_string(result);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);
@@ -412,11 +415,14 @@ static void weaveffi_kitchen_do_cancellable_jni_cb(void* context, weaveffi_error
             jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);
             if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }
         }
+        jint jcode = (jint)err->code;
+        weaveffi_error_free(err);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onError", "(ILjava/lang/String;[B)V");
-        (*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);
+        (*env)->CallVoidMethod(env, ctx->callback, mid, jcode, jmsg, jpayload);
     } else {
         jobject boxed = result ? (jobject)(*env)->NewStringUTF(env, result) : (jobject)(*env)->NewStringUTF(env, "");
+        weaveffi_free_string(result);
         jclass cls = (*env)->GetObjectClass(env, ctx->callback);
         jmethodID mid = (*env)->GetMethodID(env, cls, "onSuccess", "(Ljava/lang/Object;)V");
         (*env)->CallVoidMethod(env, ctx->callback, mid, boxed);

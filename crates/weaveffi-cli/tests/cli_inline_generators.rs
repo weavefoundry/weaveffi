@@ -7,7 +7,7 @@ fn inline_dart_package_name_used() {
     fs::write(
         &yml,
         concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",
@@ -47,7 +47,7 @@ fn inline_dart_package_name_used() {
 }
 
 const LISTENER_IDL: &str = concat!(
-    "version: \"0.6.0\"\n",
+    "version: \"0.7.0\"\n",
     "modules:\n",
     "  - name: events\n",
     "    callbacks:\n",
@@ -129,7 +129,7 @@ fn wasm_emscripten_mode_generates_module_loader() {
     fs::write(
         &yml,
         concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",

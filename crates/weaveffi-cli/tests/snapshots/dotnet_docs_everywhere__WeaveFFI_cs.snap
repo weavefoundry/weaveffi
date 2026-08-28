@@ -563,6 +563,9 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_free(IntPtr err);
+
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_docs_Notebook_destroy(IntPtr self);
 
@@ -714,6 +717,7 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }

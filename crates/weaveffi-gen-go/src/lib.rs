@@ -27,6 +27,7 @@ mod types;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::abi::is_buffered;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
@@ -35,7 +36,7 @@ use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::plan::{elem_free, ElemFree};
 use weaveffi_core::utils::{render_prelude, render_trailer, wrapper_name, CommentStyle};
-use weaveffi_ir::ir::{Api, TypeRef};
+use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{
     collect_trampoline_externs, render_async_function, render_callback_trampoline, render_function,
@@ -121,7 +122,7 @@ impl LanguageBackend for GoGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -157,7 +158,7 @@ impl LanguageBackend for GoGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
@@ -274,7 +275,7 @@ fn scan_imports(model: &BindingModel) -> Imports {
 /// Render the complete generated Go source file: the cgo preamble, imports,
 /// runtime prelude, and every module's entities and wrappers.
 pub(crate) fn render_go(
-    api: &Api,
+    api: &ResolvedApi,
     model: &BindingModel,
     prefix: &str,
     strip_module_prefix: bool,

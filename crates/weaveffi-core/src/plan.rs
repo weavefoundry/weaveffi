@@ -19,8 +19,8 @@
 //!   including the requirement that wrappers stay **lazy** (one producer
 //!   `next` per consumer step, never a hidden drain into a list).
 //! * **Async** ([`AsyncProtocol`]): the completion-callback contract,
-//!   including the rule that result buffers are borrowed for the callback's
-//!   duration and must be copied before it returns.
+//!   including the rule that results and errors are owned by the consumer
+//!   and released through the runtime free symbols.
 //!
 //! A backend that renders these plans in its own syntax cannot drift from the
 //! others on semantics; only the spelling differs.
@@ -384,12 +384,14 @@ impl IteratorBinding {
 ///    wrapper resolves its native future idiom (a Python `asyncio` future, a
 ///    JS `Promise`, a Swift continuation, a C# `TaskCompletionSource`, a Go
 ///    channel) exactly once and then releases the registration.
-/// 2. **Borrowed results.** Result buffers passed to the callback (strings,
-///    bytes, and buffered values) are owned by the producer and valid **only
-///    for the callback's duration**; the wrapper must deep-copy or decode
-///    them before the callback returns and must not free them.
-///    Interface-object results are the exception: the callback receives
-///    ownership and adopts the pointer.
+/// 2. **Owned results.** Everything passed to the callback is owned by the
+///    consumer. String results are released with `{prefix}_free_string`,
+///    byte and buffered-value results with `{prefix}_free_bytes`, and
+///    interface-object results transfer ownership of the object (the
+///    wrapper adopts the pointer). This is what lets runtimes that defer
+///    callback bodies past the native return (Dart's
+///    `NativeCallable.listener`, for example) decode safely; a wrapper that
+///    processes results inline still copies or decodes first and then frees.
 /// 3. **Foreign-thread delivery.** The callback runs on a producer thread,
 ///    so the wrapper must hop back to its native scheduler before touching
 ///    consumer state (`call_soon_threadsafe`, a threadsafe function, a
@@ -397,11 +399,9 @@ impl IteratorBinding {
 ///    target's runtime forbids it.
 ///
 /// The callback's `err` slot follows the owning function's [`ErrorStrategy`].
-/// The error struct itself is producer-owned and borrowed for the callback's
-/// duration: the wrapper copies the code, message, and payload inside the
-/// callback and the producer releases them afterward. A wrapper may also call
-/// `error_clear` itself; the clear is idempotent (it nulls the owned
-/// pointers), so the producer's own release stays safe.
+/// A non-null error is heap-boxed and owned by the consumer: the wrapper
+/// copies the code, message, and payload, then releases the box with
+/// `{prefix}_error_free` exactly once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsyncProtocol<'a> {
     /// The lowered async surface: launcher and callback typedef.
@@ -410,7 +410,8 @@ pub struct AsyncProtocol<'a> {
     /// `callback`/`context`.
     pub cancellable: bool,
     /// The release owed for an *owned interface* result adopted by the
-    /// callback; [`ReturnFree::None`] for borrowed (copy-only) results.
+    /// callback; [`ReturnFree::None`] for results copied or decoded and
+    /// then released through the runtime free symbols.
     pub result_adopt: ReturnFree,
     /// How the callback's `err` slot is interpreted.
     pub error: ErrorStrategy,
@@ -422,7 +423,7 @@ impl AsyncBinding {
     ///
     /// A direct or optional interface result (where an optional's null slot
     /// simply means none) is adopted by the callback; every other result
-    /// shape is borrowed and copied or decoded.
+    /// shape is copied or decoded, then freed through the runtime symbols.
     pub fn protocol<'a>(&'a self, f: &FnBinding, module: &str, prefix: &str) -> AsyncProtocol<'a> {
         fn adoptable(ty: &TypeRef) -> Option<&TypeRef> {
             match ty {

@@ -52,7 +52,7 @@ contract." Things that have already changed during 0.x:
   with constructors, methods, and statics) and per-function typed errors
   (`throws:`), and made bare type names unique across the whole API. The
   samples' handle-based resource surfaces were rewritten as interfaces.
-- Schema `0.6.0` moved records, rich enums, optionals, lists, and maps to
+- Schema `0.7.0` moved records, rich enums, optionals, lists, and maps to
   by-value crossing as serialized value buffers (one
   `(const uint8_t*, size_t)` pair per value; see the
   [Value Buffer Protocol](reference/value-buffers.md)), replacing opaque
@@ -103,7 +103,7 @@ tied to `weaveffi-ir`'s minor version: each `weaveffi-ir` minor bump
 corresponds to at most one schema version bump.
 [`CURRENT_SCHEMA_VERSION`](https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs)
 in `crates/weaveffi-ir/src/ir.rs` is the source of truth; the current
-schema version is `0.6.0`.
+schema version is `0.7.0`.
 
 Pre-1.0, **only the current schema version is accepted**
 (`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`), so a

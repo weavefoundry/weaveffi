@@ -15,9 +15,9 @@ future is the module's typed domain error (see the
 
 The completion contract every wrapper implements is stated once, in
 `weaveffi_core::plan::AsyncProtocol`: the callback fires exactly once
-per launch, from an arbitrary producer thread, and the result it
-receives is either borrowed (copy it inside the callback) or adopted
-(own it and destroy it later). See
+per launch, from an arbitrary producer thread, and everything it
+receives (the error and the result) is owned by the consumer, which
+releases it through the runtime free symbols or adopts it. See
 [Result ownership and threading](#result-ownership-and-threading)
 below.
 
@@ -43,7 +43,7 @@ Avoid async for:
 ### 1. Declare the function in the IDL
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: net
     errors:
@@ -110,22 +110,24 @@ pub extern "C" fn weaveffi_net_fetch_data_async(
     let ctx = context as usize;
     std::thread::spawn(move || {
         let payload = abi::string_to_c_ptr(&format!("payload from {url_str}"));
+        // Ownership of the string transfers to the consumer, which
+        // releases it with `weaveffi_free_string` after copying.
         callback(ctx as *mut c_void, std::ptr::null_mut(), payload);
-        // The string is borrowed by the callback: the producer frees it
-        // after the callback returns, so the consumer must have copied.
-        abi::free_string(payload);
     });
 }
 ```
 
 The async launcher symbol always carries the `_async` suffix
 (`weaveffi_net_fetch_data_async`), keeping the name free for a possible
-synchronous variant. Note who frees the result: buffer results
-(strings, bytes, and the serialized value buffers of buffered results
-such as records, rich enums, lists, and maps) are owned by the
-producer, which releases them after the callback returns; the
-macro-generated launchers do exactly this. Owned interface results are
-the exception: the callback receives ownership of the object pointer.
+synchronous variant. Note who frees the result: everything passed to
+the callback is owned by the consumer. String results are released
+with `weaveffi_free_string`, byte and serialized value buffers (the
+buffered results such as records, rich enums, lists, and maps) with
+`weaveffi_free_bytes`, and a reported error (heap-boxed on the failure
+path) with `weaveffi_error_free`; owned interface results transfer
+ownership of the object pointer. The macro-generated launchers
+allocate results this way for you, and every generated wrapper frees
+them for you.
 See [Result ownership and threading](#result-ownership-and-threading).
 
 ### 3. Call it from each target
@@ -246,16 +248,17 @@ The completion contract has three clauses, stated once in
    future, a JS `Promise`, a Swift continuation, a C#
    `TaskCompletionSource`, a Go channel) exactly once and then
    releases the registration.
-2. **Borrowed results.** Result buffers passed to the callback
-   (strings, bytes, and buffered results delivered as a
+2. **Owned results.** Result buffers passed to the callback (strings,
+   bytes, and buffered results delivered as a
    `(const uint8_t* result_ptr, size_t result_len)` pair holding the
-   serialized value buffer) are owned by the producer and valid **only
-   for the callback's duration**: the wrapper copies or decodes them
-   before the callback returns and must not free them. The producer
-   releases them after the callback returns; the macro-generated
-   launchers do this for you. Owned interface results (including
-   `Interface?`) are the exception: the callback receives ownership and
-   adopts the pointer into the wrapper's disposal idiom, which
+   serialized value buffer) are owned by the consumer: the wrapper
+   copies or decodes them, then releases them through the runtime free
+   symbols (`weaveffi_free_string` for strings, `weaveffi_free_bytes`
+   for byte and value buffers). This is what lets runtimes that defer
+   callback bodies past the native return, such as Dart's
+   `NativeCallable.listener`, decode safely. Owned interface results
+   (including `Interface?`) transfer ownership the same way: the
+   callback adopts the pointer into the wrapper's disposal idiom, which
    eventually calls the type's `_destroy` symbol.
 3. **Foreign-thread delivery.** The callback runs on an arbitrary
    producer thread, so the wrapper hops back to its native scheduler
@@ -264,16 +267,15 @@ The completion contract has three clauses, stated once in
    Swift continuation) rather than resolving inline where the target's
    runtime forbids it.
 
-The error struct passed to the callback is also producer-owned and
-borrowed for the callback's duration: the wrapper copies the code and
-message inside the callback, and the producer releases the message
-afterward. A wrapper may also call `weaveffi_error_clear` itself; the
-clear is idempotent (it nulls the message pointer), so the producer's
-own release stays safe.
+A non-null error passed to the callback is heap-boxed and also owned
+by the consumer: the wrapper copies the code, message, and payload,
+then releases the box exactly once with `weaveffi_error_free`. (This
+differs from the synchronous `out_err` slot, which is caller-allocated
+and cleared with `weaveffi_error_clear`.)
 
 If you consume the raw C surface directly, the same rules apply to
-your callback: copy every buffer before returning, adopt object
-pointers, and never free a borrowed result.
+your callback: copy or decode every buffer and then free it, release a
+non-null error with `weaveffi_error_free`, and adopt object pointers.
 
 ### Per-target async surface
 
@@ -350,11 +352,15 @@ For every async-capable target:
 - **Returning `null` instead of invoking the callback**: the contract
   is that the callback fires **exactly once** for every async call,
   including on cancellation.
-- **Holding a result pointer past the callback**: buffer results are
-  producer-owned and freed as soon as the callback returns. Copy the
-  data inside the callback; a stashed pointer dangles.
-- **Freeing a borrowed result inside the callback**: strings, bytes,
-  and serialized value buffers belong to the producer, which frees
-  them itself. Freeing them in the callback double-frees. The only
-  pointers the callback owns are interface results, which it must
-  eventually `_destroy` exactly once.
+- **Forgetting to free an owned result**: strings, bytes, and
+  serialized value buffers passed to the callback belong to the
+  consumer. Copy or decode them, then release them with
+  `weaveffi_free_string` or `weaveffi_free_bytes`; a callback that
+  only copies leaks the producer's allocation. The generated wrappers
+  do this for you; the rule matters when you consume the raw C
+  surface.
+- **Freeing the boxed error with the wrong symbol**: the error passed
+  to an async callback is heap-boxed, so it is released with
+  `weaveffi_error_free` (which frees the message, the payload, and the
+  box). Calling only `weaveffi_error_clear` on it leaks the box;
+  calling `free()` on it leaks the message and payload.

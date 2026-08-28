@@ -196,15 +196,16 @@ pub(crate) fn render_jni_interface(
     jni_c.push_str(&w.finish());
 }
 
-/// Box one borrowed async result into the JVM local `boxed` for delivery to
-/// the pinned `WeaveContinuation`. Buffered results arrive as a borrowed
+/// Box one owned async result into the JVM local `boxed` for delivery to
+/// the pinned `WeaveContinuation`. Buffered results arrive as an owned
 /// `(result_ptr, result_len)` pair, copied into a `jbyteArray` the Kotlin
-/// wrapper decodes; the producer frees the buffer after the callback returns.
+/// wrapper decodes and then released with `weaveffi_free_bytes`.
 fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
     let mut w = CodeWriter::four_space().with_depth(2);
     if ret.is_some_and(abi::is_buffered) {
         w.line("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);");
         w.line("if (boxed && result_ptr) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result_ptr); }");
+        w.line("weaveffi_free_bytes((uint8_t*)result_ptr, result_len);");
         w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
         w.line(
             "jmethodID mid = (*env)->GetMethodID(env, cls, \"onSuccess\", \"(Ljava/lang/Object;)V\");",
@@ -260,13 +261,15 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, result ? JNI_TRUE : JNI_FALSE);");
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            // The producer owns `result` for the callback's duration only:
-            // copy, never free.
+            // Owned by the consumer: copy, then free.
             w.line("jobject boxed = result ? (jobject)(*env)->NewStringUTF(env, result) : (jobject)(*env)->NewStringUTF(env, \"\");");
+            w.line("weaveffi_free_string(result);");
         }
         Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+            // Owned by the consumer: copy, then free.
             w.line("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);");
             w.line("if (boxed && result) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result); }");
+            w.line("weaveffi_free_bytes((uint8_t*)result, result_len);");
         }
         // Only `Interface?` reaches here (every other optional is buffered):
         // a nullable owned pointer boxed as `Long`, null crossing as `null`.
@@ -354,8 +357,9 @@ pub(crate) fn render_jni_async_function(
             // The raw `(code, message, payload)` triple crosses to Kotlin,
             // where the continuation's mapper picks the typed or generic
             // exception (decoding payload fields when declared); producer
-            // threads cannot `FindClass` app classes themselves. The payload
-            // buffer is borrowed, so it is copied before the callback returns.
+            // threads cannot `FindClass` app classes themselves. The boxed
+            // error is owned: copy its fields, then release it with
+            // `weaveffi_error_free`.
             w.line("const char* msg = err->message ? err->message : \"WeaveFFI error\";");
             w.line("jstring jmsg = (*env)->NewStringUTF(env, msg);");
             w.line("jbyteArray jpayload = NULL;");
@@ -363,9 +367,11 @@ pub(crate) fn render_jni_async_function(
                 w.line("jpayload = (*env)->NewByteArray(env, (jsize)err->payload_len);");
                 w.line("if (jpayload != NULL) { (*env)->SetByteArrayRegion(env, jpayload, 0, (jsize)err->payload_len, (const jbyte*)err->payload_ptr); }");
             });
+            w.line("jint jcode = (jint)err->code;");
+            w.line("weaveffi_error_free(err);");
             w.line("jclass cls = (*env)->GetObjectClass(env, ctx->callback);");
             w.line("jmethodID mid = (*env)->GetMethodID(env, cls, \"onError\", \"(ILjava/lang/String;[B)V\");");
-            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, (jint)err->code, jmsg, jpayload);");
+            w.line("(*env)->CallVoidMethod(env, ctx->callback, mid, jcode, jmsg, jpayload);");
         });
         w.line("} else {");
         w.scope(|w| {

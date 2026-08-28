@@ -15,8 +15,8 @@ fn render_sample_headers() {
     std::fs::create_dir_all(&out_dir).unwrap();
     for sample in ["kvstore", "contacts", "events", "shapes", "calculator"] {
         let src = std::fs::read_to_string(format!("{root}/samples/{sample}/{sample}.yml")).unwrap();
-        let mut api = weaveffi_ir::parse::parse_api_str(&src, "yaml").unwrap();
-        weaveffi_core::validate::validate_api(&mut api, None).unwrap();
+        let api = weaveffi_ir::parse::parse_api_str(&src, "yaml").unwrap();
+        let api = weaveffi_core::validate::validate_api(api, None).unwrap();
         let model = BindingModel::build(&api, "weaveffi");
         let gen = weaveffi_gen_c::CGenerator;
         let cfg = weaveffi_gen_c::CConfig::default();

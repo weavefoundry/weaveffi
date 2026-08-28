@@ -75,6 +75,10 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
     };
     weaveffi_core::validate::resolve_type_refs(&mut api);
     resolve_sibling_named_refs(&mut api);
+    // After `resolve_type_refs` plus the sibling rewrite above, no `Named`
+    // reference remains, which is exactly the contract `assume_resolved`
+    // asserts (see the doc on `resolve_sibling_named_refs`).
+    let api = weaveffi_core::ResolvedApi::assume_resolved(api);
 
     // 2. Build the canonical lowered model. Nested modules are flattened into
     //    one binding each, keyed here by their path segments (e.g. `["kv",

@@ -24,7 +24,7 @@ emulator or a physical device.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: greeter
     errors:

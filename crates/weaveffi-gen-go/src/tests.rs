@@ -1,6 +1,7 @@
 //! Output-content tests for the Go generator: fixtures mirroring the
 //! sample IDLs plus assertions over the rendered source.
 
+use weaveffi_core::resolved::ResolvedApi;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::errors::ERROR_BRAND;
@@ -13,13 +14,13 @@ use super::*;
 
 // ── Fixture helpers ──
 
-fn api_of(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn api_of(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn module(name: &str) -> Module {
@@ -69,7 +70,6 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.into(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
@@ -93,16 +93,16 @@ fn variant(name: &str, value: i32, fields: Vec<StructField>) -> EnumVariant {
 }
 
 /// Render with the default surface: `weaveffi` prefix, stripping on.
-fn rg(api: &Api) -> String {
+fn rg(api: &ResolvedApi) -> String {
     rg_with(api, "weaveffi", true)
 }
 
-fn rg_with(api: &Api, prefix: &str, strip: bool) -> String {
+fn rg_with(api: &ResolvedApi, prefix: &str, strip: bool) -> String {
     let model = BindingModel::build(api, prefix);
     render_go(api, &model, prefix, strip, "weaveffi.yml")
 }
 
-fn calculator_api() -> Api {
+fn calculator_api() -> ResolvedApi {
     let mut m = module("calculator");
     m.functions = vec![
         func_of(
@@ -123,7 +123,7 @@ fn calculator_api() -> Api {
 /// sync/async/iterator methods, a static), the `KvError` domain, the
 /// `Entry` record, the eviction listener, and the nested `kv.stats`
 /// submodule taking a cross-module interface parameter.
-fn kv_api() -> Api {
+fn kv_api() -> ResolvedApi {
     let mut stats = module("stats");
     stats.structs = vec![StructDef {
         name: "Stats".into(),
@@ -239,7 +239,7 @@ fn kv_api() -> Api {
 /// Mirrors `samples/contacts/contacts.yml`, standing in for the CLI test
 /// (`cli_go.rs`) while the workspace binary is blocked on other generator
 /// crates mid-overhaul.
-fn contacts_api() -> Api {
+fn contacts_api() -> ResolvedApi {
     let mut m = module("contacts");
     m.enums = vec![EnumDef {
         name: "ContactType".into(),
@@ -307,7 +307,7 @@ fn contacts_api() -> Api {
 
 /// A module with one rich (algebraic) enum used across params and
 /// returns.
-fn shapes_api() -> Api {
+fn shapes_api() -> ResolvedApi {
     let mut m = module("shapes");
     m.enums = vec![EnumDef {
         name: "Shape".into(),
@@ -906,7 +906,7 @@ fn optional_scalar_return_decodes_buffer() {
 
 // ── Throwing functions ──
 
-fn store_api() -> Api {
+fn store_api() -> ResolvedApi {
     let mut m = module("store");
     m.errors = Some(ErrorDomain {
         name: "StoreError".into(),
@@ -1517,17 +1517,17 @@ fn go_async_generates_blocking_wrapper() {
         "plain async wrapper must panic on a reported error: {go}"
     );
     assert!(
-        go.contains("ch <- wvOutcomeIoRead{err: wvBrandError(wvTakeError(err))}"),
+        go.contains("ch <- wvOutcomeIoRead{err: wvBrandError(wvTakeBoxedError(err))}"),
         "plain async trampoline brands the error, never the domain: {go}"
     );
     assert!(
         go.contains("return outcome.val"),
         "plain async wrapper returns the outcome value: {go}"
     );
-    // The completion callback borrows its result buffers: copy, no free.
+    // The completion callback owns its result buffers: copy, then free.
     assert!(
-        !go.contains("C.weaveffi_free_string(result)"),
-        "borrowed async result buffers must not be freed: {go}"
+        go.contains("C.weaveffi_free_string(result)"),
+        "owned async result buffers must be freed after copying: {go}"
     );
     assert!(
         go.contains("val = C.GoString(result)"),
@@ -1565,7 +1565,7 @@ fn async_cancellable_passes_null_token() {
 }
 
 #[test]
-fn async_record_result_decodes_borrowed_buffer() {
+fn async_record_result_decodes_owned_buffer() {
     let mut m = module("metrics");
     m.structs = vec![StructDef {
         name: "Stats".into(),
@@ -1585,16 +1585,12 @@ fn async_record_result_decodes_borrowed_buffer() {
         "buffered async callback carries borrowed ptr + len slots: {go}"
     );
     assert!(
-        go.contains("rRes := &wvReader{buf: wvBorrowBuffer(result_ptr, result_len)}"),
-        "async result buffer is borrowed, never freed: {go}"
+        go.contains("rRes := &wvReader{buf: wvCopyBuffer(result_ptr, result_len)}"),
+        "async result buffer is owned: copied, then freed: {go}"
     );
     assert!(
         go.contains("val = wvUnpackStats(rRes)"),
         "async record result decodes inside the trampoline: {go}"
-    );
-    assert!(
-        !go.contains("wvCopyBuffer(result_ptr"),
-        "the producer frees the async result buffer, not the consumer: {go}"
     );
     assert!(
         go.contains("func Load() Stats {"),
@@ -1858,7 +1854,7 @@ fn interface_async_method_throws() {
         "launch passes s.ptr then the NULL cancel token: {go}"
     );
     assert!(
-        go.contains("ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeError(err))}"),
+        go.contains("ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeBoxedError(err))}"),
         "trampoline maps the domain error: {go}"
     );
     assert!(
@@ -2379,7 +2375,7 @@ fn string_list_return_decodes_from_buffer() {
 
 // ── Docs ──
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     let mut m = module("docs");
     m.functions = vec![Function {
         name: "do_thing".into(),
@@ -2404,7 +2400,6 @@ fn doc_api() -> Api {
             name: "id".into(),
             ty: TypeRef::I64,
             doc: Some("Stable id".into()),
-            default: None,
         }],
     }];
     m.enums = vec![EnumDef {

@@ -24,7 +24,7 @@ pub(crate) fn cmd_new(name: &str, quiet: bool) -> Result<()> {
     let idl_path = project_dir.join("weaveffi.yml");
     let idl_contents = format!(
         concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "package:\n",
             "  name: {name}\n",
             "  version: \"0.1.0\"\n",
@@ -61,8 +61,8 @@ pub(crate) fn cmd_new(name: &str, quiet: bool) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write {}", idl_path))?;
 
-    let mut api = parse_api_str(&idl_contents, "yaml").wrap_err("failed to parse generated IDL")?;
-    validate_api(&mut api, None).wrap_err("generated IDL failed validation")?;
+    let api = parse_api_str(&idl_contents, "yaml").wrap_err("failed to parse generated IDL")?;
+    let api = validate_api(api, None).wrap_err("generated IDL failed validation")?;
 
     let cargo_toml_path = project_dir.join("Cargo.toml");
     let cargo_toml = format!(

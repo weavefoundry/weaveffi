@@ -2,6 +2,7 @@
 //! generated source text and are the byte-compatibility guard for the
 //! crate.
 
+use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::stubs::render_pyi_module;
 use crate::types::{py_ctypes_scalar, py_type_hint};
@@ -11,13 +12,13 @@ use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn simple_module(functions: Vec<Function>) -> Module {
@@ -39,7 +40,7 @@ fn generator_name_is_python() {
     assert_eq!(Generator::name(&PythonGenerator), "python");
 }
 
-fn ping_api() -> Api {
+fn ping_api() -> ResolvedApi {
     make_api(vec![simple_module(vec![Function {
         name: "ping".into(),
         params: vec![],
@@ -78,7 +79,6 @@ fn python_keywords_escape_with_trailing_underscore() {
             name: "from".into(),
             ty: TypeRef::StringUtf8,
             doc: None,
-            default: None,
         }],
     }];
     let api = make_api(vec![module]);
@@ -505,13 +505,11 @@ fn struct_dataclass_value_type() {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -578,8 +576,8 @@ fn struct_dataclass_value_type() {
 
 #[test]
 fn buffered_record_param_packs() {
-    let api = Api {
-        version: "0.6.0".into(),
+    let api = ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![Module {
             name: "contacts".into(),
             functions: vec![Function {
@@ -606,13 +604,11 @@ fn buffered_record_param_packs() {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "age".into(),
                         ty: TypeRef::I32,
                         doc: None,
-                        default: None,
                     },
                 ],
             }],
@@ -625,7 +621,7 @@ fn buffered_record_param_packs() {
         }],
         generators: None,
         package: None,
-    };
+    });
     let dir = tempfile::tempdir().unwrap();
     let out = Utf8Path::from_path(dir.path()).unwrap();
     PythonGenerator
@@ -1087,7 +1083,6 @@ fn struct_optional_string_field() {
                 name: "email".into(),
                 ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1134,7 +1129,6 @@ fn struct_enum_field() {
                 name: "role".into(),
                 ty: TypeRef::Enum("Role".into()),
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1193,25 +1187,21 @@ fn comprehensive_contacts_api() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "contact_type".into(),
                     ty: TypeRef::Enum("ContactType".into()),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1444,7 +1434,6 @@ fn struct_bytes_field() {
                 name: "data".into(),
                 ty: TypeRef::Bytes,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1502,31 +1491,26 @@ fn python_generates_type_stubs() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "tags".into(),
                     ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "metadata".into(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1748,25 +1732,21 @@ fn generate_python_with_structs() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "last_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -2221,31 +2201,26 @@ fn generate_python_pyi_types() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "tags".into(),
                     ty: TypeRef::List(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "scores".into(),
                     ty: TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -2388,31 +2363,26 @@ fn generate_python_full_contacts() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "last_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "contact_type".into(),
                     ty: TypeRef::Enum("ContactType".into()),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -2886,7 +2856,6 @@ fn python_deeply_nested_optional() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2971,7 +2940,6 @@ fn python_enum_keyed_map() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -3013,8 +2981,8 @@ fn python_enum_keyed_map() {
 
 #[test]
 fn python_typed_handle_type() {
-    let api = Api {
-        version: "0.6.0".into(),
+    let api = ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![Module {
             name: "contacts".into(),
             functions: vec![Function {
@@ -3040,7 +3008,6 @@ fn python_typed_handle_type() {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 }],
             }],
             enums: vec![],
@@ -3052,7 +3019,7 @@ fn python_typed_handle_type() {
         }],
         generators: None,
         package: None,
-    };
+    });
     let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
     // A typed handle is an opaque token: hinted as int, passed raw.
     assert!(
@@ -3100,7 +3067,6 @@ fn python_no_double_free_on_error() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -3203,7 +3169,6 @@ fn python_null_check_on_optional_return() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -3268,10 +3233,12 @@ fn python_async_function_is_async_def() {
         code.contains("_fut = _loop.create_future()"),
         "should create a future: {code}"
     );
+    // The string result slot is `c_void_p` (a `c_char_p` slot would
+    // auto-convert to `bytes` and lose the pointer `_take_string` frees).
     assert!(
         code.contains(
             "_cb_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, \
-                       ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_char_p)"
+                       ctypes.POINTER(_WeaveFFIErrorStruct), ctypes.c_void_p)"
         ),
         "should build the CFUNCTYPE trampoline: {code}"
     );
@@ -3497,7 +3464,6 @@ fn python_cross_module_struct() {
                     name: "value".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 }],
             }],
             enums: vec![],
@@ -3763,7 +3729,7 @@ fn deprecated_function_generates_annotation() {
     );
 }
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "docs".into(),
         functions: vec![Function {
@@ -3789,7 +3755,6 @@ fn doc_api() -> Api {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -3897,7 +3862,7 @@ fn python_custom_prefix_threads_to_user_symbols() {
 /// non-throwing free function, and a `Store` interface exercising the
 /// canonical `new` constructor, a factory constructor, an instance method
 /// with a string parameter and return, and a static.
-fn kv_api() -> Api {
+fn kv_api() -> ResolvedApi {
     use weaveffi_ir::ir::{ErrorCode, ErrorDomain, InterfaceDef};
 
     let fn_lit =
@@ -3975,7 +3940,7 @@ fn kv_api() -> Api {
 #[test]
 fn python_interface_async_and_iterator_members() {
     use weaveffi_ir::ir::InterfaceDef;
-    let mut api = kv_api();
+    let mut api = kv_api().api().clone();
     api.modules[0].interfaces = vec![InterfaceDef {
         name: "Store".into(),
         doc: None,
@@ -4031,6 +3996,7 @@ fn python_interface_async_and_iterator_members() {
             since: None,
         }],
     }];
+    let api = ResolvedApi::assume_resolved(api);
     let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
 
     // Async method: the wrapper itself is the async def, and the launcher
@@ -4536,7 +4502,6 @@ fn rich_enum_sum_type() {
                         name: "radius".into(),
                         ty: TypeRef::F64,
                         doc: None,
-                        default: None,
                     }],
                 },
                 EnumVariant {
@@ -4548,13 +4513,11 @@ fn rich_enum_sum_type() {
                             name: "width".into(),
                             ty: TypeRef::F64,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "height".into(),
                             ty: TypeRef::F64,
                             doc: None,
-                            default: None,
                         },
                     ],
                 },
@@ -4685,13 +4648,11 @@ fn error_payload_decoding() {
                             name: "key".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "attempts".into(),
                             ty: TypeRef::I32,
                             doc: None,
-                            default: None,
                         },
                     ],
                 },
@@ -4780,7 +4741,6 @@ fn listener_buffered_record_param_decodes() {
                 name: "kind".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -4847,7 +4807,6 @@ fn async_function_returns_buffered_record() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -4863,18 +4822,14 @@ fn async_function_returns_buffered_record() {
         py.contains("async def fetch_contact(id: int) -> \"Contact\":"),
         "missing async wrapper: {py}"
     );
-    // The borrowed result buffer is copied and decoded inside the
-    // completion trampoline; the producer frees it afterward.
+    // The owned result buffer is copied and freed by `_take_buffer`, then
+    // decoded inside the completion trampoline.
     assert!(
         py.contains(
             "_state[\"val\"] = _unpack_Contact(\
-             ctypes.string_at(result_ptr, result_len) if result_ptr else b\"\")"
+             _take_buffer(ctypes.cast(result_ptr, ctypes.c_void_p).value, result_len))"
         ),
-        "trampoline should decode the borrowed result buffer: {py}"
-    );
-    assert!(
-        !py.contains("weaveffi_free_bytes(result_ptr"),
-        "the consumer must not free the borrowed result: {py}"
+        "trampoline should decode the owned result buffer: {py}"
     );
     // Decode failures surface through the future rather than escaping
     // the C callback.
@@ -4912,7 +4867,6 @@ fn iterator_buffered_record_elements() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -4944,77 +4898,6 @@ fn iterator_buffered_record_elements() {
     assert!(
         py.contains("return _unpack_Contact(_take_buffer(_out_item.value, _out_len.value))"),
         "element should be taken then decoded: {py}"
-    );
-}
-
-#[test]
-fn struct_field_defaults_become_dataclass_defaults() {
-    let api = make_api(vec![Module {
-        name: "inventory".into(),
-        functions: vec![],
-        structs: vec![StructDef {
-            name: "Item".into(),
-            doc: None,
-            fields: vec![
-                StructField {
-                    name: "name".into(),
-                    ty: TypeRef::StringUtf8,
-                    doc: None,
-                    default: None,
-                },
-                StructField {
-                    name: "quantity".into(),
-                    ty: TypeRef::U32,
-                    doc: None,
-                    default: Some(serde_yaml::Value::Number(0.into())),
-                },
-                StructField {
-                    name: "active".into(),
-                    ty: TypeRef::Bool,
-                    doc: None,
-                    default: Some(serde_yaml::Value::Bool(true)),
-                },
-                StructField {
-                    name: "weight".into(),
-                    ty: TypeRef::F64,
-                    doc: None,
-                    default: Some(serde_yaml::Value::Number(1.5.into())),
-                },
-            ],
-        }],
-        enums: vec![],
-        callbacks: vec![],
-        listeners: vec![],
-        interfaces: vec![],
-        errors: None,
-        modules: vec![],
-    }]);
-    let py = render_python_module(&api, true, "weaveffi", "weaveffi.yml");
-
-    // The trailing defaulted run surfaces as dataclass defaults; the
-    // required leading field stays bare.
-    assert!(py.contains("name: str\n"), "missing required field: {py}");
-    assert!(
-        py.contains("quantity: int = 0"),
-        "missing int default: {py}"
-    );
-    assert!(
-        py.contains("active: bool = True"),
-        "missing bool default: {py}"
-    );
-    assert!(
-        py.contains("weight: float = 1.5"),
-        "missing float default: {py}"
-    );
-
-    // The stub marks defaulted constructor parameters with `= ...`.
-    let pyi = render_pyi_module(&BindingModel::build(&api, "weaveffi"), true, "weaveffi.yml");
-    assert!(
-        pyi.contains(
-            "def __init__(self, name: str, quantity: int = ..., \
-             active: bool = ..., weight: float = ...) -> None: ..."
-        ),
-        "stub should mark defaults: {pyi}"
     );
 }
 
@@ -5101,19 +4984,16 @@ fn kitchen_sink_api_generates() {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "quantity".into(),
                     ty: TypeRef::U32,
                     doc: None,
-                    default: Some(serde_yaml::Value::Number(0.into())),
                 },
                 StructField {
                     name: "data".into(),
                     ty: TypeRef::Bytes,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "nested".into(),
@@ -5122,7 +5002,6 @@ fn kitchen_sink_api_generates() {
                         Box::new(TypeRef::F64),
                     ))))),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -5144,7 +5023,6 @@ fn kitchen_sink_api_generates() {
                         name: "radius".into(),
                         ty: TypeRef::F64,
                         doc: None,
-                        default: None,
                     }],
                 },
             ],
@@ -5207,7 +5085,6 @@ fn kitchen_sink_api_generates() {
                     name: "reason".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 }],
             }],
         }),

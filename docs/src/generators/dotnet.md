@@ -52,7 +52,7 @@ package named `kvstore` produces `Kvstore.cs` inside
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -517,11 +517,13 @@ public static async Task<TaskResult> RunTask(string name)
   `WeaveFFIException`.
 - Result ownership follows the async contract: string, bytes, and
   buffered results (records, rich enums, optionals, arrays, maps,
-  arriving as a `(result, resultLen)` pair) are borrowed for the
-  callback's duration, so the callback copies or decodes them into
-  managed values and never frees them (the producer does after the
-  callback returns). An owned interface result is the exception: the
-  callback receives ownership and the wrapper adopts the pointer.
+  arriving as a `(result, resultLen)` pair) are owned by the consumer,
+  so the callback copies or decodes them into managed values and then
+  releases them with `NativeMethods.weaveffi_free_string` or
+  `NativeMethods.weaveffi_free_bytes`. A reported error is heap-boxed
+  and released with `NativeMethods.weaveffi_error_free` after its
+  fields are copied. An owned interface result transfers ownership
+  too: the wrapper adopts the pointer.
 
 Async interface methods follow the same pattern as instance methods:
 `await store.Compact()` returns `Task<long>`.

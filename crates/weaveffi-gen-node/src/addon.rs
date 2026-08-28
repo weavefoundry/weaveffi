@@ -902,24 +902,29 @@ fn render_async_machinery(
         AsyncResultShape::Value => {
             out.push_str("        ctx->result = result;\n");
         }
+        // The string result is owned: copy, then release the producer
+        // allocation.
         AsyncResultShape::Str => {
             out.push_str("        ctx->result_null = result == NULL;\n");
             out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
+            out.push_str("        weaveffi_free_string(result);\n");
         }
         AsyncResultShape::Bytes => {
             out.push_str("        ctx->result_len = result_len;\n");
             out.push_str(
                 "        if (result != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result, result_len); }\n",
             );
+            out.push_str("        weaveffi_free_bytes((uint8_t*)result, result_len);\n");
         }
-        // The buffer is borrowed for the callback's duration, so the bytes
-        // are copied here; the JS wrapper decodes them after the promise
+        // The value buffer is owned: copy, then release the producer
+        // allocation; the JS wrapper decodes the copy after the promise
         // resolves.
         AsyncResultShape::Buffered => {
             out.push_str("        ctx->result_len = result_len;\n");
             out.push_str(
                 "        if (result_ptr != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result_ptr, result_len); }\n",
             );
+            out.push_str("        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);\n");
         }
         // Owned-object results (interfaces, typed handles, iterators) are
         // adopted by the receiver, so the pointer stays valid across the
@@ -929,6 +934,9 @@ fn render_async_machinery(
         }
     }
     out.push_str("    }\n");
+    // The heap-boxed error transfers ownership too; a null or zero-code
+    // error is a safe no-op to free.
+    out.push_str("    weaveffi_error_free(err);\n");
     out.push_str("    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);\n");
     out.push_str("}\n\n");
 

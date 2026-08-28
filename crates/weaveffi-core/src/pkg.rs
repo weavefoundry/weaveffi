@@ -178,7 +178,7 @@ mod tests {
 
     fn api_with(pkg: Option<Package>) -> Api {
         Api {
-            version: "0.6.0".into(),
+            version: "0.7.0".into(),
             package: pkg,
             modules: vec![],
             generators: None,

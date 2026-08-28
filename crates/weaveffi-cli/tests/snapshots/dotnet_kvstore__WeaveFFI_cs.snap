@@ -726,6 +726,7 @@ namespace WeaveFFI
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
                             var payload = WeaveFFIError.CopyPayload(wErr);
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(KvException.FromCode(wErr.Code, msg, payload));
                             return;
                         }
@@ -847,6 +848,9 @@ namespace WeaveFFI
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_free(IntPtr err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kv_Store_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kv_Store_destroy(IntPtr self);

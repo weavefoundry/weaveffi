@@ -79,7 +79,7 @@ helpers, is rewritten with the new prefix.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -492,15 +492,14 @@ The launcher returns immediately; WeaveFFI invokes the callback
 exactly once, with either a result or a populated error, from the
 producer's worker thread.
 
-Ownership inside the callback follows the async contract. Result
+Ownership inside the callback follows the async contract: everything
+the callback receives is owned by the consumer. Copy or decode result
 buffers (strings, bytes, and the serialized value buffers of buffered
-results) are borrowed: they stay owned by the producer and are valid
-only for the callback's duration, so copy or decode anything you need
-before returning and don't free them. Owned interface results are the
-exception: the callback receives ownership of the object pointer and
-must eventually pass it to the matching `_destroy`. The `err` struct is
-likewise borrowed; copy its code, message, and payload inside the
-callback.
+results), then release them with `weaveffi_free_string` or
+`weaveffi_free_bytes`. Owned interface results transfer ownership of
+the object pointer, which you must eventually pass to the matching
+`_destroy`. A non-null `err` is heap-boxed: copy its code, message,
+and payload, then release it exactly once with `weaveffi_error_free`.
 
 For `cancellable: true` functions the launcher gains a
 `weaveffi_cancel_token*` slot before the callback, and the runtime

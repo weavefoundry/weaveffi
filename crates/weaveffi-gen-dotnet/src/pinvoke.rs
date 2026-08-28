@@ -44,7 +44,8 @@ pub(crate) fn is_error_slot(slot: &AbiParam) -> bool {
 }
 
 /// Render the `NativeMethods` static class: the shared runtime imports
-/// (`free_string`, `free_bytes`, `error_clear`) followed by every interface,
+/// (`free_string`, `free_bytes`, `error_clear`, `error_free`) followed by
+/// every interface,
 /// callback, listener, and function extern in declaration order.
 pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::four_space().with_depth(1);
@@ -61,6 +62,9 @@ pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     w.blank();
     w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
     w.line("internal static extern void weaveffi_error_clear(ref WeaveFFIError err);");
+    w.blank();
+    w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
+    w.line("internal static extern void weaveffi_error_free(IntPtr err);");
     w.blank();
     w.dedent();
 

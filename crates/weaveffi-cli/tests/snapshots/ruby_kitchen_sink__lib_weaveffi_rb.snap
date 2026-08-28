@@ -216,6 +216,7 @@ module WeaveFFI
   end
 
   attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
   attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
 
@@ -826,10 +827,12 @@ module WeaveFFI
       if err && err[:code] != 0
         code = err[:code]
         msg = err[:message].null? ? '' : err[:message].read_string
-        weaveffi_error_clear(err_ptr)
+        weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
-        queue << (result.null? ? '' : result.read_string)
+        _wv_s = result.null? ? '' : result.read_string
+        weaveffi_free_string(result) unless result.null?
+        queue << _wv_s
       end
     end
     weaveffi_kitchen_do_async_async(input, callback, FFI::Pointer::NULL)
@@ -848,10 +851,12 @@ module WeaveFFI
       if err && err[:code] != 0
         code = err[:code]
         msg = err[:message].null? ? '' : err[:message].read_string
-        weaveffi_error_clear(err_ptr)
+        weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
-        queue << (result.null? ? '' : result.read_string)
+        _wv_s = result.null? ? '' : result.read_string
+        weaveffi_free_string(result) unless result.null?
+        queue << _wv_s
       end
     end
     weaveffi_kitchen_do_cancellable_async(input, FFI::Pointer::NULL, callback, FFI::Pointer::NULL)

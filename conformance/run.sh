@@ -135,6 +135,18 @@ cpp_kvstore() {
         && "$OUT/cpp_kvstore"
 }
 
+c_async_demo() {
+    clang -I "$GENROOT/async-demo/c" "$ROOT/conformance/c/async_demo.c" \
+        -L "$LIBDIR" -lasync_demo -o "$OUT/c_async_demo" \
+        && "$OUT/c_async_demo"
+}
+
+cpp_async_demo() {
+    clang++ -std=c++17 -I "$GENROOT/async-demo/cpp" "$ROOT/conformance/cpp/async_demo.cpp" \
+        -L "$LIBDIR" -lasync_demo -o "$OUT/cpp_async_demo" \
+        && "$OUT/cpp_async_demo"
+}
+
 c_shapes() {
     clang -I "$GENROOT/shapes/c" "$ROOT/conformance/c/shapes.c" \
         -L "$LIBDIR" -lshapes -lm -o "$OUT/c_shapes" \
@@ -172,11 +184,14 @@ c_producer_exports() {
     done
 }
 
-# Resolve the platform-specific cdylib path for a sample crate.
+# Resolve the platform-specific cdylib path for a sample crate. Cargo
+# normalizes hyphens in crate names to underscores in the artifact name
+# (async-demo -> libasync_demo).
 sample_lib() {
+    local n=${1//-/_}
     case "$(uname)" in
-        Darwin) echo "$LIBDIR/lib$1.dylib" ;;
-        *)      echo "$LIBDIR/lib$1.so" ;;
+        Darwin) echo "$LIBDIR/lib$n.dylib" ;;
+        *)      echo "$LIBDIR/lib$n.so" ;;
     esac
 }
 
@@ -190,10 +205,11 @@ py_consumer() {
         python3 "$ROOT/conformance/python/$script"
 }
 
-python_contacts() { py_consumer contacts contacts.py; }
-python_events()   { py_consumer events events.py; }
-python_kvstore()  { py_consumer kvstore kvstore.py; }
-python_shapes()   { py_consumer shapes shapes.py; }
+python_contacts()   { py_consumer contacts contacts.py; }
+python_events()     { py_consumer events events.py; }
+python_kvstore()    { py_consumer kvstore kvstore.py; }
+python_shapes()     { py_consumer shapes shapes.py; }
+python_async_demo() { py_consumer async-demo async_demo.py; }
 
 # Run a Ruby consumer; same library-selection story as Python.
 rb_consumer() {
@@ -203,10 +219,11 @@ rb_consumer() {
         ruby "$ROOT/conformance/ruby/$script"
 }
 
-ruby_contacts() { rb_consumer contacts contacts.rb; }
-ruby_events()   { rb_consumer events events.rb; }
-ruby_kvstore()  { rb_consumer kvstore kvstore.rb; }
-ruby_shapes()   { rb_consumer shapes shapes.rb; }
+ruby_contacts()   { rb_consumer contacts contacts.rb; }
+ruby_events()     { rb_consumer events events.rb; }
+ruby_kvstore()    { rb_consumer kvstore kvstore.rb; }
+ruby_shapes()     { rb_consumer shapes shapes.rb; }
+ruby_async_demo() { rb_consumer async-demo async_demo.rb; }
 
 # Run a Dart consumer from inside the generated package so `package:weaveffi`
 # and the cached `ffi` dependency resolve. The cdylib comes via WEAVEFFI_LIBRARY.
@@ -225,10 +242,11 @@ dart_consumer() {
     ( cd "$pkgdir" && WEAVEFFI_LIBRARY="$(sample_lib "$sample")" dart run bin/conformance.dart )
 }
 
-dart_contacts() { dart_consumer contacts contacts.dart; }
-dart_events()   { dart_consumer events events.dart; }
-dart_kvstore() { dart_consumer kvstore kvstore.dart; }
-dart_shapes()   { dart_consumer shapes shapes.dart; }
+dart_contacts()   { dart_consumer contacts contacts.dart; }
+dart_events()     { dart_consumer events events.dart; }
+dart_kvstore()    { dart_consumer kvstore kvstore.dart; }
+dart_shapes()     { dart_consumer shapes shapes.dart; }
+dart_async_demo() { dart_consumer async-demo async_demo.dart; }
 
 # A directory containing `libweaveffi.<ext>` symlinked to the sample cdylib, so
 # build-time `-lweaveffi` / `#cgo -lweaveffi` resolve. On Linux the consumer then
@@ -270,10 +288,11 @@ EOF
            go run . )
 }
 
-go_contacts() { go_consumer contacts contacts.go; }
-go_events()   { go_consumer events events.go; }
-go_kvstore()  { go_consumer kvstore kvstore.go; }
-go_shapes()   { go_consumer shapes shapes.go; }
+go_contacts()   { go_consumer contacts contacts.go; }
+go_events()     { go_consumer events events.go; }
+go_kvstore()    { go_consumer kvstore kvstore.go; }
+go_shapes()     { go_consumer shapes shapes.go; }
+go_async_demo() { go_consumer async-demo async_demo.go; }
 
 # Swift: assemble a throwaway SwiftPM package that vendors the generated
 # WeaveFFI module plus a C shim whose module map points at the generated header
@@ -296,7 +315,7 @@ swift_consumer() {
     cat > "$pkg/Sources/C$mod/module.modulemap" <<EOF
 module C$mod [system] {
   header "$GENROOT/$sample/c/weaveffi.h"
-  link "$sample"
+  link "${sample//-/_}"
   export *
 }
 EOF
@@ -319,10 +338,11 @@ EOF
     ( cd "$pkg" && swift run -Xlinker -L"$LIBDIR" conformance 2>&1 )
 }
 
-swift_contacts() { swift_consumer contacts contacts.swift; }
-swift_events()   { swift_consumer events events.swift; }
-swift_kvstore()  { swift_consumer kvstore kvstore.swift; }
-swift_shapes()   { swift_consumer shapes shapes.swift; }
+swift_contacts()   { swift_consumer contacts contacts.swift; }
+swift_events()     { swift_consumer events events.swift; }
+swift_kvstore()    { swift_consumer kvstore kvstore.swift; }
+swift_shapes()     { swift_consumer shapes shapes.swift; }
+swift_async_demo() { swift_consumer async-demo async_demo.swift; }
 
 # .NET: compile the generated P/Invoke source together with the consumer into
 # one console app. The generated file is named after the resolved identity
@@ -357,10 +377,11 @@ EOF
            dotnet run -c Release --nologo -v quiet 2>&1 )
 }
 
-dotnet_contacts() { dotnet_consumer contacts Contacts.cs; }
-dotnet_events()   { dotnet_consumer events Events.cs; }
-dotnet_kvstore()  { dotnet_consumer kvstore Kvstore.cs; }
-dotnet_shapes()   { dotnet_consumer shapes Shapes.cs; }
+dotnet_contacts()   { dotnet_consumer contacts Contacts.cs; }
+dotnet_events()     { dotnet_consumer events Events.cs; }
+dotnet_kvstore()    { dotnet_consumer kvstore Kvstore.cs; }
+dotnet_shapes()     { dotnet_consumer shapes Shapes.cs; }
+dotnet_async_demo() { dotnet_consumer async-demo AsyncDemo.cs; }
 
 # Node: build the generated N-API addon with node-gyp against the producer
 # cdylib (via the `libweaveffi` link alias + include of the generated C header),
@@ -389,10 +410,11 @@ EOF
         node "$ROOT/conformance/node/$src"
 }
 
-node_contacts() { node_consumer contacts contacts.js; }
-node_events()   { node_consumer events events.js; }
-node_kvstore() { node_consumer kvstore kvstore.js; }
-node_shapes()   { node_consumer shapes shapes.js; }
+node_contacts()   { node_consumer contacts contacts.js; }
+node_events()     { node_consumer events events.js; }
+node_kvstore()    { node_consumer kvstore kvstore.js; }
+node_shapes()     { node_consumer shapes shapes.js; }
+node_async_demo() { node_consumer async-demo async_demo.js; }
 
 # Kotlin/Android: compile the generated JNI bridge into `libweaveffi.<ext>` (what
 # `System.loadLibrary("weaveffi")` expects), linked against the producer cdylib;
@@ -433,7 +455,7 @@ kotlin_consumer() {
     [ -n "$coro" ] || { echo "kotlinx-coroutines-core-jvm.jar not found" >&2; return 1; }
     cc -shared -fPIC "$GENROOT/$sample/android/src/main/cpp/weaveffi_jni.c" \
         -I"$jh/include" -I"$jni_os_inc" -I"$GENROOT/$sample/c" \
-        -L"$LIBDIR" -l"$sample" -Wl,-rpath,"$LIBDIR" \
+        -L"$LIBDIR" -l"${sample//-/_}" -Wl,-rpath,"$LIBDIR" \
         -o "$b/libweaveffi.$EXT" || { echo "JNI bridge compile failed" >&2; return 1; }
     kotlinc "$GENROOT/$sample/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt" \
         "$ROOT/conformance/kotlin/$src" -cp "$coro" -include-runtime -d "$b/app.jar" \
@@ -443,10 +465,11 @@ kotlin_consumer() {
         java -Djava.library.path="$b" -cp "$b/app.jar:$coro" Main
 }
 
-kotlin_contacts() { kotlin_consumer contacts contacts.kt; }
-kotlin_events()  { kotlin_consumer events events.kt; }
-kotlin_kvstore() { kotlin_consumer kvstore kvstore.kt; }
-kotlin_shapes()  { kotlin_consumer shapes shapes.kt; }
+kotlin_contacts()   { kotlin_consumer contacts contacts.kt; }
+kotlin_events()     { kotlin_consumer events events.kt; }
+kotlin_kvstore()    { kotlin_consumer kvstore kvstore.kt; }
+kotlin_shapes()     { kotlin_consumer shapes shapes.kt; }
+kotlin_async_demo() { kotlin_consumer async-demo async_demo.kt; }
 
 # Wasm: compile the producer to wasm32-unknown-unknown and drive the generated
 # ESM bindings from Node. The generated JS glue expects weaveffi_alloc/dealloc
@@ -465,16 +488,17 @@ wasm_consumer() {
     echo "--- building wasm producer: $sample"
     cargo build -q -p "$sample" --release --target wasm32-unknown-unknown \
         || { echo "wasm32 build failed" >&2; return 1; }
-    local wasm="$TARGET_DIR/wasm32-unknown-unknown/release/$sample.wasm"
+    local wasm="$TARGET_DIR/wasm32-unknown-unknown/release/${sample//-/_}.wasm"
     [ -f "$wasm" ] || { echo "wasm artifact not found: $wasm" >&2; return 1; }
     WV_WASM="$wasm" WV_JS="$GENROOT/$sample/wasm/weaveffi_wasm.js" \
         node --experimental-wasm-type-reflection "$ROOT/conformance/wasm/$src"
 }
 
-wasm_contacts() { wasm_consumer contacts contacts.mjs; }
-wasm_events()  { wasm_consumer events events.mjs; }
-wasm_kvstore() { wasm_consumer kvstore kvstore.mjs; }
-wasm_shapes()  { wasm_consumer shapes shapes.mjs; }
+wasm_contacts()   { wasm_consumer contacts contacts.mjs; }
+wasm_events()     { wasm_consumer events events.mjs; }
+wasm_kvstore()    { wasm_consumer kvstore kvstore.mjs; }
+wasm_shapes()     { wasm_consumer shapes shapes.mjs; }
+wasm_async_demo() { wasm_consumer async-demo async_demo.mjs; }
 
 # ---------------------------------------------------------------------------
 # Producers + generation
@@ -487,13 +511,17 @@ build_producer kvstore
 generate kvstore samples/kvstore/kvstore.yml
 build_producer shapes
 generate shapes samples/shapes/shapes.yml
+build_producer async-demo
+generate async-demo samples/async-demo/async_demo.yml
 # Header-only: the producer-export lane implements this in C, no Rust cdylib.
 generate calculator samples/calculator/calculator.yml
 
 # ---------------------------------------------------------------------------
 # Run matrix: every language runs the events lane (callbacks/listeners +
-# iterators) and the kvstore lane (handles, structs, builders, async, eviction
-# listener); contacts covers the original struct/enum/optional surface.
+# iterators), the kvstore lane (handles, structs, builders, async, eviction
+# listener), and the async-demo lane (module-level async functions, typed
+# async errors, buffered async list-of-record returns); contacts covers the
+# original struct/enum/optional surface.
 # ---------------------------------------------------------------------------
 check c-contacts c_contacts
 check c-events c_events
@@ -540,6 +568,17 @@ check kotlin-kvstore kotlin_kvstore
 check wasm-contacts wasm_contacts
 check wasm-events wasm_events
 check wasm-kvstore wasm_kvstore
+check c-async-demo c_async_demo
+check cpp-async-demo cpp_async_demo
+check python-async-demo python_async_demo
+check ruby-async-demo ruby_async_demo
+check go-async-demo go_async_demo
+check dart-async-demo dart_async_demo
+check swift-async-demo swift_async_demo
+check dotnet-async-demo dotnet_async_demo
+check node-async-demo node_async_demo
+check kotlin-async-demo kotlin_async_demo
+check wasm-async-demo wasm_async_demo
 
 echo
 echo "conformance: $PASS passed, $FAIL failed"

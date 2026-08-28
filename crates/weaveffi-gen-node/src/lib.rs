@@ -35,12 +35,12 @@ mod tests;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
-use weaveffi_ir::ir::Api;
 
 use crate::addon::render_addon_c;
 use crate::entities::render_node_index;
@@ -120,7 +120,7 @@ impl LanguageBackend for NodeGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -158,7 +158,7 @@ impl LanguageBackend for NodeGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,

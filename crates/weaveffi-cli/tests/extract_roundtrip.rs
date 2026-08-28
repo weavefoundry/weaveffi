@@ -3,7 +3,7 @@
 //! `roundtrip_kitchen_sink` proves the extractor recovers the same shape
 //! as the original kitchen-sink IDL when run on the hand-annotated Rust
 //! file at `crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`,
-//! including the 0.6.0 surface: the `Gadget` interface, the `KitchenErrors`
+//! including the 0.7.0 surface: the `Gadget` interface, the `KitchenErrors`
 //! domain, and per-function `throws`. Lossy fields (struct field defaults,
 //! iterator returns, standalone `since` without `#[deprecated]`, callback
 //! param docs, error-code `doc:` separate from `message:`) are documented

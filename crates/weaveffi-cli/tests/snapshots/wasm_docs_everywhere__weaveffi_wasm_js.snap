@@ -267,18 +267,19 @@ function _checkDocsErrorsError(wasm, errPtr) {
   }
 }
 
-// Throw if a borrowed (producer-owned) error carries a non-zero
-// code. Used by async callbacks: the producer owns and frees the
-// error struct, so the slot is read but never deallocated here.
+// Throw if a heap-boxed (consumer-owned) error carries a non-zero
+// code. Used by async callbacks: the fields are read, then the box
+// is released with weaveffi_error_free before throwing.
 // `mkErr` maps domain codes (and decodes payload fields) for
 // throwing callables; without it the generic WeaveFFIError is thrown.
 function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
-  if (code === 0) return;
+  if (code === 0) { wasm.weaveffi_error_free(errPtr); return; }
   const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
-  if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
-  throw new WeaveFFIError(code, msg);
+  const err = mkErr ? mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true)) : new WeaveFFIError(code, msg);
+  wasm.weaveffi_error_free(errPtr);
+  throw err;
 }
 
 // Serialize a `docs.Document` record into the value-buffer wire format.

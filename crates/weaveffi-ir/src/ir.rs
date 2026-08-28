@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.6.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.7.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -52,7 +52,7 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.6.0`).
+    /// IR schema version this document targets (for example `0.7.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Package identity used to name, version, and describe every generated
@@ -117,8 +117,7 @@ pub struct Package {
 /// language's natural grouping construct (a namespace, a submodule, a symbol
 /// prefix, and so on). They may nest through [`modules`](Self::modules) to
 /// mirror a package hierarchy.
-// `Eq` is omitted because a nested `StructField::default` holds `serde_yaml::Value` (an `f64`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(
     description = "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors."
 )]
@@ -584,8 +583,7 @@ impl JsonSchema for TypeRef {
 /// A C-style enum lowers across the C ABI by value as an integer, while an
 /// algebraic enum lowers as an opaque object with a tag getter plus per-variant
 /// constructors and field getters.
-// `Eq` is omitted because a variant field's `default` may hold `serde_yaml::Value` (an `f64`), matching `StructDef`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(
     description = "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields."
 )]
@@ -613,8 +611,7 @@ impl EnumDef {
 }
 
 /// A single variant of an [`EnumDef`].
-// `Eq` is omitted because a variant field's `default` may hold `serde_yaml::Value` (an `f64`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EnumVariant {
     /// Variant name (for example `Red`).
     pub name: String,
@@ -627,15 +624,13 @@ pub struct EnumVariant {
     pub doc: Option<String>,
     /// Associated data carried by this variant. Empty for a unit variant or a
     /// C-style enum; non-empty makes the owning enum a sum type (see
-    /// [`EnumDef::is_rich`]). Variant fields reuse [`StructField`] but ignore
-    /// the `default` slot (a sum-type payload has no defaultable fields).
+    /// [`EnumDef::is_rich`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<StructField>,
 }
 
 /// A struct (record) type with named fields.
-// `Eq` is omitted because `StructField::default` holds `serde_yaml::Value` (an `f64`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(description = "A struct (record) type with named fields.")]
 pub struct StructDef {
     /// Struct type name (for example `Contact`).
@@ -651,7 +646,7 @@ pub struct StructDef {
 
 /// A named field of a [`StructDef`], or the payload of an algebraic
 /// [`EnumVariant`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StructField {
     /// Field name (for example `email`).
     pub name: String,
@@ -662,19 +657,11 @@ pub struct StructField {
     /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
-    /// Default value used when the field is omitted, kept as a raw YAML value so
-    /// any literal the field's type accepts can be expressed. Ignored for
-    /// algebraic [`EnumVariant`] payloads, which aren't defaultable. `None` when
-    /// the field has no default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<serde_json::Value>")]
-    pub default: Option<serde_yaml::Value>,
 }
 
 /// A module's error domain: the named set of error codes its fallible functions
 /// can report.
-// `Eq` is omitted because a code's payload fields hold `serde_yaml::Value`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorDomain {
     /// Error domain name, used to name the generated error type (for example
     /// `ContactErrors`).
@@ -684,8 +671,7 @@ pub struct ErrorDomain {
 }
 
 /// A single named error within an [`ErrorDomain`].
-// `Eq` is omitted because a payload field's `default` may hold `serde_yaml::Value` (an `f64`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorCode {
     /// Error code name, lowered to a variant or constant on the generated error
     /// type (for example `not_found`).
@@ -700,8 +686,7 @@ pub struct ErrorCode {
     pub doc: Option<String>,
     /// Structured payload fields this error carries beyond its code and
     /// message, serialized across the ABI in the error's payload buffer.
-    /// Empty for a plain code. Payload fields reuse [`StructField`] but
-    /// ignore the `default` slot.
+    /// Empty for a plain code.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<StructField>,
 }
@@ -713,7 +698,7 @@ mod tests {
     #[test]
     fn struct_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: geometry
     functions: []
@@ -744,7 +729,7 @@ modules:
     #[test]
     fn struct_def_round_trip_json() {
         let json = r#"{
-            "version": "0.6.0",
+            "version": "0.7.0",
             "modules": [{
                 "name": "geo",
                 "functions": [],
@@ -767,7 +752,7 @@ modules:
     #[test]
     fn structs_default_to_empty() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -779,7 +764,7 @@ modules:
     #[test]
     fn package_block_round_trips_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 package:
   name: kvstore
   version: 1.2.0
@@ -818,7 +803,7 @@ modules:
     #[test]
     fn package_is_optional() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -833,7 +818,7 @@ modules:
     #[test]
     fn package_minimal_requires_name_and_version() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 package:
   name: tiny
   version: 0.0.1
@@ -862,7 +847,6 @@ modules: []
             name: "origin".to_string(),
             ty: TypeRef::Named("Point".to_string()),
             doc: None,
-            default: None,
         };
         let json = serde_json::to_string(&field).unwrap();
         let back: StructField = serde_json::from_str(&json).unwrap();
@@ -879,7 +863,7 @@ modules: []
     #[test]
     fn enum_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: graphics
     functions: []
@@ -915,7 +899,7 @@ modules:
     #[test]
     fn enum_def_round_trip_json() {
         let json = r#"{
-            "version": "0.6.0",
+            "version": "0.7.0",
             "modules": [{
                 "name": "status",
                 "functions": [],
@@ -939,7 +923,7 @@ modules:
     #[test]
     fn enums_default_to_empty() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -993,7 +977,6 @@ modules:
                         name: "radius".to_string(),
                         ty: TypeRef::F64,
                         doc: None,
-                        default: None,
                     }],
                 },
                 EnumVariant {
@@ -1017,19 +1000,16 @@ modules:
                     name: "r".to_string(),
                     ty: TypeRef::U32,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "g".to_string(),
                     ty: TypeRef::U32,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "b".to_string(),
                     ty: TypeRef::U32,
                     doc: None,
-                    default: None,
                 },
             ],
         };
@@ -1188,7 +1168,7 @@ modules:
     #[test]
     fn typeref_optional_yaml_deser() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     functions:
@@ -1211,7 +1191,7 @@ modules:
     #[test]
     fn typeref_list_yaml_deser() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     functions:
@@ -1304,7 +1284,7 @@ modules:
     #[test]
     fn typeref_map_yaml_deser() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     functions:
@@ -1453,7 +1433,7 @@ modules:
     #[test]
     fn typeref_borrowed_yaml_deser() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: io
     functions:
@@ -1482,7 +1462,7 @@ modules:
     #[test]
     fn generators_field_parses_from_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -1503,7 +1483,7 @@ generators:
     #[test]
     fn generators_defaults_to_none() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -1524,7 +1504,7 @@ modules:
     #[test]
     fn callback_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: events
     functions: []
@@ -1549,7 +1529,7 @@ modules:
     #[test]
     fn listener_def_round_trip_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: events
     functions: []
@@ -1573,7 +1553,7 @@ modules:
     #[test]
     fn callbacks_and_listeners_default_to_empty() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -1615,7 +1595,7 @@ modules:
     #[test]
     fn error_code_fields_default_to_empty() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     functions: []
@@ -1637,7 +1617,7 @@ modules:
     #[test]
     fn error_code_payload_fields_round_trip() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     functions: []
@@ -1668,7 +1648,7 @@ modules:
     #[test]
     fn param_mutable_defaults_to_false() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: io
     functions:
@@ -1684,7 +1664,7 @@ modules:
     #[test]
     fn param_mutable_true_round_trip() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: io
     functions:
@@ -1705,7 +1685,7 @@ modules:
     #[test]
     fn param_mutable_false_explicit() {
         let json = r#"{
-            "version": "0.6.0",
+            "version": "0.7.0",
             "modules": [{
                 "name": "io",
                 "functions": [{
@@ -1721,7 +1701,7 @@ modules:
     #[test]
     fn deprecated_and_since_default_to_none() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions:
@@ -1737,7 +1717,7 @@ modules:
     #[test]
     fn deprecated_and_since_round_trip() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions:
@@ -1759,37 +1739,12 @@ modules:
     }
 
     #[test]
-    fn struct_field_default_value_round_trip() {
-        let yaml = r#"
-version: "0.6.0"
-modules:
-  - name: contacts
-    functions: []
-    structs:
-      - name: Contact
-        fields:
-          - name: name
-            type: string
-          - name: age
-            type: i32
-            default: 0
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let fields = &api.modules[0].structs[0].fields;
-        assert!(fields[0].default.is_none());
-        assert_eq!(
-            fields[1].default,
-            Some(serde_yaml::Value::Number(serde_yaml::Number::from(0)))
-        );
-    }
-
-    #[test]
     fn serialization_omits_defaulted_fields() {
         // A minimal API whose every optional/defaulted field is at its
         // default must serialize without emitting those fields, so the
         // canonical IDL produced by `weaveffi format`/`extract` stays terse.
         let api = Api {
-            version: "0.6.0".into(),
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "calc".into(),
                 functions: vec![Function {
@@ -1893,7 +1848,7 @@ modules:
     #[test]
     fn interface_round_trip_yaml() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     interfaces:
@@ -1946,7 +1901,7 @@ modules:
     #[test]
     fn interfaces_default_to_empty() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions: []
@@ -1958,7 +1913,7 @@ modules:
     #[test]
     fn throws_defaults_to_false_and_round_trips() {
         let yaml = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     functions:

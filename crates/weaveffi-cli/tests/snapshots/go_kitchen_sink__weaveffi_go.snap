@@ -66,6 +66,22 @@ func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {
 	return code, msg, payload
 }
 
+// wvTakeBoxedError reads a heap-boxed error delivered to an async
+// completion callback and releases the box with weaveffi_error_free.
+func wvTakeBoxedError(cErr *C.weaveffi_error) (int32, string, []byte) {
+	code := int32(cErr.code)
+	msg := ""
+	if cErr.message != nil {
+		msg = C.GoString(cErr.message)
+	}
+	var payload []byte
+	if cErr.payload_ptr != nil {
+		payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))
+	}
+	C.weaveffi_error_free(cErr)
+	return code, msg, payload
+}
+
 func wvBrandError(code int32, message string, _ []byte) error {
 	return &WeaveFFIError{Code: code, Message: message}
 }
@@ -811,12 +827,13 @@ func goWv_weaveffi_kitchen_do_async_callback(context unsafe.Pointer, err *C.weav
 	}
 	ch := v.(chan wvOutcomeKitchenDoAsync)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeKitchenDoAsync{err: wvBrandError(wvTakeError(err))}
+		ch <- wvOutcomeKitchenDoAsync{err: wvBrandError(wvTakeBoxedError(err))}
 		return
 	}
 	val := ""
 	if result != nil {
 		val = C.GoString(result)
+		C.weaveffi_free_string(result)
 	}
 	ch <- wvOutcomeKitchenDoAsync{val: val}
 }
@@ -849,12 +866,13 @@ func goWv_weaveffi_kitchen_do_cancellable_callback(context unsafe.Pointer, err *
 	}
 	ch := v.(chan wvOutcomeKitchenDoCancellable)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeKitchenDoCancellable{err: wvBrandError(wvTakeError(err))}
+		ch <- wvOutcomeKitchenDoCancellable{err: wvBrandError(wvTakeBoxedError(err))}
 		return
 	}
 	val := ""
 	if result != nil {
 		val = C.GoString(result)
+		C.weaveffi_free_string(result)
 	}
 	ch <- wvOutcomeKitchenDoCancellable{val: val}
 }

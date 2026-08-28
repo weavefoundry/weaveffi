@@ -661,6 +661,9 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_free(IntPtr err);
+
         [DllImport(LibName, EntryPoint = "weaveffi_shared_ping", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_shared_ping(ref WeaveFFIError err);
 
@@ -1087,11 +1090,14 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
-                    tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? "");
+                    var str = Marshal.PtrToStringUTF8(result) ?? "";
+                    if (result != IntPtr.Zero) NativeMethods.weaveffi_free_string(result);
+                    tcs.SetResult(str);
                 }
                 finally
                 {
@@ -1137,11 +1143,14 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
-                    tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? "");
+                    var str = Marshal.PtrToStringUTF8(result) ?? "";
+                    if (result != IntPtr.Zero) NativeMethods.weaveffi_free_string(result);
+                    tcs.SetResult(str);
                 }
                 finally
                 {

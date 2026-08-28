@@ -1,7 +1,8 @@
 //! C header generator for WeaveFFI.
 //!
-//! Emits a single `{prefix}.h` describing the stable C ABI surface of an
-//! [`Api`], plus a companion `{prefix}.c` placeholder for future convenience
+//! Emits a single `{prefix}.h` describing the stable C ABI surface of a
+//! [`ResolvedApi`](weaveffi_core::resolved::ResolvedApi), plus a companion
+//! `{prefix}.c` placeholder for future convenience
 //! wrappers. This is the canonical backend: the header it emits *is* the C ABI
 //! every other language binds to.
 //!
@@ -21,11 +22,11 @@ mod tests;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
-use weaveffi_ir::ir::Api;
 
 pub use header::{render_c_header, render_c_header_from_model};
 
@@ -81,7 +82,7 @@ impl LanguageBackend for CGenerator {
 
     fn files(
         &self,
-        _api: &Api,
+        _api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -105,7 +106,7 @@ impl LanguageBackend for CGenerator {
 
     fn package(
         &self,
-        _api: &Api,
+        _api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,

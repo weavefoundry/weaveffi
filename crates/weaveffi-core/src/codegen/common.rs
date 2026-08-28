@@ -1,8 +1,7 @@
 //! Shared codegen primitives that every language generator can reuse.
 //!
 //! Until 0.4.0, every generator hand-rolled its own copy of the module
-//! tree walker, the doc-comment emitter, and the "is this type a C
-//! pointer at the ABI boundary?" predicate. Pulling them in here gives
+//! tree walker and the doc-comment emitter. Pulling them in here gives
 //! the generators one source of truth and shrinks each crate by a few
 //! dozen lines of near-identical helper code.
 //!
@@ -12,7 +11,7 @@
 //! their behaviour is non-uniform; this module deliberately covers
 //! only the common 80%.
 
-use weaveffi_ir::ir::{Module, TypeRef};
+use weaveffi_ir::ir::Module;
 
 /// Doc-comment flavour used by [`emit_doc`].
 ///
@@ -126,34 +125,6 @@ pub fn walk_modules_with_path<'a>(
         }
         Some((m, path))
     })
-}
-
-/// Predicate: returns `true` when the IR type is represented as a
-/// pointer at the C ABI boundary.
-///
-/// String types, byte buffers, record values, rich (algebraic) enums,
-/// interfaces, typed handles, lists, maps, and iterators all cross the ABI as
-/// pointers. Scalars (`i32`/`bool`/etc.), `Handle`, and a C-style `Enum(_)`
-/// cross by value.
-///
-/// `Optional(T)` is *not* automatically a pointer here: callers that
-/// care about Optional pointer-ness (the C/C++ generators) recurse
-/// into the inner type before consulting this predicate.
-pub fn is_c_pointer_type(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::Interface(_)
-            | TypeRef::TypedHandle(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-            | TypeRef::Iterator(_)
-    )
 }
 
 /// Convert a `snake_case` identifier to `PascalCase` by uppercasing the
@@ -395,55 +366,6 @@ mod tests {
             DocCommentStyle::Javadoc,
         );
         assert_eq!(out, "/** hello */\n");
-    }
-
-    // --- is_c_pointer_type ---
-
-    #[test]
-    fn is_c_pointer_for_pointer_carrying_types() {
-        for ty in [
-            TypeRef::StringUtf8,
-            TypeRef::BorrowedStr,
-            TypeRef::Bytes,
-            TypeRef::BorrowedBytes,
-            TypeRef::Record("X".into()),
-            TypeRef::RichEnum("Y".into()),
-            TypeRef::Interface("Z".into()),
-            TypeRef::TypedHandle("X".into()),
-            TypeRef::List(Box::new(TypeRef::I32)),
-            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-            TypeRef::Iterator(Box::new(TypeRef::StringUtf8)),
-        ] {
-            assert!(is_c_pointer_type(&ty), "expected pointer: {ty:?}");
-        }
-    }
-
-    #[test]
-    fn is_c_pointer_for_value_types_is_false() {
-        for ty in [
-            TypeRef::I32,
-            TypeRef::U32,
-            TypeRef::I64,
-            TypeRef::F64,
-            TypeRef::Bool,
-            TypeRef::Handle,
-            TypeRef::Enum("E".into()),
-        ] {
-            assert!(!is_c_pointer_type(&ty), "expected non-pointer: {ty:?}");
-        }
-    }
-
-    #[test]
-    fn is_c_pointer_does_not_recurse_into_optional() {
-        // Callers that care about Optional pointer-ness recurse first.
-        // We document and enforce that contract: bare Optional is not
-        // a pointer.
-        assert!(!is_c_pointer_type(&TypeRef::Optional(Box::new(
-            TypeRef::I32
-        ))));
-        assert!(!is_c_pointer_type(&TypeRef::Optional(Box::new(
-            TypeRef::StringUtf8
-        ))));
     }
 
     // --- pascal_case ---

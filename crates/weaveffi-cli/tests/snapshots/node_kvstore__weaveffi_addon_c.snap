@@ -289,6 +289,7 @@ static void weaveffi_kv_Store_compact_napi_cb(void* context, weaveffi_error* err
     } else {
         ctx->result = result;
     }
+    weaveffi_error_free(err);
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 

@@ -640,9 +640,10 @@ fn render_iterator_next_method(
 /// heap-allocated, threaded through the C `context` pointer, settled by the
 /// completion callback, and deleted exactly once. A callback error settles
 /// the promise with the typed domain exception (payload fields decoded) when
-/// the callable throws, or the generic `WeaveFFIError` otherwise. Borrowed
-/// result buffers are copied or decoded inside the callback, before the
-/// producer reclaims them.
+/// the callable throws, or the generic `WeaveFFIError` otherwise. The
+/// callback owns everything it receives: the boxed error and any string or
+/// buffer result are released through the runtime free symbols after
+/// copying.
 fn render_async_callable(
     out: &mut String,
     f: &FnBinding,
@@ -710,6 +711,7 @@ fn render_async_callable(
             w.scope(|w| {
                 w.line("std::string msg(err->message ? err->message : \"unknown error\");");
                 w.line(format!("p->set_exception({make_error});"));
+                w.line(format!("{prefix}_error_free(err);"));
             });
             w.line("} else {");
             w.scope(|w| {
@@ -735,25 +737,33 @@ fn render_async_callable(
 ///
 /// Per the async completion contract (`weaveffi_core::plan::AsyncProtocol`),
 /// result buffers handed to the callback (strings, bytes, and buffered
-/// values) are *borrowed*: they stay owned by the producer and are valid only
-/// for the callback's duration, so the wrapper deep-copies or decodes them
-/// and never frees them. An owned interface result is the exception: the
-/// callback receives ownership and adopts the pointer into the RAII wrapper.
+/// values) are *owned by the consumer*: the wrapper copies or decodes them,
+/// then releases the producer allocation through the runtime free symbols.
+/// An owned interface result is instead adopted into the RAII wrapper.
 fn emit_async_set_value(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: &str) {
     match ret_pass(Some(ty), module, prefix) {
         RetPass::Buffer => {
-            // Borrowed `(result_ptr, result_len)` buffer: decode, never free.
+            // Owned `(result_ptr, result_len)` buffer: decode, then free.
             w.line("detail::BufferReader result_r(result_ptr, result_len);");
             emit_read_decl(w, ty, "value", "result_r", module, prefix);
             w.line("result_r.expect_end();");
+            w.line(format!(
+                "{prefix}_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);"
+            ));
             w.line("p->set_value(std::move(value));");
         }
-        // Borrowed for the callback's duration: copy, do not free.
+        // Owned by the consumer: copy, then free.
         RetPass::String => {
-            w.line("p->set_value(std::string(result));");
+            w.line("std::string value(result ? result : \"\");");
+            w.line(format!("{prefix}_free_string(result);"));
+            w.line("p->set_value(std::move(value));");
         }
         RetPass::Bytes => {
-            w.line("p->set_value(std::vector<uint8_t>(result, result + result_len));");
+            w.line("std::vector<uint8_t> value(result, result + result_len);");
+            w.line(format!(
+                "{prefix}_free_bytes(const_cast<uint8_t*>(result), result_len);"
+            ));
+            w.line("p->set_value(std::move(value));");
         }
         // Owned interface result: the callback receives ownership; adopt it.
         // A nullable result maps null to `std::nullopt`.

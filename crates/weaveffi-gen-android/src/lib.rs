@@ -23,12 +23,12 @@ mod types;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{BindingModel, CallShape, CallbackBinding};
 use weaveffi_core::pkg;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::calls::{render_kotlin_free_fn, render_listener_api};
 use crate::codec::model_uses_buffers;
@@ -122,7 +122,7 @@ impl LanguageBackend for AndroidGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,

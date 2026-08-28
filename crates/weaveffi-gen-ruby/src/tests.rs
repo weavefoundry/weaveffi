@@ -1,6 +1,7 @@
 //! Tests for the Ruby generator: rendering coverage across every entity
 //! and call shape, error-domain semantics, packaging, and identifier policy.
 
+use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::types::{rb_abi_types, rb_ffi_type};
 use camino::Utf8Path;
@@ -80,13 +81,13 @@ use weaveffi_ir::ir::{
     StructDef, StructField, TypeRef,
 };
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".to_string(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".to_string(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn simple_module(name: &str, functions: Vec<Function>) -> Module {
@@ -105,7 +106,7 @@ fn simple_module(name: &str, functions: Vec<Function>) -> Module {
 
 /// Build the model (test-only; the driver builds it in production) and
 /// render with the default naming (module-prefix stripping on).
-fn render(api: &Api, module_name: &str, prefix: &str) -> String {
+fn render(api: &ResolvedApi, module_name: &str, prefix: &str) -> String {
     let model = BindingModel::build(api, prefix);
     render_ruby_module(&model, module_name, true, "weaveffi.rb", "weaveffi.yml")
 }
@@ -139,7 +140,7 @@ fn str_param(name: &str) -> Param {
 /// constructor, a factory constructor, methods (sync throwing, sync
 /// non-throwing, async), a static, plus throwing and non-throwing free
 /// functions.
-fn kv_api() -> Api {
+fn kv_api() -> ResolvedApi {
     let mut m = simple_module(
         "kv",
         vec![
@@ -363,13 +364,11 @@ fn error_payload_fields_decode_into_attributes() {
                     name: "key".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "attempts".into(),
                     ty: TypeRef::U32,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -731,13 +730,11 @@ fn renders_struct_as_value_class() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -791,13 +788,11 @@ fn struct_codec_packs_and_unpacks_fields_in_order() {
                     name: "x".into(),
                     ty: TypeRef::F64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "label".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1164,7 +1159,6 @@ fn struct_return_wraps_in_class() {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1242,20 +1236,20 @@ fn async_function_generates_blocking_wrapper() {
         code.contains("# Blocks the current thread until the async producer completes"),
         "blocking doc: {code}"
     );
-    // The completion callback copies the borrowed result buffer and must
-    // not free it: the producer owns callback result buffers.
+    // The completion callback copies the owned result string and then
+    // releases the producer allocation.
     assert!(
         code.contains("result.read_string"),
         "result copied in callback: {code}"
     );
     assert!(
-        !code.contains("weaveffi_free_string(result)"),
-        "borrowed callback buffer must not be freed: {code}"
+        code.contains("weaveffi_free_string(result) unless result.null?"),
+        "owned callback string must be freed after copying: {code}"
     );
 }
 
 #[test]
-fn async_bytes_result_copied_not_freed() {
+fn async_bytes_result_copied_then_freed() {
     let api = make_api(vec![simple_module(
         "io",
         vec![Function {
@@ -1276,8 +1270,8 @@ fn async_bytes_result_copied_not_freed() {
         "bytes copied in callback: {code}"
     );
     assert!(
-        !code.contains("weaveffi_free_bytes(result, result_len)"),
-        "borrowed callback bytes must not be freed: {code}"
+        code.contains("weaveffi_free_bytes(result, result_len) unless result.null?"),
+        "owned callback bytes must be freed after copying: {code}"
     );
 }
 
@@ -1408,7 +1402,6 @@ fn iterator_of_records_adopts_each_element() {
                 name: "key".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1709,7 +1702,6 @@ fn list_of_structs_return() {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1766,9 +1758,9 @@ fn optional_struct_returns_nil_on_null() {
 
 // ── Comprehensive tests ──
 
-fn contacts_api() -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn contacts_api() -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![Module {
             name: "contacts".into(),
             functions: vec![
@@ -1872,31 +1864,26 @@ fn contacts_api() -> Api {
                         name: "id".into(),
                         ty: TypeRef::I64,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "first_name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "last_name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "email".into(),
                         ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "contact_type".into(),
                         ty: TypeRef::Enum("ContactType".into()),
                         doc: None,
-                        default: None,
                     },
                 ],
             }],
@@ -1931,7 +1918,7 @@ fn contacts_api() -> Api {
         }],
         generators: None,
         package: None,
-    }
+    })
 }
 
 #[test]
@@ -2010,13 +1997,11 @@ fn generate_ruby_with_structs() {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "last_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -2390,7 +2375,6 @@ fn ruby_no_double_free_on_error() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2512,7 +2496,7 @@ fn ruby_null_check_on_optional_return() {
     );
 }
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "docs".into(),
         functions: vec![Function {
@@ -2539,7 +2523,6 @@ fn doc_api() -> Api {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -2636,7 +2619,7 @@ fn ruby_custom_prefix_threads_to_user_symbols() {
     );
 }
 
-fn shapes_api() -> Api {
+fn shapes_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "shapes".into(),
         functions: vec![
@@ -2702,7 +2685,6 @@ fn shapes_api() -> Api {
                             name: "radius".into(),
                             ty: TypeRef::F64,
                             doc: None,
-                            default: None,
                         }],
                     },
                     EnumVariant {
@@ -2714,13 +2696,11 @@ fn shapes_api() -> Api {
                                 name: "width".into(),
                                 ty: TypeRef::F32,
                                 doc: None,
-                                default: None,
                             },
                             StructField {
                                 name: "height".into(),
                                 ty: TypeRef::F32,
                                 doc: None,
-                                default: None,
                             },
                         ],
                     },
@@ -2733,13 +2713,11 @@ fn shapes_api() -> Api {
                                 name: "label".into(),
                                 ty: TypeRef::StringUtf8,
                                 doc: None,
-                                default: None,
                             },
                             StructField {
                                 name: "count".into(),
                                 ty: TypeRef::U8,
                                 doc: None,
-                                default: None,
                             },
                         ],
                     },
@@ -2965,13 +2943,11 @@ fn kitchen_sink_module_renders_coherently() {
                 name: "key".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             },
             StructField {
                 name: "hits".into(),
                 ty: TypeRef::Optional(Box::new(TypeRef::U32)),
                 doc: None,
-                default: None,
             },
         ],
     }];
@@ -2987,7 +2963,6 @@ fn kitchen_sink_module_renders_coherently() {
                     name: "entry".into(),
                     ty: TypeRef::Record("Entry".into()),
                     doc: None,
-                    default: None,
                 }],
             },
             EnumVariant {
@@ -3009,7 +2984,6 @@ fn kitchen_sink_module_renders_coherently() {
                 name: "key".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
     });
@@ -3102,18 +3076,18 @@ fn async_buffered_result_decoded_inside_callback() {
         modules: vec![],
     }]);
     let code = render(&api, "WeaveFFI", "weaveffi");
-    // The borrowed result buffer is decoded inside the callback and
-    // never freed (the producer frees after the callback returns).
+    // The owned result buffer is copied, freed, and decoded inside the
+    // callback.
     assert!(
         code.contains(
             "_wv_r = WvBufferReader.new(result_ptr.null? ? ''.b : result_ptr.read_string(result_len))"
         ),
-        "borrowed buffer copied and decoded: {code}"
+        "owned buffer copied and decoded: {code}"
     );
     assert!(code.contains("queue << _wv_v"), "decoded push: {code}");
     assert!(
-        !code.contains("weaveffi_free_bytes(result_ptr"),
-        "borrowed callback buffer must not be freed: {code}"
+        code.contains("weaveffi_free_bytes(result_ptr, result_len) unless result_ptr.null?"),
+        "owned callback buffer must be freed after copying: {code}"
     );
     // A decode failure surfaces through the queue rather than raising
     // across the C callback boundary.
@@ -3149,7 +3123,6 @@ fn listener_buffered_argument_decoded_before_dispatch() {
                 name: "key".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         ..simple_module("events", vec![])
@@ -3195,13 +3168,11 @@ fn keyword_params_and_fields_gain_trailing_underscore() {
                     name: "end".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "normal".into(),
                     ty: TypeRef::Bool,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -3294,7 +3265,7 @@ fn negative_runtime_codes_fall_through_to_generic_error() {
 fn gemspec_escapes_quotes_and_backslashes_in_metadata() {
     use weaveffi_ir::ir::Package;
 
-    let mut api = make_api(vec![simple_module("kv", vec![])]);
+    let mut api = make_api(vec![simple_module("kv", vec![])]).api().clone();
     api.package = Some(Package {
         name: "my-kv".into(),
         version: "1.2.3".into(),
@@ -3304,6 +3275,7 @@ fn gemspec_escapes_quotes_and_backslashes_in_metadata() {
         homepage: Some("https://example.com/it's".into()),
         repository: None,
     });
+    let api = ResolvedApi::assume_resolved(api);
     let dir = tempfile::tempdir().unwrap();
     let out_dir = Utf8Path::from_path(dir.path()).unwrap();
     RubyGenerator

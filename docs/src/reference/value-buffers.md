@@ -93,11 +93,11 @@ The consumer decodes the buffer and then releases it with
 `const uint8_t** out_item` plus `size_t* out_len`; the consumer decodes and
 frees it with `weaveffi_free_bytes` per element.
 
-**Async results.** The completion callback receives a *borrowed*
-`(const uint8_t* result_ptr, size_t result_len)` pair. The producer frees the
-encoding after the callback returns, so the consumer must decode (or copy)
-inside the callback. Owned interface results are the exception: the callback
-adopts the object pointer.
+**Async results.** The completion callback receives an *owned*
+`(const uint8_t* result_ptr, size_t result_len)` pair: the consumer decodes
+(or copies) the encoding and then releases it with `weaveffi_free_bytes`.
+Owned interface results transfer ownership the same way: the callback adopts
+the object pointer.
 
 **Callback and listener arguments.** Buffered callback arguments are borrowed
 `(ptr, len)` pairs valid only for the duration of the dispatch.

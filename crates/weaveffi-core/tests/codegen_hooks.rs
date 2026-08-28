@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use camino::Utf8Path;
 use weaveffi_core::codegen::{ConfiguredGenerator, Generator, Orchestrator, OrchestratorHooks};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
 
 const HOOK_HELPER: &str = env!("CARGO_BIN_EXE_hook_helper");
@@ -46,7 +47,12 @@ impl Generator for CountingGenerator {
         weaveffi_core::capabilities::TargetCapabilities::full()
     }
 
-    fn generate(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Result<()> {
+    fn generate(
+        &self,
+        _api: &ResolvedApi,
+        out_dir: &Utf8Path,
+        _config: &Self::Config,
+    ) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let dir = out_dir.join(self.name);
         std::fs::create_dir_all(dir.as_std_path())?;
@@ -55,8 +61,8 @@ impl Generator for CountingGenerator {
     }
 }
 
-fn test_api() -> Api {
-    Api {
+fn test_api() -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
         version: "0.5.0".to_string(),
         modules: vec![Module {
             name: "math".to_string(),
@@ -94,7 +100,7 @@ fn test_api() -> Api {
         }],
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn configured(

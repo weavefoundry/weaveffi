@@ -99,7 +99,7 @@ mod tests {
         std::fs::write(
             &yml,
             concat!(
-                "version: \"0.6.0\"\n",
+                "version: \"0.7.0\"\n",
                 "modules:\n",
                 "  - name: math\n",
                 "    functions:\n",
@@ -122,9 +122,8 @@ mod tests {
 
         let api = {
             let contents = std::fs::read_to_string(&yml).unwrap();
-            let mut api = weaveffi_ir::parse::parse_api_str(&contents, "yaml").unwrap();
-            weaveffi_core::validate::validate_api(&mut api, None).unwrap();
-            api
+            let api = weaveffi_ir::parse::parse_api_str(&contents, "yaml").unwrap();
+            weaveffi_core::validate::validate_api(api, None).unwrap()
         };
         let out_dir = Utf8Path::new(out_str);
 

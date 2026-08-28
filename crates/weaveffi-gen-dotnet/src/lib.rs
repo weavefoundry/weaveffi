@@ -28,12 +28,12 @@ mod types;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{BindingModel, CallShape, ErrorBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::calls::render_wrapper_class;
 use crate::entities::{
@@ -121,7 +121,7 @@ impl LanguageBackend for DotnetGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -161,7 +161,7 @@ impl LanguageBackend for DotnetGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,

@@ -65,7 +65,7 @@ standard fixed-width boolean type across ABIs.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -494,7 +494,7 @@ async def compact(self) -> int:
         if err and err.contents.code != 0:
             _code = err.contents.code
             _msg = err.contents.message.decode("utf-8") if err.contents.message else ""
-            _lib.weaveffi_error_clear(ctypes.byref(err.contents))
+            _lib.weaveffi_error_free(err)
             _state["err"] = _kv_error_from(_code, _msg)
         else:
             _state["val"] = result
@@ -522,11 +522,14 @@ async def compact(self) -> int:
 
 The completion callback fires exactly once, on an arbitrary producer
 thread. Result buffers passed to it (strings, bytes, and the serialized
-value buffers of buffered results) are owned by the producer and valid
-only for the callback's duration, so the wrapper copies or decodes them
-inside the callback and never frees them. Owned interface results are
-the exception: the callback receives ownership and adopts the pointer
-into a wrapper class. Conversion happens on the producer thread; the
+value buffers of buffered results) are owned by the consumer, so the
+wrapper copies or decodes them inside the callback and then releases
+them with `weaveffi_free_string` or `weaveffi_free_bytes` (the
+`_take_string` and `_take_buffer` helpers pair the copy with the
+free). A reported error is heap-boxed and released with
+`weaveffi_error_free` after its fields are copied. Owned interface
+results transfer ownership too: the callback adopts the pointer into a
+wrapper class. Conversion happens on the producer thread; the
 wrapper then hops back to the event loop with
 `loop.call_soon_threadsafe` to resolve the future, since asyncio
 futures must not be touched from foreign threads.

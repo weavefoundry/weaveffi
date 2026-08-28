@@ -42,6 +42,11 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+typedef _NativeWeaveffiErrorFree = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorFree = void Function(Pointer<_WeaveFFIError>);
+final _weaveffiErrorFree = _lib.lookupFunction<
+    _NativeWeaveffiErrorFree, _DartWeaveffiErrorFree>('weaveffi_error_free');
+
 typedef _NativeWeaveffiFreeString = Void Function(Pointer<Utf8>);
 typedef _DartWeaveffiFreeString = void Function(Pointer<Utf8>);
 final _weaveffiFreeString = _lib.lookupFunction<
@@ -697,7 +702,7 @@ class Store {
           final code = err.ref.code;
           final msg = err.ref.message.toDartString();
           final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);
-          _weaveffiErrorClear(err);
+          _weaveffiErrorFree(err);
           completer.completeError(_mapKvException(code, msg, payload));
           return;
         }

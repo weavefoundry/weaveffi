@@ -104,8 +104,9 @@ the generated IDL and every binding.
 
 Call `weaveffi::export_runtime!()` exactly once in the crate (not per module).
 It emits the fixed C ABI runtime symbols (`weaveffi_free_string`,
-`weaveffi_free_bytes`, `weaveffi_error_clear`, the cancel-token helpers, and
-the arena) that every binding links against.
+`weaveffi_free_bytes`, `weaveffi_error_clear`, `weaveffi_error_free`,
+the cancel-token helpers, and the arena) that every binding links
+against.
 
 ## How values cross the boundary
 

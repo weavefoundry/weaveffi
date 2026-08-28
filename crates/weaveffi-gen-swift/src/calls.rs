@@ -87,20 +87,28 @@ impl<'a> ErrCtx<'a> {
 
     /// The statements an async completion callback runs (after copying the
     /// runtime `code`/`msg` locals) when the error slot reports: copy the
-    /// payload and resume throwing the mapped domain error, resume with the
-    /// generic brand error, or trap.
+    /// payload, release the heap-boxed error with `weaveffi_error_free`, and
+    /// resume throwing the mapped domain error, resume with the generic brand
+    /// error, or trap.
     fn async_err_lines(&self) -> Vec<String> {
         if !self.throws {
-            return vec!["fatalError(\"\\(code): \\(msg)\")".to_string()];
+            return vec![
+                "weaveffi_error_free(err)".to_string(),
+                "fatalError(\"\\(code): \\(msg)\")".to_string(),
+            ];
         }
         match self.domain {
             Some(stem) => vec![
                 "let payload: [UInt8]? = err.pointee.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.pointee.payload_len)) }".to_string(),
+                "weaveffi_error_free(err)".to_string(),
                 format!("contRef.value.resume(throwing: map{stem}(code: code, message: msg, payload: payload))"),
             ],
-            None => vec![format!(
-                "contRef.value.resume(throwing: {ERROR_BRAND}.error(code: code, message: msg))"
-            )],
+            None => vec![
+                "weaveffi_error_free(err)".to_string(),
+                format!(
+                    "contRef.value.resume(throwing: {ERROR_BRAND}.error(code: code, message: msg))"
+                ),
+            ],
         }
     }
 
@@ -882,11 +890,10 @@ fn async_callback_param_names(rp: &RetPass) -> &'static str {
 /// Render the success branch of an async completion callback: convert the
 /// callback's result slots and resume the continuation exactly once.
 ///
-/// Result buffers (strings, bytes, and buffered values) are borrowed for the
-/// callback's duration: they're deep-copied or decoded before the callback
-/// returns and never freed here. Owned-object results are the exception; the
-/// callback receives ownership and the pointer is adopted by its wrapper
-/// class.
+/// Result buffers (strings, bytes, and buffered values) are owned by the
+/// consumer: they're deep-copied or decoded here, then released through the
+/// runtime free symbols. An owned-object result is instead adopted by its
+/// wrapper class.
 fn render_async_resume_result(
     w: &mut CodeWriter,
     f: &FnBinding,
@@ -901,8 +908,8 @@ fn render_async_resume_result(
         }
         RetPass::Buffer => {
             let ty = f.ret.as_ref().expect("a buffered return carries a type");
-            // Borrowed for the callback's duration: copy the bytes and decode
-            // inside the callback; the producer frees its own buffer after.
+            // Owned by the consumer: copy the bytes, free the producer
+            // allocation, then decode from the copy.
             w.line("guard let resultPtr = resultPtr else {");
             w.indent();
             w.line(err.async_fail_stmt(-1, "null buffer"));
@@ -914,6 +921,7 @@ fn render_async_resume_result(
             w.line(
                 "let resultBytes = [UInt8](UnsafeBufferPointer(start: resultPtr, count: resultLen))",
             );
+            w.line("weaveffi_free_bytes(UnsafeMutablePointer(mutating: resultPtr), resultLen)");
             w.line("var resultReader = WvReader(bytes: resultBytes)");
             let v = fresh(counter, "v");
             read_value_stmts(w, ty, &v, "resultReader", ctx, counter);
@@ -931,14 +939,17 @@ fn render_async_resume_result(
             }
             w.dedent();
             w.line("}");
-            // The string is borrowed for the callback's duration: copy it,
-            // don't free it (the producer releases its own buffer).
-            w.line("contRef.value.resume(returning: String(cString: result))");
+            // Owned by the consumer: copy the string, then free it.
+            w.line("let resultValue = String(cString: result)");
+            w.line("weaveffi_free_string(result)");
+            w.line("contRef.value.resume(returning: resultValue)");
         }
         RetPass::Bytes => {
             w.line("if let result = result {");
             w.scope(|w| {
-                w.line("contRef.value.resume(returning: Data(bytes: result, count: resultLen))");
+                w.line("let resultValue = Data(bytes: result, count: resultLen)");
+                w.line("weaveffi_free_bytes(UnsafeMutablePointer(mutating: result), resultLen)");
+                w.line("contRef.value.resume(returning: resultValue)");
             });
             w.line("} else {");
             w.scope(|w| {

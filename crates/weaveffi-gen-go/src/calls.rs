@@ -363,12 +363,10 @@ fn async_outcome_type(prefix: &str, f: &FnBinding) -> String {
 /// Send the converted async result over the outcome channel. Runs inside the
 /// completion trampoline after the error path has been handled.
 ///
-/// Result buffers (strings, bytes, value buffers) are borrowed for the
-/// callback's duration per the shared async protocol: they are decoded or
-/// deep copied here and never freed (the producer releases them after the
-/// callback returns). Owned interface results are the exception: the callback
-/// receives ownership and the wrapper adopts the pointer (its `Close` calls
-/// the destroy symbol).
+/// Result buffers (strings, bytes, value buffers) are owned by the consumer
+/// per the shared async protocol: they are copied or decoded here and then
+/// released through the runtime free symbols. Owned interface results are
+/// adopted by the wrapper instead (its `Close` calls the destroy symbol).
 fn emit_async_result_send(
     out: &mut String,
     ret: &Option<TypeRef>,
@@ -385,26 +383,28 @@ fn emit_async_result_send(
     match plan::ret_pass(Some(ty), module, prefix) {
         RetPass::Void => unreachable!("a present return type is never void"),
         RetPass::Buffer => {
-            // Borrowed for the callback's duration: decode, do not free.
-            w.line("rRes := &wvReader{buf: wvBorrowBuffer(result_ptr, result_len)}");
+            // Owned by the consumer: wvCopyBuffer copies, then frees.
+            w.line("rRes := &wvReader{buf: wvCopyBuffer(result_ptr, result_len)}");
             w.line(format!("var val {}", go_type(ty)));
             emit_buffer_read(&mut w, "rRes", "val", ty, "Res", 0, prefix, module);
             w.line("rRes.expectEnd()");
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         RetPass::String => {
-            // Borrowed for the callback's duration: copy, do not free.
+            // Owned by the consumer: copy, then free.
             w.line("val := \"\"");
             w.block("if result != nil {", "}", |w| {
                 w.line("val = C.GoString(result)");
+                w.line("C.weaveffi_free_string(result)");
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
         RetPass::Bytes => {
-            // Borrowed for the callback's duration: copy, do not free.
+            // Owned by the consumer: copy, then free.
             w.line("var val []byte");
             w.block("if result != nil {", "}", |w| {
                 w.line("val = C.GoBytes(unsafe.Pointer(result), C.int(result_len))");
+                w.line("C.weaveffi_free_bytes(result, result_len)");
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
@@ -504,9 +504,9 @@ pub(crate) fn render_async_function(
     // A non-throwing function's error slot can only carry a producer bug:
     // brand it generically rather than dressing it as a typed domain error.
     let map_err = if err.throws {
-        err.map_call("wvTakeError(err)")
+        err.map_call("wvTakeBoxedError(err)")
     } else {
-        "wvBrandError(wvTakeError(err))".to_string()
+        "wvBrandError(wvTakeBoxedError(err))".to_string()
     };
     w.line(format!("//export {tramp}"));
     w.block(

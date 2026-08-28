@@ -26,7 +26,7 @@ and objects:
 
 ```text
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.6.0"
+version: "0.7.0"
 package:
   name: my_app
   version: "1.0.0"
@@ -50,7 +50,7 @@ A complete, validating example lives at the bottom of this page in the
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version; only the current version (`"0.6.0"`) is accepted |
+| `version`    | string                      | yes      | Schema version; only the current version (`"0.7.0"`) is accepted |
 | `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
 | `modules`    | array of Module             | yes      | One or more modules                      |
 | `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
@@ -144,7 +144,7 @@ spelling.
 ### Package example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 package:
   name: kvstore
   version: "1.0.0"
@@ -196,7 +196,7 @@ parameters and return types.
 ### Primitive examples
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: primitives
     structs:
@@ -276,7 +276,7 @@ knows how to spell the handle's type. At the C ABI level, `handle<T>` is
 still a `uint64_t`.
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: sessions
     structs:
@@ -326,12 +326,11 @@ Each field:
 | `name`    | string  | yes      | Field name                         |
 | `type`    | TypeRef | yes      | Field type                         |
 | `doc`     | string  | no       | Documentation string               |
-| `default` | value   | no       | Default value for this field       |
 
 ### Struct example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: geometry
     structs:
@@ -358,10 +357,8 @@ modules:
         fields:
           - name: timeout
             type: i32
-            default: 30
           - name: retries
             type: i32
-            default: 3
           - name: label
             type: "string?"
 
@@ -417,7 +414,7 @@ Each variant:
 ### Enum example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -451,7 +448,7 @@ Swift `enum` with associated values). A *unit* variant (no `fields`) and a *data
 variant may coexist in the same enum.
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: shapes
     enums:
@@ -563,7 +560,7 @@ positions.
 A trimmed version of the `kvstore` sample's `Store` interface:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     errors:
@@ -653,7 +650,7 @@ the default is null.
 ### Optional example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     structs:
@@ -695,7 +692,7 @@ Wrap a type in `[T]` brackets to declare a list (variable-length sequence).
 ### List example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: lists
     structs:
@@ -740,7 +737,7 @@ valid `TypeRef`.
 ### Map example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: maps
     structs:
@@ -824,7 +821,7 @@ because every composite serializes into one value buffer:
 ### Nested type example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: nested
     structs:
@@ -871,7 +868,7 @@ one at a time and are suitable for large or streaming result sets.
 ### Iterator example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: streaming
     structs:
@@ -925,7 +922,7 @@ invokes a caller-provided function.
 ### Callback example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: events
     functions: []
@@ -965,7 +962,7 @@ with subscribe/unsubscribe lifecycle management.
 ### Listener example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: events
     functions: []
@@ -993,7 +990,7 @@ modules.
 ### Nested module example
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: app
     functions:
@@ -1042,7 +1039,7 @@ For example, a nested `stats` module can take the parent `kv` module's
 `Store` interface as a parameter:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     errors:
@@ -1089,7 +1086,7 @@ Functions can be marked as asynchronous. See the
 behaviour.
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: net
     errors:
@@ -1128,7 +1125,7 @@ return a list instead or make the function synchronous.
 Mark a function as deprecated with a migration message:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: legacy
     functions:
@@ -1150,7 +1147,7 @@ Generators propagate the deprecation message to the target language
 Mark a parameter as mutable when the callee may modify it in-place:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: buffers
     functions:
@@ -1171,7 +1168,7 @@ directly in the IDL file. This is an alternative to using a separate
 TOML configuration file with `--config`.
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions:
@@ -1242,7 +1239,7 @@ A full IDL combining structs, enums, optionals, lists, an interface, and a
 typed error domain (a trimmed version of the `contacts` sample):
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -1395,7 +1392,7 @@ generator re-cases them into its own idiom.
 ### Structured error payloads
 
 A code may declare `fields:` using the same shape as struct fields (`name`,
-`type`, `doc`; the `default` slot is ignored). When a matching error is
+`type`, `doc`). When a matching error is
 raised, those fields are serialized into the `weaveffi_error` struct's
 `payload_ptr`/`payload_len` slots in the value-buffer format, and each
 generator decodes them into properties of the raised exception or returned
@@ -1425,7 +1422,7 @@ Declaring a domain reserves the codes; a function, method, or constructor
 joins the typed error path by declaring `throws: true`:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     errors:
@@ -1510,7 +1507,7 @@ Per-target syntax:
 Example IDL:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: docs
     structs:

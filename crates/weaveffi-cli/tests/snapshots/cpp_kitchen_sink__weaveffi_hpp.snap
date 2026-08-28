@@ -65,6 +65,11 @@ typedef struct weaveffi_error {
 } weaveffi_error;
 
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
+
+/* Async completion callbacks receive a heap-boxed error the consumer
+   owns; weaveffi_error_free releases the message, the payload, and the
+   box itself. Passing NULL is a safe no-op. */
+WEAVEFFI_API void weaveffi_error_free(weaveffi_error* err);
 WEAVEFFI_API void weaveffi_free_string(const char* ptr);
 WEAVEFFI_API void weaveffi_free_bytes(uint8_t* ptr, size_t len);
 
@@ -914,8 +919,11 @@ inline std::future<std::string> do_async(const std::string& input) {
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
             p->set_exception(detail::make_error(err->code, msg));
+            weaveffi_error_free(err);
         } else {
-            p->set_value(std::string(result));
+            std::string value(result ? result : "");
+            weaveffi_free_string(result);
+            p->set_value(std::move(value));
         }
         delete p;
     }, static_cast<void*>(promise_ptr));
@@ -931,8 +939,11 @@ inline std::future<std::string> do_cancellable(const std::string& input, weaveff
         if (err && err->code != 0) {
             std::string msg(err->message ? err->message : "unknown error");
             p->set_exception(detail::make_error(err->code, msg));
+            weaveffi_error_free(err);
         } else {
-            p->set_value(std::string(result));
+            std::string value(result ? result : "");
+            weaveffi_free_string(result);
+            p->set_value(std::move(value));
         }
         delete p;
     }, static_cast<void*>(promise_ptr));

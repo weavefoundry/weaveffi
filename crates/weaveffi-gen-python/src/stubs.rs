@@ -8,7 +8,7 @@ use weaveffi_core::model::{
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::docs::emit_doc;
-use crate::entities::{py_code_class_name, py_default_suffix_start};
+use crate::entities::py_code_class_name;
 use crate::types::{
     py_callable_hint, py_field, py_member_name, py_name, py_type_hint, py_wrapper_fn_name,
 };
@@ -209,8 +209,7 @@ fn render_pyi_rich_enum(out: &mut String, e: &EnumBinding) {
 
 /// `.pyi` stub for a record: a dataclass-shaped value class with typed field
 /// attributes and the generated constructor, mirroring
-/// [`crate::entities::render_struct`]. Declared defaults surface as `= ...`
-/// on the trailing constructor parameters that carry them.
+/// [`crate::entities::render_struct`].
 fn render_pyi_struct(out: &mut String, s: &StructBinding) {
     out.push('\n');
     emit_doc(out, &s.doc, "");
@@ -220,16 +219,12 @@ fn render_pyi_struct(out: &mut String, s: &StructBinding) {
         emit_doc(out, &field.doc, "    ");
         out.push_str(&format!("    {}: {}\n", py_field(&field.name), py_ty));
     }
-    let start = py_default_suffix_start(&s.fields);
     let mut params = vec!["self".to_string()];
-    params.extend(s.fields.iter().enumerate().map(|(i, f)| {
-        let hint = py_type_hint(&f.ty);
-        if i >= start {
-            format!("{}: {} = ...", py_field(&f.name), hint)
-        } else {
-            format!("{}: {}", py_field(&f.name), hint)
-        }
-    }));
+    params.extend(
+        s.fields
+            .iter()
+            .map(|f| format!("{}: {}", py_field(&f.name), py_type_hint(&f.ty))),
+    );
     out.push_str(&format!(
         "    def __init__({}) -> None: ...\n",
         params.join(", ")

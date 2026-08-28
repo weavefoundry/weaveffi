@@ -141,14 +141,14 @@ Everything above describes **synchronous** returns: the consumer
 receives an owned value and owes the matching release call after
 copying it.
 
-**Async results invert the buffer rule.** The buffers passed to an
-async completion callback (strings, bytes, and the serialized value
-buffers of buffered results) are borrowed: they stay owned by the
-producer, are valid only for the callback's duration, and are freed by
-the producer after the callback returns. The consumer copies or decodes
-inside the callback and must not free them. Owned interface results
-(including `Interface?`) are the exception in both directions: the
-callback receives ownership, adopts the pointer, and eventually calls
+**Async results follow the same owned-value rule.** The buffers passed
+to an async completion callback (strings, bytes, and the serialized
+value buffers of buffered results) are owned by the consumer: copy or
+decode them, then release them with `weaveffi_free_string` or
+`weaveffi_free_bytes`. A non-null error is heap-boxed and released
+with `weaveffi_error_free` after its code, message, and payload are
+copied. Owned interface results (including `Interface?`) transfer
+ownership too: the callback adopts the pointer and eventually calls
 `_destroy`, exactly as a synchronous interface return would. See
 [Result ownership and threading](async.md#result-ownership-and-threading).
 
@@ -220,11 +220,11 @@ non-zero code only ever reports a producer bug, so the wrapper panics
 or traps instead. See the [Error Handling Guide](errors.md).
 
 `weaveffi_error_clear` is idempotent: it frees the message and nulls
-the pointer, so clearing an already-cleared slot is safe. That matters
-for async completion callbacks, where the error struct is borrowed
-from the producer (which releases the message itself after the
-callback returns); a consumer that clears it anyway causes no
-double-free.
+the pointer, so clearing an already-cleared slot is safe. Async
+completion callbacks use a different symbol: the error they receive is
+heap-boxed and consumer-owned, so it is released exactly once with
+`weaveffi_error_free`, which clears the slot and then frees the box
+itself.
 
 ### Thread safety
 
@@ -252,9 +252,10 @@ queue.sync {
 | Interface instance | Rust      | `*_destroy`                | Call exactly once; methods borrow    |
 | Iterator handle    | Rust      | the iterator's `_destroy`  | Exactly once: on exhaustion or abandonment |
 | Iterator element   | Rust      | `weaveffi_free_string` / `weaveffi_free_bytes` / nothing | Each `_next` yields a consumer-owned element |
-| Async result buffer | Rust     | none (borrowed)            | Producer frees after the callback returns; copy or decode inside it |
+| Async result buffer | Rust     | `weaveffi_free_string` / `weaveffi_free_bytes` | Consumer-owned: copy or decode, then free |
 | Async interface result | Rust  | `*_destroy`                | Callback adopts ownership            |
-| Error message and payload | Rust | `weaveffi_error_clear`   | Clears code, frees message and payload; idempotent |
+| Sync error slot (message and payload) | Rust | `weaveffi_error_clear` | Clears code, frees message and payload; idempotent |
+| Async boxed error  | Rust      | `weaveffi_error_free`      | Frees message, payload, and the box; exactly once |
 
 ## Pitfalls
 
@@ -279,10 +280,10 @@ queue.sync {
   `[Contact]` is one serialized buffer; the strings and records you
   decode out of it are copies. Free the buffer once with
   `weaveffi_free_bytes(ptr, out_len)` and nothing else.
-- **Freeing an async result buffer**: buffers passed to a completion
-  callback are producer-owned and freed by the producer after the
-  callback returns. Copy inside the callback; freeing there
-  double-frees.
+- **Leaking an async result buffer**: buffers passed to a completion
+  callback are consumer-owned. Copy or decode the data, then free the
+  buffer with the matching runtime symbol; a callback that only copies
+  leaks the producer's allocation.
 - **Destroying an iterator handle twice**: destroy it once, on
   exhaustion or when abandoning iteration early. Generated wrappers
   null the handle so their disposal idiom cannot double-destroy;

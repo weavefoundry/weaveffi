@@ -63,8 +63,6 @@ fn canon_function(f: &mut Function) {
 /// Strip everything the gate doesn't compare from one field.
 fn canon_field(field: &mut StructField) {
     field.doc = None;
-    // Rust struct syntax can't carry an IDL field default.
-    field.default = None;
     field.ty = normalize_type(&field.ty);
 }
 

@@ -47,7 +47,7 @@ layer bridges them to the C ABI.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -447,13 +447,15 @@ static void weaveffi_tasks_run_task_jni_cb(void* context, weaveffi_error* err,
 
 The completion callback fires exactly once, on a producer thread.
 Result buffers passed to it (strings, byte arrays, and buffered values,
-which arrive as a `(result_ptr, result_len)` pair) are borrowed from
-the producer for the callback's duration, so the shim copies them into
-Java objects (`NewStringUTF`, `SetByteArrayRegion`) inside the callback
-and never frees them; the Kotlin layer then decodes buffered results
-into their value types. An owned interface result is the exception: the
-callback receives ownership, resumes the continuation with the raw
-handle, and the suspend wrapper adopts it. An exception thrown by the
+which arrive as a `(result_ptr, result_len)` pair) are owned by the
+consumer, so the shim copies them into Java objects (`NewStringUTF`,
+`SetByteArrayRegion`) and then releases them with
+`weaveffi_free_string` or `weaveffi_free_bytes`; the Kotlin layer then
+decodes buffered results into their value types. A reported error is
+heap-boxed: the shim copies its fields and releases it with
+`weaveffi_error_free`. An owned interface result transfers ownership
+too: the callback resumes the continuation with the raw handle, and
+the suspend wrapper adopts it. An exception thrown by the
 resumed coroutine goes through the same
 `weaveffi_jni_handle_uncaught` path as listener exceptions (see
 [Callbacks and listeners](#callbacks-and-listeners)).

@@ -216,6 +216,7 @@ module WeaveFFI
   end
 
   attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
   attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
 
@@ -590,7 +591,7 @@ module WeaveFFI
           code = err[:code]
           msg = err[:message].null? ? '' : err[:message].read_string
           payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
-          WeaveFFI.weaveffi_error_clear(err_ptr)
+          WeaveFFI.weaveffi_error_free(err_ptr)
           queue << WeaveFFI.kv_error_from(code, msg, payload)
         else
           queue << result

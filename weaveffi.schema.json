@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.6.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.7.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "package": {

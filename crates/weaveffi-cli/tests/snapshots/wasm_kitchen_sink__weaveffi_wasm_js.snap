@@ -267,18 +267,19 @@ function _checkKitchenErrorsError(wasm, errPtr) {
   }
 }
 
-// Throw if a borrowed (producer-owned) error carries a non-zero
-// code. Used by async callbacks: the producer owns and frees the
-// error struct, so the slot is read but never deallocated here.
+// Throw if a heap-boxed (consumer-owned) error carries a non-zero
+// code. Used by async callbacks: the fields are read, then the box
+// is released with weaveffi_error_free before throwing.
 // `mkErr` maps domain codes (and decodes payload fields) for
 // throwing callables; without it the generic WeaveFFIError is thrown.
 function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
-  if (code === 0) return;
+  if (code === 0) { wasm.weaveffi_error_free(errPtr); return; }
   const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
-  if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
-  throw new WeaveFFIError(code, msg);
+  const err = mkErr ? mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true)) : new WeaveFFIError(code, msg);
+  wasm.weaveffi_error_free(errPtr);
+  throw err;
 }
 
 // Serialize a `shared.Token` record into the value-buffer wire format.
@@ -695,7 +696,11 @@ export async function loadWeaveffiWasm(url) {
       doAsync(input) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
-          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => _readCStr(w, p) });
+          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => {
+            const _s = _readCStr(w, p);
+            if (p !== 0) w.weaveffi_free_string(p);
+            return _s;
+          } });
           const [a0_p, a0_s] = _cstr(wasm, input);
           wasm.weaveffi_kitchen_do_async_async(a0_p, _cbPtr_i32_i32_i32, ctxId);
           wasm.weaveffi_dealloc(a0_p, a0_s);
@@ -704,7 +709,11 @@ export async function loadWeaveffiWasm(url) {
       doCancellable(input) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
-          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => _readCStr(w, p) });
+          _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, p) => {
+            const _s = _readCStr(w, p);
+            if (p !== 0) w.weaveffi_free_string(p);
+            return _s;
+          } });
           const [a0_p, a0_s] = _cstr(wasm, input);
           wasm.weaveffi_kitchen_do_cancellable_async(a0_p, 0, _cbPtr_i32_i32_i32, ctxId);
           wasm.weaveffi_dealloc(a0_p, a0_s);

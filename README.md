@@ -1,6 +1,6 @@
 # WeaveFFI
 
-[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.6.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
+[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.7.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
 WeaveFFI generates type-safe bindings for 11 languages for any native library
 that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or anything
@@ -29,7 +29,7 @@ declares. An interface is a real object with methods; an error domain plus
 `throws: true` gives its fallible members typed errors:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     errors:
@@ -215,10 +215,10 @@ the module's error domain as a typed error or exception.
   `dart:ffi`, all from the same definition.
 - **The whole IDL surface, on every target.** Interfaces, typed error
   domains, async functions, iterators, callbacks, and event listeners work
-  across all eleven languages (Wasm excepts callbacks/listeners and says so
-  loudly). Generators declare their capabilities and `weaveffi generate`
-  fails with a clear error (never a silent skip) if a target can't deliver
-  a feature you use. See the
+  across all eleven languages. Generators declare their capabilities and
+  `weaveffi generate` fails with a clear error (never a silent skip) in the
+  rare mode that can't deliver a feature you use (Wasm's Emscripten compat
+  mode excludes async, callbacks, and listeners). See the
   [feature matrix](docs/src/generators/README.md#feature-support-matrix).
 
 ## How does it compare?
@@ -260,7 +260,7 @@ Verify the install:
 
 ```bash
 weaveffi --version
-weaveffi schema-version    # prints 0.6.0
+weaveffi schema-version    # prints 0.7.0
 ```
 
 ## CLI reference
@@ -277,7 +277,7 @@ weaveffi schema-version    # prints 0.6.0
 | `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
 | `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
-| `weaveffi schema-version` | Print the current IR schema version (`0.6.0`) |
+| `weaveffi schema-version` | Print the current IR schema version (`0.7.0`) |
 | `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
 | `weaveffi completions <shell>` | Print shell completion scripts (`bash`, `zsh`, `fish`, `powershell`, `elvish`) |
 
@@ -285,7 +285,7 @@ Reference the JSON Schema from your IDL for editor autocompletion:
 
 ```yaml
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.6.0"
+version: "0.7.0"
 modules: ...
 ```
 
@@ -316,7 +316,10 @@ recommended `weaveffi diff --check` CI workflow.
 The full quality gate (`cargo fmt`, `cargo clippy -D warnings`, `cargo
 test`, `cargo doc -D warnings`, `cargo deny`, `cargo audit`, `cargo
 machete`, `cargo insta test --check`, `cargo bench --no-run`, and
-`weaveffi diff --check` on every sample) runs in CI on every PR.
+`weaveffi diff --check` on every sample) runs in CI on every PR, plus a
+conformance harness that builds real producers and runs generated
+consumers end to end in all eleven languages, including dedicated async
+lanes.
 
 Releases are fully automated by [semantic-release](https://semantic-release.gitbook.io/)
 on merge to `main`.

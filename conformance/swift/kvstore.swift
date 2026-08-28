@@ -1,6 +1,6 @@
 // Conformance consumer: kvstore sample, Swift target.
 //
-// Binds through the generated `Kvstore` module and exercises the 0.6.0
+// Binds through the generated `Kvstore` module and exercises the 0.7.0
 // interface surface: `Store` as a final class opened via the throwing static
 // factory `Store.open(path:)`, throwing methods raising the typed `KvError`
 // domain enum (put/get/delete/listKeys), non-throwing methods without `try`

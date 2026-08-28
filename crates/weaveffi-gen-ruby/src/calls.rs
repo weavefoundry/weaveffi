@@ -491,9 +491,11 @@ fn render_sync_function_wrapper(
 /// The trampoline (`callback` local) stays referenced by the wrapper's stack
 /// frame until `queue.pop` returns, which happens only after the producer has
 /// invoked it, so the GC cannot collect it mid-flight. Per
-/// [`weaveffi_core::plan::AsyncProtocol`], the trampoline copies borrowed
-/// result buffers before returning and never frees them; the error slot
-/// follows the function's [`ErrorStrategy`].
+/// [`weaveffi_core::plan::AsyncProtocol`], everything the trampoline receives
+/// is owned by the consumer: it copies result buffers and then releases them
+/// through the runtime free symbols, and it releases a reported error with
+/// `weaveffi_error_free`; the error slot follows the function's
+/// [`ErrorStrategy`].
 fn render_async_function_wrapper(
     out: &mut String,
     module: &ModuleBinding,
@@ -561,14 +563,13 @@ fn render_async_function_wrapper(
                     w.line("code = err[:code]");
                     w.line("msg = err[:message].null? ? '' : err[:message].read_string");
                     if typed_error {
-                        // The payload buffer is borrowed for the callback's
-                        // duration: copy it before clearing the slot.
+                        // Copy the payload before releasing the boxed error.
                         w.line(
                             "payload = err[:payload_ptr].null? ? nil : \
                              err[:payload_ptr].read_string(err[:payload_len])",
                         );
                     }
-                    w.line(format!("{q}weaveffi_error_clear(err_ptr)"));
+                    w.line(format!("{q}weaveffi_error_free(err_ptr)"));
                     w.line(format!("queue << {error_expr}"));
                 });
                 w.line("else");
@@ -616,11 +617,10 @@ fn render_async_function_wrapper(
 /// `result_ptr`/`result_len` for a buffered value.
 ///
 /// Per the async completion contract ([`weaveffi_core::plan::AsyncProtocol`]),
-/// string, bytes, and buffered result buffers are producer-owned and borrowed
-/// for the callback's duration: the callback deep-copies or decodes them
-/// before returning and never frees them. Owned interface results are the
-/// exception: the callback receives ownership, so the pointer is adopted by
-/// a finalizer-bearing wrapper.
+/// string, bytes, and buffered result buffers are owned by the consumer: the
+/// callback deep-copies or decodes them, then releases them through the
+/// runtime free symbols. Owned interface results are adopted by a
+/// finalizer-bearing wrapper instead.
 fn render_async_result_push(
     out: &mut String,
     ret: &Option<TypeRef>,
@@ -634,9 +634,9 @@ fn render_async_result_push(
             w.line("queue << nil");
         }
         RetPass::Buffer => {
-            // Borrowed buffer: decode inside the callback, never free. A
-            // decode failure surfaces through the queue so the caller thread
-            // raises it.
+            // Owned buffer: copy, free, then decode from the copy. A decode
+            // failure surfaces through the queue so the caller thread raises
+            // it.
             let ty = ret.as_ref().expect("buffered return has a type");
             w.line("begin");
             w.scope(|w| {
@@ -644,6 +644,9 @@ fn render_async_result_push(
                     "_wv_r = WvBufferReader.new(result_ptr.null? ? ''.b : \
                      result_ptr.read_string(result_len))",
                 );
+                w.line(format!(
+                    "{m}weaveffi_free_bytes(result_ptr, result_len) unless result_ptr.null?"
+                ));
                 crate::codec::render_wv_read(w, "_wv_r", "_wv_v", ty, 0, &m);
                 w.line("_wv_r.expect_end!");
                 w.line("queue << _wv_v");
@@ -655,12 +658,20 @@ fn render_async_result_push(
             w.line("end");
         }
         RetPass::String => {
-            // Borrowed for the callback's duration: copy, don't free.
-            w.line("queue << (result.null? ? '' : result.read_string)");
+            // Owned by the consumer: copy, then free.
+            w.line("_wv_s = result.null? ? '' : result.read_string");
+            w.line(format!(
+                "{m}weaveffi_free_string(result) unless result.null?"
+            ));
+            w.line("queue << _wv_s");
         }
         RetPass::Bytes => {
-            // Borrowed for the callback's duration: copy, don't free.
-            w.line("queue << (result.null? ? ''.b : result.read_string(result_len))");
+            // Owned by the consumer: copy, then free.
+            w.line("_wv_b = result.null? ? ''.b : result.read_string(result_len)");
+            w.line(format!(
+                "{m}weaveffi_free_bytes(result, result_len) unless result.null?"
+            ));
+            w.line("queue << _wv_b");
         }
         // A returned interface transfers ownership of a new object
         // reference; wrap it without re-running initialize. A nullable

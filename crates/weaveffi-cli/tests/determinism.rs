@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use camino::Utf8Path;
 use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
 use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
 use weaveffi_gen_c::{CConfig, CGenerator};
@@ -22,22 +23,20 @@ use weaveffi_gen_python::{PythonConfig, PythonGenerator};
 use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
 use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
 use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
-use weaveffi_ir::ir::Api;
 use weaveffi_ir::parse::parse_api_str;
 
 const KITCHEN_SINK: &str = "06_kitchen_sink.yml";
 
-fn load_kitchen_sink() -> Api {
+fn load_kitchen_sink() -> ResolvedApi {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(KITCHEN_SINK);
     let contents = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
-    let mut api = parse_api_str(&contents, "yaml")
+    let api = parse_api_str(&contents, "yaml")
         .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(&mut api, None)
-        .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()));
-    api
+    validate_api(api, None)
+        .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
 }
 
 fn collect_files_sorted(root: &Path) -> Vec<PathBuf> {
@@ -62,7 +61,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn run_into_tempdir(gen: &dyn DynGenerator, api: &Api) -> (tempfile::TempDir, PathBuf) {
+fn run_into_tempdir(gen: &dyn DynGenerator, api: &ResolvedApi) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let out_dir = Utf8Path::from_path(tmp.path()).expect("utf8 tempdir");
     gen.generate(api, out_dir).expect("generator failed");

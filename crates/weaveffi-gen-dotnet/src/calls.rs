@@ -60,8 +60,8 @@ impl<'a> ErrCtx<'a> {
 
     /// The exception expression an async completion callback faults its
     /// `TaskCompletionSource` with. A domain exception decodes the error's
-    /// structured payload, copied from the borrowed error struct inside the
-    /// callback (the producer releases the original afterward).
+    /// structured payload, copied out of the heap-boxed error before the
+    /// callback releases it with `weaveffi_error_free`.
     pub(crate) fn async_exception_expr(&self) -> String {
         match self {
             ErrCtx::Generic => "new WeaveFFIException(wErr.Code, msg)".into(),
@@ -605,7 +605,7 @@ pub(crate) fn render_iterator_wrapper_method(
     out.push_str(&w.finish());
 }
 
-/// True when an async result crosses the completion callback as a borrowed
+/// True when an async result crosses the completion callback as an owned
 /// `ptr` + `len` pair: bytes and every buffered type (records, rich enums,
 /// lists, maps, and non-interface optionals).
 pub(crate) fn async_result_is_ptr_len(ty: &TypeRef) -> bool {
@@ -683,14 +683,14 @@ pub(crate) fn render_async_wrapper_method(
                     w.line("if (wErr.Code != 0)");
                     w.line("{");
                     w.scope(|w| {
-                        // The error struct is borrowed for the callback's
-                        // duration (the producer releases it afterward), so
-                        // the message and payload are copied here and the
-                        // error is never cleared by the consumer.
+                        // The boxed error is owned by the consumer: copy the
+                        // message and payload, then release it with
+                        // `weaveffi_error_free`.
                         w.line("var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? \"\";");
                         if matches!(err, ErrCtx::Domain(_)) {
                             w.line("var payload = WeaveFFIError.CopyPayload(wErr);");
                         }
+                        w.line("NativeMethods.weaveffi_error_free(err);");
                         w.line(format!("tcs.SetException({});", err.async_exception_expr()));
                         w.line("return;");
                     });
@@ -792,12 +792,12 @@ pub(crate) fn render_async_wrapper_method(
 }
 
 /// Emit the statements resolving the `TaskCompletionSource` from the
-/// completion callback's result slots, honoring the `AsyncProtocol` borrowed
+/// completion callback's result slots, honoring the `AsyncProtocol` owned
 /// results clause: string, bytes, and buffered result buffers are owned by
-/// the producer and valid only for the callback's duration, so they are
-/// deep-copied (and buffered results decoded) here and never freed.
-/// Owned-object results (interfaces, typed handles) are the exception: the
-/// callback receives ownership and the wrapper adopts the pointer.
+/// the consumer, so they are deep-copied (and buffered results decoded)
+/// here and then released through the runtime free symbols. Owned-object
+/// results (interfaces, typed handles) transfer ownership instead: the
+/// wrapper adopts the pointer.
 pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     if let Some(ty) = ret {
@@ -806,6 +806,7 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line(
                 "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, resultBuf, 0, (int)resultLen);",
             );
+            w.line("if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);");
             emit_buffer_decode(&mut w, ty, "value", "resultBuf");
             w.line("tcs.SetResult(value);");
             out.push_str(&w.finish());
@@ -820,7 +821,9 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line("tcs.SetResult(result != 0);");
         }
         Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
-            w.line("tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? \"\");");
+            w.line("var str = Marshal.PtrToStringUTF8(result) ?? \"\";");
+            w.line("if (result != IntPtr.Zero) NativeMethods.weaveffi_free_string(result);");
+            w.line("tcs.SetResult(str);");
         }
         Some(TypeRef::Enum(name)) => {
             let cn = local_type_name(name);
@@ -839,6 +842,7 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line(
                 "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, arr, 0, (int)resultLen);",
             );
+            w.line("if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);");
             w.line("tcs.SetResult(arr);");
         }
         // Only `Interface?` reaches here: a nullable owned object pointer.

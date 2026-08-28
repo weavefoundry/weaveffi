@@ -541,7 +541,6 @@ fn extract_struct(item: &syn::ItemStruct) -> syn::Result<StructDef> {
                     name: field_name,
                     ty: type_ref_from_syn(&f.ty)?,
                     doc: extract_doc(&f.attrs),
-                    default: None,
                 })
             })
             .collect::<syn::Result<_>>()?,
@@ -575,7 +574,6 @@ fn extract_variant_fields(fields: &syn::FieldsNamed) -> syn::Result<Vec<StructFi
                 name: field_name,
                 ty: type_ref_from_syn(&f.ty)?,
                 doc: extract_doc(&f.attrs),
-                default: None,
             })
         })
         .collect()

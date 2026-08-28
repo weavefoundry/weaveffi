@@ -8,7 +8,7 @@ use weaveffi_ir::parse::parse_api_str;
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.6.0".to_string(),
+        version: "0.7.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
             functions: vec![
@@ -129,19 +129,16 @@ fn large_api() -> Api {
                             name: "id".to_string(),
                             ty: TypeRef::I32,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "name".to_string(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "active".to_string(),
                             ty: TypeRef::Bool,
                             doc: None,
-                            default: None,
                         },
                     ],
                 })
@@ -224,7 +221,7 @@ fn large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.6.0".to_string(),
+        version: "0.7.0".to_string(),
         modules,
         generators: None,
         package: None,
@@ -235,8 +232,7 @@ fn bench_validate_small_api(c: &mut Criterion) {
     let api = calculator_api();
     c.bench_function("validate_small_api", |b| {
         b.iter(|| {
-            let mut api = api.clone();
-            weaveffi_core::validate::validate_api(black_box(&mut api), None).unwrap();
+            weaveffi_core::validate::validate_api(black_box(api.clone()), None).unwrap();
         });
     });
 }
@@ -245,18 +241,16 @@ fn bench_validate_large_api(c: &mut Criterion) {
     let api = large_api();
     c.bench_function("validate_large_api", |b| {
         b.iter(|| {
-            let mut api = api.clone();
-            weaveffi_core::validate::validate_api(black_box(&mut api), None).unwrap();
+            weaveffi_core::validate::validate_api(black_box(api.clone()), None).unwrap();
         });
     });
 }
 
 fn bench_hash_api(c: &mut Criterion) {
-    let mut api = large_api();
-    weaveffi_core::validate::validate_api(&mut api, None).unwrap();
+    let api = weaveffi_core::validate::validate_api(large_api(), None).unwrap();
     c.bench_function("hash_large_api", |b| {
         b.iter(|| {
-            weaveffi_core::cache::hash_api(black_box(&api));
+            weaveffi_core::cache::hash_api(black_box(api.api()));
         });
     });
 }
@@ -277,19 +271,18 @@ fn bench_validate_kitchen_sink(c: &mut Criterion) {
     let api = load_kitchen_sink_unvalidated();
     c.bench_function("validate_kitchen_sink", |b| {
         b.iter(|| {
-            let mut api = api.clone();
-            weaveffi_core::validate::validate_api(black_box(&mut api), None).unwrap();
+            weaveffi_core::validate::validate_api(black_box(api.clone()), None).unwrap();
         });
     });
 }
 
 /// Target: hash_api < 1ms for the kitchen-sink fixture.
 fn bench_hash_kitchen_sink(c: &mut Criterion) {
-    let mut api = load_kitchen_sink_unvalidated();
-    weaveffi_core::validate::validate_api(&mut api, None).unwrap();
+    let api =
+        weaveffi_core::validate::validate_api(load_kitchen_sink_unvalidated(), None).unwrap();
     c.bench_function("hash_kitchen_sink", |b| {
         b.iter(|| {
-            weaveffi_core::cache::hash_api(black_box(&api));
+            weaveffi_core::cache::hash_api(black_box(api.api()));
         });
     });
 }

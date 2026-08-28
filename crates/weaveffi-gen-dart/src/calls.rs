@@ -429,8 +429,8 @@ pub(crate) fn render_listener(
 
 /// The (native, dart, name) slot triples an async completion callback carries
 /// after its `(context, err)` prefix. Bytes and buffered results arrive as
-/// borrowed `(result, resultLen)` pairs; interfaces as adopted pointers;
-/// everything else by value.
+/// owned `(result, resultLen)` pairs the consumer frees; interfaces as
+/// adopted pointers; everything else by value.
 fn async_cb_result_slots(ret: Option<&TypeRef>) -> Vec<(String, String, String)> {
     let Some(ty) = ret else {
         return vec![];
@@ -579,7 +579,7 @@ fn render_async_function(
                                 "final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);",
                             );
                         }
-                        w.line("_weaveffiErrorClear(err);");
+                        w.line("_weaveffiErrorFree(err);");
                         w.line(format!("completer.completeError({});", err.map_expr()));
                         w.line("return;");
                     });
@@ -627,9 +627,11 @@ fn render_async_function(
 }
 
 /// Emit the callback statements that resolve the completer from the result
-/// slots. Bytes and buffered results are borrowed for the callback's
-/// duration, so they are copied (bytes) or decoded (buffered) here and never
-/// freed; an owned interface result is instead adopted by its wrapper class.
+/// slots. Async results transfer ownership to the consumer (which is what
+/// lets `NativeCallable.listener` defer this code past the native callback's
+/// return): strings are freed with `weaveffi_free_string`, byte and value
+/// buffers with `weaveffi_free_bytes`, and an owned interface result is
+/// adopted by its wrapper class.
 fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let Some(ty) = ty else {
@@ -638,21 +640,25 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
         return;
     };
     match plan::ret_pass(Some(ty), "", "") {
-        // Decode inside the callback: the producer frees the encoding as
-        // soon as the callback returns.
+        // Copy the owned encoding, release it, then decode.
         RetPass::Buffer => {
             w.line("final resultData = _copyNativeBytes(result, resultLen);");
+            w.line("_weaveffiFreeBytes(result, resultLen);");
             w.line("final resultReader = _BufferReader(resultData);");
             w.line(format!("final value = {};", read_expr("resultReader", ty)));
             w.line("resultReader.expectEnd();");
             w.line("completer.complete(value);");
         }
         RetPass::Bytes => {
-            w.line("completer.complete(_copyNativeBytes(result, resultLen));");
+            w.line("final resultData = _copyNativeBytes(result, resultLen);");
+            w.line("_weaveffiFreeBytes(result, resultLen);");
+            w.line("completer.complete(resultData);");
         }
-        // Borrowed: copy before the callback returns, never free.
+        // Copy the owned C string, then release the producer allocation.
         RetPass::String => {
-            w.line("completer.complete(result.toDartString());");
+            w.line("final value = result.toDartString();");
+            w.line("_weaveffiFreeString(result);");
+            w.line("completer.complete(value);");
         }
         // The callback receives ownership of an object result; the wrapper
         // adopts the pointer and its `dispose()` owns the eventual destroy.

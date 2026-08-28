@@ -353,21 +353,10 @@ pub(crate) fn render_struct(out: &mut String, s: &StructBinding) {
     out.push_str(&w.finish());
 }
 
-/// Emit dataclass field lines (`name: hint` or `name: hint = default`), with
-/// field docs as leading comments. Declared defaults apply only to the
-/// longest trailing run of fields that all have representable literals, so a
-/// defaulted field never precedes a required one (which Python rejects).
+/// Emit dataclass field lines (`name: hint`), with field docs as leading
+/// comments.
 fn render_dataclass_fields(w: &mut CodeWriter, fields: &[FieldBinding]) {
-    let literals: Vec<Option<String>> = fields
-        .iter()
-        .map(|f| {
-            f.default
-                .as_ref()
-                .and_then(|d| py_default_literal(&f.ty, d))
-        })
-        .collect();
-    let start = py_default_suffix_start(fields);
-    for (i, f) in fields.iter().enumerate() {
+    for f in fields {
         if let Some(d) = &f.doc {
             let trimmed = d.trim();
             if !trimmed.is_empty() {
@@ -376,66 +365,7 @@ fn render_dataclass_fields(w: &mut CodeWriter, fields: &[FieldBinding]) {
                 }
             }
         }
-        let hint = py_type_hint(&f.ty);
-        match &literals[i] {
-            Some(lit) if i >= start => {
-                w.line(format!("{}: {} = {}", py_field(&f.name), hint, lit));
-            }
-            _ => {
-                w.line(format!("{}: {}", py_field(&f.name), hint));
-            }
-        }
-    }
-}
-
-/// The index where the trailing run of defaulted dataclass fields starts:
-/// every field at or past it carries a representable default literal, so
-/// only that suffix receives defaults (Python rejects a defaulted field
-/// ahead of a required one).
-pub(crate) fn py_default_suffix_start(fields: &[FieldBinding]) -> usize {
-    let mut start = fields.len();
-    while start > 0 {
-        let f = &fields[start - 1];
-        let has_literal = f
-            .default
-            .as_ref()
-            .and_then(|d| py_default_literal(&f.ty, d))
-            .is_some();
-        if !has_literal {
-            break;
-        }
-        start -= 1;
-    }
-    start
-}
-
-/// The Python literal for one declared field default, or `None` when the
-/// value has no simple literal spelling (in which case the dataclass field
-/// stays required).
-fn py_default_literal(ty: &TypeRef, value: &serde_yaml::Value) -> Option<String> {
-    match (ty, value) {
-        (TypeRef::Bool, serde_yaml::Value::Bool(b)) => {
-            Some(if *b { "True" } else { "False" }.to_string())
-        }
-        (
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Handle,
-            serde_yaml::Value::Number(n),
-        ) => Some(n.to_string()),
-        (TypeRef::StringUtf8 | TypeRef::BorrowedStr, serde_yaml::Value::String(s)) => {
-            Some(format!("\"{}\"", py_str_literal(s)))
-        }
-        (TypeRef::Optional(_), serde_yaml::Value::Null) => Some("None".to_string()),
-        _ => None,
+        w.line(format!("{}: {}", py_field(&f.name), py_type_hint(&f.ty)));
     }
 }
 

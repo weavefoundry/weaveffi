@@ -1,7 +1,7 @@
 // Conformance consumer: kvstore sample, Wasm (wasm32-unknown-unknown) target.
 //
 // Drives the generated ESM bindings (loadWeaveffiWasm) against the real producer
-// compiled to wasm. Exercises the 0.6.0 surface end to end: the `Store`
+// compiled to wasm. Exercises the 0.7.0 surface end to end: the `Store`
 // interface class (static `open` factory, instance methods passing the handle
 // as the implicit self argument, the `defaultCapacity` static, and `free()`
 // through the destroy symbol), the per-module typed error domain (`KvError`
