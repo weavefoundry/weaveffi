@@ -1944,7 +1944,6 @@ dependencies = [
  "camino",
  "heck",
  "serde",
- "serde_yaml",
  "tempfile",
  "weaveffi-core",
  "weaveffi-ir",
