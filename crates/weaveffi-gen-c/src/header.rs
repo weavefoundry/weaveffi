@@ -9,10 +9,10 @@ use std::fmt::Write;
 
 use weaveffi_core::cabi;
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_core::resolved::ResolvedApi;
 
 use crate::idents::escape_module_param_names;
 

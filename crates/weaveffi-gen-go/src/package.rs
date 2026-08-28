@@ -2,11 +2,11 @@
 //! bundling per-platform shared libraries with a rewritten cgo preamble.
 
 use camino::Utf8Path;
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::platform::Platform;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::{render_go, GoConfig};

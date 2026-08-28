@@ -35,8 +35,7 @@ fn load_kitchen_sink() -> ResolvedApi {
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     let api = parse_api_str(&contents, "yaml")
         .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(api, None)
-        .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
+    validate_api(api, None).unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
 }
 
 fn collect_files_sorted(root: &Path) -> Vec<PathBuf> {

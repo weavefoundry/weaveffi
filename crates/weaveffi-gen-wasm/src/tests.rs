@@ -1,11 +1,11 @@
 //! Unit tests: golden-content assertions over the JS loader, the
 //! TypeScript declarations, the README, and the package manifest.
 
-use weaveffi_ir::ir::Api;
-use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
+use weaveffi_ir::ir::Api;
 use weaveffi_ir::ir::{
     EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };

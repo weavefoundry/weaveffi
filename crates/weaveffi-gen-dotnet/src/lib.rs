@@ -28,11 +28,11 @@ mod types;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{BindingModel, CallShape, ErrorBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::calls::render_wrapper_class;

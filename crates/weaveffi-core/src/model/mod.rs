@@ -1,5 +1,5 @@
 //! The **binding model**: a normalized, fully-lowered view of a
-//! [`ResolvedApi`](crate::resolved::ResolvedApi) that every language backend
+//! [`ResolvedApi`] that every language backend
 //! consumes.
 //!
 //! Before this module existed, each of the eleven generators re-walked the IR,

@@ -1,12 +1,12 @@
 //! Tests for the Ruby generator: rendering coverage across every entity
 //! and call shape, error-domain semantics, packaging, and identifier policy.
 
-use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::types::{rb_abi_types, rb_ffi_type};
 use camino::Utf8Path;
 use weaveffi_core::abi;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
 
 #[test]
 fn package_emits_platform_gems_and_swaps_loader() {

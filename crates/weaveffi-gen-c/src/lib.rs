@@ -1,7 +1,7 @@
 //! C header generator for WeaveFFI.
 //!
 //! Emits a single `{prefix}.h` describing the stable C ABI surface of a
-//! [`ResolvedApi`](weaveffi_core::resolved::ResolvedApi), plus a companion
+//! [`ResolvedApi`], plus a companion
 //! `{prefix}.c` placeholder for future convenience
 //! wrappers. This is the canonical backend: the header it emits *is* the C ABI
 //! every other language binds to.
@@ -22,11 +22,11 @@ mod tests;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::resolved::ResolvedApi;
 
 pub use header::{render_c_header, render_c_header_from_model};
 

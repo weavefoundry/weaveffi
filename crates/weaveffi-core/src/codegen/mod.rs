@@ -84,8 +84,7 @@ pub trait Generator: Send + Sync {
     ///
     /// Returns an error if the target cannot render the API or cannot write its
     /// output files (for example a filesystem failure).
-    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config)
-        -> Result<()>;
+    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
 
     /// Files that [`generate`](Generator::generate) would write, relative
     /// to (or anchored under) `out_dir`. Used by `--dry-run` and `diff`.

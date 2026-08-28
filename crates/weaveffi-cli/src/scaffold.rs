@@ -1,8 +1,8 @@
 use std::fmt::Write;
 
 use weaveffi_core::abi::AbiParam;
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::model::{AbiFn, BindingModel, CallShape, ModuleBinding};
+use weaveffi_core::resolved::ResolvedApi;
 
 /// The body every generated stub carries until the producer fills it in.
 const TODO_BODY: &str = "    todo!()\n";

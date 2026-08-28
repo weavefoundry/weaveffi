@@ -1,11 +1,11 @@
 //! Output-content tests for the .NET generator: fixtures mirroring the
 //! sample IDLs plus assertions over the rendered C# source and manifests.
 
-use weaveffi_ir::ir::Api;
-use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::types::{cs_type, pinvoke_type, safe_cs_name};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
+use weaveffi_ir::ir::Api;
 use weaveffi_ir::ir::{
     EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };

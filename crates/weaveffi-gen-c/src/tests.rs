@@ -1,10 +1,10 @@
 //! Tests for the C backend: rendered-header assertions over fixture APIs,
 //! keyword-escaping regressions, and packaging checks.
 
-use weaveffi_ir::ir::Api;
-use weaveffi_core::resolved::ResolvedApi;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
+use weaveffi_ir::ir::Api;
 use weaveffi_ir::ir::{
     CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
     StructField, TypeRef,

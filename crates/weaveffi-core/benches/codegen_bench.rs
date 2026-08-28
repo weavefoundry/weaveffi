@@ -278,8 +278,7 @@ fn bench_validate_kitchen_sink(c: &mut Criterion) {
 
 /// Target: hash_api < 1ms for the kitchen-sink fixture.
 fn bench_hash_kitchen_sink(c: &mut Criterion) {
-    let api =
-        weaveffi_core::validate::validate_api(load_kitchen_sink_unvalidated(), None).unwrap();
+    let api = weaveffi_core::validate::validate_api(load_kitchen_sink_unvalidated(), None).unwrap();
     c.bench_function("hash_kitchen_sink", |b| {
         b.iter(|| {
             weaveffi_core::cache::hash_api(black_box(api.api()));

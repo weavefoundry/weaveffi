@@ -1,7 +1,7 @@
-use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::types::swift_type_for;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
     StructField, TypeRef,

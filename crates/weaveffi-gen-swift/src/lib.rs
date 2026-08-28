@@ -31,12 +31,12 @@ use std::collections::{HashMap, HashSet};
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::walk_modules;
 use weaveffi_core::model::{BindingModel, ModuleBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::Module;
 

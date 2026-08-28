@@ -635,9 +635,7 @@ fn render_async_ffi_call_body(
             "{ind}        _payload = ctypes.string_at(err.contents.payload_ptr, err.contents.payload_len) if err.contents.payload_ptr else b\"\"\n"
         ));
     }
-    out.push_str(&format!(
-        "{ind}        _lib.weaveffi_error_free(err)\n"
-    ));
+    out.push_str(&format!("{ind}        _lib.weaveffi_error_free(err)\n"));
     out.push_str(&format!("{ind}        _state[\"err\"] = {err_expr}\n"));
     out.push_str(&format!("{ind}    else:\n"));
     // Decoding a malformed result buffer raises; surface that through the

@@ -1,10 +1,10 @@
 //! Output-content tests for the Go generator: fixtures mirroring the
 //! sample IDLs plus assertions over the rendered source.
 
-use weaveffi_core::resolved::ResolvedApi;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::errors::ERROR_BRAND;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
     ListenerDef, Module, Param, StructDef, StructField, TypeRef,

@@ -1,11 +1,11 @@
 //! Tests for the C++ backend: rendered-header assertions over fixture APIs,
 //! plus config, packaging, and determinism checks.
 
-use weaveffi_core::resolved::ResolvedApi;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::lang::{self, CPP_KEYWORDS};
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
     ListenerDef, Module, Param, StructDef, StructField, TypeRef,

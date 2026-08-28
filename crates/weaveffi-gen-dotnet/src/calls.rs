@@ -806,7 +806,9 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line(
                 "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, resultBuf, 0, (int)resultLen);",
             );
-            w.line("if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);");
+            w.line(
+                "if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);",
+            );
             emit_buffer_decode(&mut w, ty, "value", "resultBuf");
             w.line("tcs.SetResult(value);");
             out.push_str(&w.finish());
@@ -842,7 +844,9 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line(
                 "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, arr, 0, (int)resultLen);",
             );
-            w.line("if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);");
+            w.line(
+                "if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);",
+            );
             w.line("tcs.SetResult(arr);");
         }
         // Only `Interface?` reaches here: a nullable owned object pointer.

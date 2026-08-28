@@ -2,12 +2,12 @@
 //! generated source text and are the byte-compatibility guard for the
 //! crate.
 
-use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::stubs::render_pyi_module;
 use crate::types::{py_ctypes_scalar, py_type_hint};
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };

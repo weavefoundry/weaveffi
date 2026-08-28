@@ -27,7 +27,6 @@ mod types;
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::abi::is_buffered;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
@@ -35,6 +34,7 @@ use weaveffi_core::model::{BindingModel, CallShape};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::plan::{elem_free, ElemFree};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, wrapper_name, CommentStyle};
 use weaveffi_ir::ir::TypeRef;
 

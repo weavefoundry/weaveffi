@@ -1,11 +1,11 @@
 //! Unit tests for the Android backend: rendering assertions over the Kotlin
 //! wrapper and the JNI C bridge, plus file-set and config-variant checks.
 
-use weaveffi_core::resolved::ResolvedApi;
 use camino::Utf8Path;
 use weaveffi_core::codegen::common::pascal_case;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
     StructField, TypeRef,
@@ -555,7 +555,12 @@ fn list_of_string_return_is_buffered() {
 
 /// A single-module API with one free function, for return-marshalling
 /// tests.
-fn make_fn_api(name: &str, params: Vec<Param>, returns: Option<TypeRef>, throws: bool) -> ResolvedApi {
+fn make_fn_api(
+    name: &str,
+    params: Vec<Param>,
+    returns: Option<TypeRef>,
+    throws: bool,
+) -> ResolvedApi {
     make_api(vec![Module {
         name: "m".to_string(),
         functions: vec![Function {

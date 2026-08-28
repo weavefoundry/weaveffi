@@ -23,11 +23,11 @@ mod tests;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::pkg;
+use weaveffi_core::resolved::ResolvedApi;
 
 use crate::dts::render_wasm_dts;
 use crate::entities::render_wasm_js_stub;

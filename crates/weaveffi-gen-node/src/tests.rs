@@ -1,12 +1,12 @@
 //! Unit tests: golden-content assertions over every emitted file.
 
-use weaveffi_core::resolved::ResolvedApi;
 use super::*;
 use crate::addon::render_addon_c;
 use crate::entities::render_node_index;
 use crate::package::render_node_dts;
 use crate::types::ts_type_for;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef, Module, Param,
     StructDef, StructField, TypeRef,

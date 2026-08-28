@@ -1,12 +1,12 @@
 //! Unit tests for the Dart generator: rendered-source assertions over
 //! representative APIs, plus slot-mapping and packaging checks.
 
-use weaveffi_core::resolved::ResolvedApi;
 use camino::Utf8Path;
 use weaveffi_core::abi::lower_param;
 use weaveffi_core::backend::LanguageBackend;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, ParamBinding};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };
