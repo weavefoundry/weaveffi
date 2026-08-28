@@ -1,4 +1,4 @@
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: shared
     structs:
@@ -26,10 +26,10 @@ modules:
         fields:
           - { name: id, type: i64, doc: Stable identifier }
           - { name: name, type: string, doc: Display name }
-          - { name: count, type: i32, default: 0, doc: Initial count }
-          - { name: enabled, type: bool, default: true, doc: Whether the item is enabled }
-          - { name: ratio, type: f64, default: 1.0, doc: Scaling ratio }
-          - { name: nick, type: u32, default: 0 }
+          - { name: count, type: i32, doc: Initial count }
+          - { name: enabled, type: bool, doc: Whether the item is enabled }
+          - { name: ratio, type: f64, doc: Scaling ratio }
+          - { name: nick, type: u32 }
           - { name: payload, type: bytes }
           - { name: tags, type: "[string]" }
           - { name: attrs, type: "{string:string}" }

@@ -216,6 +216,7 @@ module WeaveFFI
   end
 
   attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
   attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
 
@@ -326,11 +327,12 @@ module WeaveFFI
         code = err[:code]
         msg = err[:message].null? ? '' : err[:message].read_string
         payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
-        weaveffi_error_clear(err_ptr)
+        weaveffi_error_free(err_ptr)
         queue << task_error_from(code, msg, payload)
       else
         begin
           _wv_r = WvBufferReader.new(result_ptr.null? ? ''.b : result_ptr.read_string(result_len))
+          weaveffi_free_bytes(result_ptr, result_len) unless result_ptr.null?
           _wv_v = _wv_read_task_result(_wv_r)
           _wv_r.expect_end!
           queue << _wv_v
@@ -354,11 +356,12 @@ module WeaveFFI
       if err && err[:code] != 0
         code = err[:code]
         msg = err[:message].null? ? '' : err[:message].read_string
-        weaveffi_error_clear(err_ptr)
+        weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
         begin
           _wv_r = WvBufferReader.new(result_ptr.null? ? ''.b : result_ptr.read_string(result_len))
+          weaveffi_free_bytes(result_ptr, result_len) unless result_ptr.null?
           _wv_v = Array.new(_wv_r.read_len) do
             _wv_e0 = _wv_read_task_result(_wv_r)
             _wv_e0
@@ -400,7 +403,7 @@ module WeaveFFI
       if err && err[:code] != 0
         code = err[:code]
         msg = err[:message].null? ? '' : err[:message].read_string
-        weaveffi_error_clear(err_ptr)
+        weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
         queue << result

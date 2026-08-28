@@ -13,6 +13,7 @@ use crate::report::with_named_source;
 use camino::Utf8Path;
 use miette::{bail, IntoDiagnostic, Report, Result, WrapErr};
 use weaveffi_core::validate::validate_api;
+use weaveffi_core::ResolvedApi;
 use weaveffi_ir::ir::Api;
 use weaveffi_ir::parse::parse_api_str;
 
@@ -58,9 +59,10 @@ pub(crate) fn load_api(input: &str) -> Result<(Api, String)> {
 }
 
 /// [`load_api`] plus validation, the shared front half of `generate`,
-/// `lint`, `diff`, and `format`.
-pub(crate) fn load_validated_api(input: &str) -> Result<(Api, String)> {
-    let (mut api, contents) = load_api(input)?;
-    validate_api(&mut api, Some((input, &contents))).map_err(Report::new)?;
+/// `lint`, `diff`, and `format`. Returns the [`ResolvedApi`] that every
+/// downstream consumer (orchestrator, scaffold, packagers) requires.
+pub(crate) fn load_validated_api(input: &str) -> Result<(ResolvedApi, String)> {
+    let (api, contents) = load_api(input)?;
+    let api = validate_api(api, Some((input, &contents))).map_err(Report::new)?;
     Ok((api, contents))
 }

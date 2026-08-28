@@ -4,6 +4,8 @@
 use super::*;
 use crate::types::{cs_type, pinvoke_type, safe_cs_name};
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
+use weaveffi_ir::ir::Api;
 use weaveffi_ir::ir::{
     EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };
@@ -11,7 +13,7 @@ use weaveffi_ir::ir::{
 /// Test shim matching the pre-0.5.0 signature: builds the [`BindingModel`]
 /// here so the production `render_csharp` stays model-only.
 fn render_csharp(
-    api: &Api,
+    api: &ResolvedApi,
     namespace: &str,
     strip_module_prefix: bool,
     prefix: &str,
@@ -97,13 +99,13 @@ fn package_emits_runtimes_and_rebinds_libname() {
     );
 }
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn simple_module(functions: Vec<Function>) -> Module {
@@ -250,8 +252,8 @@ fn listeners_generate_register_unregister() {
 
 #[test]
 fn dotnet_record_is_plain_value_class() {
-    let api = Api {
-        version: "0.6.0".into(),
+    let api = ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![Module {
             name: "contacts".into(),
             functions: vec![],
@@ -263,13 +265,11 @@ fn dotnet_record_is_plain_value_class() {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "age".into(),
                         ty: TypeRef::I32,
                         doc: None,
-                        default: None,
                     },
                 ],
             }],
@@ -282,7 +282,7 @@ fn dotnet_record_is_plain_value_class() {
         }],
         generators: None,
         package: None,
-    };
+    });
     let dir = tempfile::tempdir().unwrap();
     let out = Utf8Path::from_path(dir.path()).unwrap();
     DotnetGenerator
@@ -643,13 +643,11 @@ fn struct_is_sealed_value_class_with_doc() {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -701,25 +699,21 @@ fn struct_has_property_getters() {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "active".into(),
                     ty: TypeRef::Bool,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "role".into(),
                     ty: TypeRef::Enum("Role".into()),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -789,7 +783,6 @@ fn struct_has_no_dispose_or_finalizer() {
                 name: "id".into(),
                 ty: TypeRef::I32,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -833,13 +826,11 @@ fn struct_emits_no_pinvoke_declarations() {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1233,7 +1224,6 @@ fn struct_optional_string_field() {
                 name: "email".into(),
                 ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1375,25 +1365,21 @@ fn comprehensive_contacts_api() {
                     name: "id".into(),
                     ty: TypeRef::I64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "contact_type".into(),
                     ty: TypeRef::Enum("ContactType".into()),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1599,25 +1585,21 @@ fn generate_dotnet_with_structs() {
                     name: "full_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "score".into(),
                     ty: TypeRef::F64,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "active".into(),
                     ty: TypeRef::Bool,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1816,25 +1798,21 @@ fn generate_dotnet_with_optionals() {
                     name: "nickname".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "max_retries".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::I32)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "threshold".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::F64)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "enabled".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::Bool)),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -1964,7 +1942,6 @@ fn generate_dotnet_with_lists() {
                 name: "tags".into(),
                 ty: TypeRef::List(Box::new(TypeRef::I32)),
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2069,49 +2046,41 @@ fn generate_dotnet_full_contacts() {
                     name: "id".into(),
                     ty: TypeRef::Handle,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "first_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "last_name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".into(),
                     ty: TypeRef::Optional(Box::new(TypeRef::StringUtf8)),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".into(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "active".into(),
                     ty: TypeRef::Bool,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "contact_type".into(),
                     ty: TypeRef::Enum("ContactType".into()),
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "scores".into(),
                     ty: TypeRef::List(Box::new(TypeRef::I32)),
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -2568,7 +2537,6 @@ fn dotnet_deeply_nested_optional() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2667,7 +2635,6 @@ fn dotnet_enum_keyed_map() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -2716,8 +2683,8 @@ fn dotnet_enum_keyed_map() {
 
 #[test]
 fn dotnet_typed_handle_type() {
-    let api = Api {
-        version: "0.6.0".into(),
+    let api = ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![Module {
             name: "contacts".into(),
             functions: vec![Function {
@@ -2743,7 +2710,6 @@ fn dotnet_typed_handle_type() {
                     name: "name".into(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 }],
             }],
             enums: vec![],
@@ -2755,7 +2721,7 @@ fn dotnet_typed_handle_type() {
         }],
         generators: None,
         package: None,
-    };
+    });
     let cs = render_csharp(
         &api,
         "WeaveFFI",
@@ -2807,7 +2773,6 @@ fn dotnet_no_double_free_on_error() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2885,7 +2850,6 @@ fn dotnet_null_check_on_optional_return() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -3058,7 +3022,7 @@ fn dotnet_async_pins_callback_for_lifetime() {
 
 /// A module with one async function per given return type, named `run0`,
 /// `run1`, ... in order, plus a `Contact` record for object results.
-fn async_api(returns: Vec<Option<TypeRef>>) -> Api {
+fn async_api(returns: Vec<Option<TypeRef>>) -> ResolvedApi {
     let functions = returns
         .into_iter()
         .enumerate()
@@ -3084,7 +3048,6 @@ fn async_api(returns: Vec<Option<TypeRef>>) -> Api {
                 name: "id".into(),
                 ty: TypeRef::Handle,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -3096,11 +3059,11 @@ fn async_api(returns: Vec<Option<TypeRef>>) -> Api {
     }])
 }
 
-/// Async result buffers are borrowed for the callback's duration
-/// (`AsyncProtocol` clause 2): strings and bytes are deep-copied inside
-/// the callback and never freed by the consumer.
+/// Async result buffers are owned by the consumer (`AsyncProtocol`
+/// clause 2): strings and bytes are deep-copied inside the callback and
+/// then released through the runtime free symbols.
 #[test]
-fn dotnet_async_borrowed_results_copied_never_freed() {
+fn dotnet_async_owned_results_copied_then_freed() {
     let cs = render_csharp(
         &async_api(vec![
             Some(TypeRef::StringUtf8),
@@ -3113,38 +3076,39 @@ fn dotnet_async_borrowed_results_copied_never_freed() {
         "weaveffi.yml",
         "WeaveFFI.cs",
     );
-    // String result: copied, not freed.
+    // String result: copied, then freed.
     assert!(
-        cs.contains("tcs.SetResult(Marshal.PtrToStringUTF8(result) ?? \"\");"),
+        cs.contains("var str = Marshal.PtrToStringUTF8(result) ?? \"\";")
+            && cs.contains("tcs.SetResult(str);"),
         "async string result must copy: {cs}"
     );
     assert!(
-        !cs.contains("weaveffi_free_string(result)"),
-        "async string result must not be freed by the consumer: {cs}"
+        cs.contains("NativeMethods.weaveffi_free_string(result);"),
+        "async string result is owned and must be freed after copying: {cs}"
     );
-    // Bytes result: copied via the (result, resultLen) pair, not freed.
+    // Bytes result: copied via the (result, resultLen) pair, then freed.
     assert!(
         cs.contains("Marshal.Copy(result, arr, 0, (int)resultLen);"),
         "async bytes result must copy: {cs}"
     );
     assert!(
-        !cs.contains("weaveffi_free_bytes(result"),
-        "async bytes result must not be freed by the consumer: {cs}"
+        cs.contains("NativeMethods.weaveffi_free_bytes(result, resultLen);"),
+        "async bytes result is owned and must be freed after copying: {cs}"
     );
-    // Buffered optional result: the borrowed buffer is copied and
-    // decoded inside the callback, never freed by the consumer.
+    // Buffered optional result: the owned buffer is copied, freed, and
+    // decoded inside the callback.
     assert!(
         cs.contains("Marshal.Copy(result, resultBuf, 0, (int)resultLen);")
             && cs.contains("long? value = null;")
             && cs.contains("var valueValue = valueReader.ReadI64();")
             && cs.contains("tcs.SetResult(value);"),
-        "async optional result must decode the borrowed buffer: {cs}"
+        "async optional result must decode the owned buffer: {cs}"
     );
 }
 
-/// Record, list, and map async results all arrive as one borrowed
-/// `(result, resultLen)` value buffer: the callback copies and decodes
-/// it before completing the task, and never frees it.
+/// Record, list, and map async results all arrive as one owned
+/// `(result, resultLen)` value buffer: the callback copies, frees, and
+/// decodes it before completing the task.
 #[test]
 fn dotnet_async_buffered_results_decoded() {
     let cs = render_csharp(
@@ -3168,7 +3132,7 @@ fn dotnet_async_buffered_results_decoded() {
         cs.contains("IntPtr result, UIntPtr resultLen"),
         "async buffered delegate must carry the length slot: {cs}"
     );
-    // Record result decoded from the borrowed copy.
+    // Record result decoded from the local copy.
     assert!(
         cs.contains("var value = Contact.ReadFrom(valueReader);")
             && cs.contains("tcs.SetResult(value);"),
@@ -3195,12 +3159,10 @@ fn dotnet_async_buffered_results_decoded() {
         !cs.contains("resultKeys") && !cs.contains("resultValues"),
         "parallel map buffers must be gone: {cs}"
     );
-    // No release calls anywhere in this API: every native buffer here is
-    // an async result, borrowed for the callback's duration.
+    // Every owned value buffer is released after the copy.
     assert!(
-        !cs.contains("NativeMethods.weaveffi_free_string(")
-            && !cs.contains("NativeMethods.weaveffi_free_bytes("),
-        "async result buffers are borrowed and must not be freed: {cs}"
+        cs.contains("NativeMethods.weaveffi_free_bytes(result, resultLen);"),
+        "async result buffers are owned and must be freed after copying: {cs}"
     );
 }
 
@@ -3408,7 +3370,7 @@ fn deprecated_function_generates_annotation() {
     );
 }
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "docs".into(),
         functions: vec![Function {
@@ -3434,7 +3396,6 @@ fn doc_api() -> Api {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -3582,7 +3543,7 @@ fn dotnet_custom_prefix_threads_to_user_symbols() {
     );
 }
 
-fn shapes_api() -> Api {
+fn shapes_api() -> ResolvedApi {
     let shape = EnumDef {
         name: "Shape".into(),
         doc: Some("An algebraic shape".into()),
@@ -3601,7 +3562,6 @@ fn shapes_api() -> Api {
                     name: "radius".into(),
                     ty: TypeRef::F64,
                     doc: None,
-                    default: None,
                 }],
             },
             EnumVariant {
@@ -3613,13 +3573,11 @@ fn shapes_api() -> Api {
                         name: "width".into(),
                         ty: TypeRef::F32,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "height".into(),
                         ty: TypeRef::F32,
                         doc: None,
-                        default: None,
                     },
                 ],
             },
@@ -3632,13 +3590,11 @@ fn shapes_api() -> Api {
                         name: "label".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "count".into(),
                         ty: TypeRef::U8,
                         doc: None,
-                        default: None,
                     },
                 ],
             },
@@ -3837,7 +3793,7 @@ fn rich_enum_generates_sum_type() {
 /// A `kv` module exercising the 0.5.0 surface: a declared error domain, a
 /// `Store` interface (real ctor, named factory, sync/iterator/async
 /// methods, a static), and free functions with mixed `throws`.
-fn kv_api() -> Api {
+fn kv_api() -> ResolvedApi {
     use weaveffi_ir::ir::{ErrorCode, ErrorDomain, InterfaceDef};
     let f = |name: &str,
              params: Vec<Param>,
@@ -3943,13 +3899,11 @@ fn kv_api() -> Api {
                             name: "key".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "attempts".into(),
                             ty: TypeRef::I32,
                             doc: None,
-                            default: None,
                         },
                     ],
                 },
@@ -4312,8 +4266,8 @@ fn render_fixture(name: &str) -> String {
         .join(name);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
-    let mut api = weaveffi_ir::parse::parse_api_str(&text, "yml").expect("fixture must parse");
-    weaveffi_core::validate::validate_api(&mut api, None).expect("fixture must validate");
+    let api = weaveffi_ir::parse::parse_api_str(&text, "yml").expect("fixture must parse");
+    let api = weaveffi_core::validate::validate_api(api, None).expect("fixture must validate");
     render_csharp(&api, "WeaveFFI", true, "weaveffi", name, "WeaveFFI.cs")
 }
 
@@ -4478,13 +4432,11 @@ fn keyword_identifiers_are_escaped() {
                 name: "default".into(),
                 ty: TypeRef::I32,
                 doc: None,
-                default: None,
             },
             StructField {
                 name: "normal".into(),
                 ty: TypeRef::Bool,
                 doc: None,
-                default: None,
             },
         ],
     });
@@ -4587,7 +4539,7 @@ fn error_mapping_reserves_negative_codes_for_runtime() {
 #[test]
 fn manifest_metadata_is_xml_escaped() {
     use weaveffi_ir::ir::Package;
-    let mut api = make_api(vec![simple_module(vec![])]);
+    let mut api = make_api(vec![simple_module(vec![])]).api().clone();
     api.package = Some(Package {
         name: "my-kv".into(),
         version: "1.2.3".into(),
@@ -4597,6 +4549,7 @@ fn manifest_metadata_is_xml_escaped() {
         homepage: Some("https://example.com/?a=1&b=2".into()),
         repository: None,
     });
+    let api = ResolvedApi::assume_resolved(api);
     let config = DotnetConfig::default();
     let package = crate::package::resolve_dotnet_package(&api, &config);
     let csproj = crate::package::render_csproj(&package, "weaveffi.yml", "WeaveFFI.csproj");

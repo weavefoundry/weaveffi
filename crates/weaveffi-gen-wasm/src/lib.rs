@@ -27,7 +27,7 @@ use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::pkg;
-use weaveffi_ir::ir::Api;
+use weaveffi_core::resolved::ResolvedApi;
 
 use crate::dts::render_wasm_dts;
 use crate::entities::render_wasm_js_stub;
@@ -112,7 +112,7 @@ impl LanguageBackend for WasmGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,

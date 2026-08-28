@@ -12,7 +12,7 @@ pub(crate) fn cmd_format(input: &str, check: bool, quiet: bool) -> Result<()> {
     let formatted = match format {
         "yaml" => format_api_yaml(&api)?,
         "json" => format_api_json(&api)?,
-        "toml" => toml::to_string_pretty(&api)
+        "toml" => toml::to_string_pretty(api.api())
             .into_diagnostic()
             .wrap_err("failed to serialize API as TOML")?,
         _ => unreachable!(),

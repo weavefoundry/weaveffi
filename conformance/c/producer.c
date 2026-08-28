@@ -42,6 +42,10 @@ void weaveffi_error_clear(weaveffi_error* err) {
     }
 }
 
+void weaveffi_error_free(weaveffi_error* err) {
+    (void)err;
+}
+
 void weaveffi_free_string(const char* ptr) {
     (void)ptr;
 }

@@ -96,15 +96,15 @@ iteration ran to exhaustion or was abandoned early.
 
 ## Async completion callbacks
 
-Result buffers passed to an async completion callback (strings, bytes,
-and serialized value buffers for buffered results) are borrowed: the
-producer owns them, they are valid only for the callback's duration, and
-the producer frees them after the callback returns. Copy or decode inside
-the callback; do not free them. Owned interface results are the exception:
-the callback receives ownership of the object pointer and must eventually
-call `_destroy`. The `err` struct is likewise borrowed; copy its code,
-message, and payload inside the callback (clearing it anyway is safe
-because the clear is idempotent).
+Everything passed to an async completion callback is owned by the
+consumer. Result buffers (strings, bytes, and serialized value buffers
+for buffered results) are copied or decoded, then released with
+`weaveffi_free_string` or `weaveffi_free_bytes`. Owned interface
+results transfer ownership of the object pointer, which the consumer
+must eventually `_destroy`. A non-null `err` is heap-boxed: copy its
+code, message, and payload, then release the box exactly once with
+`weaveffi_error_free` (which frees the message, the payload, and the
+box itself).
 
 ## Handles and interfaces
 

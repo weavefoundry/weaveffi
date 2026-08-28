@@ -13,10 +13,10 @@ fuzz_target!(|data: &[u8]| {
     let Ok(s) = std::str::from_utf8(data) else {
         return;
     };
-    let Ok(mut api) = parse_api_str(s, "yaml") else {
+    let Ok(api) = parse_api_str(s, "yaml") else {
         return;
     };
-    let _ = validate_api(&mut api, None);
+    let _ = validate_api(api, None);
 });
 
 #[cfg(not(fuzzing))]

@@ -47,7 +47,9 @@ static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err, 
     } else {
         ctx->result_len = result_len;
         if (result_ptr != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result_ptr, result_len); }
+        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);
     }
+    weaveffi_error_free(err);
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 
@@ -112,7 +114,9 @@ static void weaveffi_tasks_run_batch_napi_cb(void* context, weaveffi_error* err,
     } else {
         ctx->result_len = result_len;
         if (result_ptr != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result_ptr, result_len); }
+        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);
     }
+    weaveffi_error_free(err);
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 
@@ -192,6 +196,7 @@ static void weaveffi_tasks_run_n_tasks_napi_cb(void* context, weaveffi_error* er
     } else {
         ctx->result = result;
     }
+    weaveffi_error_free(err);
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 

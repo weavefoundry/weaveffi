@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # Conformance consumer: kvstore sample, Ruby target.
 #
-# Full-surface drive of the 0.6.0 wrapper: the Store interface (the open(path)
+# Full-surface drive of the 0.7.0 wrapper: the Store interface (the open(path)
 # factory constructor, sync methods, the iterator-backed list_keys, the
 # blocking compact bridge over the async ABI, the deprecated legacy_put, and
 # the default_capacity static), the typed KvError domain (codes 1001-1004)

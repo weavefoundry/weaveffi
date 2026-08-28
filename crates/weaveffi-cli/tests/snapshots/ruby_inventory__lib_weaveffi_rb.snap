@@ -216,6 +216,7 @@ module WeaveFFI
   end
 
   attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
   attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
 

@@ -3,11 +3,16 @@
 //!
 //! This is the producer half of the completion contract stated by
 //! [`weaveffi_core::plan::AsyncProtocol`]: the callback fires exactly once,
-//! from an arbitrary producer thread; borrowed result buffers (strings,
-//! arrays) are freed by the producer after the callback returns, so the
-//! consumer must copy them inside the callback; owned-object results transfer
-//! ownership to the consumer. The callback's `err` slot follows the owning
-//! function's [`ErrorStrategy`](weaveffi_core::plan::ErrorStrategy).
+//! from an arbitrary producer thread, and everything it delivers is *owned by
+//! the consumer*. A non-null `err` is heap-boxed and released with
+//! `weaveffi_error_free`; a string result is released with
+//! `weaveffi_free_string`; a buffered result is released with
+//! `weaveffi_free_bytes`; an owned-object result transfers ownership. This
+//! ownership transfer (unlike the borrow-and-copy contract of synchronous
+//! `out_err` slots) is what lets consumers defer decoding past the callback's
+//! return, which runtimes such as Dart's `NativeCallable.listener` require.
+//! The callback's `err` slot follows the owning function's
+//! [`ErrorStrategy`](weaveffi_core::plan::ErrorStrategy).
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -108,44 +113,44 @@ fn lift_async_input(
 }
 
 /// Lower the future's output into the completion callback's *result* arguments
-/// (the slots after `context` and `err`), returning
-/// `(preamble, args, postamble)`.
+/// (the slots after `context` and `err`), returning `(preamble, args)`.
 ///
-/// The postamble runs *after* the callback returns and releases every buffer
-/// the callback merely borrowed, per the plan's async contract
-/// ([`weaveffi_core::plan::AsyncProtocol`]): strings and value buffers are
-/// producer-owned and freed here (the consumer copies or decodes inside the
-/// callback); an owned interface result transfers ownership to the consumer
-/// and is not freed. `bytes` results are not yet supported.
+/// Every result transfers ownership to the consumer, per the plan's async
+/// contract ([`weaveffi_core::plan::AsyncProtocol`]): a string is released
+/// with `weaveffi_free_string`, a value buffer with `weaveffi_free_bytes`,
+/// and an owned interface result is adopted (the consumer eventually calls
+/// `_destroy`). Ownership transfer is what lets consumers defer decoding past
+/// the callback's return. `bytes` results are not yet supported.
 fn async_result_args(
     ty: &TypeRef,
     value: TokenStream,
-) -> syn::Result<(TokenStream, Vec<TokenStream>, TokenStream)> {
+) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
     let none = TokenStream::new();
-    // A buffered result crosses as a borrowed `(ptr, len)` pair the consumer
-    // decodes inside the callback; the encoding drops when the local `Vec`
-    // goes out of scope after the callback returns.
+    // A buffered result crosses as an owned `(ptr, len)` pair the consumer
+    // decodes at its leisure and releases with `weaveffi_free_bytes`.
     if weaveffi_core::abi::is_buffered(ty) {
         return Ok((
-            quote!(let __wv_res_buf = ::weaveffi::abi::encode_value(&(#value));),
-            vec![quote!(__wv_res_buf.as_ptr()), quote!(__wv_res_buf.len())],
-            none,
+            quote! {
+                let __wv_res_buf = ::weaveffi::abi::encode_value(&(#value)).into_boxed_slice();
+                let __wv_res_len = __wv_res_buf.len();
+                let __wv_res_ptr = ::std::boxed::Box::into_raw(__wv_res_buf) as *const u8;
+            },
+            vec![quote!(__wv_res_ptr), quote!(__wv_res_len)],
         ));
     }
     Ok(match ty {
-        t if is_copy(t) && !matches!(t, TypeRef::Enum(_)) => (none.clone(), vec![value], none),
-        TypeRef::Enum(_) => (none.clone(), vec![quote!((#value) as i32)], none),
+        t if is_copy(t) && !matches!(t, TypeRef::Enum(_)) => (none.clone(), vec![value]),
+        TypeRef::Enum(_) => (none.clone(), vec![quote!((#value) as i32)]),
+        // An owned string the consumer releases with `weaveffi_free_string`.
         TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
             quote!(let __wv_res = ::weaveffi::abi::string_to_c_ptr(&(#value));),
             vec![quote!(__wv_res)],
-            quote!(::weaveffi::abi::free_string(__wv_res);),
         ),
         // An owned-object result: the callback adopts the pointer (the plan's
         // `result_adopt`) and the consumer eventually calls `_destroy`.
         TypeRef::Interface(_) => (
             none.clone(),
             vec![quote!(::std::boxed::Box::into_raw(::std::boxed::Box::new(#value)))],
-            none,
         ),
         _ => return Err(unsupported("async return", "result type")),
     })
@@ -212,8 +217,11 @@ pub(crate) fn gen_async_function(
                     ::weaveffi::abi::MARSHAL_ERROR_CODE,
                     "self is null",
                 );
-                callback(context, &mut __wv_e #(, #sentinels)*);
-                ::weaveffi::abi::error_clear(&mut __wv_e);
+                callback(
+                    context,
+                    ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
+                    #(, #sentinels)*
+                );
                 return;
             }
             let __wv_self_addr = __wv_self as usize;
@@ -242,21 +250,26 @@ pub(crate) fn gen_async_function(
     }
 
     let is_throws = throws(f);
-    let (result_pre, success_args, result_post) = match &f.ret {
+    let (result_pre, success_args) = match &f.ret {
         Some(ty) => async_result_args(ty, quote!(__wv_val))?,
-        None => (TokenStream::new(), Vec::new(), TokenStream::new()),
+        None => (TokenStream::new(), Vec::new()),
     };
-    // Borrowed result buffers are released only after the callback returns:
-    // the consumer copies inside the callback, per the async plan contract.
+    // Result buffers and strings transfer ownership to the consumer, which
+    // releases them with the runtime free symbols, per the async plan
+    // contract.
     let success_call = quote! {
         #result_pre
         callback(__wv_ctx as *mut ::std::ffi::c_void, ::std::ptr::null_mut() #(, #success_args)*);
-        #result_post
     };
 
+    // A non-null `err` is heap-boxed: the consumer copies what it needs and
+    // releases it with `weaveffi_error_free`.
     let fail_call = quote! {
-        callback(__wv_ctx as *mut ::std::ffi::c_void, &mut __wv_e #(, #sentinels)*);
-        ::weaveffi::abi::error_clear(&mut __wv_e);
+        callback(
+            __wv_ctx as *mut ::std::ffi::c_void,
+            ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
+            #(, #sentinels)*
+        );
     };
 
     let dispatch = if is_throws {

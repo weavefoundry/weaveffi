@@ -55,8 +55,8 @@ fn parse_type_ref_seed_is_well_formed() {
 #[test]
 fn validate_seed_passes_validation() {
     let s = seed("fuzz_validate", "minimal.yml");
-    let mut api = parse_api_str(&s, "yaml").expect("seed must parse as YAML");
-    validate_api(&mut api, None).expect("seed must pass validation");
+    let api = parse_api_str(&s, "yaml").expect("seed must parse as YAML");
+    validate_api(api, None).expect("seed must pass validation");
 }
 
 /// Mirrors the body of `fuzz_target!` in `parse_yaml.rs`: arbitrary bytes must

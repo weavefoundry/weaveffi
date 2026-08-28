@@ -5,6 +5,7 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::common::pascal_case;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
     StructField, TypeRef,
@@ -13,18 +14,18 @@ use weaveffi_ir::ir::{
 use crate::types::{jni_param_type, kotlin_jni_type, kotlin_type};
 use crate::{AndroidConfig, AndroidGenerator};
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".to_string(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".to_string(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 /// Test-local shim mirroring the driver: build the model once and hand it
 /// to the renderer (production code never calls `BindingModel::build`).
-fn render_kotlin(api: &Api, package: &str, strip: bool, input_basename: &str) -> String {
+fn render_kotlin(api: &ResolvedApi, package: &str, strip: bool, input_basename: &str) -> String {
     super::render_kotlin(
         &BindingModel::build(api, "weaveffi"),
         package,
@@ -36,7 +37,7 @@ fn render_kotlin(api: &Api, package: &str, strip: bool, input_basename: &str) ->
 /// Test-local shim for the JNI renderer; `c_prefix` seeds the model the
 /// same way the driver's global prefix does.
 fn render_jni_c(
-    api: &Api,
+    api: &ResolvedApi,
     package: &str,
     strip: bool,
     input_basename: &str,
@@ -50,7 +51,7 @@ fn render_jni_c(
     )
 }
 
-fn make_struct_api() -> Api {
+fn make_struct_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "contacts".to_string(),
         functions: vec![],
@@ -62,13 +63,11 @@ fn make_struct_api() -> Api {
                     name: "name".to_string(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".to_string(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -95,14 +94,13 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.to_string(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
 /// The `shapes` conformance sample in its already-resolved IR form: a rich
 /// (algebraic) enum `Shape`, a plain enum `Channel`, and free functions that
 /// take/return the rich enum (lowered to an opaque `Struct` pointer).
-fn make_shapes_api() -> Api {
+fn make_shapes_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "shapes".to_string(),
         enums: vec![
@@ -557,7 +555,12 @@ fn list_of_string_return_is_buffered() {
 
 /// A single-module API with one free function, for return-marshalling
 /// tests.
-fn make_fn_api(name: &str, params: Vec<Param>, returns: Option<TypeRef>, throws: bool) -> Api {
+fn make_fn_api(
+    name: &str,
+    params: Vec<Param>,
+    returns: Option<TypeRef>,
+    throws: bool,
+) -> ResolvedApi {
     make_api(vec![Module {
         name: "m".to_string(),
         functions: vec![Function {
@@ -894,7 +897,7 @@ fn listener_exception_policy_routes_to_handler_then_describes() {
 }
 
 #[test]
-fn async_bytes_result_is_copied_not_freed() {
+fn async_bytes_result_is_copied_then_freed() {
     let api = make_api(vec![Module {
         name: "m".to_string(),
         functions: vec![Function {
@@ -923,7 +926,7 @@ fn async_bytes_result_is_copied_not_freed() {
     );
     assert!(
         jni.contains("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);"),
-        "the borrowed buffer must be deep-copied into a ByteArray: {jni}"
+        "the owned buffer must be deep-copied into a ByteArray: {jni}"
     );
     let cb_start = jni.find("_jni_cb(void* context").expect("callback missing");
     let cb_end = jni[cb_start..]
@@ -932,8 +935,12 @@ fn async_bytes_result_is_copied_not_freed() {
         .expect("callback body must close");
     let cb_body = &jni[cb_start..cb_end];
     assert!(
-        !cb_body.contains("weaveffi_free_bytes"),
-        "the callback borrows the result buffer and must not free it: {cb_body}"
+        cb_body.contains("weaveffi_free_bytes((uint8_t*)result, result_len);"),
+        "the callback owns the result buffer and must free it after copying: {cb_body}"
+    );
+    assert!(
+        cb_body.contains("weaveffi_error_free(err);"),
+        "the callback owns the boxed error and must free it: {cb_body}"
     );
     assert!(
         cb_body.contains("weaveffi_jni_handle_uncaught(env);"),
@@ -1035,7 +1042,6 @@ fn kotlin_struct_with_bytes_field() {
                 name: "data".to_string(),
                 ty: TypeRef::Bytes,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1073,7 +1079,6 @@ fn kotlin_struct_with_nested_struct_field() {
                 name: "start".to_string(),
                 ty: TypeRef::Record("Point".into()),
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -1920,19 +1925,16 @@ fn generate_android_with_structs_and_enums() {
                     name: "name".to_string(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "email".to_string(),
                     ty: TypeRef::StringUtf8,
                     doc: None,
-                    default: None,
                 },
                 StructField {
                     name: "age".to_string(),
                     ty: TypeRef::I32,
                     doc: None,
-                    default: None,
                 },
             ],
         }],
@@ -2329,7 +2331,7 @@ fn android_custom_package() {
 
 /// One module declaring an error domain, with one throwing and one
 /// non-throwing function, shared by the typed-error tests.
-fn make_error_api() -> Api {
+fn make_error_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "contacts".to_string(),
         functions: vec![
@@ -2428,11 +2430,12 @@ fn kotlin_inline_error_types() {
 
 #[test]
 fn kotlin_error_payload_fields_decode() {
-    let mut api = make_error_api();
+    let mut api = make_error_api().api().clone();
     api.modules[0].errors.as_mut().unwrap().codes[0].fields = vec![
         field("contact_id", TypeRef::I64),
         field("hint", TypeRef::Optional(Box::new(TypeRef::StringUtf8))),
     ];
+    let api = ResolvedApi::assume_resolved(api);
     let kt = render_kotlin(&api, "com.weaveffi", true, "weaveffi.yml");
     assert!(
         kt.contains(
@@ -2655,7 +2658,6 @@ fn android_deeply_nested_optional() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2746,7 +2748,6 @@ fn android_enum_keyed_map() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -2819,7 +2820,6 @@ fn android_typed_handle_type() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -2863,7 +2863,6 @@ fn android_no_double_free_on_error() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -3011,7 +3010,6 @@ fn android_null_check_on_optional_return() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -3184,7 +3182,7 @@ fn android_async_pins_callback_for_lifetime() {
     );
 }
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "docs".into(),
         functions: vec![Function {
@@ -3210,7 +3208,6 @@ fn doc_api() -> Api {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -3275,7 +3272,7 @@ fn android_emits_doc_on_param() {
 /// the `new` constructor, a named factory, sync methods (throwing and
 /// not), an async throwing method, a static, and an interface-typed
 /// parameter and return.
-fn make_interface_api() -> Api {
+fn make_interface_api() -> ResolvedApi {
     use weaveffi_ir::ir::InterfaceDef;
     make_api(vec![Module {
         name: "kv".to_string(),
@@ -3561,9 +3558,9 @@ fn samples_generate_android_and_c_outputs() {
             return;
         }
         let contents = std::fs::read_to_string(idl.as_std_path()).unwrap();
-        let mut api = weaveffi_ir::parse::parse_api_str(&contents, "yaml")
+        let api = weaveffi_ir::parse::parse_api_str(&contents, "yaml")
             .unwrap_or_else(|e| panic!("parse {sample}: {e}"));
-        weaveffi_core::validate::validate_api(&mut api, None)
+        let api = weaveffi_core::validate::validate_api(api, None)
             .unwrap_or_else(|e| panic!("validate {sample}: {e:?}"));
         let out = genroot.join(sample);
         let android_cfg = AndroidConfig {
@@ -3663,7 +3660,6 @@ fn kotlin_reserved_word_identifiers_are_escaped() {
                 name: "val".to_string(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],

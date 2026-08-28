@@ -65,6 +65,22 @@ func wvTakeError(cErr *C.weaveffi_error) (int32, string, []byte) {
 	return code, msg, payload
 }
 
+// wvTakeBoxedError reads a heap-boxed error delivered to an async
+// completion callback and releases the box with weaveffi_error_free.
+func wvTakeBoxedError(cErr *C.weaveffi_error) (int32, string, []byte) {
+	code := int32(cErr.code)
+	msg := ""
+	if cErr.message != nil {
+		msg = C.GoString(cErr.message)
+	}
+	var payload []byte
+	if cErr.payload_ptr != nil {
+		payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))
+	}
+	C.weaveffi_error_free(cErr)
+	return code, msg, payload
+}
+
 func wvBrandError(code int32, message string, _ []byte) error {
 	return &WeaveFFIError{Code: code, Message: message}
 }
@@ -388,10 +404,10 @@ func goWv_weaveffi_tasks_run_task_callback(context unsafe.Pointer, err *C.weavef
 	}
 	ch := v.(chan wvOutcomeTasksRunTask)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeTasksRunTask{err: wvMapTasks(wvTakeError(err))}
+		ch <- wvOutcomeTasksRunTask{err: wvMapTasks(wvTakeBoxedError(err))}
 		return
 	}
-	rRes := &wvReader{buf: wvBorrowBuffer(result_ptr, result_len)}
+	rRes := &wvReader{buf: wvCopyBuffer(result_ptr, result_len)}
 	var val TaskResult
 	val = wvUnpackTaskResult(rRes)
 	rRes.expectEnd()
@@ -425,10 +441,10 @@ func goWv_weaveffi_tasks_run_batch_callback(context unsafe.Pointer, err *C.weave
 	}
 	ch := v.(chan wvOutcomeTasksRunBatch)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeTasksRunBatch{err: wvBrandError(wvTakeError(err))}
+		ch <- wvOutcomeTasksRunBatch{err: wvBrandError(wvTakeBoxedError(err))}
 		return
 	}
-	rRes := &wvReader{buf: wvBorrowBuffer(result_ptr, result_len)}
+	rRes := &wvReader{buf: wvCopyBuffer(result_ptr, result_len)}
 	var val []TaskResult
 	nRes0 := rRes.readLen()
 	val = make([]TaskResult, nRes0)
@@ -480,7 +496,7 @@ func goWv_weaveffi_tasks_run_n_tasks_callback(context unsafe.Pointer, err *C.wea
 	}
 	ch := v.(chan wvOutcomeTasksRunNTasks)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeTasksRunNTasks{err: wvBrandError(wvTakeError(err))}
+		ch <- wvOutcomeTasksRunNTasks{err: wvBrandError(wvTakeBoxedError(err))}
 		return
 	}
 	ch <- wvOutcomeTasksRunNTasks{val: int32(result)}

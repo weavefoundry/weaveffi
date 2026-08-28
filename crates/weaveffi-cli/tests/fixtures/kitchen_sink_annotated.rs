@@ -10,7 +10,6 @@
 //! Round-trip gaps documented in `docs/src/guides/extract.md`:
 //!   * The original `stream_items` IDL function (an `iter<T>` return) is
 //!     omitted from this fixture.
-//!   * Struct field `default:` values: dropped.
 //!   * Standalone `since:` without `#[deprecated]`: dropped, so `new_op`
 //!     loses its `since: "0.3.0"`.
 //!   * An error code's yml `doc:` cannot be expressed separately from its

@@ -1,5 +1,6 @@
-//! The **binding model**: a normalized, fully-lowered view of an [`Api`] that
-//! every language backend consumes.
+//! The **binding model**: a normalized, fully-lowered view of a
+//! [`ResolvedApi`] that every language backend
+//! consumes.
 //!
 //! Before this module existed, each of the eleven generators re-walked the IR,
 //! re-derived the C ABI calling convention, and re-invented every emitted C
@@ -23,7 +24,7 @@
 
 use heck::ToUpperCamelCase;
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, ErrorDomain, Function, InterfaceDef, ListenerDef, Module, StructDef,
+    CallbackDef, EnumDef, ErrorDomain, Function, InterfaceDef, ListenerDef, Module, StructDef,
     TypeRef,
 };
 
@@ -31,6 +32,7 @@ use crate::abi::{
     self, async_callback_params, async_input_params, context_param, error_out_param, lower_param,
     lower_return, sync_signature, AbiParam, CType, ConstPos,
 };
+use crate::resolved::ResolvedApi;
 
 /// A single lowered C symbol: its name, ordered ABI parameter slots, and C
 /// return type. This is what a backend declares to its FFI layer and calls.
@@ -148,9 +150,8 @@ pub struct FnBinding {
 ///
 /// Records and rich enums are value types: they declare no C symbols of their
 /// own and cross the ABI serialized inside a value buffer, so a field is just
-/// its name, type, and (for records) optional default. Field declaration
-/// order **is** the wire order.
-#[derive(Debug, Clone, PartialEq)]
+/// its name and type. Field declaration order **is** the wire order.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldBinding {
     /// The field name as written in the IDL.
     pub name: String,
@@ -158,16 +159,12 @@ pub struct FieldBinding {
     pub doc: Option<String>,
     /// The idiomatic IR type of the field.
     pub ty: TypeRef,
-    /// Default value used when the field is omitted at construction, kept as
-    /// the raw IDL value. Only records carry defaults; variant and error
-    /// payload fields leave this `None`.
-    pub default: Option<serde_yaml::Value>,
 }
 
 /// A struct (record), fully lowered: a plain value type generators emit as a
 /// native data class plus buffer read/write functions. No C symbols exist for
 /// a record; instances cross the ABI serialized in value buffers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructBinding {
     /// The struct name as written in the IDL.
     pub name: String,
@@ -186,7 +183,7 @@ pub struct StructBinding {
 /// variant's fields in declaration order. Either way, the C header still
 /// emits the discriminant constants ([`EnumVariantBinding::c_const`]) so C
 /// consumers can switch on the value or tag.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumBinding {
     /// The enum name as written in the IDL.
     pub name: String,
@@ -210,7 +207,7 @@ impl EnumBinding {
 
 /// A single enum variant with its precomputed C constant name and any
 /// associated data.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumVariantBinding {
     /// The variant name as written in the IDL.
     pub name: String,
@@ -284,7 +281,7 @@ pub struct InterfaceBinding {
 }
 
 /// One error code of a module's error domain, with its C constant name.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorCodeBinding {
     /// The code name exactly as written in the IDL (e.g. `KEY_NOT_FOUND`).
     pub name: String,
@@ -310,7 +307,7 @@ pub struct ErrorCodeBinding {
 /// Backends emit one error type per *declaring* module
 /// ([`declared_here`](Self::declared_here) is `true`) and reference the
 /// ancestor's type from inheriting submodules.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorBinding {
     /// The domain name as written in the IDL (e.g. `KvError`).
     pub name: String,
@@ -331,7 +328,7 @@ pub struct ErrorBinding {
 }
 
 /// One module, flattened with its underscore-joined symbol path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleBinding {
     /// The module name (its final path segment).
     pub name: String,
@@ -397,7 +394,7 @@ impl ModuleBinding {
 }
 
 /// The whole API, normalized and lowered for code generation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindingModel {
     /// The C symbol prefix every emitted name is built from.
     pub prefix: String,
@@ -408,11 +405,11 @@ pub struct BindingModel {
 }
 
 impl BindingModel {
-    /// Build the model from a validated [`Api`], using `prefix` for every C
+    /// Build the model from a [`ResolvedApi`], using `prefix` for every C
     /// symbol name. `prefix` is the single global ABI prefix (default
     /// `"weaveffi"`); passing the same prefix to every backend is what keeps
     /// the producer header and all consumers calling identical symbols.
-    pub fn build(api: &Api, prefix: &str) -> Self {
+    pub fn build(api: &ResolvedApi, prefix: &str) -> Self {
         let mut modules = Vec::new();
         for m in &api.modules {
             lower_module(m, &[], prefix, None, &mut modules);
@@ -534,7 +531,6 @@ fn lower_field(f: &weaveffi_ir::ir::StructField) -> FieldBinding {
         name: f.name.clone(),
         doc: f.doc.clone(),
         ty: f.ty.clone(),
-        default: f.default.clone(),
     }
 }
 
@@ -796,7 +792,7 @@ pub fn iterator_item_ctype(elem: &TypeRef, module: &str) -> CType {
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
+        Api, CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
         StructField,
     };
 
@@ -837,13 +833,13 @@ mod tests {
         }
     }
 
-    fn api(modules: Vec<Module>) -> Api {
-        Api {
-            version: "0.6.0".into(),
+    fn api(modules: Vec<Module>) -> ResolvedApi {
+        ResolvedApi::assume_resolved(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
             modules,
             generators: None,
             package: None,
-        }
+        })
     }
 
     #[test]
@@ -969,13 +965,11 @@ mod tests {
                         name: "name".into(),
                         ty: TypeRef::StringUtf8,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "age".into(),
                         ty: TypeRef::I32,
                         doc: None,
-                        default: None,
                     },
                 ],
             }],

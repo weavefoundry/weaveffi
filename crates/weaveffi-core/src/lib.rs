@@ -18,6 +18,9 @@ pub mod package;
 pub mod pkg;
 pub mod plan;
 pub mod platform;
+pub mod resolved;
 pub mod utils;
 pub mod validate;
 pub mod wire;
+
+pub use resolved::ResolvedApi;

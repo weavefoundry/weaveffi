@@ -273,6 +273,7 @@ static void weaveffi_docs_publish_async_napi_cb(void* context, weaveffi_error* e
     } else {
         ctx->result = result;
     }
+    weaveffi_error_free(err);
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 

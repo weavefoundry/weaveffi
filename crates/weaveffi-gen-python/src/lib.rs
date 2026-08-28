@@ -31,8 +31,8 @@ use weaveffi_core::model::{
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::calls::{render_callable, render_callback_type, render_listener, FnScope};
 use crate::entities::{render_enum, render_error, render_interface, render_struct};
@@ -249,7 +249,7 @@ impl LanguageBackend for PythonGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -298,7 +298,7 @@ impl LanguageBackend for PythonGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
@@ -373,7 +373,7 @@ weaveffi_core::impl_generator_via_backend!(PythonGenerator);
 /// [`PythonGenerator::render_py_source`]); retained for direct use in tests.
 #[cfg(test)]
 fn render_python_module(
-    api: &Api,
+    api: &ResolvedApi,
     strip_module_prefix: bool,
     prefix: &str,
     input_basename: &str,

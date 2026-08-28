@@ -422,6 +422,9 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_free(IntPtr err);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_tasks_run_task(IntPtr context, IntPtr err, IntPtr result, UIntPtr resultLen);
 
@@ -465,12 +468,14 @@ namespace WeaveFFI
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
                             var payload = WeaveFFIError.CopyPayload(wErr);
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(TaskException.FromCode(wErr.Code, msg, payload));
                             return;
                         }
                     }
                     var resultBuf = new byte[(int)resultLen];
                     if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, resultBuf, 0, (int)resultLen);
+                    if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);
                     var valueReader = new WeaveFFIBufferReader(resultBuf);
                     var value = TaskResult.ReadFrom(valueReader);
                     valueReader.ExpectEnd();
@@ -519,12 +524,14 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }
                     }
                     var resultBuf = new byte[(int)resultLen];
                     if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, resultBuf, 0, (int)resultLen);
+                    if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);
                     var valueReader = new WeaveFFIBufferReader(resultBuf);
                     var valueCount = valueReader.ReadLen();
                     var value = new TaskResult[valueCount];
@@ -594,6 +601,7 @@ namespace WeaveFFI
                         if (wErr.Code != 0)
                         {
                             var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            NativeMethods.weaveffi_error_free(err);
                             tcs.SetException(new WeaveFFIException(wErr.Code, msg));
                             return;
                         }

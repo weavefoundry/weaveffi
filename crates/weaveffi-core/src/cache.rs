@@ -155,6 +155,7 @@ fn migrate_legacy_cache(out_dir: &Utf8Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::codegen::{ConfiguredGenerator, Generator, Orchestrator, OrchestratorHooks};
+    use crate::resolved::ResolvedApi;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use weaveffi_ir::ir::{Function, Module, Param, TypeRef};
@@ -173,7 +174,7 @@ mod tests {
 
     fn minimal_api() -> Api {
         Api {
-            version: "0.6.0".to_string(),
+            version: "0.7.0".to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -231,7 +232,7 @@ mod tests {
 
         fn generate(
             &self,
-            _api: &Api,
+            _api: &crate::resolved::ResolvedApi,
             out_dir: &Utf8Path,
             _config: &Self::Config,
         ) -> anyhow::Result<()> {
@@ -398,7 +399,13 @@ mod tests {
         let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
 
         assert!(out_dir.join(CACHE_DIR).join("counting.hash").exists());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -414,10 +421,22 @@ mod tests {
         let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -435,7 +454,13 @@ mod tests {
         let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let mut modified_api = api;
@@ -464,7 +489,13 @@ mod tests {
             since: None,
         });
 
-        orch.run(&modified_api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(modified_api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -482,10 +513,22 @@ mod tests {
         let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &hooks, true).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            true,
+        )
+        .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        orch.run(&api, out_dir, &hooks, true).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
@@ -505,7 +548,13 @@ mod tests {
         let gen = configured("counting", Arc::clone(&calls), TestConfig::default());
 
         let orch = Orchestrator::new().with_generator(&gen);
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -528,14 +577,26 @@ mod tests {
             .with_generator(&s_gen);
 
         let api = minimal_api();
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(c_calls.load(Ordering::SeqCst), 1);
         assert_eq!(s_calls.load(Ordering::SeqCst), 1);
 
         // Invalidate only the C generator's cache; the API itself is unchanged.
         std::fs::remove_file(out_dir.join(CACHE_DIR).join("c.hash")).unwrap();
 
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             c_calls.load(Ordering::SeqCst),
             2,
@@ -604,7 +665,12 @@ mod tests {
         let gen = configured("c", Arc::clone(&calls), TestConfig::default());
         Orchestrator::new()
             .with_generator(&gen)
-            .run(&api, out_dir, &hooks, false)
+            .run(
+                &ResolvedApi::assume_resolved(api.clone()),
+                out_dir,
+                &hooks,
+                false,
+            )
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
@@ -618,7 +684,12 @@ mod tests {
         );
         Orchestrator::new()
             .with_generator(&gen2)
-            .run(&api, out_dir, &hooks, false)
+            .run(
+                &ResolvedApi::assume_resolved(api.clone()),
+                out_dir,
+                &hooks,
+                false,
+            )
             .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -629,7 +700,12 @@ mod tests {
         // A third run with the same `changed` config should hit the cache again.
         Orchestrator::new()
             .with_generator(&gen2)
-            .run(&api, out_dir, &hooks, false)
+            .run(
+                &ResolvedApi::assume_resolved(api.clone()),
+                out_dir,
+                &hooks,
+                false,
+            )
             .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -655,7 +731,13 @@ mod tests {
         let stale = hash_api_for_generator(&api, "c");
         write_generator_cache(out_dir, "c", &stale).unwrap();
 
-        orch.run(&api, out_dir, &hooks, false).unwrap();
+        orch.run(
+            &ResolvedApi::assume_resolved(api.clone()),
+            out_dir,
+            &hooks,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,

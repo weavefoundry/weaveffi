@@ -7,7 +7,7 @@
 //! [`LanguageBackend`]; the shared driver bridges it into the generator
 //! pipeline.
 //!
-//! The generated surface follows the 0.6.0 value-buffer layout:
+//! The generated surface follows the 0.7.0 value-buffer layout:
 //!
 //! * Records are plain C++ value structs with typed members; rich (algebraic)
 //!   enums are `std::variant`-backed sum types with one payload struct per
@@ -58,10 +58,11 @@ use weaveffi_core::cabi;
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{BindingModel, CallShape, EnumBinding, InterfaceBinding, ModuleBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::{Api, TypeRef};
+use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::render_cpp_module_ns;
 use crate::entities::{
@@ -142,7 +143,7 @@ impl LanguageBackend for CppGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -170,7 +171,7 @@ impl LanguageBackend for CppGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,

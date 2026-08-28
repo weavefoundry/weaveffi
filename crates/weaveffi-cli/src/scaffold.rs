@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use weaveffi_core::abi::AbiParam;
 use weaveffi_core::model::{AbiFn, BindingModel, CallShape, ModuleBinding};
-use weaveffi_ir::ir::Api;
+use weaveffi_core::resolved::ResolvedApi;
 
 /// The body every generated stub carries until the producer fills it in.
 const TODO_BODY: &str = "    todo!()\n";
@@ -50,7 +50,7 @@ fn emit_abi_fn(out: &mut String, f: &AbiFn, prefix: &str, body: &str) {
 /// [`render_rust`](weaveffi_core::abi::CType::render_rust), so a scaffolded
 /// producer matches the generated header (and therefore every language binding)
 /// by construction; there is no second, drift-prone ABI lowering here.
-pub fn render_scaffold(api: &Api, c_prefix: &str) -> String {
+pub fn render_scaffold(api: &ResolvedApi, c_prefix: &str) -> String {
     let model = BindingModel::build(api, c_prefix);
     let mut out = String::new();
     out.push_str("#![allow(unsafe_code)]\n");
@@ -185,9 +185,9 @@ mod tests {
     use super::*;
     use weaveffi_ir::ir::{Api, Function, Module, Param, StructDef, StructField, TypeRef};
 
-    fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> Api {
-        Api {
-            version: "0.6.0".to_string(),
+    fn minimal_api(functions: Vec<Function>, structs: Vec<StructDef>) -> ResolvedApi {
+        ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".to_string(),
             modules: vec![Module {
                 name: "calc".to_string(),
                 functions,
@@ -201,13 +201,13 @@ mod tests {
             }],
             generators: None,
             package: None,
-        }
+        })
     }
 
     #[test]
     fn scaffold_interface_emits_type_members_and_destroy() {
         use weaveffi_ir::ir::InterfaceDef;
-        let mut api = minimal_api(vec![], vec![]);
+        let mut api = minimal_api(vec![], vec![]).api().clone();
         api.modules[0].interfaces.push(InterfaceDef {
             name: "Store".into(),
             doc: None,
@@ -240,6 +240,7 @@ mod tests {
             }],
             statics: vec![],
         });
+        let api = ResolvedApi::assume_resolved(api);
         let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("pub struct weaveffi_calc_Store {"));
         assert!(out.contains("fn weaveffi_calc_Store_open("));
@@ -314,7 +315,6 @@ mod tests {
                     name: "x".into(),
                     ty: TypeRef::F64,
                     doc: None,
-                    default: None,
                 }],
             }],
         );
@@ -469,13 +469,11 @@ mod tests {
                         name: "x".into(),
                         ty: TypeRef::F64,
                         doc: None,
-                        default: None,
                     },
                     StructField {
                         name: "y".into(),
                         ty: TypeRef::F64,
                         doc: None,
-                        default: None,
                     },
                 ],
             }],
@@ -513,7 +511,6 @@ mod tests {
                     name: "x".into(),
                     ty: TypeRef::F64,
                     doc: None,
-                    default: None,
                 }],
             }],
         );
@@ -531,8 +528,8 @@ mod tests {
     #[test]
     fn scaffold_rich_enum_emits_no_producer_surface() {
         use weaveffi_ir::ir::{EnumDef, EnumVariant};
-        let api = Api {
-            version: "0.6.0".into(),
+        let api = ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "shapes".into(),
                 functions: vec![],
@@ -555,7 +552,6 @@ mod tests {
                                 name: "radius".into(),
                                 ty: TypeRef::F64,
                                 doc: None,
-                                default: None,
                             }],
                         },
                     ],
@@ -568,7 +564,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        };
+        });
         let out = render_scaffold(&api, "weaveffi");
         // Rich enums are value types crossing the ABI as serialized buffers:
         // no opaque object, per-variant constructors, getters, tag reader, or
@@ -582,8 +578,8 @@ mod tests {
     #[test]
     fn scaffold_c_style_enum_emits_no_producer_surface() {
         use weaveffi_ir::ir::{EnumDef, EnumVariant};
-        let api = Api {
-            version: "0.6.0".into(),
+        let api = ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "shapes".into(),
                 functions: vec![],
@@ -614,7 +610,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        };
+        });
         let out = render_scaffold(&api, "weaveffi");
         assert!(
             !out.contains("weaveffi_shapes_Channel"),
@@ -912,8 +908,8 @@ mod tests {
         // A nested submodule's functions/structs must get stubs, and their C
         // symbols must use the underscore-joined module path so they line up
         // with the generated bindings.
-        let api = Api {
-            version: "0.6.0".into(),
+        let api = ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "graphics".into(),
                 functions: vec![],
@@ -943,7 +939,6 @@ mod tests {
                             name: "sides".into(),
                             ty: TypeRef::I32,
                             doc: None,
-                            default: None,
                         }],
                     }],
                     enums: vec![],
@@ -956,7 +951,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        };
+        });
         let out = render_scaffold(&api, "weaveffi");
         assert!(
             out.contains("pub extern \"C\" fn weaveffi_graphics_shapes_make("),
@@ -974,8 +969,8 @@ mod tests {
         // After resolution, a cross-module struct reference is dot-qualified
         // (e.g. `shared.Token`). The scaffold must flatten it to the owning
         // module's C symbol, never embed the dot or the referrer's module.
-        let api = Api {
-            version: "0.6.0".into(),
+        let api = ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "kitchen".into(),
                 functions: vec![Function {
@@ -999,7 +994,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        };
+        });
         let out = render_scaffold(&api, "weaveffi");
         // A cross-module record return is a value buffer like any other; the
         // stub must not leak the dotted name or invent a referrer-module tag.
@@ -1019,8 +1014,8 @@ mod tests {
 
     #[test]
     fn scaffold_multiple_modules() {
-        let api = Api {
-            version: "0.6.0".into(),
+        let api = ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![
                 Module {
                     name: "math".into(),
@@ -1067,7 +1062,7 @@ mod tests {
             ],
             generators: None,
             package: None,
-        };
+        });
         let out = render_scaffold(&api, "weaveffi");
         assert!(out.contains("weaveffi_math_add"), "missing math module");
         assert!(out.contains("weaveffi_io_read"), "missing io module");
@@ -1077,9 +1072,9 @@ mod tests {
         functions: Vec<Function>,
         callbacks: Vec<weaveffi_ir::ir::CallbackDef>,
         listeners: Vec<weaveffi_ir::ir::ListenerDef>,
-    ) -> Api {
-        Api {
-            version: "0.6.0".into(),
+    ) -> ResolvedApi {
+        ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "events".into(),
                 functions,
@@ -1093,7 +1088,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        }
+        })
     }
 
     #[test]
@@ -1173,8 +1168,8 @@ mod tests {
 
     #[test]
     fn scaffold_cancellable_async_threads_cancel_token() {
-        let api = Api {
-            version: "0.6.0".into(),
+        let api = ResolvedApi::assume_resolved(Api {
+            version: "0.7.0".into(),
             modules: vec![Module {
                 name: "net".into(),
                 functions: vec![Function {
@@ -1203,7 +1198,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        };
+        });
         let out = render_scaffold(&api, "weaveffi");
         // The completion callback prefix is (context, err, result).
         assert!(

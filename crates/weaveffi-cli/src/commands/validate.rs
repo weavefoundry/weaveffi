@@ -11,10 +11,10 @@ pub(crate) fn cmd_validate(
     quiet: bool,
 ) -> Result<()> {
     let json_mode = format == Some("json");
-    let (mut api, contents) = super::load_api(input)?;
+    let (api, contents) = super::load_api(input)?;
 
-    match validate_api(&mut api, Some((input, &contents))) {
-        Ok(()) => {
+    match validate_api(api, Some((input, &contents))) {
+        Ok(api) => {
             if warn && !quiet {
                 for w in collect_warnings(&api) {
                     eprintln!("warning: {w}");

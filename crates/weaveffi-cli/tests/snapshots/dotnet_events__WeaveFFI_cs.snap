@@ -382,6 +382,9 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_clear(ref WeaveFFIError err);
 
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_free(IntPtr err);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void Cb_weaveffi_events_OnMessage_fn(IntPtr message, IntPtr context);
 

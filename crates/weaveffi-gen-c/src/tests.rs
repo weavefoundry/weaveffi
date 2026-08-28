@@ -3,6 +3,8 @@
 
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
+use weaveffi_ir::ir::Api;
 use weaveffi_ir::ir::{
     CallbackDef, EnumDef, EnumVariant, Function, ListenerDef, Module, Param, StructDef,
     StructField, TypeRef,
@@ -15,12 +17,12 @@ fn package_bundles_header_libs_and_cmake() {
     use weaveffi_core::package::{FileContent, PackageContext};
     use weaveffi_core::platform::{BinarySet, Platform};
 
-    let api = Api {
-        version: "0.6.0".into(),
+    let api = ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![module("calc")],
         generators: None,
         package: None,
-    };
+    });
     let model = BindingModel::build(&api, "weaveffi");
     let mut bins = BinarySet::new("calculator");
     bins.insert(Platform::MacosArm64, "/s/darwin-arm64/libcalculator.dylib");
@@ -97,16 +99,16 @@ fn module(name: &str) -> Module {
     }
 }
 
-fn api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
-fn header(api: &Api, prefix: &str) -> String {
+fn header(api: &ResolvedApi, prefix: &str) -> String {
     render_c_header(api, prefix, "weaveffi.yml", "weaveffi.h")
 }
 
@@ -131,7 +133,6 @@ fn typed_handle_target_gets_forward_typedef() {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: None,
-                default: None,
             }],
         }],
         ..module("shared")
@@ -249,7 +250,6 @@ fn record_is_a_value_type_with_no_c_object() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         functions: vec![func(
@@ -281,7 +281,6 @@ fn record_return_uses_out_buffer_params() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         functions: vec![func(

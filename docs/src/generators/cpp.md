@@ -48,7 +48,7 @@ directory can be dropped into any CMake build.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -429,12 +429,14 @@ inline std::future<Contact> fetch_contact(int32_t id) {
 
 Use it with `.get()` (blocking) or compose with your event loop. The
 completion lambda runs exactly once, on an arbitrary producer thread; it
-completes (or rejects) the promise and then deletes it. Result buffers
-passed to the callback (strings, bytes, buffered values, and the error
-message) are borrowed from the producer for the callback's duration, so
-the lambda copies or unpacks them into C++ values before returning and
-never frees them. An owned interface result is the exception: the
-callback receives ownership and adopts the pointer into a RAII wrapper. An async callable with `throws: true` rejects with the
+completes (or rejects) the promise and then deletes it. Everything
+passed to the callback is owned by the consumer: the lambda copies or
+unpacks string, bytes, and buffered-value results into C++ values and
+then releases them with `weaveffi_free_string` or
+`weaveffi_free_bytes`, and it releases a heap-boxed error with
+`weaveffi_error_free` after copying its fields. An owned interface
+result transfers ownership too: the
+callback adopts the pointer into a RAII wrapper. An async callable with `throws: true` rejects with the
 module's typed domain exception (`detail::make_kv_error` and friends);
 one without `throws` rejects with the generic `WeaveFFIError` only when
 the producer has a bug.

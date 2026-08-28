@@ -650,8 +650,8 @@ fn async_struct_result_completes_via_callback() {
     use std::time::Duration;
 
     type Msg = (bool, i64, String);
-    // The buffered result is borrowed for the callback's duration: decode
-    // inside the callback (the producer frees the encoding afterward).
+    // The buffered result is owned by the consumer: decode it, then release
+    // the producer allocation with `free_bytes`.
     extern "C" fn cb(
         ctx: *mut c_void,
         err: *mut weaveffi_error,
@@ -660,11 +660,15 @@ fn async_struct_result_completes_via_callback() {
     ) {
         let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
         let had_err = !err.is_null() && unsafe { (*err).code } != 0;
+        if had_err {
+            abi::error_free(err);
+        }
         let payload = if result_ptr.is_null() {
             (had_err, 0, String::new())
         } else {
             let bytes = unsafe { std::slice::from_raw_parts(result_ptr, result_len) };
             let r: tasks::TaskResult = abi::decode_value(bytes).expect("well-formed result");
+            abi::free_bytes(result_ptr as *mut u8, result_len);
             (had_err, r.id, r.value)
         };
         tx.send(payload).unwrap();
@@ -693,6 +697,10 @@ fn async_result_ok_and_err_paths() {
     extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i32) {
         let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
         let had_err = !err.is_null() && unsafe { (*err).code } != 0;
+        if had_err {
+            // The reported error is heap-boxed and owned by the consumer.
+            abi::error_free(err);
+        }
         tx.send((had_err, result)).unwrap();
     }
 

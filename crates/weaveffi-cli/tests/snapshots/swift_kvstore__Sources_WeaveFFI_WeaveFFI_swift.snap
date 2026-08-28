@@ -443,6 +443,7 @@ public final class Store {
                     let code = err.pointee.code
                     let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
                     let payload: [UInt8]? = err.pointee.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.pointee.payload_len)) }
+                    weaveffi_error_free(err)
                     contRef.value.resume(throwing: mapKv(code: code, message: msg, payload: payload))
                 } else {
                     contRef.value.resume(returning: result)

@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn inline_generator_config() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn inline_dart_package_name_merges() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn inline_go_module_path_merges() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn inline_ruby_module_name_merges() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn inline_ruby_gem_name_merges() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn inline_global_strip_module_prefix_merges() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn inline_global_pre_generate_merges() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn inline_unknown_target_silently_ignored() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn inline_unknown_key_silently_ignored() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: m\n",
             "    functions: []\n",
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn inline_generator_config_overrides_file() {
         let yaml = concat!(
-            "version: \"0.6.0\"\n",
+            "version: \"0.7.0\"\n",
             "modules:\n",
             "  - name: math\n",
             "    functions:\n",

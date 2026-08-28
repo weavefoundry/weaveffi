@@ -5,6 +5,7 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::lang::{self, CPP_KEYWORDS};
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
     ListenerDef, Module, Param, StructDef, StructField, TypeRef,
@@ -28,7 +29,6 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.into(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
@@ -88,22 +88,22 @@ fn empty_module(name: &str) -> Module {
     }
 }
 
-fn api_of(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn api_of(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 /// Render with the default namespace and prefix, as the driver would.
-fn render(api: &Api) -> String {
+fn render(api: &ResolvedApi) -> String {
     let model = BindingModel::build(api, "weaveffi");
     render_cpp_header(&model, "weaveffi", "weaveffi.yml", "weaveffi.hpp")
 }
 
-fn minimal_api() -> Api {
+fn minimal_api() -> ResolvedApi {
     let mut m = empty_module("calculator");
     m.functions = vec![func(
         "add",
@@ -113,7 +113,7 @@ fn minimal_api() -> Api {
     api_of(vec![m])
 }
 
-fn contacts_api() -> Api {
+fn contacts_api() -> ResolvedApi {
     let mut m = empty_module("contacts");
     m.enums = vec![EnumDef {
         name: "ContactType".into(),
@@ -150,7 +150,7 @@ fn contacts_api() -> Api {
 /// enum, struct, an interface with a factory constructor,
 /// sync/iterator/async methods, a static, and a nested module whose
 /// function takes the interface across modules.
-fn kvstore_api() -> Api {
+fn kvstore_api() -> ResolvedApi {
     let mut kv = empty_module("kv");
     kv.errors = Some(ErrorDomain {
         name: "KvError".into(),
@@ -1327,7 +1327,7 @@ fn interface_param_passing_between_modules() {
 
 // ── Rich enum tests ──
 
-fn shapes_api() -> Api {
+fn shapes_api() -> ResolvedApi {
     let mut m = empty_module("geometry");
     m.enums = vec![EnumDef {
         name: "Shape".into(),
@@ -1710,8 +1710,8 @@ fn async_error_settles_promise_with_typed_exception() {
     );
 }
 
-/// An async buffered result is borrowed: the trampoline decodes it inside
-/// the callback and never frees it.
+/// An async buffered result is owned by the consumer: the trampoline decodes
+/// it inside the callback and then frees the producer allocation.
 #[test]
 fn async_buffered_result_decoded_in_callback() {
     let mut m = empty_module("feed");
@@ -1727,7 +1727,7 @@ fn async_buffered_result_decoded_in_callback() {
     let h = render(&api_of(vec![m]));
     assert!(
         h.contains("const uint8_t* result_ptr, size_t result_len"),
-        "callback should receive the borrowed buffer slots: {h}"
+        "callback should receive the owned buffer slots: {h}"
     );
     let cb = &h[h.find("inline std::future<Batch> fetch(").unwrap()..];
     let cb = &cb[..cb.find("\n}\n").unwrap()];
@@ -1735,11 +1735,11 @@ fn async_buffered_result_decoded_in_callback() {
         cb.contains("detail::BufferReader result_r(result_ptr, result_len);")
             && cb.contains("Batch value = detail::read_Batch(result_r);")
             && cb.contains("p->set_value(std::move(value));"),
-        "borrowed result must decode inside the callback: {cb}"
+        "owned result must decode inside the callback: {cb}"
     );
     assert!(
-        !cb.contains("weaveffi_free_bytes"),
-        "borrowed async buffers must never be freed: {cb}"
+        cb.contains("weaveffi_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);"),
+        "owned async buffers must be freed after decoding: {cb}"
     );
 }
 

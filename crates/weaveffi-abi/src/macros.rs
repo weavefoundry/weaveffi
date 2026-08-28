@@ -22,6 +22,7 @@
 /// - `weaveffi_free_string`
 /// - `weaveffi_free_bytes`
 /// - `weaveffi_error_clear`
+/// - `weaveffi_error_free`
 /// - `weaveffi_cancel_token_create`
 /// - `weaveffi_cancel_token_cancel`
 /// - `weaveffi_cancel_token_is_cancelled`
@@ -81,6 +82,11 @@ macro_rules! export_runtime {
         #[no_mangle]
         pub extern "C" fn weaveffi_error_clear(err: *mut $crate::weaveffi_error) {
             $crate::error_clear(err)
+        }
+
+        #[no_mangle]
+        pub extern "C" fn weaveffi_error_free(err: *mut $crate::weaveffi_error) {
+            $crate::error_free(err)
         }
 
         #[no_mangle]

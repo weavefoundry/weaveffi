@@ -70,6 +70,29 @@ pub(crate) fn render_error_infra(out: &mut String) {
     );
     w.blank();
 
+    w.line("// wvTakeBoxedError reads a heap-boxed error delivered to an async");
+    w.line("// completion callback and releases the box with weaveffi_error_free.");
+    w.block(
+        "func wvTakeBoxedError(cErr *C.weaveffi_error) (int32, string, []byte) {",
+        "}",
+        |w| {
+            w.line("code := int32(cErr.code)");
+            w.line("msg := \"\"");
+            w.block("if cErr.message != nil {", "}", |w| {
+                w.line("msg = C.GoString(cErr.message)");
+            });
+            w.line("var payload []byte");
+            w.block("if cErr.payload_ptr != nil {", "}", |w| {
+                w.line(
+                    "payload = C.GoBytes(unsafe.Pointer(cErr.payload_ptr), C.int(cErr.payload_len))",
+                );
+            });
+            w.line("C.weaveffi_error_free(cErr)");
+            w.line("return code, msg, payload");
+        },
+    );
+    w.blank();
+
     w.block(
         "func wvBrandError(code int32, message string, _ []byte) error {",
         "}",
@@ -96,9 +119,9 @@ pub(crate) fn render_error_infra(out: &mut String) {
 
 /// The private writer/reader pair implementing the WeaveFFI value-buffer
 /// wire format (little-endian, packed, `u32` length prefixes), plus the two
-/// buffer copy helpers (`wvCopyBuffer` for owned returns released with
-/// `weaveffi_free_bytes`, `wvBorrowBuffer` for borrowed callback/async
-/// buffers the producer frees).
+/// buffer copy helpers (`wvCopyBuffer` for owned return and async result
+/// buffers released with `weaveffi_free_bytes`, `wvBorrowBuffer` for borrowed
+/// callback argument buffers the producer frees).
 ///
 /// The reader panics on malformed input: a bad buffer is a producer bug (a
 /// contract violation), not a recoverable domain error, so it surfaces

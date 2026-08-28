@@ -4,6 +4,8 @@
 use super::*;
 use camino::Utf8Path;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
+use weaveffi_ir::ir::Api;
 use weaveffi_ir::ir::{
     EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };
@@ -13,28 +15,28 @@ use crate::entities::render_wasm_js_stub;
 use crate::package::render_wasm_readme;
 use crate::types::{ts_type_for, type_display, wasm_type, wasm_type_note};
 
-fn empty_api() -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn empty_api() -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules: vec![],
         generators: None,
         package: None,
-    }
+    })
 }
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 /// Test-only shim: build the model (the driver's job in production) and
 /// render the JS stub with the historical argument order.
 fn js_stub_for(
-    api: &Api,
+    api: &ResolvedApi,
     module_name: &str,
     prefix: &str,
     input_basename: &str,
@@ -55,7 +57,7 @@ fn js_stub_for(
 
 /// Test-only shim mirroring [`js_stub_for`] for the `.d.ts` renderer.
 fn dts_for(
-    api: &Api,
+    api: &ResolvedApi,
     module_name: &str,
     input_basename: &str,
     filename: &str,
@@ -73,7 +75,7 @@ fn dts_for(
 }
 
 /// Test-only shim mirroring [`js_stub_for`] for the README renderer.
-fn readme_for(api: &Api, prefix: &str, input_basename: &str, emscripten: bool) -> String {
+fn readme_for(api: &ResolvedApi, prefix: &str, input_basename: &str, emscripten: bool) -> String {
     let model = BindingModel::build(api, prefix);
     render_wasm_readme(api, &model, prefix, input_basename, emscripten)
 }
@@ -83,7 +85,6 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.into(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
@@ -134,7 +135,7 @@ fn module(name: &str) -> Module {
     }
 }
 
-fn sample_api() -> Api {
+fn sample_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![Function {
             name: "add".into(),
@@ -183,7 +184,7 @@ fn sample_api() -> Api {
 /// An API with a callback + listener, delivered synchronously through a
 /// long-lived function-table trampoline in the standard loader (and
 /// stubbed in Emscripten mode).
-fn listener_api() -> Api {
+fn listener_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![member("send", vec![str_param("text")], None, false, false)],
         callbacks: vec![weaveffi_ir::ir::CallbackDef {
@@ -613,7 +614,7 @@ fn type_display_round_trips() {
 
 /// A `contacts` module with a string-to-optional-record lookup, reused by
 /// the API-reference and marshalling tests.
-fn contacts_api() -> Api {
+fn contacts_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![member(
             "find",
@@ -1050,7 +1051,7 @@ fn wasm_enum_keyed_map() {
 
 /// A one-function API returning a record, exercising both the buffered
 /// parameter staging and the buffered return decode.
-fn record_roundtrip_api() -> Api {
+fn record_roundtrip_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![member(
             "save",
@@ -1471,7 +1472,6 @@ fn doc_module() -> Module {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -1584,7 +1584,7 @@ fn wasm_custom_prefix_threads_to_user_symbols() {
 /// sibling enum and free functions taking/returning the rich enum (already
 /// resolved to `TypeRef::RichEnum`) so the value-buffer marshalling is
 /// exercised too.
-fn rich_enum_api() -> Api {
+fn rich_enum_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![
             member(
@@ -1818,7 +1818,7 @@ fn wasm_rich_enum_readme() {
 }
 
 /// A one-function async API for the Emscripten stub tests.
-fn async_api() -> Api {
+fn async_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![Function {
             name: "compute".into(),
@@ -2019,7 +2019,7 @@ fn dts_bytes_map_to_uint8array() {
 /// A kvstore-shaped module: a `Store` interface (canonical `new` plus an
 /// `open` factory, sync/iterator/async methods, one static), a `KvError`
 /// domain, and one non-throwing free function.
-fn kv_api() -> Api {
+fn kv_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![member("flush_all", vec![], None, false, false)],
         errors: Some(weaveffi_ir::ir::ErrorDomain {
@@ -2282,12 +2282,17 @@ fn async_throwing_member_rejects_with_domain_error() {
         js.contains("if (errPtr !== 0) _checkErrRef(wasm, errPtr, ctx.mkErr);"),
         "{js}"
     );
-    // The borrowed-error checker hands the payload slots to the factory.
+    // The boxed-error checker hands the payload slots to the factory, then
+    // releases the box before throwing.
     assert!(
         js.contains(
-            "if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));"
+            "const err = mkErr ? mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true)) : new WeaveFFIError(code, msg);"
         ),
         "{js}"
+    );
+    assert!(
+        js.contains("wasm.weaveffi_error_free(errPtr);"),
+        "the consumer must free the boxed async error: {js}"
     );
     // The launcher passes the cancel slot and callback as usual.
     assert!(
@@ -2455,7 +2460,7 @@ fn optional_interface_stays_nullable_pointer() {
 
 /// An error domain where one code declares payload fields, plus a
 /// throwing function so the checker path is generated.
-fn payload_api() -> Api {
+fn payload_api() -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![member("login", vec![str_param("name")], None, true, false)],
         errors: Some(weaveffi_ir::ir::ErrorDomain {
@@ -2635,14 +2640,14 @@ fn callback_buffered_argument_decoded_borrowed() {
 // --- Async completion contract: borrowed buffers are copied, not freed ---
 
 /// A one-module API with a single free function of the given return type.
-fn returning_api(ret: TypeRef, is_async: bool) -> Api {
+fn returning_api(ret: TypeRef, is_async: bool) -> ResolvedApi {
     make_api(vec![Module {
         functions: vec![member("get_it", vec![], Some(ret), false, is_async)],
         ..module("m")
     }])
 }
 
-fn js_for_api(api: &Api) -> String {
+fn js_for_api(api: &ResolvedApi) -> String {
     js_stub_for(
         api,
         DEFAULT_MODULE_NAME,
@@ -2654,39 +2659,40 @@ fn js_for_api(api: &Api) -> String {
 }
 
 #[test]
-fn async_string_result_is_copied_not_freed() {
+fn async_string_result_is_copied_then_freed() {
     let js = js_for_api(&returning_api(TypeRef::StringUtf8, true));
+    assert!(js.contains("unwrap: (w, p) => {"), "{js}");
     assert!(
-        js.contains("unwrap: (w, p) => _readCStr(w, p) });"),
-        "async string results are borrowed and must not be freed: {js}"
+        js.contains("const _s = _readCStr(w, p);"),
+        "async string results are copied out of wasm memory: {js}"
     );
     assert!(
-        !js.contains("unwrap: (w, p) => _takeCStr"),
-        "async unwrap must not free the producer's string: {js}"
+        js.contains("if (p !== 0) w.weaveffi_free_string(p);"),
+        "async string results are owned and must be freed: {js}"
     );
 }
 
 #[test]
-fn async_bytes_result_is_copied_not_freed() {
+fn async_bytes_result_is_copied_then_freed() {
     let js = js_for_api(&returning_api(TypeRef::Bytes, true));
     assert!(
-        js.contains("new Uint8Array(w.memory.buffer, ptr, len).slice() });"),
+        js.contains("new Uint8Array(w.memory.buffer, ptr, len).slice();"),
         "async bytes results must be deep-copied: {js}"
     );
     assert!(
-        !js.contains("unwrap: (w, ptr, len) => _takeBytes"),
-        "async unwrap must not free the producer's buffer: {js}"
+        js.contains("if (ptr !== 0) w.weaveffi_free_bytes(ptr, len);"),
+        "async bytes results are owned and must be freed: {js}"
     );
 }
 
 #[test]
-fn async_buffered_result_decoded_inside_callback_not_freed() {
+fn async_buffered_result_decoded_inside_callback_then_freed() {
     let js = js_for_api(&returning_api(
         TypeRef::List(Box::new(TypeRef::StringUtf8)),
         true,
     ));
-    // The borrowed value buffer arrives as (ptr, len): the callback copies
-    // it out of wasm memory, decodes, and never frees it.
+    // The owned value buffer arrives as (ptr, len): the callback copies it
+    // out of wasm memory, frees the producer allocation, then decodes.
     assert!(js.contains("unwrap: (w, ptr, len) => {"), "{js}");
     assert!(
         js.contains(
@@ -2694,19 +2700,12 @@ fn async_buffered_result_decoded_inside_callback_not_freed() {
         ),
         "{js}"
     );
+    assert!(
+        js.contains("if (ptr !== 0) w.weaveffi_free_bytes(ptr, len);"),
+        "the consumer frees the owned result buffer: {js}"
+    );
     assert!(js.contains("_arr.push(_rd.str())"), "{js}");
     assert!(js.contains("_rd.end();"), "{js}");
-    // The unwrap closure binds the exports object as `w`, so any free
-    // call inside it would spell `w.weaveffi_free_bytes` (the shared
-    // `_takeBytes` helper legitimately frees owned returns elsewhere).
-    assert!(
-        !js.contains("w.weaveffi_free_bytes("),
-        "the producer frees the borrowed result buffer: {js}"
-    );
-    assert!(
-        !js.contains("unwrap: (w, ptr, len) => _takeBytes"),
-        "async unwrap must not adopt the borrowed buffer: {js}"
-    );
     // The completion callback carries (ctx, err, ptr, len): four i32s.
     assert!(js.contains("_cbPtr_i32_i32_i32_i32"), "{js}");
     assert!(

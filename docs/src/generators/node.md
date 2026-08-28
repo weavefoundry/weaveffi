@@ -51,7 +51,7 @@ camelCased function wrappers.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -353,11 +353,15 @@ static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err,
     if (err != NULL && err->code != 0) {
         ctx->err_code = err->code;
         ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
-    } else if (result_ptr != NULL && result_len > 0) {
-        ctx->result = (uint8_t*)malloc(result_len);
-        memcpy(ctx->result, result_ptr, result_len);
+    } else {
         ctx->result_len = result_len;
+        if (result_ptr != NULL && result_len > 0) {
+            ctx->result = (uint8_t*)malloc(result_len);
+            memcpy(ctx->result, result_ptr, result_len);
+        }
+        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);
     }
+    weaveffi_error_free(err);
     napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
 }
 ```
@@ -365,11 +369,13 @@ static void weaveffi_tasks_run_task_napi_cb(void* context, weaveffi_error* err,
 The completion callback fires exactly once, on the producer thread.
 Result buffers passed to it (strings, byte buffers, and the serialized
 value buffers of buffered results such as the `TaskResult` record here)
-are borrowed for the callback's duration, so the callback deep-copies
-them (note the `strdup` and `memcpy` above) before returning and never
-frees them. Owned interface results are the exception: the callback
-receives ownership of the object pointer, which the settle callback
-wraps into the JS-side owner.
+are owned by the consumer, so the callback deep-copies them (note the
+`strdup` and `memcpy` above) and then releases them with
+`weaveffi_free_string` or `weaveffi_free_bytes`; a reported error is
+heap-boxed and released with `weaveffi_error_free` after its fields
+are copied. Owned interface results transfer ownership too: the
+callback receives the object pointer, which the settle callback wraps
+into the JS-side owner.
 
 Rejected promises carry the C error message plus a numeric `code`
 property; the loader rebrands the rejection into the module's typed

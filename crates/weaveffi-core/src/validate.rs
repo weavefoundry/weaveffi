@@ -11,6 +11,8 @@ use miette::Diagnostic;
 use std::collections::BTreeSet;
 use weaveffi_ir::ir::{Api, SUPPORTED_VERSIONS};
 
+use crate::resolved::ResolvedApi;
+
 mod diagnostic;
 mod resolve;
 mod rules;
@@ -525,14 +527,17 @@ impl Diagnostic for ValidationDiagnostics {
     }
 }
 
-/// Validate an [`Api`], reporting **every** rule violation found. The optional
-/// `source` is `(filename, contents)` of the IDL file and is used to attach
-/// spans to the returned diagnostics. Pass `None` when the API is constructed
-/// in memory (tests, programmatic builds) and there is no on-disk source.
+/// Validate an [`Api`] document, reporting **every** rule violation found.
+/// The optional `source` is `(filename, contents)` of the IDL file and is
+/// used to attach spans to the returned diagnostics. Pass `None` when the
+/// API is constructed in memory (tests, programmatic builds) and there is no
+/// on-disk source.
 ///
-/// On success, type references in `api` are resolved in place (see
-/// [`resolve_type_refs`]): enum and interface references are distinguished
-/// from struct references, and cross-module references are qualified.
+/// This is the one checked way to turn a parsed document into the
+/// [`ResolvedApi`] every generator consumes. On success, type references are
+/// resolved (see [`resolve_type_refs`]): enum and interface references are
+/// distinguished from struct references, and cross-module references are
+/// qualified with their owning module's path.
 ///
 /// # Errors
 ///
@@ -541,12 +546,12 @@ impl Diagnostic for ValidationDiagnostics {
 /// an unknown or misplaced type, an empty struct or enum, a `throws` without
 /// an error domain, or any other rule violation in the catalog above.
 pub fn validate_api(
-    api: &mut Api,
+    mut api: Api,
     source: Option<(&str, &str)>,
-) -> Result<(), ValidationDiagnostics> {
-    let errors = validate_api_inner(api);
+) -> Result<ResolvedApi, ValidationDiagnostics> {
+    let errors = validate_api_inner(&mut api);
     if errors.is_empty() {
-        return Ok(());
+        return Ok(ResolvedApi::assume_resolved(api));
     }
     Err(ValidationDiagnostics {
         diagnostics: errors

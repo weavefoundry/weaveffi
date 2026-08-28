@@ -1,6 +1,7 @@
 //! The fixed Ruby runtime the generated module carries: the library loader,
 //! the error surface, the value-buffer reader/writer pair, and the runtime
-//! ABI attachments (`error_clear`, `free_string`, `free_bytes`).
+//! ABI attachments (`error_clear`, `error_free`, `free_string`,
+//! `free_bytes`).
 
 /// The exact `ffi_lib` loader block [`render_preamble`] emits in `generate`
 /// mode, so the packager can swap it for a bundled-first variant.
@@ -81,6 +82,7 @@ module {module_name}
     out.push_str(
         "
   attach_function :weaveffi_error_clear, [:pointer], :void
+  attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
   attach_function :weaveffi_free_bytes, [:pointer, :size_t], :void
 

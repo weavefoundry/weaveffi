@@ -1,24 +1,25 @@
 use super::*;
 use crate::types::swift_type_for;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, Module, Param, StructDef,
     StructField, TypeRef,
 };
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".to_string(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".to_string(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 /// Build the binding model and render the wrapper, exactly as the driver
 /// does in production before calling [`LanguageBackend::files`].
 fn render(
-    api: &Api,
+    api: &ResolvedApi,
     c_prefix: &str,
     strip_module_prefix: bool,
     input_basename: &str,
@@ -161,7 +162,6 @@ fn listener_decodes_buffered_argument() {
                 name: "name".into(),
                 ty: TypeRef::StringUtf8,
                 doc: None,
-                default: None,
             }],
         }],
         enums: vec![],
@@ -275,7 +275,6 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.into(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
@@ -2155,17 +2154,17 @@ fn swift_async_buffered_result_decoded_in_callback() {
         modules: vec![],
     }]);
     let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
-    // The callback receives a borrowed (ptr, len) pair.
+    // The callback receives an owned (ptr, len) pair.
     assert!(
         out.contains("{ context, err, resultPtr, resultLen in"),
-        "callback must take the borrowed buffer pair: {out}"
+        "callback must take the owned buffer pair: {out}"
     );
     // The buffer is copied and decoded inside the callback, before resuming.
     assert!(
         out.contains(
             "let resultBytes = [UInt8](UnsafeBufferPointer(start: resultPtr, count: resultLen))"
         ),
-        "callback must copy the borrowed buffer: {out}"
+        "callback must copy the owned buffer: {out}"
     );
     assert!(
         out.contains("var resultReader = WvReader(bytes: resultBytes)"),
@@ -2175,12 +2174,13 @@ fn swift_async_buffered_result_decoded_in_callback() {
         out.contains("contRef.value.resume(returning: v0)"),
         "callback must resume with the decoded value: {out}"
     );
-    // The producer frees the buffer after the callback returns; the wrapper
-    // must not free it.
+    // The wrapper owns the buffer: it frees the producer allocation after
+    // copying.
     let cb_pos = out.find("fetch_ids_async").expect("async launcher present");
     assert!(
-        !out[cb_pos..].contains("weaveffi_free_bytes"),
-        "async wrapper must not free the borrowed result buffer: {out}"
+        out[cb_pos..]
+            .contains("weaveffi_free_bytes(UnsafeMutablePointer(mutating: resultPtr), resultLen)"),
+        "async wrapper must free the owned result buffer after copying: {out}"
     );
 }
 
@@ -2278,7 +2278,7 @@ fn swift_nested_module_output() {
 }
 
 /// A module with an `iter<i32>` function, throwing or not.
-fn iter_api(throws: bool) -> Api {
+fn iter_api(throws: bool) -> ResolvedApi {
     make_api(vec![Module {
         name: "data".to_string(),
         functions: vec![Function {
@@ -2584,7 +2584,7 @@ fn map_return_decodes_single_buffer() {
 }
 
 #[test]
-fn async_string_result_is_copied_not_freed() {
+fn async_string_result_is_copied_then_freed() {
     let api = make_api(vec![Module {
         name: "tasks".to_string(),
         functions: vec![Function {
@@ -2607,16 +2607,17 @@ fn async_string_result_is_copied_not_freed() {
         modules: vec![],
     }]);
     let out = render(&api, "weaveffi", true, "weaveffi.yml", "WeaveFFI.swift");
-    // The callback's string is borrowed for the callback's duration: it
-    // is copied into the resumed value and never freed by the wrapper.
+    // The callback's string is owned by the consumer: it is copied into the
+    // resumed value and then released with `weaveffi_free_string`.
     assert!(
-        out.contains("contRef.value.resume(returning: String(cString: result))"),
+        out.contains("let resultValue = String(cString: result)")
+            && out.contains("contRef.value.resume(returning: resultValue)"),
         "async string result must be copied before resuming: {out}"
     );
     let cb_pos = out.find("fetch_async").expect("async launcher present");
     assert!(
-        !out[cb_pos..].contains("weaveffi_free_string"),
-        "async wrapper must not free the borrowed result buffer: {out}"
+        out[cb_pos..].contains("weaveffi_free_string(result)"),
+        "async wrapper must free the owned result string after copying: {out}"
     );
 }
 
@@ -2654,7 +2655,7 @@ fn deprecated_function_generates_annotation() {
     );
 }
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "docs".into(),
         functions: vec![Function {
@@ -2680,7 +2681,6 @@ fn doc_api() -> Api {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -2775,7 +2775,7 @@ fn swift_emits_doc_on_param() {
 /// f64 payload, two f32 payloads, and a string+u8 payload), a plain C-style
 /// enum `Channel`, and the free functions that take/return `Shape` (lowered
 /// to `TypeRef::RichEnum`) plus the numerics smoke `sum_bytes`.
-fn shapes_api() -> Api {
+fn shapes_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "shapes".into(),
         functions: vec![
@@ -2975,7 +2975,7 @@ fn rich_enum_functions_marshal_buffers() {
 /// exercising every member kind: a plain constructor named `new`, a
 /// throwing factory constructor, throwing and non-throwing methods, an
 /// async throwing method, and a static.
-fn store_api() -> Api {
+fn store_api() -> ResolvedApi {
     use weaveffi_ir::ir::InterfaceDef;
     fn f(
         name: &str,

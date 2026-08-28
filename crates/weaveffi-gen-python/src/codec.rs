@@ -181,6 +181,18 @@ pub(crate) fn py_decode_borrowed_expr(ptr: &str, len: &str, ty: &TypeRef) -> Str
     }
 }
 
+/// The expression decoding an *owned* `(ptr, len)` buffer pair (an async
+/// completion result) into its idiomatic value. The consumer owns the buffer,
+/// so `_take_buffer` copies it and releases the producer allocation with
+/// `weaveffi_free_bytes`.
+pub(crate) fn py_decode_owned_expr(ptr: &str, len: &str, ty: &TypeRef) -> String {
+    let data = format!("_take_buffer(ctypes.cast({ptr}, ctypes.c_void_p).value, {len})");
+    match wire::classify(ty) {
+        WireType::User(name) => format!("{}({data})", py_unpack_fn_name(name)),
+        _ => format!("_decode_buffer({data}, lambda _r: {})", py_read_expr(ty, 0)),
+    }
+}
+
 /// Append a record's buffer codec functions: the statement writer, the
 /// reader, and the standalone pack/unpack pair.
 pub(crate) fn render_record_codecs(w: &mut CodeWriter, s: &StructBinding) {

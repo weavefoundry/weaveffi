@@ -244,6 +244,7 @@ public enum Tasks {
                         let code = err.pointee.code
                         let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
                         let payload: [UInt8]? = err.pointee.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.pointee.payload_len)) }
+                        weaveffi_error_free(err)
                         contRef.value.resume(throwing: mapTasks(code: code, message: msg, payload: payload))
                     } else {
                         guard let resultPtr = resultPtr else {
@@ -251,6 +252,7 @@ public enum Tasks {
                             return
                         }
                         let resultBytes = [UInt8](UnsafeBufferPointer(start: resultPtr, count: resultLen))
+                        weaveffi_free_bytes(UnsafeMutablePointer(mutating: resultPtr), resultLen)
                         var resultReader = WvReader(bytes: resultBytes)
                         let v0 = wvReadTaskResult(&resultReader)
                         resultReader.finish()
@@ -276,12 +278,14 @@ public enum Tasks {
                     if let err = err, err.pointee.code != 0 {
                         let code = err.pointee.code
                         let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                        weaveffi_error_free(err)
                         fatalError("\(code): \(msg)")
                     } else {
                         guard let resultPtr = resultPtr else {
                             fatalError("-1: null buffer")
                         }
                         let resultBytes = [UInt8](UnsafeBufferPointer(start: resultPtr, count: resultLen))
+                        weaveffi_free_bytes(UnsafeMutablePointer(mutating: resultPtr), resultLen)
                         var resultReader = WvReader(bytes: resultBytes)
                         let n2 = resultReader.readLen()
                         var v1: [TaskResult] = []
@@ -311,6 +315,7 @@ public enum Tasks {
                 if let err = err, err.pointee.code != 0 {
                     let code = err.pointee.code
                     let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    weaveffi_error_free(err)
                     fatalError("\(code): \(msg)")
                 } else {
                     contRef.value.resume(returning: result)

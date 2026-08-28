@@ -145,7 +145,11 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
            const uint8_t* payload_ptr;\n    \
            size_t payload_len;\n\
          }} {prefix}_error;\n\n\
-         {api} void {prefix}_error_clear({prefix}_error* err);\n\
+         {api} void {prefix}_error_clear({prefix}_error* err);\n\n\
+         /* Async completion callbacks receive a heap-boxed error the consumer\n   \
+           owns; {prefix}_error_free releases the message, the payload, and the\n   \
+           box itself. Passing NULL is a safe no-op. */\n\
+         {api} void {prefix}_error_free({prefix}_error* err);\n\
          {api} void {prefix}_free_string(const char* ptr);\n\
          {api} void {prefix}_free_bytes(uint8_t* ptr, size_t len);\n\n\
          /* Linear-memory allocator used by the Wasm JS glue to stage call\n   \

@@ -53,7 +53,7 @@ Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -185,7 +185,7 @@ The Go module path defaults to `weaveffi`; override it via the
 generator config:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     functions:
@@ -520,11 +520,12 @@ func (s *Store) Compact() (int64, error) {
 The completion callback fires exactly once, on a producer thread. The
 trampoline removes the channel from the registry with `wvCallbackTake`
 (one-shot), converts the C error or result inside the callback (result
-buffers such as strings and buffered values are borrowed from the
-producer for the callback's duration, so the trampoline copies or
-decodes them into Go memory and never frees them; an owned interface
-result is adopted into a wrapper instead), and sends a single
-`wvOutcome…` value:
+buffers such as strings and buffered values are owned by the consumer,
+so the trampoline copies or decodes them into Go memory and then
+releases them with the runtime free symbols; a heap-boxed error is
+read and released by `wvTakeBoxedError`; an owned interface result is
+adopted into a wrapper instead), and sends a single `wvOutcome…`
+value:
 
 ```go
 //export goWv_weaveffi_kv_Store_compact_callback
@@ -535,7 +536,7 @@ func goWv_weaveffi_kv_Store_compact_callback(context unsafe.Pointer, err *C.weav
 	}
 	ch := v.(chan wvOutcomeKvStoreCompact)
 	if err != nil && err.code != 0 {
-		ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeError(err))}
+		ch <- wvOutcomeKvStoreCompact{err: wvMapKv(wvTakeBoxedError(err))}
 		return
 	}
 	ch <- wvOutcomeKvStoreCompact{val: int64(result)}

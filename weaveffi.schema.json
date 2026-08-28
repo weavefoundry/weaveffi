@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.6.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.7.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "package": {
@@ -363,9 +363,6 @@
             "string",
             "null"
           ]
-        },
-        "default": {
-          "description": "Default value used when the field is omitted, kept as a raw YAML value so any literal the field's type accepts can be expressed. Ignored for algebraic [`EnumVariant`] payloads, which aren't defaultable. `None` when the field has no default."
         }
       }
     },
@@ -422,7 +419,7 @@
           ]
         },
         "fields": {
-          "description": "Associated data carried by this variant. Empty for a unit variant or a C-style enum; non-empty makes the owning enum a sum type (see [`EnumDef::is_rich`]). Variant fields reuse [`StructField`] but ignore the `default` slot (a sum-type payload has no defaultable fields).",
+          "description": "Associated data carried by this variant. Empty for a unit variant or a C-style enum; non-empty makes the owning enum a sum type (see [`EnumDef::is_rich`]).",
           "type": "array",
           "items": {
             "$ref": "#/definitions/StructField"
@@ -534,7 +531,7 @@
           ]
         },
         "fields": {
-          "description": "Structured payload fields this error carries beyond its code and message, serialized across the ABI in the error's payload buffer. Empty for a plain code. Payload fields reuse [`StructField`] but ignore the `default` slot.",
+          "description": "Structured payload fields this error carries beyond its code and message, serialized across the ABI in the error's payload buffer. Empty for a plain code.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/StructField"

@@ -40,7 +40,7 @@ Describe the API once in a language-neutral IDL. Create `math.yml` with a
 record and a function:
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 package:
   name: my-math
   version: "0.1.0"

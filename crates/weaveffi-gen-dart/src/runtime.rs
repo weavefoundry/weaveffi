@@ -369,6 +369,18 @@ pub(crate) fn render_error_plumbing(out: &mut String) {
         "void",
     );
 
+    // Async completion callbacks receive a heap-boxed error the consumer
+    // owns; `weaveffi_error_free` releases the message, the payload, and the
+    // box itself once the deferred listener has copied what it needs.
+    emit_typedef_and_lookup(
+        out,
+        "weaveffi_error_free",
+        "Pointer<_WeaveFFIError>",
+        "Pointer<_WeaveFFIError>",
+        "Void",
+        "void",
+    );
+
     // Runtime release helpers: every returned `const char*` is freed with
     // `weaveffi_free_string` after copying, and every producer-allocated
     // buffer (bytes and serialized value buffers) with `weaveffi_free_bytes`.

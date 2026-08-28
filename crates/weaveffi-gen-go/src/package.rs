@@ -6,8 +6,8 @@ use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::platform::Platform;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::{render_go, GoConfig};
 
@@ -112,7 +112,7 @@ alongside Go, for example `weaveffi package --target c,go`).
 /// preamble, `go.mod`, the packaged README, and one bundled shared library
 /// per platform.
 pub(crate) fn package_files(
-    api: &Api,
+    api: &ResolvedApi,
     model: &BindingModel,
     ctx: &PackageContext,
     out_dir: &Utf8Path,

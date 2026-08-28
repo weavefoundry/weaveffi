@@ -36,8 +36,9 @@ use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::codegen::common::walk_modules;
 use weaveffi_core::model::{BindingModel, ModuleBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::{Api, Module};
+use weaveffi_ir::ir::Module;
 
 use crate::entities::{render_swift_module_body, render_swift_module_types};
 use crate::package::{
@@ -154,7 +155,7 @@ impl LanguageBackend for SwiftGenerator {
 
     fn files(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         out_dir: &Utf8Path,
         config: &Self::Config,
@@ -196,7 +197,7 @@ impl LanguageBackend for SwiftGenerator {
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         model: &BindingModel,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
@@ -250,7 +251,7 @@ weaveffi_core::impl_generator_via_backend!(SwiftGenerator);
 /// the runtime helpers the model needs, every module's file-scope types, and
 /// one namespace `enum` per top-level module.
 fn render_swift_wrapper(
-    api: &Api,
+    api: &ResolvedApi,
     model: &BindingModel,
     c_prefix: &str,
     strip_module_prefix: bool,

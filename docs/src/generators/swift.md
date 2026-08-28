@@ -53,7 +53,7 @@ stays buildable under any name.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -396,10 +396,14 @@ public static func runTask(name: String) async throws -> TaskResult {
                 if let err = err, err.pointee.code != 0 {
                     let code = err.pointee.code
                     let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    weaveffi_error_free(err)
                     contRef.value.resume(throwing: mapTasks(code: code, message: msg))
                 } else {
-                    // TaskResult is a record: decode the borrowed value buffer.
-                    var reader = WvReader(ptr: resultPtr, len: resultLen)
+                    // TaskResult is a record: copy the owned value buffer,
+                    // free it, then decode from the copy.
+                    let resultBytes = [UInt8](UnsafeBufferPointer(start: resultPtr, count: resultLen))
+                    weaveffi_free_bytes(UnsafeMutablePointer(mutating: resultPtr), resultLen)
+                    var reader = WvReader(bytes: resultBytes)
                     contRef.value.resume(returning: wvReadTaskResult(&reader))
                 }
             }, ctx)
@@ -411,12 +415,14 @@ public static func runTask(name: String) async throws -> TaskResult {
 The completion callback fires exactly once, on an arbitrary producer
 thread, and the continuation is resumed exactly once from inside it.
 Result buffers passed to the callback (strings, bytes, and buffered
-values) are borrowed from the producer for the callback's duration: the
-wrapper copies or decodes them (for example `String(cString:)` on the
-error message, or `wvReadTaskResult` above) before the callback returns
-and never frees them. An owned interface result is the exception: the
-callback adopts the pointer into a new wrapper instance, whose `deinit`
-eventually frees it.
+values) are owned by the consumer: the wrapper copies or decodes them
+(for example `String(cString:)`, or the byte-array copy above) and
+then releases them with `weaveffi_free_string` or
+`weaveffi_free_bytes`. A reported error is heap-boxed: the wrapper
+copies its code, message, and payload, then releases it with
+`weaveffi_error_free`. An owned interface result transfers ownership
+too: the callback adopts the pointer into a new wrapper instance,
+whose `deinit` eventually frees it.
 
 `run_task` declares `throws: true`, so the continuation rejects with the
 typed `TaskError` (via `mapTasks`). An async callable without `throws` is

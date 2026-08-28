@@ -359,6 +359,23 @@ pub fn error_clear(err: *mut weaveffi_error) {
     error_set_ok(err);
 }
 
+/// Free a heap-boxed error delivered through an async completion callback.
+///
+/// Async launchers hand the callback an *owned* `weaveffi_error` allocated on
+/// the heap (unlike the caller-owned `out_err` slot of synchronous calls), so
+/// consumers can defer reading it past the callback's return. Once the
+/// consumer has copied what it needs, it releases the message, the payload,
+/// and the box itself through this function. Passing null is a safe no-op.
+pub fn error_free(err: *mut weaveffi_error) {
+    if err.is_null() {
+        return;
+    }
+    error_clear(err);
+    // SAFETY: async launchers allocate the error with `Box::new`, and the
+    // consumer calls this exactly once with that pointer.
+    unsafe { drop(Box::from_raw(err)) };
+}
+
 /// Opaque cancellation token passed across the C ABI boundary.
 ///
 /// Foreign callers obtain a token via `weaveffi_cancel_token_create`, signal

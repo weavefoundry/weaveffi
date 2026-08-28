@@ -267,13 +267,14 @@ pub(crate) fn emit_error_slot_helpers(out: &mut String) {
     out.push_str("}\n\n");
 }
 
-/// Emit `_checkErrRef`, the borrowed-error checker the async completion
-/// callbacks route through: the producer owns and frees the error struct, so
-/// the slot is read but never deallocated here.
+/// Emit `_checkErrRef`, the boxed-error checker the async completion
+/// callbacks route through: the consumer owns the heap-boxed error struct,
+/// so its fields are read (and any typed error built) before the box is
+/// released with `weaveffi_error_free`.
 pub(crate) fn emit_check_err_ref(out: &mut String) {
-    out.push_str("// Throw if a borrowed (producer-owned) error carries a non-zero\n");
-    out.push_str("// code. Used by async callbacks: the producer owns and frees the\n");
-    out.push_str("// error struct, so the slot is read but never deallocated here.\n");
+    out.push_str("// Throw if a heap-boxed (consumer-owned) error carries a non-zero\n");
+    out.push_str("// code. Used by async callbacks: the fields are read, then the box\n");
+    out.push_str("// is released with weaveffi_error_free before throwing.\n");
     out.push_str("// `mkErr` maps domain codes (and decodes payload fields) for\n");
     out.push_str(&format!(
         "// throwing callables; without it the generic {ERROR_BRAND} is thrown.\n"
@@ -281,12 +282,13 @@ pub(crate) fn emit_check_err_ref(out: &mut String) {
     out.push_str("function _checkErrRef(wasm, errPtr, mkErr) {\n");
     out.push_str("  const dv = new DataView(wasm.memory.buffer);\n");
     out.push_str("  const code = dv.getInt32(errPtr, true);\n");
-    out.push_str("  if (code === 0) return;\n");
+    out.push_str("  if (code === 0) { wasm.weaveffi_error_free(errPtr); return; }\n");
     out.push_str("  const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';\n");
-    out.push_str(
-        "  if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));\n",
-    );
-    out.push_str(&format!("  throw new {ERROR_BRAND}(code, msg);\n"));
+    out.push_str(&format!(
+        "  const err = mkErr ? mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true)) : new {ERROR_BRAND}(code, msg);\n"
+    ));
+    out.push_str("  wasm.weaveffi_error_free(errPtr);\n");
+    out.push_str("  throw err;\n");
     out.push_str("}\n\n");
 }
 

@@ -3,6 +3,7 @@ use std::path::Path;
 use camino::Utf8Path;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator, Generator, Orchestrator};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
 use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
 use weaveffi_gen_c::{CConfig, CGenerator};
@@ -23,7 +24,7 @@ use weaveffi_ir::parse::parse_api_str;
 /// 10 modules x (50 functions + 5 structs + 3 enums) each. Type names are
 /// namespaced per module (`M0Struct0`, ...) because bare type names must be
 /// unique across the whole API.
-fn build_large_api() -> Api {
+fn build_large_api() -> ResolvedApi {
     let modules = (0..10)
         .map(|m| {
             let structs: Vec<StructDef> = (0..5)
@@ -35,19 +36,16 @@ fn build_large_api() -> Api {
                             name: "id".into(),
                             ty: TypeRef::I32,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "name".into(),
                             ty: TypeRef::StringUtf8,
                             doc: None,
-                            default: None,
                         },
                         StructField {
                             name: "active".into(),
                             ty: TypeRef::Bool,
                             doc: None,
-                            default: None,
                         },
                     ],
                 })
@@ -132,12 +130,14 @@ fn build_large_api() -> Api {
         })
         .collect();
 
-    Api {
-        version: "0.6.0".into(),
+    // The synthetic API already uses resolved type references (see the
+    // `Record` comment above), so it skips the validate/resolve pass.
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 /// Construct the same fan-out of generators used by the CLI, each with its
@@ -233,31 +233,27 @@ fn bench_generate_all_large_api(c: &mut Criterion) {
 /// Parse and validate the canonical kitchen-sink IDL fixture so the
 /// parallel-vs-serial benchmark exercises every generator against a
 /// realistic, full-featured API.
-fn load_kitchen_sink_api() -> Api {
+fn load_kitchen_sink_api() -> ResolvedApi {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/06_kitchen_sink.yml");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
-    let mut api = parse_api_str(&contents, "yaml")
+    let api = parse_api_str(&contents, "yaml")
         .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(&mut api, None)
-        .unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()));
-    api
+    validate_api(api, None).unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
 }
 
 /// Parse and validate the calculator sample IDL.
-fn load_calculator_api() -> Api {
+fn load_calculator_api() -> ResolvedApi {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/calculator/calculator.yml");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read sample {}: {e}", path.display()));
-    let mut api = parse_api_str(&contents, "yaml")
+    let api = parse_api_str(&contents, "yaml")
         .unwrap_or_else(|e| panic!("parse sample {}: {e}", path.display()));
-    validate_api(&mut api, None)
-        .unwrap_or_else(|e| panic!("validate sample {}: {e}", path.display()));
-    api
+    validate_api(api, None).unwrap_or_else(|e| panic!("validate sample {}: {e}", path.display()))
 }
 
-fn run_all_generators(api: &Api) {
+fn run_all_generators(api: &ResolvedApi) {
     let generators = all_default_generators();
     let mut orchestrator = Orchestrator::new();
     for g in &generators {

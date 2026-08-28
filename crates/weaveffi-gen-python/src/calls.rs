@@ -20,7 +20,8 @@ use weaveffi_core::wire::{self, WireType};
 use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{
-    py_decode_borrowed_expr, py_pack_fn_name, py_read_expr, py_unpack_fn_name, py_write_stmts,
+    py_decode_borrowed_expr, py_decode_owned_expr, py_pack_fn_name, py_read_expr,
+    py_unpack_fn_name, py_write_stmts,
 };
 use crate::docs::{emit_doc, emit_docstring, emit_fn_docstring};
 use crate::entities::{py_checker_name, py_error_factory_name};
@@ -472,45 +473,56 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
         None => vec![],
         Some(ty) => abi::callback_result_params(ty, "")
             .into_iter()
-            .map(|p| (p.name, py_ctype(&p.ty)))
+            .map(|p| {
+                // An owned string result must keep its raw address (a
+                // `c_char_p` slot would auto-convert to `bytes` and lose the
+                // pointer `weaveffi_free_string` needs).
+                let cty = match py_ctype(&p.ty).as_str() {
+                    "ctypes.c_char_p" => "ctypes.c_void_p".to_string(),
+                    other => other.to_string(),
+                };
+                (p.name, cty)
+            })
             .collect(),
     }
 }
 
 /// Append the success branch of an async completion trampoline: convert the
-/// borrowed `result` slots into the idiomatic value and store it in
-/// `_state["val"]`. Borrowed buffers (strings, bytes, value buffers) are
-/// copied and never freed; the producer releases them after the callback
-/// returns. An owned interface pointer is adopted by its wrapper class.
+/// owned `result` slots into the idiomatic value and store it in
+/// `_state["val"]`. Async results transfer ownership to the consumer: strings
+/// are released with `weaveffi_free_string`, value buffers with
+/// `weaveffi_free_bytes`, and an owned interface pointer is adopted by its
+/// wrapper class.
 fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
     let Some(ty) = ret else {
         out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
         return;
     };
     match plan::ret_pass(Some(ty), "", "") {
-        // The borrowed `(result_ptr, result_len)` pair holds one encoded
-        // value; copy and decode it before the producer reclaims it.
+        // The owned `(result_ptr, result_len)` pair holds one encoded value;
+        // `_take_buffer` copies it and frees the producer allocation.
         RetPass::Buffer => {
             out.push_str(&format!(
                 "{ind}_state[\"val\"] = {}\n",
-                py_decode_borrowed_expr("result_ptr", "result_len", ty)
+                py_decode_owned_expr("result_ptr", "result_len", ty)
             ));
         }
         RetPass::String => {
-            // `result` arrives as `bytes` (ctypes copies `c_char_p` callback
-            // arguments), so decoding is already a deep copy of the borrowed
-            // producer buffer. The producer frees it; the wrapper must not.
+            // The owned C string is copied and freed by `_take_string` (the
+            // callback slot is typed `c_void_p` so the address survives).
             out.push_str(&format!(
-                "{ind}_state[\"val\"] = _bytes_to_string(result) or \"\"\n"
+                "{ind}_state[\"val\"] = _take_string(result) or \"\"\n"
             ));
         }
         RetPass::Bytes => {
-            // Copy the borrowed buffer; the producer owns and frees it.
+            // Copy the owned buffer, then release the producer allocation.
             out.push_str(&format!("{ind}if not result:\n"));
             out.push_str(&format!("{ind}    _state[\"val\"] = b\"\"\n"));
             out.push_str(&format!("{ind}else:\n"));
             out.push_str(&format!("{ind}    _n = int(result_len)\n"));
-            out.push_str(&format!("{ind}    _state[\"val\"] = bytes(result[:_n])\n"));
+            out.push_str(&format!(
+                "{ind}    _state[\"val\"] = _take_buffer(ctypes.cast(result, ctypes.c_void_p).value, _n)\n"
+            ));
         }
         // A returned interface transfers ownership of a new object reference;
         // wrap it without re-running the class's FFI constructor. A nullable
@@ -563,9 +575,10 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
 /// `CFUNCTYPE` completion trampoline for the launcher's callback typedef,
 /// pins it in `_async_pending` until completion, invokes the launcher (which
 /// returns immediately), and awaits the future. The trampoline runs on an
-/// arbitrary producer thread: it copies borrowed result buffers before
-/// returning (owned object pointers are adopted instead), then resolves the
-/// future via `call_soon_threadsafe`. A throwing callable maps the completion
+/// arbitrary producer thread: it takes ownership of the result (freeing
+/// strings and value buffers through the runtime symbols; owned object
+/// pointers are adopted), then resolves the future via
+/// `call_soon_threadsafe`. A throwing callable maps the completion
 /// error through the module domain's factory (from `error`); a non-throwing
 /// one traps with the generic `WeaveFFIError`. When `has_self` is set (an
 /// instance method), the launcher receives `self._ptr` as its leading
@@ -604,10 +617,10 @@ fn render_async_ffi_call_body(
     out.push('\n');
     out.push_str(&format!("{ind}def _cb_impl({cb_params_joined}):\n"));
     out.push_str(&format!(
-        "{ind}    # Fires exactly once, on a producer thread: convert (copying\n"
+        "{ind}    # Fires exactly once, on a producer thread: take ownership of\n"
     ));
     out.push_str(&format!(
-        "{ind}    # borrowed buffers) here, then hop back to the event loop.\n"
+        "{ind}    # the result here, then hop back to the event loop.\n"
     ));
     out.push_str(&format!(
         "{ind}    _state = {{\"err\": None, \"val\": None}}\n"
@@ -622,9 +635,7 @@ fn render_async_ffi_call_body(
             "{ind}        _payload = ctypes.string_at(err.contents.payload_ptr, err.contents.payload_len) if err.contents.payload_ptr else b\"\"\n"
         ));
     }
-    out.push_str(&format!(
-        "{ind}        _lib.weaveffi_error_clear(ctypes.byref(err.contents))\n"
-    ));
+    out.push_str(&format!("{ind}        _lib.weaveffi_error_free(err)\n"));
     out.push_str(&format!("{ind}        _state[\"err\"] = {err_expr}\n"));
     out.push_str(&format!("{ind}    else:\n"));
     // Decoding a malformed result buffer raises; surface that through the

@@ -6,6 +6,7 @@ use crate::entities::render_node_index;
 use crate::package::render_node_dts;
 use crate::types::ts_type_for;
 use weaveffi_core::codegen::Generator;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef, Module, Param,
     StructDef, StructField, TypeRef,
@@ -64,13 +65,13 @@ fn package_uses_optional_dependencies_per_platform() {
     );
 }
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn make_module(name: &str) -> Module {
@@ -92,7 +93,6 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.into(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
@@ -133,19 +133,19 @@ fn contact_struct() -> StructDef {
 
 /// Test-only bridge from an inline [`Api`] literal to the model the
 /// production path receives from the driver.
-fn build_model(api: &Api) -> BindingModel {
+fn build_model(api: &ResolvedApi) -> BindingModel {
     BindingModel::build(api, "weaveffi")
 }
 
-fn index_for(api: &Api, strip: bool) -> String {
+fn index_for(api: &ResolvedApi, strip: bool) -> String {
     render_node_index(&build_model(api), strip, "weaveffi.yml")
 }
 
-fn dts_for(api: &Api, strip: bool) -> String {
+fn dts_for(api: &ResolvedApi, strip: bool) -> String {
     render_node_dts(&build_model(api), strip, "weaveffi.yml")
 }
 
-fn addon_for(api: &Api, strip: bool) -> String {
+fn addon_for(api: &ResolvedApi, strip: bool) -> String {
     render_addon_c(&build_model(api), strip, "weaveffi.yml")
 }
 
@@ -1231,7 +1231,6 @@ fn doc_module() -> Module {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {

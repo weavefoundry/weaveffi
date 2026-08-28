@@ -9,19 +9,24 @@ use std::fmt::Write;
 
 use weaveffi_core::cabi;
 use weaveffi_core::model::BindingModel;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::Api;
 
 use crate::idents::escape_module_param_names;
 
 /// Render the complete `{prefix}.h` for `api` using `prefix` for every symbol.
 ///
-/// Thin `Api`-based wrapper over [`render_c_header_from_model`] for tests and
-/// callers that only hold an [`Api`]; the production path renders directly from
-/// the driver-built [`BindingModel`] without re-deriving it.
-pub fn render_c_header(api: &Api, prefix: &str, input_basename: &str, filename: &str) -> String {
+/// Thin wrapper over [`render_c_header_from_model`] for tests and callers
+/// that only hold a [`ResolvedApi`]; the production path renders directly
+/// from the driver-built [`BindingModel`] without re-deriving it.
+pub fn render_c_header(
+    api: &ResolvedApi,
+    prefix: &str,
+    input_basename: &str,
+    filename: &str,
+) -> String {
     render_c_header_from_model(&BindingModel::build(api, prefix), input_basename, filename)
 }
 

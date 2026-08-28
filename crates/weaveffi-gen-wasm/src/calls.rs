@@ -761,11 +761,10 @@ pub(crate) fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static st
 /// rejects with the typed error.
 ///
 /// The unwrap runs inside the completion callback, so it follows the async
-/// borrowing contract: string, byte, and value buffers are producer-owned and
-/// valid only for the callback's duration, so they are deep-copied or decoded
-/// out of wasm memory and never freed here. Owned interface results are the
-/// exception: the callback receives ownership and the pointer is adopted by
-/// its wrapper class.
+/// ownership contract: string, byte, and value buffers are consumer-owned,
+/// so they are deep-copied or decoded out of wasm memory and then released
+/// through the runtime free symbols. Owned interface results are adopted by
+/// their wrapper class instead.
 fn emit_async_unwrap(
     out: &mut String,
     indent: &str,
@@ -788,13 +787,14 @@ fn emit_async_unwrap(
     let open = format!("_asyncContexts.set(ctxId, {{ {base}, unwrap: ");
     match plan::ret_pass(Some(ret), module, prefix) {
         RetPass::Void => unreachable!("a present return type is never void"),
-        // Borrowed: copy the encoding out of wasm memory inside the callback,
-        // decode, never free (the producer reclaims it afterwards).
+        // Owned: copy the encoding out of wasm memory, free the producer
+        // allocation, then decode from the copy.
         RetPass::Buffer => {
             w.block(format!("{open}(w, ptr, len) => {{"), "} });", |w| {
                 w.line(
                     "const _b = ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice();",
                 );
+                w.line("if (ptr !== 0) w.weaveffi_free_bytes(ptr, len);");
                 w.line("const _rd = new _BufReader(_b);");
                 w.line(format!("const _v = {};", buf_read_expr(ret, module, "_rd")));
                 w.line("_rd.end();");
@@ -808,8 +808,12 @@ fn emit_async_unwrap(
             w.line(plain);
         }
         RetPass::String => {
-            // Borrowed: copy out of wasm memory, never free.
-            w.line(format!("{open}(w, p) => _readCStr(w, p) }});"));
+            // Owned: copy out of wasm memory, then free.
+            w.block(format!("{open}(w, p) => {{"), "} });", |w| {
+                w.line("const _s = _readCStr(w, p);");
+                w.line("if (p !== 0) w.weaveffi_free_string(p);");
+                w.line("return _s;");
+            });
         }
         RetPass::Object { nullable, .. } => {
             let cls = local_type_name(object_ret_name(ret));
@@ -822,10 +826,14 @@ fn emit_async_unwrap(
             }
         }
         RetPass::Bytes => {
-            // Borrowed: slice() deep-copies out of wasm memory, never free.
-            w.line(format!(
-                "{open}(w, ptr, len) => ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice() }});"
-            ));
+            // Owned: slice() deep-copies out of wasm memory, then free.
+            w.block(format!("{open}(w, ptr, len) => {{"), "} });", |w| {
+                w.line(
+                    "const _b = ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice();",
+                );
+                w.line("if (ptr !== 0) w.weaveffi_free_bytes(ptr, len);");
+                w.line("return _b;");
+            });
         }
     }
     out.push_str(&w.finish());

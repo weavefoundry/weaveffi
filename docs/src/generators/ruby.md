@@ -57,7 +57,7 @@ directions.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -513,11 +513,13 @@ def self.run_task(name)
   ) do |_context, err_ptr, result_ptr, result_len|
     err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
     if err && err[:code] != 0
-      # ... read code/message, weaveffi_error_clear ...
+      # ... read code/message/payload, then weaveffi_error_free ...
       queue << task_error_from(code, msg)
     else
-      # TaskResult is a record: decode the borrowed value buffer.
-      queue << _wv_read_task_result(WvBufferReader.new(result_ptr.read_string(result_len)))
+      # TaskResult is a record: copy the owned buffer, free it, decode.
+      reader = WvBufferReader.new(result_ptr.read_string(result_len))
+      weaveffi_free_bytes(result_ptr, result_len) unless result_ptr.null?
+      queue << _wv_read_task_result(reader)
     end
   end
   weaveffi_tasks_run_task_async(name, callback, FFI::Pointer::NULL)
@@ -542,13 +544,14 @@ mid-flight.
 
 Result ownership follows the async contract: string, bytes, and
 buffered results (records, rich enums, optionals, arrays, and maps,
-arriving as a pointer-plus-length pair) are borrowed for the callback's
-duration, so the callback copies or decodes them into Ruby values
-before it returns and never frees them; the producer does after the
-callback returns. An owned interface result is the exception: the
-callback receives ownership, and the wrapper adopts the pointer into
-its `FFI::AutoPointer`, so the destructor runs on GC or an explicit
-`destroy`.
+arriving as a pointer-plus-length pair) are owned by the consumer, so
+the callback copies or decodes them into Ruby values and then releases
+them with `weaveffi_free_string` or `weaveffi_free_bytes`. A reported
+error is heap-boxed: the callback copies its code, message, and
+payload, then releases it with `weaveffi_error_free`. An owned
+interface result transfers ownership too: the wrapper adopts the
+pointer into its `FFI::AutoPointer`, so the destructor runs on GC or
+an explicit `destroy`.
 
 For functions marked `cancellable: true` the C launcher takes an extra
 cancel-token parameter. The wrapper always passes `FFI::Pointer::NULL`

@@ -41,7 +41,7 @@ Reach for this guide when:
 ### Declare a domain and opt in with `throws`
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     errors:

@@ -6,6 +6,7 @@ use weaveffi_core::abi::lower_param;
 use weaveffi_core::backend::LanguageBackend;
 use weaveffi_core::codegen::Generator;
 use weaveffi_core::model::{BindingModel, ParamBinding};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_ir::ir::{
     Api, EnumDef, EnumVariant, Function, Module, Param, StructDef, StructField, TypeRef,
 };
@@ -13,13 +14,13 @@ use weaveffi_ir::ir::{
 use crate::types::{dart_type, input_slots, return_ffi, return_out_slots};
 use crate::{DartConfig, DartGenerator};
 
-fn make_api(modules: Vec<Module>) -> Api {
-    Api {
-        version: "0.6.0".into(),
+fn make_api(modules: Vec<Module>) -> ResolvedApi {
+    ResolvedApi::assume_resolved(Api {
+        version: "0.7.0".into(),
         modules,
         generators: None,
         package: None,
-    }
+    })
 }
 
 fn simple_module(functions: Vec<Function>) -> Module {
@@ -64,7 +65,6 @@ fn field(name: &str, ty: TypeRef) -> StructField {
         name: name.into(),
         ty,
         doc: None,
-        default: None,
     }
 }
 
@@ -84,7 +84,7 @@ fn pb(name: &str, ty: TypeRef) -> ParamBinding {
 /// Build the binding model and render the module exactly as the driver
 /// does in production before calling [`LanguageBackend::files`]. Shadows
 /// the production renderer for the test suite.
-fn render_dart_module(api: &Api, prefix: &str, input_basename: &str) -> String {
+fn render_dart_module(api: &ResolvedApi, prefix: &str, input_basename: &str) -> String {
     let model = BindingModel::build(api, prefix);
     let config = DartConfig {
         prefix: Some(prefix.to_string()),
@@ -1354,7 +1354,7 @@ fn dart_null_check_on_optional_return() {
     );
 }
 
-fn doc_api() -> Api {
+fn doc_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "docs".into(),
         functions: vec![Function {
@@ -1372,7 +1372,6 @@ fn doc_api() -> Api {
                 name: "id".into(),
                 ty: TypeRef::I64,
                 doc: Some("Stable id".into()),
-                default: None,
             }],
         }],
         enums: vec![EnumDef {
@@ -1424,7 +1423,7 @@ fn dart_emits_doc_on_field() {
 /// A rich (algebraic) enum mirroring `samples/shapes`: a unit variant, an
 /// f64 payload, two f32 payloads, and a (string, u8) payload, plus a plain
 /// sibling enum and functions that take/return the rich enum by value.
-fn rich_enum_api() -> Api {
+fn rich_enum_api() -> ResolvedApi {
     make_api(vec![Module {
         name: "shapes".into(),
         functions: vec![
@@ -1462,7 +1461,6 @@ fn rich_enum_api() -> Api {
                             name: "radius".into(),
                             ty: TypeRef::F64,
                             doc: Some("Radius in points".into()),
-                            default: None,
                         }],
                     },
                     EnumVariant {
@@ -1649,7 +1647,7 @@ fn rich_enum_functions_marshal_buffers() {
 /// exercising every member kind: a plain constructor named `new`, a
 /// throwing named constructor, throwing and non-throwing methods, an
 /// async throwing method, an iterator method, and a static.
-fn store_api() -> Api {
+fn store_api() -> ResolvedApi {
     use weaveffi_ir::ir::{ErrorCode, ErrorDomain, InterfaceDef};
     fn f(
         name: &str,
@@ -2272,6 +2270,7 @@ fn contacts_sample_renders_interface_and_domain() {
     // Generators run strictly post-resolution: rewrite every parsed
     // `Named` reference into its resolved kind first, as the CLI does.
     weaveffi_core::validate::resolve_type_refs(&mut api);
+    let api = ResolvedApi::assume_resolved(api);
     let dart = render_dart_module(&api, "weaveffi", "contacts.yml");
     assert!(
         dart.contains("enum ContactType {"),
@@ -2303,7 +2302,7 @@ fn contacts_sample_renders_interface_and_domain() {
 }
 
 /// One-function module helper for the ownership-audit tests below.
-fn returning(name: &str, returns: TypeRef) -> Api {
+fn returning(name: &str, returns: TypeRef) -> ResolvedApi {
     make_api(vec![simple_module(vec![func(name, vec![], Some(returns))])])
 }
 
@@ -2395,7 +2394,7 @@ fn optional_scalar_return_decodes_flag() {
 /// Async result buffers are borrowed for the callback's duration: the
 /// wrapper decodes them inside the callback and never frees them.
 #[test]
-fn async_buffer_results_decode_and_never_free() {
+fn async_buffer_results_decode_then_free() {
     let api = make_api(vec![simple_module(vec![
         Function {
             r#async: true,
@@ -2415,7 +2414,7 @@ fn async_buffer_results_decode_and_never_free() {
         dart.contains("Future<List<String>> fetchNames()"),
         "missing async list wrapper: {dart}"
     );
-    // The borrowed (ptr, len) pair is copied and decoded in the callback.
+    // The owned (ptr, len) pair is copied, freed, and decoded in the callback.
     assert!(
         dart.contains("final resultData = _copyNativeBytes(result, resultLen);")
             && dart.contains(
@@ -2423,18 +2422,14 @@ fn async_buffer_results_decode_and_never_free() {
             ),
         "async buffered result must be decoded inside the callback: {dart}"
     );
-    assert!(
-        dart.contains("completer.complete(_copyNativeBytes(result, resultLen));"),
-        "async bytes result must be copied: {dart}"
-    );
-    // Borrowed: the callback must not release the producer's buffers.
+    // Owned: the callback copies and then releases the producer's buffers.
     let cb = &dart[dart
         .find("Future<List<String>> fetchNames()")
         .expect("wrapper")..];
     let cb = &cb[..cb.find("\n}").expect("end")];
     assert!(
-        !cb.contains("_weaveffiFree"),
-        "async callback must never free borrowed result buffers: {cb}"
+        cb.contains("_weaveffiFreeBytes(result, resultLen);"),
+        "async callback must free the owned result buffer after copying: {cb}"
     );
 }
 

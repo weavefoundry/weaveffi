@@ -48,7 +48,7 @@ Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -496,12 +496,15 @@ Future<TaskResult> runTask(String name) {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
-        _weaveffiErrorClear(err);
+        _weaveffiErrorFree(err);
         completer.completeError(_mapTaskException(code, msg));
         return;
       }
-      // TaskResult is a record: decode the borrowed value buffer.
-      completer.complete(_unpackTaskResult(resultPtr, resultLen));
+      // TaskResult is a record: copy the owned value buffer, free it,
+      // then decode from the copy.
+      final resultData = _copyNativeBytes(resultPtr, resultLen);
+      _weaveffiFreeBytes(resultPtr, resultLen);
+      completer.complete(_unpackTaskResult(_BufferReader(resultData)));
     } catch (e) {
       completer.completeError(e);
     } finally {
@@ -527,14 +530,18 @@ once; input buffers are released in `whenComplete` once the future
 settles. The `dart:async` import is only emitted when the IDL contains
 at least one async function.
 
-Result ownership follows the async contract: the callback borrows
-string, bytes, and buffered results (records, rich enums, optionals,
-lists, and maps arrive as a `(resultPtr, resultLen)` pair), so the
-callback body copies or decodes them into Dart values before it returns
-and never frees them (the producer does, after the callback returns).
-An owned interface result is the exception: the callback receives
-ownership and the wrapper adopts the pointer; its `dispose()` owns the
-eventual destroy.
+Result ownership follows the async contract: the callback owns the
+string, bytes, and buffered results it receives (records, rich enums,
+optionals, lists, and maps arrive as a `(resultPtr, resultLen)` pair),
+so the callback body copies them into Dart values and then releases
+them with `_weaveffiFreeString` or `_weaveffiFreeBytes`. Consumer
+ownership is what makes `NativeCallable.listener` safe here: the
+listener defers the callback body to the isolate's event loop, past
+the native callback's return, so a producer-freed buffer would already
+dangle by the time it ran. A reported error is heap-boxed and released
+with `_weaveffiErrorFree` after its fields are copied. An owned
+interface result transfers ownership too: the wrapper adopts the
+pointer, and its `dispose()` owns the eventual destroy.
 
 For a callable marked `throws: true`, the completion callback maps an
 error through the domain mapper (`_mapTaskException` above,

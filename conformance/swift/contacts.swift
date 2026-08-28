@@ -1,6 +1,6 @@
 // Conformance consumer: contacts sample, Swift target.
 //
-// Binds through the generated `Contacts` module and asserts the 0.6.0
+// Binds through the generated `Contacts` module and asserts the 0.7.0
 // interface surface: `ContactBook` as a final class whose `new` constructor is
 // a plain `init()`, throwing methods (`add`, `get`) that raise the typed
 // `ContactsError` domain enum, non-throwing methods (`list`, `remove`,

@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: contacts
     enums:
@@ -327,7 +327,7 @@ fn summary_md_all_links_resolve() {
 /// The README quickstart IDL, kept in sync with the `kvstore.yml` snippet in
 /// `README.md` step 2 (trimmed `Store` interface plus `KvError` domain).
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: kv
     errors:
@@ -356,9 +356,9 @@ modules:
 
 #[test]
 fn readme_quickstart_yaml_parses_and_validates() {
-    let mut api = weaveffi_ir::parse::parse_api_str(README_QUICKSTART_YAML, "yaml")
+    let api = weaveffi_ir::parse::parse_api_str(README_QUICKSTART_YAML, "yaml")
         .expect("README quickstart YAML should parse");
-    weaveffi_core::validate::validate_api(&mut api, None)
+    let api = weaveffi_core::validate::validate_api(api, None)
         .expect("README quickstart YAML should validate");
 
     assert_eq!(api.modules.len(), 1);
@@ -436,7 +436,7 @@ fn readme_quickstart_generates_c_header() {
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.6.0"
+version: "0.7.0"
 modules:
   - name: math
     structs:
@@ -454,9 +454,9 @@ modules:
 
 #[test]
 fn getting_started_yaml_parses_and_validates() {
-    let mut api = weaveffi_ir::parse::parse_api_str(GETTING_STARTED_YAML, "yaml")
+    let api = weaveffi_ir::parse::parse_api_str(GETTING_STARTED_YAML, "yaml")
         .expect("getting-started YAML should parse");
-    weaveffi_core::validate::validate_api(&mut api, None)
+    let api = weaveffi_core::validate::validate_api(api, None)
         .expect("getting-started YAML should validate");
 
     assert_eq!(api.modules.len(), 1);
@@ -583,8 +583,8 @@ fn readme_states_value_proposition() {
 fn readme_uses_only_current_schema_version() {
     let readme = read_workspace_file("README.md");
     assert!(
-        readme.contains("\"0.6.0\""),
-        "README should reference schema version 0.6.0"
+        readme.contains("\"0.7.0\""),
+        "README should reference schema version 0.7.0"
     );
     for old in ["\"0.1.0\"", "\"0.2.0\"", "\"0.3.0\"", "\"0.4.0\""] {
         assert!(

@@ -287,7 +287,11 @@ fix/android-jni-crash
 
 ## CI
 
-- **CI** (`ci.yml`): runs `cargo fmt --check`, `cargo clippy`, `cargo test`, and build verification on macOS and Linux for every push and PR.
+- **CI** (`ci.yml`): runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, snapshot verification (`cargo insta test`), sample builds, and JSON Schema drift checks on macOS, Linux, and Windows for every push and PR. A second job runs the full conformance harness (`conformance/run.sh`): it installs all eleven consumer toolchains, builds every sample producer, generates bindings, and compiles and runs the consumer for every language lane, including the `async-demo` lanes.
+- **Quality** (`quality.yml`): `cargo deny` (licenses/bans/advisories), `cargo audit`, `cargo machete` (unused dependencies), rustdoc with warnings denied, and test coverage via `cargo llvm-cov`.
+- **Docs** (`docs.yml`): builds the mdBook and the rustdoc API docs and deploys them.
+- **Bench** (`bench.yml`): smoke-runs the criterion benchmarks on PRs and tracks results on pushes to `main`.
+- **Fuzz** (`fuzz.yml`): short fuzzing runs of the parser and validator harnesses on PRs and on a schedule.
 - **PR Lint** (`pr-lint.yml`): validates the PR title against Conventional Commits format (protects squash merges) and checks individual commit messages via commitlint (protects rebase merges).
 - **Release** (`release.yml`): runs on merge to `main`; computes version, generates changelog, tags, creates GitHub Release, and publishes all workspace crates to crates.io.
 

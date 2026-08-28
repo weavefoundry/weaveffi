@@ -34,20 +34,27 @@ pub(crate) fn cmd_extract(
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read source file: {input}"))?;
 
-    let mut api = weaveffi_bridge::api_from_src_stringly(&source)
+    let api = weaveffi_bridge::api_from_src_stringly(&source)
         .map_err(|e| miette!("failed to extract API from Rust source {input}:\n{e}"))?;
 
-    if let Err(e) = weaveffi_core::validate::validate_api(&mut api, None) {
-        if warn {
-            eprintln!("warning: {e}");
-        } else {
-            return Err(miette!(
-                "{e:?}\n\nThe extracted API does not validate, so it would not \
-                 generate. Fix the source (e.g. declare the referenced types), \
-                 or pass `--warn` to emit the IDL anyway."
-            ));
+    // Serialize the resolved form when the API validates (so cross-module
+    // references are emitted qualified, matching `weaveffi format`); fall
+    // back to the raw extracted document under `--warn`.
+    let api = match weaveffi_core::validate::validate_api(api.clone(), None) {
+        Ok(resolved) => resolved.api().clone(),
+        Err(e) => {
+            if warn {
+                eprintln!("warning: {e}");
+                api
+            } else {
+                return Err(miette!(
+                    "{e:?}\n\nThe extracted API does not validate, so it would not \
+                     generate. Fix the source (e.g. declare the referenced types), \
+                     or pass `--warn` to emit the IDL anyway."
+                ));
+            }
         }
-    }
+    };
 
     let serialized = match format {
         "yaml" | "yml" => serde_yaml::to_string(&api)

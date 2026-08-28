@@ -257,18 +257,19 @@ function _checkTaskError(wasm, errPtr) {
   }
 }
 
-// Throw if a borrowed (producer-owned) error carries a non-zero
-// code. Used by async callbacks: the producer owns and frees the
-// error struct, so the slot is read but never deallocated here.
+// Throw if a heap-boxed (consumer-owned) error carries a non-zero
+// code. Used by async callbacks: the fields are read, then the box
+// is released with weaveffi_error_free before throwing.
 // `mkErr` maps domain codes (and decodes payload fields) for
 // throwing callables; without it the generic WeaveFFIError is thrown.
 function _checkErrRef(wasm, errPtr, mkErr) {
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
-  if (code === 0) return;
+  if (code === 0) { wasm.weaveffi_error_free(errPtr); return; }
   const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
-  if (mkErr) throw mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
-  throw new WeaveFFIError(code, msg);
+  const err = mkErr ? mkErr(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true)) : new WeaveFFIError(code, msg);
+  wasm.weaveffi_error_free(errPtr);
+  throw err;
 }
 
 // Serialize a `tasks.TaskResult` record into the value-buffer wire format.
@@ -358,6 +359,7 @@ export async function loadWeaveffiWasm(url) {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, mkErr: _taskErrorFrom, unwrap: (w, ptr, len) => {
             const _b = ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice();
+            if (ptr !== 0) w.weaveffi_free_bytes(ptr, len);
             const _rd = new _BufReader(_b);
             const _v = _read_tasks_TaskResult(_rd);
             _rd.end();
@@ -373,6 +375,7 @@ export async function loadWeaveffiWasm(url) {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, ptr, len) => {
             const _b = ptr === 0 || len === 0 ? new Uint8Array(0) : new Uint8Array(w.memory.buffer, ptr, len).slice();
+            if (ptr !== 0) w.weaveffi_free_bytes(ptr, len);
             const _rd = new _BufReader(_b);
             const _v = (() => { const _n = _rd.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(_read_tasks_TaskResult(_rd)); return _arr; })();
             _rd.end();

@@ -42,6 +42,11 @@ typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
     _NativeWeaveffiErrorClear, _DartWeaveffiErrorClear>('weaveffi_error_clear');
 
+typedef _NativeWeaveffiErrorFree = Void Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiErrorFree = void Function(Pointer<_WeaveFFIError>);
+final _weaveffiErrorFree = _lib.lookupFunction<
+    _NativeWeaveffiErrorFree, _DartWeaveffiErrorFree>('weaveffi_error_free');
+
 typedef _NativeWeaveffiFreeString = Void Function(Pointer<Utf8>);
 typedef _DartWeaveffiFreeString = void Function(Pointer<Utf8>);
 final _weaveffiFreeString = _lib.lookupFunction<
@@ -382,11 +387,12 @@ Future<TaskResult> runTask(String name) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
         final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);
-        _weaveffiErrorClear(err);
+        _weaveffiErrorFree(err);
         completer.completeError(_mapTaskException(code, msg, payload));
         return;
       }
       final resultData = _copyNativeBytes(result, resultLen);
+      _weaveffiFreeBytes(result, resultLen);
       final resultReader = _BufferReader(resultData);
       final value = _unpackTaskResult(resultReader);
       resultReader.expectEnd();
@@ -432,11 +438,12 @@ Future<List<TaskResult>> runBatch(List<String> names) {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
-        _weaveffiErrorClear(err);
+        _weaveffiErrorFree(err);
         completer.completeError(WeaveFFIException(code, msg));
         return;
       }
       final resultData = _copyNativeBytes(result, resultLen);
+      _weaveffiFreeBytes(result, resultLen);
       final resultReader = _BufferReader(resultData);
       final value = List<TaskResult>.generate(resultReader.readLength(), (_) => _unpackTaskResult(resultReader));
       resultReader.expectEnd();
@@ -490,7 +497,7 @@ Future<int> runNTasks(int n) {
       if (err.address != 0 && err.ref.code != 0) {
         final code = err.ref.code;
         final msg = err.ref.message.toDartString();
-        _weaveffiErrorClear(err);
+        _weaveffiErrorFree(err);
         completer.completeError(WeaveFFIException(code, msg));
         return;
       }

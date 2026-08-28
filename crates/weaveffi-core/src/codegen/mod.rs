@@ -11,11 +11,11 @@ use anyhow::{bail, Result};
 use camino::Utf8Path;
 use rayon::prelude::*;
 use serde::Serialize;
-use weaveffi_ir::ir::Api;
 
 use crate::cache;
 use crate::capabilities::{self, TargetCapabilities};
 use crate::package::{PackageContext, PackagedFile};
+use crate::resolved::ResolvedApi;
 
 pub mod common;
 pub mod writer;
@@ -84,13 +84,18 @@ pub trait Generator: Send + Sync {
     ///
     /// Returns an error if the target cannot render the API or cannot write its
     /// output files (for example a filesystem failure).
-    fn generate(&self, api: &Api, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
+    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
 
     /// Files that [`generate`](Generator::generate) would write, relative
     /// to (or anchored under) `out_dir`. Used by `--dry-run` and `diff`.
     /// Default implementation returns the empty list; generators override
     /// to surface the list without doing any I/O.
-    fn output_files(&self, _api: &Api, _out_dir: &Utf8Path, _config: &Self::Config) -> Vec<String> {
+    fn output_files(
+        &self,
+        _api: &ResolvedApi,
+        _out_dir: &Utf8Path,
+        _config: &Self::Config,
+    ) -> Vec<String> {
         vec![]
     }
 
@@ -101,7 +106,7 @@ pub trait Generator: Send + Sync {
     /// the default returns `None`.
     fn package(
         &self,
-        _api: &Api,
+        _api: &ResolvedApi,
         _ctx: &PackageContext,
         _out_dir: &Utf8Path,
         _config: &Self::Config,
@@ -131,16 +136,16 @@ pub trait DynGenerator: Send + Sync {
     ///
     /// Returns an error if the underlying [`Generator::generate`] fails to
     /// render or write its output.
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()>;
+    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Result<()>;
     /// The files [`generate`](Self::generate) would write. Mirrors
     /// [`Generator::output_files`].
-    fn output_files(&self, api: &Api, out_dir: &Utf8Path) -> Vec<String>;
+    fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Vec<String>;
     /// Assemble the distributable package for this target, using the bound
     /// config. Mirrors [`Generator::package`]; returns `None` when the target
     /// does not support packaging.
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
     ) -> Option<Vec<PackagedFile>>;
@@ -191,17 +196,17 @@ impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
         self.inner.allows_unsupported(&self.config)
     }
 
-    fn generate(&self, api: &Api, out_dir: &Utf8Path) -> Result<()> {
+    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Result<()> {
         self.inner.generate(api, out_dir, &self.config)
     }
 
-    fn output_files(&self, api: &Api, out_dir: &Utf8Path) -> Vec<String> {
+    fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Vec<String> {
         self.inner.output_files(api, out_dir, &self.config)
     }
 
     fn package(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         ctx: &PackageContext,
         out_dir: &Utf8Path,
     ) -> Option<Vec<PackagedFile>> {
@@ -260,7 +265,7 @@ impl<'a> Orchestrator<'a> {
     /// fails while rendering, or a cache entry cannot be written.
     pub fn run(
         &self,
-        api: &Api,
+        api: &ResolvedApi,
         out_dir: &Utf8Path,
         hooks: &OrchestratorHooks,
         force: bool,
@@ -273,7 +278,7 @@ impl<'a> Orchestrator<'a> {
         // surface (throwing stubs) for the missing features instead.
         let mut violations: Vec<String> = Vec::new();
         for g in &self.generators {
-            let Err(err) = capabilities::check(api, g.name(), &g.capabilities()) else {
+            let Err(err) = capabilities::check(api.api(), g.name(), &g.capabilities()) else {
                 continue;
             };
             if g.allows_unsupported() {
@@ -303,7 +308,7 @@ impl<'a> Orchestrator<'a> {
         let mut pending: Vec<(&'a dyn DynGenerator, String)> = Vec::new();
         for &g in &self.generators {
             let cfg_bytes = g.config_hash_input();
-            let hash = cache::hash_generator_inputs(api, g.name(), &cfg_bytes);
+            let hash = cache::hash_generator_inputs(api.api(), g.name(), &cfg_bytes);
             let cached = cache::read_generator_cache(out_dir, g.name());
             if cached.as_deref() != Some(hash.as_str()) {
                 pending.push((g, hash));
@@ -340,7 +345,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use weaveffi_ir::ir::{Function, Module, Param, TypeRef};
+    use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
 
     /// Test generator with a minimal config so tests don't have to depend
     /// on any real per-language generator crate.
@@ -371,7 +376,12 @@ mod tests {
             config.allow_unsupported
         }
 
-        fn generate(&self, _api: &Api, out_dir: &Utf8Path, _config: &Self::Config) -> Result<()> {
+        fn generate(
+            &self,
+            _api: &ResolvedApi,
+            out_dir: &Utf8Path,
+            _config: &Self::Config,
+        ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let dir = out_dir.join(self.name);
             std::fs::create_dir_all(dir.as_std_path())?;
@@ -380,9 +390,9 @@ mod tests {
         }
     }
 
-    fn test_api() -> Api {
-        Api {
-            version: "0.6.0".to_string(),
+    fn test_api() -> ResolvedApi {
+        ResolvedApi::assume_resolved(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.to_string(),
             modules: vec![Module {
                 name: "math".to_string(),
                 functions: vec![Function {
@@ -419,7 +429,7 @@ mod tests {
             }],
             generators: None,
             package: None,
-        }
+        })
     }
 
     fn configured(
@@ -438,8 +448,8 @@ mod tests {
 
     /// An API that uses listeners, so a target without listener support
     /// trips the capability gate.
-    fn listener_api() -> Api {
-        let mut api = test_api();
+    fn listener_api() -> ResolvedApi {
+        let mut api = test_api().api().clone();
         api.modules[0].listeners = vec![weaveffi_ir::ir::ListenerDef {
             name: "on_change".to_string(),
             event_callback: "OnChange".to_string(),
@@ -450,7 +460,7 @@ mod tests {
             params: vec![],
             doc: None,
         }];
-        api
+        ResolvedApi::assume_resolved(api)
     }
 
     fn partial(
@@ -666,11 +676,12 @@ mod tests {
         // Mutate the API in a way that affects both generators' hashes by
         // renaming a module. Then pre-seed the Swift cache with the *new*
         // expected hash so only the C entry stays stale and re-runs.
-        let mut modified = api.clone();
+        let mut modified = api.api().clone();
         modified.modules[0].name = "math2".to_string();
+        let modified = ResolvedApi::assume_resolved(modified);
 
         let new_swift_hash =
-            cache::hash_generator_inputs(&modified, "swift", &s_gen.config_hash_input());
+            cache::hash_generator_inputs(modified.api(), "swift", &s_gen.config_hash_input());
         cache::write_generator_cache(out_dir, "swift", &new_swift_hash).unwrap();
 
         orch.run(&modified, out_dir, &hooks, false).unwrap();
