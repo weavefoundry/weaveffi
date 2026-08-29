@@ -280,6 +280,7 @@ weaveffi schema-version    # prints 0.7.0
 | `weaveffi schema-version` | Print the current IR schema version (`0.7.0`) |
 | `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
 | `weaveffi completions <shell>` | Print shell completion scripts (`bash`, `zsh`, `fish`, `powershell`, `elvish`) |
+| `weaveffi man --out <dir>` | Generate roff man pages for the CLI to the specified directory |
 
 Reference the JSON Schema from your IDL for editor autocompletion:
 
