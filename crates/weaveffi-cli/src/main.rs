@@ -12,7 +12,7 @@ mod extract;
 mod report;
 mod scaffold;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use tracing_subscriber::EnvFilter;
 use weaveffi_ir::ir::CURRENT_SCHEMA_VERSION;
@@ -26,6 +26,21 @@ struct Cli {
     verbose: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum HumanJsonFormat {
+    Human,
+    Json,
+}
+
+impl HumanJsonFormat {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Json => "json",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -66,7 +81,7 @@ enum Commands {
         warn: bool,
         /// Output format: `json` for machine-readable output, otherwise human-readable
         #[arg(long)]
-        format: Option<String>,
+        format: Option<HumanJsonFormat>,
     },
     Package {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -114,7 +129,7 @@ enum Commands {
         input: String,
         /// Output format: `json` for machine-readable output, otherwise human-readable
         #[arg(long)]
-        format: Option<String>,
+        format: Option<HumanJsonFormat>,
     },
     Diff {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -134,7 +149,7 @@ enum Commands {
         target: Option<String>,
         /// Output format: `json` for machine-readable output, otherwise human-readable
         #[arg(long)]
-        format: Option<String>,
+        format: Option<HumanJsonFormat>,
     },
     Completions {
         /// Shell to generate completions for
@@ -219,7 +234,12 @@ fn main() -> Result<()> {
             input,
             warn,
             format,
-        } => commands::validate::cmd_validate(&input, warn, format.as_deref(), quiet)?,
+        } => commands::validate::cmd_validate(
+            &input,
+            warn,
+            format.map(HumanJsonFormat::as_str),
+            quiet,
+        )?,
         Commands::Package {
             input,
             out,
@@ -253,7 +273,7 @@ fn main() -> Result<()> {
             quiet,
         )?,
         Commands::Lint { input, format } => {
-            if !commands::validate::cmd_lint(&input, format.as_deref(), quiet)? {
+            if !commands::validate::cmd_lint(&input, format.map(HumanJsonFormat::as_str), quiet)? {
                 std::process::exit(1);
             }
         }
@@ -261,7 +281,7 @@ fn main() -> Result<()> {
             commands::diff::cmd_diff(&input, out.as_deref(), check, quiet)?
         }
         Commands::Doctor { target, format } => {
-            doctor::cmd_doctor(target.as_deref(), format.as_deref())?
+            doctor::cmd_doctor(target.as_deref(), format.map(HumanJsonFormat::as_str))?
         }
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
@@ -306,6 +326,23 @@ fn cmd_schema(format: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_unknown_human_json_output_formats() {
+        for args in [
+            &["weaveffi", "validate", "input.yml", "--format", "jsonn"][..],
+            &["weaveffi", "lint", "input.yml", "--format", "xml"],
+            &["weaveffi", "doctor", "--target", "swift", "--format", "xml"],
+        ] {
+            let error = Cli::try_parse_from(args).expect_err("unknown format should be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+            let message = error.to_string();
+            assert!(
+                message.contains("possible values: human, json"),
+                "{message}"
+            );
+        }
+    }
 
     #[test]
     fn doctor_checks_cross_targets() {
