@@ -1,3 +1,9 @@
+## [0.20.1](https://github.com/weavefoundry/weaveffi/compare/v0.20.0...v0.20.1) (2026-08-31)
+
+### Bug Fixes
+
+* reject unknown --format values in validate, lint, and doctor ([#42](https://github.com/weavefoundry/weaveffi/issues/42)) ([7b3704d](https://github.com/weavefoundry/weaveffi/commit/7b3704dae74bb4a53e89d0cb9ddaf65cfae587fc)), closes [#37](https://github.com/weavefoundry/weaveffi/issues/37)
+
 ## [0.20.0](https://github.com/weavefoundry/weaveffi/compare/v0.19.0...v0.20.0) (2026-08-28)
 
 ### ⚠ BREAKING CHANGES

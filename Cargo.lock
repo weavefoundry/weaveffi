@@ -674,9 +674,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "indexmap"
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "weaveffi-abi",
  "weaveffi-macros",
@@ -1783,11 +1783,11 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-abi"
-version = "0.20.0"
+version = "0.20.1"
 
 [[package]]
 name = "weaveffi-bridge"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "syn 2.0.119",
  "weaveffi-ir",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-cli"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "assert_cmd",
  "camino",
@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-core"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "anyhow",
  "camino",
@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-fuzz"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "libfuzzer-sys",
  "weaveffi-core",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-android"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "serde",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-c"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "serde",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-cpp"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-dart"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-dotnet"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-go"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1927,7 +1927,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-node"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-python"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1951,7 +1951,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-ruby"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-swift"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1974,7 +1974,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-gen-wasm"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "camino",
  "heck",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-ir"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "miette",
  "schemars",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "weaveffi-macros"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "proc-macro2",
  "quote",
