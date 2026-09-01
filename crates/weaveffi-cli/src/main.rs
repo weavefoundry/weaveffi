@@ -298,36 +298,9 @@ fn cmd_man(out: &str, quiet: bool) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create directory: {out}"))?;
 
-    let mut cmd = Cli::command();
-    cmd.build();
-
-    let mut buffer = Vec::new();
-    clap_mangen::Man::new(cmd.clone())
-        .render(&mut buffer)
+    clap_mangen::generate_to(Cli::command(), &out_dir)
         .into_diagnostic()
-        .wrap_err("failed to render man page for weaveffi")?;
-
-    std::fs::write(out_dir.join("weaveffi.1"), buffer)
-        .into_diagnostic()
-        .wrap_err("failed to write weaveffi.1")?;
-
-    for sub in cmd.get_subcommands() {
-        let sub_name = sub.get_name();
-        if sub_name == "help" {
-            continue;
-        }
-
-        let sub_cmd = sub.clone().name(&*format!("weaveffi-{sub_name}").leak());
-        let mut sub_buffer = Vec::new();
-        clap_mangen::Man::new(sub_cmd)
-            .render(&mut sub_buffer)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to render man page for weaveffi-{sub_name}"))?;
-
-        std::fs::write(out_dir.join(format!("weaveffi-{sub_name}.1")), sub_buffer)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to write weaveffi-{sub_name}.1"))?;
-    }
+        .wrap_err("failed to generate man pages")?;
 
     if !quiet {
         println!("Man pages written to {}", out_dir.display());
