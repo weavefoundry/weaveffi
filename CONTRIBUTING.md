@@ -31,6 +31,16 @@ mdbook serve docs -p 3000 -n 127.0.0.1
 
 Open <http://127.0.0.1:3000>.
 
+## Claiming an issue
+
+To avoid duplicate work, claim an issue before you start on it:
+
+1. Check the issue's assignee and any linked pull requests. If either exists, the issue is taken.
+2. Comment on the issue to claim it and wait for a maintainer to assign it to you before opening a pull request.
+3. If you stop working on an assigned issue, leave a comment so it can be reassigned.
+
+Unsolicited pull requests for issues that are already assigned or already have an open pull request will be closed as duplicates, even if the work is good.
+
 ## Documentation
 
 WeaveFFI has two layers of documentation, and CI checks both:
