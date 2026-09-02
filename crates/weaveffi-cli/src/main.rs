@@ -155,6 +155,11 @@ enum Commands {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
+    Man {
+        /// Output directory for generated man pages
+        #[arg(long)]
+        out: String,
+    },
     SchemaVersion,
     Watch {
         /// Input IDL/IR file (yaml|yml|json|toml)
@@ -284,6 +289,7 @@ fn main() -> Result<()> {
             doctor::cmd_doctor(target.as_deref(), format.map(HumanJsonFormat::as_str))?
         }
         Commands::Completions { shell } => cmd_completions(shell),
+        Commands::Man { out } => cmd_man(&out, quiet)?,
         Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
         Commands::Watch {
             input,
@@ -304,6 +310,23 @@ fn cmd_completions(shell: clap_complete::Shell) {
         "weaveffi",
         &mut std::io::stdout(),
     );
+}
+
+fn cmd_man(out: &str, quiet: bool) -> Result<()> {
+    let out_dir = std::path::PathBuf::from(out);
+    std::fs::create_dir_all(&out_dir)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create directory: {out}"))?;
+
+    clap_mangen::generate_to(Cli::command(), &out_dir)
+        .into_diagnostic()
+        .wrap_err("failed to generate man pages")?;
+
+    if !quiet {
+        println!("Man pages written to {}", out_dir.display());
+    }
+
+    Ok(())
 }
 
 fn cmd_schema(format: &str) -> Result<()> {
@@ -435,5 +458,61 @@ mod tests {
         let stdout = String::from_utf8_lossy(&cmd.stdout);
         assert!(cmd.status.success(), "schema-version failed: {stdout}");
         assert_eq!(stdout.trim(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn man_generation() {
+        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let out_dir = temp_dir.path().join("man");
+
+        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["man", "--out", out_dir.to_str().unwrap()])
+            .output()
+            .expect("failed to run weaveffi man");
+
+        let stdout = String::from_utf8_lossy(&cmd.stdout);
+        assert!(cmd.status.success(), "man generation failed: {stdout}");
+        assert!(
+            stdout.contains("Man pages written to"),
+            "should print where pages were written (not quiet): {stdout}"
+        );
+
+        // Verify top-level
+        let main_page = out_dir.join("weaveffi.1");
+        assert!(main_page.exists(), "weaveffi.1 not generated");
+        assert!(
+            std::fs::metadata(&main_page).unwrap().len() > 0,
+            "weaveffi.1 is empty"
+        );
+
+        // Verify subcommands exist. At minimum we know `generate` and `doctor` exist.
+        let generate_page = out_dir.join("weaveffi-generate.1");
+        assert!(generate_page.exists(), "weaveffi-generate.1 not generated");
+        assert!(
+            std::fs::metadata(&generate_page).unwrap().len() > 0,
+            "weaveffi-generate.1 is empty"
+        );
+
+        let doctor_page = out_dir.join("weaveffi-doctor.1");
+        assert!(doctor_page.exists(), "weaveffi-doctor.1 not generated");
+        assert!(
+            std::fs::metadata(&doctor_page).unwrap().len() > 0,
+            "weaveffi-doctor.1 is empty"
+        );
+
+        // Verify quiet respects global flag
+        let quiet_cmd = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["--quiet", "man", "--out", out_dir.to_str().unwrap()])
+            .output()
+            .expect("failed to run weaveffi --quiet man");
+
+        let quiet_stdout = String::from_utf8_lossy(&quiet_cmd.stdout);
+        assert!(quiet_cmd.status.success());
+        assert!(
+            !quiet_stdout.contains("Man pages written to"),
+            "quiet mode should suppress output"
+        );
     }
 }

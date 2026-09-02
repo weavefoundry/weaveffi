@@ -64,6 +64,7 @@ insta = { version = "1", features = ["yaml", "json"] }
 notify = "6"
 schemars = { version = "0.8", features = ["preserve_order"] }
 rayon = "1.10"
+clap_mangen = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

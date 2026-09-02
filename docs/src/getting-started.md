@@ -325,3 +325,15 @@ weaveffi doctor --target ruby --format json | jq '.[] | select(.ok == false)'
 ```
 
 Each entry has `id`, `name`, `ok`, `version`, `hint`, and `applies_to` fields.
+
+## Generating Man Pages
+
+The CLI can generate its own man pages. Pass an output directory to `--out`:
+
+```bash
+mkdir -p ./man
+weaveffi man --out ./man
+man ./man/weaveffi.1
+```
+
+This writes `weaveffi.1` as well as one man page per subcommand (e.g., `weaveffi-generate.1`) into the specified directory.
