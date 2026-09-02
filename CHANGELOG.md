@@ -1,3 +1,9 @@
+## [0.21.0](https://github.com/weavefoundry/weaveffi/compare/v0.20.1...v0.21.0) (2026-09-02)
+
+### Features
+
+* add man subcommand to generate man pages with clap_mangen ([#41](https://github.com/weavefoundry/weaveffi/issues/41)) ([5fa5c76](https://github.com/weavefoundry/weaveffi/commit/5fa5c760c91e29845a7ad7edb3c567a2c2d6d26c)), closes [#40](https://github.com/weavefoundry/weaveffi/issues/40)
+
 ## [0.20.1](https://github.com/weavefoundry/weaveffi/compare/v0.20.0...v0.20.1) (2026-08-31)
 
 ### Bug Fixes
