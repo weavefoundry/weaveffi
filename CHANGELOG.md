@@ -1,3 +1,13 @@
+## [0.22.0](https://github.com/weavefoundry/weaveffi/compare/v0.21.0...v0.22.0) (2026-09-03)
+
+### ⚠ BREAKING CHANGES
+
+* resolve types to Ty, and move package config to weaveffi.toml (#44)
+
+### Features
+
+* resolve types to Ty, and move package config to weaveffi.toml ([#44](https://github.com/weavefoundry/weaveffi/issues/44)) ([daec0f4](https://github.com/weavefoundry/weaveffi/commit/daec0f43d2dfa7e02605bf555235c46434d7226c))
+
 ## [0.21.0](https://github.com/weavefoundry/weaveffi/compare/v0.20.1...v0.21.0) (2026-09-02)
 
 ### Features
