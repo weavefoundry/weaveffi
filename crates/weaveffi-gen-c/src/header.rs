@@ -14,8 +14,6 @@ use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
 
-use crate::idents::escape_module_param_names;
-
 /// Render the complete `{prefix}.h` for `api` using `prefix` for every symbol.
 ///
 /// Thin wrapper over [`render_c_header_from_model`] for tests and callers
@@ -37,17 +35,16 @@ pub fn render_c_header(
 /// (include guard, includes, prefix aliases, the map-convention comment). The
 /// C symbol prefix is read from [`BindingModel::prefix`], so every name already
 /// agrees with the symbols baked into the model. Parameter names that collide
-/// with a C keyword are escaped with a trailing underscore before rendering
-/// (see the crate's `idents` module).
+/// with a C or C++ keyword are escaped inside `cabi` itself (see
+/// [`weaveffi_core::cabi::c_param_name`]).
 pub fn render_c_header_from_model(
     model: &BindingModel,
     input_basename: &str,
     filename: &str,
 ) -> String {
     let prefix = model.prefix.as_str();
-    let modules = escape_module_param_names(&model.modules);
     let guard = format!("{}_H", prefix.to_uppercase());
-    let mut out = String::with_capacity(2048 + modules.len() * 4096);
+    let mut out = String::with_capacity(2048 + model.modules.len() * 4096);
     out.push_str(&render_prelude(CommentStyle::DoubleSlash, input_basename));
     let _ = write!(out, "#ifndef {guard}\n#define {guard}\n\n");
     out.push_str("#include <stdint.h>\n");
@@ -71,7 +68,7 @@ pub fn render_c_header_from_model(
     ));
     out.push_str(" */\n\n");
 
-    cabi::render_decls(&mut out, &modules, prefix, true);
+    cabi::render_decls(&mut out, &model.modules, prefix, true);
 
     out.push_str("\n#ifdef __cplusplus\n}\n#endif\n\n");
     let _ = write!(out, "#endif // {guard}\n\n");

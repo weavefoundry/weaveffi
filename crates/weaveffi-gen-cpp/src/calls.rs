@@ -78,6 +78,9 @@ fn emit_param_setup(
             emit_write_value(w, &p.ty, &name, &buf, 0);
             vec![format!("{buf}.data()"), format!("{buf}.size()")]
         }
+        // `std::string::data()` is the non-const overload on a mutable
+        // parameter (C++17), yielding the `char*` the write-back slot wants.
+        ArgPass::String { .. } if p.mutable => vec![format!("{name}.data()")],
         ArgPass::String { .. } => vec![format!("{name}.c_str()")],
         ArgPass::Bytes { .. } => {
             vec![format!("{name}.data()"), format!("{name}.size()")]
@@ -277,7 +280,7 @@ fn render_sync_callable(
     let decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
         .collect();
 
     let is_ctor = matches!(kind, FnKind::Ctor);
@@ -504,7 +507,7 @@ fn render_iterator_callable(
     let decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
         .collect();
     w.line(format!(
         "{}{class_name} {cpp_name}({}){} {{",
@@ -663,7 +666,7 @@ fn render_async_callable(
     let mut decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
         .collect();
     if f.cancellable {
         decls.push(format!("{prefix}_cancel_token* cancel_token = nullptr"));

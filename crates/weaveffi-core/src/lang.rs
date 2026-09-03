@@ -223,12 +223,16 @@ pub const CSHARP_KEYWORDS: &[&str] = &[
 ];
 
 /// Dart reserved words, per the Dart language specification (the always
-/// reserved set plus the builtin identifiers that cannot name locals).
+/// reserved set plus the builtin identifiers that cannot name locals), plus
+/// the lowercase `dart:core` type names (`int`, `double`, `num`, `bool`,
+/// `dynamic`). Those are legal identifiers, but a field or parameter so named
+/// shadows the type for the rest of its class or function body, so every
+/// sibling declared as `int` stops resolving.
 pub const DART_KEYWORDS: &[&str] = &[
-    "assert", "break", "case", "catch", "class", "const", "continue", "default", "do", "else",
-    "enum", "extends", "false", "final", "finally", "for", "if", "in", "is", "new", "null",
-    "rethrow", "return", "super", "switch", "this", "throw", "true", "try", "var", "void", "while",
-    "with",
+    "assert", "bool", "break", "case", "catch", "class", "const", "continue", "default", "do",
+    "double", "dynamic", "else", "enum", "extends", "false", "final", "finally", "for", "if", "in",
+    "int", "is", "new", "null", "num", "rethrow", "return", "super", "switch", "this", "throw",
+    "true", "try", "var", "void", "while", "with",
 ];
 
 /// Ruby reserved words, per the Ruby language documentation.

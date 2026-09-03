@@ -12,7 +12,7 @@ use weaveffi_core::model::{EnumBinding, StructBinding};
 use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
 
-use crate::types::py_field;
+use crate::types::{py_field, py_variant};
 
 /// `_write_{Name}`, the statement-level field writer for a record or rich
 /// enum. `name` may be a qualified IR reference; the emitted function uses
@@ -246,7 +246,7 @@ pub(crate) fn render_rich_enum_codecs(w: &mut CodeWriter, e: &EnumBinding) {
     ));
     w.scope(|w| {
         for v in &e.variants {
-            let class = format!("{name}{}", v.name);
+            let class = format!("{name}{}", py_variant(&v.name));
             w.line(format!("if isinstance(value, {class}):"));
             w.scope(|w| {
                 w.line(format!("_w.write_i32({})", v.value));
@@ -266,7 +266,7 @@ pub(crate) fn render_rich_enum_codecs(w: &mut CodeWriter, e: &EnumBinding) {
     w.scope(|w| {
         w.line("_tag = _r.read_i32()");
         for v in &e.variants {
-            let class = format!("{name}{}", v.name);
+            let class = format!("{name}{}", py_variant(&v.name));
             w.line(format!("if _tag == {}:", v.value));
             w.scope(|w| {
                 if v.fields.is_empty() {

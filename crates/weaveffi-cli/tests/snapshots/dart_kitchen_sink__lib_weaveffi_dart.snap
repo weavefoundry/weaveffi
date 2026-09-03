@@ -383,9 +383,9 @@ String ping() {
   try {
     final result = _weaveffiSharedPing(err);
     _checkError(err);
-    final value = result.toDartString();
+    final decoded = result.toDartString();
     _weaveffiFreeString(result);
-    return value;
+    return decoded;
   } finally {
     calloc.free(err);
   }
@@ -567,9 +567,9 @@ class Gadget {
     try {
       final result = _weaveffiKitchenGadgetDescribe(_handle, err);
       _checkError(err);
-      final value = result.toDartString();
+      final decoded = result.toDartString();
       _weaveffiFreeString(result);
-      return value;
+      return decoded;
     } finally {
       calloc.free(err);
     }
@@ -595,9 +595,9 @@ class Gadget {
     try {
       final result = _weaveffiKitchenGadgetVersion(err);
       _checkError(err);
-      final value = result.toDartString();
+      final decoded = result.toDartString();
       _weaveffiFreeString(result);
-      return value;
+      return decoded;
     } finally {
       calloc.free(err);
     }
@@ -725,9 +725,9 @@ String echoString(String s) {
   try {
     final result = _weaveffiKitchenEchoString(sPtr, err);
     _checkError(err);
-    final value = result.toDartString();
+    final decoded = result.toDartString();
     _weaveffiFreeString(result);
-    return value;
+    return decoded;
   } finally {
     calloc.free(sPtr);
     calloc.free(err);
@@ -771,9 +771,9 @@ String echoBorrowedStr(String s) {
   try {
     final result = _weaveffiKitchenEchoBorrowedStr(sPtr, err);
     _checkError(err);
-    final value = result.toDartString();
+    final decoded = result.toDartString();
     _weaveffiFreeString(result);
-    return value;
+    return decoded;
   } finally {
     calloc.free(sPtr);
     calloc.free(err);
@@ -858,9 +858,9 @@ Item? maybeItem(int id) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = (reader.readOptionFlag() ? _unpackItem(reader) : null);
+    final decoded = (reader.readOptionFlag() ? _unpackItem(reader) : null);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -883,9 +883,9 @@ List<Item> listItems() {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = List<Item>.generate(reader.readLength(), (_) => _unpackItem(reader));
+    final decoded = List<Item>.generate(reader.readLength(), (_) => _unpackItem(reader));
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -908,9 +908,9 @@ Map<String, int> getAttrs() {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = <String, int>{ for (var i = reader.readLength(); i > 0; i--) reader.readString(): reader.readInt32() };
+    final decoded = <String, int>{ for (var i = reader.readLength(); i > 0; i--) reader.readString(): reader.readInt32() };
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -993,9 +993,9 @@ Token crossModuleToken() {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackToken(reader);
+    final decoded = _unpackToken(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -1023,9 +1023,9 @@ Future<String> doAsync(String input) {
         completer.completeError(WeaveFFIException(code, msg));
         return;
       }
-      final value = result.toDartString();
+      final decoded = result.toDartString();
       _weaveffiFreeString(result);
-      completer.complete(value);
+      completer.complete(decoded);
     } catch (e) {
       completer.completeError(e);
     } finally {
@@ -1065,9 +1065,9 @@ Future<String> doCancellable(String input) {
         completer.completeError(WeaveFFIException(code, msg));
         return;
       }
-      final value = result.toDartString();
+      final decoded = result.toDartString();
       _weaveffiFreeString(result);
-      completer.complete(value);
+      completer.complete(decoded);
     } catch (e) {
       completer.completeError(e);
     } finally {
@@ -1132,9 +1132,9 @@ String hello() {
   try {
     final result = _weaveffiKitchenNestedHello(err);
     _checkError(err);
-    final value = result.toDartString();
+    final decoded = result.toDartString();
     _weaveffiFreeString(result);
-    return value;
+    return decoded;
   } finally {
     calloc.free(err);
   }

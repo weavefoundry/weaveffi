@@ -135,7 +135,16 @@ pub(crate) fn ts_type_for(ty: &Ty) -> String {
             let t = ts_type_for(inner);
             format!("IterableIterator<{t}>")
         }
-        Ty::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+        // Maps decode into a plain object, whose keys are always strings at
+        // runtime; a `bigint` key would also be rejected by `Record`'s key
+        // constraint, so 64-bit keys are typed as the strings they become.
+        Ty::Map(k, v) => {
+            let key = match k.as_ref() {
+                Ty::I64 | Ty::U64 | Ty::Handle => "string".to_string(),
+                other => ts_type_for(other),
+            };
+            format!("Record<{key}, {}>", ts_type_for(v))
+        }
     }
 }
 

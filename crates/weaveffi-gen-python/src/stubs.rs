@@ -10,7 +10,8 @@ use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 use crate::docs::emit_doc;
 use crate::entities::py_code_class_name;
 use crate::types::{
-    py_callable_hint, py_field, py_member_name, py_name, py_type_hint, py_wrapper_fn_name,
+    py_callable_hint, py_field, py_member_name, py_name, py_type_hint, py_variant,
+    py_wrapper_fn_name,
 };
 
 /// Render the full `weaveffi.pyi` stub for the model.
@@ -157,7 +158,7 @@ fn render_pyi_enum(out: &mut String, e: &EnumBinding) {
     out.push_str(&format!("class {}(IntEnum):\n", e.name));
     for v in &e.variants {
         emit_doc(out, &v.doc, "    ");
-        out.push_str(&format!("    {}: int\n", v.name));
+        out.push_str(&format!("    {}: int\n", py_variant(&v.name)));
     }
 }
 
@@ -173,16 +174,19 @@ fn render_pyi_rich_enum(out: &mut String, e: &EnumBinding) {
     out.push_str("    class Tag(IntEnum):\n");
     for v in &e.variants {
         emit_doc(out, &v.doc, "        ");
-        out.push_str(&format!("        {}: int\n", v.name));
+        out.push_str(&format!("        {}: int\n", py_variant(&v.name)));
     }
     for v in &e.variants {
-        out.push_str(&format!("    {}: Type[\"{name}{}\"]\n", v.name, v.name));
+        out.push_str(&format!(
+            "    {0}: Type[\"{name}{0}\"]\n",
+            py_variant(&v.name)
+        ));
     }
     out.push_str(&format!(
         "    @property\n    def tag(self) -> \"{name}.Tag\": ...\n"
     ));
     for v in &e.variants {
-        let class = format!("{name}{}", v.name);
+        let class = format!("{name}{}", py_variant(&v.name));
         out.push('\n');
         emit_doc(out, &v.doc, "");
         out.push_str(&format!("class {class}({name}):\n"));

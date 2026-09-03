@@ -54,12 +54,18 @@ pub(crate) fn render_wasm_dts(
                 continue;
             }
             emit_doc(&mut out, &e.doc, "");
+            // The const object holds the values; the same-named type alias
+            // is their union, so `Mode` works in both value and type positions.
             out.push_str(&format!("export declare const {}: Readonly<{{\n", e.name));
             for v in &e.variants {
                 emit_doc(&mut out, &v.doc, "  ");
                 out.push_str(&format!("  {}: {};\n", v.name, v.value));
             }
-            out.push_str("}>;\n\n");
+            out.push_str("}>;\n");
+            out.push_str(&format!(
+                "export type {0} = (typeof {0})[keyof typeof {0}];\n\n",
+                e.name
+            ));
         }
 
         for i in &mb.interfaces {

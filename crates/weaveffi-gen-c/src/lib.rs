@@ -15,7 +15,6 @@
 #![warn(clippy::doc_markdown)]
 
 mod header;
-mod idents;
 mod package;
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};

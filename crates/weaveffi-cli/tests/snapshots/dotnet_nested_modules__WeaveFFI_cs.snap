@@ -537,10 +537,10 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var value = Canvas.ReadFrom(valueReader);
-            valueReader.ExpectEnd();
-            return value;
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decoded = Canvas.ReadFrom(decodedReader);
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
     }
@@ -556,10 +556,10 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var value = Shape.ReadFrom(valueReader);
-            valueReader.ExpectEnd();
-            return value;
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decoded = Shape.ReadFrom(decodedReader);
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>Nested function returning a struct owned by an ancestor module.</summary>
@@ -571,10 +571,10 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var value = Canvas.ReadFrom(valueReader);
-            valueReader.ExpectEnd();
-            return value;
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decoded = Canvas.ReadFrom(decodedReader);
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
     }
@@ -597,10 +597,10 @@ namespace WeaveFFI
                 var resultBuf = new byte[(int)outLen];
                 if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
                 NativeMethods.weaveffi_free_bytes(result, outLen);
-                var valueReader = new WeaveFFIBufferReader(resultBuf);
-                var value = Detail.ReadFrom(valueReader);
-                valueReader.ExpectEnd();
-                return value;
+                var decodedReader = new WeaveFFIBufferReader(resultBuf);
+                var decoded = Detail.ReadFrom(decodedReader);
+                decodedReader.ExpectEnd();
+                return decoded;
             }
             finally
             {

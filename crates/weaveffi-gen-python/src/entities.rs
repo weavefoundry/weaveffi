@@ -12,7 +12,7 @@ use weaveffi_core::model::{
 use crate::calls::{render_callable, render_iterator_class, FnScope};
 use crate::codec::{py_read_expr, render_record_codecs, render_rich_enum_codecs};
 use crate::docs::emit_docstring;
-use crate::types::{py_field, py_str_literal, py_type_hint};
+use crate::types::{py_field, py_str_literal, py_type_hint, py_variant};
 
 // ── Errors ──
 
@@ -242,7 +242,7 @@ pub(crate) fn render_enum(out: &mut String, e: &EnumBinding) {
                 }
             }
         }
-        w.line(format!("{} = {}", v.name, v.value));
+        w.line(format!("{} = {}", py_variant(&v.name), v.value));
     }
     out.push_str(&w.finish());
 }
@@ -278,7 +278,7 @@ fn render_rich_enum(out: &mut String, e: &EnumBinding) {
                     }
                 }
             }
-            w.line(format!("{} = {}", v.name, v.value));
+            w.line(format!("{} = {}", py_variant(&v.name), v.value));
         }
     });
     w.blank();
@@ -292,7 +292,7 @@ fn render_rich_enum(out: &mut String, e: &EnumBinding) {
 
     // One module-level dataclass per variant, subclassing the base.
     for v in &e.variants {
-        let class = format!("{name}{}", v.name);
+        let class = format!("{name}{}", py_variant(&v.name));
         w.blank().blank();
         w.line("@dataclass");
         w.line(format!("class {class}({name}):"));
@@ -303,7 +303,7 @@ fn render_rich_enum(out: &mut String, e: &EnumBinding) {
             w.raw(doc);
             w.blank();
         }
-        w.line(format!("TAG = {name}.Tag.{}", v.name));
+        w.line(format!("TAG = {name}.Tag.{}", py_variant(&v.name)));
         if !v.fields.is_empty() {
             w.blank();
             render_dataclass_fields(&mut w, &v.fields);
@@ -315,7 +315,7 @@ fn render_rich_enum(out: &mut String, e: &EnumBinding) {
     // exists.
     w.blank().blank();
     for v in &e.variants {
-        w.line(format!("{name}.{} = {name}{}", v.name, v.name));
+        w.line(format!("{name}.{0} = {name}{0}", py_variant(&v.name)));
     }
 
     render_rich_enum_codecs(&mut w, e);

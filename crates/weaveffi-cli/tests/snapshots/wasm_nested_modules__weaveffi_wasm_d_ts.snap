@@ -38,6 +38,7 @@ export declare const Unit: Readonly<{
   pixels: 0;
   points: 1;
 }>;
+export type Unit = (typeof Unit)[keyof typeof Unit];
 
 /** A struct one level deep that references both an ancestor enum and a deeper struct. */
 export interface Shape {

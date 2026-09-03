@@ -117,12 +117,20 @@ pub(crate) fn cpp_type(ty: &Ty, module: &str, prefix: &str) -> String {
 
 /// One C++ parameter declaration (`<type> <name>`) for a wrapper signature.
 /// Heavier types borrow by const reference; scalars, enums, and raw handles
-/// pass by value.
-pub(crate) fn cpp_param_decl(ty: &Ty, name: &str, module: &str, prefix: &str) -> String {
+/// pass by value. A `mutable: true` string or bytes parameter borrows by
+/// non-const reference so the producer's in-place writes reach the caller.
+pub(crate) fn cpp_param_decl(
+    ty: &Ty,
+    name: &str,
+    mutable: bool,
+    module: &str,
+    prefix: &str,
+) -> String {
+    let konst = if mutable { "" } else { "const " };
     match ty {
-        Ty::StringUtf8 | Ty::BorrowedStr => format!("const std::string& {name}"),
+        Ty::StringUtf8 | Ty::BorrowedStr => format!("{konst}std::string& {name}"),
         Ty::Bytes | Ty::BorrowedBytes => {
-            format!("const std::vector<uint8_t>& {name}")
+            format!("{konst}std::vector<uint8_t>& {name}")
         }
         Ty::TypedHandle(_) => format!("{} {name}", cpp_type(ty, module, prefix)),
         // Records and rich enums borrow: the wrapper encodes them into a local

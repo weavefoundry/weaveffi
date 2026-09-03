@@ -418,9 +418,9 @@ Canvas newCanvas(int width) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackCanvas(reader);
+    final decoded = _unpackCanvas(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -468,9 +468,9 @@ Shape makeShape(int sides) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackShape(reader);
+    final decoded = _unpackShape(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -493,9 +493,9 @@ Canvas describe() {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackCanvas(reader);
+    final decoded = _unpackCanvas(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);
@@ -541,9 +541,9 @@ Detail compute(Shape shape) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackDetail(reader);
+    final decoded = _unpackDetail(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(shapePtr);
     calloc.free(outLen);

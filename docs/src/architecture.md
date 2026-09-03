@@ -679,10 +679,12 @@ non-deterministically on different platforms or insta orderings.
 ## Snapshot tests
 
 `crates/weaveffi-cli/tests/snapshots.rs` runs every generator across a
-four-fixture corpus under `tests/fixtures/` (`kitchen_sink`, which
+five-fixture corpus under `tests/fixtures/` (`kitchen_sink`, which
 exercises every IDL feature; `shapes`, rich enums and records;
-`nested_modules`, cross-module references; and `docs_everywhere`,
-doc-comment emission). The eleven targets are driven by one data-driven
+`nested_modules`, cross-module references; `docs_everywhere`, doc-comment
+emission; and `edge_cases`, reserved-word identifiers, deeply nested
+composites, mutable and optional parameters, and the other shapes a
+mainstream API never reaches). The eleven targets are driven by one data-driven
 `snapshot_tests!` macro, so adding a fixture or a target is a one-line
 change. Output is diffed via [`cargo-insta`][insta]. When a snapshot diff
 is intentional:

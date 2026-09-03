@@ -519,9 +519,9 @@ class Notebook {
       final data = _copyNativeBytes(result, n);
       if (result != nullptr) _weaveffiFreeBytes(result, n);
       final reader = _BufferReader(data);
-      final value = _unpackDocument(reader);
+      final decoded = _unpackDocument(reader);
       reader.expectEnd();
-      return value;
+      return decoded;
     } finally {
       calloc.free(outLen);
       calloc.free(err);
@@ -610,9 +610,9 @@ Document createDocument(String title, List<String> tags) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackDocument(reader);
+    final decoded = _unpackDocument(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(titlePtr);
     calloc.free(tagsPtr);
@@ -637,9 +637,9 @@ Document? getDocument(int id) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = (reader.readOptionFlag() ? _unpackDocument(reader) : null);
+    final decoded = (reader.readOptionFlag() ? _unpackDocument(reader) : null);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);

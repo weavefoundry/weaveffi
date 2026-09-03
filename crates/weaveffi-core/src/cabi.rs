@@ -15,6 +15,7 @@ use std::fmt::Write;
 use crate::abi::{AbiParam, CType};
 use crate::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use crate::codegen::CodeWriter;
+use crate::lang::{is_reserved, CPP_KEYWORDS, C_KEYWORDS};
 use crate::model::{
     AbiFn, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
 };
@@ -34,12 +35,33 @@ pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 }
 
 /// Join lowered ABI slots into a `"<c-type> <name>, ..."` declaration string.
+///
+/// Parameter names are the one position in a header where an IDL-chosen
+/// identifier lands verbatim (every other name carries the symbol prefix), so
+/// each is escaped with [`c_param_name`] before it's printed.
 pub fn params_str(params: &[AbiParam], prefix: &str) -> String {
     params
         .iter()
-        .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
+        .map(|p| format!("{} {}", p.ty.render_c(prefix), c_param_name(&p.name)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The spelling of an IDL parameter name inside a C prototype.
+///
+/// The header is consumed from C and, through `#ifdef __cplusplus` guards or
+/// the C++ generator's inlined `extern "C"` block, from C++. A name reserved
+/// in either language (`register`, `class`, `new`, ...) gains the shared
+/// trailing-underscore escape so the same declaration compiles in both.
+/// Derived slot names (`{name}_ptr`, `out_len`) never collide and pass
+/// through unchanged.
+#[must_use]
+pub fn c_param_name(name: &str) -> String {
+    if is_reserved(name, C_KEYWORDS) || is_reserved(name, CPP_KEYWORDS) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
 }
 
 /// The export-visibility macro name for `prefix`, for example `WEAVEFFI_API`.

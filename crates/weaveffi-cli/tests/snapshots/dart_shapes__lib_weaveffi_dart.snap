@@ -494,9 +494,9 @@ String describe(Shape shape) {
   try {
     final result = _weaveffiShapesDescribe(shapePtr, shapeBuf.length, err);
     _checkError(err);
-    final value = result.toDartString();
+    final decoded = result.toDartString();
     _weaveffiFreeString(result);
-    return value;
+    return decoded;
   } finally {
     calloc.free(shapePtr);
     calloc.free(err);
@@ -523,9 +523,9 @@ Shape scale(Shape shape, double factor) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackShape(reader);
+    final decoded = _unpackShape(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(shapePtr);
     calloc.free(outLen);
@@ -569,9 +569,9 @@ Numerics makeNumerics(int a, int b, int c, int d, int e, int f, int g, int h, do
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackNumerics(reader);
+    final decoded = _unpackNumerics(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);

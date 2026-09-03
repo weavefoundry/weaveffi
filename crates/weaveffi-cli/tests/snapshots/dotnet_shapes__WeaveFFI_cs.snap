@@ -650,10 +650,10 @@ namespace WeaveFFI
                 var resultBuf = new byte[(int)outLen];
                 if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
                 NativeMethods.weaveffi_free_bytes(result, outLen);
-                var valueReader = new WeaveFFIBufferReader(resultBuf);
-                var value = Shape.ReadFrom(valueReader);
-                valueReader.ExpectEnd();
-                return value;
+                var decodedReader = new WeaveFFIBufferReader(resultBuf);
+                var decoded = Shape.ReadFrom(decodedReader);
+                decodedReader.ExpectEnd();
+                return decoded;
             }
             finally
             {
@@ -687,10 +687,10 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var value = Numerics.ReadFrom(valueReader);
-            valueReader.ExpectEnd();
-            return value;
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decoded = Numerics.ReadFrom(decodedReader);
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
     }

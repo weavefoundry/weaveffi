@@ -169,6 +169,14 @@ pub(crate) fn py_field(name: &str) -> String {
     lang::escape_ident(name, lang::PYTHON_KEYWORDS)
 }
 
+/// The Python spelling of an enum variant, used both as the `IntEnum` member
+/// and as the suffix of a rich enum's per-variant dataclass. Variants are
+/// PascalCase, so only the capitalized keywords (`None`, `True`, `False`)
+/// can collide; `None = 0` inside a class body is a `SyntaxError`.
+pub(crate) fn py_variant(name: &str) -> String {
+    lang::escape_ident(name, lang::PYTHON_KEYWORDS)
+}
+
 /// The Python spelling of an interface member name (method, static, or
 /// factory constructor): snake_case, keyword-escaped.
 pub(crate) fn py_member_name(name: &str) -> String {

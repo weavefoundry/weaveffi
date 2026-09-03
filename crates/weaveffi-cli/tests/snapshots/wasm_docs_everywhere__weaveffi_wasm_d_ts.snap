@@ -62,6 +62,7 @@ export declare const Status: Readonly<{
   /** Document is hidden from listings */
   Archived: 2;
 }>;
+export type Status = (typeof Status)[keyof typeof Status];
 
 /**
  * An ordered collection of documents.

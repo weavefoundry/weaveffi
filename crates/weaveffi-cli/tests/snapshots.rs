@@ -1,14 +1,18 @@
 //! Snapshot tests covering every generator against a small, feature-complete
 //! IDL corpus.
 //!
-//! Four fixtures cover the whole IDL surface between them: `kitchen_sink`
+//! Five fixtures cover the whole IDL surface between them: `kitchen_sink`
 //! (every scalar and composite type, borrowed params, handles, an interface,
 //! callbacks and a listener, an error domain, iterators, async and
 //! cancellable functions, deprecation, and a nested submodule), `shapes`
 //! (rich enums and the full numeric primitive set), `nested_modules` (a
-//! three-deep module tree with cross-module references), and
-//! `docs_everywhere` (doc comments on every declaration kind). One test per
-//! generator runs it over all four fixtures into a fresh tempdir, walks the
+//! three-deep module tree with cross-module references), `docs_everywhere`
+//! (doc comments on every declaration kind), and `edge_cases` (identifiers
+//! that are reserved words in some target, deeply nested composites,
+//! optional and mutable parameters, interfaces in every legal position,
+//! async functions with non-string results, type-level deprecation, and
+//! scalar and string iterators). One test per generator runs it over all
+//! five fixtures into a fresh tempdir, walks the
 //! resulting files in sorted order, and snapshots each file under
 //! `tests/snapshots/`. Regressions in any generator's output fail the
 //! affected `cargo insta test` job; behavioral regressions are the
@@ -34,11 +38,12 @@ use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
 use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
 use weaveffi_ir::parse::parse_api_str;
 
-const FIXTURES: [&str; 4] = [
+const FIXTURES: [&str; 5] = [
     "kitchen_sink",
     "shapes",
     "nested_modules",
     "docs_everywhere",
+    "edge_cases",
 ];
 
 fn load_api(stem: &str) -> ResolvedApi {

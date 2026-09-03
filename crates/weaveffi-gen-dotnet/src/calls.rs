@@ -263,8 +263,9 @@ pub(crate) fn render_return_conversion(out: &mut String, ty: &Ty, indent: &str) 
             "if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);",
         );
         w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
-        emit_buffer_decode(&mut w, ty, "value", "resultBuf");
-        w.line("return value;");
+        // Named so it cannot shadow a user parameter (`value` is a common one).
+        emit_buffer_decode(&mut w, ty, "decoded", "resultBuf");
+        w.line("return decoded;");
         out.push_str(&w.finish());
         return;
     }
@@ -810,8 +811,8 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<Ty>, indent
             w.line(
                 "if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);",
             );
-            emit_buffer_decode(&mut w, ty, "value", "resultBuf");
-            w.line("tcs.SetResult(value);");
+            emit_buffer_decode(&mut w, ty, "decoded", "resultBuf");
+            w.line("tcs.SetResult(decoded);");
             out.push_str(&w.finish());
             return;
         }

@@ -199,9 +199,11 @@ pub(crate) fn emit_buffer_read(
         }
         WireType::List(inner) => {
             let i = format!("i{depth}");
-            let elem = cs_type(inner);
             w.line(format!("var {var}Count = {reader_var}.ReadLen();"));
-            w.line(format!("var {var} = new {elem}[{var}Count];"));
+            w.line(format!(
+                "var {var} = {};",
+                cs_new_array(&cs_type(inner), &format!("{var}Count"))
+            ));
             w.line(format!("for (int {i} = 0; {i} < {var}Count; {i}++)"));
             w.block("{", "}", |w| {
                 emit_buffer_read(w, inner, &format!("{var}Item"), reader_var, depth + 1);
@@ -229,6 +231,17 @@ pub(crate) fn emit_buffer_read(
 /// Emit the statements decoding a consumer-side copy of a value buffer
 /// (`byte[]` local named `buf`) into a local named `var` of type `ty`,
 /// validating that the buffer is fully consumed.
+/// `new T[len]` for an array whose element type is `elem`.
+///
+/// C# puts the outermost rank first, so an array of `int[]` elements is
+/// spelled `new int[len][]`, not `new int[][len]`: any trailing `[]` ranks on
+/// the element type move after the length.
+fn cs_new_array(elem: &str, len: &str) -> String {
+    let base = elem.trim_end_matches("[]");
+    let ranks = &elem[base.len()..];
+    format!("new {base}[{len}]{ranks}")
+}
+
 pub(crate) fn emit_buffer_decode(w: &mut CodeWriter, ty: &Ty, var: &str, buf: &str) {
     w.line(format!(
         "var {var}Reader = new WeaveFFIBufferReader({buf});"

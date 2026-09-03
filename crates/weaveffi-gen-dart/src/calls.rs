@@ -645,9 +645,12 @@ fn emit_async_complete(out: &mut String, ty: Option<&Ty>, indent: &str) {
             w.line("final resultData = _copyNativeBytes(result, resultLen);");
             w.line("_weaveffiFreeBytes(result, resultLen);");
             w.line("final resultReader = _BufferReader(resultData);");
-            w.line(format!("final value = {};", read_expr("resultReader", ty)));
+            w.line(format!(
+                "final decoded = {};",
+                read_expr("resultReader", ty)
+            ));
             w.line("resultReader.expectEnd();");
-            w.line("completer.complete(value);");
+            w.line("completer.complete(decoded);");
         }
         RetPass::Bytes => {
             w.line("final resultData = _copyNativeBytes(result, resultLen);");
@@ -656,9 +659,9 @@ fn emit_async_complete(out: &mut String, ty: Option<&Ty>, indent: &str) {
         }
         // Copy the owned C string, then release the producer allocation.
         RetPass::String => {
-            w.line("final value = result.toDartString();");
+            w.line("final decoded = result.toDartString();");
             w.line("_weaveffiFreeString(result);");
-            w.line("completer.complete(value);");
+            w.line("completer.complete(decoded);");
         }
         // The callback receives ownership of an object result; the wrapper
         // adopts the pointer and its `dispose()` owns the eventual destroy.
@@ -785,9 +788,10 @@ fn emit_return_decode(out: &mut String, ty: &Ty, indent: &str) {
             w.line("final data = _copyNativeBytes(result, n);");
             w.line("if (result != nullptr) _weaveffiFreeBytes(result, n);");
             w.line("final reader = _BufferReader(data);");
-            w.line(format!("final value = {};", read_expr("reader", ty)));
+            // Named so it cannot shadow a user parameter (`value` is common).
+            w.line(format!("final decoded = {};", read_expr("reader", ty)));
             w.line("reader.expectEnd();");
-            w.line("return value;");
+            w.line("return decoded;");
         }
         RetPass::Bytes => {
             w.line("final n = outLen.value;");
@@ -798,9 +802,9 @@ fn emit_return_decode(out: &mut String, ty: &Ty, indent: &str) {
             w.line("return bytes;");
         }
         RetPass::String => {
-            w.line("final value = result.toDartString();");
+            w.line("final decoded = result.toDartString();");
             w.line("_weaveffiFreeString(result);");
-            w.line("return value;");
+            w.line("return decoded;");
         }
         // An owned object pointer the wrapper class adopts; when nullable,
         // null means none.

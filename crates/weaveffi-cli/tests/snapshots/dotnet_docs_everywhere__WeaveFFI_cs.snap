@@ -510,10 +510,10 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var value = Document.ReadFrom(valueReader);
-            valueReader.ExpectEnd();
-            return value;
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decoded = Document.ReadFrom(decodedReader);
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>The number of documents currently held</summary>
@@ -697,10 +697,10 @@ namespace WeaveFFI
                 var resultBuf = new byte[(int)outLen];
                 if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
                 NativeMethods.weaveffi_free_bytes(result, outLen);
-                var valueReader = new WeaveFFIBufferReader(resultBuf);
-                var value = Document.ReadFrom(valueReader);
-                valueReader.ExpectEnd();
-                return value;
+                var decodedReader = new WeaveFFIBufferReader(resultBuf);
+                var decoded = Document.ReadFrom(decodedReader);
+                decodedReader.ExpectEnd();
+                return decoded;
             }
             finally
             {
@@ -719,15 +719,15 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            Document? value = null;
-            if (valueReader.ReadOptionFlag())
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            Document? decoded = null;
+            if (decodedReader.ReadOptionFlag())
             {
-                var valueValue = Document.ReadFrom(valueReader);
-                value = valueValue;
+                var decodedValue = Document.ReadFrom(decodedReader);
+                decoded = decodedValue;
             }
-            valueReader.ExpectEnd();
-            return value;
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>Publish a document in the background</summary>
