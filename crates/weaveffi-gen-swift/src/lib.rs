@@ -10,12 +10,16 @@
 //! The generated wrapper ships a small private writer/reader pair
 //! (`WvWriter`/`WvReader`) plus one pack and one unpack routine per record and
 //! rich enum, so records surface as plain Swift structs and rich enums as
-//! native Swift enums with associated values.
+//! native Swift enums with associated values. Objects surface as `final
+//! class` wrappers owning one strong reference each, and callback interfaces
+//! as Swift protocols whose implementations cross the boundary through a
+//! process-wide vtable of `@convention(c)` trampolines.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
+mod callbacks;
 mod calls;
 mod codec;
 mod docs;
@@ -44,13 +48,13 @@ use crate::package::{
     resolve_module_name,
 };
 use crate::runtime::{
-    render_buffer_runtime, render_continuation_ref, render_error_infra, render_listener_registry,
+    render_buffer_runtime, render_callback_support, render_continuation_ref, render_error_infra,
 };
 use crate::types::{enum_raw_type, SwiftCtx};
 
 /// Per-target configuration for [`SwiftGenerator`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SwiftConfig {
     /// SwiftPM module name (default `"WeaveFFI"`).
     pub module_name: Option<String>,
@@ -143,7 +147,7 @@ impl LanguageBackend for SwiftGenerator {
         "swift"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 
@@ -231,8 +235,15 @@ impl LanguageBackend for SwiftGenerator {
                 render_packaged_readme(module_name, &c_module, prefix, ctx, input_basename),
             ),
         ];
-        // Bundle the prebuilt libraries as xcframework-ready slices.
-        for nb in &ctx.binaries.binaries {
+        // Bundle the prebuilt libraries as xcframework-ready slices. Only
+        // desktop slices are meaningful to a SwiftPM consumer; mobile and
+        // WebAssembly builds belong to other package formats.
+        for nb in ctx
+            .binaries
+            .binaries
+            .iter()
+            .filter(|nb| nb.platform.is_desktop())
+        {
             let dest = dir
                 .join("lib")
                 .join(nb.platform.id())
@@ -306,9 +317,12 @@ fn render_swift_wrapper(
         render_continuation_ref(&mut out);
     }
 
-    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
-    if has_listeners {
-        render_listener_registry(&mut out);
+    let has_callbacks = model
+        .modules
+        .iter()
+        .any(|m| !m.callback_interfaces.is_empty());
+    if has_callbacks {
+        render_callback_support(&mut out);
     }
 
     for m in &api.modules {
@@ -329,4 +343,277 @@ fn render_swift_wrapper(
     }
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weaveffi_ir::ir::{
+        Api, CallbackInterfaceDef, Function, InterfaceDef, Param, StructDef, StructField, TypeRef,
+    };
+
+    fn param(name: &str, ty: TypeRef) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            doc: None,
+        }
+    }
+
+    fn func(name: &str, params: Vec<Param>, returns: Option<TypeRef>) -> Function {
+        Function {
+            name: name.into(),
+            params,
+            returns,
+            doc: None,
+            throws: false,
+            r#async: false,
+            cancellable: false,
+            deprecated: None,
+        }
+    }
+
+    fn named(name: &str) -> TypeRef {
+        TypeRef::Named(name.into())
+    }
+
+    fn opt(ty: TypeRef) -> TypeRef {
+        TypeRef::Optional(Box::new(ty))
+    }
+
+    /// One module exercising every object and callback shape the ABI
+    /// contract distinguishes: an interface with a constructor and a method,
+    /// nullable objects in and out, objects inside a record (directly and in
+    /// a list), an iterator of objects, and a callback interface taking a
+    /// string, an `i32`, a record, and an object, with `bool` and void
+    /// returns.
+    fn fixture() -> ResolvedApi {
+        ResolvedApi::assume_valid(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
+            modules: vec![Module {
+                name: "shop".into(),
+                doc: None,
+                functions: vec![
+                    func(
+                        "find_cart",
+                        vec![param("current", opt(named("Cart")))],
+                        Some(opt(named("Cart"))),
+                    ),
+                    func(
+                        "all_carts",
+                        vec![],
+                        Some(TypeRef::Iterator(Box::new(named("Cart")))),
+                    ),
+                    func("watch", vec![param("watcher", named("Watcher"))], None),
+                ],
+                interfaces: vec![InterfaceDef {
+                    name: "Cart".into(),
+                    doc: None,
+                    deprecated: None,
+                    constructors: vec![func(
+                        "new",
+                        vec![param("owner", TypeRef::StringUtf8)],
+                        None,
+                    )],
+                    methods: vec![func(
+                        "add",
+                        vec![param("sku", TypeRef::StringUtf8)],
+                        Some(TypeRef::Bool),
+                    )],
+                    statics: vec![],
+                }],
+                callback_interfaces: vec![CallbackInterfaceDef {
+                    name: "Watcher".into(),
+                    doc: None,
+                    deprecated: None,
+                    methods: vec![
+                        func(
+                            "on_event",
+                            vec![
+                                param("name", TypeRef::StringUtf8),
+                                param("count", TypeRef::I32),
+                                param("order", named("Order")),
+                                param("cart", named("Cart")),
+                            ],
+                            Some(TypeRef::Bool),
+                        ),
+                        func("on_done", vec![], None),
+                    ],
+                }],
+                structs: vec![StructDef {
+                    name: "Order".into(),
+                    doc: None,
+                    deprecated: None,
+                    fields: vec![
+                        StructField {
+                            name: "cart".into(),
+                            ty: named("Cart"),
+                            doc: None,
+                        },
+                        StructField {
+                            name: "history".into(),
+                            ty: TypeRef::List(Box::new(named("Cart"))),
+                            doc: None,
+                        },
+                    ],
+                }],
+                enums: vec![],
+                errors: None,
+                modules: vec![],
+            }],
+        })
+    }
+
+    fn render() -> String {
+        let api = fixture();
+        let model = BindingModel::build(&api, "weaveffi");
+        render_swift_wrapper(
+            &api,
+            &model,
+            "weaveffi",
+            true,
+            "weaveffi.yml",
+            "WeaveFFI.swift",
+        )
+    }
+
+    #[track_caller]
+    fn assert_has(out: &str, needle: &str) {
+        assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+    }
+
+    #[test]
+    fn interface_class_owns_one_reference() {
+        let out = render();
+        assert_has(&out, "public final class Cart {");
+        assert_has(&out, "let ptr: OpaquePointer");
+        assert_has(&out, "weaveffi_shop_Cart_destroy(ptr)");
+        assert_has(&out, "func clonePtr() -> OpaquePointer {");
+        assert_has(&out, "weaveffi_shop_Cart_clone(ptr)!");
+        // Exactly one destroy site: the deinit.
+        assert_eq!(out.matches("weaveffi_shop_Cart_destroy(").count(), 1);
+        // Constructor adopts the returned reference; the method borrows `ptr`.
+        assert_has(&out, "public init(owner: String) {");
+        assert_has(&out, "weaveffi_shop_Cart_new(");
+        assert_has(&out, "public func add(sku: String) -> Bool {");
+        assert_has(&out, "weaveffi_shop_Cart_add(ptr, ");
+    }
+
+    #[test]
+    fn nullable_objects_map_to_optional_wrappers() {
+        let out = render();
+        assert_has(
+            &out,
+            "public static func findCart(current: Cart?) -> Cart? {",
+        );
+        assert_has(&out, "weaveffi_shop_find_cart(current?.ptr, &err)");
+        assert_has(&out, "return rv.map { Cart(ptr: $0) }");
+    }
+
+    #[test]
+    fn records_carry_object_tokens() {
+        let out = render();
+        assert_has(&out, "public struct Order {");
+        assert_has(&out, "public var cart: Cart");
+        assert_has(&out, "public var history: [Cart]");
+        assert_has(&out, "w.writeObject(value.cart.clonePtr())");
+        assert_has(&out, "w.writeObject(v0.clonePtr())");
+        assert_has(&out, "Cart(ptr: r.readObject())");
+        assert_has(&out, "mutating func writeObject(_ p: OpaquePointer)");
+        assert_has(&out, "mutating func readObject() -> OpaquePointer {");
+    }
+
+    #[test]
+    fn object_iterator_adopts_each_element() {
+        let out = render();
+        assert_has(
+            &out,
+            "public final class ShopAllCartsIterator: Sequence, IteratorProtocol {",
+        );
+        assert_has(&out, "public func next() -> Cart? {");
+        assert_has(&out, "var item: OpaquePointer? = nil");
+        assert_has(
+            &out,
+            "weaveffi_shop_AllCartsIterator_next(handle, &item, &err)",
+        );
+        assert_has(&out, "weaveffi_shop_AllCartsIterator_destroy(handle)");
+        assert_has(&out, "return Cart(ptr: item!)");
+    }
+
+    #[test]
+    fn callback_interface_renders_protocol_box_and_vtable() {
+        let out = render();
+        assert_has(&out, "public protocol Watcher {");
+        assert_has(
+            &out,
+            "func onEvent(name: String, count: Int32, order: Order, cart: Cart) throws -> Bool",
+        );
+        assert_has(&out, "func onDone() throws\n");
+        assert_has(&out, "final class WvWatcherBox {");
+        assert_has(&out, "let impl: any Watcher");
+        assert_has(&out, "enum WvWatcherVtable {");
+        assert_has(&out, "static let value = weaveffi_shop_Watcher_vtable(");
+        assert_has(
+            &out,
+            "static let pointer: UnsafePointer<weaveffi_shop_Watcher_vtable> = {",
+        );
+        assert_has(&out, "cell.initialize(to: value)");
+        assert_has(
+            &out,
+            "on_event: { ctx, name, count, order_ptr, order_len, cart, out_err in",
+        );
+        assert_has(&out, "on_done: { ctx, out_err in");
+        assert_has(&out, "free: { ctx in");
+        assert_has(&out, "Unmanaged<WvWatcherBox>.fromOpaque(ctx!).release()");
+        assert_has(
+            &out,
+            "Unmanaged<WvWatcherBox>.fromOpaque(ctx!).takeUnretainedValue()",
+        );
+        // No stray empty doc line when the interface is undocumented.
+        assert!(!out.contains("\n///\n/// Implement this protocol"), "{out}");
+    }
+
+    #[test]
+    fn callback_trampolines_decode_adopt_and_report_errors() {
+        let out = render();
+        // The record decodes through its codec before the call; the borrowed
+        // string is copied and the object argument adopted at the call site.
+        assert_has(
+            &out,
+            "[UInt8](UnsafeBufferPointer(start: order_ptr, count: order_len))",
+        );
+        assert_has(&out, "let v2 = wvReadOrder(&r1)");
+        assert_has(
+            &out,
+            "return try wvBox.impl.onEvent(name: String(cString: name!), count: count, order: v2, cart: Cart(ptr: cart!))",
+        );
+        assert_has(&out, "try wvBox.impl.onDone()");
+        // A thrown Swift error is reported as code -4 and a default returned.
+        assert_has(&out, "weaveffi_error_set(outErr, -4, $0)");
+        assert_has(&out, "wvForeignError(out_err, error)");
+        assert_has(&out, "return false");
+    }
+
+    #[test]
+    fn passing_a_callback_boxes_it_with_the_static_vtable() {
+        let out = render();
+        assert_has(&out, "public static func watch(watcher: Watcher) -> Void {");
+        assert_has(
+            &out,
+            "let watcher_ctx = Unmanaged.passRetained(WvWatcherBox(watcher)).toOpaque()",
+        );
+        assert_has(
+            &out,
+            "weaveffi_shop_watch(watcher_ctx, WvWatcherVtable.pointer, &err)",
+        );
+    }
+
+    #[test]
+    fn no_arena_or_listener_surface_remains() {
+        let out = render();
+        assert!(!out.contains("arena"), "{out}");
+        assert!(!out.contains("Listener"), "{out}");
+        assert!(!out.contains("TypedHandle"), "{out}");
+        assert!(!out.contains("weaveffi_arena"), "{out}");
+    }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "weaveffi-gen-kotlin"
+version = "0.22.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Kotlin binding generator (JNI shim, Android and desktop JVM) for WeaveFFI"
+keywords = ["ffi", "codegen", "bindings", "kotlin", "jni"]
+categories = ["development-tools::ffi"]
+
+[dependencies]
+weaveffi-core = { path = "../weaveffi-core", version = "0.22.0" }
+camino = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.22.0" }
+
+[lints]
+workspace = true

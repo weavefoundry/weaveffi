@@ -2,41 +2,31 @@
 //! delegate type) per lowered C symbol, matching each callable's shape
 //! exactly.
 
-use weaveffi_core::abi::{self, AbiParam, CType};
+use weaveffi_core::abi::{AbiParam, CType};
 use weaveffi_core::cabi::ABI_VERSION;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, FnBinding, InterfaceBinding, IteratorBinding,
-    ListenerBinding, ParamBinding,
+    BindingModel, CallShape, FnBinding, InterfaceBinding, IteratorBinding, ParamBinding,
 };
 
 use crate::calls::async_result_is_ptr_len;
 use crate::types::{cs_out_param, cs_pinvoke_ctype, pinvoke_type, safe_cs_name};
 
-/// The P/Invoke parameter list (one entry per ABI slot) for one IR-typed
-/// parameter, keeping the IDL slot names with keyword escaping applied.
-pub(crate) fn pinvoke_param_list(p: &ParamBinding) -> Vec<String> {
-    abi::lower_param(&p.name, &p.ty, "", false)
-        .iter()
-        .map(|slot| {
-            format!(
-                "{} {}",
-                cs_pinvoke_ctype(&slot.ty),
-                safe_cs_name(&slot.name)
-            )
-        })
-        .collect()
+/// The P/Invoke spelling of one ABI slot: its C type mapped onto the
+/// P/Invoke vocabulary plus the IDL slot name with keyword escaping applied.
+pub(crate) fn pinvoke_slot(slot: &AbiParam) -> String {
+    format!(
+        "{} {}",
+        cs_pinvoke_ctype(&slot.ty),
+        safe_cs_name(&slot.name)
+    )
 }
 
-/// The extern return type plus any trailing out-params (for example the
-/// `size_t* out_len` slot of a buffered return) for one IR return type.
-pub(crate) fn pinvoke_return_info(ty: &Ty) -> (String, Vec<String>) {
-    let r = abi::lower_return(ty, "");
-    (
-        cs_pinvoke_ctype(&r.ret),
-        r.out_params.iter().map(cs_out_param).collect(),
-    )
+/// The P/Invoke parameter list (one entry per precomputed ABI slot) for one
+/// IR-typed parameter.
+pub(crate) fn pinvoke_param_list(p: &ParamBinding) -> Vec<String> {
+    p.abi.iter().map(pinvoke_slot).collect()
 }
 
 /// Whether an ABI slot is the trailing `{prefix}_error* out_err`.
@@ -46,8 +36,10 @@ pub(crate) fn is_error_slot(slot: &AbiParam) -> bool {
 
 /// Render the `NativeMethods` static class: the ABI-revision check in its
 /// static constructor, the shared runtime imports (`abi_version`,
-/// `free_string`, `free_bytes`, `error_clear`, `error_free`), and then every
-/// interface, callback, listener, and function extern in declaration order.
+/// `error_set`, `free_string`, `free_bytes`, `error_clear`, `error_free`),
+/// and then every interface and function extern in declaration order.
+/// Callback interfaces declare no exported symbols; their vtables live next
+/// to the consumer-facing interface type.
 pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.line("internal static class NativeMethods");
@@ -83,6 +75,12 @@ pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
     w.line("internal static extern uint weaveffi_abi_version();");
     w.blank();
+    w.line("// Fills a producer-owned error slot with a copy of `message`; callback");
+    w.line("// trampolines report a thrown exception through it so no managed");
+    w.line("// allocation is ever handed to the producer's allocator.");
+    w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
+    w.line("internal static extern void weaveffi_error_set(IntPtr err, int code, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);");
+    w.blank();
     w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
     w.line("internal static extern void weaveffi_free_string(IntPtr ptr);");
     w.blank();
@@ -97,22 +95,12 @@ pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     w.blank();
     w.dedent();
 
-    // Records and rich enums are value types with no C symbols, so only
-    // interfaces, callbacks, listeners, and functions declare P/Invokes.
+    // Records, rich enums, and callback interfaces declare no C symbols, so
+    // only interfaces and functions declare P/Invokes.
     for m in &model.modules {
         for i in &m.interfaces {
             let mut tmp = String::new();
             render_interface_pinvoke(&mut tmp, i);
-            w.raw(tmp);
-        }
-        for cb in &m.callbacks {
-            let mut tmp = String::new();
-            render_callback_pinvoke(&mut tmp, cb);
-            w.raw(tmp);
-        }
-        for l in &m.listeners {
-            let mut tmp = String::new();
-            render_listener_pinvoke(&mut tmp, l);
             w.raw(tmp);
         }
         for f in &m.functions {
@@ -123,56 +111,6 @@ pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     }
 
     w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// The unmanaged delegate type for one module callback declaration, shared by
-/// every listener that fires it.
-pub(crate) fn render_callback_pinvoke(out: &mut String, cb: &CallbackBinding) {
-    let delegate_name = format!("Cb_{}", cb.c_fn_type);
-    let params: Vec<String> = cb
-        .abi_params
-        .iter()
-        .map(|slot| {
-            format!(
-                "{} {}",
-                cs_pinvoke_ctype(&slot.ty),
-                safe_cs_name(&slot.name)
-            )
-        })
-        .collect();
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line("[UnmanagedFunctionPointer(CallingConvention.Cdecl)]");
-    w.line(format!(
-        "internal delegate void {delegate_name}({});",
-        params.join(", ")
-    ));
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// The register and unregister externs for one listener.
-pub(crate) fn render_listener_pinvoke(out: &mut String, l: &ListenerBinding) {
-    let delegate_name = format!("Cb_{}", l.callback_c_fn_type);
-    let register_sym = &l.register_symbol;
-    let unregister_sym = &l.unregister_symbol;
-
-    let mut w = CodeWriter::four_space().with_depth(2);
-    w.line(format!(
-        "[DllImport(LibName, EntryPoint = \"{register_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-    ));
-    w.line(format!(
-        "internal static extern ulong {register_sym}({delegate_name} callback, IntPtr context);"
-    ));
-    w.blank();
-
-    w.line(format!(
-        "[DllImport(LibName, EntryPoint = \"{unregister_sym}\", CallingConvention = CallingConvention.Cdecl)]"
-    ));
-    w.line(format!(
-        "internal static extern void {unregister_sym}(ulong id);"
-    ));
     w.blank();
     out.push_str(&w.finish());
 }
@@ -188,12 +126,20 @@ pub(crate) fn render_shaped_pinvoke(out: &mut String, f: &FnBinding) {
     }
 }
 
-/// The `[DllImport]` set backing one interface: the destroy symbol plus one
-/// shape-matched extern set per member. Instance members carry the implicit
-/// leading `self` slot.
+/// The `[DllImport]` set backing one interface: the `clone` and `destroy`
+/// reference-count symbols plus one shape-matched extern set per member.
+/// Instance members carry the implicit leading `self` slot.
 pub(crate) fn render_interface_pinvoke(out: &mut String, i: &InterfaceBinding) {
+    let clone_sym = &i.clone_symbol;
     let destroy_sym = &i.destroy_symbol;
     let mut w = CodeWriter::four_space().with_depth(2);
+    w.line(format!(
+        "[DllImport(LibName, EntryPoint = \"{clone_sym}\", CallingConvention = CallingConvention.Cdecl)]"
+    ));
+    w.line(format!(
+        "internal static extern IntPtr {clone_sym}(IntPtr self);"
+    ));
+    w.blank();
     w.line(format!(
         "[DllImport(LibName, EntryPoint = \"{destroy_sym}\", CallingConvention = CallingConvention.Cdecl)]"
     ));
@@ -213,30 +159,24 @@ pub(crate) fn render_interface_pinvoke(out: &mut String, i: &InterfaceBinding) {
     }
 }
 
-/// The single extern behind one synchronous callable: lowered parameter
-/// slots, any return out-params, and the trailing error slot.
+/// The single extern behind one synchronous callable, rendered from its
+/// precomputed [`CallShape::Sync`] slots: the optional `self`, every input
+/// slot, any return out-params, and the trailing error slot.
 pub(crate) fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
-    if let CallShape::Iterator(it) = &f.shape {
-        render_iterator_pinvoke(out, it);
-        return;
-    }
-    let c_sym = &f.c_base;
-
-    let mut params: Vec<String> = Vec::new();
-    if f.has_self {
-        params.push("IntPtr self".into());
-    }
-    params.extend(f.params.iter().flat_map(pinvoke_param_list));
-
-    let ret_type = if let Some(ret) = &f.ret {
-        let (ret_cs, extra) = pinvoke_return_info(ret);
-        params.extend(extra);
-        ret_cs
-    } else {
-        "void".into()
+    let abi = match &f.shape {
+        CallShape::Sync(abi) => abi,
+        CallShape::Iterator(it) => {
+            render_iterator_pinvoke(out, it);
+            return;
+        }
+        CallShape::Async(_) => {
+            render_async_function_pinvoke(out, f);
+            return;
+        }
     };
-
-    params.push("ref WeaveFFIError err".into());
+    let c_sym = &abi.symbol;
+    let params: Vec<String> = abi.params.iter().map(slot_param).collect();
+    let ret_type = cs_pinvoke_ctype(&abi.ret);
 
     let mut w = CodeWriter::four_space().with_depth(2);
     w.line(format!(
@@ -250,23 +190,23 @@ pub(crate) fn render_function_pinvoke(out: &mut String, f: &FnBinding) {
     out.push_str(&w.finish());
 }
 
-/// One P/Invoke parameter for an iterator-shape ABI slot: the trailing error
-/// slot becomes `ref WeaveFFIError`, `out_*` pointer slots become `out`
-/// pointee values, everything else is passed by value.
-pub(crate) fn iterator_slot_param(slot: &AbiParam) -> String {
+/// One P/Invoke parameter for a sync or iterator ABI slot: the trailing
+/// error slot becomes `ref WeaveFFIError`, `out_*` pointer slots become
+/// `out` pointee values, everything else is passed by value.
+pub(crate) fn slot_param(slot: &AbiParam) -> String {
     if is_error_slot(slot) {
         return format!("ref WeaveFFIError {}", slot.name);
     }
     match &slot.ty {
         CType::Ptr { .. } if slot.name.starts_with("out_") => cs_out_param(slot),
-        ty => format!("{} {}", cs_pinvoke_ctype(ty), safe_cs_name(&slot.name)),
+        _ => pinvoke_slot(slot),
     }
 }
 
 /// The three entry points behind one `iter<T>` function: the constructor
 /// returning the opaque iterator handle, `_next`, and `_destroy`.
 pub(crate) fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
-    let launch_params: Vec<String> = it.launch.params.iter().map(iterator_slot_param).collect();
+    let launch_params: Vec<String> = it.launch.params.iter().map(slot_param).collect();
     let mut w = CodeWriter::four_space().with_depth(2);
     w.line(format!(
         "[DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]",
@@ -279,7 +219,7 @@ pub(crate) fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
     ));
     w.blank();
 
-    let next_params: Vec<String> = it.next.params.iter().map(iterator_slot_param).collect();
+    let next_params: Vec<String> = it.next.params.iter().map(slot_param).collect();
     w.line(format!(
         "[DllImport(LibName, EntryPoint = \"{0}\", CallingConvention = CallingConvention.Cdecl)]",
         it.next.symbol
@@ -304,8 +244,9 @@ pub(crate) fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
 }
 
 /// The completion delegate's result parameters for one async return type:
-/// nothing for void, a borrowed `(ptr, len)` pair for bytes and buffered
-/// values, and a single by-value slot otherwise.
+/// nothing for void, an owned `(ptr, len)` pair for bytes and buffered
+/// values, and a single by-value slot otherwise (an object result is the
+/// adopted `IntPtr`).
 pub(crate) fn async_cb_delegate_result_params(ret: &Option<Ty>) -> String {
     match ret {
         None => String::new(),

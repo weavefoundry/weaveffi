@@ -65,6 +65,14 @@ void main() {
     expect(e is wv.WeaveFFIException, 'NotFound extends the generic brand');
   }
 
+  // Releasing the object twice is safe; using it afterward is a StateError.
   book.dispose();
+  book.dispose();
+  try {
+    book.count();
+    throw StateError('expected StateError after dispose');
+  } on StateError catch (e) {
+    expect(e.message.contains('dispose'), 'use after dispose message');
+  }
   print('dart/contacts: OK');
 }

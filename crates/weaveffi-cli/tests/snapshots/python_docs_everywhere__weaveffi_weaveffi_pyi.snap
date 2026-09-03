@@ -5,10 +5,15 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # DO NOT EDIT. Your changes will be overwritten.
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
+from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import Callable, Dict, Iterator, List, Optional, Type
 
 class WeaveFFIError(Exception):
+    GENERIC_ERROR_CODE: int
+    PANIC_ERROR_CODE: int
+    MARSHAL_ERROR_CODE: int
+    FOREIGN_ERROR_CODE: int
     code: int
     message: str
     def __init__(self, code: int, message: str) -> None: ...
@@ -53,20 +58,27 @@ class Document:
     tags: List[str]
     def __init__(self, id: int, title: str, status: "Status", tags: List[str]) -> None: ...
 
+# Consumer-implemented observer of document-saved notifications.
+#
+# Implementations must be safe to call from any thread.
+class SavedListener(ABC):
+    # Fires after a document has been persisted successfully
+    @abstractmethod
+    def on_saved(self, doc_id: int, revision: int) -> None: ...
+
 # An ordered collection of documents.
 #
 # Notebooks own their documents and release them when destroyed.
 class Notebook:
     def __init__(self) -> None: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> "Notebook": ...
+    def __exit__(self, *exc: object) -> bool: ...
     def insert(self, document: "Document") -> int: ...
     def find(self, id: int) -> "Document": ...
     def size(self) -> int: ...
     @staticmethod
     def max_documents() -> int: ...
-
-# Subscribe to document-saved notifications
-def register_saved_listener(callback: Callable[[int, int], None]) -> int: ...
-def unregister_saved_listener(listener_id: int) -> None: ...
 
 # Create a brand new document.
 #
@@ -79,5 +91,8 @@ def get_document(id: int) -> Optional["Document"]: ...
 
 # Publish a document in the background
 async def publish_async(id: int) -> bool: ...
+
+# Register a listener for saved notifications
+def watch(listener: "SavedListener") -> None: ...
 
 # END weaveffi.pyi

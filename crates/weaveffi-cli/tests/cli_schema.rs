@@ -39,8 +39,7 @@ fn schema_emits_valid_json_schema() {
         "EnumDef",
         "EnumVariant",
         "InterfaceDef",
-        "CallbackDef",
-        "ListenerDef",
+        "CallbackInterfaceDef",
         "ErrorDomain",
         "ErrorCode",
     ] {

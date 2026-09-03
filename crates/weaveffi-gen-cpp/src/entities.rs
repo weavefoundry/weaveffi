@@ -8,11 +8,13 @@ use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    CallShape, EnumBinding, ErrorBinding, InterfaceBinding, ModuleBinding, StructBinding,
+    CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding, StructBinding,
 };
 use weaveffi_core::utils::local_type_name;
 
-use crate::calls::{render_cpp_callable, FnKind};
+use crate::calls::{
+    iterator_class_name, render_definition, render_iterator_range, render_member_decl, FnKind,
+};
 use crate::codec::emit_read_decl;
 use crate::types::{cpp_error_class, cpp_fn_name, cpp_ident, cpp_type};
 
@@ -24,8 +26,6 @@ use crate::types::{cpp_error_class, cpp_fn_name, cpp_ident, cpp_type};
 pub(crate) fn render_cpp_enums(out: &mut String, module: &ModuleBinding) {
     let mut w = CodeWriter::four_space();
     for e in &module.enums {
-        // Rich (algebraic) enums are value types, emitted as variant structs
-        // alongside records; only plain C-style enums map to `enum class`.
         if e.is_rich() {
             continue;
         }
@@ -86,7 +86,8 @@ impl ValueDef<'_> {
 }
 
 /// Collect the local names of value types (records and rich enums) reachable
-/// from `ty`, recursing through optional/list/map wrappers.
+/// from `ty`, recursing through optional/list/map wrappers. Interfaces are
+/// not collected: every interface class is complete before any value type.
 fn collect_value_deps(ty: &Ty, deps: &mut Vec<String>) {
     match ty {
         Ty::Record(n) | Ty::RichEnum(n) => deps.push(local_type_name(n).to_string()),
@@ -97,34 +98,6 @@ fn collect_value_deps(ty: &Ty, deps: &mut Vec<String>) {
         }
         _ => {}
     }
-}
-
-/// Local names of other interfaces referenced by an interface's member
-/// signatures (returned or accepted by value, so their classes must be
-/// complete first).
-pub(crate) fn interface_deps(i: &InterfaceBinding) -> Vec<String> {
-    fn collect(ty: &Ty, deps: &mut Vec<String>) {
-        match ty {
-            Ty::Interface(n) => deps.push(local_type_name(n).to_string()),
-            Ty::Optional(inner) | Ty::Iterator(inner) => collect(inner, deps),
-            _ => {}
-        }
-    }
-    let mut deps = Vec::new();
-    for f in i
-        .constructors
-        .iter()
-        .chain(i.methods.iter())
-        .chain(i.statics.iter())
-    {
-        for p in &f.params {
-            collect(&p.ty, &mut deps);
-        }
-        if let Some(ret) = &f.ret {
-            collect(ret, &mut deps);
-        }
-    }
-    deps
 }
 
 /// Order entries so that anything an entry depends on is emitted before it.
@@ -168,19 +141,17 @@ pub(crate) fn topo_order(names: &[String], deps: &[Vec<String>]) -> Vec<usize> {
 }
 
 /// Render a record as a plain C++ value struct: typed members in declaration
-/// (and wire) order, no handles, no destructors, no builders.
-pub(crate) fn render_cpp_record(out: &mut String, s: &StructBinding, module: &str, prefix: &str) {
+/// (and wire) order. An interface-typed member is the RAII wrapper held by
+/// value, so copying the record clones the reference and destroying it
+/// releases one.
+pub(crate) fn render_cpp_record(out: &mut String, s: &StructBinding) {
     let mut w = CodeWriter::four_space();
     w.doc(&s.doc, DocCommentStyle::Javadoc);
     w.line(format!("struct {} {{", s.name));
     w.scope(|w| {
         for f in &s.fields {
             w.doc(&f.doc, DocCommentStyle::Javadoc);
-            w.line(format!(
-                "{} {};",
-                cpp_type(&f.ty, module, prefix),
-                cpp_ident(&f.name)
-            ));
+            w.line(format!("{} {};", cpp_type(&f.ty), cpp_ident(&f.name)));
         }
     });
     w.line("};");
@@ -192,7 +163,7 @@ pub(crate) fn render_cpp_record(out: &mut String, s: &StructBinding, module: &st
 /// payload struct per variant, a `value` member holding the active payload,
 /// a nested `Tag` enum mirroring the wire discriminants, and a `tag()` reader.
 /// Construct one as `Shape{Shape::Circle{2.0}}`.
-pub(crate) fn render_cpp_rich_enum(out: &mut String, e: &EnumBinding, module: &str, prefix: &str) {
+pub(crate) fn render_cpp_rich_enum(out: &mut String, e: &EnumBinding) {
     let name = &e.name;
     let mut w = CodeWriter::four_space();
     w.doc(&e.doc, DocCommentStyle::Javadoc);
@@ -215,11 +186,7 @@ pub(crate) fn render_cpp_rich_enum(out: &mut String, e: &EnumBinding, module: &s
             w.scope(|w| {
                 for f in &v.fields {
                     w.doc(&f.doc, DocCommentStyle::Javadoc);
-                    w.line(format!(
-                        "{} {};",
-                        cpp_type(&f.ty, module, prefix),
-                        cpp_ident(&f.name)
-                    ));
+                    w.line(format!("{} {};", cpp_type(&f.ty), cpp_ident(&f.name)));
                 }
             });
             w.line("};");
@@ -260,10 +227,10 @@ pub(crate) fn render_cpp_rich_enum(out: &mut String, e: &EnumBinding, module: &s
 /// the payload buffer along the way.
 ///
 /// Domain codes are validated positive-only, and the runtime reserves every
-/// negative code (generic error, producer panic, marshalling failure), so
-/// the mapping helper routes negative codes to the generic `WeaveFFIError`
-/// before consulting the domain's cases; unknown positive codes fall back to
-/// the domain exception itself.
+/// negative code (generic error, producer panic, marshalling failure, foreign
+/// callback failure), so the mapping helper routes negative codes to the
+/// generic `WeaveFFIError` before consulting the domain's cases; unknown
+/// positive codes fall back to the domain exception itself.
 pub(crate) fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &str) {
     let domain = &eb.type_name;
     let path = &eb.owner_path;
@@ -292,11 +259,7 @@ pub(crate) fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &
         w.scope(|w| {
             for fld in &code.fields {
                 w.doc(&fld.doc, DocCommentStyle::Javadoc);
-                w.line(format!(
-                    "{} {};",
-                    cpp_type(&fld.ty, path, prefix),
-                    cpp_ident(&fld.name)
-                ));
+                w.line(format!("{} {};", cpp_type(&fld.ty), cpp_ident(&fld.name)));
             }
             if code.fields.is_empty() {
                 w.line(format!(
@@ -309,7 +272,7 @@ pub(crate) fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &
                 let mut inits = vec![format!("{domain}({}, msg)", code.value)];
                 for fld in &code.fields {
                     let name = cpp_ident(&fld.name);
-                    params.push(format!("{} {name}", cpp_type(&fld.ty, path, prefix)));
+                    params.push(format!("{} {name}", cpp_type(&fld.ty)));
                     inits.push(format!("{name}(std::move({name}))"));
                 }
                 w.line(format!(
@@ -333,9 +296,14 @@ pub(crate) fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &
     ));
     w.scope(|w| {
         // The negative range is reserved for the runtime (-1 generic error,
-        // -2 producer panic, -3 marshalling failure); those never map to a
-        // typed domain error, on the throwing path or anywhere else.
+        // -2 producer panic, -3 marshalling failure, -4 foreign callback
+        // failure); those never map to a typed domain error, on the throwing
+        // path or anywhere else.
         w.line("if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));");
+        if eb.codes.iter().all(|c| c.fields.is_empty()) {
+            w.line("(void)payload_ptr;");
+            w.line("(void)payload_len;");
+        }
         w.line("switch (code) {");
         for code in &eb.codes {
             let class = cpp_error_class(&code.name);
@@ -394,24 +362,48 @@ pub(crate) fn render_domain_error(out: &mut String, eb: &ErrorBinding, prefix: &
 
 // ── Namespace: interfaces ──
 
-/// Emit the shared move-only RAII skeleton an interface class uses: adopted
-/// `void*` handle, destructor calling `destroy_symbol`, deleted copy, move
-/// constructor and move assignment, and the raw `handle()` reader.
-fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbol: &str) {
-    w.line(format!("explicit {name}(void* h) : handle_(h) {{}}"));
+/// Emit the reference-counting RAII skeleton of an interface class: the
+/// adopted `{c_tag}*`, a destructor releasing one reference, copy operations
+/// that take a new reference through the `_clone` symbol (so C++ copy
+/// semantics equal a reference-count clone), move operations that transfer
+/// the pointer, and the `handle()`/`clone_handle()` readers the marshalling
+/// code uses to borrow or to mint a second reference.
+fn emit_raii_skeleton(w: &mut CodeWriter, i: &InterfaceBinding) {
+    let name = &i.name;
+    let tag = &i.c_tag;
+    let clone = &i.clone_symbol;
+    let destroy = &i.destroy_symbol;
+
+    w.line("/** Adopts one strong reference to a producer object. */");
+    w.line(format!("explicit {name}({tag}* h) : handle_(h) {{}}"));
     w.blank();
 
+    w.line("/** Releases this wrapper's reference; the object is dropped with its last one. */");
     w.line(format!("~{name}() {{"));
     w.scope(|w| {
-        w.line(format!(
-            "if (handle_) {destroy_symbol}(static_cast<{c_tag}*>(handle_));"
-        ));
+        w.line(format!("if (handle_) {destroy}(handle_);"));
     });
     w.line("}");
     w.blank();
 
-    w.line(format!("{name}(const {name}&) = delete;"));
-    w.line(format!("{name}& operator=(const {name}&) = delete;"));
+    w.line("/** Copies share the object: the copy takes a new strong reference. */");
+    w.line(format!(
+        "{name}(const {name}& other) : handle_({clone}(other.handle_)) {{}}"
+    ));
+    w.blank();
+
+    w.line(format!("{name}& operator=(const {name}& other) {{"));
+    w.scope(|w| {
+        w.line("if (this != &other) {");
+        w.scope(|w| {
+            w.line(format!("{tag}* h = {clone}(other.handle_);"));
+            w.line(format!("if (handle_) {destroy}(handle_);"));
+            w.line("handle_ = h;");
+        });
+        w.line("}");
+        w.line("return *this;");
+    });
+    w.line("}");
     w.blank();
 
     w.line(format!(
@@ -427,9 +419,7 @@ fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbo
     w.scope(|w| {
         w.line("if (this != &other) {");
         w.scope(|w| {
-            w.line(format!(
-                "if (handle_) {destroy_symbol}(static_cast<{c_tag}*>(handle_));"
-            ));
+            w.line(format!("if (handle_) {destroy}(handle_);"));
             w.line("handle_ = other.handle_;");
             w.line("other.handle_ = nullptr;");
         });
@@ -439,74 +429,107 @@ fn emit_raii_skeleton(w: &mut CodeWriter, name: &str, c_tag: &str, destroy_symbo
     w.line("}");
     w.blank();
 
-    w.line("void* handle() const { return handle_; }");
+    w.line("/** The wrapped pointer, borrowed: this wrapper keeps its reference. */");
+    w.line(format!("const {tag}* handle() const {{ return handle_; }}"));
+    w.blank();
+
+    w.line(
+        "/** A new strong reference the caller owns (for example to write into a value buffer). */",
+    );
+    w.line(format!(
+        "{tag}* clone_handle() const {{ return {clone}(handle_); }}"
+    ));
     w.blank();
 }
 
-/// Render an interface as a move-only RAII class. The constructor named `new`
-/// becomes the canonical C++ constructor (adopting the handle the C
-/// constructor returns); every other constructor becomes a static factory.
-/// Methods pass the wrapped handle as the leading C argument and are declared
-/// `const` (the ABI receiver is a const pointer); statics are static member
-/// functions. Sync, async, and iterator member shapes reuse the free-function
-/// marshalling paths.
-pub(crate) fn render_cpp_interface(
+/// The C++ name and declaration kind of one interface member. The constructor
+/// named `new` becomes the canonical C++ constructor; every other constructor
+/// becomes a static factory named after it.
+fn member_kinds<'a>(i: &'a InterfaceBinding) -> Vec<(&'a FnBinding, String, FnKind<'a>)> {
+    let class = i.name.as_str();
+    let mut members = Vec::new();
+    for c in &i.constructors {
+        if c.name == "new" && matches!(c.shape, CallShape::Sync(_)) {
+            members.push((c, class.to_string(), FnKind::Ctor { class }));
+        } else {
+            members.push((c, cpp_fn_name(&c.name), FnKind::Static { class }));
+        }
+    }
+    for m in &i.methods {
+        members.push((m, cpp_fn_name(&m.name), FnKind::Method { class }));
+    }
+    for s in &i.statics {
+        members.push((s, cpp_fn_name(&s.name), FnKind::Static { class }));
+    }
+    members
+}
+
+/// Emit the forward declarations an interface needs before any class body:
+/// the wrapper class itself and the range class of every iterator-returning
+/// member, so member declarations can name them as return types.
+pub(crate) fn render_cpp_interface_forward_decls(out: &mut String, i: &InterfaceBinding) {
+    out.push_str(&format!("class {};\n", i.name));
+    for (f, _, kind) in member_kinds(i) {
+        if matches!(f.shape, CallShape::Iterator(_)) {
+            out.push_str(&format!("class {};\n", iterator_class_name(f, kind)));
+        }
+    }
+}
+
+/// Render an interface's class definition: the reference-counting RAII
+/// skeleton plus the *declarations* of its constructors, methods, and
+/// statics. Member bodies are emitted later by
+/// [`render_cpp_interface_members`], once every value type and codec they
+/// marshal through is complete; the class itself must be complete first so
+/// records can hold it by value.
+pub(crate) fn render_cpp_interface_class(out: &mut String, i: &InterfaceBinding, prefix: &str) {
+    let name = &i.name;
+    let mut w = CodeWriter::four_space();
+    w.doc(&i.doc, DocCommentStyle::Javadoc);
+    w.line(format!("class {name} {{"));
+    w.scope(|w| {
+        w.line(format!("{}* handle_;", i.c_tag));
+        w.blank();
+    });
+    w.line("public:");
+    w.scope(|w| emit_raii_skeleton(w, i));
+    let mut members = String::new();
+    for (f, cpp_name, kind) in member_kinds(i) {
+        render_member_decl(&mut members, f, &cpp_name, kind, prefix);
+    }
+    w.raw(members);
+    w.line("};");
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Render the range classes of an interface's iterator-returning members at
+/// namespace scope. They need every element type complete, so they follow
+/// the value types and precede the member definitions that construct them.
+pub(crate) fn render_cpp_interface_iterators(
     out: &mut String,
     i: &InterfaceBinding,
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    let name = &i.name;
+    for (f, cpp_name, kind) in member_kinds(i) {
+        if let CallShape::Iterator(it) = &f.shape {
+            render_iterator_range(out, f, it, &cpp_name, kind, module, prefix);
+        }
+    }
+}
 
-    let mut w = CodeWriter::four_space();
-    w.doc(&i.doc, DocCommentStyle::Javadoc);
-    w.line(format!("class {name} {{"));
-    w.scope(|w| {
-        w.line("void* handle_;");
-        w.blank();
-    });
-    w.line("public:");
-    w.scope(|w| {
-        emit_raii_skeleton(w, name, &i.c_tag, &i.destroy_symbol);
-
-        let mut members = String::new();
-        for c in &i.constructors {
-            if c.name == "new" && matches!(c.shape, CallShape::Sync(_)) {
-                render_cpp_callable(&mut members, c, name, FnKind::Ctor, module, prefix);
-            } else {
-                render_cpp_callable(
-                    &mut members,
-                    c,
-                    &cpp_fn_name(&c.name),
-                    FnKind::Static,
-                    module,
-                    prefix,
-                );
-            }
-        }
-        for m in &i.methods {
-            render_cpp_callable(
-                &mut members,
-                m,
-                &cpp_fn_name(&m.name),
-                FnKind::Method { c_tag: &i.c_tag },
-                module,
-                prefix,
-            );
-        }
-        for s in &i.statics {
-            render_cpp_callable(
-                &mut members,
-                s,
-                &cpp_fn_name(&s.name),
-                FnKind::Static,
-                module,
-                prefix,
-            );
-        }
-        w.raw(members);
-    });
-    w.line("};");
-    w.blank();
-    out.push_str(&w.finish());
+/// Render the out-of-line `inline` definitions of an interface's members.
+/// Methods pass the wrapped pointer as the leading C argument; constructors
+/// adopt the returned reference; sync, async, and iterator shapes reuse the
+/// free-function marshalling paths.
+pub(crate) fn render_cpp_interface_members(
+    out: &mut String,
+    i: &InterfaceBinding,
+    module: &ModuleBinding,
+    prefix: &str,
+) {
+    for (f, cpp_name, kind) in member_kinds(i) {
+        render_definition(out, f, &cpp_name, kind, module, prefix);
+    }
 }

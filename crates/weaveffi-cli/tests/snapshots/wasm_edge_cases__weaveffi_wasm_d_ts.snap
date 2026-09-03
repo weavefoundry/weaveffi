@@ -8,8 +8,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
- * thrown directly for unknown codes, marshalling failures, and producer
- * panics. Carries the stable ABI `code`. */
+ * thrown directly for unknown codes, marshalling failures, producer
+ * panics, and callback-interface implementations that raised (code -4).
+ * Carries the stable ABI `code`. */
 export declare class WeaveFFIError extends Error {
   constructor(code: number, message?: string);
   code: number;
@@ -118,6 +119,14 @@ export interface Retired {
   id: bigint;
 }
 
+/** Record carrying objects in every buffered position */
+export interface WidgetHolder {
+  primary: Widget;
+  fallback: Widget | null;
+  extras: Widget[];
+  by_name: Record<string, Widget>;
+}
+
 /** Deprecated enum with non-contiguous values and keyword-like variants */
 export declare const Legacy: Readonly<{
   None: 0;
@@ -132,7 +141,46 @@ export declare const Mode: Readonly<{
 }>;
 export type Mode = (typeof Mode)[keyof typeof Mode];
 
-/** Interface with no constructor; instances come from make_widget */
+/**
+ * Callback interface carrying composite payloads and objects
+ *
+ * Implemented by the consumer; the producer calls these methods synchronously. An exception thrown from a method is reported to the producer as an error (code -4).
+ */
+export interface BatchListener {
+  /**
+   * Composite payloads cross as value buffers
+   */
+  onBatch(items: Outer[], raw: Uint8Array, first: Outer | null, mode: Mode): void;
+  /**
+   * Objects cross as strong references the consumer must release
+   */
+  onWidget(widget: Widget, fallback: Widget | null, children: Widget[]): void;
+  onTick(): void;
+  /**
+   * Scalar return travels back through the vtable
+   */
+  shouldContinue(class_: number): boolean;
+  /**
+   * Enum return travels back as its integer discriminant
+   */
+  pickMode(): Mode;
+}
+
+/**
+ * Callback interface whose name and methods are keywords
+ *
+ * Implemented by the consumer; the producer calls these methods synchronously. An exception thrown from a method is reported to the producer as an error (code -4).
+ */
+export interface Keyword {
+  delete(self: number): void;
+  import(): number;
+}
+
+/**
+ * Interface with no constructor; instances come from make_widget
+ *
+ * Wraps one reference to a producer object; release it with `close()`.
+ */
 export declare class Widget {
   /**
    * Void method that can fail
@@ -153,18 +201,27 @@ export declare class Widget {
    * @throws {WeaveFFIError} if the native call fails
    */
   oldName(): string;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  /** Releases this wrapper's reference exactly once; later calls are
+   * no-ops. Also reachable as `[Symbol.dispose]()` for `using`
+   * declarations. A wrapper collected unclosed is released by a
+   * finalizer where the runtime provides one. */
+  close(): void;
 }
 
-/** Deprecated interface with a throwing constructor */
+/**
+ * Deprecated interface with a throwing constructor
+ *
+ * Wraps one reference to a producer object; release it with `close()`.
+ */
 export declare class Vault {
   /**
    * Fails when the vault is busy
+   * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
    * @throws {EdgeErrorsError} on a domain error code
    */
   static open(path: string): Vault;
   /**
+   * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
    * @throws {WeaveFFIError} if the native call fails
    */
   peek(): Widget | null;
@@ -173,8 +230,11 @@ export declare class Vault {
    * @throws {EdgeErrorsError} on a domain error code
    */
   static probe(): boolean;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  /** Releases this wrapper's reference exactly once; later calls are
+   * no-ops. Also reachable as `[Symbol.dispose]()` for `using`
+   * declarations. A wrapper collected unclosed is released by a
+   * finalizer where the runtime provides one. */
+  close(): void;
 }
 
 export interface WeaveffiWasmModule {
@@ -200,17 +260,36 @@ export interface WeaveffiWasmModule {
      */
     optionalParams(text: string | null, count: number | null, outer: Outer | null, tags: string[] | null, blob: Uint8Array | null, mode: Mode | null): Mode | null;
     /**
-     * Write-back parameters
+     * Two callback interface parameters on one function
      * @throws {WeaveFFIError} if the native call fails
      */
-    mutableParams(text: string, blob: Uint8Array): void;
+    registerBatch(listener: BatchListener, keyword: Keyword): void;
+    /**
+     * Objects in every buffered position
+     * @throws {WeaveFFIError} if the native call fails
+     */
+    widgetsEverywhere(list: Widget[], byName: Record<string, Widget>, sparse: (Widget | null)[], holder: WidgetHolder): WidgetHolder;
+    /**
+     * Iterator of objects
+     * @returns A lazy iterator: one producer step per `next()` call. Exhaust it or call `return()` to release the producer handle (a `for...of` loop does both automatically); an abandoned iterator leaks the handle.
+     * @throws {WeaveFFIError} if the native call fails
+     */
+    widgetStream(): IterableIterator<Widget>;
+    /**
+     * Async returning an object
+     * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
+     * @throws {EdgeErrorsError} on a domain error code
+     */
+    asyncWidget(): Promise<Widget>;
     /**
      * Factory for an interface with no constructor
+     * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
      * @throws {WeaveFFIError} if the native call fails
      */
     makeWidget(label: string): Widget;
     /**
      * Optional interface return
+     * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
      * @throws {EdgeErrorsError} on a domain error code
      */
     findWidget(id: bigint): Widget | null;
@@ -219,10 +298,6 @@ export interface WeaveffiWasmModule {
      * @throws {WeaveFFIError} if the native call fails
      */
     inspectWidget(widget: Widget, fallback: Widget | null): string;
-    /**
-     * @throws {WeaveFFIError} if the native call fails
-     */
-    typedHandleParam(token: number, raw: bigint): number;
     /**
      * Iterator of strings
      * @returns A lazy iterator: one producer step per `next()` call. Exhaust it or call `return()` to release the producer handle (a `for...of` loop does both automatically); an abandoned iterator leaks the handle.
@@ -279,27 +354,11 @@ export interface WeaveffiWasmModule {
      * @throws {WeaveFFIError} if the native call fails
      */
     legacyValue(value: Legacy): Retired;
-    /**
-     * Register a listener for the `OnBatch` callback.
-     *
-     * @returns A subscription id for `unregisterBatchListener()`.
-     */
-    registerBatchListener(callback: (items: Outer[], raw: Uint8Array, first: Outer | null, mode: Mode) => void): number;
-    /** Unregister a listener previously registered with `registerBatchListener()`. */
-    unregisterBatchListener(id: number): void;
-    /**
-     * Register a listener for the `OnTick` callback.
-     *
-     * @returns A subscription id for `unregisterTickListener()`.
-     */
-    registerTickListener(callback: () => void): number;
-    /** Unregister a listener previously registered with `registerTickListener()`. */
-    unregisterTickListener(id: number): void;
     Widget: typeof Widget;
     Vault: typeof Vault;
   };
 }
 
-export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
+export function loadWeaveffiWasm(source: string | URL | BufferSource | WebAssembly.Module): Promise<WeaveffiWasmModule>;
 
 // END weaveffi_wasm.d.ts

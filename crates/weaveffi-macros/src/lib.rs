@@ -29,13 +29,13 @@
 //! * [`macro@module`] marks an exported namespace (the driver attribute).
 //! * [`macro@export`] exports a function; [`macro@record`] a by-value struct;
 //!   [`macro@enumeration`] a `#[repr(i32)]` C-style enum.
-//! * [`macro@interface`] declares an opaque object type whose `impl` block's
-//!   `pub fn`s become constructors, methods, and statics.
+//! * [`macro@interface`] declares an opaque, reference-counted object type
+//!   whose `impl` block's `pub fn`s become constructors, methods, and statics.
 //! * [`macro@error`] declares the module's error domain from an enum with
 //!   explicit discriminants; a variant's named fields become the code's
 //!   structured payload.
-//! * [`macro@callback`] / [`macro@listener`] declare a callback and an event
-//!   listener; [`macro@cancellable`] marks an async function as cancellable.
+//! * [`macro@callback_interface`] declares a trait the consumer implements;
+//!   [`macro@cancellable`] marks an async function as cancellable.
 //!
 //! The item-level attributes are inert markers that [`macro@module`] reads; on
 //! their own they expand to the item unchanged.
@@ -82,8 +82,9 @@ marker_attr! {
     record
 }
 marker_attr! {
-    /// Declare an interface: an opaque object type with constructors, methods,
-    /// and statics read from its `impl` block. Methods must take `&self`.
+    /// Declare an interface: an opaque, reference-counted object type with
+    /// constructors, methods, and statics read from its `impl` block. Methods
+    /// take `&self` or `self: Arc<Self>`; the type must be `Send + Sync`.
     interface
 }
 marker_attr! {
@@ -97,12 +98,10 @@ marker_attr! {
     enumeration
 }
 marker_attr! {
-    /// Declare a callback function signature the host implements.
-    callback
-}
-marker_attr! {
-    /// Declare an event listener; takes `event = "CallbackName"`.
-    listener
+    /// Declare a callback interface: a trait whose `&self` methods the consumer
+    /// implements. Producers accept one as `Arc<dyn Trait>`; declare
+    /// `Send + Sync` as supertraits when it is used from an `async fn`.
+    callback_interface
 }
 marker_attr! {
     /// Mark an async function as accepting a cancellation token.

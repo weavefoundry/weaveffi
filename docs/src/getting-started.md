@@ -40,7 +40,7 @@ Describe the API once in a language-neutral IDL. Create `math.yml` with a
 record and a function:
 
 ```yaml
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: math
     structs:
@@ -57,10 +57,15 @@ modules:
 ```
 
 The IDL describes only the API. It supports primitives (`i32`, `f64`, `bool`,
-`string`, `bytes`, `handle`), optionals (`string?`), lists (`[i32]`),
-interfaces (objects with constructors, methods, and statics), and typed error
-domains (opt in per function with `throws: true`). See the
-[IDL Schema](reference/idl.md) reference for the full specification.
+`string`, `bytes`, and the rest of the fixed-width integers and floats),
+optionals (`string?`), lists (`[i32]`), maps (`{string:i64}`), lazy iterators
+(`iter<string>`), records and rich enums, interfaces (reference-counted
+objects with constructors, methods, and statics), callback interfaces
+(methods the consumer implements and the native library calls), async
+functions, and typed error domains (opt in per function with `throws: true`).
+See the [IDL Schema](reference/idl.md) reference for the full specification
+and the [C ABI Contract](reference/abi.md) for how each of them crosses the
+boundary.
 
 Everything about how the API is *published* lives in an optional
 `weaveffi.toml` next to it. Create one so the generated package manifests
@@ -101,7 +106,7 @@ generated/
 ├── c/          # C header + convenience stubs
 ├── cpp/        # RAII C++ header + CMakeLists.txt
 ├── swift/      # SwiftPM package + Swift wrapper
-├── android/    # Kotlin JNI wrapper + Gradle skeleton
+├── kotlin/     # Kotlin JNI wrapper + Gradle (build.gradle.kts) project
 ├── node/       # N-API addon + TypeScript types
 ├── wasm/       # JavaScript loader + TypeScript types
 ├── python/     # ctypes bindings + .pyi stubs
@@ -129,8 +134,17 @@ reporting:
  * format ...
  */
 
-int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);
+// Module: math
+WEAVEFFI_API int32_t weaveffi_math_add(int32_t a, int32_t b, weaveffi_error* out_err);
 ```
+
+The header also declares the fixed runtime surface every producer exports
+(`weaveffi_abi_version`, the `weaveffi_error` struct and its helpers,
+`weaveffi_free_string`/`weaveffi_free_bytes`, and the cancel-token family);
+see the [C ABI Contract](reference/abi.md). Had `math.yml` declared an
+interface, the header would also carry an opaque typedef plus `_clone` and
+`_destroy` symbols for it, and a callback interface would appear as a vtable
+typedef.
 
 ### Swift wrapper (`generated/swift/Sources/MyMath/MyMath.swift`)
 
@@ -208,9 +222,9 @@ pub extern "C" fn weaveffi_math_add(
     a + b
 }
 
-// Emit the fixed WeaveFFI C ABI runtime surface (abi_version, free_string,
-// free_bytes, error_clear, cancel_token_*) in one line. Call this exactly
-// once per cdylib.
+// Emit the fixed WeaveFFI C ABI runtime surface (abi_version, error_set,
+// error_clear, error_free, free_string, free_bytes, cancel_token_*) in one
+// line. Call this exactly once per cdylib.
 abi::export_runtime!();
 ```
 
@@ -223,9 +237,15 @@ Key points:
 - The library must export the WeaveFFI runtime symbols: invoke
   [`weaveffi_abi::export_runtime!()`][export-runtime-doc] to emit all of
   them in one line instead of writing each `#[no_mangle]` thunk by hand.
-  Among them is `weaveffi_abi_version()`, which the generated Python, Ruby,
-  Dart, Go, .NET, Node.js, and Wasm bindings call at load time to refuse a
-  library built against a different ABI revision.
+  Among them is `weaveffi_abi_version()`, which reports ABI revision 2 and
+  which the generated Python, Ruby, Dart, Go, .NET, Node.js, and Wasm
+  bindings call at load time to refuse a library built against a different
+  revision.
+- An interface in your IDL adds a `_clone` and `_destroy` pair you implement
+  with `weaveffi_abi::object_clone` and `object_destroy` over an `Arc<T>`;
+  the [C ABI Contract](reference/abi.md#objects-interfaces) spells out the
+  reference-counting rules. The `#[weaveffi::module]` macro writes all of
+  this for you.
 
 [export-runtime-doc]: https://docs.rs/weaveffi-abi/latest/weaveffi_abi/macro.export_runtime.html
 
@@ -289,10 +309,15 @@ add(3, 4) = 7
 ## Next steps
 
 - Read the [IDL Schema](reference/idl.md) reference for all supported types
-  and features.
+  and features, and the [C ABI Contract](reference/abi.md) for how objects,
+  callback interfaces, value buffers, async functions, and iterators cross
+  the boundary.
 - Writing a Rust producer? See
   [The Rust Producer Macro](guides/producer-macro.md) to generate the C ABI
   directly from annotated Rust instead of implementing the header by hand.
+- Look at the [samples](samples.md): `kvstore` exercises every IDL feature,
+  and `events` is the smallest example of a reference-counted object plus a
+  callback interface.
 - See the [Calculator tutorial](tutorials/calculator.md) for a full end-to-end
   walkthrough including Swift and Node.js.
 - Explore the [Generators](generators/README.md) section for target-specific

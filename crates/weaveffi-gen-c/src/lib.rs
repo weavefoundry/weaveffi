@@ -31,7 +31,7 @@ use package::{render_packaged_cmake, render_packaged_readme};
 
 /// Per-target configuration for [`CGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CConfig {
     /// Prefix applied to every emitted C symbol (default `"weaveffi"`).
     /// Renames produce both `prefix_*` user symbols and
@@ -68,7 +68,7 @@ impl LanguageBackend for CGenerator {
         "c"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 

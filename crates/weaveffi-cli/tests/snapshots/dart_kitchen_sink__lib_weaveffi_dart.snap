@@ -27,7 +27,7 @@ DynamicLibrary _openLibrary() {
 }
 
 // The ABI revision these bindings were generated against.
-const int _abiVersion = 1;
+const int _abiVersion = 2;
 
 DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {
   final int Function() abiVersion;
@@ -60,6 +60,11 @@ final class _WeaveFFIError extends Struct {
   external int payloadLen;
 }
 
+typedef _NativeWeaveffiErrorSet = Void Function(Pointer<_WeaveFFIError>, Int32, Pointer<Utf8>);
+typedef _DartWeaveffiErrorSet = void Function(Pointer<_WeaveFFIError>, int, Pointer<Utf8>);
+final _weaveffiErrorSet = _lib.lookupFunction<
+    _NativeWeaveffiErrorSet, _DartWeaveffiErrorSet>('weaveffi_error_set');
+
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
@@ -80,8 +85,19 @@ typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
 final _weaveffiFreeBytes = _lib.lookupFunction<
     _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
 
-/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
+/// Generic WeaveFFI failure: a producer panic ([panicCode]), a marshalling
+/// error ([marshalCode]), a callback-interface implementation that threw
+/// ([foreignCode], carrying the Dart exception's text), or an unknown code.
 class WeaveFFIException implements Exception {
+  /// The producer reported an untyped error.
+  static const int genericCode = -1;
+  /// The producer panicked; [message] carries the panic text.
+  static const int panicCode = -2;
+  /// An argument could not be lifted by the producer.
+  static const int marshalCode = -3;
+  /// A Dart callback-interface implementation threw; [message] carries the
+  /// exception's text.
+  static const int foreignCode = -4;
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
@@ -341,9 +357,57 @@ final class _BufferReader {
   }
 }
 
-// Live listener trampolines by subscription id. Holding the
-// NativeCallable here keeps its native thunk alive until unregistered.
-final Map<int, NativeCallable> _listenerCallables = {};
+// ── WeaveFFI callback-interface runtime ──
+// A Dart implementation passed to the producer is stored here under an
+// integer key; the key (widened to a pointer) is what crosses as `ctx`, so the
+// producer never holds a Dart object and the GC never sees a raw pointer. The
+// entry lives until the producer calls the vtable's `free(ctx)`.
+final Map<int, Object> _callbackTable = {};
+int _nextCallbackKey = 1;
+
+Pointer<Void> _registerCallback(Object impl) {
+  final key = _nextCallbackKey++;
+  _callbackTable[key] = impl;
+  return Pointer<Void>.fromAddress(key);
+}
+
+Object _callbackFor(Pointer<Void> ctx) {
+  final impl = _callbackTable[ctx.address];
+  if (impl == null) {
+    throw StateError('callback interface context ${ctx.address} is not registered');
+  }
+  return impl;
+}
+
+// Vtable trampolines are process-wide: their NativeCallables are never closed,
+// so they are anchored here to keep the native thunks alive. `keepIsolateAlive`
+// is cleared on each so an idle isolate can still exit.
+final List<NativeCallable<Function>> _callbackCallables = [];
+
+Pointer<NativeFunction<T>> _pinCallable<T extends Function>(
+    NativeCallable<T> callable) {
+  callable.keepIsolateAlive = false;
+  _callbackCallables.add(callable);
+  return callable.nativeFunction;
+}
+
+// Reports a Dart exception thrown by a callback-interface implementation
+// through `weaveffi_error_set` with the reserved foreign error code (-4).
+// The producer copies the message, so the temporary is freed right away. This
+// must never throw: it runs in the catch path of a trampoline whose C frame
+// an exception must not unwind through.
+void _foreignError(Pointer<_WeaveFFIError> outErr, Object error) {
+  if (outErr == nullptr) return;
+  Pointer<Utf8> message = nullptr;
+  try {
+    message = error.toString().toNativeUtf8();
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, message);
+  } catch (_) {
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, nullptr);
+  } finally {
+    if (message != nullptr) calloc.free(message);
+  }
+}
 
 // Anchors one live native iteration for its GC-finalizer backstop.
 // A suspended `sync*` frame keeps the anchor reachable; abandoning the
@@ -463,8 +527,10 @@ class Item {
   /// Cross-module struct reference
   final Token token;
   final Priority priority;
+  /// An optional object inside a record
+  final Gadget? gadget;
 
-  Item({required this.id, required this.name, required this.count, required this.enabled, required this.ratio, required this.nick, required this.payload, required this.tags, required this.attrs, this.parent, required this.token, required this.priority});
+  Item({required this.id, required this.name, required this.count, required this.enabled, required this.ratio, required this.nick, required this.payload, required this.tags, required this.attrs, this.parent, required this.token, required this.priority, this.gadget});
 }
 
 void _packItem(_BufferWriter w, Item v) {
@@ -495,6 +561,13 @@ void _packItem(_BufferWriter w, Item v) {
   }
   _packToken(w, v.token);
   w.writeInt32(v.priority.value);
+  final t5 = v.gadget;
+  if (t5 == null) {
+    w.writeOptionFlag(false);
+  } else {
+    w.writeOptionFlag(true);
+    w.writeUint64(t5._cloneRef().address);
+  }
 }
 
 Item _unpackItem(_BufferReader r) {
@@ -511,13 +584,102 @@ Item _unpackItem(_BufferReader r) {
     parent: (r.readOptionFlag() ? r.readInt64() : null),
     token: _unpackToken(r),
     priority: Priority.fromValue(r.readInt32()),
+    gadget: (r.readOptionFlag() ? Gadget._(Pointer<Void>.fromAddress(r.readUint64())) : null),
   );
 }
+
+/// Consumer-implemented observer of ready items
+///
+/// A callback interface: implement this class and pass an instance to any
+/// function taking a [ReadyListener]. The producer keeps the instance alive
+/// (through a private handle table) until it releases the callback, so no
+/// other reference needs to be held.
+///
+/// Object arguments are owned by the implementation: call `dispose()` on
+/// them (or let the finalizer run) when done. A thrown exception is reported
+/// to the producer, which aborts the call it was making; the original Dart
+/// caller then observes a [WeaveFFIException] with [WeaveFFIException.foreignCode]
+/// carrying the exception's text.
+///
+/// Dart limitation: methods are bound with `NativeCallable.isolateLocal`, so
+/// the producer may only invoke them on the thread of the isolate that
+/// passed the callback. That holds when the producer calls them
+/// synchronously during a call from Dart. A producer that invokes a method
+/// from another thread (an async task, a background worker) is unsupported:
+/// a `NativeCallable.listener` cannot return a value or read borrowed
+/// arguments after the native frame returns.
+abstract class ReadyListener {
+  /// Fires when an item is ready
+  void onReady(int code, String msg);
+  /// Receives the item itself and says whether to keep listening
+  bool onItem(Item item, Gadget gadget);
+}
+
+typedef _NativeReadyListenerVtOnReady = Void Function(Pointer<Void>, Int32, Pointer<Utf8>, Pointer<_WeaveFFIError>);
+typedef _NativeReadyListenerVtOnItem = Bool Function(Pointer<Void>, Pointer<Uint8>, Size, Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _NativeReadyListenerVtFree = Void Function(Pointer<Void>);
+
+// The C `weaveffi_kitchen_ReadyListener_vtable` layout.
+final class _ReadyListenerVtableStruct extends Struct {
+  external Pointer<NativeFunction<_NativeReadyListenerVtOnReady>> onReady;
+  external Pointer<NativeFunction<_NativeReadyListenerVtOnItem>> onItem;
+  external Pointer<NativeFunction<_NativeReadyListenerVtFree>> free;
+}
+
+// Vtable entry `weaveffi_kitchen_ReadyListener_vtable.on_ready`.
+void _readyListenerVtOnReady(Pointer<Void> ctx, int code, Pointer<Utf8> msg, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as ReadyListener;
+    impl.onReady(code, msg == nullptr ? '' : msg.toDartString());
+  } catch (e) {
+    _foreignError(outErr, e);
+  }
+}
+
+// Vtable entry `weaveffi_kitchen_ReadyListener_vtable.on_item`.
+bool _readyListenerVtOnItem(Pointer<Void> ctx, Pointer<Uint8> itemPtr, int itemLen, Pointer<Void> gadget, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final itemData = _copyNativeBytes(itemPtr, itemLen);
+    final itemReader = _BufferReader(itemData);
+    final itemValue = _unpackItem(itemReader);
+    itemReader.expectEnd();
+    final gadgetValue = Gadget._(gadget);
+    final impl = _callbackFor(ctx) as ReadyListener;
+    return impl.onItem(itemValue, gadgetValue);
+  } catch (e) {
+    _foreignError(outErr, e);
+    return false;
+  }
+}
+
+void _readyListenerVtFree(Pointer<Void> ctx) {
+  _callbackTable.remove(ctx.address);
+}
+
+// The process-wide static `weaveffi_kitchen_ReadyListener_vtable` every ReadyListener passed to the producer
+// shares; the per-instance state travels in `ctx`.
+final Pointer<_ReadyListenerVtableStruct> _ReadyListenerVtable = () {
+  final vt = calloc<_ReadyListenerVtableStruct>();
+  vt.ref.onReady = _pinCallable(NativeCallable<_NativeReadyListenerVtOnReady>.isolateLocal(
+      _readyListenerVtOnReady));
+  vt.ref.onItem = _pinCallable(NativeCallable<_NativeReadyListenerVtOnItem>.isolateLocal(
+      _readyListenerVtOnItem, exceptionalReturn: false));
+  vt.ref.free = _pinCallable(NativeCallable<_NativeReadyListenerVtFree>.listener(
+      _readyListenerVtFree));
+  return vt;
+}();
+
+typedef _NativeWeaveffiKitchenGadgetClone = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiKitchenGadgetClone = Pointer<Void> Function(Pointer<Void>);
+final _weaveffiKitchenGadgetClone = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgetClone, _DartWeaveffiKitchenGadgetClone>('weaveffi_kitchen_Gadget_clone');
 
 typedef _NativeWeaveffiKitchenGadgetDestroy = Void Function(Pointer<Void>);
 typedef _DartWeaveffiKitchenGadgetDestroy = void Function(Pointer<Void>);
 final _weaveffiKitchenGadgetDestroy = _lib.lookupFunction<
     _NativeWeaveffiKitchenGadgetDestroy, _DartWeaveffiKitchenGadgetDestroy>('weaveffi_kitchen_Gadget_destroy');
+final _weaveffiKitchenGadgetDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_kitchen_Gadget_destroy'));
 
 typedef _NativeWeaveffiKitchenGadgetNew = Pointer<Void> Function(Int64, Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiKitchenGadgetNew = Pointer<Void> Function(int, Pointer<_WeaveFFIError>);
@@ -540,16 +702,45 @@ final _weaveffiKitchenGadgetVersion = _lib.lookupFunction<
     _NativeWeaveffiKitchenGadgetVersion, _DartWeaveffiKitchenGadgetVersion>('weaveffi_kitchen_Gadget_version');
 
 /// A pocket-sized interface exercising the object surface
-class Gadget {
-  final Pointer<Void> _handle;
-  Gadget._(this._handle);
+///
+/// A reference-counted native object. Each instance holds one strong
+/// reference, released by [dispose] or, if the instance is collected
+/// without being disposed, by a GC finalizer. Instances stay valid for as
+/// long as the Dart object is reachable; the producer keeps its own
+/// references to any object it retains.
+class Gadget implements Finalizable {
+  final Pointer<Void> _ptr;
+  bool _disposed = false;
 
-  /// Releases the native object reference.
+  /// Adopts one strong reference to the native object.
+  Gadget._(this._ptr) {
+    _weaveffiKitchenGadgetDestroyFinalizer.attach(this, _ptr, detach: this);
+  }
+
+  /// The borrowed native pointer for the duration of a call.
+  Pointer<Void> get _handle {
+    if (_disposed) throw StateError('Gadget used after dispose()');
+    return _ptr;
+  }
+
+  /// Mints a second strong reference (the interface's `_clone` symbol) for
+  /// an object token written into a value buffer.
+  Pointer<Void> _cloneRef() => _weaveffiKitchenGadgetClone(_handle);
+
+  /// Releases this instance's native reference. Safe to call more than
+  /// once; the native object is dropped when its last reference (this
+  /// one, any other wrapper's, or the producer's) is released.
   void dispose() {
-    _weaveffiKitchenGadgetDestroy(_handle);
+    if (_disposed) return;
+    _disposed = true;
+    _weaveffiKitchenGadgetDestroyFinalizer.detach(this);
+    _weaveffiKitchenGadgetDestroy(_ptr);
   }
 
   /// Create a gadget with the given id
+  ///
+  /// The returned object is owned by the caller: call its `dispose()` when
+  /// you are done with it.
   factory Gadget(int id) {
     final err = calloc<_WeaveFFIError>();
     try {
@@ -602,35 +793,6 @@ class Gadget {
       calloc.free(err);
     }
   }
-}
-
-typedef _NativeCb_weaveffi_kitchen_OnReady_fn = Void Function(Int32, Pointer<Utf8>, Pointer<Void>);
-
-typedef _NativeWeaveffiKitchenRegisterReadyListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_kitchen_OnReady_fn>>, Pointer<Void>);
-typedef _DartWeaveffiKitchenRegisterReadyListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_kitchen_OnReady_fn>>, Pointer<Void>);
-final _weaveffiKitchenRegisterReadyListener = _lib.lookupFunction<
-    _NativeWeaveffiKitchenRegisterReadyListener, _DartWeaveffiKitchenRegisterReadyListener>('weaveffi_kitchen_register_ready_listener');
-
-typedef _NativeWeaveffiKitchenUnregisterReadyListener = Void Function(Uint64);
-typedef _DartWeaveffiKitchenUnregisterReadyListener = void Function(int);
-final _weaveffiKitchenUnregisterReadyListener = _lib.lookupFunction<
-    _NativeWeaveffiKitchenUnregisterReadyListener, _DartWeaveffiKitchenUnregisterReadyListener>('weaveffi_kitchen_unregister_ready_listener');
-
-/// Subscribe to OnReady events
-/// Registers a OnReady listener. Returns a subscription id for unregisterReadyListener().
-int registerReadyListener(void Function(int code, String msg) callback) {
-  final callable = NativeCallable<_NativeCb_weaveffi_kitchen_OnReady_fn>.isolateLocal((int code, Pointer<Utf8> msg, Pointer<Void> context) {
-    callback(code, msg == nullptr ? '' : msg.toDartString());
-  });
-  final id = _weaveffiKitchenRegisterReadyListener(callable.nativeFunction, nullptr);
-  _listenerCallables[id] = callable;
-  return id;
-}
-
-/// Unregisters a listener previously registered with registerReadyListener().
-void unregisterReadyListener(int id) {
-  _weaveffiKitchenUnregisterReadyListener(id);
-  _listenerCallables.remove(id)?.close();
 }
 
 typedef _NativeWeaveffiKitchenBoolId = Bool Function(Bool, Pointer<_WeaveFFIError>);
@@ -759,63 +921,16 @@ List<int> echoBytes(List<int> b) {
   }
 }
 
-typedef _NativeWeaveffiKitchenEchoBorrowedStr = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKitchenEchoBorrowedStr = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
-final _weaveffiKitchenEchoBorrowedStr = _lib.lookupFunction<
-    _NativeWeaveffiKitchenEchoBorrowedStr, _DartWeaveffiKitchenEchoBorrowedStr>('weaveffi_kitchen_echo_borrowed_str');
+typedef _NativeWeaveffiKitchenSubscribe = Int32 Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenSubscribe = int Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenSubscribe = _lib.lookupFunction<
+    _NativeWeaveffiKitchenSubscribe, _DartWeaveffiKitchenSubscribe>('weaveffi_kitchen_subscribe');
 
-/// Borrowed string parameter
-String echoBorrowedStr(String s) {
-  final sPtr = s.toNativeUtf8();
+/// Register a listener, returning how many are attached
+int subscribe(ReadyListener listener) {
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenEchoBorrowedStr(sPtr, err);
-    _checkError(err);
-    final decoded = result.toDartString();
-    _weaveffiFreeString(result);
-    return decoded;
-  } finally {
-    calloc.free(sPtr);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKitchenEchoBorrowedBytes = Pointer<Uint8> Function(Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKitchenEchoBorrowedBytes = Pointer<Uint8> Function(Pointer<Uint8>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
-final _weaveffiKitchenEchoBorrowedBytes = _lib.lookupFunction<
-    _NativeWeaveffiKitchenEchoBorrowedBytes, _DartWeaveffiKitchenEchoBorrowedBytes>('weaveffi_kitchen_echo_borrowed_bytes');
-
-/// Borrowed bytes parameter
-List<int> echoBorrowedBytes(List<int> b) {
-  final bPtr = b.isEmpty ? nullptr : calloc<Uint8>(b.length);
-  for (var i = 0; i < b.length; i++) { bPtr[i] = b[i]; }
-  final outLen = calloc<Size>();
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKitchenEchoBorrowedBytes(bPtr, b.length, outLen, err);
-    _checkError(err);
-    final n = outLen.value;
-    if (result == nullptr) return <int>[];
-    final bytes = List<int>.generate(n, (i) => result[i]);
-    _weaveffiFreeBytes(result, n);
-    return bytes;
-  } finally {
-    if (bPtr != nullptr) calloc.free(bPtr);
-    calloc.free(outLen);
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiKitchenOpenHandle = Int64 Function(Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKitchenOpenHandle = int Function(Pointer<_WeaveFFIError>);
-final _weaveffiKitchenOpenHandle = _lib.lookupFunction<
-    _NativeWeaveffiKitchenOpenHandle, _DartWeaveffiKitchenOpenHandle>('weaveffi_kitchen_open_handle');
-
-/// Returns an opaque handle
-int openHandle() {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiKitchenOpenHandle(err);
+    final result = _weaveffiKitchenSubscribe(_registerCallback(listener), _ReadyListenerVtable.cast<Void>(), err);
     _checkError(err);
     return result;
   } finally {
@@ -823,19 +938,102 @@ int openHandle() {
   }
 }
 
-typedef _NativeWeaveffiKitchenOpenTypedHandle = Pointer<Void> Function(Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiKitchenOpenTypedHandle = Pointer<Void> Function(Pointer<_WeaveFFIError>);
-final _weaveffiKitchenOpenTypedHandle = _lib.lookupFunction<
-    _NativeWeaveffiKitchenOpenTypedHandle, _DartWeaveffiKitchenOpenTypedHandle>('weaveffi_kitchen_open_typed_handle');
+typedef _NativeWeaveffiKitchenMaybeGadget = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenMaybeGadget = Pointer<Void> Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenMaybeGadget = _lib.lookupFunction<
+    _NativeWeaveffiKitchenMaybeGadget, _DartWeaveffiKitchenMaybeGadget>('weaveffi_kitchen_maybe_gadget');
 
-/// Returns a typed handle
-Token openTypedHandle() {
+/// Optional object in both directions
+///
+/// Returns `null` when the producer reports no object. A non-null result
+/// is owned by the caller: call its `dispose()` when you are done with it.
+Gadget? maybeGadget(Gadget? fallback) {
   final err = calloc<_WeaveFFIError>();
   try {
-    final result = _weaveffiKitchenOpenTypedHandle(err);
+    final result = _weaveffiKitchenMaybeGadget(fallback?._handle ?? nullptr, err);
     _checkError(err);
-    return Token._(result);
+    return result == nullptr ? null : Gadget._(result);
   } finally {
+    calloc.free(err);
+  }
+}
+
+typedef _NativeWeaveffiKitchenGadgets = Pointer<Uint8> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenGadgets = Pointer<Uint8> Function(Pointer<Size>, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenGadgets = _lib.lookupFunction<
+    _NativeWeaveffiKitchenGadgets, _DartWeaveffiKitchenGadgets>('weaveffi_kitchen_gadgets');
+
+/// A list of objects
+List<Gadget> gadgets() {
+  final outLen = calloc<Size>();
+  final err = calloc<_WeaveFFIError>();
+  try {
+    final result = _weaveffiKitchenGadgets(outLen, err);
+    _checkError(err);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final decoded = List<Gadget>.generate(reader.readLength(), (_) => Gadget._(Pointer<Void>.fromAddress(reader.readUint64())));
+    reader.expectEnd();
+    return decoded;
+  } finally {
+    calloc.free(outLen);
+    calloc.free(err);
+  }
+}
+
+typedef _NativeWeaveffiKitchenStreamGadgets = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenStreamGadgets = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+final _weaveffiKitchenStreamGadgets = _lib.lookupFunction<
+    _NativeWeaveffiKitchenStreamGadgets, _DartWeaveffiKitchenStreamGadgets>('weaveffi_kitchen_stream_gadgets');
+
+typedef _NativeWeaveffiKitchenStreamGadgetsIteratorNext = Int32 Function(Pointer<Void>, Pointer<Pointer<Void>>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiKitchenStreamGadgetsIteratorNext = int Function(Pointer<Void>, Pointer<Pointer<Void>>, Pointer<_WeaveFFIError>);
+final _weaveffiKitchenStreamGadgetsIteratorNext = _lib.lookupFunction<
+    _NativeWeaveffiKitchenStreamGadgetsIteratorNext, _DartWeaveffiKitchenStreamGadgetsIteratorNext>('weaveffi_kitchen_StreamGadgetsIterator_next');
+
+typedef _NativeWeaveffiKitchenStreamGadgetsIteratorDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiKitchenStreamGadgetsIteratorDestroy = void Function(Pointer<Void>);
+final _weaveffiKitchenStreamGadgetsIteratorDestroy = _lib.lookupFunction<
+    _NativeWeaveffiKitchenStreamGadgetsIteratorDestroy, _DartWeaveffiKitchenStreamGadgetsIteratorDestroy>('weaveffi_kitchen_StreamGadgetsIterator_destroy');
+final _weaveffiKitchenStreamGadgetsIteratorDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_kitchen_StreamGadgetsIterator_destroy'));
+
+/// An iterator over objects
+///
+/// Returns a lazy [Iterable]: elements are pulled from the native
+/// iterator one at a time (one native `next` call per element), and
+/// iterating the result again launches a fresh native iterator.
+///
+/// The native iterator handle is destroyed exactly once: eagerly when
+/// the iteration completes or fails, or by a GC finalizer if the
+/// iteration is abandoned before it is exhausted.
+///
+/// Each yielded element is owned by the caller: call its `dispose()`
+/// when you are done with it.
+Iterable<Gadget> streamGadgets() sync* {
+  final err = calloc<_WeaveFFIError>();
+  final outItem = calloc<Pointer<Void>>();
+  Pointer<Void> iter = nullptr;
+  final anchor = _IteratorLifetime();
+  try {
+    iter = _weaveffiKitchenStreamGadgets(err);
+    _checkError(err);
+    _weaveffiKitchenStreamGadgetsIteratorDestroyFinalizer.attach(anchor, iter, detach: anchor);
+    while (_weaveffiKitchenStreamGadgetsIteratorNext(iter, outItem, err) != 0) {
+      _checkError(err);
+      final itemPtr = outItem.value;
+      yield Gadget._(itemPtr);
+    }
+    _checkError(err);
+  } finally {
+    if (iter != nullptr) {
+      _weaveffiKitchenStreamGadgetsIteratorDestroyFinalizer.detach(anchor);
+      _weaveffiKitchenStreamGadgetsIteratorDestroy(iter);
+      iter = nullptr;
+    }
+    calloc.free(outItem);
     calloc.free(err);
   }
 }

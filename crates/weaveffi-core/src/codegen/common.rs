@@ -160,8 +160,7 @@ mod tests {
             interfaces: vec![],
             structs: vec![],
             enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
+            callback_interfaces: vec![],
             errors: None,
             modules: vec![],
         }

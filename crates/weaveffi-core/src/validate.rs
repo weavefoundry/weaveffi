@@ -98,12 +98,12 @@ pub enum ValidationError {
         /// Conflicting numeric error code.
         code: i32,
     },
-    /// An error code uses a reserved value: `0` means success and `-2` is the
-    /// panic code the runtime reports when a producer panics.
+    /// An error code uses a reserved value: `0` means success and the
+    /// negative range belongs to the runtime's trap codes.
     #[error("invalid error code in module '{module}' for '{name}': must be a positive integer")]
     #[diagnostic(help(
         "0 means success and negative codes are reserved for the runtime (-1 generic, \
-         -2 panic, -3 marshalling failure); use a positive integer"
+         -2 panic, -3 marshalling failure, -4 foreign callback error); use a positive integer"
     ))]
     InvalidErrorCode {
         /// Module that contains the error domain.
@@ -152,7 +152,8 @@ pub enum ValidationError {
         /// Function marked `throws` with no domain in scope.
         function: String,
     },
-    /// Two types (structs, enums, or interfaces) share a bare name.
+    /// Two types (structs, enums, interfaces, or callback interfaces) share a
+    /// bare name.
     ///
     /// Type names must be unique across the whole API: generators emit flat
     /// per-language type names, and unqualified cross-module references
@@ -160,8 +161,8 @@ pub enum ValidationError {
     /// generated code and make references ambiguous.
     #[error("duplicate type name '{name}' (declared in '{first}' and '{second}')")]
     #[diagnostic(help(
-        "struct, enum, interface, and error domain names must be unique across the whole \
-         API; rename one of the declarations"
+        "struct, enum, interface, callback interface, and error domain names must be unique \
+         across the whole API; rename one of the declarations"
     ))]
     DuplicateTypeName {
         /// The colliding bare type name.
@@ -326,12 +327,11 @@ pub enum ValidationError {
         /// The offending constructor.
         constructor: String,
     },
-    /// An interface reference appears in a position the ABI cannot support.
+    /// An interface reference appears as a map key.
     #[error("interface type '{name}' is not valid in {location}")]
     #[diagnostic(help(
-        "interface objects may appear as function parameters, return types, and \
-         optionals of those; they cannot be struct fields, collection elements, \
-         map keys/values, or callback parameters"
+        "interface objects may appear anywhere except as map keys; key a map by a scalar, \
+         string, or C-style enum instead"
     ))]
     InterfaceInInvalidPosition {
         /// The referenced interface name.
@@ -339,83 +339,23 @@ pub enum ValidationError {
         /// Position where the interface reference appeared.
         location: String,
     },
-    /// A type reference names a struct, enum, or interface that doesn't exist.
+    /// A type reference names a struct, enum, interface, or callback interface
+    /// that doesn't exist.
     #[error("unknown type reference: {name}")]
-    #[diagnostic(help("define a struct, enum, or interface with this name, or check for typos"))]
+    #[diagnostic(help(
+        "define a struct, enum, interface, or callback interface with this name, or check \
+         for typos"
+    ))]
     UnknownTypeRef {
         /// Unresolved type name.
         name: String,
     },
     /// A map uses a key type the C ABI can't represent.
-    #[error("invalid map key type: {key_type}; only primitive types and strings are allowed as map keys")]
-    #[diagnostic(help("map keys must be primitive types (i32, u32, i64, f64, bool, string); structs, lists, and maps cannot be keys"))]
+    #[error("invalid map key type: {key_type}; only scalars, strings, and C-style enums are allowed as map keys")]
+    #[diagnostic(help("map keys must be integers (i8 through u64), f32, f64, bool, string, or a C-style enum; structs, rich enums, interfaces, optionals, lists, and maps cannot be keys"))]
     InvalidMapKey {
         /// Rejected key type, rendered as it appears in the IDL.
         key_type: String,
-    },
-    /// A borrowed type appears somewhere other than a function parameter.
-    #[error(
-        "borrowed type '{ty}' is not valid in {location}; only function parameters are allowed"
-    )]
-    #[diagnostic(help("borrowed types (&str, &[u8]) can only be used as function parameters, not return types or struct fields"))]
-    BorrowedTypeInInvalidPosition {
-        /// Borrowed type that was rejected.
-        ty: String,
-        /// Position where the borrowed type appeared.
-        location: String,
-    },
-    /// Two callbacks in the same module share a name.
-    #[error("duplicate callback name in module '{module}': {name}")]
-    #[diagnostic(help("callback names must be unique within a module; rename the duplicate"))]
-    DuplicateCallbackName {
-        /// Module that contains the callbacks.
-        module: String,
-        /// Duplicated callback name.
-        name: String,
-    },
-    /// A listener references a callback that isn't defined in its module.
-    #[error(
-        "listener '{listener}' in module '{module}' references undefined callback '{callback}'"
-    )]
-    #[diagnostic(help(
-        "listener event_callback must reference a callback defined in the same module"
-    ))]
-    ListenerCallbackNotFound {
-        /// Module that contains the listener.
-        module: String,
-        /// Listener with the dangling reference.
-        listener: String,
-        /// Callback name that could not be resolved.
-        callback: String,
-    },
-    /// Two listeners in the same module share a name.
-    #[error("duplicate listener name in module '{module}': {name}")]
-    #[diagnostic(help("listener names must be unique within a module; rename the duplicate"))]
-    DuplicateListenerName {
-        /// Module that contains the listeners.
-        module: String,
-        /// Duplicated listener name.
-        name: String,
-    },
-    /// A callback parameter uses a type that can't cross the callback ABI.
-    #[error(
-        "callback '{callback}' in module '{module}' has parameter '{param}' with unsupported \
-         type '{ty}'"
-    )]
-    #[diagnostic(help(
-        "callback parameters are limited to scalars, bool, enums, string, bytes, handles, \
-         structs, optionals of those, lists of scalars/strings, and maps of scalars/strings; \
-         every target must be able to marshal a callback argument without an FFI round-trip"
-    ))]
-    UnsupportedCallbackParamType {
-        /// Module that contains the callback.
-        module: String,
-        /// Callback that declares the parameter.
-        callback: String,
-        /// Parameter with the unsupported type.
-        param: String,
-        /// Offending type, rendered as it appears in the IDL.
-        ty: String,
     },
     /// An iterator type appears somewhere other than a function return.
     #[error("iterator type is only valid as a function return type, found in {location}")]
@@ -424,21 +364,69 @@ pub enum ValidationError {
         /// Position where the iterator type appeared.
         location: String,
     },
-    /// A parameter declares `mutable: true` with a type that has no
-    /// write-back lowering.
-    #[error("parameter '{param}' of '{function}' cannot be mutable: type '{ty}' has no write-back lowering")]
+    /// Two callback interfaces in the same module share a name.
+    #[error("duplicate callback interface name in module '{module}': {name}")]
     #[diagnostic(help(
-        "only string and bytes parameters support mutable: true; buffered types (records, \
-         rich enums, optionals, lists, maps) cross the ABI as borrowed serialized buffers \
-         and cannot be written back"
+        "callback interface names must be unique within a module; rename the duplicate"
     ))]
-    MutableParamUnsupported {
-        /// Callable that declares the parameter.
-        function: String,
-        /// Parameter marked mutable.
-        param: String,
-        /// The parameter's type, rendered as it appears in the IDL.
-        ty: String,
+    DuplicateCallbackInterfaceName {
+        /// Module that contains the callback interfaces.
+        module: String,
+        /// Duplicated callback interface name.
+        name: String,
+    },
+    /// A callback interface declares no methods.
+    #[error("empty callback interface in module '{module}': {name}")]
+    #[diagnostic(help(
+        "callback interfaces must declare at least one method; add a method or remove the \
+         callback interface"
+    ))]
+    EmptyCallbackInterface {
+        /// Module that contains the callback interface.
+        module: String,
+        /// Name of the empty callback interface.
+        name: String,
+    },
+    /// Two methods of one callback interface share a name.
+    #[error("duplicate method name in callback interface '{interface}': {name}")]
+    #[diagnostic(help(
+        "method names must be unique within a callback interface; rename the duplicate"
+    ))]
+    DuplicateCallbackMethod {
+        /// Callback interface that contains the colliding methods.
+        interface: String,
+        /// Duplicated method name.
+        name: String,
+    },
+    /// A callback-interface method uses a flag or return type the callback
+    /// ABI can't carry. The `reason` names the offending feature.
+    #[error("method '{method}' of callback interface '{interface}' {reason}")]
+    #[diagnostic(help(
+        "callback-interface methods are synchronous, never throw, and return either nothing \
+         or a direct value (a scalar, bool, or C-style enum): the consumer implements them, \
+         so no producer-owned allocation or error payload can flow back"
+    ))]
+    InvalidCallbackMethod {
+        /// Callback interface that declares the method.
+        interface: String,
+        /// The offending method.
+        method: String,
+        /// Why the method was rejected.
+        reason: &'static str,
+    },
+    /// A callback-interface type appears in a position other than a callable
+    /// parameter.
+    #[error("callback interface '{name}' is not valid in {location}")]
+    #[diagnostic(help(
+        "a callback interface is a consumer-implemented vtable: it may be passed as a \
+         parameter of a function, constructor, static, or method, but it can't be returned, \
+         nested inside another type, or passed to another callback-interface method"
+    ))]
+    CallbackInterfaceInInvalidPosition {
+        /// The referenced callback interface name.
+        name: String,
+        /// Position where the reference appeared.
+        location: String,
     },
     /// An async function tries to return an iterator, which has no async ABI.
     #[error("async function '{module}::{function}' cannot return an iterator")]

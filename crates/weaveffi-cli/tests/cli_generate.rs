@@ -30,8 +30,8 @@ fn generate_produces_expected_files() {
         "missing swift/Package.swift"
     );
     assert!(
-        out_path.join("android/build.gradle").exists(),
-        "missing android/build.gradle"
+        out_path.join("kotlin/build.gradle.kts").exists(),
+        "missing kotlin/build.gradle.kts"
     );
     assert!(
         out_path.join("node/types.d.ts").exists(),

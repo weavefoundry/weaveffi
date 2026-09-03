@@ -1,0 +1,26 @@
+[package]
+name = "codec"
+version = "1.0.0"
+description = "Value-buffer round-trip oracle covering every wire shape."
+license = "MIT"
+authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
+homepage = "https://github.com/weavefoundry/weaveffi"
+repository = "https://github.com/weavefoundry/weaveffi"
+
+[generators.ruby]
+module_name = "Codec"
+
+[generators.dotnet]
+namespace = "Codec"
+
+[generators.swift]
+module_name = "Codec"
+
+[generators.cpp]
+namespace = "codec"
+
+[generators.dart]
+package_name = "codec"
+
+[generators.go]
+module_path = "github.com/example/codec"

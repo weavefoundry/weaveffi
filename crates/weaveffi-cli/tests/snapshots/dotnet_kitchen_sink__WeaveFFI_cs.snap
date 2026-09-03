@@ -10,12 +10,26 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace WeaveFFI
 {
+    /// <summary>Raised for any WeaveFFI failure that isn't a typed domain
+    /// error: producer bugs, panics, marshalling failures, and exceptions
+    /// thrown by a callback-interface implementation.</summary>
     public class WeaveFFIException : Exception
     {
+        /// <summary>An untyped producer error.</summary>
+        public const int GenericErrorCode = -1;
+        /// <summary>The producer panicked; the message carries the panic text.</summary>
+        public const int PanicErrorCode = -2;
+        /// <summary>An argument couldn't be lifted by the producer.</summary>
+        public const int MarshalErrorCode = -3;
+        /// <summary>A callback-interface implementation threw; the message
+        /// carries the original exception's message.</summary>
+        public const int ForeignErrorCode = -4;
+
         public int Code { get; }
 
         public WeaveFFIException(int code, string message) : base(message)
@@ -93,6 +107,20 @@ namespace WeaveFFI
                 NativeMethods.weaveffi_error_clear(ref err);
                 throw KitchenErrorsException.FromCode(code, msg, payload);
             }
+        }
+    }
+
+    /// <summary>One strong reference to a native object, on its way into
+    /// a wrapper that adopts it. A distinct type (rather than a bare
+    /// <c>IntPtr</c>) so the adopting constructor never competes with a
+    /// public constructor taking an integer.</summary>
+    internal readonly struct WeaveFFIHandle
+    {
+        internal readonly IntPtr Value;
+
+        internal WeaveFFIHandle(IntPtr value)
+        {
+            Value = value;
         }
     }
 
@@ -225,6 +253,11 @@ namespace WeaveFFI
             Ensure(v.Length);
             Array.Copy(v, 0, _buf, _len, v.Length);
             _len += v.Length;
+        }
+
+        internal void WriteObject(IntPtr token)
+        {
+            WriteU64((ulong)(nuint)(nint)token);
         }
 
         internal byte[] ToArray()
@@ -373,23 +406,22 @@ namespace WeaveFFI
             return outBuf;
         }
 
+        internal IntPtr ReadObject()
+        {
+            var token = ReadU64();
+            if (token == 0)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: null object token");
+            }
+            return (nint)(nuint)token;
+        }
+
         internal void ExpectEnd()
         {
             if (_pos != _data.Length)
             {
                 throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
             }
-        }
-    }
-
-    /// <summary>A typed native handle referencing a Token.</summary>
-    public readonly struct TokenHandle
-    {
-        internal readonly IntPtr Raw;
-
-        internal TokenHandle(IntPtr raw)
-        {
-            Raw = raw;
         }
     }
 
@@ -493,7 +525,10 @@ namespace WeaveFFI
 
         public Priority Priority { get; }
 
-        public Item(long id, string name, int count, bool enabled, double ratio, uint nick, byte[] payload, string[] tags, Dictionary<string, string> attrs, long? parent, Token token, Priority priority)
+        /// <summary>An optional object inside a record</summary>
+        public Gadget? Gadget { get; }
+
+        public Item(long id, string name, int count, bool enabled, double ratio, uint nick, byte[] payload, string[] tags, Dictionary<string, string> attrs, long? parent, Token token, Priority priority, Gadget? gadget)
         {
             Id = id;
             Name = name;
@@ -507,6 +542,7 @@ namespace WeaveFFI
             Parent = parent;
             Token = token;
             Priority = priority;
+            Gadget = gadget;
         }
 
         internal void WriteTo(WeaveFFIBufferWriter writer)
@@ -540,6 +576,15 @@ namespace WeaveFFI
             }
             Token.WriteTo(writer);
             writer.WriteI32((int)Priority);
+            if (Gadget != null)
+            {
+                writer.WriteOptionFlag(true);
+                writer.WriteObject(Gadget!.CloneHandle());
+            }
+            else
+            {
+                writer.WriteOptionFlag(false);
+            }
         }
 
         internal static Item ReadFrom(WeaveFFIBufferReader reader)
@@ -574,7 +619,104 @@ namespace WeaveFFI
             }
             var fToken = Token.ReadFrom(reader);
             var fPriority = (Priority)reader.ReadI32();
-            return new Item(fId, fName, fCount, fEnabled, fRatio, fNick, fPayload, fTags, fAttrs, fParent, fToken, fPriority);
+            Gadget? fGadget = null;
+            if (reader.ReadOptionFlag())
+            {
+                var fGadgetValue = new Gadget(new WeaveFFIHandle(reader.ReadObject()));
+                fGadget = fGadgetValue;
+            }
+            return new Item(fId, fName, fCount, fEnabled, fRatio, fNick, fPayload, fTags, fAttrs, fParent, fToken, fPriority, fGadget);
+        }
+    }
+
+    /// <summary>Consumer-implemented observer of ready items</summary>
+    /// <remarks>Implement this interface and pass an instance wherever the
+    /// native library expects it. The library may call any method from any
+    /// thread until it releases its last reference to the instance. Object
+    /// arguments are owned by the implementation, which should dispose them
+    /// when done. An exception thrown by a method is reported to the native
+    /// caller as <see cref="WeaveFFIException.ForeignErrorCode"/>.</remarks>
+    public interface IReadyListener
+    {
+        /// <summary>Fires when an item is ready</summary>
+        void OnReady(int code, string msg);
+        /// <summary>Receives the item itself and says whether to keep listening</summary>
+        bool OnItem(Item item, Gadget gadget);
+    }
+
+    /// <summary>The process-wide <c>weaveffi_kitchen_ReadyListener_vtable</c> vtable and the trampolines behind
+    /// it, adapting an <see cref="IReadyListener"/> to the C ABI.</summary>
+    internal static unsafe class WeaveFFIVtable_kitchen_ReadyListener
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Layout
+        {
+            public IntPtr on_ready;
+            public IntPtr on_item;
+            public IntPtr free;
+        }
+
+        /// <summary>Address of the one static vtable for this interface. It is
+        /// allocated once and never freed, so the producer may keep the pointer
+        /// for the process lifetime.</summary>
+        internal static readonly IntPtr Pointer = Allocate();
+
+        private static IntPtr Allocate()
+        {
+            var layout = new Layout
+            {
+                on_ready = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, int, IntPtr, IntPtr, void>)&OnReadyTrampoline,
+                on_item = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, UIntPtr, IntPtr, IntPtr, byte>)&OnItemTrampoline,
+                free = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, void>)&FreeTrampoline,
+            };
+            var mem = Marshal.AllocHGlobal(Marshal.SizeOf<Layout>());
+            Marshal.StructureToPtr(layout, mem, false);
+            return mem;
+        }
+
+        private static IReadyListener Target(IntPtr ctx)
+        {
+            return (IReadyListener)GCHandle.FromIntPtr(ctx).Target!;
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void OnReadyTrampoline(IntPtr ctx, int code, IntPtr msg, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                impl.OnReady(code, Marshal.PtrToStringUTF8(msg) ?? "");
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static byte OnItemTrampoline(IntPtr ctx, IntPtr item_ptr, UIntPtr item_len, IntPtr gadget, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                var arg0Buf = new byte[(int)item_len];
+                if (item_ptr != IntPtr.Zero && (int)item_len > 0) Marshal.Copy(item_ptr, arg0Buf, 0, (int)item_len);
+                var arg0Reader = new WeaveFFIBufferReader(arg0Buf);
+                var arg0 = Item.ReadFrom(arg0Reader);
+                arg0Reader.ExpectEnd();
+                return (byte)(impl.OnItem(arg0, new Gadget(new WeaveFFIHandle(gadget))) ? 1 : 0);
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+                return default;
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void FreeTrampoline(IntPtr ctx)
+        {
+            GCHandle.FromIntPtr(ctx).Free();
         }
     }
 
@@ -582,14 +724,35 @@ namespace WeaveFFI
     public class Gadget : IDisposable
     {
         private IntPtr _handle;
-        private bool _disposed;
+        private int _released;
 
-        internal Gadget(IntPtr handle)
+        /// <summary>Adopts one strong reference to a native object.</summary>
+        internal Gadget(WeaveFFIHandle handle)
         {
-            _handle = handle;
+            _handle = handle.Value;
         }
 
-        internal IntPtr Handle => _handle;
+        /// <summary>The borrowed native pointer for the duration of a call.</summary>
+        /// <exception cref="ObjectDisposedException">The wrapper was disposed.</exception>
+        internal IntPtr Handle
+        {
+            get
+            {
+                var h = _handle;
+                if (h == IntPtr.Zero)
+                {
+                    throw new ObjectDisposedException(nameof(Gadget));
+                }
+                return h;
+            }
+        }
+
+        /// <summary>Mints a second strong reference the caller owns (for
+        /// example to write this object into a value buffer).</summary>
+        internal IntPtr CloneHandle()
+        {
+            return NativeMethods.weaveffi_kitchen_Gadget_clone(Handle);
+        }
 
         /// <summary>Create a gadget with the given id</summary>
         public Gadget(long id)
@@ -604,7 +767,7 @@ namespace WeaveFFI
         public string Describe()
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kitchen_Gadget_describe(_handle, ref err);
+            var result = NativeMethods.weaveffi_kitchen_Gadget_describe(Handle, ref err);
             WeaveFFIError.Check(err);
             var str = Marshal.PtrToStringUTF8(result);
             NativeMethods.weaveffi_free_string(result);
@@ -616,7 +779,7 @@ namespace WeaveFFI
         public int Poke(int times)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kitchen_Gadget_poke(_handle, times, ref err);
+            var result = NativeMethods.weaveffi_kitchen_Gadget_poke(Handle, times, ref err);
             WeaveFFIError.CheckKitchenErrors(err);
             return result;
         }
@@ -632,19 +795,32 @@ namespace WeaveFFI
             return str ?? "";
         }
 
+        /// <summary>Releases this wrapper's reference. The native object is
+        /// dropped when the producer releases its last reference; other
+        /// wrappers to the same object stay valid.</summary>
         public void Dispose()
         {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_kitchen_Gadget_destroy(_handle);
-                _disposed = true;
-            }
+            Release();
             GC.SuppressFinalize(this);
         }
 
         ~Gadget()
         {
-            Dispose();
+            Release();
+        }
+
+        private void Release()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _released, 1) != 0)
+            {
+                return;
+            }
+            var h = _handle;
+            _handle = IntPtr.Zero;
+            if (h != IntPtr.Zero)
+            {
+                NativeMethods.weaveffi_kitchen_Gadget_destroy(h);
+            }
         }
     }
 
@@ -653,7 +829,7 @@ namespace WeaveFFI
         private const string LibName = "weaveffi";
 
         // The ABI revision these bindings were generated against.
-        internal const uint AbiVersion = 1;
+        internal const uint AbiVersion = 2;
 
         // Runs before the first P/Invoke through this class, so a producer built
         // for a different ABI revision fails loudly instead of misreading the
@@ -680,6 +856,12 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern uint weaveffi_abi_version();
 
+        // Fills a producer-owned error slot with a copy of `message`; callback
+        // trampolines report a thrown exception through it so no managed
+        // allocation is ever handed to the producer's allocator.
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_set(IntPtr err, int code, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_string(IntPtr ptr);
 
@@ -693,73 +875,73 @@ namespace WeaveFFI
         internal static extern void weaveffi_error_free(IntPtr err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shared_ping", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shared_ping(ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shared_ping(ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_clone", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_Gadget_clone(IntPtr self);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_kitchen_Gadget_destroy(IntPtr self);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_Gadget_new(long id, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_Gadget_new(long id, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_describe", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_Gadget_describe(IntPtr self, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_Gadget_describe(IntPtr self, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_poke", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_Gadget_poke(IntPtr self, int times, ref WeaveFFIError err);
+        internal static extern int weaveffi_kitchen_Gadget_poke(IntPtr self, int times, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_Gadget_version", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_Gadget_version(ref WeaveFFIError err);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void Cb_weaveffi_kitchen_OnReady_fn(int code, IntPtr msg, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_register_ready_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_kitchen_register_ready_listener(Cb_weaveffi_kitchen_OnReady_fn callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_unregister_ready_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_kitchen_unregister_ready_listener(ulong id);
+        internal static extern IntPtr weaveffi_kitchen_Gadget_version(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_bool_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern byte weaveffi_kitchen_bool_id(byte x, ref WeaveFFIError err);
+        internal static extern byte weaveffi_kitchen_bool_id(byte x, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_i32_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_i32_id(int x, ref WeaveFFIError err);
+        internal static extern int weaveffi_kitchen_i32_id(int x, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_u32_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern uint weaveffi_kitchen_u32_id(uint x, ref WeaveFFIError err);
+        internal static extern uint weaveffi_kitchen_u32_id(uint x, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_i64_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern long weaveffi_kitchen_i64_id(long x, ref WeaveFFIError err);
+        internal static extern long weaveffi_kitchen_i64_id(long x, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_f64_id", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern double weaveffi_kitchen_f64_id(double x, ref WeaveFFIError err);
+        internal static extern double weaveffi_kitchen_f64_id(double x, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_string", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_string(IntPtr s, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_echo_string(IntPtr s, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_echo_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveFFIError out_err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_borrowed_str", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_borrowed_str(IntPtr s, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_subscribe", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kitchen_subscribe(IntPtr listener_ctx, IntPtr listener_vtable, ref WeaveFFIError out_err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_echo_borrowed_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_echo_borrowed_bytes(IntPtr b_ptr, UIntPtr b_len, out UIntPtr out_len, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_maybe_gadget", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_maybe_gadget(IntPtr fallback, ref WeaveFFIError out_err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_open_handle", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_kitchen_open_handle(ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_gadgets", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_gadgets(out UIntPtr out_len, ref WeaveFFIError out_err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_open_typed_handle", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_open_typed_handle(ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_stream_gadgets", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_kitchen_stream_gadgets(ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_StreamGadgetsIterator_next", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_kitchen_StreamGadgetsIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_kitchen_StreamGadgetsIterator_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_kitchen_StreamGadgetsIterator_destroy(IntPtr iter);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_maybe_item", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_maybe_item(long id, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_maybe_item(long id, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_list_items", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_list_items(out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_list_items(out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_get_attrs", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_get_attrs(out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_get_attrs(out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_stream_items", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_kitchen_stream_items(ref WeaveFFIError out_err);
@@ -771,7 +953,7 @@ namespace WeaveFFI
         internal static extern void weaveffi_kitchen_StreamItemsIterator_destroy(IntPtr iter);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_cross_module_token", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_cross_module_token(out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_cross_module_token(out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_kitchen_do_async(IntPtr context, IntPtr err, IntPtr result);
@@ -786,13 +968,13 @@ namespace WeaveFFI
         internal static extern void weaveffi_kitchen_do_cancellable_async(IntPtr input, IntPtr cancel_token, AsyncCb_weaveffi_kitchen_do_cancellable callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_legacy_op", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_legacy_op(ref WeaveFFIError err);
+        internal static extern int weaveffi_kitchen_legacy_op(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_new_op", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_kitchen_new_op(ref WeaveFFIError err);
+        internal static extern int weaveffi_kitchen_new_op(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_kitchen_nested_hello", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_kitchen_nested_hello(ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_kitchen_nested_hello(ref WeaveFFIError out_err);
 
     }
 
@@ -813,39 +995,6 @@ namespace WeaveFFI
 
     public static class Kitchen
     {
-        private static readonly object _listenerLock = new object();
-        // Live listener delegates by subscription id. Holding the delegate
-        // here keeps its native thunk alive until unregistered; without this
-        // the GC could collect a delegate the producer still calls.
-        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
-
-        /// <summary>Subscribe to OnReady events</summary>
-        /// <returns>A subscription id for UnregisterReadyListener().</returns>
-        public static ulong RegisterReadyListener(Action<int, string> callback)
-        {
-            NativeMethods.Cb_weaveffi_kitchen_OnReady_fn trampoline = (code, msg, context) =>
-            {
-                callback(code, Marshal.PtrToStringUTF8(msg) ?? "");
-            };
-            ulong id;
-            lock (_listenerLock)
-            {
-                id = NativeMethods.weaveffi_kitchen_register_ready_listener(trampoline, IntPtr.Zero);
-                _listenerRefs[id] = trampoline;
-            }
-            return id;
-        }
-
-        /// <summary>Unregisters a listener previously registered with RegisterReadyListener().</summary>
-        public static void UnregisterReadyListener(ulong id)
-        {
-            NativeMethods.weaveffi_kitchen_unregister_ready_listener(id);
-            lock (_listenerLock)
-            {
-                _listenerRefs.Remove(id);
-            }
-        }
-
         /// <summary>Identity for bool</summary>
         public static bool BoolId(bool x)
         {
@@ -925,62 +1074,80 @@ namespace WeaveFFI
             }
         }
 
-        /// <summary>Borrowed string parameter</summary>
-        public static string EchoBorrowedStr(string s)
+        /// <summary>Register a listener, returning how many are attached</summary>
+        public static int Subscribe(IReadyListener listener)
         {
             var err = new WeaveFFIError();
-            var sPtr = Marshal.StringToCoTaskMemUTF8(s);
-            try
-            {
-                var result = NativeMethods.weaveffi_kitchen_echo_borrowed_str(sPtr, ref err);
-                WeaveFFIError.Check(err);
-                var str = Marshal.PtrToStringUTF8(result);
-                NativeMethods.weaveffi_free_string(result);
-                return str ?? "";
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(sPtr);
-            }
-        }
-
-        /// <summary>Borrowed bytes parameter</summary>
-        public static byte[] EchoBorrowedBytes(byte[] b)
-        {
-            var err = new WeaveFFIError();
-            var bPin = GCHandle.Alloc(b, GCHandleType.Pinned);
-            try
-            {
-                var result = NativeMethods.weaveffi_kitchen_echo_borrowed_bytes(bPin.AddrOfPinnedObject(), (UIntPtr)b.Length, out var outLen, ref err);
-                WeaveFFIError.Check(err);
-                if (result == IntPtr.Zero) return Array.Empty<byte>();
-                var arr = new byte[(int)outLen];
-                Marshal.Copy(result, arr, 0, (int)outLen);
-                NativeMethods.weaveffi_free_bytes(result, outLen);
-                return arr;
-            }
-            finally
-            {
-                bPin.Free();
-            }
-        }
-
-        /// <summary>Returns an opaque handle</summary>
-        public static ulong OpenHandle()
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kitchen_open_handle(ref err);
+            var listenerCtx = GCHandle.ToIntPtr(GCHandle.Alloc(listener));
+            var result = NativeMethods.weaveffi_kitchen_subscribe(listenerCtx, WeaveFFIVtable_kitchen_ReadyListener.Pointer, ref err);
             WeaveFFIError.Check(err);
             return result;
         }
 
-        /// <summary>Returns a typed handle</summary>
-        public static TokenHandle OpenTypedHandle()
+        /// <summary>Optional object in both directions</summary>
+        public static Gadget? MaybeGadget(Gadget? fallback)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_kitchen_open_typed_handle(ref err);
+            var result = NativeMethods.weaveffi_kitchen_maybe_gadget(fallback?.Handle ?? IntPtr.Zero, ref err);
             WeaveFFIError.Check(err);
-            return new TokenHandle(result);
+            return result == IntPtr.Zero ? null : new Gadget(new WeaveFFIHandle(result));
+        }
+
+        /// <summary>A list of objects</summary>
+        public static Gadget[] Gadgets()
+        {
+            var err = new WeaveFFIError();
+            var result = NativeMethods.weaveffi_kitchen_gadgets(out var outLen, ref err);
+            WeaveFFIError.Check(err);
+            var resultBuf = new byte[(int)outLen];
+            if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+            NativeMethods.weaveffi_free_bytes(result, outLen);
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decodedCount = decodedReader.ReadLen();
+            var decoded = new Gadget[decodedCount];
+            for (int i0 = 0; i0 < decodedCount; i0++)
+            {
+                var decodedItem = new Gadget(new WeaveFFIHandle(decodedReader.ReadObject()));
+                decoded[i0] = decodedItem;
+            }
+            decodedReader.ExpectEnd();
+            return decoded;
+        }
+
+        /// <summary>An iterator over objects</summary>
+        /// <remarks>Streams lazily: each element is pulled from the native
+        /// iterator on demand, and the iterator is destroyed when enumeration
+        /// completes or the enumerator is disposed (a <c>foreach</c> disposes it
+        /// automatically, including on early exit). The returned sequence can be
+        /// enumerated only once.</remarks>
+        public static IEnumerable<Gadget> StreamGadgets()
+        {
+            var err = new WeaveFFIError();
+            var iter = NativeMethods.weaveffi_kitchen_stream_gadgets(ref err);
+            WeaveFFIError.Check(err);
+            return new WeaveFFIOnceEnumerable<Gadget>(EnumerateStreamGadgets(iter));
+        }
+
+        private static IEnumerator<Gadget> EnumerateStreamGadgets(IntPtr iter)
+        {
+            try
+            {
+                while (true)
+                {
+                    var iterErr = new WeaveFFIError();
+                    if (NativeMethods.weaveffi_kitchen_StreamGadgetsIterator_next(iter, out var out_item, ref iterErr) == 0)
+                    {
+                        WeaveFFIError.Check(iterErr);
+                        yield break;
+                    }
+                    WeaveFFIError.Check(iterErr);
+                    yield return new Gadget(new WeaveFFIHandle(out_item));
+                }
+            }
+            finally
+            {
+                NativeMethods.weaveffi_kitchen_StreamGadgetsIterator_destroy(iter);
+            }
         }
 
         /// <summary>Optional struct return</summary>

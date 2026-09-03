@@ -32,7 +32,7 @@ module WeaveFFI
   # The ABI revision these bindings were generated against. Checked before any
   # other symbol is attached so a mismatched producer fails at require time
   # instead of misreading the error struct or a value buffer later.
-  ABI_VERSION = 1
+  ABI_VERSION = 2
   begin
     attach_function :weaveffi_abi_version, [], :uint32
   rescue FFI::NotFoundError
@@ -51,6 +51,16 @@ module WeaveFFI
            :payload_ptr, :pointer,
            :payload_len, :size_t
   end
+
+  # The runtime-reserved error codes. Positive codes belong to a module's
+  # declared error domain; these negative codes are programming errors the
+  # wrappers raise as a plain Error regardless of the function's `throws`.
+  GENERIC_ERROR_CODE = -1
+  PANIC_ERROR_CODE = -2
+  MARSHAL_ERROR_CODE = -3
+  # A callback-interface implementation raised; the message carries the
+  # exception text.
+  FOREIGN_ERROR_CODE = -4
 
   class Error < StandardError
     attr_reader :code
@@ -225,12 +235,21 @@ module WeaveFFI
       take(read_len, 'byte buffer')
     end
 
+    # An object token: a non-zero u64 carrying one strong reference the
+    # caller adopts into a wrapper.
+    def read_object_token
+      addr = read_u64
+      raise Error.new(-1, 'malformed value buffer: null object token') if addr.zero?
+      FFI::Pointer.new(addr)
+    end
+
     def expect_end!
       return if @pos == @data.bytesize
       raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
+  attach_function :weaveffi_error_set, [:pointer, :int32, :string], :void
   attach_function :weaveffi_error_clear, [:pointer], :void
   attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
@@ -240,15 +259,51 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_error_clear(err.to_ptr)
     raise Error.new(code, msg)
   end
 
-  # Registered listener trampolines, keyed by subscription id. Holding the
-  # FFI::Function objects here keeps them alive until unregistered; without
-  # this the GC could collect a trampoline the producer still calls.
-  @listener_refs = {}
+  # Live callback-interface implementations keyed by the Integer the producer
+  # holds as `ctx`. Keys start at 1 so a context pointer is never NULL.
+  @wv_cb_registry = {}
+  @wv_cb_next_key = 0
+  @wv_cb_mutex = Mutex.new
+
+  # @api private
+  # Registers `impl` and returns the `ctx` pointer to hand the producer.
+  def self._wv_cb_register(impl)
+    @wv_cb_mutex.synchronize do
+      @wv_cb_next_key += 1
+      @wv_cb_registry[@wv_cb_next_key] = impl
+      FFI::Pointer.new(@wv_cb_next_key)
+    end
+  end
+
+  # @api private
+  # Resolves a trampoline's `ctx` back to the registered implementation.
+  def self._wv_cb_lookup(ctx)
+    impl = @wv_cb_mutex.synchronize { @wv_cb_registry[ctx.address] }
+    raise Error.new(FOREIGN_ERROR_CODE, 'callback context is not registered') if impl.nil?
+    impl
+  end
+
+  # @api private
+  # Drops the registry entry when the producer releases its last reference.
+  def self._wv_cb_free(ctx)
+    @wv_cb_mutex.synchronize { @wv_cb_registry.delete(ctx.address) }
+    nil
+  end
+
+  # @api private
+  # Reports a callback implementation's exception through `out_err`. The
+  # producer copies the message, so the Ruby String need not outlive the call.
+  def self._wv_cb_fail(out_err, exception)
+    message = exception.message.to_s
+    message = exception.class.name if message.empty?
+    weaveffi_error_set(out_err, FOREIGN_ERROR_CODE, message)
+    nil
+  end
 
   # === Module: edge_cases ===
 
@@ -271,7 +326,7 @@ module WeaveFFI
 
   # Builds the EdgeErrorsError subclass matching `code`, decoding any payload
   # fields the code declares, or a generic Error for codes outside
-  # the domain (panics, marshalling).
+  # the domain (panics, marshalling, callback failures).
   def self.edge_errors_error_from(code, message, payload = nil)
     cls = EDGE_ERRORS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
@@ -283,7 +338,7 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     payload_ptr = err[:payload_ptr]
     payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
@@ -656,6 +711,34 @@ module WeaveFFI
     end
   end
 
+  # Record carrying objects in every buffered position
+  class WidgetHolder
+    attr_reader :primary
+
+    attr_reader :fallback
+
+    attr_reader :extras
+
+    attr_reader :by_name
+
+    def initialize(primary:, fallback:, extras:, by_name:)
+      @primary = primary
+      @fallback = fallback
+      @extras = extras
+      @by_name = by_name
+    end
+
+    # Structural equality over every field.
+    def ==(other)
+      return false unless other.is_a?(WidgetHolder)
+      return false unless primary == other.primary
+      return false unless fallback == other.fallback
+      return false unless extras == other.extras
+      return false unless by_name == other.by_name
+      true
+    end
+  end
+
   # @api private
   # Packs a Leaf into the value-buffer wire format.
   def self._wv_write_leaf(w, v)
@@ -943,6 +1026,50 @@ module WeaveFFI
     Retired.new(id: _wv_id)
   end
 
+  # @api private
+  # Packs a WidgetHolder into the value-buffer wire format.
+  def self._wv_write_widget_holder(w, v)
+    w.write_u64(v.primary._wv_clone_ptr.address)
+    if v.fallback.nil?
+      w.write_flag(false)
+    else
+      w.write_flag(true)
+      w.write_u64(v.fallback._wv_clone_ptr.address)
+    end
+    w.write_len(v.extras.length)
+    v.extras.each do |_wv_e0|
+      w.write_u64(_wv_e0._wv_clone_ptr.address)
+    end
+    w.write_len(v.by_name.length)
+    v.by_name.each do |_wv_k0, _wv_v0|
+      w.write_string(_wv_k0)
+      w.write_u64(_wv_v0._wv_clone_ptr.address)
+    end
+  end
+
+  # @api private
+  # Unpacks a WidgetHolder from the value-buffer wire format.
+  def self._wv_read_widget_holder(r)
+    _wv_primary = Widget._from_ptr(r.read_object_token)
+    if r.read_flag
+      _wv_fallback = Widget._from_ptr(r.read_object_token)
+    else
+      _wv_fallback = nil
+    end
+    _wv_extras = Array.new(r.read_len) do
+      _wv_e0 = Widget._from_ptr(r.read_object_token)
+      _wv_e0
+    end
+    _wv_by_name = {}
+    r.read_len.times do
+      _wv_k0 = r.read_string
+      _wv_v0 = Widget._from_ptr(r.read_object_token)
+      _wv_by_name[_wv_k0] = _wv_v0
+    end
+    WidgetHolder.new(primary: _wv_primary, fallback: _wv_fallback, extras: _wv_extras, by_name: _wv_by_name)
+  end
+
+  attach_function :weaveffi_edge_cases_Widget_clone, [:pointer], :pointer
   attach_function :weaveffi_edge_cases_Widget_destroy, [:pointer], :void
   # Void method that can fail
   attach_function :weaveffi_edge_cases_Widget_refresh, [:pointer, :pointer], :void
@@ -952,19 +1079,13 @@ module WeaveFFI
   attach_function :weaveffi_edge_cases_Widget_fetch_async, [:pointer, :int64, :weaveffi_edge_cases_Widget_fetch_callback, :pointer], :void
   attach_function :weaveffi_edge_cases_Widget_old_name, [:pointer, :pointer], :pointer
 
+  attach_function :weaveffi_edge_cases_Vault_clone, [:pointer], :pointer
   attach_function :weaveffi_edge_cases_Vault_destroy, [:pointer], :void
   # Fails when the vault is busy
   attach_function :weaveffi_edge_cases_Vault_open, [:string, :pointer], :pointer
   attach_function :weaveffi_edge_cases_Vault_peek, [:pointer, :pointer], :pointer
   # Throwing static
   attach_function :weaveffi_edge_cases_Vault_probe, [:pointer], :int32
-  # Callback carrying composite payloads
-  callback :weaveffi_edge_cases_OnBatch_fn, [:pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :int32, :pointer], :void
-  callback :weaveffi_edge_cases_OnTick_fn, [:pointer], :void
-  attach_function :weaveffi_edge_cases_register_batch_listener, [:weaveffi_edge_cases_OnBatch_fn, :pointer], :uint64
-  attach_function :weaveffi_edge_cases_unregister_batch_listener, [:uint64], :void
-  attach_function :weaveffi_edge_cases_register_tick_listener, [:weaveffi_edge_cases_OnTick_fn, :pointer], :uint64
-  attach_function :weaveffi_edge_cases_unregister_tick_listener, [:uint64], :void
   # No parameters and no result
   attach_function :weaveffi_edge_cases_noop, [:pointer], :void
   # Function named after a keyword whose parameters are all keywords
@@ -972,15 +1093,23 @@ module WeaveFFI
   # Optional list of optional structs, the deepest legal nesting
   attach_function :weaveffi_edge_cases_nested_optional, [:pointer, :size_t, :pointer, :pointer], :pointer
   attach_function :weaveffi_edge_cases_optional_params, [:pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :pointer], :pointer
-  # Write-back parameters
-  attach_function :weaveffi_edge_cases_mutable_params, [:string, :pointer, :size_t, :pointer], :void
+  # Two callback interface parameters on one function
+  attach_function :weaveffi_edge_cases_register_batch, [:pointer, :pointer, :pointer, :pointer, :pointer], :void
+  # Objects in every buffered position
+  attach_function :weaveffi_edge_cases_widgets_everywhere, [:pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :pointer, :pointer], :pointer
+  # Iterator of objects
+  attach_function :weaveffi_edge_cases_widget_stream, [:pointer], :pointer
+  attach_function :weaveffi_edge_cases_WidgetStreamIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_edge_cases_WidgetStreamIterator_destroy, [:pointer], :void
+  # Async returning an object
+  callback :weaveffi_edge_cases_async_widget_callback, [:pointer, :pointer, :pointer], :void
+  attach_function :weaveffi_edge_cases_async_widget_async, [:weaveffi_edge_cases_async_widget_callback, :pointer], :void
   # Factory for an interface with no constructor
   attach_function :weaveffi_edge_cases_make_widget, [:string, :pointer], :pointer
   # Optional interface return
   attach_function :weaveffi_edge_cases_find_widget, [:int64, :pointer], :pointer
   # Interface parameter, including an optional one
   attach_function :weaveffi_edge_cases_inspect_widget, [:pointer, :pointer, :pointer], :pointer
-  attach_function :weaveffi_edge_cases_typed_handle_param, [:pointer, :uint64, :pointer], :pointer
   # Iterator of strings
   attach_function :weaveffi_edge_cases_string_stream, [:pointer], :pointer
   attach_function :weaveffi_edge_cases_StringStreamIterator_next, [:pointer, :pointer, :pointer], :int32
@@ -1011,6 +1140,222 @@ module WeaveFFI
   attach_function :weaveffi_edge_cases_keywords_roundtrip, [:pointer, :size_t, :pointer, :pointer], :pointer
   attach_function :weaveffi_edge_cases_legacy_value, [:int32, :pointer, :pointer], :pointer
 
+  # Callback interface carrying composite payloads and objects
+  # Consumer-implemented callback interface. Any object responding to the
+  # methods below is accepted wherever a BatchListener parameter is expected;
+  # include this module to inherit NotImplementedError defaults. The
+  # producer may call the methods from any thread until it releases the
+  # implementation.
+  module BatchListener
+    # Composite payloads cross as value buffers
+    def on_batch(items, raw, first, mode)
+      raise NotImplementedError, "#{self.class}#on_batch is not implemented"
+    end
+
+    # Objects cross as strong references the consumer must release
+    def on_widget(widget, fallback, children)
+      raise NotImplementedError, "#{self.class}#on_widget is not implemented"
+    end
+
+    def on_tick
+      raise NotImplementedError, "#{self.class}#on_tick is not implemented"
+    end
+
+    # Scalar return travels back through the vtable
+    # @return [Object] a bool
+    def should_continue(class_)
+      raise NotImplementedError, "#{self.class}#should_continue is not implemented"
+    end
+
+    # Enum return travels back as its integer discriminant
+    # @return [Object] a Mode
+    def pick_mode
+      raise NotImplementedError, "#{self.class}#pick_mode is not implemented"
+    end
+  end
+
+  # @api private
+  # The C vtable layout the producer calls a BatchListener through.
+  class WvBatchListenerVtable < FFI::Struct
+    layout :on_batch, :pointer,
+           :on_widget, :pointer,
+           :on_tick, :pointer,
+           :should_continue, :pointer,
+           :pick_mode, :pointer,
+           :free, :pointer
+  end
+
+  # @api private
+  # Trampoline for BatchListener#on_batch.
+  WV_BATCH_LISTENER_ON_BATCH = FFI::Function.new(:void, [:pointer, :pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :int32, :pointer]) do |ctx, items_ptr, items_len, raw_ptr, raw_len, first_ptr, first_len, mode, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      items_r = WvBufferReader.new(items_ptr.null? ? ''.b : items_ptr.read_string(items_len))
+      items_v = Array.new(items_r.read_len) do
+        _wv_e0 = _wv_read_outer(items_r)
+        _wv_e0
+      end
+      items_r.expect_end!
+      raw_v = raw_ptr.null? ? ''.b : raw_ptr.read_string(raw_len)
+      first_r = WvBufferReader.new(first_ptr.null? ? ''.b : first_ptr.read_string(first_len))
+      if first_r.read_flag
+        first_v = _wv_read_outer(first_r)
+      else
+        first_v = nil
+      end
+      first_r.expect_end!
+      mode_v = mode
+      impl.on_batch(items_v, raw_v, first_v, mode_v)
+      nil
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      nil
+    end
+  end
+
+  # @api private
+  # Trampoline for BatchListener#on_widget.
+  WV_BATCH_LISTENER_ON_WIDGET = FFI::Function.new(:void, [:pointer, :pointer, :pointer, :pointer, :size_t, :pointer]) do |ctx, widget, fallback, children_ptr, children_len, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      widget_v = Widget._from_ptr(widget)
+      fallback_v = fallback.null? ? nil : Widget._from_ptr(fallback)
+      children_r = WvBufferReader.new(children_ptr.null? ? ''.b : children_ptr.read_string(children_len))
+      children_v = Array.new(children_r.read_len) do
+        _wv_e0 = Widget._from_ptr(children_r.read_object_token)
+        _wv_e0
+      end
+      children_r.expect_end!
+      impl.on_widget(widget_v, fallback_v, children_v)
+      nil
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      nil
+    end
+  end
+
+  # @api private
+  # Trampoline for BatchListener#on_tick.
+  WV_BATCH_LISTENER_ON_TICK = FFI::Function.new(:void, [:pointer, :pointer]) do |ctx, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      impl.on_tick
+      nil
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      nil
+    end
+  end
+
+  # @api private
+  # Trampoline for BatchListener#should_continue.
+  WV_BATCH_LISTENER_SHOULD_CONTINUE = FFI::Function.new(:int32, [:pointer, :int32, :pointer]) do |ctx, class_, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      class__v = class_
+      impl.should_continue(class__v) ? 1 : 0
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      0
+    end
+  end
+
+  # @api private
+  # Trampoline for BatchListener#pick_mode.
+  WV_BATCH_LISTENER_PICK_MODE = FFI::Function.new(:int32, [:pointer, :pointer]) do |ctx, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      Integer(impl.pick_mode)
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      0
+    end
+  end
+
+  # @api private
+  # Releases a BatchListener implementation when the producer drops its last
+  # reference.
+  WV_BATCH_LISTENER_FREE = FFI::Function.new(:void, [:pointer]) do |ctx|
+    _wv_cb_free(ctx)
+  end
+
+  # The one process-wide BatchListener vtable every registration hands the
+  # producer; its entries live for the process lifetime.
+  WV_BATCH_LISTENER_VTABLE = WvBatchListenerVtable.new
+  WV_BATCH_LISTENER_VTABLE[:on_batch] = WV_BATCH_LISTENER_ON_BATCH
+  WV_BATCH_LISTENER_VTABLE[:on_widget] = WV_BATCH_LISTENER_ON_WIDGET
+  WV_BATCH_LISTENER_VTABLE[:on_tick] = WV_BATCH_LISTENER_ON_TICK
+  WV_BATCH_LISTENER_VTABLE[:should_continue] = WV_BATCH_LISTENER_SHOULD_CONTINUE
+  WV_BATCH_LISTENER_VTABLE[:pick_mode] = WV_BATCH_LISTENER_PICK_MODE
+  WV_BATCH_LISTENER_VTABLE[:free] = WV_BATCH_LISTENER_FREE
+
+  # Callback interface whose name and methods are keywords
+  # Consumer-implemented callback interface. Any object responding to the
+  # methods below is accepted wherever a Keyword parameter is expected;
+  # include this module to inherit NotImplementedError defaults. The
+  # producer may call the methods from any thread until it releases the
+  # implementation.
+  module Keyword
+    def delete(self_)
+      raise NotImplementedError, "#{self.class}#delete is not implemented"
+    end
+
+    # @return [Object] a i32
+    def import
+      raise NotImplementedError, "#{self.class}#import is not implemented"
+    end
+  end
+
+  # @api private
+  # The C vtable layout the producer calls a Keyword through.
+  class WvKeywordVtable < FFI::Struct
+    layout :delete, :pointer,
+           :import, :pointer,
+           :free, :pointer
+  end
+
+  # @api private
+  # Trampoline for Keyword#delete.
+  WV_KEYWORD_DELETE = FFI::Function.new(:void, [:pointer, :int32, :pointer]) do |ctx, self_, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      self__v = self_
+      impl.delete(self__v)
+      nil
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      nil
+    end
+  end
+
+  # @api private
+  # Trampoline for Keyword#import.
+  WV_KEYWORD_IMPORT = FFI::Function.new(:int32, [:pointer, :pointer]) do |ctx, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      Integer(impl.import)
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      0
+    end
+  end
+
+  # @api private
+  # Releases a Keyword implementation when the producer drops its last
+  # reference.
+  WV_KEYWORD_FREE = FFI::Function.new(:void, [:pointer]) do |ctx|
+    _wv_cb_free(ctx)
+  end
+
+  # The one process-wide Keyword vtable every registration hands the
+  # producer; its entries live for the process lifetime.
+  WV_KEYWORD_VTABLE = WvKeywordVtable.new
+  WV_KEYWORD_VTABLE[:delete] = WV_KEYWORD_DELETE
+  WV_KEYWORD_VTABLE[:import] = WV_KEYWORD_IMPORT
+  WV_KEYWORD_VTABLE[:free] = WV_KEYWORD_FREE
+
+  # @api private
+  # Owns one strong reference to a Widget; releases it exactly once.
   class WidgetPtr < FFI::AutoPointer
     def self.release(ptr)
       WeaveFFI.weaveffi_edge_cases_Widget_destroy(ptr)
@@ -1019,9 +1364,8 @@ module WeaveFFI
 
   # Interface with no constructor; instances come from make_widget
   class Widget
-    attr_reader :handle
-
-    # Wraps an owned pointer the producer handed over, without
+    # @api private
+    # Adopts one strong reference the producer handed over, without
     # re-running initialize.
     def self._from_ptr(ptr)
       obj = allocate
@@ -1029,16 +1373,43 @@ module WeaveFFI
       obj
     end
 
-    def destroy
+    # The borrowed object pointer passed to producer calls.
+    def handle
+      raise Error.new(-1, 'Widget used after close') if @handle.nil?
+      @handle
+    end
+
+    # Whether close has released this wrapper's reference.
+    def closed?
+      @handle.nil?
+    end
+
+    # Releases this wrapper's reference now rather than at GC time.
+    # Idempotent; the object itself is dropped when the last reference
+    # anywhere (another wrapper, a record field, the producer) goes.
+    def close
       return if @handle.nil?
       @handle.free
       @handle = nil
     end
 
+    # @api private
+    # Mints a new strong reference the caller owns (used when this
+    # object is written into a value buffer).
+    def _wv_clone_ptr
+      WeaveFFI.weaveffi_edge_cases_Widget_clone(handle)
+    end
+
+    # dup and clone produce an independent wrapper with its own reference.
+    def initialize_copy(other)
+      super
+      @handle = WidgetPtr.new(WeaveFFI.weaveffi_edge_cases_Widget_clone(other.handle))
+    end
+
     # Void method that can fail
     def refresh()
       err = ErrorStruct.new
-      WeaveFFI.weaveffi_edge_cases_Widget_refresh(@handle, err)
+      WeaveFFI.weaveffi_edge_cases_Widget_refresh(handle, err)
       WeaveFFI.check_edge_errors_error!(err)
     end
 
@@ -1054,10 +1425,10 @@ module WeaveFFI
       import_data = import_w.data
       import_buf = FFI::MemoryPointer.new(:uint8, import_data.bytesize)
       import_buf.put_bytes(0, import_data)
-      result = WeaveFFI.weaveffi_edge_cases_Widget_rename(@handle, class_, import_buf, import_data.bytesize, err)
+      result = WeaveFFI.weaveffi_edge_cases_Widget_rename(handle, class_, import_buf, import_data.bytesize, err)
       WeaveFFI.check_error!(err)
       return '' if result.null?
-      str = result.read_string
+      str = result.read_string.force_encoding(Encoding::UTF_8)
       WeaveFFI.weaveffi_free_string(result)
       str
     end
@@ -1071,7 +1442,7 @@ module WeaveFFI
         err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
         if err && err[:code] != 0
           code = err[:code]
-          msg = err[:message].null? ? '' : err[:message].read_string
+          msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
           payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
           WeaveFFI.weaveffi_error_free(err_ptr)
           queue << WeaveFFI.edge_errors_error_from(code, msg, payload)
@@ -1087,7 +1458,7 @@ module WeaveFFI
           end
         end
       end
-      WeaveFFI.weaveffi_edge_cases_Widget_fetch_async(@handle, id, callback, FFI::Pointer::NULL)
+      WeaveFFI.weaveffi_edge_cases_Widget_fetch_async(handle, id, callback, FFI::Pointer::NULL)
       value = queue.pop
       raise value if value.is_a?(Error)
       value
@@ -1096,15 +1467,17 @@ module WeaveFFI
     def old_name()
       warn "[DEPRECATED] Use rename instead"
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_edge_cases_Widget_old_name(@handle, err)
+      result = WeaveFFI.weaveffi_edge_cases_Widget_old_name(handle, err)
       WeaveFFI.check_error!(err)
       return '' if result.null?
-      str = result.read_string
+      str = result.read_string.force_encoding(Encoding::UTF_8)
       WeaveFFI.weaveffi_free_string(result)
       str
     end
   end
 
+  # @api private
+  # Owns one strong reference to a Vault; releases it exactly once.
   class VaultPtr < FFI::AutoPointer
     def self.release(ptr)
       WeaveFFI.weaveffi_edge_cases_Vault_destroy(ptr)
@@ -1112,10 +1485,10 @@ module WeaveFFI
   end
 
   # Deprecated interface with a throwing constructor
+  # @deprecated Use Widget instead
   class Vault
-    attr_reader :handle
-
-    # Wraps an owned pointer the producer handed over, without
+    # @api private
+    # Adopts one strong reference the producer handed over, without
     # re-running initialize.
     def self._from_ptr(ptr)
       obj = allocate
@@ -1123,10 +1496,37 @@ module WeaveFFI
       obj
     end
 
-    def destroy
+    # The borrowed object pointer passed to producer calls.
+    def handle
+      raise Error.new(-1, 'Vault used after close') if @handle.nil?
+      @handle
+    end
+
+    # Whether close has released this wrapper's reference.
+    def closed?
+      @handle.nil?
+    end
+
+    # Releases this wrapper's reference now rather than at GC time.
+    # Idempotent; the object itself is dropped when the last reference
+    # anywhere (another wrapper, a record field, the producer) goes.
+    def close
       return if @handle.nil?
       @handle.free
       @handle = nil
+    end
+
+    # @api private
+    # Mints a new strong reference the caller owns (used when this
+    # object is written into a value buffer).
+    def _wv_clone_ptr
+      WeaveFFI.weaveffi_edge_cases_Vault_clone(handle)
+    end
+
+    # dup and clone produce an independent wrapper with its own reference.
+    def initialize_copy(other)
+      super
+      @handle = VaultPtr.new(WeaveFFI.weaveffi_edge_cases_Vault_clone(other.handle))
     end
 
     # Fails when the vault is busy
@@ -1140,7 +1540,7 @@ module WeaveFFI
 
     def peek()
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_edge_cases_Vault_peek(@handle, err)
+      result = WeaveFFI.weaveffi_edge_cases_Vault_peek(handle, err)
       WeaveFFI.check_error!(err)
       return nil if result.null?
       Widget._from_ptr(result)
@@ -1151,62 +1551,8 @@ module WeaveFFI
       err = ErrorStruct.new
       result = WeaveFFI.weaveffi_edge_cases_Vault_probe(err)
       WeaveFFI.check_edge_errors_error!(err)
-      result != 0
+      (result != 0)
     end
-  end
-
-  # Registers a OnBatch listener block. Returns a subscription id for
-  # unregister_batch_listener.
-  def self.register_batch_listener(&block)
-    trampoline = FFI::Function.new(:void, [:pointer, :size_t, :pointer, :size_t, :pointer, :size_t, :int32, :pointer]) do |items_ptr, items_len, raw_ptr, raw_len, first_ptr, first_len, mode, _context|
-      begin
-        items_r = WvBufferReader.new(items_ptr.null? ? ''.b : items_ptr.read_string(items_len))
-        items_v = Array.new(items_r.read_len) do
-          _wv_e0 = _wv_read_outer(items_r)
-          _wv_e0
-        end
-        items_r.expect_end!
-        first_r = WvBufferReader.new(first_ptr.null? ? ''.b : first_ptr.read_string(first_len))
-        if first_r.read_flag
-          first_v = _wv_read_outer(first_r)
-        else
-          first_v = nil
-        end
-        first_r.expect_end!
-      rescue Error => e
-        warn "weaveffi: dropped OnBatch event: #{e.message}"
-        next
-      end
-      block.call(items_v, (raw_ptr.null? ? ''.b : raw_ptr.read_string(raw_len)), first_v, mode)
-    end
-    listener_id = weaveffi_edge_cases_register_batch_listener(trampoline, FFI::Pointer::NULL)
-    @listener_refs[listener_id] = trampoline
-    listener_id
-  end
-
-  # Unregisters a listener previously registered with register_batch_listener.
-  def self.unregister_batch_listener(listener_id)
-    weaveffi_edge_cases_unregister_batch_listener(listener_id)
-    @listener_refs.delete(listener_id)
-    nil
-  end
-
-  # Registers a OnTick listener block. Returns a subscription id for
-  # unregister_tick_listener.
-  def self.register_tick_listener(&block)
-    trampoline = FFI::Function.new(:void, [:pointer]) do |_context|
-      block.call()
-    end
-    listener_id = weaveffi_edge_cases_register_tick_listener(trampoline, FFI::Pointer::NULL)
-    @listener_refs[listener_id] = trampoline
-    listener_id
-  end
-
-  # Unregisters a listener previously registered with register_tick_listener.
-  def self.unregister_tick_listener(listener_id)
-    weaveffi_edge_cases_unregister_tick_listener(listener_id)
-    @listener_refs.delete(listener_id)
-    nil
   end
 
   # No parameters and no result
@@ -1368,13 +1714,121 @@ module WeaveFFI
     _wv_value
   end
 
-  # Write-back parameters
-  def self.mutable_params(text, blob)
+  # Two callback interface parameters on one function
+  def self.register_batch(listener, keyword)
     err = ErrorStruct.new
-    blob_buf = FFI::MemoryPointer.new(:uint8, blob.bytesize)
-    blob_buf.put_bytes(0, blob)
-    weaveffi_edge_cases_mutable_params(text, blob_buf, blob.bytesize, err)
+    listener_ctx = _wv_cb_register(listener)
+    keyword_ctx = _wv_cb_register(keyword)
+    weaveffi_edge_cases_register_batch(listener_ctx, WV_BATCH_LISTENER_VTABLE.to_ptr, keyword_ctx, WV_KEYWORD_VTABLE.to_ptr, err)
     check_error!(err)
+  end
+
+  # Objects in every buffered position
+  def self.widgets_everywhere(list, by_name, sparse, holder)
+    err = ErrorStruct.new
+    list_w = WvBufferWriter.new
+    list_w.write_len(list.length)
+    list.each do |_wv_e0|
+      list_w.write_u64(_wv_e0._wv_clone_ptr.address)
+    end
+    list_data = list_w.data
+    list_buf = FFI::MemoryPointer.new(:uint8, list_data.bytesize)
+    list_buf.put_bytes(0, list_data)
+    by_name_w = WvBufferWriter.new
+    by_name_w.write_len(by_name.length)
+    by_name.each do |_wv_k0, _wv_v0|
+      by_name_w.write_string(_wv_k0)
+      by_name_w.write_u64(_wv_v0._wv_clone_ptr.address)
+    end
+    by_name_data = by_name_w.data
+    by_name_buf = FFI::MemoryPointer.new(:uint8, by_name_data.bytesize)
+    by_name_buf.put_bytes(0, by_name_data)
+    sparse_w = WvBufferWriter.new
+    sparse_w.write_len(sparse.length)
+    sparse.each do |_wv_e0|
+      if _wv_e0.nil?
+        sparse_w.write_flag(false)
+      else
+        sparse_w.write_flag(true)
+        sparse_w.write_u64(_wv_e0._wv_clone_ptr.address)
+      end
+    end
+    sparse_data = sparse_w.data
+    sparse_buf = FFI::MemoryPointer.new(:uint8, sparse_data.bytesize)
+    sparse_buf.put_bytes(0, sparse_data)
+    holder_w = WvBufferWriter.new
+    _wv_write_widget_holder(holder_w, holder)
+    holder_data = holder_w.data
+    holder_buf = FFI::MemoryPointer.new(:uint8, holder_data.bytesize)
+    holder_buf.put_bytes(0, holder_data)
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_edge_cases_widgets_everywhere(list_buf, list_data.bytesize, by_name_buf, by_name_data.bytesize, sparse_buf, sparse_data.bytesize, holder_buf, holder_data.bytesize, out_len, err)
+    check_error!(err)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = _wv_read_widget_holder(_wv_r)
+    _wv_r.expect_end!
+    _wv_value
+  end
+
+  # Iterator of objects
+  # Returns a lazy Enumerator that streams one element per pull; call
+  # `.to_a` to collect eagerly. The underlying producer iterator is
+  # launched on the first pull, so launch errors raise at that point
+  # rather than when this method returns. The iterator handle is
+  # released exactly once, when iteration finishes or is abandoned
+  # early (for example by `break`).
+  def self.widget_stream()
+    Enumerator.new do |y|
+      err = ErrorStruct.new
+      iter = weaveffi_edge_cases_widget_stream(err)
+      begin
+        check_error!(err)
+        unless iter.null?
+          loop do
+            out_item = FFI::MemoryPointer.new(:pointer)
+            item_err = ErrorStruct.new
+            has_item = weaveffi_edge_cases_WidgetStreamIterator_next(iter, out_item, item_err)
+            check_error!(item_err)
+            break if has_item.zero?
+            item_ptr = out_item.read_pointer
+            raise Error.new(-1, 'null pointer') if item_ptr.null?
+            y << Widget._from_ptr(item_ptr)
+          end
+        end
+      ensure
+        weaveffi_edge_cases_WidgetStreamIterator_destroy(iter) unless iter.null?
+      end
+    end
+  end
+
+  # Async returning an object
+  # Blocks the current thread until the async producer completes; the
+  # result (or error) is delivered through the completion callback.
+  def self.async_widget()
+    queue = Queue.new
+    callback = FFI::Function.new(:void, [:pointer, :pointer, :pointer]) do |_context, err_ptr, result|
+      err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
+      if err && err[:code] != 0
+        code = err[:code]
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
+        payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
+        weaveffi_error_free(err_ptr)
+        queue << edge_errors_error_from(code, msg, payload)
+      else
+        if result.null?
+          queue << Error.new(-1, 'null pointer')
+        else
+          queue << Widget._from_ptr(result)
+        end
+      end
+    end
+    weaveffi_edge_cases_async_widget_async(callback, FFI::Pointer::NULL)
+    value = queue.pop
+    raise value if value.is_a?(Error)
+    value
   end
 
   # Factory for an interface with no constructor
@@ -1401,17 +1855,9 @@ module WeaveFFI
     result = weaveffi_edge_cases_inspect_widget(widget.handle, fallback&.handle, err)
     check_error!(err)
     return '' if result.null?
-    str = result.read_string
+    str = result.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_free_string(result)
     str
-  end
-
-  def self.typed_handle_param(token, raw)
-    err = ErrorStruct.new
-    result = weaveffi_edge_cases_typed_handle_param(token.handle, raw, err)
-    check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    Leaf.new(result)
   end
 
   # Iterator of strings
@@ -1438,7 +1884,7 @@ module WeaveFFI
             if item_ptr.null?
               y << ''
             else
-              item = item_ptr.read_string
+              item = item_ptr.read_string.force_encoding(Encoding::UTF_8)
               weaveffi_free_string(item_ptr)
               y << item
             end
@@ -1517,7 +1963,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
@@ -1538,7 +1984,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
@@ -1561,7 +2007,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
         weaveffi_error_free(err_ptr)
         queue << edge_errors_error_from(code, msg, payload)
@@ -1591,7 +2037,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         payload = err[:payload_ptr].null? ? nil : err[:payload_ptr].read_string(err[:payload_len])
         weaveffi_error_free(err_ptr)
         queue << edge_errors_error_from(code, msg, payload)
@@ -1624,7 +2070,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
@@ -1657,7 +2103,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
@@ -1678,11 +2124,11 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
-        _wv_s = result.null? ? '' : result.read_string
+        _wv_s = result.null? ? '' : result.read_string.force_encoding(Encoding::UTF_8)
         weaveffi_free_string(result) unless result.null?
         queue << _wv_s
       end

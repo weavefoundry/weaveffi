@@ -17,6 +17,19 @@ from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
+    """An error reported through the C ABI.
+
+    Positive codes are a module's declared error codes (raised as the
+    module's typed subclasses); negative codes are runtime traps: a generic
+    producer error (-1), a producer panic (-2), a marshalling failure (-3),
+    or an exception raised by a callback-interface implementation (-4).
+    """
+
+    GENERIC_ERROR_CODE = -1
+    PANIC_ERROR_CODE = -2
+    MARSHAL_ERROR_CODE = -3
+    FOREIGN_ERROR_CODE = -4
+
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
@@ -53,7 +66,7 @@ _lib = _load_library()
 # The ABI revision these bindings were generated against. Checked before any
 # other symbol is bound so a mismatched producer fails at import time instead
 # of misreading the error struct or a value buffer later.
-_ABI_VERSION = 1
+_ABI_VERSION = 2
 
 
 def _check_abi_version(lib: ctypes.CDLL) -> None:
@@ -75,6 +88,14 @@ def _check_abi_version(lib: ctypes.CDLL) -> None:
 
 
 _check_abi_version(_lib)
+# Callback-interface trampolines report a failed implementation through
+# weaveffi_error_set, which copies the message with the producer's allocator.
+_lib.weaveffi_error_set.argtypes = [
+    ctypes.POINTER(_WeaveFFIErrorStruct),
+    ctypes.c_int32,
+    ctypes.c_char_p,
+]
+_lib.weaveffi_error_set.restype = None
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 # Async completion callbacks receive a heap-boxed error the consumer owns;
@@ -130,14 +151,30 @@ def _take_string(ptr) -> Optional[str]:
     return _s
 
 
+def _borrow(obj):
+    """The raw pointer of a live object wrapper, lent to the producer for the
+    duration of one call. Raises if the wrapper was already closed."""
+    _p = obj._ptr
+    if _p is None:
+        raise WeaveFFIError(-1, f"{type(obj).__name__} used after close()")
+    return _p
+
+
 class _BufferWriter:
     """Encodes values into the WeaveFFI value-buffer wire format:
     little-endian, packed, no alignment."""
 
     def __init__(self) -> None:
         self._buf = bytearray()
+        self._objects = []
 
     def finish(self) -> bytes:
+        # Mint the object tokens last: an encoding that raised part-way
+        # (a closed wrapper, a field of the wrong type) never reaches here,
+        # so it leaks no strong references.
+        for _pos, _obj in self._objects:
+            struct.pack_into("<Q", self._buf, _pos, _obj._clone_ptr())
+        self._objects = []
         return bytes(self._buf)
 
     def write_bool(self, v) -> None:
@@ -187,6 +224,14 @@ class _BufferWriter:
     def write_bytes(self, v: bytes) -> None:
         self.write_len(len(v))
         self._buf += bytes(v)
+
+    def write_object(self, obj) -> None:
+        """Write an object token: one strong reference to `obj` the reader
+        will adopt. The wrapper is checked to be live now (a closed one
+        raises), but the reference itself is cloned in finish()."""
+        _borrow(obj)
+        self._objects.append((len(self._buf), obj))
+        self._buf += bytes(8)
 
 
 class _BufferReader:
@@ -268,6 +313,14 @@ class _BufferReader:
         _n = self.read_len()
         return bytes(self._take(_n, "bytes data"))
 
+    def read_object(self) -> int:
+        """Read an object token: one strong reference the caller adopts into
+        a wrapper. Zero never appears in a non-optional position."""
+        _p = struct.unpack("<Q", self._take(8, "object token"))[0]
+        if _p == 0:
+            raise WeaveFFIError(-1, "malformed value buffer: null object token")
+        return _p
+
     def expect_end(self) -> None:
         if self._pos != len(self._data):
             raise WeaveFFIError(-1, "malformed value buffer: trailing bytes")
@@ -290,6 +343,7 @@ def _take_buffer(ptr, length) -> bytes:
     _lib.weaveffi_free_bytes(ptr, ctypes.c_size_t(length))
     return _data
 
+import abc
 import asyncio
 import threading
 
@@ -312,10 +366,23 @@ def _async_register(cb) -> int:
     return _token
 
 
-# Registered listener trampolines, keyed by subscription id. Holding
-# the ctypes function objects here keeps them alive until unregistered;
-# without this the GC could collect a trampoline the producer still calls.
-_listener_refs: Dict[int, object] = {}
+# Live callback-interface implementations, keyed by the integer the producer
+# receives as `ctx`. An entry is added when an implementation is passed to a
+# call and removed when the producer invokes the vtable's `free(ctx)`, so the
+# implementation stays alive exactly as long as the producer may call it and
+# the producer never holds a raw reference to a Python object.
+_cb_impls: Dict[int, object] = {}
+_cb_lock = threading.Lock()
+_cb_next_ctx = 0
+
+
+def _cb_register(impl) -> int:
+    global _cb_next_ctx
+    with _cb_lock:
+        _cb_next_ctx += 1
+        _ctx = _cb_next_ctx
+        _cb_impls[_ctx] = impl
+    return _ctx
 
 
 # === Module: docs ===
@@ -431,6 +498,67 @@ def _unpack_Document(data: bytes) -> "Document":
     return _decode_buffer(data, _read_Document)
 
 
+class SavedListener(abc.ABC):
+    """
+    Consumer-implemented observer of document-saved notifications.
+
+    Implementations must be safe to call from any thread.
+
+    Consumer-implemented callback interface. Subclass it, implement every abstract method, and pass an instance wherever the API takes a `SavedListener`; the producer may call the methods from any thread until it releases the instance. An exception raised by a method is reported to the producer as WeaveFFIError.FOREIGN_ERROR_CODE (-4) and aborts the call that was in progress.
+    """
+
+    @abc.abstractmethod
+    def on_saved(self, doc_id: int, revision: int) -> None:
+        """Fires after a document has been persisted successfully
+
+        Parameters
+        ----------
+        doc_id : Identifier of the saved document
+        revision : Monotonically increasing revision
+        """
+
+
+_SavedListener_on_saved_cfunctype = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct))
+_SavedListener_vtable_free_cfunctype = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+class _SavedListenerVtable(ctypes.Structure):
+    """The C vtable `weaveffi_docs_SavedListener_vtable`."""
+
+    _fields_ = [
+        ("on_saved", _SavedListener_on_saved_cfunctype),
+        ("free", _SavedListener_vtable_free_cfunctype),
+    ]
+
+
+def _SavedListener_on_saved_trampoline(ctx, doc_id, revision, out_err):
+    try:
+        _impl = _cb_impls[ctx]
+        _impl.on_saved(doc_id, revision)
+    except Exception as _exc:
+        # Never unwind through the C frame: report the failure and return a
+        # default; the producer aborts its call with FOREIGN_ERROR_CODE.
+        _lib.weaveffi_error_set(out_err, -4, str(_exc).encode("utf-8", "replace"))
+
+
+def _SavedListener_vtable_free_trampoline(ctx):
+    # The producer's last reference is gone; it never touches `ctx` again.
+    _cb_impls.pop(ctx, None)
+
+
+# The one process-wide vtable for SavedListener. The CFUNCTYPE objects are held at
+# module scope so their function pointers stay valid for the process lifetime.
+_SavedListener_on_saved_cfunc = _SavedListener_on_saved_cfunctype(_SavedListener_on_saved_trampoline)
+_SavedListener_vtable_free_cfunc = _SavedListener_vtable_free_cfunctype(_SavedListener_vtable_free_trampoline)
+_SavedListener_vtable = _SavedListenerVtable(_SavedListener_on_saved_cfunc, _SavedListener_vtable_free_cfunc)
+
+
+_lib.weaveffi_docs_Notebook_clone.argtypes = [ctypes.c_void_p]
+_lib.weaveffi_docs_Notebook_clone.restype = ctypes.c_void_p
+_lib.weaveffi_docs_Notebook_destroy.argtypes = [ctypes.c_void_p]
+_lib.weaveffi_docs_Notebook_destroy.restype = None
+
+
 class Notebook:
     """
     An ordered collection of documents.
@@ -440,6 +568,7 @@ class Notebook:
 
     @classmethod
     def _from_ptr(cls, ptr) -> "Notebook":
+        """Adopt one strong reference the producer handed over."""
         _obj = cls.__new__(cls)
         _obj._ptr = ptr
         return _obj
@@ -459,12 +588,30 @@ class Notebook:
         self._ptr = _result
 
 
+    def _clone_ptr(self):
+        """A new strong reference to the same object (a raw pointer the
+        receiver must eventually release), leaving this wrapper's own
+        reference untouched."""
+        return _lib.weaveffi_docs_Notebook_clone(_borrow(self))
+
+    def close(self) -> None:
+        """Release this wrapper's reference. The object itself is dropped
+        when its last reference (here or in the producer) is released.
+        Idempotent; the wrapper is unusable afterwards."""
+        _p = getattr(self, "_ptr", None)
+        self._ptr = None
+        if _p is not None:
+            _lib.weaveffi_docs_Notebook_destroy(_p)
+
+    def __enter__(self) -> "Notebook":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
+
     def __del__(self) -> None:
-        if self._ptr is not None:
-            _lib.weaveffi_docs_Notebook_destroy.argtypes = [ctypes.c_void_p]
-            _lib.weaveffi_docs_Notebook_destroy.restype = None
-            _lib.weaveffi_docs_Notebook_destroy(self._ptr)
-            self._ptr = None
+        self.close()
 
     def insert(self, document: "Document") -> int:
         """Add a document, returning its position in the notebook
@@ -478,7 +625,7 @@ class Notebook:
         _fn.restype = ctypes.c_int32
         _document_buf = _pack_Document(document)
         _err = _WeaveFFIErrorStruct()
-        _result = _fn(self._ptr, _document_buf, len(_document_buf), ctypes.byref(_err))
+        _result = _fn(_borrow(self), _document_buf, len(_document_buf), ctypes.byref(_err))
         _check_error(_err)
         return _result
 
@@ -500,7 +647,7 @@ class Notebook:
         _fn.restype = ctypes.c_void_p
         _err = _WeaveFFIErrorStruct()
         _out_len = ctypes.c_size_t(0)
-        _result = _fn(self._ptr, id, ctypes.byref(_out_len), ctypes.byref(_err))
+        _result = _fn(_borrow(self), id, ctypes.byref(_out_len), ctypes.byref(_err))
         _check_docs_errors_error(_err)
         _data = _take_buffer(_result, _out_len.value)
         return _unpack_Document(_data)
@@ -513,7 +660,7 @@ class Notebook:
         _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
         _fn.restype = ctypes.c_int32
         _err = _WeaveFFIErrorStruct()
-        _result = _fn(self._ptr, ctypes.byref(_err))
+        _result = _fn(_borrow(self), ctypes.byref(_err))
         _check_error(_err)
         return _result
 
@@ -530,37 +677,6 @@ class Notebook:
         _check_error(_err)
         return _result
 
-
-
-# Fires after a document has been persisted successfully
-# Callback type OnSaved: Callable[[int, int], None]
-_CFUNC_weaveffi_docs_OnSaved_fn = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p)
-
-
-def register_saved_listener(callback: Callable[[int, int], None]) -> int:
-    """
-    Subscribe to document-saved notifications
-
-    Returns a subscription id for unregister_saved_listener().
-    """
-    def _trampoline(doc_id, revision, _context):
-        callback(doc_id, revision)
-    _cfunc = _CFUNC_weaveffi_docs_OnSaved_fn(_trampoline)
-    _fn = _lib.weaveffi_docs_register_saved_listener
-    _fn.argtypes = [_CFUNC_weaveffi_docs_OnSaved_fn, ctypes.c_void_p]
-    _fn.restype = ctypes.c_uint64
-    _listener_id = int(_fn(_cfunc, None))
-    _listener_refs[_listener_id] = _cfunc
-    return _listener_id
-
-
-def unregister_saved_listener(listener_id: int) -> None:
-    """Unregister a listener previously registered with register_saved_listener()."""
-    _fn = _lib.weaveffi_docs_unregister_saved_listener
-    _fn.argtypes = [ctypes.c_uint64]
-    _fn.restype = None
-    _fn(ctypes.c_uint64(listener_id))
-    _listener_refs.pop(listener_id, None)
 
 
 def create_document(title: str, tags: List[str]) -> "Document":
@@ -654,5 +770,21 @@ async def publish_async(id: int) -> bool:
     _fn.restype = None
     _fn(id, _cb, None)
     return await _fut
+
+
+def watch(listener: "SavedListener") -> None:
+    """Register a listener for saved notifications
+
+    Parameters
+    ----------
+    listener : Receiver of saved notifications
+    """
+    _fn = _lib.weaveffi_docs_watch
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_SavedListenerVtable), ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.restype = None
+    _listener_ctx = _cb_register(listener)
+    _err = _WeaveFFIErrorStruct()
+    _fn(_listener_ctx, ctypes.byref(_SavedListener_vtable), ctypes.byref(_err))
+    _check_error(_err)
 
 # END weaveffi.py

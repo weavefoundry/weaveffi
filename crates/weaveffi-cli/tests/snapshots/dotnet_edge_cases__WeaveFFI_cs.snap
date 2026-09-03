@@ -10,12 +10,26 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace WeaveFFI
 {
+    /// <summary>Raised for any WeaveFFI failure that isn't a typed domain
+    /// error: producer bugs, panics, marshalling failures, and exceptions
+    /// thrown by a callback-interface implementation.</summary>
     public class WeaveFFIException : Exception
     {
+        /// <summary>An untyped producer error.</summary>
+        public const int GenericErrorCode = -1;
+        /// <summary>The producer panicked; the message carries the panic text.</summary>
+        public const int PanicErrorCode = -2;
+        /// <summary>An argument couldn't be lifted by the producer.</summary>
+        public const int MarshalErrorCode = -3;
+        /// <summary>A callback-interface implementation threw; the message
+        /// carries the original exception's message.</summary>
+        public const int ForeignErrorCode = -4;
+
         public int Code { get; }
 
         public WeaveFFIException(int code, string message) : base(message)
@@ -89,6 +103,20 @@ namespace WeaveFFI
                 NativeMethods.weaveffi_error_clear(ref err);
                 throw EdgeErrorsException.FromCode(code, msg, payload);
             }
+        }
+    }
+
+    /// <summary>One strong reference to a native object, on its way into
+    /// a wrapper that adopts it. A distinct type (rather than a bare
+    /// <c>IntPtr</c>) so the adopting constructor never competes with a
+    /// public constructor taking an integer.</summary>
+    internal readonly struct WeaveFFIHandle
+    {
+        internal readonly IntPtr Value;
+
+        internal WeaveFFIHandle(IntPtr value)
+        {
+            Value = value;
         }
     }
 
@@ -221,6 +249,11 @@ namespace WeaveFFI
             Ensure(v.Length);
             Array.Copy(v, 0, _buf, _len, v.Length);
             _len += v.Length;
+        }
+
+        internal void WriteObject(IntPtr token)
+        {
+            WriteU64((ulong)(nuint)(nint)token);
         }
 
         internal byte[] ToArray()
@@ -369,23 +402,22 @@ namespace WeaveFFI
             return outBuf;
         }
 
+        internal IntPtr ReadObject()
+        {
+            var token = ReadU64();
+            if (token == 0)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: null object token");
+            }
+            return (nint)(nuint)token;
+        }
+
         internal void ExpectEnd()
         {
             if (_pos != _data.Length)
             {
                 throw new InvalidOperationException("malformed WeaveFFI value buffer: trailing bytes");
             }
-        }
-    }
-
-    /// <summary>A typed native handle referencing a Leaf.</summary>
-    public readonly struct LeafHandle
-    {
-        internal readonly IntPtr Raw;
-
-        internal LeafHandle(IntPtr raw)
-        {
-            Raw = raw;
         }
     }
 
@@ -1011,25 +1043,376 @@ namespace WeaveFFI
         }
     }
 
+    /// <summary>Record carrying objects in every buffered position</summary>
+    public sealed class WidgetHolder
+    {
+        public Widget Primary { get; }
+
+        public Widget? Fallback { get; }
+
+        public Widget[] Extras { get; }
+
+        public Dictionary<string, Widget> ByName { get; }
+
+        public WidgetHolder(Widget primary, Widget? fallback, Widget[] extras, Dictionary<string, Widget> byName)
+        {
+            Primary = primary;
+            Fallback = fallback;
+            Extras = extras;
+            ByName = byName;
+        }
+
+        internal void WriteTo(WeaveFFIBufferWriter writer)
+        {
+            writer.WriteObject(Primary.CloneHandle());
+            if (Fallback != null)
+            {
+                writer.WriteOptionFlag(true);
+                writer.WriteObject(Fallback!.CloneHandle());
+            }
+            else
+            {
+                writer.WriteOptionFlag(false);
+            }
+            writer.WriteLen(Extras.Length);
+            foreach (var item0 in Extras)
+            {
+                writer.WriteObject(item0.CloneHandle());
+            }
+            writer.WriteLen(ByName.Count);
+            foreach (var entry0 in ByName)
+            {
+                writer.WriteString(entry0.Key);
+                writer.WriteObject(entry0.Value.CloneHandle());
+            }
+        }
+
+        internal static WidgetHolder ReadFrom(WeaveFFIBufferReader reader)
+        {
+            var fPrimary = new Widget(new WeaveFFIHandle(reader.ReadObject()));
+            Widget? fFallback = null;
+            if (reader.ReadOptionFlag())
+            {
+                var fFallbackValue = new Widget(new WeaveFFIHandle(reader.ReadObject()));
+                fFallback = fFallbackValue;
+            }
+            var fExtrasCount = reader.ReadLen();
+            var fExtras = new Widget[fExtrasCount];
+            for (int i0 = 0; i0 < fExtrasCount; i0++)
+            {
+                var fExtrasItem = new Widget(new WeaveFFIHandle(reader.ReadObject()));
+                fExtras[i0] = fExtrasItem;
+            }
+            var fByNameCount = reader.ReadLen();
+            var fByName = new Dictionary<string, Widget>(fByNameCount);
+            for (int i0 = 0; i0 < fByNameCount; i0++)
+            {
+                var fByNameKey = reader.ReadString();
+                var fByNameVal = new Widget(new WeaveFFIHandle(reader.ReadObject()));
+                fByName[fByNameKey] = fByNameVal;
+            }
+            return new WidgetHolder(fPrimary, fFallback, fExtras, fByName);
+        }
+    }
+
+    /// <summary>Callback interface carrying composite payloads and objects</summary>
+    /// <remarks>Implement this interface and pass an instance wherever the
+    /// native library expects it. The library may call any method from any
+    /// thread until it releases its last reference to the instance. Object
+    /// arguments are owned by the implementation, which should dispose them
+    /// when done. An exception thrown by a method is reported to the native
+    /// caller as <see cref="WeaveFFIException.ForeignErrorCode"/>.</remarks>
+    public interface IBatchListener
+    {
+        /// <summary>Composite payloads cross as value buffers</summary>
+        void OnBatch(Outer[] items, byte[] raw, Outer? first, Mode mode);
+        /// <summary>Objects cross as strong references the consumer must release</summary>
+        void OnWidget(Widget widget, Widget? fallback, Widget[] children);
+        void OnTick();
+        /// <summary>Scalar return travels back through the vtable</summary>
+        bool ShouldContinue(int @class);
+        /// <summary>Enum return travels back as its integer discriminant</summary>
+        Mode PickMode();
+    }
+
+    /// <summary>The process-wide <c>weaveffi_edge_cases_BatchListener_vtable</c> vtable and the trampolines behind
+    /// it, adapting an <see cref="IBatchListener"/> to the C ABI.</summary>
+    internal static unsafe class WeaveFFIVtable_edge_cases_BatchListener
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Layout
+        {
+            public IntPtr on_batch;
+            public IntPtr on_widget;
+            public IntPtr on_tick;
+            public IntPtr should_continue;
+            public IntPtr pick_mode;
+            public IntPtr free;
+        }
+
+        /// <summary>Address of the one static vtable for this interface. It is
+        /// allocated once and never freed, so the producer may keep the pointer
+        /// for the process lifetime.</summary>
+        internal static readonly IntPtr Pointer = Allocate();
+
+        private static IntPtr Allocate()
+        {
+            var layout = new Layout
+            {
+                on_batch = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, UIntPtr, IntPtr, UIntPtr, IntPtr, UIntPtr, int, IntPtr, void>)&OnBatchTrampoline,
+                on_widget = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, IntPtr, UIntPtr, IntPtr, void>)&OnWidgetTrampoline,
+                on_tick = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, void>)&OnTickTrampoline,
+                should_continue = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, int, IntPtr, byte>)&ShouldContinueTrampoline,
+                pick_mode = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, int>)&PickModeTrampoline,
+                free = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, void>)&FreeTrampoline,
+            };
+            var mem = Marshal.AllocHGlobal(Marshal.SizeOf<Layout>());
+            Marshal.StructureToPtr(layout, mem, false);
+            return mem;
+        }
+
+        private static IBatchListener Target(IntPtr ctx)
+        {
+            return (IBatchListener)GCHandle.FromIntPtr(ctx).Target!;
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void OnBatchTrampoline(IntPtr ctx, IntPtr items_ptr, UIntPtr items_len, IntPtr raw_ptr, UIntPtr raw_len, IntPtr first_ptr, UIntPtr first_len, int mode, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                var arg0Buf = new byte[(int)items_len];
+                if (items_ptr != IntPtr.Zero && (int)items_len > 0) Marshal.Copy(items_ptr, arg0Buf, 0, (int)items_len);
+                var arg0Reader = new WeaveFFIBufferReader(arg0Buf);
+                var arg0Count = arg0Reader.ReadLen();
+                var arg0 = new Outer[arg0Count];
+                for (int i0 = 0; i0 < arg0Count; i0++)
+                {
+                    var arg0Item = Outer.ReadFrom(arg0Reader);
+                    arg0[i0] = arg0Item;
+                }
+                arg0Reader.ExpectEnd();
+                var arg1 = new byte[(int)raw_len];
+                if (raw_ptr != IntPtr.Zero && (int)raw_len > 0) Marshal.Copy(raw_ptr, arg1, 0, (int)raw_len);
+                var arg2Buf = new byte[(int)first_len];
+                if (first_ptr != IntPtr.Zero && (int)first_len > 0) Marshal.Copy(first_ptr, arg2Buf, 0, (int)first_len);
+                var arg2Reader = new WeaveFFIBufferReader(arg2Buf);
+                Outer? arg2 = null;
+                if (arg2Reader.ReadOptionFlag())
+                {
+                    var arg2Value = Outer.ReadFrom(arg2Reader);
+                    arg2 = arg2Value;
+                }
+                arg2Reader.ExpectEnd();
+                impl.OnBatch(arg0, arg1, arg2, (Mode)mode);
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void OnWidgetTrampoline(IntPtr ctx, IntPtr widget, IntPtr fallback, IntPtr children_ptr, UIntPtr children_len, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                var arg2Buf = new byte[(int)children_len];
+                if (children_ptr != IntPtr.Zero && (int)children_len > 0) Marshal.Copy(children_ptr, arg2Buf, 0, (int)children_len);
+                var arg2Reader = new WeaveFFIBufferReader(arg2Buf);
+                var arg2Count = arg2Reader.ReadLen();
+                var arg2 = new Widget[arg2Count];
+                for (int i0 = 0; i0 < arg2Count; i0++)
+                {
+                    var arg2Item = new Widget(new WeaveFFIHandle(arg2Reader.ReadObject()));
+                    arg2[i0] = arg2Item;
+                }
+                arg2Reader.ExpectEnd();
+                impl.OnWidget(new Widget(new WeaveFFIHandle(widget)), fallback == IntPtr.Zero ? null : new Widget(new WeaveFFIHandle(fallback)), arg2);
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void OnTickTrampoline(IntPtr ctx, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                impl.OnTick();
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static byte ShouldContinueTrampoline(IntPtr ctx, int @class, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                return (byte)(impl.ShouldContinue(@class) ? 1 : 0);
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+                return default;
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static int PickModeTrampoline(IntPtr ctx, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                return (int)impl.PickMode();
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+                return default;
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void FreeTrampoline(IntPtr ctx)
+        {
+            GCHandle.FromIntPtr(ctx).Free();
+        }
+    }
+
+    /// <summary>Callback interface whose name and methods are keywords</summary>
+    /// <remarks>Implement this interface and pass an instance wherever the
+    /// native library expects it. The library may call any method from any
+    /// thread until it releases its last reference to the instance. Object
+    /// arguments are owned by the implementation, which should dispose them
+    /// when done. An exception thrown by a method is reported to the native
+    /// caller as <see cref="WeaveFFIException.ForeignErrorCode"/>.</remarks>
+    public interface IKeyword
+    {
+        void Delete(int self);
+        int Import();
+    }
+
+    /// <summary>The process-wide <c>weaveffi_edge_cases_Keyword_vtable</c> vtable and the trampolines behind
+    /// it, adapting an <see cref="IKeyword"/> to the C ABI.</summary>
+    internal static unsafe class WeaveFFIVtable_edge_cases_Keyword
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Layout
+        {
+            public IntPtr delete;
+            public IntPtr import;
+            public IntPtr free;
+        }
+
+        /// <summary>Address of the one static vtable for this interface. It is
+        /// allocated once and never freed, so the producer may keep the pointer
+        /// for the process lifetime.</summary>
+        internal static readonly IntPtr Pointer = Allocate();
+
+        private static IntPtr Allocate()
+        {
+            var layout = new Layout
+            {
+                delete = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, int, IntPtr, void>)&DeleteTrampoline,
+                import = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, int>)&ImportTrampoline,
+                free = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, void>)&FreeTrampoline,
+            };
+            var mem = Marshal.AllocHGlobal(Marshal.SizeOf<Layout>());
+            Marshal.StructureToPtr(layout, mem, false);
+            return mem;
+        }
+
+        private static IKeyword Target(IntPtr ctx)
+        {
+            return (IKeyword)GCHandle.FromIntPtr(ctx).Target!;
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void DeleteTrampoline(IntPtr ctx, int self, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                impl.Delete(self);
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static int ImportTrampoline(IntPtr ctx, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                return impl.Import();
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+                return default;
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void FreeTrampoline(IntPtr ctx)
+        {
+            GCHandle.FromIntPtr(ctx).Free();
+        }
+    }
+
     /// <summary>Interface with no constructor; instances come from make_widget</summary>
     public class Widget : IDisposable
     {
         private IntPtr _handle;
-        private bool _disposed;
+        private int _released;
 
-        internal Widget(IntPtr handle)
+        /// <summary>Adopts one strong reference to a native object.</summary>
+        internal Widget(WeaveFFIHandle handle)
         {
-            _handle = handle;
+            _handle = handle.Value;
         }
 
-        internal IntPtr Handle => _handle;
+        /// <summary>The borrowed native pointer for the duration of a call.</summary>
+        /// <exception cref="ObjectDisposedException">The wrapper was disposed.</exception>
+        internal IntPtr Handle
+        {
+            get
+            {
+                var h = _handle;
+                if (h == IntPtr.Zero)
+                {
+                    throw new ObjectDisposedException(nameof(Widget));
+                }
+                return h;
+            }
+        }
+
+        /// <summary>Mints a second strong reference the caller owns (for
+        /// example to write this object into a value buffer).</summary>
+        internal IntPtr CloneHandle()
+        {
+            return NativeMethods.weaveffi_edge_cases_Widget_clone(Handle);
+        }
 
         /// <summary>Void method that can fail</summary>
         /// <exception cref="EdgeErrorsException">Thrown when the call reports a EdgeErrorsError code.</exception>
         public void Refresh()
         {
             var err = new WeaveFFIError();
-            NativeMethods.weaveffi_edge_cases_Widget_refresh(_handle, ref err);
+            NativeMethods.weaveffi_edge_cases_Widget_refresh(Handle, ref err);
             WeaveFFIError.CheckEdgeErrors(err);
         }
 
@@ -1051,7 +1434,7 @@ namespace WeaveFFI
             var importPin = GCHandle.Alloc(importBuf, GCHandleType.Pinned);
             try
             {
-                var result = NativeMethods.weaveffi_edge_cases_Widget_rename(_handle, @classPtr, importPin.AddrOfPinnedObject(), (UIntPtr)importBuf.Length, ref err);
+                var result = NativeMethods.weaveffi_edge_cases_Widget_rename(Handle, @classPtr, importPin.AddrOfPinnedObject(), (UIntPtr)importBuf.Length, ref err);
                 WeaveFFIError.Check(err);
                 var str = Marshal.PtrToStringUTF8(result);
                 NativeMethods.weaveffi_free_string(result);
@@ -1105,7 +1488,7 @@ namespace WeaveFFI
             var ctx = GCHandle.ToIntPtr(gcHandle);
             try
             {
-                NativeMethods.weaveffi_edge_cases_Widget_fetch_async(_handle, id, callback, ctx);
+                NativeMethods.weaveffi_edge_cases_Widget_fetch_async(Handle, id, callback, ctx);
             }
             catch
             {
@@ -1119,26 +1502,39 @@ namespace WeaveFFI
         public string OldName()
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_edge_cases_Widget_old_name(_handle, ref err);
+            var result = NativeMethods.weaveffi_edge_cases_Widget_old_name(Handle, ref err);
             WeaveFFIError.Check(err);
             var str = Marshal.PtrToStringUTF8(result);
             NativeMethods.weaveffi_free_string(result);
             return str ?? "";
         }
 
+        /// <summary>Releases this wrapper's reference. The native object is
+        /// dropped when the producer releases its last reference; other
+        /// wrappers to the same object stay valid.</summary>
         public void Dispose()
         {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_edge_cases_Widget_destroy(_handle);
-                _disposed = true;
-            }
+            Release();
             GC.SuppressFinalize(this);
         }
 
         ~Widget()
         {
-            Dispose();
+            Release();
+        }
+
+        private void Release()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _released, 1) != 0)
+            {
+                return;
+            }
+            var h = _handle;
+            _handle = IntPtr.Zero;
+            if (h != IntPtr.Zero)
+            {
+                NativeMethods.weaveffi_edge_cases_Widget_destroy(h);
+            }
         }
     }
 
@@ -1146,14 +1542,35 @@ namespace WeaveFFI
     public class Vault : IDisposable
     {
         private IntPtr _handle;
-        private bool _disposed;
+        private int _released;
 
-        internal Vault(IntPtr handle)
+        /// <summary>Adopts one strong reference to a native object.</summary>
+        internal Vault(WeaveFFIHandle handle)
         {
-            _handle = handle;
+            _handle = handle.Value;
         }
 
-        internal IntPtr Handle => _handle;
+        /// <summary>The borrowed native pointer for the duration of a call.</summary>
+        /// <exception cref="ObjectDisposedException">The wrapper was disposed.</exception>
+        internal IntPtr Handle
+        {
+            get
+            {
+                var h = _handle;
+                if (h == IntPtr.Zero)
+                {
+                    throw new ObjectDisposedException(nameof(Vault));
+                }
+                return h;
+            }
+        }
+
+        /// <summary>Mints a second strong reference the caller owns (for
+        /// example to write this object into a value buffer).</summary>
+        internal IntPtr CloneHandle()
+        {
+            return NativeMethods.weaveffi_edge_cases_Vault_clone(Handle);
+        }
 
         /// <summary>Fails when the vault is busy</summary>
         /// <exception cref="EdgeErrorsException">Thrown when the call reports a EdgeErrorsError code.</exception>
@@ -1165,7 +1582,7 @@ namespace WeaveFFI
             {
                 var result = NativeMethods.weaveffi_edge_cases_Vault_open(pathPtr, ref err);
                 WeaveFFIError.CheckEdgeErrors(err);
-                return new Vault(result);
+                return new Vault(new WeaveFFIHandle(result));
             }
             finally
             {
@@ -1176,9 +1593,9 @@ namespace WeaveFFI
         public Widget? Peek()
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_edge_cases_Vault_peek(_handle, ref err);
+            var result = NativeMethods.weaveffi_edge_cases_Vault_peek(Handle, ref err);
             WeaveFFIError.Check(err);
-            return result == IntPtr.Zero ? null : new Widget(result);
+            return result == IntPtr.Zero ? null : new Widget(new WeaveFFIHandle(result));
         }
 
         /// <summary>Throwing static</summary>
@@ -1191,19 +1608,32 @@ namespace WeaveFFI
             return result != 0;
         }
 
+        /// <summary>Releases this wrapper's reference. The native object is
+        /// dropped when the producer releases its last reference; other
+        /// wrappers to the same object stay valid.</summary>
         public void Dispose()
         {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_edge_cases_Vault_destroy(_handle);
-                _disposed = true;
-            }
+            Release();
             GC.SuppressFinalize(this);
         }
 
         ~Vault()
         {
-            Dispose();
+            Release();
+        }
+
+        private void Release()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _released, 1) != 0)
+            {
+                return;
+            }
+            var h = _handle;
+            _handle = IntPtr.Zero;
+            if (h != IntPtr.Zero)
+            {
+                NativeMethods.weaveffi_edge_cases_Vault_destroy(h);
+            }
         }
     }
 
@@ -1212,7 +1642,7 @@ namespace WeaveFFI
         private const string LibName = "weaveffi";
 
         // The ABI revision these bindings were generated against.
-        internal const uint AbiVersion = 1;
+        internal const uint AbiVersion = 2;
 
         // Runs before the first P/Invoke through this class, so a producer built
         // for a different ABI revision fails loudly instead of misreading the
@@ -1239,6 +1669,12 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern uint weaveffi_abi_version();
 
+        // Fills a producer-owned error slot with a copy of `message`; callback
+        // trampolines report a thrown exception through it so no managed
+        // allocation is ever handed to the producer's allocator.
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_set(IntPtr err, int code, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_string(IntPtr ptr);
 
@@ -1251,14 +1687,17 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_free(IntPtr err);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Widget_clone", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_edge_cases_Widget_clone(IntPtr self);
+
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Widget_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_edge_cases_Widget_destroy(IntPtr self);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Widget_refresh", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_edge_cases_Widget_refresh(IntPtr self, ref WeaveFFIError err);
+        internal static extern void weaveffi_edge_cases_Widget_refresh(IntPtr self, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Widget_rename", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_Widget_rename(IntPtr self, IntPtr @class, IntPtr import_ptr, UIntPtr import_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_Widget_rename(IntPtr self, IntPtr @class, IntPtr import_ptr, UIntPtr import_len, ref WeaveFFIError out_err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_edge_cases_Widget_fetch(IntPtr context, IntPtr err, IntPtr result, UIntPtr resultLen);
@@ -1267,64 +1706,64 @@ namespace WeaveFFI
         internal static extern void weaveffi_edge_cases_Widget_fetch_async(IntPtr self, long id, AsyncCb_weaveffi_edge_cases_Widget_fetch callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Widget_old_name", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_Widget_old_name(IntPtr self, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_Widget_old_name(IntPtr self, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Vault_clone", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_edge_cases_Vault_clone(IntPtr self);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Vault_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_edge_cases_Vault_destroy(IntPtr self);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Vault_open", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_Vault_open(IntPtr path, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_Vault_open(IntPtr path, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Vault_peek", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_Vault_peek(IntPtr self, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_Vault_peek(IntPtr self, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_Vault_probe", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern byte weaveffi_edge_cases_Vault_probe(ref WeaveFFIError err);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void Cb_weaveffi_edge_cases_OnBatch_fn(IntPtr items_ptr, UIntPtr items_len, IntPtr raw_ptr, UIntPtr raw_len, IntPtr first_ptr, UIntPtr first_len, int mode, IntPtr context);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void Cb_weaveffi_edge_cases_OnTick_fn(IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_register_batch_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_edge_cases_register_batch_listener(Cb_weaveffi_edge_cases_OnBatch_fn callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_unregister_batch_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_edge_cases_unregister_batch_listener(ulong id);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_register_tick_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_edge_cases_register_tick_listener(Cb_weaveffi_edge_cases_OnTick_fn callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_unregister_tick_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_edge_cases_unregister_tick_listener(ulong id);
+        internal static extern byte weaveffi_edge_cases_Vault_probe(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_noop", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_edge_cases_noop(ref WeaveFFIError err);
+        internal static extern void weaveffi_edge_cases_noop(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_select", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_edge_cases_select(int @class, IntPtr from, IntPtr func_ptr, UIntPtr func_len, IntPtr range_ptr, UIntPtr range_len, byte type_, ref WeaveFFIError err);
+        internal static extern int weaveffi_edge_cases_select(int @class, IntPtr from, IntPtr func_ptr, UIntPtr func_len, IntPtr range_ptr, UIntPtr range_len, byte type_, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_nested_optional", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_nested_optional(IntPtr items_ptr, UIntPtr items_len, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_nested_optional(IntPtr items_ptr, UIntPtr items_len, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_optional_params", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_optional_params(IntPtr text_ptr, UIntPtr text_len, IntPtr count_ptr, UIntPtr count_len, IntPtr outer_ptr, UIntPtr outer_len, IntPtr tags_ptr, UIntPtr tags_len, IntPtr blob_ptr, UIntPtr blob_len, IntPtr mode_ptr, UIntPtr mode_len, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_optional_params(IntPtr text_ptr, UIntPtr text_len, IntPtr count_ptr, UIntPtr count_len, IntPtr outer_ptr, UIntPtr outer_len, IntPtr tags_ptr, UIntPtr tags_len, IntPtr blob_ptr, UIntPtr blob_len, IntPtr mode_ptr, UIntPtr mode_len, out UIntPtr out_len, ref WeaveFFIError out_err);
 
-        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_mutable_params", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_edge_cases_mutable_params(IntPtr text, IntPtr blob_ptr, UIntPtr blob_len, ref WeaveFFIError err);
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_register_batch", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_edge_cases_register_batch(IntPtr listener_ctx, IntPtr listener_vtable, IntPtr keyword_ctx, IntPtr keyword_vtable, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_widgets_everywhere", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_edge_cases_widgets_everywhere(IntPtr list_ptr, UIntPtr list_len, IntPtr by_name_ptr, UIntPtr by_name_len, IntPtr sparse_ptr, UIntPtr sparse_len, IntPtr holder_ptr, UIntPtr holder_len, out UIntPtr out_len, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_widget_stream", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_edge_cases_widget_stream(ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_WidgetStreamIterator_next", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int weaveffi_edge_cases_WidgetStreamIterator_next(IntPtr iter, out IntPtr out_item, ref WeaveFFIError out_err);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_WidgetStreamIterator_destroy", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_edge_cases_WidgetStreamIterator_destroy(IntPtr iter);
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void AsyncCb_weaveffi_edge_cases_async_widget(IntPtr context, IntPtr err, IntPtr result);
+
+        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_async_widget_async", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_edge_cases_async_widget_async(AsyncCb_weaveffi_edge_cases_async_widget callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_make_widget", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_make_widget(IntPtr label, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_make_widget(IntPtr label, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_find_widget", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_find_widget(long id, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_find_widget(long id, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_inspect_widget", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_inspect_widget(IntPtr widget, IntPtr fallback, ref WeaveFFIError err);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_typed_handle_param", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_typed_handle_param(IntPtr token, ulong raw, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_inspect_widget(IntPtr widget, IntPtr fallback, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_string_stream", CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr weaveffi_edge_cases_string_stream(ref WeaveFFIError out_err);
@@ -1396,96 +1835,15 @@ namespace WeaveFFI
         internal static extern void weaveffi_edge_cases_async_keywords_async(IntPtr @class, int import, AsyncCb_weaveffi_edge_cases_async_keywords callback, IntPtr context);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_keywords_roundtrip", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_keywords_roundtrip(IntPtr value_ptr, UIntPtr value_len, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_keywords_roundtrip(IntPtr value_ptr, UIntPtr value_len, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_edge_cases_legacy_value", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_edge_cases_legacy_value(int value, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_edge_cases_legacy_value(int value, out UIntPtr out_len, ref WeaveFFIError out_err);
 
     }
 
     public static class EdgeCases
     {
-        private static readonly object _listenerLock = new object();
-        // Live listener delegates by subscription id. Holding the delegate
-        // here keeps its native thunk alive until unregistered; without this
-        // the GC could collect a delegate the producer still calls.
-        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
-
-        /// <returns>A subscription id for UnregisterBatchListener().</returns>
-        public static ulong RegisterBatchListener(Action<Outer[], byte[], Outer?, Mode> callback)
-        {
-            NativeMethods.Cb_weaveffi_edge_cases_OnBatch_fn trampoline = (items_ptr, items_len, raw_ptr, raw_len, first_ptr, first_len, mode, context) =>
-            {
-                var arg0Buf = new byte[(int)items_len];
-                if (items_ptr != IntPtr.Zero && (int)items_len > 0) Marshal.Copy(items_ptr, arg0Buf, 0, (int)items_len);
-                var arg0Reader = new WeaveFFIBufferReader(arg0Buf);
-                var arg0Count = arg0Reader.ReadLen();
-                var arg0 = new Outer[arg0Count];
-                for (int i0 = 0; i0 < arg0Count; i0++)
-                {
-                    var arg0Item = Outer.ReadFrom(arg0Reader);
-                    arg0[i0] = arg0Item;
-                }
-                arg0Reader.ExpectEnd();
-                var arg1 = new byte[(int)raw_len];
-                if (raw_ptr != IntPtr.Zero && (int)raw_len > 0) Marshal.Copy(raw_ptr, arg1, 0, (int)raw_len);
-                var arg2Buf = new byte[(int)first_len];
-                if (first_ptr != IntPtr.Zero && (int)first_len > 0) Marshal.Copy(first_ptr, arg2Buf, 0, (int)first_len);
-                var arg2Reader = new WeaveFFIBufferReader(arg2Buf);
-                Outer? arg2 = null;
-                if (arg2Reader.ReadOptionFlag())
-                {
-                    var arg2Value = Outer.ReadFrom(arg2Reader);
-                    arg2 = arg2Value;
-                }
-                arg2Reader.ExpectEnd();
-                callback(arg0, arg1, arg2, (Mode)mode);
-            };
-            ulong id;
-            lock (_listenerLock)
-            {
-                id = NativeMethods.weaveffi_edge_cases_register_batch_listener(trampoline, IntPtr.Zero);
-                _listenerRefs[id] = trampoline;
-            }
-            return id;
-        }
-
-        /// <summary>Unregisters a listener previously registered with RegisterBatchListener().</summary>
-        public static void UnregisterBatchListener(ulong id)
-        {
-            NativeMethods.weaveffi_edge_cases_unregister_batch_listener(id);
-            lock (_listenerLock)
-            {
-                _listenerRefs.Remove(id);
-            }
-        }
-
-        /// <returns>A subscription id for UnregisterTickListener().</returns>
-        public static ulong RegisterTickListener(Action callback)
-        {
-            NativeMethods.Cb_weaveffi_edge_cases_OnTick_fn trampoline = (context) =>
-            {
-                callback();
-            };
-            ulong id;
-            lock (_listenerLock)
-            {
-                id = NativeMethods.weaveffi_edge_cases_register_tick_listener(trampoline, IntPtr.Zero);
-                _listenerRefs[id] = trampoline;
-            }
-            return id;
-        }
-
-        /// <summary>Unregisters a listener previously registered with RegisterTickListener().</summary>
-        public static void UnregisterTickListener(ulong id)
-        {
-            NativeMethods.weaveffi_edge_cases_unregister_tick_listener(id);
-            lock (_listenerLock)
-            {
-                _listenerRefs.Remove(id);
-            }
-        }
-
         /// <summary>No parameters and no result</summary>
         public static void Noop()
         {
@@ -1702,22 +2060,157 @@ namespace WeaveFFI
             }
         }
 
-        /// <summary>Write-back parameters</summary>
-        public static void MutableParams(string text, byte[] blob)
+        /// <summary>Two callback interface parameters on one function</summary>
+        public static void RegisterBatch(IBatchListener listener, IKeyword keyword)
         {
             var err = new WeaveFFIError();
-            var textPtr = Marshal.StringToCoTaskMemUTF8(text);
-            var blobPin = GCHandle.Alloc(blob, GCHandleType.Pinned);
+            var listenerCtx = GCHandle.ToIntPtr(GCHandle.Alloc(listener));
+            var keywordCtx = GCHandle.ToIntPtr(GCHandle.Alloc(keyword));
+            NativeMethods.weaveffi_edge_cases_register_batch(listenerCtx, WeaveFFIVtable_edge_cases_BatchListener.Pointer, keywordCtx, WeaveFFIVtable_edge_cases_Keyword.Pointer, ref err);
+            WeaveFFIError.Check(err);
+        }
+
+        /// <summary>Objects in every buffered position</summary>
+        public static WidgetHolder WidgetsEverywhere(Widget[] list, Dictionary<string, Widget> byName, Widget?[] sparse, WidgetHolder holder)
+        {
+            var err = new WeaveFFIError();
+            var listWriter = new WeaveFFIBufferWriter();
+            listWriter.WriteLen(list.Length);
+            foreach (var item0 in list)
+            {
+                listWriter.WriteObject(item0.CloneHandle());
+            }
+            var listBuf = listWriter.ToArray();
+            var listPin = GCHandle.Alloc(listBuf, GCHandleType.Pinned);
+            var byNameWriter = new WeaveFFIBufferWriter();
+            byNameWriter.WriteLen(byName.Count);
+            foreach (var entry0 in byName)
+            {
+                byNameWriter.WriteString(entry0.Key);
+                byNameWriter.WriteObject(entry0.Value.CloneHandle());
+            }
+            var byNameBuf = byNameWriter.ToArray();
+            var byNamePin = GCHandle.Alloc(byNameBuf, GCHandleType.Pinned);
+            var sparseWriter = new WeaveFFIBufferWriter();
+            sparseWriter.WriteLen(sparse.Length);
+            foreach (var item0 in sparse)
+            {
+                if (item0 != null)
+                {
+                    sparseWriter.WriteOptionFlag(true);
+                    sparseWriter.WriteObject(item0!.CloneHandle());
+                }
+                else
+                {
+                    sparseWriter.WriteOptionFlag(false);
+                }
+            }
+            var sparseBuf = sparseWriter.ToArray();
+            var sparsePin = GCHandle.Alloc(sparseBuf, GCHandleType.Pinned);
+            var holderWriter = new WeaveFFIBufferWriter();
+            holder.WriteTo(holderWriter);
+            var holderBuf = holderWriter.ToArray();
+            var holderPin = GCHandle.Alloc(holderBuf, GCHandleType.Pinned);
             try
             {
-                NativeMethods.weaveffi_edge_cases_mutable_params(textPtr, blobPin.AddrOfPinnedObject(), (UIntPtr)blob.Length, ref err);
+                var result = NativeMethods.weaveffi_edge_cases_widgets_everywhere(listPin.AddrOfPinnedObject(), (UIntPtr)listBuf.Length, byNamePin.AddrOfPinnedObject(), (UIntPtr)byNameBuf.Length, sparsePin.AddrOfPinnedObject(), (UIntPtr)sparseBuf.Length, holderPin.AddrOfPinnedObject(), (UIntPtr)holderBuf.Length, out var outLen, ref err);
                 WeaveFFIError.Check(err);
+                var resultBuf = new byte[(int)outLen];
+                if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
+                NativeMethods.weaveffi_free_bytes(result, outLen);
+                var decodedReader = new WeaveFFIBufferReader(resultBuf);
+                var decoded = WidgetHolder.ReadFrom(decodedReader);
+                decodedReader.ExpectEnd();
+                return decoded;
             }
             finally
             {
-                Marshal.FreeCoTaskMem(textPtr);
-                blobPin.Free();
+                listPin.Free();
+                byNamePin.Free();
+                sparsePin.Free();
+                holderPin.Free();
             }
+        }
+
+        /// <summary>Iterator of objects</summary>
+        /// <remarks>Streams lazily: each element is pulled from the native
+        /// iterator on demand, and the iterator is destroyed when enumeration
+        /// completes or the enumerator is disposed (a <c>foreach</c> disposes it
+        /// automatically, including on early exit). The returned sequence can be
+        /// enumerated only once.</remarks>
+        public static IEnumerable<Widget> WidgetStream()
+        {
+            var err = new WeaveFFIError();
+            var iter = NativeMethods.weaveffi_edge_cases_widget_stream(ref err);
+            WeaveFFIError.Check(err);
+            return new WeaveFFIOnceEnumerable<Widget>(EnumerateWidgetStream(iter));
+        }
+
+        private static IEnumerator<Widget> EnumerateWidgetStream(IntPtr iter)
+        {
+            try
+            {
+                while (true)
+                {
+                    var iterErr = new WeaveFFIError();
+                    if (NativeMethods.weaveffi_edge_cases_WidgetStreamIterator_next(iter, out var out_item, ref iterErr) == 0)
+                    {
+                        WeaveFFIError.Check(iterErr);
+                        yield break;
+                    }
+                    WeaveFFIError.Check(iterErr);
+                    yield return new Widget(new WeaveFFIHandle(out_item));
+                }
+            }
+            finally
+            {
+                NativeMethods.weaveffi_edge_cases_WidgetStreamIterator_destroy(iter);
+            }
+        }
+
+        /// <summary>Async returning an object</summary>
+        /// <exception cref="EdgeErrorsException">Thrown when the call reports a EdgeErrorsError code.</exception>
+        public static async Task<Widget> AsyncWidget()
+        {
+            var tcs = new TaskCompletionSource<Widget>(TaskCreationOptions.RunContinuationsAsynchronously);
+            NativeMethods.AsyncCb_weaveffi_edge_cases_async_widget callback = (context, err, result) =>
+            {
+                try
+                {
+                    if (err != IntPtr.Zero)
+                    {
+                        var wErr = Marshal.PtrToStructure<WeaveFFIError>(err);
+                        if (wErr.Code != 0)
+                        {
+                            var msg = Marshal.PtrToStringUTF8(wErr.Message) ?? "";
+                            var payload = WeaveFFIError.CopyPayload(wErr);
+                            NativeMethods.weaveffi_error_free(err);
+                            tcs.SetException(EdgeErrorsException.FromCode(wErr.Code, msg, payload));
+                            return;
+                        }
+                    }
+                    tcs.SetResult(new Widget(new WeaveFFIHandle(result)));
+                }
+                finally
+                {
+                    if (context != IntPtr.Zero)
+                    {
+                        GCHandle.FromIntPtr(context).Free();
+                    }
+                }
+            };
+            var gcHandle = GCHandle.Alloc(callback, GCHandleType.Normal);
+            var ctx = GCHandle.ToIntPtr(gcHandle);
+            try
+            {
+                NativeMethods.weaveffi_edge_cases_async_widget_async(callback, ctx);
+            }
+            catch
+            {
+                if (gcHandle.IsAllocated) gcHandle.Free();
+                throw;
+            }
+            return await tcs.Task;
         }
 
         /// <summary>Factory for an interface with no constructor</summary>
@@ -1729,7 +2222,7 @@ namespace WeaveFFI
             {
                 var result = NativeMethods.weaveffi_edge_cases_make_widget(labelPtr, ref err);
                 WeaveFFIError.Check(err);
-                return new Widget(result);
+                return new Widget(new WeaveFFIHandle(result));
             }
             finally
             {
@@ -1744,7 +2237,7 @@ namespace WeaveFFI
             var err = new WeaveFFIError();
             var result = NativeMethods.weaveffi_edge_cases_find_widget(id, ref err);
             WeaveFFIError.CheckEdgeErrors(err);
-            return result == IntPtr.Zero ? null : new Widget(result);
+            return result == IntPtr.Zero ? null : new Widget(new WeaveFFIHandle(result));
         }
 
         /// <summary>Interface parameter, including an optional one</summary>
@@ -1756,14 +2249,6 @@ namespace WeaveFFI
             var str = Marshal.PtrToStringUTF8(result);
             NativeMethods.weaveffi_free_string(result);
             return str ?? "";
-        }
-
-        public static LeafHandle TypedHandleParam(LeafHandle token, ulong raw)
-        {
-            var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_edge_cases_typed_handle_param(token.Raw, raw, ref err);
-            WeaveFFIError.Check(err);
-            return new LeafHandle(result);
         }
 
         /// <summary>Iterator of strings</summary>

@@ -2,16 +2,15 @@
 //! generated `weaveffi.py` module exposes.
 
 use weaveffi_core::model::{
-    BindingModel, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ListenerBinding,
-    ModuleBinding, StructBinding,
+    BindingModel, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    StructBinding,
 };
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::docs::emit_doc;
 use crate::entities::py_code_class_name;
 use crate::types::{
-    py_callable_hint, py_field, py_member_name, py_name, py_type_hint, py_variant,
-    py_wrapper_fn_name,
+    py_field, py_member_name, py_name, py_type_hint, py_variant, py_wrapper_fn_name,
 };
 
 /// Render the full `weaveffi.pyi` stub for the model.
@@ -22,9 +21,14 @@ pub(crate) fn render_pyi_module(
 ) -> String {
     let mut out = render_prelude(CommentStyle::Hash, input_basename);
     out.push_str(
-        "from enum import IntEnum\nfrom typing import Callable, Dict, Iterator, List, Optional, Type\n",
+        "from abc import ABC, abstractmethod\nfrom enum import IntEnum\n\
+         from typing import Callable, Dict, Iterator, List, Optional, Type\n",
     );
     out.push_str("\nclass WeaveFFIError(Exception):\n");
+    out.push_str("    GENERIC_ERROR_CODE: int\n");
+    out.push_str("    PANIC_ERROR_CODE: int\n");
+    out.push_str("    MARSHAL_ERROR_CODE: int\n");
+    out.push_str("    FOREIGN_ERROR_CODE: int\n");
     out.push_str("    code: int\n");
     out.push_str("    message: str\n");
     out.push_str("    def __init__(self, code: int, message: str) -> None: ...\n");
@@ -42,11 +46,11 @@ pub(crate) fn render_pyi_module(
         for s in &m.structs {
             render_pyi_struct(&mut out, s);
         }
+        for cb in &m.callback_interfaces {
+            render_pyi_callback_interface(&mut out, cb);
+        }
         for i in &m.interfaces {
             render_pyi_interface(&mut out, i);
-        }
-        for l in &m.listeners {
-            render_pyi_listener(&mut out, m, l, strip_module_prefix);
         }
         for f in &m.functions {
             render_pyi_function(&mut out, &m.path, f, strip_module_prefix);
@@ -87,9 +91,39 @@ fn render_pyi_error(out: &mut String, eb: &ErrorBinding) {
     }
 }
 
+/// `.pyi` stub for one callback interface: the abstract base class with one
+/// abstract method per IDL method, mirroring
+/// [`crate::calls::render_callback_interface`].
+fn render_pyi_callback_interface(out: &mut String, cb: &CallbackInterfaceBinding) {
+    out.push('\n');
+    emit_doc(out, &cb.doc, "");
+    out.push_str(&format!("class {}(ABC):\n", cb.name));
+    for m in &cb.methods {
+        let mut params = vec!["self".to_string()];
+        params.extend(
+            m.params
+                .iter()
+                .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty))),
+        );
+        let ret = m
+            .ret
+            .as_ref()
+            .map(py_type_hint)
+            .unwrap_or_else(|| "None".into());
+        emit_doc(out, &m.doc, "    ");
+        out.push_str(&format!(
+            "    @abstractmethod\n    def {}({}) -> {}: ...\n",
+            py_member_name(&m.name),
+            params.join(", "),
+            ret
+        ));
+    }
+}
+
 /// `.pyi` stub for one interface wrapper class: `__init__` for the canonical
-/// `new` constructor, a classmethod per remaining constructor, then methods
-/// and statics, mirroring [`crate::entities::render_interface`].
+/// `new` constructor, a classmethod per remaining constructor, the
+/// reference-releasing `close()` and context-manager pair, then methods and
+/// statics, mirroring [`crate::entities::render_interface`].
 fn render_pyi_interface(out: &mut String, i: &InterfaceBinding) {
     out.push('\n');
     emit_doc(out, &i.doc, "");
@@ -110,6 +144,9 @@ fn render_pyi_interface(out: &mut String, i: &InterfaceBinding) {
             member_sig(c, Some("self"))
         ));
     }
+    out.push_str("    def close(self) -> None: ...\n");
+    out.push_str(&format!("    def __enter__(self) -> \"{}\": ...\n", i.name));
+    out.push_str("    def __exit__(self, *exc: object) -> bool: ...\n");
     for c in i.constructors.iter().filter(|c| c.name != "new") {
         out.push_str(&format!(
             "    @classmethod\n    def {}({}) -> \"{}\": ...\n",
@@ -145,9 +182,6 @@ fn render_pyi_interface(out: &mut String, i: &InterfaceBinding) {
             member_sig(s, None),
             ret
         ));
-    }
-    if i.constructors.is_empty() && i.methods.is_empty() && i.statics.is_empty() {
-        out.push_str("    ...\n");
     }
 }
 
@@ -232,37 +266,6 @@ fn render_pyi_struct(out: &mut String, s: &StructBinding) {
     out.push_str(&format!(
         "    def __init__({}) -> None: ...\n",
         params.join(", ")
-    ));
-}
-
-/// `.pyi` stub for one listener's register/unregister wrapper pair.
-fn render_pyi_listener(
-    out: &mut String,
-    module: &ModuleBinding,
-    l: &ListenerBinding,
-    strip_module_prefix: bool,
-) {
-    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
-        unreachable!("listener '{}' references unknown callback", l.name);
-    };
-    let register_name = py_wrapper_fn_name(
-        &module.path,
-        &format!("register_{}", l.name),
-        strip_module_prefix,
-    );
-    let unregister_name = py_wrapper_fn_name(
-        &module.path,
-        &format!("unregister_{}", l.name),
-        strip_module_prefix,
-    );
-    out.push('\n');
-    emit_doc(out, &l.doc, "");
-    out.push_str(&format!(
-        "def {register_name}(callback: {}) -> int: ...\n",
-        py_callable_hint(&cb.params)
-    ));
-    out.push_str(&format!(
-        "def {unregister_name}(listener_id: int) -> None: ...\n"
     ));
 }
 

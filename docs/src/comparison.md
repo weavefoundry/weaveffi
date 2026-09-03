@@ -2,141 +2,176 @@
 
 WeaveFFI sits in a crowded ecosystem of FFI tooling. This page is an honest,
 side-by-side look at how it compares to the projects you are most likely to
-evaluate against it: **UniFFI**, **cbindgen**, **diplomat**, **SWIG**, and
-**autocxx**.
+evaluate against it: **UniFFI** (Mozilla's multi-language generator),
+**Diplomat** (the Rust-to-many-languages tool behind ICU4X), **cbindgen** plus
+hand-written glue, the single-language bridges **swift-bridge**, **napi-rs**,
+and **wasm-bindgen**, and the C/C++-first generators **SWIG** and **autocxx**.
 
 > All comparisons reflect the public state of each project at the time of
-> writing. If something here is out of date, please open a PR.
+> writing (ABI revision 2, schema `0.9.0`). If something here is out of date,
+> please open a PR.
+
+## The short version
+
+WeaveFFI's distinguishing bet is *one language-neutral IDL, one C ABI, eleven
+generators*. The producer can be Rust (with `#[weaveffi::module]` writing the
+ABI for you) or anything else that can export C symbols, and every generated
+package is standalone: consumers never install WeaveFFI. Since ABI revision 2
+the object model is on par with the Rust-first tools: interface objects are
+reference counted (`Arc<T>`), can be shared between wrappers and nested inside
+records, lists, maps, optionals, iterators, and async results, and callback
+interfaces let the producer call consumer code through a vtable.
+
+The honest flip side is that WeaveFFI is pre-1.0 and its type system is
+deliberately smaller than UniFFI's: no user-defined generics or trait objects
+with generics, callback methods return only scalars (no strings, buffers, or
+objects yet), no async callback methods, and no multi-file IDL imports. The
+[roadmap](roadmap.md) lists what's planned.
 
 ## At a glance
 
-|                                    | **WeaveFFI** | **UniFFI** | **cbindgen** | **diplomat** | **SWIG** | **autocxx** |
-|------------------------------------|:------------:|:----------:|:------------:|:------------:|:--------:|:-----------:|
-| Source language                    | Rust / C / C++ / Zig (anything with a C ABI) | Rust | Rust | Rust | C / C++ | C++ |
-| Input format                       | YAML / JSON / TOML IDL or annotated Rust | UDL or proc-macro on Rust | Rust source (annotated) | Rust source (annotated) | C/C++ headers + `.i` interface | C++ headers |
-| **Languages**                      |              |            |              |              |          |             |
-| C                                  | ✓            | ✗          | ✓            | ✓            | ✓        | ✗           |
-| C++                                | ✓ (RAII, `std::optional/vector/unordered_map`) | ✗ | ✓ (header) | ✓            | ✓        | ✓ (its purpose) |
-| Swift                              | ✓ (SwiftPM, `async/await`, `throws`) | ✓ | ✗ | ✓ | ✗ | ✗ |
-| Kotlin / Android (JNI)             | ✓ (Kotlin + JNI shim + Gradle) | ✓ | ✗ | ✗ | ✓ (Java via JNI) | ✗ |
-| Node.js                            | ✓ (N-API + `.d.ts`) | community add-on | ✗ | ✗ | ✓ (JavaScriptCore/V8) | ✗ |
-| WebAssembly                        | ✓ (loader + `.d.ts`) | ✗ | ✗ | ✓ (JS via Wasm) | ✗ | ✗ |
-| Python                             | ✓ (`ctypes` + `.pyi`) | ✓ | ✗ | ✗ | ✓ | ✗ |
-| .NET / C#                          | ✓ (P/Invoke + `.csproj`) | ✓ (community) | ✗ | ✗ | ✓ | ✗ |
-| Dart / Flutter                     | ✓ (`dart:ffi`)         | community | ✗ | ✓ | ✗ | ✗ |
-| Go                                 | ✓ (CGo)                 | community | ✗ | ✗ | ✓ | ✗ |
-| Ruby                               | ✓ (FFI gem)             | ✗ | ✗ | ✗ | ✓ | ✗ |
-| **Type system**                    |              |            |              |              |          |             |
-| Primitives + `string`              | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
-| `bytes` / byte slices              | ✓            | ✓          | ✓ (raw)      | ✓            | partial  | ✓           |
-| Structs                            | ✓ (idiomatic value types via value buffers) | ✓ (records & objects) | ✓ (`#[repr(C)]`) | ✓ (opaque) | ✓ | ✓ |
-| Interfaces (objects w/ methods)    | ✓ (constructors, methods, statics, implicit destroy) | ✓ (objects) | ✗ | ✓ (opaque types w/ methods) | ✓ (classes) | ✓ (C++ classes) |
-| Typed error domains                | ✓ (per-module codes, opt-in `throws`, native error types) | ✓ (error enums) | ✗ | partial (`Result`) | ✗ | ✗ |
-| Enums w/ explicit discriminants    | ✓            | ✓          | ✓            | ✓            | ✓        | ✓           |
-| Optionals                          | ✓ (`T?`)     | ✓          | partial      | ✓            | partial  | ✓           |
-| Lists                              | ✓ (`[T]`)    | ✓          | partial      | ✓            | ✓        | ✓           |
-| Maps                               | ✓ (`{K:V}`)  | ✓          | ✗            | ✓            | partial  | partial     |
-| Typed handles (`handle<T>`)        | ✓            | ✓ (objects) | ✗          | ✓ (opaque)   | partial  | ✗           |
-| Borrowed types (`&str`, `&[u8]`)   | ✓            | partial    | ✓            | ✓            | ✗        | ✓           |
-| Iterators (`iter<T>`)              | ✓            | ✓ (callbacks) | ✗         | partial      | partial  | ✗           |
-| Async functions                    | ✓ (callback ABI + `async/await`/`Promise`/`suspend`/`Task<T>`) | ✓ | ✗ | partial | ✗ | ✗ |
-| Cancellable futures                | ✓ (`weaveffi_cancel_token`) | partial | ✗ | ✗ | ✗ | ✗ |
-| Callbacks / event listeners        | ✓ (module-level) | ✓     | ✗ (raw fn ptrs) | partial   | partial  | partial     |
-| Cross-module type references       | ✓            | ✓          | n/a          | ✓            | ✓        | ✓           |
-| Nested modules                     | ✓            | partial    | n/a          | ✓            | ✓        | ✓           |
-| **Workflow**                       |              |            |              |              |          |             |
-| Single-binary CLI install          | ✓ (`cargo install weaveffi-cli`) | ✓ | ✓ | ✓ | system package | ✓ |
-| Standalone publishable packages    | ✓ (npm, SwiftPM, pub.dev, NuGet, gem, etc.) | partial | n/a | partial | partial | n/a |
-| JSON Schema for IDL editor support | ✓            | ✗          | n/a          | n/a          | ✗        | n/a         |
-| `extract` from annotated source    | ✓ (Rust)     | ✓ (proc-macro) | ✓ (Rust) | ✓ (Rust)    | n/a      | ✓ (C++)     |
-| `watch` mode                       | ✓            | ✗          | ✓ (`--watch`) | ✗          | ✗        | partial     |
-| `format` IDL canonicalizer         | ✓            | ✗          | n/a          | n/a          | ✗        | n/a         |
-| Custom template overrides          | ✗            | partial (Mako) | ✗        | partial      | ✓ (`%typemap`) | partial |
-| Snapshot-tested generator output   | ✓            | ✓          | ✓            | ✓            | partial  | ✓           |
-| Maturity                           | pre-1.0      | 1.0+ in Mozilla shipping products | 1.0+ widely deployed | pre-1.0 | 30+ years, ubiquitous | pre-1.0 |
-| License                            | MIT OR Apache-2.0 | MPL-2.0 | MPL-2.0 | BSD-3-Clause | GPL with FOSS exception | MIT OR Apache-2.0 |
+|                                    | **WeaveFFI** | **UniFFI** | **Diplomat** | **cbindgen + glue** | **swift-bridge** | **napi-rs** | **wasm-bindgen** | **SWIG** | **autocxx** |
+|------------------------------------|:------------:|:----------:|:------------:|:-------------------:|:----------------:|:-----------:|:----------------:|:--------:|:-----------:|
+| Producer language                  | Rust, C, C++, Zig (anything with a C ABI) | Rust | Rust | Rust | Rust | Rust | Rust | C / C++ | C++ (consumed from Rust) |
+| Input                              | YAML / JSON / TOML IDL or annotated Rust | UDL or proc-macros | annotated Rust bridge crate | Rust source | annotated Rust bridge module | annotated Rust | annotated Rust | C/C++ headers + `.i` file | C++ headers |
+| Consumer languages                 | C, C++, Swift, Kotlin, Node.js, Wasm/JS, Python, .NET, Dart, Go, Ruby | Kotlin, Swift, Python, Ruby first-party; Go, C#, Dart, Kotlin Multiplatform, React Native as external bindgens | C, C++, JS/TS (Wasm), Dart, Kotlin (JNA), Python (nanobind) | C (you write the rest) | Swift | Node.js | JS/TS (Wasm) | many (Python, Java, C#, Ruby, Lua, Perl, PHP, R, ...) | Rust |
+| Standalone C header                | ✓ (the contract every target shares) | ✗ (private scaffolding ABI) | ✓ (C backend) | ✓ (its purpose) | ✓ (generated) | ✗ | ✗ | ✗ | n/a |
+| **Type system**                    |              |            |              |                     |                  |             |                  |          |             |
+| Records / enums / optionals / lists / maps | ✓ (value buffers) | ✓ | ✓ (structs, enums, `Option`, slices; no maps) | manual | ✓ (transparent structs and enums, `Option`, `Vec`) | ✓ (serde objects) | ✓ (`serde-wasm-bindgen` or classes) | ✓ | ✓ |
+| Objects with methods               | ✓ reference counted, shareable, nestable | ✓ (`Arc<T>`) | ✓ (opaques, borrowed or owned) | manual | ✓ (opaque types) | ✓ (`#[napi]` classes) | ✓ (classes) | ✓ (classes) | ✓ (C++ classes) |
+| Callback interfaces                | ✓ (vtable; sync, scalar returns) | ✓ (foreign traits; any return, `throws`, async) | partial (Kotlin, C, C++; input-only) | manual fn pointers | partial (closures Rust to Swift) | ✓ (`ThreadsafeFunction`) | ✓ (closures) | partial (directors) | partial |
+| Typed error domains                | ✓ (per-module codes, opt-in `throws`, payload fields) | ✓ (error enums) | ✓ (`Result`) | manual | ✓ (`Result`) | ✓ (JS `Error`) | ✓ (`Result<JsValue>`) | ✗ | ✗ |
+| Async functions                    | ✓ (callback ABI, pluggable spawner, cancel tokens) | ✓ (poll-based, foreign executors) | ✗ | manual | ✓ (both directions) | ✓ (Tokio) | ✓ (`Promise`) | ✗ | ✗ |
+| Iterators                          | ✓ (`iter<T>`, lazy on every target) | ✗ (materialize or use a trait) | partial (`DiplomatWrite`) | manual | ✗ | ✗ | ✓ (JS iterators) | partial | ✗ |
+| Generics / trait objects           | ✗ (fixed set of built-in shapes) | partial (traits, no generics) | partial (traits on some backends) | ✗ | partial | ✗ | ✗ | ✓ (templates via `%template`) | ✓ |
+| Multi-file / multi-crate definitions | ✗ (one document per API) | ✓ (external types across crates) | ✓ (one bridge crate, many modules) | n/a | ✗ | n/a | n/a | ✓ (`%include`) | ✓ |
+| **Workflow**                       |              |            |              |                     |                  |             |                  |          |             |
+| Standalone CLI                     | ✓ (`cargo install weaveffi-cli`) | `uniffi-bindgen` (build.rs or CLI) | `diplomat-tool` | ✓ | `swift-bridge-cli` | `napi` CLI (npm) | `wasm-bindgen-cli` | system package | cargo build |
+| Publishable per-ecosystem packages | ✓ (`weaveffi package` for every target) | partial | partial | n/a | ✓ (SwiftPM) | ✓ (npm) | ✓ (npm via wasm-pack) | ✗ | n/a |
+| Schema-checked IDL with JSON Schema | ✓ | ✗ | n/a | n/a | n/a | n/a | n/a | ✗ | n/a |
+| Load-time ABI version check        | ✓ (`weaveffi_abi_version`) | ✓ (checksums) | ✗ | ✗ | ✗ | ✓ (N-API version) | ✗ | ✗ | n/a |
+| Generated-output drift check in CI | ✓ (`weaveffi diff --check`) | build-time | build-time | ✓ | build-time | build-time | build-time | ✗ | build-time |
+| Maturity                           | pre-1.0      | shipping in Firefox and Mozilla products since 2020 | shipping in ICU4X | 1.0+, widely deployed | 0.1.x, active | 2.x+, widely deployed | 0.2.x, ubiquitous | 30+ years | pre-1.0 |
+| License                            | MIT OR Apache-2.0 | MPL-2.0 | MIT OR Apache-2.0 | MPL-2.0 | MIT OR Apache-2.0 | MIT | MIT OR Apache-2.0 | GPL-3.0 (generated code exempt) | MIT OR Apache-2.0 |
 
-Legend: ✓ = first-class support; *partial* = supported with caveats or via
-extensions; ✗ = not supported; *n/a* = not applicable to that tool's scope.
+Legend: ✓ = first-class support; *partial* = supported with caveats, on a
+subset of backends, or via extensions; ✗ = not supported; *manual* = you write
+it by hand; *n/a* = not applicable to that tool's scope.
 
 ## Where competitors are stronger
 
-We try hard to be honest about the trade-offs. Pick the right tool for the job:
+Pick the right tool for the job. These are the places where another project
+is ahead of WeaveFFI today.
 
-- **UniFFI is more mature.** It ships in production at Mozilla (Firefox Sync,
-  Glean, Nimbus) and has years of battle-testing across iOS, Android, and
-  desktop. If you only need Swift, Kotlin, and Python today and you are
-  comfortable with a UDL-or-proc-macro workflow, UniFFI is the safer choice.
+- **UniFFI has the richer type system and more production mileage.** It
+  ships in Firefox, Firefox Sync, Glean, and Nimbus and has years of
+  battle-testing across iOS, Android, and desktop. Its foreign traits can
+  return any type (strings, records, objects), can `throw`, and can be
+  `async`; WeaveFFI's callback-interface methods are synchronous and return
+  only scalars, `bool`, or a C-style enum. UniFFI also supports external types
+  across crates, whereas a WeaveFFI API is one IDL document (or one annotated
+  Rust source tree). If your matrix is Kotlin, Swift, and Python and you want
+  maximum maturity, UniFFI is the safer pick.
+- **Diplomat has the more mature Kotlin and JS story for a Rust library.**
+  It powers ICU4X, its bridge-crate model keeps everything in Rust, and its
+  C++ backend is polished for slotting into existing C++ builds. Its opaques
+  support borrowed as well as owned references, which WeaveFFI does not
+  model (every WeaveFFI object crossing is a strong reference). Diplomat has
+  no async support and no maps, and callbacks exist only on some backends.
 - **cbindgen is simpler if all you want is a C header.** WeaveFFI generates
-  a C header *and* ten other targets. If you only consume the C surface
-  from C/C++ code, cbindgen has less ceremony, no IDL file, and a smaller
-  dependency footprint.
-- **diplomat has a more polished C++ story.** Its C++ output uses richer
-  templates and integrates more cleanly with existing C++ codebases. WeaveFFI's
-  C++ output is RAII-based and includes a `CMakeLists.txt`, but it's
-  optimized for greenfield projects, not for slotting into a 20-year-old
-  C++ build system.
-- **SWIG covers languages WeaveFFI doesn't.** Lua, Tcl, R, Octave, Perl, PHP:
-  if your target is exotic, SWIG probably has a generator. SWIG also
-  natively understands C and C++ headers, so you don't need to author an
-  IDL at all.
-- **autocxx is unmatched for "wrap an existing C++ library."** It reads
-  your C++ headers directly and uses bindgen + cxx under the hood. WeaveFFI
-  does not parse C++; you describe the surface area you want to expose, and
-  WeaveFFI generates the contract.
-- **No IDE plugin yet.** The other tools listed have community VSCode/JetBrains
-  extensions of varying quality. WeaveFFI ships a JSON Schema for editor
-  autocompletion and a `format` command, but no first-party IDE plugin.
-- **No formal stability guarantee yet.** WeaveFFI is pre-1.0; the IDL,
-  generated output, and runtime symbol names can shift in minor releases.
-  UniFFI, cbindgen, and SWIG offer stronger compatibility commitments
-  today.
+  a C header *and* ten other targets. If you only consume the C surface from
+  C or C++ code, cbindgen has less ceremony, no IDL, and a smaller footprint.
+  You write the object lifecycle, error channel, and any callback plumbing
+  yourself.
+- **swift-bridge, napi-rs, and wasm-bindgen are deeper in their one
+  language.** Each exposes idioms WeaveFFI's common denominator can't:
+  swift-bridge bridges async functions in *both* directions and transparent
+  Swift structs; napi-rs gives you the full N-API surface (`ThreadsafeFunction`,
+  typed arrays, `AsyncTask`, class inheritance) and Tokio integration;
+  wasm-bindgen talks to the whole Web platform through `web-sys` and
+  `js-sys` and runs futures on the JS event loop. If you ship to exactly one
+  of those ecosystems, the dedicated bridge is the better fit.
+- **SWIG covers languages WeaveFFI doesn't.** Lua, Tcl, R, Octave, Perl, PHP,
+  Java: if your target is exotic, SWIG probably has a generator, and it reads
+  C and C++ headers directly so you author no IDL. It also handles C++
+  templates.
+- **autocxx is unmatched for "wrap an existing C++ library."** It reads your
+  C++ headers and uses bindgen plus cxx under the hood. WeaveFFI does not
+  parse C++; you describe the surface you want to expose and implement the
+  generated header.
+- **WeaveFFI's Wasm target is single-threaded.** The default
+  `wasm32-unknown-unknown` build has no threads, so async functions resolve
+  inline and callback-interface methods fire only while a call into the
+  module is on the stack; a producer that calls back from a spawned thread
+  can't run there. wasm-bindgen's `wasm-bindgen-futures` integrates with the
+  JS event loop natively, and Emscripten-based toolchains can use
+  `pthread`s. In WeaveFFI's Emscripten compatibility mode, async functions
+  and callback interfaces are not available at all.
+- **No formal stability guarantee yet.** WeaveFFI is pre-1.0; schema `0.9.0`
+  and ABI revision 2 removed constructs without compatibility shims (see the
+  [migration guide](stability.md#migrating-from-schema-080--abi-1-to-090--abi-2)).
+  UniFFI, cbindgen, napi-rs, wasm-bindgen, and SWIG offer stronger
+  compatibility commitments today.
 
 ## When to choose WeaveFFI
 
 WeaveFFI is the right pick when you want:
 
-1. **One source of truth for many languages.** If your library has to land
-   in npm *and* SwiftPM *and* PyPI *and* NuGet *and* pub.dev *and* RubyGems
-   *and* a Go module *and* a Gradle artifact, that's the WeaveFFI sweet
-   spot. UniFFI covers a smaller subset out of the box; cbindgen and
-   autocxx don't try.
-2. **Standalone, publishable consumer packages.** Generated packages are
-   self-contained: a Swift consumer adds your `.xcframework` + a SwiftPM
-   manifest and is done. No "install WeaveFFI" step on the consumer side.
-3. **A native library that isn't (only) Rust.** WeaveFFI works against
-   anything that exposes a stable C ABI: Rust (with the
-   `#[weaveffi::module]` macro generating the ABI for you), C, C++, Zig,
-   etc. UniFFI and diplomat assume Rust; autocxx assumes C++.
-4. **Idiomatic per-target output, not a lowest-common-denominator API.**
-   Async functions become `async/await` in Swift, `Promise`s in Node,
-   `suspend fun` in Kotlin, `async def` in Python, and `Task<T>` in C#,
-   all from the same `async: true` flag in the IDL.
-5. **A CLI workflow with `validate`, `lint`, `diff`, `watch`, and
-   `format`.** WeaveFFI is built for monorepos and CI: every sub-command
-   has a `--format json` output mode, and `diff --check` and
-   `format --check` are designed to drop into pre-commit and CI gates.
-6. **Honest pre-1.0 churn, documented every release.** Every breaking IDL
-   change is called out in `CHANGELOG.md` with a migration note, and
-   `weaveffi validate` rejects out-of-date schema versions with an
-   actionable error instead of silently misreading them.
+1. **One source of truth for many languages.** If your library has to land in
+   npm *and* SwiftPM *and* PyPI *and* NuGet *and* pub.dev *and* RubyGems
+   *and* a Go module *and* a Gradle artifact, that's the WeaveFFI sweet spot.
+   UniFFI and Diplomat cover a smaller set out of the box; the
+   single-language bridges don't try.
+2. **A native library that isn't (only) Rust.** WeaveFFI works against
+   anything that exposes a C ABI: Rust (with the `#[weaveffi::module]` macro
+   generating the ABI for you), C, C++, Zig, and so on. UniFFI, Diplomat,
+   swift-bridge, napi-rs, and wasm-bindgen assume Rust; autocxx assumes C++.
+3. **Objects that behave the same everywhere.** Reference-counted interfaces
+   with deterministic release (`close()`, `Dispose()`, `deinit`, RAII) and a
+   garbage-collector backstop on every managed target, and the ability to put
+   an object inside a record, a list, a map, an optional, an iterator, or an
+   async result on all eleven targets, from one declaration.
+4. **Callback interfaces without hand-written trampolines.** Declare the
+   methods once and each target gets a protocol, interface, or abstract class
+   to implement; the producer receives an `Arc<dyn Trait>` it can retain and
+   call from any thread, and a consumer-side exception surfaces to the
+   original caller as a typed foreign error.
+5. **Standalone, publishable consumer packages.** Generated packages are
+   self-contained; `weaveffi package` bundles the native library per platform
+   (including `jniLibs/<abi>/` for Kotlin and the `.wasm` for npm). There is no
+   "install WeaveFFI" step on the consumer side.
+6. **Idiomatic per-target output, not a lowest-common-denominator API.**
+   Async functions become `async/await` in Swift, `Promise`s in Node and
+   Wasm, `suspend fun` in Kotlin, `async def` in Python, `Task<T>` in C#, and
+   `Future<T>` in Dart, all from the same `async: true` flag; Rust producers
+   can plug their own executor with `weaveffi::set_spawner`.
+7. **A CI-first CLI.** `validate`, `diff --check`, `extract`, `schema`, and
+   `package` are designed to drop into pipelines, every generator's output is
+   byte-for-byte deterministic, and generated consumers refuse to load a
+   producer built for a different ABI revision.
 
 ## When to choose something else
 
-- **You only need Swift + Kotlin + Python and want maximum stability**:
-  use UniFFI.
+- **You only need Kotlin, Swift, and Python and want maximum stability, or
+  you need callback methods that return strings, records, or objects, or
+  async callbacks**: use UniFFI.
 - **You only need a C header for a Rust crate**: use cbindgen.
-- **You're wrapping a large existing C++ codebase**: use autocxx (or
-  cxx + bindgen directly).
+- **You ship to exactly one of Swift, Node.js, or the browser**: use
+  swift-bridge, napi-rs, or wasm-bindgen respectively.
+- **You're wrapping a large existing C++ codebase from Rust**: use autocxx (or
+  cxx plus bindgen directly).
 - **Your target language is Lua, Tcl, R, Octave, Perl, or PHP**: use SWIG.
-- **You need a battle-tested C++ binding generator with rich template
-  support**: use diplomat or SWIG.
+- **You want a Rust-only bridge crate with borrowed-reference semantics and a
+  polished C++ backend**: use Diplomat (`#[diplomat::bridge]`, from the
+  `rust-diplomat/diplomat` repository).
 
-## Migrating to / from WeaveFFI
+## Migrating to or from WeaveFFI
 
-WeaveFFI's IDL is intentionally close to UniFFI's UDL surface area, which
-makes hand-porting straightforward in either direction. There is no
-automatic UDL → WeaveFFI converter today, but `weaveffi extract` can read
-annotated Rust source and produce a starting IDL, which is often the
-fastest path off any Rust-only generator. See the
-[extract guide](guides/extract.md) for details.
+WeaveFFI's IDL is intentionally close to UniFFI's UDL surface area (records,
+enums, interfaces, callback interfaces, error enums, `async`), which makes
+hand-porting straightforward in either direction. There is no automatic UDL
+to WeaveFFI converter today, but `weaveffi extract` can read annotated Rust
+source and produce a starting IDL, which is often the fastest path off any
+Rust-only generator. See the [extract guide](guides/extract.md) for details,
+and the [C ABI contract](reference/abi.md) if you're bringing a non-Rust
+producer to the generated header.

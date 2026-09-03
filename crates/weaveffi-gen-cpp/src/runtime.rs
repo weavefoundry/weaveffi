@@ -1,15 +1,25 @@
 //! The private runtime prelude of the generated header: the generic error
-//! surface, the value-buffer reader/writer, and the listener registry.
+//! surface, the ABI revision check, and the value-buffer reader/writer.
 
 use weaveffi_core::codegen::CodeWriter;
 
-/// Emit the generic `WeaveFFIError` plus the `detail::check`/`detail::make_error`
-/// helpers every non-throwing wrapper uses. A nonzero code on a non-throwing
-/// callable can only be a producer panic or a marshalling failure, so it
-/// surfaces as this generic exception rather than a typed domain error.
+/// Emit the generic `WeaveFFIError`, the `check_abi_version()` helper, and
+/// the `detail::check`/`detail::make_error` helpers every non-throwing wrapper
+/// uses. A nonzero code on a non-throwing callable can only be a runtime trap
+/// (a producer panic, a marshalling failure, or a callback-interface
+/// implementation that raised), so it surfaces as this generic exception
+/// rather than a typed domain error.
 pub(crate) fn render_generic_error(out: &mut String, prefix: &str) {
+    let upper = prefix.to_uppercase();
     let mut w = CodeWriter::four_space();
-    w.line("/** Base exception for every error reported through the C ABI. */");
+    w.line("/**");
+    w.line(" * Base exception for every error reported through the C ABI.");
+    w.line(" *");
+    w.line(" * Positive codes are the module's declared error codes (see the typed");
+    w.line(" * domain exceptions); negative codes are runtime traps: -1 a generic");
+    w.line(" * producer error, -2 a producer panic, -3 a marshalling failure, -4 a");
+    w.line(" * callback-interface implementation that threw.");
+    w.line(" */");
     w.line("class WeaveFFIError : public std::runtime_error {");
     w.scope(|w| {
         w.line("int32_t code_;");
@@ -21,6 +31,24 @@ pub(crate) fn render_generic_error(out: &mut String, prefix: &str) {
         w.line("int32_t code() const { return code_; }");
     });
     w.line("};");
+    w.blank();
+
+    w.line("/**");
+    w.line(" * Throws WeaveFFIError when the loaded producer library was built for a");
+    w.line(" * different WeaveFFI ABI revision than this header. Call once at startup.");
+    w.line(" */");
+    w.line("inline void check_abi_version() {");
+    w.scope(|w| {
+        w.line(format!("uint32_t actual = {prefix}_abi_version();"));
+        w.line(format!("if (actual != {upper}_ABI_VERSION) {{"));
+        w.scope(|w| {
+            w.line(format!(
+                "throw WeaveFFIError(-1, \"WeaveFFI ABI revision mismatch: header \" + std::to_string({upper}_ABI_VERSION) + \", library \" + std::to_string(actual));"
+            ));
+        });
+        w.line("}");
+    });
+    w.line("}");
     w.blank();
 
     w.line("namespace detail {");
@@ -121,7 +149,8 @@ public:
  * Decodes values from the WeaveFFI value-buffer wire format. A malformed
  * buffer is a producer/consumer contract violation (both sides are generated
  * from one IDL), so every decode failure throws the generic WeaveFFIError,
- * the same channel as a producer panic.
+ * the same channel as a producer panic. Object tokens adopted before a
+ * failure live in RAII wrappers that release them on unwind.
  */
 class BufferReader {
     const uint8_t* data_;
@@ -231,23 +260,4 @@ struct BufferGuard {
 
 "#;
     out.push_str(&body.replace("@PREFIX@", prefix));
-}
-
-/// Emit the `detail` registry that pins each listener's heap-boxed
-/// `std::function` (type-erased) until unregistration, plus the mutex
-/// guarding it. Listener closures are threaded through the C `context`
-/// pointer, so the box must outlive the registration.
-pub(crate) fn render_listener_registry(out: &mut String) {
-    out.push_str("namespace detail {\n\n");
-    out.push_str("inline std::mutex& wv_listener_mutex() {\n");
-    out.push_str("    static std::mutex m;\n");
-    out.push_str("    return m;\n");
-    out.push_str("}\n\n");
-    out.push_str(
-        "inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {\n",
-    );
-    out.push_str("    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;\n");
-    out.push_str("    return registry;\n");
-    out.push_str("}\n\n");
-    out.push_str("} // namespace detail\n\n");
 }

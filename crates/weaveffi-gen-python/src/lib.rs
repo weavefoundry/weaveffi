@@ -1,9 +1,14 @@
 //! Python (`ctypes`) binding generator for WeaveFFI.
 //!
 //! Emits a pip-installable package containing `ctypes`-based bindings and
-//! `.pyi` type stubs over the C ABI. Async functions surface as
-//! `async def` wrappers. Implements [`LanguageBackend`]; the shared driver
-//! bridges it into the generator pipeline.
+//! `.pyi` type stubs over the C ABI (revision 2). Records and rich enums are
+//! dataclasses crossing the boundary as value buffers; interfaces are
+//! reference-counted wrapper classes with `close()` and a `__del__` backstop;
+//! callback interfaces are abstract base classes the consumer subclasses,
+//! backed by one static vtable of `ctypes` trampolines per interface; async
+//! functions surface as `async def` wrappers and `iter<T>` returns as lazy
+//! Python iterators. Implements [`LanguageBackend`]; the shared driver bridges
+//! it into the generator pipeline.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
@@ -16,6 +21,8 @@ mod entities;
 mod package;
 mod runtime;
 mod stubs;
+#[cfg(test)]
+mod tests;
 mod types;
 
 use camino::Utf8Path;
@@ -23,26 +30,28 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{
-    BindingModel, CallbackBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
-    ListenerBinding, ModuleBinding, StructBinding,
+    BindingModel, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    ModuleBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
-use crate::calls::{render_callable, render_callback_type, render_listener, FnScope};
+use crate::calls::{render_callable, render_callback_interface, FnScope};
 use crate::entities::{render_enum, render_error, render_interface, render_struct};
 use crate::package::{
-    render_packaged_readme, render_packaged_setup_py, render_pyproject_toml, render_readme,
-    render_setup_py,
+    render_packaged_readme, render_packaged_setup_py, render_py_typed, render_pyproject_toml,
+    render_readme, render_setup_py,
 };
-use crate::runtime::{py_loader_packaged, render_preamble, PY_LOADER_ORIGINAL};
+use crate::runtime::{
+    py_loader_packaged, render_feature_runtime, render_preamble, PY_LOADER_ORIGINAL,
+};
 use crate::stubs::render_pyi_module;
 
 /// Per-target configuration for [`PythonGenerator`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PythonConfig {
     /// pip-installable Python package name (default `"weaveffi"`). Also
     /// determines the on-disk package directory inside `python/`.
@@ -97,57 +106,16 @@ pub struct PythonGenerator;
 impl PythonGenerator {
     /// Render the primary `weaveffi.py` source by composing the shared
     /// [`LanguageBackend::emit_members`] walk over every module.
-    fn render_py_source(
-        &self,
-        model: &BindingModel,
-        strip_module_prefix: bool,
-        input_basename: &str,
-    ) -> String {
-        let config = PythonConfig {
-            strip_module_prefix,
-            ..PythonConfig::default()
-        };
-        let mut out = render_prelude(CommentStyle::Hash, input_basename);
+    fn render_py_source(&self, model: &BindingModel, config: &PythonConfig) -> String {
+        let mut out = render_prelude(CommentStyle::Hash, config.input_basename());
         render_preamble(&mut out);
-        let has_async = model
-            .modules
-            .iter()
-            .flat_map(|m| m.callables())
-            .any(|f| f.is_async);
-        if has_async {
-            out.push_str(
-                "\nimport asyncio\nimport threading\n\n\n\
-                 # Pending async completion trampolines, keyed by an integer token.\n\
-                 # Holding the ctypes function objects here keeps them alive until the\n\
-                 # producer fires the completion callback, even when the awaiting\n\
-                 # coroutine has been cancelled; each entry is removed on completion.\n\
-                 _async_pending: Dict[int, object] = {}\n\
-                 _async_lock = threading.Lock()\n\
-                 _async_next_token = 0\n\n\n\
-                 def _async_register(cb) -> int:\n    \
-                     global _async_next_token\n    \
-                     with _async_lock:\n        \
-                         _async_next_token += 1\n        \
-                         _token = _async_next_token\n        \
-                         _async_pending[_token] = cb\n    \
-                     return _token\n",
-            );
-        }
-        let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
-        if has_listeners {
-            out.push_str(
-                "\n\n# Registered listener trampolines, keyed by subscription id. Holding\n\
-                 # the ctypes function objects here keeps them alive until unregistered;\n\
-                 # without this the GC could collect a trampoline the producer still calls.\n\
-                 _listener_refs: Dict[int, object] = {}\n",
-            );
-        }
+        render_feature_runtime(&mut out, model.has_async(), model.has_callback_interfaces());
         // The model is a flat, pre-order list of modules, each carrying its
         // joined symbol path, the same traversal order the recursive walk
         // produced.
         for m in &model.modules {
             out.push_str(&format!("\n\n# === Module: {} ===", m.path));
-            self.emit_members(&mut out, m, &config);
+            self.emit_members(&mut out, m, config);
         }
         out.push('\n');
         out.push_str(&render_trailer(CommentStyle::Hash, "weaveffi.py"));
@@ -162,7 +130,7 @@ impl LanguageBackend for PythonGenerator {
         "python"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 
@@ -204,24 +172,14 @@ impl LanguageBackend for PythonGenerator {
         render_struct(out, s);
     }
 
-    fn render_callback(
-        &self,
-        out: &mut String,
-        _module: &ModuleBinding,
-        c: &CallbackBinding,
-        _config: &Self::Config,
-    ) {
-        render_callback_type(out, c);
-    }
-
-    fn render_listener(
+    fn render_callback_interface(
         &self,
         out: &mut String,
         module: &ModuleBinding,
-        l: &ListenerBinding,
+        cb: &CallbackInterfaceBinding,
         config: &Self::Config,
     ) {
-        render_listener(out, module, l, config.strip_module_prefix);
+        render_callback_interface(out, module, cb, config.prefix());
     }
 
     fn render_function(
@@ -270,12 +228,13 @@ impl LanguageBackend for PythonGenerator {
             ),
             OutputFile::new(
                 pkg_dir.join("weaveffi.py"),
-                self.render_py_source(model, config.strip_module_prefix, input_basename),
+                self.render_py_source(model, config),
             ),
             OutputFile::new(
                 pkg_dir.join("weaveffi.pyi"),
                 render_pyi_module(model, config.strip_module_prefix, input_basename),
             ),
+            OutputFile::new(pkg_dir.join("py.typed"), render_py_typed(input_basename)),
             OutputFile::new(
                 dir.join("pyproject.toml"),
                 render_pyproject_toml(&package, &import_name, input_basename),
@@ -310,12 +269,10 @@ impl LanguageBackend for PythonGenerator {
 
         // Render the binding source once with the bundled-first loader, then
         // reuse it across every per-platform wheel tree.
-        let py_source = self
-            .render_py_source(model, config.strip_module_prefix, input_basename)
-            .replace(
-                PY_LOADER_ORIGINAL,
-                &py_loader_packaged(&ctx.binaries.lib_name),
-            );
+        let py_source = self.render_py_source(model, config).replace(
+            PY_LOADER_ORIGINAL,
+            &py_loader_packaged(&ctx.binaries.lib_name),
+        );
         let init_py = format!(
             "{}from .weaveffi import *  # noqa: F401,F403\n\n{}",
             render_prelude(hash, input_basename),
@@ -327,8 +284,14 @@ impl LanguageBackend for PythonGenerator {
 
         let py_dir = out_dir.join("python");
         let mut files = Vec::new();
+        // Wheels exist only for the platforms that have a wheel platform tag;
+        // a binary for any other platform (Android, wasm32) has no wheel to
+        // land in and is skipped.
         for nb in &ctx.binaries.binaries {
             let platform = nb.platform;
+            let Some(tag) = platform.python_platform_tag() else {
+                continue;
+            };
             let tree = py_dir.join(platform.id());
             let pkg_dir = tree.join(&import_name);
             files.push(PackagedFile::text(
@@ -343,6 +306,10 @@ impl LanguageBackend for PythonGenerator {
                 pkg_dir.join("weaveffi.pyi"),
                 pyi.clone(),
             ));
+            files.push(PackagedFile::text(
+                pkg_dir.join("py.typed"),
+                render_py_typed(input_basename),
+            ));
             files.push(PackagedFile::copy(
                 pkg_dir.join(ctx.binaries.bundled_filename(platform)),
                 nb.source.clone(),
@@ -354,7 +321,7 @@ impl LanguageBackend for PythonGenerator {
             files.push(PackagedFile::text(tree.join("setup.py"), setup_py.clone()));
             files.push(PackagedFile::text(
                 tree.join("README.md"),
-                render_packaged_readme(&package, &import_name, platform, input_basename),
+                render_packaged_readme(&package, &import_name, platform, tag, input_basename),
             ));
         }
         Some(files)

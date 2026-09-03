@@ -62,7 +62,26 @@ jobs:
           "$BIN" generate samples/calculator/src/lib.rs -o generated
 
       - name: Build sample producer cdylibs (debug)
-        run: cargo build -p calculator -p contacts -p kvstore
+        run: cargo build -p calculator -p contacts -p kvstore -p events -p codec
+
+      # `weaveffi diff --check` is the CI gate we recommend to users, so it has
+      # to hold for our own samples: a fresh tree diffs clean (exit 0), and a
+      # tree with a stale file is reported (exit 1) instead of silently passing.
+      - name: Verify `weaveffi diff --check` on every sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/release/weaveffi
+          [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
+          for sample in calculator contacts events kvstore shapes async-demo codec inventory; do
+            "$BIN" generate "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --force --quiet
+            "$BIN" diff "samples/$sample/src/lib.rs" -o "diffcheck/$sample" --check --quiet
+          done
+          echo "stale" >> diffcheck/calculator/c/weaveffi.h
+          if "$BIN" diff samples/calculator/src/lib.rs -o diffcheck/calculator --check --quiet; then
+            echo "diff --check did not detect a stale file" >&2
+            exit 1
+          fi
 
       - name: Add wasm target
         if: runner.os != 'Windows'
@@ -99,13 +118,14 @@ jobs:
   conformance:
     # Correctness gate: every consumer binds through the *generated* wrappers and
     # asserts concrete results, so a backend that lowers a type wrong, drifts a
-    # symbol, or skips a feature fails here. Covers contacts + events + kvstore
-    # across C, C++, Python, Ruby, Dart, Go, Swift, .NET, Node, Kotlin, and
-    # Wasm: the events lanes exercise listeners/callbacks + iterators, and the
-    # kvstore lanes exercise interfaces (constructors, methods, async methods,
-    # iterator methods, destroy), typed error domains, struct getters
-    # (bytes/optional/list/map), builders, and eviction listeners; see
-    # conformance/run.sh.
+    # symbol, or skips a feature fails here. Covers contacts, events, kvstore,
+    # shapes, async-demo, and codec across C, C++, Python, Ruby, Dart, Go,
+    # Swift, .NET, Node, Kotlin, and Wasm: the events lanes exercise a callback
+    # interface plus objects and iterators, the kvstore lanes exercise objects
+    # in every position (constructors, methods, async methods, iterator methods,
+    # records and lists carrying objects, clone/destroy), typed error domains,
+    # builders, and an eviction callback interface, and the codec lanes
+    # round-trip every value-buffer wire shape; see conformance/run.sh.
     name: Conformance harness
     runs-on: ubuntu-latest
     steps:
@@ -196,7 +216,7 @@ jobs:
             "generated/c/weaveffi.h",
             "generated/swift/Package.swift",
             "generated/node/types.d.ts",
-            "generated/android/build.gradle",
+            "generated/kotlin/build.gradle.kts",
             "generated/python/calculator/weaveffi.py",
             "generated/dotnet/WeaveFFI.cs",
             "generated/wasm/README.md"
@@ -238,10 +258,10 @@ jobs:
       - name: Build CLI (release)
         run: cargo build -p weaveffi-cli --release
 
-      - name: Generate Android + C bindings for contacts
+      - name: Generate Kotlin + C bindings for contacts
         run: |
           target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target c
-          target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target android
+          target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target kotlin
 
       - name: Compile JNI shim with NDK clang
         env:
@@ -258,7 +278,7 @@ jobs:
             -I generated/c \
             -Wl,--unresolved-symbols=ignore-all \
             -o libweaveffi_jni_test.so \
-            generated/android/src/main/cpp/weaveffi_jni.c
+            generated/kotlin/src/main/cpp/weaveffi_jni.c
 
       - name: Assert exported JNI symbols
         env:
@@ -269,7 +289,7 @@ jobs:
           file libweaveffi_jni_test.so
           ldd libweaveffi_jni_test.so || true
           "$NM" -D --defined-only libweaveffi_jni_test.so > nm.out
-          # The Android generator lowers each interface to its own Kotlin
+          # The Kotlin generator lowers each interface to its own Kotlin
           # class with `native*` externals, so the JNI exports are namespaced
           # per type: the ContactBook interface's constructor, methods, and
           # destroy hook. Records (like Contact) are value types serialized

@@ -15,8 +15,8 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
   (`--format json` payloads in particular). Adding a new optional flag is a
   minor bump; removing or renaming one is a breaking change.
 - **IDL schema.** The set of accepted top-level keys, type-reference syntax
-  (`handle<T>`, `iter<T>`, `[T]`, `{K:V}`, `T?`, `&str`, `&[u8]`, primitives,
-  user-defined struct/enum/interface names), `version` semantics, and the
+  (`iter<T>`, `[T]`, `{K:V}`, `T?`, primitives, and user-defined struct, enum,
+  interface, and callback-interface names), `version` semantics, and the
   JSON Schema exported by `weaveffi schema --format json-schema`.
 - **Generated code shape.** The exported symbol names, function signatures,
   type names, package layouts, and ABI conventions of every generator's
@@ -25,7 +25,7 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
   ones; a major release may break.
 - **Public Rust API of every published crate.** That is `weaveffi-ir`,
   `weaveffi-abi`, `weaveffi-core`, `weaveffi-gen-c`, `weaveffi-gen-cpp`,
-  `weaveffi-gen-swift`, `weaveffi-gen-android`, `weaveffi-gen-node`,
+  `weaveffi-gen-swift`, `weaveffi-gen-kotlin`, `weaveffi-gen-node`,
   `weaveffi-gen-wasm`, `weaveffi-gen-python`, `weaveffi-gen-dotnet`,
   `weaveffi-gen-dart`, `weaveffi-gen-go`, `weaveffi-gen-ruby`, and
   `weaveffi-cli`. The `LanguageBackend` trait, the `Orchestrator`, the IR
@@ -33,11 +33,13 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
   public contracts.
 - **The C ABI revision.** The `weaveffi_abi_version()` runtime symbol
   reports the revision of the runtime surface (the `weaveffi_error` layout,
-  the value-buffer encoding, and the `weaveffi_*` symbol set). Generated
+  the value-buffer encoding, the object and callback-interface conventions,
+  and the `weaveffi_*` symbol set); the current revision is 2, and
+  [C ABI Contract](reference/abi.md) is its normative description. Generated
   consumers embed the revision they were built for and, where a load-time
   check is cheap (Python, Ruby, Dart, Go, .NET, Node.js, Wasm), refuse to
-  run against a producer reporting a different one. The revision only
-  changes with a major release.
+  run against a producer reporting a different one. Post-1.0, the revision
+  only changes with a major release.
 
 ## What is NOT covered pre-1.0
 
@@ -87,10 +89,110 @@ contract." Things that have already changed during 0.x:
   peripheral `new`, `scaffold`, `watch`, `format`, `lint`, `doctor`, and
   `man` CLI commands were removed; `validate --warn` reports the former
   lint warnings.
+- Schema `0.9.0` and **ABI revision 2** made interface objects reference
+  counted (every interface gained `_clone` beside `_destroy`, and objects may
+  now appear inside records, optionals, lists, maps, iterators, and async
+  results as `u64` tokens carrying one strong reference), replaced
+  module-level `callbacks:`/`listeners:` with `callback_interfaces:` (a
+  consumer-implemented vtable of methods), made the async executor pluggable
+  (`weaveffi::set_spawner`), and added `weaveffi_error_set` plus the
+  `FOREIGN_ERROR_CODE` (`-4`) reserved code. It removed the `handle`,
+  `handle<T>`, `&str`, and `&[u8]` type spellings, `Param.mutable`,
+  `Function.since`, the `weaveffi_arena_*` runtime, and `weaveffi::Handle`,
+  and renamed the `android` target to `kotlin`. See the
+  [migration guide](#migrating-from-schema-080--abi-1-to-090--abi-2) below.
 
 Pin the WeaveFFI version in CI (`cargo install weaveffi-cli --version
-=0.3.0`) and vendor the generated output in your repository so that
+=0.22.0`) and vendor the generated output in your repository so that
 upgrades are an explicit, reviewable event.
+
+## Migrating from schema 0.8.0 / ABI 1 to 0.9.0 / ABI 2
+
+This release removed constructs rather than deprecating them, so a `0.8.0`
+document is rejected until it's rewritten. Change `version: "0.8.0"` to
+`version: "0.9.0"`, then work through the tables below. `weaveffi validate`
+names every remaining offender with a hint; a Rust producer gets the same
+guidance as compile errors from the macros.
+
+### Removed IDL constructs
+
+| Removed in `0.8.0`                        | Replacement in `0.9.0`                                                                                                  |
+|-------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
+| `type: handle` (untyped opaque token)     | Declare an interface for the resource and use its name as the type. Every interface is reference counted and may appear anywhere a type can. |
+| `type: handle<T>`                         | `type: T`, where `T` is an interface declared under `interfaces:`.                                                         |
+| `type: "&str"` / `type: "&[u8]"`          | `type: string` / `type: bytes`. Parameters of these families are always borrowed views at the ABI, so the explicit borrowed spelling no longer means anything. |
+| `mutable: true` on a parameter            | Drop it. Interface methods take a shared `&self`; guard interior state with a `Mutex` (or another `Sync` primitive) in the producer. |
+| `since:` on a function                    | Drop it. Use `deprecated: "<message>"` to mark surface that's on its way out; generators emit the target's deprecation marker. |
+| module-level `callbacks:`                 | A `callback_interfaces:` entry whose `methods:` list the calls the producer makes. Functions that took a callback type take the callback interface by name instead. |
+| module-level `listeners:` (`register_*` / `unregister_*` returning a subscription id) | A `callback_interfaces:` entry plus an ordinary interface method (or function) that accepts it, such as `subscribe(listener: MyListener)`. The producer retains the implementation for as long as it likes; the consumer's `free` fires when the last reference drops, so there's no unregister token to manage. |
+
+A callback-interface method is synchronous, can't declare `throws`, `async`,
+or `cancellable`, and returns nothing, a scalar, `bool`, or a C-style enum.
+Its parameters may use any type except another callback interface or an
+iterator. Callback interfaces may appear only as parameters of functions,
+constructors, statics, and methods (not as returns, not inside records or
+collections, and not as `T?`).
+
+### Renamed things
+
+| `0.8.0` / ABI 1                              | `0.9.0` / ABI 2                                                        |
+|----------------------------------------------|------------------------------------------------------------------------|
+| `--target android`, output dir `android/`    | `--target kotlin`, output dir `kotlin/` (with `build.gradle.kts`)       |
+| `[generators.android]` in `weaveffi.toml`    | `[generators.kotlin]`                                                  |
+| crate `weaveffi-gen-android`                 | crate `weaveffi-gen-kotlin`                                            |
+| `#[weaveffi::callback]` / `#[weaveffi::listener]` | `#[weaveffi::callback_interface]` on a `trait Name: Send + Sync`   |
+| `weaveffi::Handle`                           | `Arc<T>` of a `#[weaveffi::interface]` type                            |
+| `weaveffi_arena_*` runtime symbols           | Removed. Buffered values are individually owned and freed with `weaveffi_free_bytes`. |
+| `errors::ResolvedError`, `ConstPos::East` (Rust API) | Removed.                                                       |
+| `ABI_VERSION == 1`                           | `ABI_VERSION == 2`                                                     |
+
+The reserved error codes are now `GENERIC_ERROR_CODE = -1`,
+`PANIC_ERROR_CODE = -2`, `MARSHAL_ERROR_CODE = -3`, and the new
+`FOREIGN_ERROR_CODE = -4` (a consumer callback-interface implementation
+raised). Consumers report the last one through the new runtime symbol
+`weaveffi_error_set(err, code, message)` so no foreign allocator touches
+`weaveffi_error.message`.
+
+### Rust producer changes
+
+- Every `#[weaveffi::interface]` type must be `Send + Sync`; the macro
+  asserts it. Constructors return `Self`, `Arc<Self>`, or a `Result` of
+  either; methods take `&self` or `self: Arc<Self>`. `&mut self` methods no
+  longer compile.
+- Interface types can be used as `Arc<T>` (or `&T` for a borrowed parameter)
+  in any position: `Option<Arc<T>>`, `Vec<Arc<T>>`, `BTreeMap<K, Arc<T>>`,
+  record fields, iterator items, and async returns.
+- Replace `#[weaveffi::callback]`/`#[weaveffi::listener]` with a
+  `#[weaveffi::callback_interface] trait Name: Send + Sync { ... }` and accept
+  it as `Arc<dyn Name>`. Treat every call into it as potentially panicking
+  (a consumer failure unwinds to the exported thunk, which reports
+  `FOREIGN_ERROR_CODE`): snapshot state and release locks before calling out.
+- Async exports run on the installed spawner. Nothing changes if the default
+  thread-per-future executor is fine; call `weaveffi::set_spawner(...)` once
+  at startup to run futures on Tokio or another runtime instead.
+
+### Consumer-facing ownership changes
+
+- **Every wrapper owns one strong reference.** Wrappers release it through
+  the language's disposal hook (`close()`, `Dispose()`, `deinit`, RAII
+  destructor, `dispose()`, `Close()`) with a garbage-collector backstop where
+  one exists. Two wrappers may refer to the same native object; releasing one
+  never invalidates the other.
+- **Objects returned from calls, iterators, async results, and callback-method
+  parameters are adopted.** Consumers no longer need to think about whether a
+  returned pointer is borrowed: it's always one reference they own.
+- **Objects inside value buffers are tokens carrying one reference.** A
+  wrapper that encodes an object into a record or list calls `_clone` first;
+  a buffer that contains objects is decoded exactly once.
+- **Callback implementations are freed by the producer.** The producer calls
+  the vtable's `free(ctx)` exactly once when its last reference drops; there
+  is no unregister call. A consumer implementation that raises is reported to
+  the original caller as `FOREIGN_ERROR_CODE`.
+- **Kotlin consumers move from `android/` to `kotlin/`** and from a Groovy
+  `build.gradle` to `build.gradle.kts`. The generated code still targets
+  Android (JNI plus Gradle) and also runs on the desktop JVM.
+- **Node.js consumers receive `i64`/`u64` values as `BigInt`**, and Dart
+  wrappers use `NativeFinalizer` as their backstop.
 
 ## Post-1.0 deprecation policy
 
@@ -120,16 +222,23 @@ tied to `weaveffi-ir`'s minor version: each `weaveffi-ir` minor bump
 corresponds to at most one schema version bump.
 [`CURRENT_SCHEMA_VERSION`](https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs)
 in `crates/weaveffi-ir/src/ir.rs` is the source of truth; the current
-schema version is `0.8.0`.
+schema version is `0.9.0`.
 
 Pre-1.0, **only the current schema version is accepted**
 (`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`), so a
 document declaring any earlier revision is rejected with an actionable
 error. When a schema bump lands, update the `version` field in your IDL and
 adjust the document to the new schema by hand; the changes are documented
-in `CHANGELOG.md` with a "Migration" section. Post-1.0, schema bumps will
-ship with an automated migration tool and a widened `SUPPORTED_VERSIONS`
-window.
+in `CHANGELOG.md` and, for the `0.9.0` bump, in the
+[migration guide](#migrating-from-schema-080--abi-1-to-090--abi-2) above.
+Post-1.0, schema bumps will ship with an automated migration tool and a
+widened `SUPPORTED_VERSIONS` window.
+
+The C ABI revision is independent of both: it changes only when the runtime
+contract changes incompatibly. Schema `0.9.0` happened to ship with ABI
+revision 2 because reference-counted objects and callback-interface vtables
+needed new symbols; a future schema bump that only adds IDL surface would
+leave the ABI revision alone.
 
 ## Generated-code stability (determinism)
 
@@ -179,7 +288,7 @@ A typical GitHub Actions step:
 ```yaml
 - name: Verify generated bindings are up to date
   run: |
-    cargo install weaveffi-cli --locked --version =0.3.0
+    cargo install weaveffi-cli --locked --version =0.22.0
     weaveffi diff idl/api.yml --out generated/ --check
 ```
 
@@ -190,5 +299,8 @@ plus advisory lints) for a complete CI guard.
 
 - [IDL Schema](reference/idl.md): the type system the schema version
   governs.
+- [C ABI Contract](reference/abi.md): the normative description of ABI
+  revision 2.
+- [Roadmap](roadmap.md): what's planned after ABI 2 and the criteria for 1.0.
 - [Getting Started](getting-started.md): installation and the basic
   workflow `diff --check` plugs into.

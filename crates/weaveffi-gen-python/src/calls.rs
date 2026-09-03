@@ -1,10 +1,12 @@
-//! Call rendering: sync, async, and iterator wrappers, plus callback
-//! typedefs and listener register/unregister pairs.
+//! Call rendering: sync, async, and iterator wrappers, plus the
+//! consumer-facing abstract base class, static vtable, and trampolines of
+//! each callback interface.
 //!
 //! Marshalling dispatch is driven by the shared plans: [`ArgPass`] decides
-//! how each parameter crosses, [`RetPass`] how the result comes back, and
-//! [`plan::elem_free`] what an iterator step owes, so this module never
-//! re-derives those shapes from `Ty` matches.
+//! how each parameter crosses, [`RetPass`] how a result (or a trampoline
+//! argument) is received, [`plan::elem_free`] what an iterator step owes, and
+//! [`CallbackProtocol`] how each trampoline receives its arguments, so this
+//! module never re-derives those shapes from `Ty` matches.
 
 use weaveffi_core::abi;
 use weaveffi_core::codegen::common::pascal_case;
@@ -12,22 +14,22 @@ use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::lang;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    CallShape, CallbackBinding, ErrorBinding, FnBinding, ListenerBinding, ModuleBinding,
-    ParamBinding,
+    CallShape, CallbackInterfaceBinding, CallbackMethodBinding, ErrorBinding, FnBinding,
+    ModuleBinding, ParamBinding,
 };
 use weaveffi_core::model::{Prim, WireType};
-use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy, RetPass};
+use weaveffi_core::plan::{self, ArgPass, CallbackProtocol, ErrorStrategy, Free, RetPass};
 use weaveffi_core::utils::local_type_name;
 
 use crate::codec::{
     py_decode_borrowed_expr, py_decode_owned_expr, py_pack_fn_name, py_read_expr,
     py_unpack_fn_name, py_write_stmts,
 };
-use crate::docs::{emit_doc, emit_docstring, emit_fn_docstring};
+use crate::docs::{emit_docstring, emit_fn_docstring};
 use crate::entities::{py_checker_name, py_error_factory_name};
 use crate::types::{
-    py_callable_hint, py_ctype, py_ctypes_scalar, py_member_name, py_name, py_param_argtypes,
-    py_return_info, py_type_hint, py_wrapper_fn_name,
+    py_ctype, py_ctypes_scalar, py_member_name, py_name, py_param_argtypes, py_return_info,
+    py_type_hint, py_vtable_class_name, py_vtable_instance_name, py_wrapper_fn_name,
 };
 
 /// How a rendered callable is scoped and spelled in the generated Python.
@@ -257,7 +259,7 @@ pub(crate) fn render_callable(
 
         let mut call_args: Vec<String> = Vec::new();
         if scope.has_self_slot() {
-            call_args.push("self._ptr".into());
+            call_args.push("_borrow(self)".into());
         }
         for p in &f.params {
             call_args.extend(py_param_call_args(p));
@@ -317,10 +319,15 @@ pub(crate) fn render_callable(
 
 /// The statements preparing one parameter's locals ahead of the C call: a
 /// packed `_{name}_buf` for buffered types, a `_{name}_arr` element array
-/// for bytes. Direct types need no preparation.
+/// for bytes, a `_{name}_ctx` handle-table key for a callback interface.
+/// Direct, string, and object types need no preparation.
 fn py_param_conversion(p: &ParamBinding, ind: &str) -> Vec<String> {
     let name = py_name(&p.name);
     match p.arg_pass() {
+        // Register the implementation in the handle table; the integer key
+        // is what the producer receives as `ctx` and hands back to every
+        // trampoline and, finally, to `free`.
+        ArgPass::Callback { .. } => vec![format!("{ind}_{name}_ctx = _cb_register({name})")],
         // Records and rich enums pack through their dedicated helpers; other
         // buffered shapes (optionals, lists, maps) inline their write
         // statements through a per-parameter writer (so several buffered
@@ -357,20 +364,31 @@ fn py_param_call_args(p: &ParamBinding) -> Vec<String> {
         ArgPass::Buffer { .. } => vec![format!("_{name}_buf"), format!("len(_{name}_buf)")],
         ArgPass::Bytes { .. } => vec![format!("_{name}_arr"), format!("len({name})")],
         ArgPass::String { .. } => vec![format!("_string_to_bytes({name})")],
-        // Interface parameters are borrowed: pass the wrapper's raw pointer;
-        // the callee never takes ownership. A nullable `Interface?` maps
-        // `None` onto a null pointer.
+        // Interface parameters are borrowed: lend the wrapper's raw pointer
+        // and keep the wrapper's own reference; the producer clones if it
+        // retains the object. A nullable `Interface?` maps `None` onto a
+        // null pointer.
         ArgPass::Object {
             nullable: false, ..
-        } => vec![format!("{name}._ptr")],
+        } => vec![format!("_borrow({name})")],
         ArgPass::Object { nullable: true, .. } => {
-            vec![format!("{name}._ptr if {name} is not None else None")]
+            vec![format!("(_borrow({name}) if {name} is not None else None)")]
+        }
+        // The handle-table key as `ctx`, and the address of the interface's
+        // one static vtable.
+        ArgPass::Callback { .. } => {
+            let cb =
+                p.ty.callback_interface_name()
+                    .expect("callback family names a callback interface");
+            vec![
+                format!("_{name}_ctx"),
+                format!("ctypes.byref({})", py_vtable_instance_name(cb)),
+            ]
         }
         ArgPass::Direct { .. } => match &p.ty {
             Ty::Bool => vec![format!("1 if {name} else 0")],
             Ty::Enum(_) => vec![format!("{name}.value")],
-            // Scalars, handles, and typed handles are already the raw slot
-            // value the C signature wants.
+            // Scalars are already the raw slot value the C signature wants.
             _ => vec![name],
         },
     }
@@ -380,11 +398,8 @@ fn py_param_call_args(p: &ParamBinding) -> Vec<String> {
 
 /// The interface name behind a direct or optional interface return.
 fn object_interface_name(ty: &Ty) -> &str {
-    match ty {
-        Ty::Interface(name) => name,
-        Ty::Optional(inner) => object_interface_name(inner),
-        _ => unreachable!("object returns are direct or optional interfaces"),
-    }
+    ty.interface_name()
+        .expect("object returns are direct or optional interfaces")
 }
 
 /// Append the statements converting `_result` (and `_out_len` when present)
@@ -443,11 +458,6 @@ fn render_return_value(out: &mut String, ty: &Ty, ind: &str) {
             w.line(format!("return {name}._from_ptr(_result)"));
         }
         RetPass::Direct => match ty {
-            // The `c_void_p` restype surfaces null as `None`; normalize to
-            // the integer handle representation.
-            Ty::TypedHandle(_) => {
-                w.line("return _result or 0");
-            }
             Ty::Bool => {
                 w.line("return bool(_result)");
             }
@@ -548,10 +558,6 @@ fn append_async_success_handler(out: &mut String, ret: &Option<Ty>, ind: &str) {
             }
         }
         RetPass::Direct => match ty {
-            // A typed handle's `c_void_p` slot surfaces as `int | None`.
-            Ty::TypedHandle(_) => {
-                out.push_str(&format!("{ind}_state[\"val\"] = result or 0\n"));
-            }
             Ty::Bool => {
                 out.push_str(&format!("{ind}_state[\"val\"] = bool(result)\n"));
             }
@@ -703,7 +709,7 @@ fn render_async_ffi_call_body(
 
     let mut call_args: Vec<String> = Vec::new();
     if has_self {
-        call_args.push("self._ptr".into());
+        call_args.push("_borrow(self)".into());
     }
     for p in &f.params {
         call_args.extend(py_param_call_args(p));
@@ -730,9 +736,9 @@ fn render_async_ffi_call_body(
 /// so they survive to be freed, per [`plan::elem_free`].
 fn py_iter_slots(inner: &Ty) -> (String, bool) {
     match plan::elem_free(inner) {
-        ElemFree::Bytes => ("ctypes.c_void_p".into(), true),
-        ElemFree::String => ("ctypes.c_void_p".into(), false),
-        ElemFree::None => (py_ctypes_scalar(inner).into(), false),
+        Free::Bytes => ("ctypes.c_void_p".into(), true),
+        Free::String => ("ctypes.c_void_p".into(), false),
+        Free::None => (py_ctypes_scalar(inner).into(), false),
     }
 }
 
@@ -744,7 +750,7 @@ fn py_read_iter_item(inner: &Ty) -> String {
         // A `ptr` + `len` element: copy the bytes, free them with
         // `weaveffi_free_bytes` (via `_take_buffer`), then decode any
         // buffered value.
-        ElemFree::Bytes => match inner.wire() {
+        Free::Bytes => match inner.wire() {
             WireType::Prim(Prim::Bytes) => "_take_buffer(_out_item.value, _out_len.value)".into(),
             WireType::User(name) => format!(
                 "{}(_take_buffer(_out_item.value, _out_len.value))",
@@ -757,16 +763,21 @@ fn py_read_iter_item(inner: &Ty) -> String {
         },
         // Owned string element: copy, then `weaveffi_free_string`. The out
         // slot is a raw `c_void_p`, so the address survives to be freed.
-        ElemFree::String => "_take_string(_out_item.value)".into(),
-        ElemFree::None => match inner {
+        Free::String => "_take_string(_out_item.value)".into(),
+        Free::None => match inner {
             Ty::Enum(name) => {
                 format!("{}(_out_item.value)", local_type_name(name))
             }
-            // An owned interface element is adopted by its wrapper class.
+            // An owned interface element transfers one strong reference,
+            // adopted by its wrapper class. A nullable element maps null to
+            // `None`.
             Ty::Interface(name) => {
                 format!("{}._from_ptr(_out_item.value)", local_type_name(name))
             }
-            Ty::TypedHandle(_) => "_out_item.value or 0".into(),
+            Ty::Optional(obj) if matches!(obj.as_ref(), Ty::Interface(_)) => format!(
+                "({}._from_ptr(_out_item.value) if _out_item.value else None)",
+                local_type_name(object_interface_name(inner))
+            ),
             Ty::Bool => "bool(_out_item.value)".into(),
             _ => "_out_item.value".into(),
         },
@@ -868,156 +879,277 @@ pub(crate) fn render_iterator_class(
     out.push('\n');
 }
 
-// ── Callbacks & listeners ──
+// ── Callback interfaces ──
 
-/// The module-level `ctypes.CFUNCTYPE` alias for one callback type. Listener
-/// registration binds against this; the C side sees the matching
-/// `typedef void (*{c_fn_type})(…, void* context)`.
-pub(crate) fn render_callback_type(out: &mut String, c: &CallbackBinding) {
-    let mut parts: Vec<String> = vec!["None".into()];
-    parts.extend(c.abi_params.iter().map(|p| py_ctype(&p.ty)));
-    let mut w = CodeWriter::four_space();
-    w.blank().blank();
-    let mut doc = String::new();
-    emit_doc(&mut doc, &c.doc, "");
-    w.raw(doc);
-    w.line(format!(
-        "# Callback type {}: {}",
-        c.name,
-        py_callable_hint(&c.params)
-    ));
-    w.line(format!(
-        "_CFUNC_{} = ctypes.CFUNCTYPE({})",
-        c.c_fn_type,
-        parts.join(", ")
-    ));
-    out.push_str(&w.finish());
+/// The Python spelling of a trampoline slot name: the ABI slot name,
+/// keyword-escaped. Derived slots (`{name}_ptr`, `out_err`) never collide
+/// with a keyword, so only single-slot parameters can change spelling.
+fn py_slot_name(slot: &str) -> String {
+    lang::escape_ident(slot, lang::PYTHON_KEYWORDS)
 }
 
-/// The Python expression converting one trampoline parameter's C slots into
-/// the idiomatic value passed to the user callback. Slot names derive from
-/// the raw IR parameter name (mirroring the ABI lowering), so multi-slot
-/// references keep the raw stem while single-slot references use the
-/// keyword-escaped spelling the trampoline declares.
-fn py_cb_param_expr(p: &ParamBinding) -> String {
+/// The expression converting one trampoline parameter's borrowed (or, for
+/// objects, transferred) C slots into the idiomatic value handed to the
+/// implementation, per the receiving contract in `pass`.
+fn py_trampoline_arg_expr(p: &ParamBinding, pass: &RetPass) -> String {
     let n = &p.name;
-    let esc = lang::escape_ident(n, lang::PYTHON_KEYWORDS);
-    match p.arg_pass() {
-        // A buffered argument arrives as a borrowed `({n}_ptr, {n}_len)`
-        // pair, valid only during the dispatch; copy and decode before
-        // invoking the user callable.
-        ArgPass::Buffer { .. } => {
-            py_decode_borrowed_expr(&format!("{n}_ptr"), &format!("{n}_len"), &p.ty)
+    let esc = py_slot_name(n);
+    match pass {
+        // A buffered argument is a borrowed `({n}_ptr, {n}_len)` pair valid
+        // only during the dispatch: copy and decode before returning. Object
+        // tokens inside are adopted by the decoded wrappers.
+        RetPass::Buffer => py_decode_borrowed_expr(&format!("{n}_ptr"), &format!("{n}_len"), &p.ty),
+        RetPass::Bytes => {
+            format!("(ctypes.string_at({n}_ptr, {n}_len) if {n}_ptr else b\"\")")
         }
-        ArgPass::Bytes { .. } => {
-            format!("bytes({n}_ptr[:{n}_len]) if {n}_ptr else b\"\"")
+        // `c_char_p` already delivered a `bytes` copy of the borrowed string.
+        RetPass::String => format!("_bytes_to_string({esc})"),
+        // An object argument transfers one strong reference: adopt it into a
+        // wrapper whose disposal owes the destroy symbol. Null is `None` for
+        // an `Interface?` slot.
+        RetPass::Object { nullable, .. } => {
+            let class = local_type_name(object_interface_name(&p.ty));
+            if *nullable {
+                format!("({class}._from_ptr({esc}) if {esc} else None)")
+            } else {
+                format!("{class}._from_ptr({esc})")
+            }
         }
-        ArgPass::String { .. } => format!("_bytes_to_string({esc})"),
-        // Borrowed by contract: the producer owns callback arguments for the
-        // duration of the call, so interface references and nullable
-        // `Interface?` slots pass through raw rather than being wrapped in
-        // an owning class whose `__del__` would free them.
-        ArgPass::Object { .. } => esc,
-        ArgPass::Direct { .. } => match &p.ty {
+        RetPass::Direct => match &p.ty {
             Ty::Bool => format!("bool({esc})"),
             Ty::Enum(name) => format!("{}({esc})", local_type_name(name)),
-            // Scalars, handles, and typed handles pass through unchanged.
             _ => esc,
         },
+        RetPass::Void => unreachable!("parameters are never void"),
     }
 }
 
-/// Register/unregister wrapper pair for one listener. The trampoline converts
-/// each C slot to its idiomatic value, and the `ctypes` function object is
-/// pinned in `_listener_refs` until `unregister` so the producer never calls
-/// a collected trampoline.
-pub(crate) fn render_listener(
+/// `(coercion, default)` for a callback method's direct return: the Python
+/// conversion applied to the implementation's result before it is written
+/// into the C return slot, and the value returned after a failure has been
+/// reported through `out_err`. `None` for a void method.
+fn py_trampoline_return(ret: Option<&Ty>) -> Option<(&'static str, &'static str)> {
+    match ret {
+        None => None,
+        Some(Ty::Bool) => Some(("1 if {} else 0", "0")),
+        Some(Ty::F32 | Ty::F64) => Some(("float({})", "0.0")),
+        // Integers and C-style enums (an `IntEnum` is an `int`).
+        Some(_) => Some(("int({})", "0")),
+    }
+}
+
+/// The module-level stems of one callback method's trampoline objects:
+/// `_{Name}_{method}_cfunctype`, `_{Name}_{method}_trampoline`, and
+/// `_{Name}_{method}_cfunc`.
+fn py_trampoline_stem(cb: &CallbackInterfaceBinding, method: &str) -> String {
+    format!("_{}_{method}", cb.name)
+}
+
+/// Render one callback interface: the abstract base class the consumer
+/// subclasses, then the ABI side that satisfies every clause of
+/// [`CallbackProtocol`]: one `CFUNCTYPE` per method plus the trailing `free`,
+/// the `ctypes.Structure` mirroring the C vtable, one trampoline per method,
+/// and the single process-wide static vtable instance whose function objects
+/// are pinned at module scope for the process lifetime.
+///
+/// Each trampoline looks its implementation up by the integer `ctx`, decodes
+/// borrowed string, bytes, and buffer arguments (freeing nothing), adopts
+/// object arguments, and calls the method. Any exception is reported through
+/// `{prefix}_error_set(out_err, -4, message)` and a default value is
+/// returned, so nothing ever unwinds through the C frame. `free` removes the
+/// handle-table entry. `ctypes` acquires the GIL on entry, so the producer
+/// may call from any thread.
+pub(crate) fn render_callback_interface(
     out: &mut String,
     module: &ModuleBinding,
-    l: &ListenerBinding,
-    strip_module_prefix: bool,
+    cb: &CallbackInterfaceBinding,
+    prefix: &str,
 ) {
-    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
-        // Validation guarantees the referenced callback exists in-module.
-        unreachable!("listener '{}' references unknown callback", l.name);
-    };
-    let register_name = py_wrapper_fn_name(
-        &module.path,
-        &format!("register_{}", l.name),
-        strip_module_prefix,
-    );
-    let unregister_name = py_wrapper_fn_name(
-        &module.path,
-        &format!("unregister_{}", l.name),
-        strip_module_prefix,
-    );
-    let cfunc = format!("_CFUNC_{}", cb.c_fn_type);
-    let ind = "    ";
+    let protocol: CallbackProtocol<'_> = cb.protocol(&module.path, prefix);
+    let name = &cb.name;
+    let vtable_class = py_vtable_class_name(name);
+    let vtable_instance = py_vtable_instance_name(name);
+    let free_stem = format!("_{name}_vtable_free");
 
     let mut w = CodeWriter::four_space();
 
-    // register_{listener}(callback) -> int
+    // The consumer-facing abstract base class.
     w.blank().blank();
-    w.line(format!(
-        "def {register_name}(callback: {}) -> int:",
-        py_callable_hint(&cb.params)
-    ));
+    w.line(format!("class {name}(abc.ABC):"));
     w.indent();
-    let reg_doc = match &l.doc {
-        Some(d) => format!(
-            "{}\n\nReturns a subscription id for {unregister_name}().",
-            d.trim()
-        ),
-        None => format!(
-            "Register a {} listener. Returns a subscription id for {unregister_name}().",
-            cb.name
-        ),
+    let base_doc = "Consumer-implemented callback interface. Subclass it, implement every \
+                    abstract method, and pass an instance wherever the API takes a \
+                    `{name}`; the producer may call the methods from any thread until it \
+                    releases the instance. An exception raised by a method is reported to \
+                    the producer as WeaveFFIError.FOREIGN_ERROR_CODE (-4) and aborts the \
+                    call that was in progress."
+        .replace("{name}", name);
+    let class_doc = match &cb.doc {
+        Some(d) if !d.trim().is_empty() => format!("{}\n\n{base_doc}", d.trim()),
+        _ => base_doc,
     };
     let mut doc = String::new();
-    emit_docstring(&mut doc, &Some(reg_doc), ind);
+    emit_docstring(&mut doc, &Some(class_doc), &w.indent_str());
     w.raw(doc);
-
-    let tramp_params: Vec<String> = cb
-        .params
-        .iter()
-        .flat_map(|p| {
-            p.abi
+    for m in &cb.methods {
+        let mut sig: Vec<String> = vec!["self".into()];
+        sig.extend(
+            m.params
                 .iter()
-                .map(|slot| lang::escape_ident(&slot.name, lang::PYTHON_KEYWORDS))
-        })
-        .chain(std::iter::once("_context".to_string()))
-        .collect();
-    let call_args: Vec<String> = cb.params.iter().map(py_cb_param_expr).collect();
-    w.line(format!("def _trampoline({}):", tramp_params.join(", ")));
-    w.scope(|w| {
-        w.line(format!("callback({})", call_args.join(", ")));
-    });
-    w.line(format!("_cfunc = {cfunc}(_trampoline)"));
-    w.line(format!("_fn = _lib.{}", l.register_symbol));
-    w.line(format!("_fn.argtypes = [{cfunc}, ctypes.c_void_p]"));
-    w.line("_fn.restype = ctypes.c_uint64");
-    w.line("_listener_id = int(_fn(_cfunc, None))");
-    w.line("_listener_refs[_listener_id] = _cfunc");
-    w.line("return _listener_id");
+                .map(|p| format!("{}: {}", py_name(&p.name), py_type_hint(&p.ty))),
+        );
+        let ret_hint = m
+            .ret
+            .as_ref()
+            .map(py_type_hint)
+            .unwrap_or_else(|| "None".to_string());
+        w.blank();
+        w.line("@abc.abstractmethod");
+        w.line(format!(
+            "def {}({}) -> {ret_hint}:",
+            py_member_name(&m.name),
+            sig.join(", ")
+        ));
+        w.indent();
+        let mut mdoc = String::new();
+        emit_fn_docstring(&mut mdoc, &m.doc, &m.params, &w.indent_str(), None);
+        if mdoc.is_empty() {
+            w.line("...");
+        } else {
+            w.raw(mdoc);
+        }
+        w.dedent();
+    }
     w.dedent();
 
-    // unregister_{listener}(listener_id) -> None
+    // One CFUNCTYPE per vtable entry, in declaration order, then `free`.
     w.blank().blank();
-    w.line(format!("def {unregister_name}(listener_id: int) -> None:"));
-    w.indent();
-    let mut unreg_doc = String::new();
-    emit_docstring(
-        &mut unreg_doc,
-        &Some(format!(
-            "Unregister a listener previously registered with {register_name}()."
-        )),
-        ind,
-    );
-    w.raw(unreg_doc);
-    w.line(format!("_fn = _lib.{}", l.unregister_symbol));
-    w.line("_fn.argtypes = [ctypes.c_uint64]");
-    w.line("_fn.restype = None");
-    w.line("_fn(ctypes.c_uint64(listener_id))");
-    w.line("_listener_refs.pop(listener_id, None)");
+    for m in &cb.methods {
+        let parts: Vec<String> = std::iter::once(py_ctype(&m.abi_ret))
+            .chain(m.abi_params.iter().map(|p| py_ctype(&p.ty)))
+            .collect();
+        w.line(format!(
+            "{}_cfunctype = ctypes.CFUNCTYPE({})",
+            py_trampoline_stem(cb, &m.name),
+            parts.join(", ")
+        ));
+    }
+    w.line(format!(
+        "{free_stem}_cfunctype = ctypes.CFUNCTYPE(None, ctypes.c_void_p)"
+    ));
+
+    // The vtable layout: the C struct `{vtable_tag}`.
+    w.blank().blank();
+    w.line(format!("class {vtable_class}(ctypes.Structure):"));
+    w.scope(|w| {
+        w.line(format!("\"\"\"The C vtable `{}`.\"\"\"", cb.vtable_tag));
+        w.blank();
+        w.line("_fields_ = [");
+        w.scope(|w| {
+            for m in &cb.methods {
+                w.line(format!(
+                    "(\"{}\", {}_cfunctype),",
+                    m.name,
+                    py_trampoline_stem(cb, &m.name)
+                ));
+            }
+            w.line(format!("(\"free\", {free_stem}_cfunctype),"));
+        });
+        w.line("]");
+    });
+
+    // One trampoline per method.
+    for (m, args) in cb.methods.iter().zip(&protocol.method_args) {
+        render_callback_trampoline(&mut w, cb, m, args);
+    }
+
+    w.blank().blank();
+    w.line(format!("def {free_stem}_trampoline(ctx):"));
+    w.scope(|w| {
+        w.line("# The producer's last reference is gone; it never touches `ctx` again.");
+        w.line("_cb_impls.pop(ctx, None)");
+    });
+
+    // The single static vtable, with every function object pinned.
+    w.blank().blank();
+    w.line(format!(
+        "# The one process-wide vtable for {name}. The CFUNCTYPE objects are held at"
+    ));
+    w.line("# module scope so their function pointers stay valid for the process lifetime.");
+    for m in &cb.methods {
+        let stem = py_trampoline_stem(cb, &m.name);
+        w.line(format!(
+            "{stem}_cfunc = {stem}_cfunctype({stem}_trampoline)"
+        ));
+    }
+    w.line(format!(
+        "{free_stem}_cfunc = {free_stem}_cfunctype({free_stem}_trampoline)"
+    ));
+    let entries: Vec<String> = cb
+        .methods
+        .iter()
+        .map(|m| format!("{}_cfunc", py_trampoline_stem(cb, &m.name)))
+        .chain(std::iter::once(format!("{free_stem}_cfunc")))
+        .collect();
+    w.line(format!(
+        "{vtable_instance} = {vtable_class}({})",
+        entries.join(", ")
+    ));
+
     out.push_str(&w.finish());
+}
+
+/// Render the trampoline for one callback method: the `def` whose parameters
+/// are the vtable entry's C slots (`ctx`, the parameter slots, `out_err`),
+/// receiving each argument per `args` and reporting any exception through
+/// `error_set` with the foreign error code.
+fn render_callback_trampoline(
+    w: &mut CodeWriter,
+    cb: &CallbackInterfaceBinding,
+    m: &CallbackMethodBinding,
+    args: &[RetPass],
+) {
+    let stem = py_trampoline_stem(cb, &m.name);
+    let slots: Vec<String> = m.abi_params.iter().map(|p| py_slot_name(&p.name)).collect();
+    let call_args: Vec<String> = m
+        .params
+        .iter()
+        .zip(args)
+        .map(|(p, pass)| py_trampoline_arg_expr(p, pass))
+        .collect();
+    let call = format!(
+        "_impl.{}({})",
+        py_member_name(&m.name),
+        call_args.join(", ")
+    );
+    let ret = py_trampoline_return(m.ret.as_ref());
+
+    w.blank().blank();
+    w.line(format!("def {stem}_trampoline({}):", slots.join(", ")));
+    w.scope(|w| {
+        w.line("try:");
+        w.scope(|w| {
+            w.line("_impl = _cb_impls[ctx]");
+            match ret {
+                Some((coerce, _)) => {
+                    w.line(format!("_ret = {call}"));
+                    w.line(format!("return {}", coerce.replace("{}", "_ret")));
+                }
+                None => {
+                    w.line(call);
+                }
+            }
+        });
+        w.line("except Exception as _exc:");
+        w.scope(|w| {
+            w.line("# Never unwind through the C frame: report the failure and return a");
+            w.line("# default; the producer aborts its call with FOREIGN_ERROR_CODE.");
+            w.line(
+                "_lib.weaveffi_error_set(out_err, -4, str(_exc).encode(\"utf-8\", \"replace\"))",
+            );
+            if let Some((_, default)) = ret {
+                w.line(format!("return {default}"));
+            }
+        });
+    });
 }

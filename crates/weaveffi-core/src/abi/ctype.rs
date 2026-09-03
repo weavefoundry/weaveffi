@@ -3,8 +3,9 @@
 //! [`CType`] is a prefix-agnostic description of a single C type as it appears
 //! in a WeaveFFI ABI signature. The canonical C rendering lives in
 //! [`CType::render_c`]; every other language generator maps `CType` onto its
-//! own FFI vocabulary (ctypes, P/Invoke, `dart:ffi`, …). Because the structure
-//! is shared, every target agrees on the calling convention by construction.
+//! own FFI vocabulary (ctypes, P/Invoke, `dart:ffi`, ...). Because the
+//! structure is shared, every target agrees on the calling convention by
+//! construction.
 
 /// Placement of a `const` qualifier on a pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,8 +14,6 @@ pub enum ConstPos {
     None,
     /// West `const`: `const T*`.
     West,
-    /// East `const`: `T const*` (used for arrays of pointer elements).
-    East,
 }
 
 /// A single C type in an ABI signature, independent of the configured symbol
@@ -50,8 +49,6 @@ pub enum CType {
     Char,
     /// `void`.
     Void,
-    /// `{prefix}_handle_t`.
-    Handle,
     /// `{prefix}_cancel_token`.
     CancelToken,
     /// `{prefix}_error`.
@@ -63,15 +60,23 @@ pub enum CType {
         /// The enum's bare type name.
         name: String,
     },
-    /// A user struct / typed-handle tag: `{prefix}_{module}_{name}`.
+    /// An interface's opaque object tag: `{prefix}_{module}_{name}`.
     StructTag {
         /// Underscore-joined symbol path of the module that declares the type.
         module: String,
-        /// The struct or typed-handle's bare type name.
+        /// The interface's bare type name.
         name: String,
     },
-    /// A prefixed named type emitted elsewhere in the header (callback
-    /// function-pointer typedefs, iterator opaque structs, …). Renders as
+    /// A callback interface's vtable struct: `{prefix}_{module}_{name}_vtable`.
+    VtableTag {
+        /// Underscore-joined symbol path of the module that declares the
+        /// callback interface.
+        module: String,
+        /// The callback interface's bare type name.
+        name: String,
+    },
+    /// A prefixed named type emitted elsewhere in the header (async callback
+    /// function-pointer typedefs, iterator opaque structs, ...). Renders as
     /// `{prefix}_{core}`.
     Named(String),
     /// A pointer to `pointee` with the given `const` placement.
@@ -101,8 +106,6 @@ impl CType {
     }
 
     /// Whether this type is represented as a pointer at the C ABI boundary.
-    /// Mirrors the pointer/value split the array renderer keys its east/west
-    /// `const` decision on.
     pub fn is_pointer(&self) -> bool {
         matches!(self, CType::Ptr { .. })
     }
@@ -122,8 +125,7 @@ impl CType {
     /// * A C-style [`Enum`](Self::Enum) crosses the ABI as its `int`-sized
     ///   discriminant, so it lowers to `i32` (matching the header's
     ///   `int`-backed `typedef enum`).
-    /// * Both `const` placements collapse to `*const` (Rust draws no
-    ///   east/west distinction); a non-`const` pointer is `*mut`.
+    /// * A `const` pointer is `*const`; a non-`const` pointer is `*mut`.
     pub fn render_rust(&self, prefix: &str) -> String {
         match self {
             CType::Int8 => "i8".to_string(),
@@ -140,7 +142,6 @@ impl CType {
             CType::Size => "usize".to_string(),
             CType::Char => "c_char".to_string(),
             CType::Void => "std::ffi::c_void".to_string(),
-            CType::Handle => "u64".to_string(),
             // The runtime types come from `weaveffi-abi` and keep their fixed
             // names regardless of the configured business-symbol prefix.
             CType::CancelToken => "weaveffi_cancel_token".to_string(),
@@ -148,12 +149,13 @@ impl CType {
             // A C-style enum is passed/returned as its int discriminant.
             CType::Enum { .. } => "i32".to_string(),
             CType::StructTag { module, name } => format!("{prefix}_{module}_{name}"),
+            CType::VtableTag { module, name } => format!("{prefix}_{module}_{name}_vtable"),
             CType::Named(core) => format!("{prefix}_{core}"),
             CType::Ptr { konst, pointee } => {
                 let inner = pointee.render_rust(prefix);
                 match konst {
                     ConstPos::None => format!("*mut {inner}"),
-                    ConstPos::West | ConstPos::East => format!("*const {inner}"),
+                    ConstPos::West => format!("*const {inner}"),
                 }
             }
         }
@@ -177,18 +179,17 @@ impl CType {
             CType::Size => "size_t".to_string(),
             CType::Char => "char".to_string(),
             CType::Void => "void".to_string(),
-            CType::Handle => format!("{prefix}_handle_t"),
             CType::CancelToken => format!("{prefix}_cancel_token"),
             CType::Error => format!("{prefix}_error"),
             CType::Enum { module, name } => format!("{prefix}_{module}_{name}"),
             CType::StructTag { module, name } => format!("{prefix}_{module}_{name}"),
+            CType::VtableTag { module, name } => format!("{prefix}_{module}_{name}_vtable"),
             CType::Named(core) => format!("{prefix}_{core}"),
             CType::Ptr { konst, pointee } => {
                 let inner = pointee.render_c(prefix);
                 match konst {
                     ConstPos::None => format!("{inner}*"),
                     ConstPos::West => format!("const {inner}*"),
-                    ConstPos::East => format!("{inner} const*"),
                 }
             }
         }
@@ -203,7 +204,6 @@ mod tests {
     fn scalars_render() {
         assert_eq!(CType::Int32.render_c("weaveffi"), "int32_t");
         assert_eq!(CType::Size.render_c("weaveffi"), "size_t");
-        assert_eq!(CType::Handle.render_c("myffi"), "myffi_handle_t");
         assert_eq!(CType::Error.render_c("myffi"), "myffi_error");
     }
 
@@ -215,34 +215,35 @@ mod tests {
     }
 
     #[test]
-    fn struct_tag_uses_prefix_and_module() {
+    fn struct_and_vtable_tags_use_prefix_and_module() {
         let t = CType::StructTag {
             module: "contacts".into(),
-            name: "Contact".into(),
+            name: "Book".into(),
         };
-        assert_eq!(t.render_c("weaveffi"), "weaveffi_contacts_Contact");
+        assert_eq!(t.render_c("weaveffi"), "weaveffi_contacts_Book");
         assert_eq!(
             CType::ptr(t).render_c("weaveffi"),
-            "weaveffi_contacts_Contact*"
+            "weaveffi_contacts_Book*"
         );
-    }
-
-    #[test]
-    fn east_const_array_of_string_pointers() {
-        // `[string]` element is `const char*`; the array pointer is east-const.
-        let elem = CType::const_ptr(CType::Char);
-        let arr = CType::Ptr {
-            konst: ConstPos::East,
-            pointee: Box::new(elem),
+        let v = CType::VtableTag {
+            module: "events".into(),
+            name: "Listener".into(),
         };
-        assert_eq!(arr.render_c("weaveffi"), "const char* const*");
+        assert_eq!(
+            CType::const_ptr(v.clone()).render_c("weaveffi"),
+            "const weaveffi_events_Listener_vtable*"
+        );
+        assert_eq!(
+            CType::const_ptr(v).render_rust("weaveffi"),
+            "*const weaveffi_events_Listener_vtable"
+        );
     }
 
     #[test]
     fn named_type_is_prefixed() {
         assert_eq!(
-            CType::Named("events_on_data_fn".into()).render_c("weaveffi"),
-            "weaveffi_events_on_data_fn"
+            CType::Named("events_fetch_callback".into()).render_c("weaveffi"),
+            "weaveffi_events_fetch_callback"
         );
     }
 
@@ -254,13 +255,10 @@ mod tests {
         assert_eq!(CType::Double.render_rust("weaveffi"), "f64");
         assert_eq!(CType::Bool.render_rust("weaveffi"), "bool");
         assert_eq!(CType::Size.render_rust("weaveffi"), "usize");
-        assert_eq!(CType::Handle.render_rust("weaveffi"), "u64");
     }
 
     #[test]
     fn rust_runtime_types_keep_canonical_names_under_custom_prefix() {
-        // `weaveffi-abi` exports these Rust types under fixed names regardless
-        // of the configured business-symbol prefix.
         assert_eq!(CType::Error.render_rust("acme"), "weaveffi_error");
         assert_eq!(
             CType::CancelToken.render_rust("acme"),
@@ -287,38 +285,6 @@ mod tests {
             name: "Color".into(),
         };
         assert_eq!(e.render_rust("weaveffi"), "i32");
-    }
-
-    #[test]
-    fn rust_struct_tag_uses_prefix_and_module() {
-        let t = CType::StructTag {
-            module: "contacts".into(),
-            name: "Contact".into(),
-        };
-        assert_eq!(t.render_rust("weaveffi"), "weaveffi_contacts_Contact");
-        assert_eq!(
-            CType::ptr(t).render_rust("weaveffi"),
-            "*mut weaveffi_contacts_Contact"
-        );
-    }
-
-    #[test]
-    fn rust_east_const_collapses_to_const() {
-        // `[string]` lowers to an east-const array of string pointers; Rust has
-        // no east/west distinction so both render `*const`.
-        let arr = CType::Ptr {
-            konst: ConstPos::East,
-            pointee: Box::new(CType::const_ptr(CType::Char)),
-        };
-        assert_eq!(arr.render_rust("weaveffi"), "*const *const c_char");
-    }
-
-    #[test]
-    fn rust_map_return_keys_match_header_arity() {
-        // The header types a returned map's keys as `const char*** out_keys`;
-        // the Rust producer must declare the matching `*mut *mut *const c_char`.
-        let out_keys = CType::ptr(CType::ptr(CType::const_ptr(CType::Char)));
-        assert_eq!(out_keys.render_rust("weaveffi"), "*mut *mut *const c_char");
     }
 
     #[test]

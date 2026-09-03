@@ -1,18 +1,20 @@
 //! Kvstore sample cdylib: a production-quality, in-memory key/value store that
 //! exercises every IDL feature WeaveFFI supports through the
-//! `#[weaveffi::module]` macro: an interface with constructors, methods,
-//! statics, and an implicit destroy symbol, a typed error domain
-//! (`#[weaveffi::error]`), callbacks, listeners, optional/list/map/bytes
-//! record fields, an iterator return, a cancellable async method, deprecated
-//! and nested-submodule surface, all over the C ABI. Records cross the
-//! boundary as value buffers: each `#[weaveffi::record]` gets a generated
-//! `BufferValue` implementation instead of per-field C accessors.
+//! `#[weaveffi::module]` macro: a reference-counted interface with
+//! constructors, methods, statics, and `_clone`/`_destroy` symbols, a typed
+//! error domain (`#[weaveffi::error]`), a consumer-implemented callback
+//! interface, optional/list/map/bytes record fields, records and lists that
+//! carry objects, `Store?` in both directions, an iterator return, a
+//! cancellable async method, deprecated and nested-submodule surface, all
+//! over the C ABI. Records cross the boundary as value buffers: each
+//! `#[weaveffi::record]` gets a generated `BufferValue` implementation instead
+//! of per-field C accessors.
 //!
 //! `Store` is exported as an interface, so each object owns its rich state
 //! (its entries and the monotonic entry-id counter) directly. Methods take
 //! `&self` and guard that state with a `Mutex` because the object is shared
-//! across the FFI boundary; destroying the object (via the generated
-//! `weaveffi_kv_Store_destroy`) releases the state with it.
+//! across the FFI boundary; the last `weaveffi_kv_Store_destroy` releases the
+//! state with it.
 
 #![allow(unsafe_code)]
 
@@ -21,7 +23,7 @@
 pub mod kv {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicI64, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex, PoisonError};
     #[cfg(not(target_arch = "wasm32"))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,24 +103,68 @@ pub mod kv {
         1_700_000_000
     }
 
-    /// Fires when an entry is evicted from the store.
-    #[weaveffi::callback]
-    #[allow(non_snake_case, dead_code, unused_variables)]
-    fn OnEvict(key: String) {}
+    /// Why an entry left the store.
+    #[weaveffi::enumeration]
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum EvictionReason {
+        /// Removed by an explicit `delete`.
+        Deleted = 0,
+        /// Its TTL elapsed and a read evicted it.
+        Expired = 1,
+    }
 
-    /// Subscribe to per-key eviction notifications.
-    #[weaveffi::listener(event = "OnEvict")]
-    #[allow(dead_code)]
-    fn eviction_listener() {}
+    /// A consumer-implemented observer of evictions. One listener at a time
+    /// is attached to a store with [`Store::set_eviction_listener`]; the store
+    /// retains it until it's replaced, cleared, or the store is dropped.
+    #[weaveffi::callback_interface]
+    pub trait EvictionListener: Send + Sync {
+        /// An entry left the store. Returns whether the listener wants to keep
+        /// receiving notifications; `false` detaches it.
+        fn on_evict(&self, entry: &Entry, reason: EvictionReason) -> bool;
+    }
+
+    /// A named view of a store, used to exercise objects inside records: the
+    /// `store` field carries a strong reference and `mirror` may be absent.
+    #[weaveffi::record]
+    #[derive(Clone)]
+    pub struct StoreInfo {
+        /// A caller-chosen label.
+        pub label: String,
+        /// The described store.
+        pub store: Arc<Store>,
+        /// An optional second store to compare against.
+        pub mirror: Option<Arc<Store>>,
+        /// Live entry count at the time of the snapshot.
+        pub count: i64,
+    }
 
     /// An embedded key-value store owning its entries. Exported as an
     /// interface: each object holds its own entry map and id counter behind a
     /// `Mutex` (methods take `&self` because the object is shared across the
-    /// FFI boundary), and the generated destroy symbol releases the state.
+    /// FFI boundary), and the last generated `destroy` releases the state.
     #[weaveffi::interface]
     pub struct Store {
         entries: Mutex<BTreeMap<String, Entry>>,
         next_entry_id: AtomicI64,
+        listener: Mutex<Option<Arc<dyn EvictionListener>>>,
+    }
+
+    impl Store {
+        /// Notify the attached listener (if any) outside every lock; detach it
+        /// when it asks to stop.
+        fn notify_eviction(&self, entry: &Entry, reason: EvictionReason) {
+            let listener = self
+                .listener
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(listener) = listener {
+                if !listener.on_evict(entry, reason) {
+                    *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                }
+            }
+        }
     }
 
     impl Store {
@@ -133,7 +179,82 @@ pub mod kv {
             Ok(Store {
                 entries: Mutex::new(BTreeMap::new()),
                 next_entry_id: AtomicI64::new(1),
+                listener: Mutex::new(None),
             })
+        }
+
+        /// Attach `listener`, replacing any previous one (whose consumer
+        /// `free` then runs).
+        pub fn set_eviction_listener(&self, listener: Arc<dyn EvictionListener>) {
+            *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = Some(listener);
+        }
+
+        /// Detach the current listener, if any.
+        pub fn clear_eviction_listener(&self) {
+            *self.listener.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+
+        /// A second reference to this same store (the returned pointer equals
+        /// the receiver's; both must eventually be destroyed).
+        pub fn share(self: Arc<Self>) -> Arc<Store> {
+            self
+        }
+
+        /// A new store holding a copy of every live entry.
+        pub fn fork(&self) -> Arc<Store> {
+            let now = now_unix_seconds();
+            let entries: BTreeMap<String, Entry> = self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, e)| !e.is_expired(now))
+                .map(|(k, e)| (k.clone(), e.clone()))
+                .collect();
+            let next = self.next_entry_id.load(Ordering::Relaxed);
+            Arc::new(Store {
+                entries: Mutex::new(entries),
+                next_entry_id: AtomicI64::new(next),
+                listener: Mutex::new(None),
+            })
+        }
+
+        /// Whichever of `self` and `other` holds more live entries, or `None`
+        /// when `other` is absent and `self` is empty. Exercises `Store?` as
+        /// both a parameter and a return.
+        pub fn larger(self: Arc<Self>, other: Option<Arc<Store>>) -> Option<Arc<Store>> {
+            match other {
+                Some(o) if o.count() > self.count() => Some(o),
+                Some(_) => Some(self),
+                None if self.count() > 0 => Some(self),
+                None => None,
+            }
+        }
+
+        /// Snapshot this store into a record that carries the object itself.
+        pub fn describe(self: Arc<Self>, label: String, mirror: Option<Arc<Store>>) -> StoreInfo {
+            let count = self.count();
+            StoreInfo {
+                label,
+                store: self,
+                mirror,
+                count,
+            }
+        }
+
+        /// Open one store per path. Exercises a list of objects as a return.
+        pub fn open_many(paths: Vec<String>) -> Result<Vec<Arc<Store>>, KvError> {
+            paths
+                .into_iter()
+                .map(|p| Store::open(p).map(Arc::new))
+                .collect()
+        }
+
+        /// Total live entries across `stores`. Exercises a list of objects as
+        /// a parameter and an object inside a record as a parameter.
+        pub fn total_count(stores: Vec<Arc<Store>>, extra: Option<StoreInfo>) -> i64 {
+            let base: i64 = stores.iter().map(|s| s.count()).sum();
+            base + extra.map_or(0, |info| info.store.count())
         }
 
         /// Insert or replace a value, returning true on success. A new key is
@@ -174,33 +295,33 @@ pub mod kv {
 
         /// Look up an entry by key; returns null if missing or expired (and
         /// reports the matching [`KvError`] code through `out_err`). An
-        /// expired entry is evicted on read, firing the eviction listener.
+        /// expired entry is evicted on read, notifying the eviction listener.
         pub fn get(&self, key: String) -> Result<Option<Entry>, KvError> {
             let now = now_unix_seconds();
             let (result, evicted) = {
                 let mut entries = self.entries.lock().unwrap();
                 match entries.get(&key) {
                     Some(entry) if entry.is_expired(now) => {
-                        entries.remove(&key);
-                        (Err(KvError::Expired), Some(key.clone()))
+                        let gone = entries.remove(&key);
+                        (Err(KvError::Expired), gone)
                     }
                     Some(entry) => (Ok(Some(entry.clone())), None),
                     None => (Err(KvError::KeyNotFound), None),
                 }
             };
-            if let Some(evicted_key) = evicted {
-                emit_eviction_listener(&evicted_key);
+            if let Some(entry) = evicted {
+                self.notify_eviction(&entry, EvictionReason::Expired);
             }
             result
         }
 
         /// Remove the entry for the given key, returning true if it existed.
-        /// A removed entry fires the eviction listener.
+        /// A removed entry notifies the eviction listener.
         pub fn delete(&self, key: String) -> Result<bool, KvError> {
             let removed = self.entries.lock().unwrap().remove(&key);
             match removed {
-                Some(_) => {
-                    emit_eviction_listener(&key);
+                Some(entry) => {
+                    self.notify_eviction(&entry, EvictionReason::Deleted);
                     Ok(true)
                 }
                 None => Ok(false),
@@ -300,7 +421,7 @@ pub mod kv {
         /// Snapshot the current store statistics. Takes the parent module's
         /// `Store` interface by reference across the module boundary.
         #[weaveffi::export]
-        pub fn get_stats(store: &super::Store) -> Result<Stats, KvError> {
+        pub fn get_stats(store: &Store) -> Result<Stats, KvError> {
             let now = super::now_unix_seconds();
             let entries = store.entries.lock().unwrap();
             let total_entries = entries.len() as i64;
@@ -326,7 +447,7 @@ mod tests {
     use std::ffi::{c_void, CString};
     use std::os::raw::c_char;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
     use weaveffi::abi::{self, weaveffi_error};
 
@@ -339,10 +460,8 @@ mod tests {
         value
     }
 
-    // The macro-generated eviction-listener registry is process-global, so the
-    // tests that register a listener (or fire evictions a listener could
-    // observe) are serialized and each unregisters before releasing the guard;
-    // that keeps at most one subscriber live at a time.
+    // Stores are independent objects, but the tests share process-wide
+    // vtables and counters, so they run serialized for readable failures.
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     fn setup() -> std::sync::MutexGuard<'static, ()> {
@@ -785,44 +904,72 @@ mod tests {
         assert_eq!(back.expired_entries, 3);
     }
 
-    #[test]
-    fn eviction_listener_fires_on_delete() {
-        let _g = setup();
-        let s = open();
-        put_simple(s, "evict-me", b"v");
+    /// A consumer-side eviction listener, exactly as a generated binding
+    /// builds one: a heap context plus a process-wide vtable.
+    struct ListenerState {
+        evictions: Mutex<Vec<(String, i32)>>,
+        keep_after: usize,
+        freed: Arc<AtomicUsize>,
+    }
 
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        COUNT.store(0, Ordering::Relaxed);
-        extern "C" fn on_evict(_key: *const c_char, _ctx: *mut c_void) {
-            COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        let id = weaveffi_kv_register_eviction_listener(on_evict, std::ptr::null_mut());
-        assert!(id > 0);
+    unsafe extern "C" fn on_evict(
+        ctx: *mut c_void,
+        entry_ptr: *const u8,
+        entry_len: usize,
+        reason: i32,
+        _out_err: *mut weaveffi_error,
+    ) -> bool {
+        let state = &*(ctx as *const ListenerState);
+        let entry: Entry =
+            abi::decode_value(std::slice::from_raw_parts(entry_ptr, entry_len)).unwrap();
+        let mut seen = state.evictions.lock().unwrap();
+        seen.push((entry.key, reason));
+        seen.len() < state.keep_after
+    }
 
-        let mut err = new_err();
-        let key = CString::new("evict-me").unwrap();
-        assert!(weaveffi_kv_Store_delete(s, key.as_ptr(), &mut err));
-        assert_eq!(COUNT.load(Ordering::Relaxed), 1);
+    unsafe extern "C" fn free_listener(ctx: *mut c_void) {
+        let state = Box::from_raw(ctx as *mut ListenerState);
+        state.freed.fetch_add(1, Ordering::SeqCst);
+    }
 
-        weaveffi_kv_unregister_eviction_listener(id);
-        put_simple(s, "again", b"x");
-        let key2 = CString::new("again").unwrap();
-        weaveffi_kv_Store_delete(s, key2.as_ptr(), &mut err);
-        assert_eq!(COUNT.load(Ordering::Relaxed), 1);
+    static LISTENER_VTABLE: weaveffi_kv_EvictionListener_vtable =
+        weaveffi_kv_EvictionListener_vtable {
+            on_evict,
+            free: free_listener,
+        };
 
-        weaveffi_kv_Store_destroy(s);
+    fn new_listener(keep_after: usize, freed: &Arc<AtomicUsize>) -> *mut ListenerState {
+        Box::into_raw(Box::new(ListenerState {
+            evictions: Mutex::new(Vec::new()),
+            keep_after,
+            freed: Arc::clone(freed),
+        }))
     }
 
     #[test]
-    fn eviction_listener_fires_on_ttl_expiry() {
+    fn eviction_listener_sees_deletes_and_expiry_then_detaches() {
         let _g = setup();
         let s = open();
+        let freed = Arc::new(AtomicUsize::new(0));
+        let listener = new_listener(2, &freed);
         let mut err = new_err();
-        let key = CString::new("expiring").unwrap();
+        weaveffi_kv_Store_set_eviction_listener(
+            s,
+            listener as *mut c_void,
+            &LISTENER_VTABLE,
+            &mut err,
+        );
+        assert_eq!(err.code, 0);
+
+        put_simple(s, "evict-me", b"v");
+        let key = CString::new("evict-me").unwrap();
+        assert!(weaveffi_kv_Store_delete(s, key.as_ptr(), &mut err));
+
+        let expiring = CString::new("expiring").unwrap();
         let ttl = abi::encode_value(&Some(-1i64));
         weaveffi_kv_Store_put(
             s,
-            key.as_ptr(),
+            expiring.as_ptr(),
             b"x".as_ptr(),
             1,
             EntryKind::Volatile as i32,
@@ -830,22 +977,143 @@ mod tests {
             ttl.len(),
             &mut err,
         );
-
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
-        COUNT.store(0, Ordering::Relaxed);
-        extern "C" fn on_evict(_key: *const c_char, _ctx: *mut c_void) {
-            COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        let id = weaveffi_kv_register_eviction_listener(on_evict, std::ptr::null_mut());
-
-        let mut out_len: usize = 0;
-        let p = weaveffi_kv_Store_get(s, key.as_ptr(), &mut out_len, &mut err);
+        let mut out_len = 0usize;
+        let p = weaveffi_kv_Store_get(s, expiring.as_ptr(), &mut out_len, &mut err);
         assert!(p.is_null());
         assert_eq!(err.code, 1002);
-        assert_eq!(COUNT.load(Ordering::Relaxed), 1);
         abi::error_clear(&mut err);
 
-        weaveffi_kv_unregister_eviction_listener(id);
+        // The second eviction returned `false`, so the store detached (and
+        // freed) the listener; a third eviction is not observed.
+        assert_eq!(
+            freed.load(Ordering::SeqCst),
+            1,
+            "detached listener is freed"
+        );
+        put_simple(s, "again", b"x");
+        let again = CString::new("again").unwrap();
+        weaveffi_kv_Store_delete(s, again.as_ptr(), &mut err);
+        weaveffi_kv_Store_destroy(s);
+    }
+
+    #[test]
+    fn eviction_listener_is_retained_until_replaced() {
+        let _g = setup();
+        let s = open();
+        let freed = Arc::new(AtomicUsize::new(0));
+        let mut err = new_err();
+        let first = new_listener(usize::MAX, &freed);
+        weaveffi_kv_Store_set_eviction_listener(
+            s,
+            first as *mut c_void,
+            &LISTENER_VTABLE,
+            &mut err,
+        );
+        assert_eq!(freed.load(Ordering::SeqCst), 0);
+        let second = new_listener(usize::MAX, &freed);
+        weaveffi_kv_Store_set_eviction_listener(
+            s,
+            second as *mut c_void,
+            &LISTENER_VTABLE,
+            &mut err,
+        );
+        assert_eq!(
+            freed.load(Ordering::SeqCst),
+            1,
+            "replaced listener is freed"
+        );
+        weaveffi_kv_Store_clear_eviction_listener(s, &mut err);
+        assert_eq!(freed.load(Ordering::SeqCst), 2);
+        weaveffi_kv_Store_destroy(s);
+    }
+
+    #[test]
+    fn share_and_fork_reference_counting() {
+        let _g = setup();
+        let s = open();
+        put_simple(s, "a", b"1");
+        let mut err = new_err();
+
+        let shared = weaveffi_kv_Store_share(s, &mut err);
+        assert_eq!(shared, s, "share returns the same object");
+        weaveffi_kv_Store_destroy(s);
+        assert_eq!(weaveffi_kv_Store_count(shared, &mut err), 1, "still alive");
+
+        let forked = weaveffi_kv_Store_fork(shared, &mut err);
+        assert_ne!(forked, shared);
+        put_simple(forked, "b", b"2");
+        assert_eq!(weaveffi_kv_Store_count(forked, &mut err), 2);
+        assert_eq!(weaveffi_kv_Store_count(shared, &mut err), 1);
+
+        let cloned = weaveffi_kv_Store_clone(forked);
+        weaveffi_kv_Store_destroy(forked);
+        assert_eq!(weaveffi_kv_Store_count(cloned, &mut err), 2);
+        weaveffi_kv_Store_destroy(cloned);
+        weaveffi_kv_Store_destroy(shared);
+    }
+
+    #[test]
+    fn larger_handles_nullable_objects_both_ways() {
+        let _g = setup();
+        let a = open();
+        let b = open();
+        put_simple(b, "x", b"1");
+        let mut err = new_err();
+
+        assert!(weaveffi_kv_Store_larger(a, std::ptr::null(), &mut err).is_null());
+        let bigger = weaveffi_kv_Store_larger(a, b, &mut err);
+        assert_eq!(bigger, b);
+        weaveffi_kv_Store_destroy(bigger);
+        let own = weaveffi_kv_Store_larger(b, std::ptr::null(), &mut err);
+        assert_eq!(own, b);
+        weaveffi_kv_Store_destroy(own);
+
+        weaveffi_kv_Store_destroy(a);
+        weaveffi_kv_Store_destroy(b);
+    }
+
+    #[test]
+    fn objects_inside_records_and_lists() {
+        let _g = setup();
+        let s = open();
+        put_simple(s, "k", b"v");
+        let mut err = new_err();
+
+        let label = CString::new("primary").unwrap();
+        let mut out_len = 0usize;
+        let ptr =
+            weaveffi_kv_Store_describe(s, label.as_ptr(), std::ptr::null(), &mut out_len, &mut err);
+        assert_eq!(err.code, 0);
+        let info = decode_and_free::<StoreInfo>(ptr, out_len);
+        assert_eq!(info.label, "primary");
+        assert_eq!(info.count, 1);
+        assert!(info.mirror.is_none());
+        // The record's object token carried its own reference.
+        assert_eq!(Arc::as_ptr(&info.store), s as *const Store);
+        assert_eq!(Arc::strong_count(&info.store), 2);
+
+        let paths = abi::encode_value(&vec!["/a".to_string(), "/b".to_string()]);
+        let mut many_len = 0usize;
+        let many_ptr =
+            weaveffi_kv_Store_open_many(paths.as_ptr(), paths.len(), &mut many_len, &mut err);
+        assert_eq!(err.code, 0);
+        let many = decode_and_free::<Vec<Arc<Store>>>(many_ptr, many_len);
+        assert_eq!(many.len(), 2);
+        put_simple(Arc::as_ptr(&many[0]) as *mut Store, "m", b"1");
+
+        // Objects written into a parameter buffer carry one reference each.
+        let stores = abi::encode_value(&many);
+        let extra = abi::encode_value(&Some(info.clone()));
+        let total = weaveffi_kv_Store_total_count(
+            stores.as_ptr(),
+            stores.len(),
+            extra.as_ptr(),
+            extra.len(),
+            &mut err,
+        );
+        assert_eq!(total, 2);
+        drop(info);
+        drop(many);
         weaveffi_kv_Store_destroy(s);
     }
 

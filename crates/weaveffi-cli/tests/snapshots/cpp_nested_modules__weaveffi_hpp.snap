@@ -15,8 +15,8 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
-#include <cstring>
 #include <utility>
+#include <cstring>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -50,15 +50,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -66,6 +67,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -108,7 +113,14 @@ WEAVEFFI_API const uint8_t* weaveffi_graphics_shapes_geometry_compute(const uint
 
 namespace weaveffi {
 
-/** Base exception for every error reported through the C ABI. */
+/**
+ * Base exception for every error reported through the C ABI.
+ *
+ * Positive codes are the module's declared error codes (see the typed
+ * domain exceptions); negative codes are runtime traps: -1 a generic
+ * producer error, -2 a producer panic, -3 a marshalling failure, -4 a
+ * callback-interface implementation that threw.
+ */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -116,6 +128,17 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+/**
+ * Throws WeaveFFIError when the loaded producer library was built for a
+ * different WeaveFFI ABI revision than this header. Call once at startup.
+ */
+inline void check_abi_version() {
+    uint32_t actual = weaveffi_abi_version();
+    if (actual != WEAVEFFI_ABI_VERSION) {
+        throw WeaveFFIError(-1, "WeaveFFI ABI revision mismatch: header " + std::to_string(WEAVEFFI_ABI_VERSION) + ", library " + std::to_string(actual));
+    }
+}
 
 namespace detail {
 
@@ -201,7 +224,8 @@ public:
  * Decodes values from the WeaveFFI value-buffer wire format. A malformed
  * buffer is a producer/consumer contract violation (both sides are generated
  * from one IDL), so every decode failure throws the generic WeaveFFIError,
- * the same channel as a producer panic.
+ * the same channel as a producer panic. Object tokens adopted before a
+ * failure live in RAII wrappers that release them on unwind.
  */
 class BufferReader {
     const uint8_t* data_;
@@ -315,6 +339,10 @@ enum class Unit : int32_t {
     points = 1
 };
 
+struct Canvas;
+struct Shape;
+struct Detail;
+
 /** A struct two levels deep. */
 struct Detail {
     double area;
@@ -345,9 +373,8 @@ inline void write_Detail(BufferWriter& w, const Detail& v) {
 
 /** Decodes a `Detail` from the WeaveFFI value-buffer format. */
 inline Detail read_Detail(BufferReader& r) {
-    Detail out{};
-    out.area = r.read_f64();
-    return out;
+    double f_area = r.read_f64();
+    return Detail{std::move(f_area)};
 }
 
 /** Encodes a `Shape` in the WeaveFFI value-buffer format. */
@@ -359,11 +386,10 @@ inline void write_Shape(BufferWriter& w, const Shape& v) {
 
 /** Decodes a `Shape` from the WeaveFFI value-buffer format. */
 inline Shape read_Shape(BufferReader& r) {
-    Shape out{};
-    out.sides = r.read_i32();
-    out.unit = static_cast<Unit>(r.read_i32());
-    out.detail = detail::read_Detail(r);
-    return out;
+    int32_t f_sides = r.read_i32();
+    Unit f_unit = static_cast<Unit>(r.read_i32());
+    Detail f_detail = detail::read_Detail(r);
+    return Shape{std::move(f_sides), std::move(f_unit), std::move(f_detail)};
 }
 
 /** Encodes a `Canvas` in the WeaveFFI value-buffer format. */
@@ -374,10 +400,9 @@ inline void write_Canvas(BufferWriter& w, const Canvas& v) {
 
 /** Decodes a `Canvas` from the WeaveFFI value-buffer format. */
 inline Canvas read_Canvas(BufferReader& r) {
-    Canvas out{};
-    out.width = r.read_i32();
-    out.root = detail::read_Shape(r);
-    return out;
+    int32_t f_width = r.read_i32();
+    Shape f_root = detail::read_Shape(r);
+    return Canvas{std::move(f_width), std::move(f_root)};
 }
 
 } // namespace detail
@@ -399,6 +424,8 @@ namespace detail {
 /** Map a `graphics` error code and payload to its typed exception (WeaveFFIError for runtime codes, GraphicsError for unknown codes). */
 inline std::exception_ptr make_graphics_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
     if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
+    (void)payload_ptr;
+    (void)payload_len;
     switch (code) {
     case 1: return std::make_exception_ptr(OutOfBoundsError(msg));
     default: return std::make_exception_ptr(GraphicsError(code, msg));

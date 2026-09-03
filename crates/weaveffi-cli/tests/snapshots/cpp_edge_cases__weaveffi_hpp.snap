@@ -15,13 +15,11 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
-#include <cstring>
 #include <utility>
+#include <cstring>
 #include <future>
 #include <cstddef>
 #include <iterator>
-#include <functional>
-#include <mutex>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -55,15 +53,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -71,6 +70,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -100,13 +103,38 @@ typedef enum { weaveffi_edge_cases_Mode_Fast = 1, weaveffi_edge_cases_Mode_Safe 
 typedef enum { weaveffi_edge_cases_EdgeErrors_Busy = 7 } weaveffi_edge_cases_EdgeErrors;
 typedef struct weaveffi_edge_cases_Widget weaveffi_edge_cases_Widget;
 typedef struct weaveffi_edge_cases_Vault weaveffi_edge_cases_Vault;
+typedef struct weaveffi_edge_cases_WidgetStreamIterator weaveffi_edge_cases_WidgetStreamIterator;
 typedef struct weaveffi_edge_cases_StringStreamIterator weaveffi_edge_cases_StringStreamIterator;
 typedef struct weaveffi_edge_cases_ScalarStreamIterator weaveffi_edge_cases_ScalarStreamIterator;
 typedef struct weaveffi_edge_cases_ModeStreamIterator weaveffi_edge_cases_ModeStreamIterator;
-typedef struct weaveffi_edge_cases_Leaf weaveffi_edge_cases_Leaf;
-/** Callback carrying composite payloads */
-typedef void (*weaveffi_edge_cases_OnBatch_fn)(const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, void* context);
-typedef void (*weaveffi_edge_cases_OnTick_fn)(void* context);
+/**
+ * Callback interface carrying composite payloads and objects
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_edge_cases_BatchListener_vtable {
+    /** Composite payloads cross as value buffers */
+    void (*on_batch)(void* ctx, const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, weaveffi_error* out_err);
+    /** Objects cross as strong references the consumer must release */
+    void (*on_widget)(void* ctx, weaveffi_edge_cases_Widget* widget, weaveffi_edge_cases_Widget* fallback, const uint8_t* children_ptr, size_t children_len, weaveffi_error* out_err);
+    void (*on_tick)(void* ctx, weaveffi_error* out_err);
+    /** Scalar return travels back through the vtable */
+    bool (*should_continue)(void* ctx, int32_t class_, weaveffi_error* out_err);
+    /** Enum return travels back as its integer discriminant */
+    weaveffi_edge_cases_Mode (*pick_mode)(void* ctx, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_edge_cases_BatchListener_vtable;
+/**
+ * Callback interface whose name and methods are keywords
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_edge_cases_Keyword_vtable {
+    void (*delete_)(void* ctx, int32_t self, weaveffi_error* out_err);
+    int32_t (*import)(void* ctx, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_edge_cases_Keyword_vtable;
+typedef void (*weaveffi_edge_cases_async_widget_callback)(void* context, weaveffi_error* err, weaveffi_edge_cases_Widget* result);
 typedef void (*weaveffi_edge_cases_async_void_callback)(void* context, weaveffi_error* err);
 typedef void (*weaveffi_edge_cases_async_bytes_callback)(void* context, weaveffi_error* err, const uint8_t* result, size_t result_len);
 typedef void (*weaveffi_edge_cases_async_struct_callback)(void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len);
@@ -124,6 +152,9 @@ WEAVEFFI_API const char* weaveffi_edge_cases_Widget_rename(const weaveffi_edge_c
 WEAVEFFI_API void weaveffi_edge_cases_Widget_fetch_async(const weaveffi_edge_cases_Widget* self, int64_t id, weaveffi_edge_cases_Widget_fetch_callback callback, void* context);
 WEAVEFFI_DEPRECATED("Use rename instead")
 WEAVEFFI_API const char* weaveffi_edge_cases_Widget_old_name(const weaveffi_edge_cases_Widget* self, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_Widget_clone(const weaveffi_edge_cases_Widget* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_edge_cases_Widget_destroy(weaveffi_edge_cases_Widget* self);
 
 /** Deprecated interface with a throwing constructor */
@@ -132,12 +163,11 @@ WEAVEFFI_API weaveffi_edge_cases_Vault* weaveffi_edge_cases_Vault_open(const cha
 /** Throwing static */
 WEAVEFFI_API bool weaveffi_edge_cases_Vault_probe(weaveffi_error* out_err);
 WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_Vault_peek(const weaveffi_edge_cases_Vault* self, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_edge_cases_Vault* weaveffi_edge_cases_Vault_clone(const weaveffi_edge_cases_Vault* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_edge_cases_Vault_destroy(weaveffi_edge_cases_Vault* self);
 
-WEAVEFFI_API uint64_t weaveffi_edge_cases_register_batch_listener(weaveffi_edge_cases_OnBatch_fn callback, void* context);
-WEAVEFFI_API void weaveffi_edge_cases_unregister_batch_listener(uint64_t id);
-WEAVEFFI_API uint64_t weaveffi_edge_cases_register_tick_listener(weaveffi_edge_cases_OnTick_fn callback, void* context);
-WEAVEFFI_API void weaveffi_edge_cases_unregister_tick_listener(uint64_t id);
 /** No parameters and no result */
 WEAVEFFI_API void weaveffi_edge_cases_noop(weaveffi_error* out_err);
 /** Function named after a keyword whose parameters are all keywords */
@@ -145,15 +175,22 @@ WEAVEFFI_API int32_t weaveffi_edge_cases_select(int32_t class_, const char* from
 /** Optional list of optional structs, the deepest legal nesting */
 WEAVEFFI_API const uint8_t* weaveffi_edge_cases_nested_optional(const uint8_t* items_ptr, size_t items_len, size_t* out_len, weaveffi_error* out_err);
 WEAVEFFI_API const uint8_t* weaveffi_edge_cases_optional_params(const uint8_t* text_ptr, size_t text_len, const uint8_t* count_ptr, size_t count_len, const uint8_t* outer_ptr, size_t outer_len, const uint8_t* tags_ptr, size_t tags_len, const uint8_t* blob_ptr, size_t blob_len, const uint8_t* mode_ptr, size_t mode_len, size_t* out_len, weaveffi_error* out_err);
-/** Write-back parameters */
-WEAVEFFI_API void weaveffi_edge_cases_mutable_params(char* text, uint8_t* blob_ptr, size_t blob_len, weaveffi_error* out_err);
+/** Two callback interface parameters on one function */
+WEAVEFFI_API void weaveffi_edge_cases_register_batch(void* listener_ctx, const weaveffi_edge_cases_BatchListener_vtable* listener_vtable, void* keyword_ctx, const weaveffi_edge_cases_Keyword_vtable* keyword_vtable, weaveffi_error* out_err);
+/** Objects in every buffered position */
+WEAVEFFI_API const uint8_t* weaveffi_edge_cases_widgets_everywhere(const uint8_t* list_ptr, size_t list_len, const uint8_t* by_name_ptr, size_t by_name_len, const uint8_t* sparse_ptr, size_t sparse_len, const uint8_t* holder_ptr, size_t holder_len, size_t* out_len, weaveffi_error* out_err);
+/** Iterator of objects */
+WEAVEFFI_API weaveffi_edge_cases_WidgetStreamIterator* weaveffi_edge_cases_widget_stream(weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_edge_cases_WidgetStreamIterator_next(weaveffi_edge_cases_WidgetStreamIterator* iter, weaveffi_edge_cases_Widget** out_item, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_edge_cases_WidgetStreamIterator_destroy(weaveffi_edge_cases_WidgetStreamIterator* iter);
+/** Async returning an object */
+WEAVEFFI_API void weaveffi_edge_cases_async_widget_async(weaveffi_edge_cases_async_widget_callback callback, void* context);
 /** Factory for an interface with no constructor */
 WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_make_widget(const char* label, weaveffi_error* out_err);
 /** Optional interface return */
 WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_find_widget(int64_t id, weaveffi_error* out_err);
 /** Interface parameter, including an optional one */
 WEAVEFFI_API const char* weaveffi_edge_cases_inspect_widget(const weaveffi_edge_cases_Widget* widget, const weaveffi_edge_cases_Widget* fallback, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_edge_cases_Leaf* weaveffi_edge_cases_typed_handle_param(weaveffi_edge_cases_Leaf* token, weaveffi_handle_t raw, weaveffi_error* out_err);
 /** Iterator of strings */
 WEAVEFFI_API weaveffi_edge_cases_StringStreamIterator* weaveffi_edge_cases_string_stream(weaveffi_error* out_err);
 WEAVEFFI_API int32_t weaveffi_edge_cases_StringStreamIterator_next(weaveffi_edge_cases_StringStreamIterator* iter, const char** out_item, weaveffi_error* out_err);
@@ -182,7 +219,14 @@ WEAVEFFI_API const uint8_t* weaveffi_edge_cases_legacy_value(weaveffi_edge_cases
 
 namespace weaveffi {
 
-/** Base exception for every error reported through the C ABI. */
+/**
+ * Base exception for every error reported through the C ABI.
+ *
+ * Positive codes are the module's declared error codes (see the typed
+ * domain exceptions); negative codes are runtime traps: -1 a generic
+ * producer error, -2 a producer panic, -3 a marshalling failure, -4 a
+ * callback-interface implementation that threw.
+ */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -190,6 +234,17 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+/**
+ * Throws WeaveFFIError when the loaded producer library was built for a
+ * different WeaveFFI ABI revision than this header. Call once at startup.
+ */
+inline void check_abi_version() {
+    uint32_t actual = weaveffi_abi_version();
+    if (actual != WEAVEFFI_ABI_VERSION) {
+        throw WeaveFFIError(-1, "WeaveFFI ABI revision mismatch: header " + std::to_string(WEAVEFFI_ABI_VERSION) + ", library " + std::to_string(actual));
+    }
+}
 
 namespace detail {
 
@@ -275,7 +330,8 @@ public:
  * Decodes values from the WeaveFFI value-buffer wire format. A malformed
  * buffer is a producer/consumer contract violation (both sides are generated
  * from one IDL), so every decode failure throws the generic WeaveFFIError,
- * the same channel as a producer panic.
+ * the same channel as a producer panic. Object tokens adopted before a
+ * failure live in RAII wrappers that release them on unwind.
  */
 class BufferReader {
     const uint8_t* data_;
@@ -395,6 +451,128 @@ enum class Mode : int32_t {
     Safe = 2
 };
 
+struct Leaf;
+struct Inner;
+struct Outer;
+struct Keywords;
+struct Retired;
+struct WidgetHolder;
+class Widget;
+class Vault;
+class BatchListener;
+class Keyword;
+
+/** Interface with no constructor; instances come from make_widget */
+class Widget {
+    weaveffi_edge_cases_Widget* handle_;
+
+public:
+    /** Adopts one strong reference to a producer object. */
+    explicit Widget(weaveffi_edge_cases_Widget* h) : handle_(h) {}
+
+    /** Releases this wrapper's reference; the object is dropped with its last one. */
+    ~Widget() {
+        if (handle_) weaveffi_edge_cases_Widget_destroy(handle_);
+    }
+
+    /** Copies share the object: the copy takes a new strong reference. */
+    Widget(const Widget& other) : handle_(weaveffi_edge_cases_Widget_clone(other.handle_)) {}
+
+    Widget& operator=(const Widget& other) {
+        if (this != &other) {
+            weaveffi_edge_cases_Widget* h = weaveffi_edge_cases_Widget_clone(other.handle_);
+            if (handle_) weaveffi_edge_cases_Widget_destroy(handle_);
+            handle_ = h;
+        }
+        return *this;
+    }
+
+    Widget(Widget&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Widget& operator=(Widget&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_edge_cases_Widget_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** The wrapped pointer, borrowed: this wrapper keeps its reference. */
+    const weaveffi_edge_cases_Widget* handle() const { return handle_; }
+
+    /** A new strong reference the caller owns (for example to write into a value buffer). */
+    weaveffi_edge_cases_Widget* clone_handle() const { return weaveffi_edge_cases_Widget_clone(handle_); }
+
+    /** Void method that can fail */
+    void refresh() const;
+
+    std::string rename(const std::string& class_, const std::optional<std::string>& import) const;
+
+    /** Async method with a struct result */
+    std::future<Outer> fetch(int64_t id) const;
+
+    [[deprecated("Use rename instead")]]
+    std::string old_name() const;
+
+};
+
+/** Deprecated interface with a throwing constructor */
+class Vault {
+    weaveffi_edge_cases_Vault* handle_;
+
+public:
+    /** Adopts one strong reference to a producer object. */
+    explicit Vault(weaveffi_edge_cases_Vault* h) : handle_(h) {}
+
+    /** Releases this wrapper's reference; the object is dropped with its last one. */
+    ~Vault() {
+        if (handle_) weaveffi_edge_cases_Vault_destroy(handle_);
+    }
+
+    /** Copies share the object: the copy takes a new strong reference. */
+    Vault(const Vault& other) : handle_(weaveffi_edge_cases_Vault_clone(other.handle_)) {}
+
+    Vault& operator=(const Vault& other) {
+        if (this != &other) {
+            weaveffi_edge_cases_Vault* h = weaveffi_edge_cases_Vault_clone(other.handle_);
+            if (handle_) weaveffi_edge_cases_Vault_destroy(handle_);
+            handle_ = h;
+        }
+        return *this;
+    }
+
+    Vault(Vault&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Vault& operator=(Vault&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_edge_cases_Vault_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** The wrapped pointer, borrowed: this wrapper keeps its reference. */
+    const weaveffi_edge_cases_Vault* handle() const { return handle_; }
+
+    /** A new strong reference the caller owns (for example to write into a value buffer). */
+    weaveffi_edge_cases_Vault* clone_handle() const { return weaveffi_edge_cases_Vault_clone(handle_); }
+
+    /** Fails when the vault is busy */
+    static Vault open(const std::string& path);
+
+    std::optional<Widget> peek() const;
+
+    /** Throwing static */
+    static bool probe();
+
+};
+
 struct Leaf {
     float weight;
 };
@@ -487,6 +665,14 @@ struct Retired {
     int64_t id;
 };
 
+/** Record carrying objects in every buffered position */
+struct WidgetHolder {
+    Widget primary;
+    std::optional<Widget> fallback;
+    std::vector<Widget> extras;
+    std::unordered_map<std::string, Widget> by_name;
+};
+
 namespace detail {
 
 /** Encodes a `Leaf` in the WeaveFFI value-buffer format. */
@@ -496,9 +682,8 @@ inline void write_Leaf(BufferWriter& w, const Leaf& v) {
 
 /** Decodes a `Leaf` from the WeaveFFI value-buffer format. */
 inline Leaf read_Leaf(BufferReader& r) {
-    Leaf out{};
-    out.weight = r.read_f32();
-    return out;
+    float f_weight = r.read_f32();
+    return Leaf{std::move(f_weight)};
 }
 
 /** Encodes a `Inner` in the WeaveFFI value-buffer format. */
@@ -512,17 +697,17 @@ inline void write_Inner(BufferWriter& w, const Inner& v) {
 
 /** Decodes a `Inner` from the WeaveFFI value-buffer format. */
 inline Inner read_Inner(BufferReader& r) {
-    Inner out{};
-    out.leaf = detail::read_Leaf(r);
+    Leaf f_leaf = detail::read_Leaf(r);
+    std::vector<Leaf> f_leaves{};
     {
-        size_t v_leaves_n = r.read_len();
-        out.leaves.reserve(v_leaves_n);
-        for (size_t v_leaves_i = 0; v_leaves_i < v_leaves_n; ++v_leaves_i) {
-            Leaf v_leaves_item = detail::read_Leaf(r);
-            out.leaves.push_back(std::move(v_leaves_item));
+        size_t f_leaves_n = r.read_len();
+        f_leaves.reserve(f_leaves_n);
+        for (size_t f_leaves_i = 0; f_leaves_i < f_leaves_n; ++f_leaves_i) {
+            Leaf f_leaves_item = detail::read_Leaf(r);
+            f_leaves.push_back(std::move(f_leaves_item));
         }
     }
-    return out;
+    return Inner{std::move(f_leaf), std::move(f_leaves)};
 }
 
 /** Encodes a `Outer` in the WeaveFFI value-buffer format. */
@@ -574,75 +759,82 @@ inline void write_Outer(BufferWriter& w, const Outer& v) {
 
 /** Decodes a `Outer` from the WeaveFFI value-buffer format. */
 inline Outer read_Outer(BufferReader& r) {
-    Outer out{};
-    out.inner = detail::read_Inner(r);
+    Inner f_inner = detail::read_Inner(r);
+    std::optional<Inner> f_maybe_inner{};
     if (r.read_option_flag()) {
-        Inner v_maybe_inner_v = detail::read_Inner(r);
-        out.maybe_inner = std::move(v_maybe_inner_v);
+        Inner f_maybe_inner_v = detail::read_Inner(r);
+        f_maybe_inner = std::move(f_maybe_inner_v);
     }
+    std::unordered_map<std::string, Inner> f_by_name{};
     {
-        size_t v_by_name_n = r.read_len();
-        for (size_t v_by_name_i = 0; v_by_name_i < v_by_name_n; ++v_by_name_i) {
-            std::string v_by_name_key = r.read_string();
-            Inner v_by_name_val = detail::read_Inner(r);
-            out.by_name.emplace(std::move(v_by_name_key), std::move(v_by_name_val));
+        size_t f_by_name_n = r.read_len();
+        for (size_t f_by_name_i = 0; f_by_name_i < f_by_name_n; ++f_by_name_i) {
+            std::string f_by_name_key = r.read_string();
+            Inner f_by_name_val = detail::read_Inner(r);
+            f_by_name.emplace(std::move(f_by_name_key), std::move(f_by_name_val));
         }
     }
+    std::vector<Mode> f_modes{};
     {
-        size_t v_modes_n = r.read_len();
-        out.modes.reserve(v_modes_n);
-        for (size_t v_modes_i = 0; v_modes_i < v_modes_n; ++v_modes_i) {
-            Mode v_modes_item = static_cast<Mode>(r.read_i32());
-            out.modes.push_back(std::move(v_modes_item));
+        size_t f_modes_n = r.read_len();
+        f_modes.reserve(f_modes_n);
+        for (size_t f_modes_i = 0; f_modes_i < f_modes_n; ++f_modes_i) {
+            Mode f_modes_item = static_cast<Mode>(r.read_i32());
+            f_modes.push_back(std::move(f_modes_item));
         }
     }
+    std::vector<std::vector<int32_t>> f_matrix{};
     {
-        size_t v_matrix_n = r.read_len();
-        out.matrix.reserve(v_matrix_n);
-        for (size_t v_matrix_i = 0; v_matrix_i < v_matrix_n; ++v_matrix_i) {
-            std::vector<int32_t> v_matrix_item{};
+        size_t f_matrix_n = r.read_len();
+        f_matrix.reserve(f_matrix_n);
+        for (size_t f_matrix_i = 0; f_matrix_i < f_matrix_n; ++f_matrix_i) {
+            std::vector<int32_t> f_matrix_item{};
             {
-                size_t v_matrix_item_n = r.read_len();
-                v_matrix_item.reserve(v_matrix_item_n);
-                for (size_t v_matrix_item_i = 0; v_matrix_item_i < v_matrix_item_n; ++v_matrix_item_i) {
-                    int32_t v_matrix_item_item = r.read_i32();
-                    v_matrix_item.push_back(std::move(v_matrix_item_item));
+                size_t f_matrix_item_n = r.read_len();
+                f_matrix_item.reserve(f_matrix_item_n);
+                for (size_t f_matrix_item_i = 0; f_matrix_item_i < f_matrix_item_n; ++f_matrix_item_i) {
+                    int32_t f_matrix_item_item = r.read_i32();
+                    f_matrix_item.push_back(std::move(f_matrix_item_item));
                 }
             }
-            out.matrix.push_back(std::move(v_matrix_item));
+            f_matrix.push_back(std::move(f_matrix_item));
         }
     }
+    std::vector<std::optional<int64_t>> f_sparse{};
     {
-        size_t v_sparse_n = r.read_len();
-        out.sparse.reserve(v_sparse_n);
-        for (size_t v_sparse_i = 0; v_sparse_i < v_sparse_n; ++v_sparse_i) {
-            std::optional<int64_t> v_sparse_item{};
+        size_t f_sparse_n = r.read_len();
+        f_sparse.reserve(f_sparse_n);
+        for (size_t f_sparse_i = 0; f_sparse_i < f_sparse_n; ++f_sparse_i) {
+            std::optional<int64_t> f_sparse_item{};
             if (r.read_option_flag()) {
-                int64_t v_sparse_item_v = r.read_i64();
-                v_sparse_item = std::move(v_sparse_item_v);
+                int64_t f_sparse_item_v = r.read_i64();
+                f_sparse_item = std::move(f_sparse_item_v);
             }
-            out.sparse.push_back(std::move(v_sparse_item));
+            f_sparse.push_back(std::move(f_sparse_item));
         }
     }
+    std::optional<std::vector<uint8_t>> f_blob{};
     if (r.read_option_flag()) {
-        std::vector<uint8_t> v_blob_v = r.read_bytes();
-        out.blob = std::move(v_blob_v);
+        std::vector<uint8_t> f_blob_v = r.read_bytes();
+        f_blob = std::move(f_blob_v);
     }
+    std::optional<std::string> f_note{};
     if (r.read_option_flag()) {
-        std::string v_note_v = r.read_string();
-        out.note = std::move(v_note_v);
+        std::string f_note_v = r.read_string();
+        f_note = std::move(f_note_v);
     }
+    std::unordered_map<int64_t, std::string> f_by_id{};
     {
-        size_t v_by_id_n = r.read_len();
-        for (size_t v_by_id_i = 0; v_by_id_i < v_by_id_n; ++v_by_id_i) {
-            int64_t v_by_id_key = r.read_i64();
-            std::string v_by_id_val = r.read_string();
-            out.by_id.emplace(std::move(v_by_id_key), std::move(v_by_id_val));
+        size_t f_by_id_n = r.read_len();
+        for (size_t f_by_id_i = 0; f_by_id_i < f_by_id_n; ++f_by_id_i) {
+            int64_t f_by_id_key = r.read_i64();
+            std::string f_by_id_val = r.read_string();
+            f_by_id.emplace(std::move(f_by_id_key), std::move(f_by_id_val));
         }
     }
-    out._hidden = r.read_bool();
-    out.v2 = r.read_u8();
-    return out;
+    bool f__hidden = r.read_bool();
+    uint8_t f_v2 = r.read_u8();
+    return Outer{std::move(f_inner), std::move(f_maybe_inner), std::move(f_by_name), std::move(f_modes), std::move(f_matrix), std::move(f_sparse), std::move(f_blob), std::move(f_note), std::move(f_by_id), std::move(f__hidden), std::move(f_v2)};
 }
 
 /** Encodes a `Keywords` in the WeaveFFI value-buffer format. */
@@ -710,67 +902,66 @@ inline void write_Keywords(BufferWriter& w, const Keywords& v) {
 
 /** Decodes a `Keywords` from the WeaveFFI value-buffer format. */
 inline Keywords read_Keywords(BufferReader& r) {
-    Keywords out{};
-    out.class_ = r.read_i32();
-    out.def = r.read_i32();
-    out.import = r.read_i32();
-    out.from = r.read_i32();
-    out.func = r.read_i32();
-    out.range = r.read_i32();
-    out.register_ = r.read_i32();
-    out.volatile_ = r.read_i32();
-    out.new_ = r.read_i32();
-    out.default_ = r.read_i32();
-    out.end = r.read_i32();
-    out.in = r.read_i32();
-    out.is = r.read_i32();
-    out.int_ = r.read_i32();
-    out.var = r.read_i32();
-    out.val = r.read_i32();
-    out.self = r.read_i32();
-    out.this_ = r.read_i32();
-    out.object = r.read_i32();
-    out.string = r.read_i32();
-    out.case_ = r.read_i32();
-    out.select = r.read_i32();
-    out.switch_ = r.read_i32();
-    out.void_ = r.read_i32();
-    out.union_ = r.read_i32();
-    out.namespace_ = r.read_i32();
-    out.operator_ = r.read_i32();
-    out.template_ = r.read_i32();
-    out.package = r.read_i32();
-    out.protocol = r.read_i32();
-    out.guard = r.read_i32();
-    out.defer = r.read_i32();
-    out.inout = r.read_i32();
-    out.internal = r.read_i32();
-    out.when = r.read_i32();
-    out.fun = r.read_i32();
-    out.data = r.read_i32();
-    out.late = r.read_i32();
-    out.part = r.read_i32();
-    out.out = r.read_i32();
-    out.ref = r.read_i32();
-    out.event = r.read_i32();
-    out.base = r.read_i32();
-    out.lambda = r.read_i32();
-    out.yield = r.read_i32();
-    out.nil = r.read_i32();
-    out.null = r.read_i32();
-    out.begin = r.read_i32();
-    out.rescue = r.read_i32();
-    out.module = r.read_i32();
-    out.chan = r.read_i32();
-    out.go = r.read_i32();
-    out.let = r.read_i32();
-    out.export_ = r.read_i32();
-    out.delete_ = r.read_i32();
-    out.typedef_ = r.read_i32();
-    out.sizeof_ = r.read_i32();
-    out.static_ = r.read_i32();
-    out.super = r.read_i32();
-    return out;
+    int32_t f_class = r.read_i32();
+    int32_t f_def = r.read_i32();
+    int32_t f_import = r.read_i32();
+    int32_t f_from = r.read_i32();
+    int32_t f_func = r.read_i32();
+    int32_t f_range = r.read_i32();
+    int32_t f_register = r.read_i32();
+    int32_t f_volatile = r.read_i32();
+    int32_t f_new = r.read_i32();
+    int32_t f_default = r.read_i32();
+    int32_t f_end = r.read_i32();
+    int32_t f_in = r.read_i32();
+    int32_t f_is = r.read_i32();
+    int32_t f_int = r.read_i32();
+    int32_t f_var = r.read_i32();
+    int32_t f_val = r.read_i32();
+    int32_t f_self = r.read_i32();
+    int32_t f_this = r.read_i32();
+    int32_t f_object = r.read_i32();
+    int32_t f_string = r.read_i32();
+    int32_t f_case = r.read_i32();
+    int32_t f_select = r.read_i32();
+    int32_t f_switch = r.read_i32();
+    int32_t f_void = r.read_i32();
+    int32_t f_union = r.read_i32();
+    int32_t f_namespace = r.read_i32();
+    int32_t f_operator = r.read_i32();
+    int32_t f_template = r.read_i32();
+    int32_t f_package = r.read_i32();
+    int32_t f_protocol = r.read_i32();
+    int32_t f_guard = r.read_i32();
+    int32_t f_defer = r.read_i32();
+    int32_t f_inout = r.read_i32();
+    int32_t f_internal = r.read_i32();
+    int32_t f_when = r.read_i32();
+    int32_t f_fun = r.read_i32();
+    int32_t f_data = r.read_i32();
+    int32_t f_late = r.read_i32();
+    int32_t f_part = r.read_i32();
+    int32_t f_out = r.read_i32();
+    int32_t f_ref = r.read_i32();
+    int32_t f_event = r.read_i32();
+    int32_t f_base = r.read_i32();
+    int32_t f_lambda = r.read_i32();
+    int32_t f_yield = r.read_i32();
+    int32_t f_nil = r.read_i32();
+    int32_t f_null = r.read_i32();
+    int32_t f_begin = r.read_i32();
+    int32_t f_rescue = r.read_i32();
+    int32_t f_module = r.read_i32();
+    int32_t f_chan = r.read_i32();
+    int32_t f_go = r.read_i32();
+    int32_t f_let = r.read_i32();
+    int32_t f_export = r.read_i32();
+    int32_t f_delete = r.read_i32();
+    int32_t f_typedef = r.read_i32();
+    int32_t f_sizeof = r.read_i32();
+    int32_t f_static = r.read_i32();
+    int32_t f_super = r.read_i32();
+    return Keywords{std::move(f_class), std::move(f_def), std::move(f_import), std::move(f_from), std::move(f_func), std::move(f_range), std::move(f_register), std::move(f_volatile), std::move(f_new), std::move(f_default), std::move(f_end), std::move(f_in), std::move(f_is), std::move(f_int), std::move(f_var), std::move(f_val), std::move(f_self), std::move(f_this), std::move(f_object), std::move(f_string), std::move(f_case), std::move(f_select), std::move(f_switch), std::move(f_void), std::move(f_union), std::move(f_namespace), std::move(f_operator), std::move(f_template), std::move(f_package), std::move(f_protocol), std::move(f_guard), std::move(f_defer), std::move(f_inout), std::move(f_internal), std::move(f_when), std::move(f_fun), std::move(f_data), std::move(f_late), std::move(f_part), std::move(f_out), std::move(f_ref), std::move(f_event), std::move(f_base), std::move(f_lambda), std::move(f_yield), std::move(f_nil), std::move(f_null), std::move(f_begin), std::move(f_rescue), std::move(f_module), std::move(f_chan), std::move(f_go), std::move(f_let), std::move(f_export), std::move(f_delete), std::move(f_typedef), std::move(f_sizeof), std::move(f_static), std::move(f_super)};
 }
 
 /** Encodes a `Retired` in the WeaveFFI value-buffer format. */
@@ -780,9 +971,55 @@ inline void write_Retired(BufferWriter& w, const Retired& v) {
 
 /** Decodes a `Retired` from the WeaveFFI value-buffer format. */
 inline Retired read_Retired(BufferReader& r) {
-    Retired out{};
-    out.id = r.read_i64();
-    return out;
+    int64_t f_id = r.read_i64();
+    return Retired{std::move(f_id)};
+}
+
+/** Encodes a `WidgetHolder` in the WeaveFFI value-buffer format. */
+inline void write_WidgetHolder(BufferWriter& w, const WidgetHolder& v) {
+    w.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(v.primary.clone_handle())));
+    w.write_option_flag(v.fallback.has_value());
+    if (v.fallback.has_value()) {
+        w.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>((*v.fallback).clone_handle())));
+    }
+    w.write_len(v.extras.size());
+    for (const auto& item0 : v.extras) {
+        w.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(item0.clone_handle())));
+    }
+    w.write_len(v.by_name.size());
+    for (const auto& kv0 : v.by_name) {
+        w.write_string(kv0.first);
+        w.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kv0.second.clone_handle())));
+    }
+}
+
+/** Decodes a `WidgetHolder` from the WeaveFFI value-buffer format. */
+inline WidgetHolder read_WidgetHolder(BufferReader& r) {
+    Widget f_primary = Widget(reinterpret_cast<weaveffi_edge_cases_Widget*>(static_cast<uintptr_t>(r.read_u64())));
+    std::optional<Widget> f_fallback{};
+    if (r.read_option_flag()) {
+        Widget f_fallback_v = Widget(reinterpret_cast<weaveffi_edge_cases_Widget*>(static_cast<uintptr_t>(r.read_u64())));
+        f_fallback = std::move(f_fallback_v);
+    }
+    std::vector<Widget> f_extras{};
+    {
+        size_t f_extras_n = r.read_len();
+        f_extras.reserve(f_extras_n);
+        for (size_t f_extras_i = 0; f_extras_i < f_extras_n; ++f_extras_i) {
+            Widget f_extras_item = Widget(reinterpret_cast<weaveffi_edge_cases_Widget*>(static_cast<uintptr_t>(r.read_u64())));
+            f_extras.push_back(std::move(f_extras_item));
+        }
+    }
+    std::unordered_map<std::string, Widget> f_by_name{};
+    {
+        size_t f_by_name_n = r.read_len();
+        for (size_t f_by_name_i = 0; f_by_name_i < f_by_name_n; ++f_by_name_i) {
+            std::string f_by_name_key = r.read_string();
+            Widget f_by_name_val = Widget(reinterpret_cast<weaveffi_edge_cases_Widget*>(static_cast<uintptr_t>(r.read_u64())));
+            f_by_name.emplace(std::move(f_by_name_key), std::move(f_by_name_val));
+        }
+    }
+    return WidgetHolder{std::move(f_primary), std::move(f_fallback), std::move(f_extras), std::move(f_by_name)};
 }
 
 } // namespace detail
@@ -804,6 +1041,8 @@ namespace detail {
 /** Map a `edge_cases` error code and payload to its typed exception (WeaveFFIError for runtime codes, EdgeErrorsError for unknown codes). */
 inline std::exception_ptr make_edge_cases_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
     if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
+    (void)payload_ptr;
+    (void)payload_len;
     switch (code) {
     case 7: return std::make_exception_ptr(BusyError(msg));
     default: return std::make_exception_ptr(EdgeErrorsError(code, msg));
@@ -821,224 +1060,280 @@ inline void check_edge_cases(weaveffi_error& err) {
 
 } // namespace detail
 
+/**
+ * Callback interface carrying composite payloads and objects
+ *
+ * Implement this interface and pass a `std::shared_ptr<BatchListener>` to any function that accepts one. The producer may call the methods from any thread until it releases its last reference to the implementation. An exception thrown by a method is reported to the producer as a foreign error (code -4) and aborts the call that triggered it.
+ */
+class BatchListener {
+public:
+    virtual ~BatchListener() = default;
+
+    /** Composite payloads cross as value buffers */
+    virtual void on_batch(const std::vector<Outer>& items, const std::vector<uint8_t>& raw, const std::optional<Outer>& first, Mode mode) = 0;
+    /** Objects cross as strong references the consumer must release */
+    virtual void on_widget(Widget widget, std::optional<Widget> fallback, const std::vector<Widget>& children) = 0;
+    virtual void on_tick() = 0;
+    /** Scalar return travels back through the vtable */
+    virtual bool should_continue(int32_t class_) = 0;
+    /** Enum return travels back as its integer discriminant */
+    virtual Mode pick_mode() = 0;
+};
+
 namespace detail {
 
-inline std::mutex& wv_listener_mutex() {
-    static std::mutex m;
-    return m;
-}
+/** Vtable trampolines adapting a `BatchListener` implementation to `weaveffi_edge_cases_BatchListener_vtable`. */
+struct BatchListener_trampolines {
+    static void on_batch(void* ctx, const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, weaveffi_error* out_err) {
+        try {
+            BatchListener& impl = **static_cast<std::shared_ptr<BatchListener>*>(ctx);
+            detail::BufferReader items_r(items_ptr, items_len);
+            std::vector<Outer> items_val{};
+            {
+                size_t items_val_n = items_r.read_len();
+                items_val.reserve(items_val_n);
+                for (size_t items_val_i = 0; items_val_i < items_val_n; ++items_val_i) {
+                    Outer items_val_item = detail::read_Outer(items_r);
+                    items_val.push_back(std::move(items_val_item));
+                }
+            }
+            items_r.expect_end();
+            std::vector<uint8_t> raw_val(raw_ptr, raw_ptr + raw_len);
+            detail::BufferReader first_r(first_ptr, first_len);
+            std::optional<Outer> first_val{};
+            if (first_r.read_option_flag()) {
+                Outer first_val_v = detail::read_Outer(first_r);
+                first_val = std::move(first_val_v);
+            }
+            first_r.expect_end();
+            impl.on_batch(items_val, raw_val, first_val, static_cast<Mode>(static_cast<int32_t>(mode)));
+            return;
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "BatchListener::on_batch threw a non-standard exception");
+        }
+    }
 
-inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
-    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
-    return registry;
+    static void on_widget(void* ctx, weaveffi_edge_cases_Widget* widget, weaveffi_edge_cases_Widget* fallback, const uint8_t* children_ptr, size_t children_len, weaveffi_error* out_err) {
+        Widget widget_val(widget);
+        std::optional<Widget> fallback_val;
+        if (fallback) fallback_val.emplace(fallback);
+        try {
+            BatchListener& impl = **static_cast<std::shared_ptr<BatchListener>*>(ctx);
+            detail::BufferReader children_r(children_ptr, children_len);
+            std::vector<Widget> children_val{};
+            {
+                size_t children_val_n = children_r.read_len();
+                children_val.reserve(children_val_n);
+                for (size_t children_val_i = 0; children_val_i < children_val_n; ++children_val_i) {
+                    Widget children_val_item = Widget(reinterpret_cast<weaveffi_edge_cases_Widget*>(static_cast<uintptr_t>(children_r.read_u64())));
+                    children_val.push_back(std::move(children_val_item));
+                }
+            }
+            children_r.expect_end();
+            impl.on_widget(std::move(widget_val), std::move(fallback_val), children_val);
+            return;
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "BatchListener::on_widget threw a non-standard exception");
+        }
+    }
+
+    static void on_tick(void* ctx, weaveffi_error* out_err) {
+        try {
+            BatchListener& impl = **static_cast<std::shared_ptr<BatchListener>*>(ctx);
+            impl.on_tick();
+            return;
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "BatchListener::on_tick threw a non-standard exception");
+        }
+    }
+
+    static bool should_continue(void* ctx, int32_t class_, weaveffi_error* out_err) {
+        try {
+            BatchListener& impl = **static_cast<std::shared_ptr<BatchListener>*>(ctx);
+            return impl.should_continue(class_);
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "BatchListener::should_continue threw a non-standard exception");
+        }
+        return bool{};
+    }
+
+    static weaveffi_edge_cases_Mode pick_mode(void* ctx, weaveffi_error* out_err) {
+        try {
+            BatchListener& impl = **static_cast<std::shared_ptr<BatchListener>*>(ctx);
+            return static_cast<weaveffi_edge_cases_Mode>(static_cast<int32_t>(impl.pick_mode()));
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "BatchListener::pick_mode threw a non-standard exception");
+        }
+        return weaveffi_edge_cases_Mode{};
+    }
+
+    /** Releases the implementation box once the producer drops its last reference. */
+    static void free_ctx(void* ctx) {
+        delete static_cast<std::shared_ptr<BatchListener>*>(ctx);
+    }
+};
+
+/** The process-wide vtable every `BatchListener` implementation is passed with. */
+inline const weaveffi_edge_cases_BatchListener_vtable& BatchListener_vtable() {
+    static const weaveffi_edge_cases_BatchListener_vtable vtable = {
+        &BatchListener_trampolines::on_batch,
+        &BatchListener_trampolines::on_widget,
+        &BatchListener_trampolines::on_tick,
+        &BatchListener_trampolines::should_continue,
+        &BatchListener_trampolines::pick_mode,
+        &BatchListener_trampolines::free_ctx,
+    };
+    return vtable;
 }
 
 } // namespace detail
 
-/** Interface with no constructor; instances come from make_widget */
-class Widget {
-    void* handle_;
-
+/**
+ * Callback interface whose name and methods are keywords
+ *
+ * Implement this interface and pass a `std::shared_ptr<Keyword>` to any function that accepts one. The producer may call the methods from any thread until it releases its last reference to the implementation. An exception thrown by a method is reported to the producer as a foreign error (code -4) and aborts the call that triggered it.
+ */
+class Keyword {
 public:
-    explicit Widget(void* h) : handle_(h) {}
+    virtual ~Keyword() = default;
 
-    ~Widget() {
-        if (handle_) weaveffi_edge_cases_Widget_destroy(static_cast<weaveffi_edge_cases_Widget*>(handle_));
-    }
+    virtual void delete_(int32_t self) = 0;
+    virtual int32_t import() = 0;
+};
 
-    Widget(const Widget&) = delete;
-    Widget& operator=(const Widget&) = delete;
+namespace detail {
 
-    Widget(Widget&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Widget& operator=(Widget&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_edge_cases_Widget_destroy(static_cast<weaveffi_edge_cases_Widget*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
+/** Vtable trampolines adapting a `Keyword` implementation to `weaveffi_edge_cases_Keyword_vtable`. */
+struct Keyword_trampolines {
+    static void delete_(void* ctx, int32_t self, weaveffi_error* out_err) {
+        try {
+            Keyword& impl = **static_cast<std::shared_ptr<Keyword>*>(ctx);
+            impl.delete_(self);
+            return;
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "Keyword::delete_ threw a non-standard exception");
         }
-        return *this;
     }
 
-    void* handle() const { return handle_; }
-
-    /** Void method that can fail */
-    void refresh() const {
-        weaveffi_error err{};
-        weaveffi_edge_cases_Widget_refresh(static_cast<const weaveffi_edge_cases_Widget*>(handle_), &err);
-        detail::check_edge_cases(err);
-    }
-
-    std::string rename(const std::string& class_, const std::optional<std::string>& import) const {
-        detail::BufferWriter import_buf;
-        import_buf.write_option_flag(import.has_value());
-        if (import.has_value()) {
-            import_buf.write_string((*import));
+    static int32_t import(void* ctx, weaveffi_error* out_err) {
+        try {
+            Keyword& impl = **static_cast<std::shared_ptr<Keyword>*>(ctx);
+            return impl.import();
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "Keyword::import threw a non-standard exception");
         }
-        weaveffi_error err{};
-        auto result = weaveffi_edge_cases_Widget_rename(static_cast<const weaveffi_edge_cases_Widget*>(handle_), class_.c_str(), import_buf.data(), import_buf.size(), &err);
-        detail::check(err);
-        std::string ret(result);
-        weaveffi_free_string(result);
-        return ret;
+        return int32_t{};
     }
 
-    /** Async method with a struct result */
-    std::future<Outer> fetch(int64_t id) const {
-        auto* promise_ptr = new std::promise<Outer>();
-        auto future = promise_ptr->get_future();
-        weaveffi_edge_cases_Widget_fetch_async(static_cast<const weaveffi_edge_cases_Widget*>(handle_), id, [](void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len) {
-            auto* p = static_cast<std::promise<Outer>*>(context);
+    /** Releases the implementation box once the producer drops its last reference. */
+    static void free_ctx(void* ctx) {
+        delete static_cast<std::shared_ptr<Keyword>*>(ctx);
+    }
+};
+
+/** The process-wide vtable every `Keyword` implementation is passed with. */
+inline const weaveffi_edge_cases_Keyword_vtable& Keyword_vtable() {
+    static const weaveffi_edge_cases_Keyword_vtable vtable = {
+        &Keyword_trampolines::delete_,
+        &Keyword_trampolines::import,
+        &Keyword_trampolines::free_ctx,
+    };
+    return vtable;
+}
+
+} // namespace detail
+
+inline void Widget::refresh() const {
+    weaveffi_error err{};
+    weaveffi_edge_cases_Widget_refresh(handle_, &err);
+    detail::check_edge_cases(err);
+}
+
+inline std::string Widget::rename(const std::string& class_, const std::optional<std::string>& import) const {
+    detail::BufferWriter import_buf;
+    import_buf.write_option_flag(import.has_value());
+    if (import.has_value()) {
+        import_buf.write_string((*import));
+    }
+    weaveffi_error err{};
+    auto result = weaveffi_edge_cases_Widget_rename(handle_, class_.c_str(), import_buf.data(), import_buf.size(), &err);
+    detail::check(err);
+    std::string ret(result);
+    weaveffi_free_string(result);
+    return ret;
+}
+
+inline std::future<Outer> Widget::fetch(int64_t id) const {
+    auto* promise_ptr = new std::promise<Outer>();
+    auto future = promise_ptr->get_future();
+    weaveffi_edge_cases_Widget_fetch_async(handle_, id, [](void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len) {
+        auto* p = static_cast<std::promise<Outer>*>(context);
+        try {
             if (err && err->code != 0) {
                 std::string msg(err->message ? err->message : "unknown error");
                 p->set_exception(detail::make_edge_cases_error(err->code, msg, err->payload_ptr, err->payload_len));
-                weaveffi_error_free(err);
             } else {
+                detail::BufferGuard result_guard{result_ptr, result_len};
                 detail::BufferReader result_r(result_ptr, result_len);
                 Outer value = detail::read_Outer(result_r);
                 result_r.expect_end();
-                weaveffi_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);
                 p->set_value(std::move(value));
             }
-            delete p;
-        }, static_cast<void*>(promise_ptr));
-        return future;
-    }
-
-    [[deprecated("Use rename instead")]]
-    std::string old_name() const {
-        weaveffi_error err{};
-        auto result = weaveffi_edge_cases_Widget_old_name(static_cast<const weaveffi_edge_cases_Widget*>(handle_), &err);
-        detail::check(err);
-        std::string ret(result);
-        weaveffi_free_string(result);
-        return ret;
-    }
-
-};
-
-/** Deprecated interface with a throwing constructor */
-class Vault {
-    void* handle_;
-
-public:
-    explicit Vault(void* h) : handle_(h) {}
-
-    ~Vault() {
-        if (handle_) weaveffi_edge_cases_Vault_destroy(static_cast<weaveffi_edge_cases_Vault*>(handle_));
-    }
-
-    Vault(const Vault&) = delete;
-    Vault& operator=(const Vault&) = delete;
-
-    Vault(Vault&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Vault& operator=(Vault&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_edge_cases_Vault_destroy(static_cast<weaveffi_edge_cases_Vault*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
-        return *this;
-    }
+        weaveffi_error_free(err);
+        delete p;
+    }, static_cast<void*>(promise_ptr));
+    return future;
+}
 
-    void* handle() const { return handle_; }
+inline std::string Widget::old_name() const {
+    weaveffi_error err{};
+    auto result = weaveffi_edge_cases_Widget_old_name(handle_, &err);
+    detail::check(err);
+    std::string ret(result);
+    weaveffi_free_string(result);
+    return ret;
+}
 
-    /** Fails when the vault is busy */
-    static Vault open(const std::string& path) {
-        weaveffi_error err{};
-        auto result = weaveffi_edge_cases_Vault_open(path.c_str(), &err);
-        detail::check_edge_cases(err);
-        return Vault(result);
-    }
+inline Vault Vault::open(const std::string& path) {
+    weaveffi_error err{};
+    auto result = weaveffi_edge_cases_Vault_open(path.c_str(), &err);
+    detail::check_edge_cases(err);
+    return Vault(result);
+}
 
-    std::optional<Widget> peek() const {
-        weaveffi_error err{};
-        auto result = weaveffi_edge_cases_Vault_peek(static_cast<const weaveffi_edge_cases_Vault*>(handle_), &err);
-        detail::check(err);
-        if (!result) return std::nullopt;
-        return Widget(result);
-    }
+inline std::optional<Widget> Vault::peek() const {
+    weaveffi_error err{};
+    auto result = weaveffi_edge_cases_Vault_peek(handle_, &err);
+    detail::check(err);
+    if (!result) return std::nullopt;
+    return Widget(result);
+}
 
-    /** Throwing static */
-    static bool probe() {
-        weaveffi_error err{};
-        auto result = weaveffi_edge_cases_Vault_probe(&err);
-        detail::check_edge_cases(err);
-        return result;
-    }
-
-};
+inline bool Vault::probe() {
+    weaveffi_error err{};
+    auto result = weaveffi_edge_cases_Vault_probe(&err);
+    detail::check_edge_cases(err);
+    return result;
+}
 
 namespace edge_cases {
-
-/** @return A subscription id for unregister_batch_listener(). */
-inline uint64_t register_batch_listener(std::function<void(std::vector<Outer>, std::vector<uint8_t>, std::optional<Outer>, Mode)> callback) {
-    auto fn = std::make_shared<std::function<void(std::vector<Outer>, std::vector<uint8_t>, std::optional<Outer>, Mode)>>(std::move(callback));
-    uint64_t id = weaveffi_edge_cases_register_batch_listener(
-        [](const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, void* context) {
-            auto& cb = *static_cast<std::function<void(std::vector<Outer>, std::vector<uint8_t>, std::optional<Outer>, Mode)>*>(context);
-            std::vector<Outer> items_val{};
-            if (items_ptr != nullptr) {
-                detail::BufferReader items_r(items_ptr, items_len);
-                {
-                    size_t items_val_n = items_r.read_len();
-                    items_val.reserve(items_val_n);
-                    for (size_t items_val_i = 0; items_val_i < items_val_n; ++items_val_i) {
-                        Outer items_val_item = detail::read_Outer(items_r);
-                        items_val.push_back(std::move(items_val_item));
-                    }
-                }
-                items_r.expect_end();
-            }
-            std::optional<Outer> first_val{};
-            if (first_ptr != nullptr) {
-                detail::BufferReader first_r(first_ptr, first_len);
-                if (first_r.read_option_flag()) {
-                    Outer first_val_v = detail::read_Outer(first_r);
-                    first_val = std::move(first_val_v);
-                }
-                first_r.expect_end();
-            }
-            cb(std::move(items_val), raw_ptr ? std::vector<uint8_t>(raw_ptr, raw_ptr + raw_len) : std::vector<uint8_t>{}, std::move(first_val), static_cast<Mode>(static_cast<int32_t>(mode)));
-        },
-        fn.get());
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry()[id] = fn;
-    return id;
-}
-
-/** Unregisters a listener previously registered with register_batch_listener(). */
-inline void unregister_batch_listener(uint64_t id) {
-    weaveffi_edge_cases_unregister_batch_listener(id);
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry().erase(id);
-}
-
-/** @return A subscription id for unregister_tick_listener(). */
-inline uint64_t register_tick_listener(std::function<void()> callback) {
-    auto fn = std::make_shared<std::function<void()>>(std::move(callback));
-    uint64_t id = weaveffi_edge_cases_register_tick_listener(
-        [](void* context) {
-            auto& cb = *static_cast<std::function<void()>*>(context);
-            cb();
-        },
-        fn.get());
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry()[id] = fn;
-    return id;
-}
-
-/** Unregisters a listener previously registered with register_tick_listener(). */
-inline void unregister_tick_listener(uint64_t id) {
-    weaveffi_edge_cases_unregister_tick_listener(id);
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry().erase(id);
-}
 
 /** No parameters and no result */
 inline void noop() {
@@ -1154,11 +1449,166 @@ inline std::optional<Mode> optional_params(const std::optional<std::string>& tex
     return ret;
 }
 
-/** Write-back parameters */
-inline void mutable_params(std::string& text, std::vector<uint8_t>& blob) {
+/** Two callback interface parameters on one function */
+inline void register_batch(std::shared_ptr<BatchListener> listener, std::shared_ptr<Keyword> keyword) {
+    if (!listener) throw std::invalid_argument("listener: null callback interface");
+    auto* listener_ctx = new std::shared_ptr<BatchListener>(std::move(listener));
+    if (!keyword) throw std::invalid_argument("keyword: null callback interface");
+    auto* keyword_ctx = new std::shared_ptr<Keyword>(std::move(keyword));
     weaveffi_error err{};
-    weaveffi_edge_cases_mutable_params(text.data(), blob.data(), blob.size(), &err);
+    weaveffi_edge_cases_register_batch(static_cast<void*>(listener_ctx), &detail::BatchListener_vtable(), static_cast<void*>(keyword_ctx), &detail::Keyword_vtable(), &err);
     detail::check(err);
+}
+
+/** Objects in every buffered position */
+inline WidgetHolder widgets_everywhere(const std::vector<Widget>& list, const std::unordered_map<std::string, Widget>& by_name, const std::vector<std::optional<Widget>>& sparse, const WidgetHolder& holder) {
+    detail::BufferWriter list_buf;
+    list_buf.write_len(list.size());
+    for (const auto& item0 : list) {
+        list_buf.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(item0.clone_handle())));
+    }
+    detail::BufferWriter by_name_buf;
+    by_name_buf.write_len(by_name.size());
+    for (const auto& kv0 : by_name) {
+        by_name_buf.write_string(kv0.first);
+        by_name_buf.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(kv0.second.clone_handle())));
+    }
+    detail::BufferWriter sparse_buf;
+    sparse_buf.write_len(sparse.size());
+    for (const auto& item0 : sparse) {
+        sparse_buf.write_option_flag(item0.has_value());
+        if (item0.has_value()) {
+            sparse_buf.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>((*item0).clone_handle())));
+        }
+    }
+    detail::BufferWriter holder_buf;
+    detail::write_WidgetHolder(holder_buf, holder);
+    size_t out_len = 0;
+    weaveffi_error err{};
+    auto result = weaveffi_edge_cases_widgets_everywhere(list_buf.data(), list_buf.size(), by_name_buf.data(), by_name_buf.size(), sparse_buf.data(), sparse_buf.size(), holder_buf.data(), holder_buf.size(), &out_len, &err);
+    detail::check(err);
+    detail::BufferGuard result_guard{result, out_len};
+    detail::BufferReader result_r(result, out_len);
+    WidgetHolder ret = detail::read_WidgetHolder(result_r);
+    result_r.expect_end();
+    return ret;
+}
+
+/**
+ * A lazy, move-only range over the `Widget` elements produced by `widget_stream()`.
+ *
+ * Each iteration step pulls exactly one element from the producer, so results stream in constant memory. The range owns the producer-side iterator and releases it exactly once: eagerly when the range is exhausted, or from the destructor when iteration is abandoned early.
+ */
+class WidgetStreamIterator {
+    weaveffi_edge_cases_WidgetStreamIterator* handle_;
+
+public:
+    /** Adopts ownership of the raw producer iterator. */
+    explicit WidgetStreamIterator(weaveffi_edge_cases_WidgetStreamIterator* h) : handle_(h) {}
+
+    ~WidgetStreamIterator() {
+        if (handle_) weaveffi_edge_cases_WidgetStreamIterator_destroy(handle_);
+    }
+
+    WidgetStreamIterator(const WidgetStreamIterator&) = delete;
+    WidgetStreamIterator& operator=(const WidgetStreamIterator&) = delete;
+
+    WidgetStreamIterator(WidgetStreamIterator&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    WidgetStreamIterator& operator=(WidgetStreamIterator&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_edge_cases_WidgetStreamIterator_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** Pulls the next element from the producer, or `std::nullopt` once exhausted (which releases the producer iterator eagerly). A producer error throws the generic WeaveFFIError after releasing the iterator. */
+    std::optional<Widget> next() {
+        if (!handle_) return std::nullopt;
+        weaveffi_error err{};
+        weaveffi_edge_cases_Widget* item{};
+        int32_t has_item = weaveffi_edge_cases_WidgetStreamIterator_next(handle_, &item, &err);
+        if (err.code != 0) {
+            weaveffi_edge_cases_WidgetStreamIterator_destroy(handle_);
+            handle_ = nullptr;
+            detail::check(err);
+        }
+        if (has_item == 0) {
+            weaveffi_edge_cases_WidgetStreamIterator_destroy(handle_);
+            handle_ = nullptr;
+            return std::nullopt;
+        }
+        return Widget(item);
+    }
+
+    /** Sentinel type marking the end of the range. */
+    struct sentinel {};
+
+    /** Single-pass input iterator; each increment pulls one element from the producer. */
+    class iterator {
+        WidgetStreamIterator* range_;
+        std::optional<Widget> current_;
+
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = Widget;
+        using difference_type = std::ptrdiff_t;
+        using pointer = Widget*;
+        using reference = Widget&;
+
+        /** Binds to `range` and pulls the first element. */
+        explicit iterator(WidgetStreamIterator* range) : range_(range), current_(range->next()) {}
+        reference operator*() { return *current_; }
+        pointer operator->() { return &*current_; }
+        iterator& operator++() { current_ = range_->next(); return *this; }
+        void operator++(int) { current_ = range_->next(); }
+        bool operator==(sentinel) const { return !current_.has_value(); }
+        bool operator!=(sentinel) const { return current_.has_value(); }
+    };
+
+    /** Begins iteration by pulling the first element. */
+    iterator begin() { return iterator(this); }
+
+    /** The past-the-end sentinel. */
+    sentinel end() const { return sentinel{}; }
+};
+
+/**
+ * Iterator of objects
+ *
+ * @return A lazy `WidgetStreamIterator` range that streams one element per iteration step and releases the producer iterator when exhausted or destroyed.
+ */
+inline WidgetStreamIterator widget_stream() {
+    weaveffi_error err{};
+    weaveffi_edge_cases_WidgetStreamIterator* iter = weaveffi_edge_cases_widget_stream(&err);
+    detail::check(err);
+    return WidgetStreamIterator(iter);
+}
+
+/** Async returning an object */
+inline std::future<Widget> async_widget() {
+    auto* promise_ptr = new std::promise<Widget>();
+    auto future = promise_ptr->get_future();
+    weaveffi_edge_cases_async_widget_async([](void* context, weaveffi_error* err, weaveffi_edge_cases_Widget* result) {
+        auto* p = static_cast<std::promise<Widget>*>(context);
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_edge_cases_error(err->code, msg, err->payload_ptr, err->payload_len));
+            } else {
+                p->set_value(Widget(result));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
+        }
+        weaveffi_error_free(err);
+        delete p;
+    }, static_cast<void*>(promise_ptr));
+    return future;
 }
 
 /** Factory for an interface with no constructor */
@@ -1181,18 +1631,11 @@ inline std::optional<Widget> find_widget(int64_t id) {
 /** Interface parameter, including an optional one */
 inline std::string inspect_widget(const Widget& widget, const std::optional<Widget>& fallback) {
     weaveffi_error err{};
-    auto result = weaveffi_edge_cases_inspect_widget(static_cast<const weaveffi_edge_cases_Widget*>(widget.handle()), fallback.has_value() ? static_cast<const weaveffi_edge_cases_Widget*>(fallback.value().handle()) : nullptr, &err);
+    auto result = weaveffi_edge_cases_inspect_widget(widget.handle(), fallback.has_value() ? fallback->handle() : nullptr, &err);
     detail::check(err);
     std::string ret(result);
     weaveffi_free_string(result);
     return ret;
-}
-
-inline weaveffi_edge_cases_Leaf* typed_handle_param(weaveffi_edge_cases_Leaf* token, void* raw) {
-    weaveffi_error err{};
-    auto result = weaveffi_edge_cases_typed_handle_param(token, static_cast<weaveffi_handle_t>(reinterpret_cast<uintptr_t>(raw)), &err);
-    detail::check(err);
-    return result;
 }
 
 /**
@@ -1204,7 +1647,7 @@ class StringStreamIterator {
     weaveffi_edge_cases_StringStreamIterator* handle_;
 
 public:
-    /** Adopts ownership of the raw producer iterator handle. */
+    /** Adopts ownership of the raw producer iterator. */
     explicit StringStreamIterator(weaveffi_edge_cases_StringStreamIterator* h) : handle_(h) {}
 
     ~StringStreamIterator() {
@@ -1301,7 +1744,7 @@ class ScalarStreamIterator {
     weaveffi_edge_cases_ScalarStreamIterator* handle_;
 
 public:
-    /** Adopts ownership of the raw producer iterator handle. */
+    /** Adopts ownership of the raw producer iterator. */
     explicit ScalarStreamIterator(weaveffi_edge_cases_ScalarStreamIterator* h) : handle_(h) {}
 
     ~ScalarStreamIterator() {
@@ -1396,7 +1839,7 @@ class ModeStreamIterator {
     weaveffi_edge_cases_ModeStreamIterator* handle_;
 
 public:
-    /** Adopts ownership of the raw producer iterator handle. */
+    /** Adopts ownership of the raw producer iterator. */
     explicit ModeStreamIterator(weaveffi_edge_cases_ModeStreamIterator* h) : handle_(h) {}
 
     ~ModeStreamIterator() {
@@ -1488,13 +1931,17 @@ inline std::future<void> async_void() {
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_void_async([](void* context, weaveffi_error* err) {
         auto* p = static_cast<std::promise<void>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            p->set_value();
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                p->set_value();
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
@@ -1505,15 +1952,19 @@ inline std::future<std::vector<uint8_t>> async_bytes(uint32_t size) {
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_bytes_async(size, [](void* context, weaveffi_error* err, const uint8_t* result, size_t result_len) {
         auto* p = static_cast<std::promise<std::vector<uint8_t>>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            std::vector<uint8_t> value(result, result + result_len);
-            weaveffi_free_bytes(const_cast<uint8_t*>(result), result_len);
-            p->set_value(std::move(value));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                std::vector<uint8_t> value(result, result + result_len);
+                weaveffi_free_bytes(const_cast<uint8_t*>(result), result_len);
+                p->set_value(std::move(value));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
@@ -1524,46 +1975,54 @@ inline std::future<Outer> async_struct() {
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_struct_async([](void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len) {
         auto* p = static_cast<std::promise<Outer>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_edge_cases_error(err->code, msg, err->payload_ptr, err->payload_len));
-            weaveffi_error_free(err);
-        } else {
-            detail::BufferReader result_r(result_ptr, result_len);
-            Outer value = detail::read_Outer(result_r);
-            result_r.expect_end();
-            weaveffi_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);
-            p->set_value(std::move(value));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_edge_cases_error(err->code, msg, err->payload_ptr, err->payload_len));
+            } else {
+                detail::BufferGuard result_guard{result_ptr, result_len};
+                detail::BufferReader result_r(result_ptr, result_len);
+                Outer value = detail::read_Outer(result_r);
+                result_r.expect_end();
+                p->set_value(std::move(value));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
 }
 
-inline std::future<std::vector<Outer>> async_list(weaveffi_cancel_token* cancel_token = nullptr) {
+inline std::future<std::vector<Outer>> async_list(weaveffi_cancel_token* cancel_token) {
     auto* promise_ptr = new std::promise<std::vector<Outer>>();
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_list_async(cancel_token, [](void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len) {
         auto* p = static_cast<std::promise<std::vector<Outer>>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_edge_cases_error(err->code, msg, err->payload_ptr, err->payload_len));
-            weaveffi_error_free(err);
-        } else {
-            detail::BufferReader result_r(result_ptr, result_len);
-            std::vector<Outer> value{};
-            {
-                size_t value_n = result_r.read_len();
-                value.reserve(value_n);
-                for (size_t value_i = 0; value_i < value_n; ++value_i) {
-                    Outer value_item = detail::read_Outer(result_r);
-                    value.push_back(std::move(value_item));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_edge_cases_error(err->code, msg, err->payload_ptr, err->payload_len));
+            } else {
+                detail::BufferGuard result_guard{result_ptr, result_len};
+                detail::BufferReader result_r(result_ptr, result_len);
+                std::vector<Outer> value{};
+                {
+                    size_t value_n = result_r.read_len();
+                    value.reserve(value_n);
+                    for (size_t value_i = 0; value_i < value_n; ++value_i) {
+                        Outer value_item = detail::read_Outer(result_r);
+                        value.push_back(std::move(value_item));
+                    }
                 }
+                result_r.expect_end();
+                p->set_value(std::move(value));
             }
-            result_r.expect_end();
-            weaveffi_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);
-            p->set_value(std::move(value));
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
@@ -1574,21 +2033,25 @@ inline std::future<std::optional<int64_t>> async_optional() {
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_optional_async([](void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len) {
         auto* p = static_cast<std::promise<std::optional<int64_t>>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            detail::BufferReader result_r(result_ptr, result_len);
-            std::optional<int64_t> value{};
-            if (result_r.read_option_flag()) {
-                int64_t value_v = result_r.read_i64();
-                value = std::move(value_v);
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                detail::BufferGuard result_guard{result_ptr, result_len};
+                detail::BufferReader result_r(result_ptr, result_len);
+                std::optional<int64_t> value{};
+                if (result_r.read_option_flag()) {
+                    int64_t value_v = result_r.read_i64();
+                    value = std::move(value_v);
+                }
+                result_r.expect_end();
+                p->set_value(std::move(value));
             }
-            result_r.expect_end();
-            weaveffi_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);
-            p->set_value(std::move(value));
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
@@ -1599,13 +2062,17 @@ inline std::future<Mode> async_enum() {
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_enum_async([](void* context, weaveffi_error* err, weaveffi_edge_cases_Mode result) {
         auto* p = static_cast<std::promise<Mode>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            p->set_value(static_cast<Mode>(result));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                p->set_value(static_cast<Mode>(result));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
@@ -1616,15 +2083,19 @@ inline std::future<std::string> async_keywords(const std::string& class_, int32_
     auto future = promise_ptr->get_future();
     weaveffi_edge_cases_async_keywords_async(class_.c_str(), import, [](void* context, weaveffi_error* err, const char* result) {
         auto* p = static_cast<std::promise<std::string>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            std::string value(result ? result : "");
-            weaveffi_free_string(result);
-            p->set_value(std::move(value));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                std::string value(result ? result : "");
+                weaveffi_free_string(result);
+                p->set_value(std::move(value));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;

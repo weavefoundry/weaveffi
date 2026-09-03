@@ -52,7 +52,7 @@ fn generate(input: &Path, out: &Path, extra: &[&str]) {
 }
 
 const ALL_TARGETS: [&str; 11] = [
-    "c", "cpp", "swift", "android", "node", "wasm", "python", "dotnet", "dart", "go", "ruby",
+    "c", "cpp", "swift", "kotlin", "node", "wasm", "python", "dotnet", "dart", "go", "ruby",
 ];
 
 /// The kvstore sample's `weaveffi.toml` sits beside its `src/lib.rs`; running
@@ -162,7 +162,7 @@ fn inline_package_block_in_idl_is_an_error() {
     fs::write(
         &idl,
         concat!(
-            "version: \"0.8.0\"\n",
+            "version: \"0.9.0\"\n",
             "package:\n",
             "  name: legacy\n",
             "modules:\n",
@@ -274,7 +274,7 @@ fn c_prefix_from_the_c_table_reaches_cpp() {
     let header = read(&out.join("c/myffi.h"));
     for alias in [
         "#define myffi_error weaveffi_error",
-        "#define myffi_handle_t weaveffi_handle_t",
+        "#define myffi_error_set weaveffi_error_set",
         "#define myffi_free_string weaveffi_free_string",
         "#define myffi_cancel_token_create weaveffi_cancel_token_create",
     ] {

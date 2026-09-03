@@ -1,23 +1,33 @@
 //! The native N-API addon (`weaveffi_addon.c`): one C entry point per
-//! callable, plus the iterator, listener, and async machinery.
+//! callable, the per-interface `clone`/`destroy` entry points, the lazy
+//! iterator and async machinery, and one static vtable plus trampolines per
+//! callback interface.
 //!
 //! Marshalling dispatch is driven by the shared plan layer:
 //! [`ParamBinding::arg_pass`] decides how each incoming JS argument crosses
-//! into its ABI slots and [`plan::ret_pass`] decides what the entry point does
-//! with the result; only the N-API spellings live here.
+//! into its ABI slots, [`plan::ret_pass`] decides what the entry point does
+//! with a result, and [`CallbackInterfaceBinding::protocol`] decides how a
+//! trampoline receives each argument; only the N-API spellings live here.
+//!
+//! Object handles cross the addon boundary as `bigint`s holding the pointer
+//! value, 64-bit integers as `bigint`s (never `number`, so nothing above
+//! 2^53 is rounded), and every other direct value as the obvious JS type.
 
-use weaveffi_core::abi;
+use weaveffi_core::abi::{self, split_qualified};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    iterator_item_ctype, BindingModel, CallShape, CallbackBinding, FnBinding, InterfaceBinding,
-    IteratorBinding, ListenerBinding, ParamBinding,
+    iterator_item_ctype, BindingModel, CallShape, CallbackInterfaceBinding, CallbackMethodBinding,
+    FnBinding, InterfaceBinding, IteratorBinding, ModuleBinding, ParamBinding,
 };
-use weaveffi_core::plan::{self, elem_free, ArgPass, ElemFree, RetPass};
+use weaveffi_core::plan::{self, elem_free, ArgPass, Free, RetPass};
 use weaveffi_core::utils::{render_prelude, render_trailer, wrapper_name, CommentStyle};
 
-use crate::runtime::model_has_iterators;
-use crate::types::{iface_member_base, js_fn_name};
+use crate::types::{iface_lifecycle_base, iface_member_base, js_fn_name};
+
+/// The ABI error code a callback trampoline writes when the consumer's
+/// implementation raised (the producer runtime's `FOREIGN_ERROR_CODE`).
+const FOREIGN_ERROR_CODE: i32 = -4;
 
 /// The C return-type spelling of `ty` at a call site. Buffered values render
 /// as `const uint8_t*` (the encoded buffer); an iterator launcher's handle is
@@ -29,7 +39,96 @@ fn c_ret_type_str(ty: &Ty, module: &str, prefix: &str) -> String {
     abi::lower_return(ty, module).ret.render_c(prefix)
 }
 
-/// The bare C type of a scalar (or C-enum-free leaf) parameter temporary.
+/// The `{c_tag}` stem of a (possibly dot-qualified) callback interface name
+/// referenced from `module`; its vtable is `{c_tag}_vtable` and its addon
+/// helpers hang off the same stem.
+fn callback_c_tag(name: &str, module: &str, prefix: &str) -> String {
+    let (m, n) = split_qualified(name, module);
+    format!("{prefix}_{m}_{n}")
+}
+
+/// The C statement that creates napi value `target` from a direct-family C
+/// expression `expr` (scalars, bools, C-style enums). 64-bit integers become
+/// `bigint`s.
+fn napi_create_leaf(ty: &Ty, expr: &str, target: &str) -> String {
+    match ty {
+        Ty::I8 | Ty::I16 | Ty::I32 => format!("napi_create_int32(env, {expr}, &{target});"),
+        Ty::U8 | Ty::U16 | Ty::U32 => format!("napi_create_uint32(env, {expr}, &{target});"),
+        Ty::I64 => format!("napi_create_bigint_int64(env, {expr}, &{target});"),
+        Ty::U64 => format!("napi_create_bigint_uint64(env, {expr}, &{target});"),
+        Ty::F32 | Ty::F64 => format!("napi_create_double(env, {expr}, &{target});"),
+        Ty::Bool => format!("napi_get_boolean(env, {expr}, &{target});"),
+        Ty::Enum(_) => format!("napi_create_int32(env, (int32_t)({expr}), &{target});"),
+        other => unreachable!("direct leaf with non-direct type {other:?}"),
+    }
+}
+
+/// Emit the statements reading a direct-family JS value `val` into the C
+/// lvalue `target` of type `ty`, recording the N-API status in `status`.
+/// N-API only exposes 32/64-bit int and `double` getters, so narrower
+/// scalars are read into a wider temporary and narrowed with an explicit
+/// cast; 64-bit integers are read from `bigint`s losslessly (a `number` is
+/// accepted too, and an out-of-range `bigint` is a failure).
+fn emit_leaf_read(out: &mut String, indent: &str, ty: &Ty, val: &str, target: &str, status: &str) {
+    let tmp = format!("{}_tmp", target.replace(['.', '>', '-', '[', ']'], "_"));
+    match ty {
+        Ty::I32 => out.push_str(&format!(
+            "{indent}{status} = napi_get_value_int32(env, {val}, &{target});\n"
+        )),
+        Ty::U32 => out.push_str(&format!(
+            "{indent}{status} = napi_get_value_uint32(env, {val}, &{target});\n"
+        )),
+        Ty::I8 | Ty::I16 => {
+            out.push_str(&format!("{indent}int32_t {tmp} = 0;\n"));
+            out.push_str(&format!(
+                "{indent}{status} = napi_get_value_int32(env, {val}, &{tmp});\n"
+            ));
+            out.push_str(&format!(
+                "{indent}{target} = ({}){tmp};\n",
+                c_scalar_type(ty)
+            ));
+        }
+        Ty::U8 | Ty::U16 => {
+            out.push_str(&format!("{indent}uint32_t {tmp} = 0;\n"));
+            out.push_str(&format!(
+                "{indent}{status} = napi_get_value_uint32(env, {val}, &{tmp});\n"
+            ));
+            out.push_str(&format!(
+                "{indent}{target} = ({}){tmp};\n",
+                c_scalar_type(ty)
+            ));
+        }
+        Ty::I64 => out.push_str(&format!(
+            "{indent}{status} = weaveffi_napi_get_i64(env, {val}, &{target});\n"
+        )),
+        Ty::U64 => out.push_str(&format!(
+            "{indent}{status} = weaveffi_napi_get_u64(env, {val}, &{target});\n"
+        )),
+        Ty::F64 => out.push_str(&format!(
+            "{indent}{status} = napi_get_value_double(env, {val}, &{target});\n"
+        )),
+        Ty::F32 => {
+            out.push_str(&format!("{indent}double {tmp} = 0;\n"));
+            out.push_str(&format!(
+                "{indent}{status} = napi_get_value_double(env, {val}, &{tmp});\n"
+            ));
+            out.push_str(&format!("{indent}{target} = (float){tmp};\n"));
+        }
+        Ty::Bool => out.push_str(&format!(
+            "{indent}{status} = napi_get_value_bool(env, {val}, &{target});\n"
+        )),
+        Ty::Enum(_) => {
+            out.push_str(&format!("{indent}int32_t {tmp} = 0;\n"));
+            out.push_str(&format!(
+                "{indent}{status} = napi_get_value_int32(env, {val}, &{tmp});\n"
+            ));
+            out.push_str(&format!("{indent}{target} = {tmp};\n"));
+        }
+        other => unreachable!("direct leaf read with non-direct type {other:?}"),
+    }
+}
+
+/// The bare C type of a scalar parameter temporary.
 fn c_scalar_type(ty: &Ty) -> &'static str {
     match ty {
         Ty::I8 => "int8_t",
@@ -47,35 +146,88 @@ fn c_scalar_type(ty: &Ty) -> &'static str {
     }
 }
 
-/// The N-API getter that reads one direct-slot JS argument.
-fn napi_getter(ty: &Ty) -> &'static str {
-    match ty {
-        // i8/i16 are read through the 32-bit signed getter (N-API has no
-        // narrower int getter) and narrowed at the use site.
-        Ty::I8 | Ty::I16 | Ty::I32 | Ty::Enum(_) => "napi_get_value_int32",
-        Ty::U8 | Ty::U16 | Ty::U32 => "napi_get_value_uint32",
-        // u64 mirrors i64/handle: read as a 64-bit int, reinterpreted as needed.
-        Ty::I64 | Ty::U64 | Ty::Handle | Ty::TypedHandle(_) => "napi_get_value_int64",
-        // f32 is read as a double then narrowed to float at the use site.
-        Ty::F32 | Ty::F64 => "napi_get_value_double",
-        Ty::Bool => "napi_get_value_bool",
-        _ => "napi_get_value_int64",
+/// Emit the shared value helpers every entry point uses: lossless 64-bit
+/// readers (a `bigint` that does not fit is a `RangeError`, a non-integer a
+/// `TypeError`, so no value is ever silently truncated), and the object
+/// handle codec (`bigint` holding the pointer value; `null`/`undefined` read
+/// as `NULL` and a `NULL` pointer surfaces as `null`). All `static inline`
+/// so an addon that never needs one compiles without an unused warning.
+fn render_value_helpers_c(out: &mut String) {
+    out.push_str(
+        r#"static inline napi_status weaveffi_napi_get_i64(napi_env env, napi_value v, int64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_int64(env, v, out, &lossless);
+    if (s == napi_ok && !lossless) {
+      napi_throw_range_error(env, NULL, "bigint does not fit in a signed 64-bit integer");
+      return napi_generic_failure;
     }
+    return s;
+  }
+  if (t == napi_number) {
+    return napi_get_value_int64(env, v, out);
+  }
+  napi_throw_type_error(env, NULL, "expected a bigint");
+  return napi_bigint_expected;
 }
 
-/// The C type of the temporary an N-API getter writes into for a scalar that is
-/// narrower than the getter's natural width. N-API only exposes 32/64-bit int
-/// and `double` getters, so `i8/i16/u8/u16/f32` must be read into a wider
-/// temporary and then narrowed with an explicit cast to the real ABI type;
-/// `u64` is read as `int64_t` then reinterpreted.
-fn napi_read_tmp_type(ty: &Ty) -> &'static str {
-    match ty {
-        Ty::I8 | Ty::I16 => "int32_t",
-        Ty::U8 | Ty::U16 => "uint32_t",
-        Ty::U64 => "int64_t",
-        Ty::F32 => "double",
-        _ => "int64_t",
+static inline napi_status weaveffi_napi_get_u64(napi_env env, napi_value v, uint64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_uint64(env, v, out, &lossless);
+    if (s == napi_ok && !lossless) {
+      napi_throw_range_error(env, NULL, "bigint does not fit in an unsigned 64-bit integer");
+      return napi_generic_failure;
     }
+    return s;
+  }
+  if (t == napi_number) {
+    double d = 0;
+    napi_status s = napi_get_value_double(env, v, &d);
+    if (s == napi_ok && (d < 0 || d != d)) {
+      napi_throw_range_error(env, NULL, "negative number for an unsigned 64-bit integer");
+      return napi_generic_failure;
+    }
+    *out = (uint64_t)d;
+    return s;
+  }
+  napi_throw_type_error(env, NULL, "expected a bigint");
+  return napi_bigint_expected;
+}
+
+// An object handle is the pointer value carried as a bigint. null and
+// undefined read as NULL (the absent case of a nullable object).
+static inline napi_status weaveffi_napi_get_handle(napi_env env, napi_value v, void** out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_null || t == napi_undefined) {
+    *out = NULL;
+    return napi_ok;
+  }
+  if (t == napi_bigint) {
+    uint64_t raw = 0;
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_uint64(env, v, &raw, &lossless);
+    *out = (void*)(uintptr_t)raw;
+    return s;
+  }
+  napi_throw_type_error(env, NULL, "expected an object handle");
+  return napi_bigint_expected;
+}
+
+static inline napi_status weaveffi_napi_make_handle(napi_env env, const void* p, napi_value* out) {
+  if (p == NULL) {
+    return napi_get_null(env, out);
+  }
+  return napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)p, out);
+}
+
+"#,
+    );
 }
 
 /// Emit `{prefix}_napi_error_value`, the shared constructor of the JS error
@@ -118,7 +270,7 @@ fn emit_error_check_c(out: &mut String, prefix: &str) {
     out.push_str(&format!(
         "    napi_throw(env, {prefix}_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));\n"
     ));
-    out.push_str("    weaveffi_error_clear(&err);\n");
+    out.push_str(&format!("    {prefix}_error_clear(&err);\n"));
     out.push_str("    return NULL;\n");
     out.push_str("  }\n");
 }
@@ -155,9 +307,11 @@ fn emit_iter_state_read(out: &mut String, prefix: &str) {
 /// per-step fault then throws the code-carrying error, which the JS wrapper
 /// maps per the callable's error strategy. A produced element is converted
 /// and released per its element plan: strings are freed with
-/// `weaveffi_free_string` after the JS string is created, and byte or
-/// buffered elements are copied into a JS `Buffer` and released with
-/// `weaveffi_free_bytes` (the JS wrapper decodes buffered elements).
+/// `{prefix}_free_string` after the JS string is created, byte or buffered
+/// elements are copied into a JS `Buffer` and released with
+/// `{prefix}_free_bytes` (the JS wrapper decodes buffered elements), and an
+/// object element's strong reference is surfaced as a handle the JS wrapper
+/// adopts.
 fn render_iterator_napi_fns(
     out: &mut String,
     f: &FnBinding,
@@ -199,11 +353,11 @@ fn render_iterator_napi_fns(
     out.push_str("  }\n");
     let et = iterator_item_ctype(&ib.elem, module).render_c(prefix);
     out.push_str(&format!("  {et} iter_item;\n"));
-    if ef == ElemFree::Bytes {
+    if ef == Free::Bytes {
         out.push_str("  size_t iter_item_len = 0;\n");
     }
-    out.push_str("  weaveffi_error iter_err = {0};\n");
-    let next_args = if ef == ElemFree::Bytes {
+    out.push_str(&format!("  {prefix}_error iter_err = {{0}};\n"));
+    let next_args = if ef == Free::Bytes {
         format!("({tag}*)state->iter, &iter_item, &iter_item_len, &iter_err")
     } else {
         format!("({tag}*)state->iter, &iter_item, &iter_err")
@@ -215,28 +369,35 @@ fn render_iterator_napi_fns(
     out.push_str(&format!(
         "      napi_throw(env, {prefix}_napi_error_value(env, iter_err.code, iter_err.message, iter_err.payload_ptr, iter_err.payload_len));\n"
     ));
-    out.push_str("      weaveffi_error_clear(&iter_err);\n");
+    out.push_str(&format!("      {prefix}_error_clear(&iter_err);\n"));
     out.push_str("      return NULL;\n");
     out.push_str("    }\n");
     out.push_str("    napi_get_undefined(env, &ret);\n");
     out.push_str("    return ret;\n");
     out.push_str("  }\n");
     match ef {
-        ElemFree::String => {
+        Free::String => {
             out.push_str(
                 "  napi_create_string_utf8(env, iter_item ? iter_item : \"\", NAPI_AUTO_LENGTH, &ret);\n",
             );
-            out.push_str("  weaveffi_free_string((char*)iter_item);\n");
+            out.push_str(&format!("  {prefix}_free_string((char*)iter_item);\n"));
         }
-        ElemFree::Bytes => {
+        Free::Bytes => {
             out.push_str("  napi_create_buffer_copy(env, iter_item_len, iter_item, NULL, &ret);\n");
-            out.push_str("  weaveffi_free_bytes((uint8_t*)iter_item, iter_item_len);\n");
-        }
-        ElemFree::None => {
             out.push_str(&format!(
-                "  {}\n",
-                napi_create_leaf("env", &ib.elem, "iter_item", "ret")
+                "  {prefix}_free_bytes((uint8_t*)iter_item, iter_item_len);\n"
             ));
+        }
+        Free::None => {
+            if ib.elem.interface_name().is_some() {
+                // One strong reference per element; the JS wrapper adopts it.
+                out.push_str("  weaveffi_napi_make_handle(env, iter_item, &ret);\n");
+            } else {
+                out.push_str(&format!(
+                    "  {}\n",
+                    napi_create_leaf(&ib.elem, "iter_item", "ret")
+                ));
+            }
         }
     }
     out.push_str("  return ret;\n");
@@ -260,7 +421,7 @@ fn render_iterator_napi_fns(
 
 /// Emit one callable's `Napi_*` entry point (plus its async or iterator
 /// machinery when needed) and register its JS export(s). `self_tag` is the
-/// interface `c_tag` for an instance method, whose wrapped pointer arrives as
+/// interface `c_tag` for an instance method, whose wrapped handle arrives as
 /// `args[0]`. An iterator-returning callable additionally exports its
 /// per-iterator `next`/`destroy` entry points under `{js_name}_iterNext` and
 /// `{js_name}_iterDestroy`, which the JS wrapper drives lazily.
@@ -296,7 +457,7 @@ fn render_callable_napi(
         "static napi_value {napi_name}(napi_env env, napi_callback_info info) {{\n"
     ));
     if f.is_async {
-        render_async_napi_body(out, f, prefix, self_tag);
+        render_async_napi_body(out, f, module, prefix, self_tag);
     } else {
         render_napi_body(out, f, module, prefix, self_tag);
     }
@@ -310,12 +471,23 @@ pub(crate) fn render_addon_c(
     input_basename: &str,
 ) -> String {
     let prefix = model.prefix.as_str();
+    let has_callbacks = model.has_callback_interfaces();
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
+    // The bigint and threadsafe-function APIs need Node-API version 6 or
+    // later; pin the version the addon is written against unless the build
+    // already chose one.
+    out.push_str("#ifndef NAPI_VERSION\n#define NAPI_VERSION 8\n#endif\n");
     out.push_str(&format!(
-        "#include <node_api.h>\n#include \"{prefix}.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n"
+        "#include <node_api.h>\n#include \"{prefix}.h\"\n#include <stdbool.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
     ));
+    if has_callbacks {
+        out.push_str("#include <uv.h>\n");
+    }
+    out.push('\n');
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
+
+    render_value_helpers_c(&mut out);
 
     // Every error path (sync throws, iterator faults, async rejections)
     // funnels through one code-and-payload-carrying error constructor.
@@ -327,23 +499,27 @@ pub(crate) fn render_addon_c(
         render_error_value_helper_c(&mut out, prefix);
     }
 
-    if model_has_iterators(model) {
+    if model.has_iterators() {
         render_iter_state_c(&mut out, prefix);
     }
 
-    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
-    if has_listeners {
-        render_listener_support_c(&mut out, prefix);
+    if has_callbacks {
+        render_callback_runtime_c(&mut out, prefix);
     }
 
     for m in &model.modules {
+        // Callback interfaces get their frames, trampolines, dispatcher, and
+        // static vtable before any callable that may take one.
+        for cb in &m.callback_interfaces {
+            render_callback_interface_c(&mut out, m, cb, prefix, &model.prefix);
+        }
         // Records and rich enums are value types crossing the ABI serialized
         // in value buffers, so they need no native helpers here; the JS
         // loader packs and unpacks them. Interfaces get one native entry
         // point per member (constructors and statics marshal like free
-        // functions; methods additionally read the wrapped pointer from the
-        // leading argument) plus the destructor the JS class's disposal path
-        // calls.
+        // functions; methods additionally read the wrapped handle from the
+        // leading argument) plus the `clone` and `destroy` entry points the
+        // JS class's codec and disposal paths call.
         for i in &m.interfaces {
             for f in i.constructors.iter().chain(i.statics.iter()) {
                 render_callable_napi(
@@ -375,48 +551,22 @@ pub(crate) fn render_addon_c(
                     Some(&i.c_tag),
                 );
             }
-            render_interface_destroy_napi(&mut out, i);
+            render_interface_lifecycle_napi(&mut out, i);
             all_exports.push((
                 wrapper_name(
                     &m.path,
-                    &iface_member_base(&i.name, "destroy"),
+                    &iface_lifecycle_base(&i.name, "destroy"),
                     strip_module_prefix,
                 ),
                 format!("Napi_{}", i.destroy_symbol),
             ));
-        }
-        // Callbacks referenced by listeners get a payload struct, a producer-
-        // thread trampoline, and a JS-thread marshaller (threadsafe function).
-        let used_callbacks: Vec<&CallbackBinding> = m
-            .listeners
-            .iter()
-            .filter_map(|l| m.callback(&l.event_callback))
-            .collect();
-        for cb in &used_callbacks {
-            render_cb_payload_struct(&mut out, cb, prefix);
-            render_cb_tramp(&mut out, cb, prefix);
-            render_cb_calljs(&mut out, cb);
-        }
-        for l in &m.listeners {
-            let Some(cb) = m.callback(&l.event_callback) else {
-                unreachable!("validation guarantees the listener's callback exists");
-            };
-            render_listener_napi_fns(&mut out, l, cb, prefix);
             all_exports.push((
-                js_fn_name(
+                wrapper_name(
                     &m.path,
-                    &format!("register_{}", l.name),
+                    &iface_lifecycle_base(&i.name, "clone"),
                     strip_module_prefix,
                 ),
-                format!("Napi_{}", l.register_symbol),
-            ));
-            all_exports.push((
-                js_fn_name(
-                    &m.path,
-                    &format!("unregister_{}", l.name),
-                    strip_module_prefix,
-                ),
-                format!("Napi_{}", l.unregister_symbol),
+                format!("Napi_{}", i.clone_symbol),
             ));
         }
         for f in &m.functions {
@@ -450,6 +600,11 @@ pub(crate) fn render_addon_c(
     out.push_str("      return NULL;\n");
     out.push_str("    }\n");
     out.push_str("  }\n");
+    if has_callbacks {
+        // Trampolines compare against this to decide whether they may call
+        // into JS directly or must hop through the threadsafe function.
+        out.push_str(&format!("  {prefix}_napi_js_thread = uv_thread_self();\n"));
+    }
     if !all_exports.is_empty() {
         out.push_str("  napi_property_descriptor props[] = {\n");
         for (js_name, napi_fn) in &all_exports {
@@ -473,321 +628,465 @@ pub(crate) fn render_addon_c(
     out
 }
 
-/// Read `args[0]` as the opaque handle and bind it to a typed `self` pointer.
-/// Used by the interface destructor entry point.
+/// Read `args[0]` as an object handle and bind it to a typed `self` pointer.
+/// Used by the interface lifecycle entry points.
 fn emit_self_handle_read(out: &mut String, c_tag: &str) {
     out.push_str("  size_t argc = 1;\n");
     out.push_str("  napi_value args[1];\n");
     out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
-    out.push_str("  int64_t self_raw;\n");
-    out.push_str("  napi_get_value_int64(env, args[0], &self_raw);\n");
-    out.push_str(&format!(
-        "  {c_tag}* self = ({c_tag}*)(intptr_t)self_raw;\n"
-    ));
+    out.push_str("  void* self_raw = NULL;\n");
+    out.push_str("  if (weaveffi_napi_get_handle(env, args[0], &self_raw) != napi_ok || self_raw == NULL) {\n");
+    out.push_str("    return NULL;\n");
+    out.push_str("  }\n");
+    out.push_str(&format!("  {c_tag}* self = ({c_tag}*)self_raw;\n"));
 }
 
-/// The `Napi_*` destructor entry point for one interface: reads the wrapped
-/// pointer from `args[0]` and releases the object via the destroy symbol.
-/// Called by the JS class's `destroy()` and its `FinalizationRegistry` net.
-fn render_interface_destroy_napi(out: &mut String, i: &InterfaceBinding) {
-    let napi_destroy = format!("Napi_{}", i.destroy_symbol);
+/// The `Napi_*` lifecycle entry points for one interface. `destroy` reads
+/// the wrapped handle from `args[0]` and releases the strong reference it
+/// carries; the JS class's `close()` and its `FinalizationRegistry` backstop
+/// call it exactly once per wrapper. `clone` produces a second strong
+/// reference (as a fresh handle) for the value-buffer codec to write as an
+/// object token.
+fn render_interface_lifecycle_napi(out: &mut String, i: &InterfaceBinding) {
     out.push_str(&format!(
-        "static napi_value {napi_destroy}(napi_env env, napi_callback_info info) {{\n"
+        "static napi_value Napi_{}(napi_env env, napi_callback_info info) {{\n",
+        i.destroy_symbol
     ));
     emit_self_handle_read(out, &i.c_tag);
     out.push_str(&format!("  {}(self);\n", i.destroy_symbol));
     out.push_str("  napi_value ret;\n");
     out.push_str("  napi_get_undefined(env, &ret);\n");
     out.push_str("  return ret;\n}\n\n");
+
+    out.push_str(&format!(
+        "static napi_value Napi_{}(napi_env env, napi_callback_info info) {{\n",
+        i.clone_symbol
+    ));
+    emit_self_handle_read(out, &i.c_tag);
+    out.push_str(&format!(
+        "  {}* cloned = {}(self);\n",
+        i.c_tag, i.clone_symbol
+    ));
+    out.push_str("  napi_value ret;\n");
+    out.push_str("  weaveffi_napi_make_handle(env, cloned, &ret);\n");
+    out.push_str("  return ret;\n}\n\n");
 }
 
-/// The listener context + registry shared by every generated listener. The
-/// registry is only mutated from the JS thread (register/unregister are plain
-/// N-API calls), so a simple singly-linked list suffices.
-fn render_listener_support_c(out: &mut String, prefix: &str) {
-    let mut w = CodeWriter::four_space();
+/// Emit the callback-interface runtime shared by every interface: the JS
+/// thread identity captured at addon init, the handle-table entry
+/// (`{prefix}_napi_cb_ctx`: the `napi_ref` holding the consumer's adapter
+/// object plus the threadsafe function used to reach the JS thread), the
+/// cross-thread request cell, and the helpers that register an entry,
+/// release it, hop a blocking request to the JS thread, and report a JS
+/// exception through `out_err` with [`FOREIGN_ERROR_CODE`].
+///
+/// A trampoline that finds itself on the JS thread calls the adapter
+/// directly. From any other thread it queues a request through the
+/// threadsafe function and waits on a condition variable until the JS thread
+/// has run the call and filled in the result. `free` follows the same
+/// discipline: the `napi_ref` can only be deleted on the JS thread, so an
+/// off-thread `free` queues a release request instead.
+fn render_callback_runtime_c(out: &mut String, prefix: &str) {
+    let mut w = CodeWriter::two_space();
+    w.line(format!("static uv_thread_t {prefix}_napi_js_thread;"));
+    w.blank();
     w.block(
-        format!("typedef struct {prefix}_napi_listener_ctx {{"),
-        format!("}} {prefix}_napi_listener_ctx;"),
+        format!("static inline bool {prefix}_napi_on_js_thread(void) {{"),
+        "}",
         |w| {
-            w.line("napi_threadsafe_function tsfn;");
-            w.line("uint64_t id;");
-            w.line(format!("struct {prefix}_napi_listener_ctx* next;"));
+            w.line("uv_thread_t self = uv_thread_self();");
+            w.line(format!(
+                "return uv_thread_equal(&self, &{prefix}_napi_js_thread) != 0;"
+            ));
         },
     );
     w.blank();
-    w.line(format!(
-        "static {prefix}_napi_listener_ctx* {prefix}_napi_listeners = NULL;"
-    ));
-    w.blank();
-    out.push_str(&w.finish());
-}
-
-/// The `{c_fn_type}_payload` struct name of one callback.
-fn cb_payload_name(cb: &CallbackBinding) -> String {
-    format!("{}_payload", cb.c_fn_type)
-}
-
-/// The deep-copy payload carried from the producer thread to the JS thread.
-/// Every pointer field is owned by the payload (strdup/memcpy in the
-/// trampoline, freed in the call-js marshaller). Buffered arguments arrive as
-/// borrowed `ptr` + `len` pairs valid only for the dispatch, so their bytes
-/// are copied exactly like a `bytes` argument; the JS loader decodes the
-/// copied buffer before invoking the user callback.
-fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str) {
-    let mut w = CodeWriter::four_space();
+    w.line("// One handle-table entry per registered callback-interface implementation;");
+    w.line("// its address is the `ctx` the producer passes back to every method.");
     w.block(
         "typedef struct {",
-        format!("}} {};", cb_payload_name(cb)),
+        format!("}} {prefix}_napi_cb_ctx;"),
         |w| {
-            for p in &cb.params {
-                let n0 = &p.abi[0].name;
-                match p.arg_pass() {
-                    ArgPass::Buffer { len, .. } | ArgPass::Bytes { len, .. } => {
-                        w.line(format!("uint8_t* {n0};"));
-                        w.line(format!("size_t {};", len.name));
-                    }
-                    ArgPass::String { .. } => {
-                        w.line(format!("char* {n0};"));
-                    }
-                    // Only `Interface?` reaches here (validation rejects bare
-                    // interface callback params): a nullable borrowed object
-                    // pointer.
-                    ArgPass::Object { .. } => {
-                        w.line(format!("void* {n0};"));
-                    }
-                    ArgPass::Direct { slot } => {
-                        if matches!(p.ty, Ty::TypedHandle(_)) {
-                            w.line(format!("void* {n0};"));
-                        } else {
-                            w.line(format!("{} {n0};", slot.ty.render_c(prefix)));
-                        }
-                    }
-                }
-            }
+            w.line("napi_env env;");
+            w.line("napi_ref ref;");
+            w.line("napi_threadsafe_function tsfn;");
+        },
+    );
+    w.blank();
+    w.line("// Every method frame starts with this header so the dispatcher can reach");
+    w.line("// `out_err` without knowing the method.");
+    w.block(
+        "typedef struct {",
+        format!("}} {prefix}_napi_cb_frame_hdr;"),
+        |w| {
+            w.line(format!("{prefix}_error* out_err;"));
+        },
+    );
+    w.blank();
+    w.line("// A request hopped from a producer thread to the JS thread. `method` is the");
+    w.line("// vtable index to run, or -1 to release the context.");
+    w.block(
+        "typedef struct {",
+        format!("}} {prefix}_napi_cb_req;"),
+        |w| {
+            w.line(format!("{prefix}_napi_cb_ctx* ctx;"));
+            w.line("int method;");
+            w.line("void* frame;");
+            w.line("uv_mutex_t mu;");
+            w.line("uv_cond_t cv;");
+            w.line("bool done;");
+        },
+    );
+    w.blank();
+    w.block(
+        format!("static {prefix}_napi_cb_ctx* {prefix}_napi_cb_register(napi_env env, napi_value target, const char* name, napi_threadsafe_function_call_js dispatch) {{"),
+        "}",
+        |w| {
+            w.line(format!(
+                "{prefix}_napi_cb_ctx* ctx = ({prefix}_napi_cb_ctx*)calloc(1, sizeof({prefix}_napi_cb_ctx));"
+            ));
+            w.line("ctx->env = env;");
+            w.line("napi_create_reference(env, target, 1, &ctx->ref);");
+            w.line("napi_value resource_name;");
+            w.line("napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &resource_name);");
+            w.line("napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, dispatch, &ctx->tsfn);");
+            w.line("// A live implementation must not pin the event loop by itself.");
+            w.line("napi_unref_threadsafe_function(env, ctx->tsfn);");
+            w.line("return ctx;");
+        },
+    );
+    w.blank();
+    w.line("// Release one entry on the JS thread (env is NULL only during teardown, when");
+    w.line("// the reference is already gone).");
+    w.block(
+        format!("static void {prefix}_napi_cb_release(napi_env env, {prefix}_napi_cb_ctx* ctx) {{"),
+        "}",
+        |w| {
+            w.line("if (env != NULL) {");
+            w.line("  napi_delete_reference(env, ctx->ref);");
+            w.line("}");
+            w.line("napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);");
+            w.line("free(ctx);");
+        },
+    );
+    w.blank();
+    w.line("// The vtable's `free` entry: the producer is done with `ctx`.");
+    w.block(
+        format!("static void {prefix}_napi_cb_free(void* ctx_) {{"),
+        "}",
+        |w| {
+            w.line(format!(
+                "{prefix}_napi_cb_ctx* ctx = ({prefix}_napi_cb_ctx*)ctx_;"
+            ));
+            w.line("if (ctx == NULL) {");
+            w.line("  return;");
+            w.line("}");
+            w.line(format!("if ({prefix}_napi_on_js_thread()) {{"));
+            w.line(format!("  {prefix}_napi_cb_release(ctx->env, ctx);"));
+            w.line("  return;");
+            w.line("}");
+            w.line(format!(
+                "{prefix}_napi_cb_req* req = ({prefix}_napi_cb_req*)calloc(1, sizeof({prefix}_napi_cb_req));"
+            ));
+            w.line("req->ctx = ctx;");
+            w.line("req->method = -1;");
+            w.line("if (napi_call_threadsafe_function(ctx->tsfn, req, napi_tsfn_nonblocking) != napi_ok) {");
+            w.line("  free(req);");
+            w.line("}");
+        },
+    );
+    w.blank();
+    w.line("// Run `req` on the JS thread and block until it has completed.");
+    w.block(
+        format!("static void {prefix}_napi_cb_hop({prefix}_napi_cb_req* req) {{"),
+        "}",
+        |w| {
+            w.line("uv_mutex_init(&req->mu);");
+            w.line("uv_cond_init(&req->cv);");
+            w.line("req->done = false;");
+            w.line("if (napi_call_threadsafe_function(req->ctx->tsfn, req, napi_tsfn_blocking) == napi_ok) {");
+            w.line("  uv_mutex_lock(&req->mu);");
+            w.line("  while (!req->done) {");
+            w.line("    uv_cond_wait(&req->cv, &req->mu);");
+            w.line("  }");
+            w.line("  uv_mutex_unlock(&req->mu);");
+            w.line("} else {");
+            w.line(format!(
+                "  {prefix}_error_set((({prefix}_napi_cb_frame_hdr*)req->frame)->out_err, {FOREIGN_ERROR_CODE}, \"callback interface implementation is no longer reachable\");"
+            ));
+            w.line("}");
+            w.line("uv_cond_destroy(&req->cv);");
+            w.line("uv_mutex_destroy(&req->mu);");
+        },
+    );
+    w.blank();
+    w.block(
+        format!("static void {prefix}_napi_cb_finish({prefix}_napi_cb_req* req) {{"),
+        "}",
+        |w| {
+            w.line("uv_mutex_lock(&req->mu);");
+            w.line("req->done = true;");
+            w.line("uv_cond_signal(&req->cv);");
+            w.line("uv_mutex_unlock(&req->mu);");
+        },
+    );
+    w.blank();
+    w.line("// Report a JS exception raised by a callback implementation (or a return");
+    w.line("// value of the wrong type) through `out_err` as a foreign error, clearing");
+    w.line("// the pending exception so nothing unwinds through the C frame.");
+    w.block(
+        format!("static void {prefix}_napi_cb_report(napi_env env, {prefix}_error* out_err, const char* fallback) {{"),
+        "}",
+        |w| {
+            w.line("char msg[512];");
+            w.line("msg[0] = 0;");
+            w.line("bool pending = false;");
+            w.line("napi_is_exception_pending(env, &pending);");
+            w.line("if (pending) {");
+            w.line("  napi_value exc;");
+            w.line("  napi_get_and_clear_last_exception(env, &exc);");
+            w.line("  napi_valuetype t;");
+            w.line("  napi_typeof(env, exc, &t);");
+            w.line("  napi_value text = exc;");
+            w.line("  if (t == napi_object) {");
+            w.line("    napi_get_named_property(env, exc, \"message\", &text);");
+            w.line("  }");
+            w.line("  napi_value str;");
+            w.line("  if (napi_coerce_to_string(env, text, &str) == napi_ok) {");
+            w.line("    napi_get_value_string_utf8(env, str, msg, sizeof msg, NULL);");
+            w.line("  }");
+            w.line("  napi_is_exception_pending(env, &pending);");
+            w.line("  if (pending) {");
+            w.line("    napi_get_and_clear_last_exception(env, &exc);");
+            w.line("  }");
+            w.line("}");
+            w.line(format!(
+                "{prefix}_error_set(out_err, {FOREIGN_ERROR_CODE}, msg[0] ? msg : fallback);"
+            ));
         },
     );
     w.blank();
     out.push_str(&w.finish());
 }
 
-/// The producer-thread trampoline: deep-copies the C arguments into a payload
-/// and queues it onto the threadsafe function. Runs on whatever thread the
-/// producer fires the event from; never touches `napi_env`.
-fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
-    let payload = cb_payload_name(cb);
-    // The callback's full ABI slot list (including the trailing context) is
-    // precomputed on the model, so the trampoline's signature matches the
-    // producer's typedef by construction.
-    let decls: Vec<String> = cb
-        .abi_params
-        .iter()
-        .map(|slot| format!("{} {}", slot.ty.render_c(prefix), slot.name))
-        .collect();
-    out.push_str(&format!(
-        "static void {}_napi_tramp({}) {{\n",
-        cb.c_fn_type,
-        decls.join(", ")
-    ));
-    out.push_str(&format!(
-        "    {prefix}_napi_listener_ctx* ctx = ({prefix}_napi_listener_ctx*)context;\n"
-    ));
-    out.push_str(&format!(
-        "    {payload}* p = ({payload}*)calloc(1, sizeof({payload}));\n"
-    ));
-    for p in &cb.params {
-        let n0 = &p.abi[0].name;
-        match p.arg_pass() {
-            ArgPass::Buffer { len, .. } | ArgPass::Bytes { len, .. } => {
-                let n1 = &len.name;
-                out.push_str(&format!("    p->{n1} = {n1};\n"));
-                out.push_str(&format!(
-                    "    if ({n0} != NULL && {n1} > 0) {{ p->{n0} = (uint8_t*)malloc({n1}); memcpy(p->{n0}, {n0}, {n1}); }}\n"
-                ));
-            }
-            ArgPass::String { .. } => {
-                out.push_str(&format!("    p->{n0} = {n0} ? strdup({n0}) : NULL;\n"));
-            }
-            ArgPass::Object { .. } => {
-                out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
-            }
-            ArgPass::Direct { .. } => {
-                if matches!(p.ty, Ty::TypedHandle(_)) {
-                    out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
-                } else {
-                    out.push_str(&format!("    p->{n0} = {n0};\n"));
-                }
-            }
-        }
-    }
-    out.push_str("    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);\n");
-    out.push_str("}\n\n");
+/// The frame struct name of one callback method.
+fn cb_frame_name(c_tag: &str, m: &CallbackMethodBinding) -> String {
+    format!("{c_tag}_{}_frame", m.name)
 }
 
-/// One payload field rendered to a `napi_value` in `argv[idx]` (call-js side).
-fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize) {
-    let n0 = &p.abi[0].name;
-    let target = format!("argv[{idx}]");
-    match p.arg_pass() {
-        ArgPass::Buffer { len, .. } | ArgPass::Bytes { len, .. } => {
-            let n1 = &len.name;
+/// Emit one callback interface's native side: a frame struct per method (the
+/// C arguments as the producer passed them plus the result slot), the
+/// JS-thread invoker per method (convert arguments, call the adapter's
+/// method by its IDL name, convert the return or report the exception), the
+/// trampoline per method that the vtable points at (call the invoker
+/// directly on the JS thread, or hop and wait), the dispatcher the
+/// interface's threadsafe functions run, and the one process-wide static
+/// vtable.
+///
+/// Inside an invoker, strings, bytes, and buffers are borrowed (copied into
+/// JS values, never freed), object arguments carry one strong reference each
+/// (surfaced as a handle the JS adapter adopts), and 64-bit integers cross
+/// as `bigint`s.
+fn render_callback_interface_c(
+    out: &mut String,
+    m: &ModuleBinding,
+    cb: &CallbackInterfaceBinding,
+    prefix: &str,
+    model_prefix: &str,
+) {
+    let c_tag = &cb.c_tag;
+    let protocol = cb.protocol(&m.path, model_prefix);
+
+    for (idx, method) in cb.methods.iter().enumerate() {
+        let frame = cb_frame_name(c_tag, method);
+        let invoke = format!("{c_tag}_{}_invoke", method.name);
+        let tramp = format!("{c_tag}_{}_tramp", method.name);
+        let ret_c = method.abi_ret.render_c(prefix);
+        let is_void = method.ret.is_none();
+        let slots = &method.abi_params[1..method.abi_params.len() - 1];
+        let out_err_name = &method
+            .abi_params
+            .last()
+            .expect("callback method has an out_err slot")
+            .name;
+
+        // -- frame --
+        out.push_str("typedef struct {\n");
+        out.push_str(&format!("    {prefix}_napi_cb_frame_hdr hdr;\n"));
+        for slot in slots {
             out.push_str(&format!(
-                "        napi_create_buffer_copy(env, p->{n1}, p->{n0} ? (const void*)p->{n0} : (const void*)\"\", NULL, &{target});\n"
+                "    {} {};\n",
+                slot.ty.render_c(prefix),
+                slot.name
             ));
         }
-        ArgPass::String { .. } => out.push_str(&format!(
-            "        napi_create_string_utf8(env, p->{n0} ? p->{n0} : \"\", NAPI_AUTO_LENGTH, &{target});\n"
-        )),
-        // Only `Interface?` reaches here: nullable object pointer.
-        ArgPass::Object { .. } => out.push_str(&format!(
-            "        if (p->{n0}) napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target}); else napi_get_null(env, &{target});\n"
-        )),
-        ArgPass::Direct { .. } => {
-            if matches!(p.ty, Ty::TypedHandle(_)) {
-                out.push_str(&format!(
-                    "        napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target});\n"
-                ));
-            } else {
-                let leaf = payload_leaf_to_napi(&p.ty, &format!("p->{n0}"), &target);
-                out.push_str(&format!("        {leaf}\n"));
-            }
+        if !is_void {
+            out.push_str(&format!("    {ret_c} result;\n"));
         }
-    }
-}
+        out.push_str(&format!("}} {frame};\n\n"));
 
-/// One scalar-ish payload value to a `napi_value` (single statement).
-fn payload_leaf_to_napi(ty: &Ty, expr: &str, target: &str) -> String {
-    match ty {
-        Ty::I32 => format!("napi_create_int32(env, {expr}, &{target});"),
-        Ty::U32 => format!("napi_create_uint32(env, {expr}, &{target});"),
-        Ty::I64 => format!("napi_create_int64(env, {expr}, &{target});"),
-        Ty::F64 => format!("napi_create_double(env, {expr}, &{target});"),
-        Ty::I8 | Ty::I16 => format!("napi_create_int32(env, {expr}, &{target});"),
-        Ty::U8 | Ty::U16 => format!("napi_create_uint32(env, {expr}, &{target});"),
-        Ty::U64 => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
-        Ty::F32 => format!("napi_create_double(env, {expr}, &{target});"),
-        Ty::Bool => format!("napi_get_boolean(env, {expr}, &{target});"),
-        Ty::Handle => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
-        Ty::Enum(_) => format!("napi_create_int32(env, (int32_t){expr}, &{target});"),
-        _ => format!("napi_get_null(env, &{target});"),
-    }
-}
+        // -- JS-thread invoker --
+        out.push_str(&format!(
+            "static void {invoke}(napi_env env, {prefix}_napi_cb_ctx* ctx, {frame}* f) {{\n"
+        ));
+        out.push_str("  napi_handle_scope scope;\n");
+        out.push_str("  napi_open_handle_scope(env, &scope);\n");
+        out.push_str("  napi_value target;\n");
+        out.push_str("  napi_get_reference_value(env, ctx->ref, &target);\n");
+        out.push_str("  napi_value fn;\n");
+        out.push_str(&format!(
+            "  napi_get_named_property(env, target, \"{}\", &fn);\n",
+            method.name
+        ));
+        let argc = method.params.len();
+        if argc > 0 {
+            out.push_str(&format!("  napi_value argv[{argc}];\n"));
+        }
+        for (i, (p, pass)) in method
+            .params
+            .iter()
+            .zip(&protocol.method_args[idx])
+            .enumerate()
+        {
+            emit_cb_arg_to_napi(out, p, pass, i);
+        }
+        out.push_str("  napi_value result;\n");
+        out.push_str("  napi_valuetype fn_type;\n");
+        out.push_str("  napi_typeof(env, fn, &fn_type);\n");
+        let argv = if argc > 0 { "argv" } else { "NULL" };
+        out.push_str("  if (fn_type != napi_function) {\n");
+        out.push_str(&format!(
+            "    {prefix}_napi_cb_report(env, f->hdr.out_err, \"{} implementation has no {} method\");\n",
+            cb.name, method.name
+        ));
+        out.push_str(&format!(
+            "  }} else if (napi_call_function(env, target, fn, {argc}, {argv}, &result) != napi_ok) {{\n"
+        ));
+        out.push_str(&format!(
+            "    {prefix}_napi_cb_report(env, f->hdr.out_err, \"{}.{} threw\");\n",
+            cb.name, method.name
+        ));
+        if let Some(ret) = &method.ret {
+            out.push_str("  } else {\n");
+            out.push_str("    napi_status rs;\n");
+            emit_leaf_read(out, "    ", ret, "result", "f->result", "rs");
+            out.push_str("    if (rs != napi_ok) {\n");
+            out.push_str(&format!(
+                "      {prefix}_napi_cb_report(env, f->hdr.out_err, \"{}.{} returned a value of the wrong type\");\n",
+                cb.name, method.name
+            ));
+            out.push_str("    }\n");
+        }
+        out.push_str("  }\n");
+        out.push_str("  napi_close_handle_scope(env, scope);\n");
+        out.push_str("}\n\n");
 
-/// Frees one payload field after the JS call.
-fn emit_payload_free(out: &mut String, p: &ParamBinding) {
-    if matches!(
-        p.arg_pass(),
-        ArgPass::Buffer { .. } | ArgPass::Bytes { .. } | ArgPass::String { .. }
-    ) {
-        out.push_str(&format!("    free(p->{});\n", p.abi[0].name));
-    }
-}
-
-/// The JS-thread marshaller invoked by the threadsafe function: converts the
-/// payload into JS arguments, calls the user callback, and frees the payload.
-fn render_cb_calljs(out: &mut String, cb: &CallbackBinding) {
-    let payload = cb_payload_name(cb);
-    out.push_str(&format!(
-        "static void {}_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {{\n",
-        cb.c_fn_type
-    ));
-    out.push_str("    (void)context;\n");
-    out.push_str(&format!("    {payload}* p = ({payload}*)data;\n"));
-    out.push_str("    if (env != NULL) {\n");
-    out.push_str("        napi_value undefined;\n");
-    out.push_str("        napi_get_undefined(env, &undefined);\n");
-    let argc = cb.params.len();
-    if argc > 0 {
-        out.push_str(&format!("        napi_value argv[{argc}];\n"));
-        for (i, p) in cb.params.iter().enumerate() {
-            emit_payload_to_napi(out, p, i);
+        // -- trampoline (any producer thread) --
+        let decls: Vec<String> = method
+            .abi_params
+            .iter()
+            .map(|slot| format!("{} {}", slot.ty.render_c(prefix), slot.name))
+            .collect();
+        out.push_str(&format!(
+            "static {ret_c} {tramp}({}) {{\n",
+            decls.join(", ")
+        ));
+        out.push_str(&format!("  {frame} f;\n"));
+        out.push_str("  memset(&f, 0, sizeof f);\n");
+        out.push_str(&format!("  f.hdr.out_err = {out_err_name};\n"));
+        for slot in slots {
+            out.push_str(&format!("  f.{0} = {0};\n", slot.name));
         }
         out.push_str(&format!(
-            "        napi_call_function(env, undefined, js_cb, {argc}, argv, NULL);\n"
+            "  {prefix}_napi_cb_ctx* c = ({prefix}_napi_cb_ctx*){};\n",
+            method.abi_params[0].name
         ));
-    } else {
-        out.push_str("        napi_call_function(env, undefined, js_cb, 0, NULL, NULL);\n");
+        out.push_str(&format!("  if ({prefix}_napi_on_js_thread()) {{\n"));
+        out.push_str(&format!("    {invoke}(c->env, c, &f);\n"));
+        out.push_str("  } else {\n");
+        out.push_str(&format!("    {prefix}_napi_cb_req req;\n"));
+        out.push_str("    req.ctx = c;\n");
+        out.push_str(&format!("    req.method = {idx};\n"));
+        out.push_str("    req.frame = &f;\n");
+        out.push_str(&format!("    {prefix}_napi_cb_hop(&req);\n"));
+        out.push_str("  }\n");
+        if !is_void {
+            out.push_str("  return f.result;\n");
+        }
+        out.push_str("}\n\n");
     }
+
+    // -- dispatcher: runs queued requests on the JS thread --
+    out.push_str(&format!(
+        "static void {c_tag}_napi_dispatch(napi_env env, napi_value js_cb, void* context, void* data) {{\n"
+    ));
+    out.push_str("  (void)js_cb;\n");
+    out.push_str("  (void)context;\n");
+    out.push_str(&format!(
+        "  {prefix}_napi_cb_req* req = ({prefix}_napi_cb_req*)data;\n"
+    ));
+    out.push_str("  if (req->method < 0) {\n");
+    out.push_str(&format!("    {prefix}_napi_cb_release(env, req->ctx);\n"));
+    out.push_str("    free(req);\n");
+    out.push_str("    return;\n");
+    out.push_str("  }\n");
+    out.push_str("  if (env == NULL) {\n");
+    out.push_str(&format!(
+        "    {prefix}_error_set((({prefix}_napi_cb_frame_hdr*)req->frame)->out_err, {FOREIGN_ERROR_CODE}, \"Node environment is shutting down\");\n"
+    ));
+    out.push_str("  } else {\n");
+    out.push_str("    switch (req->method) {\n");
+    for (idx, method) in cb.methods.iter().enumerate() {
+        let frame = cb_frame_name(c_tag, method);
+        out.push_str(&format!(
+            "      case {idx}: {c_tag}_{}_invoke(env, req->ctx, ({frame}*)req->frame); break;\n",
+            method.name
+        ));
+    }
+    out.push_str("      default: break;\n");
     out.push_str("    }\n");
-    for p in &cb.params {
-        emit_payload_free(out, p);
-    }
-    out.push_str("    free(p);\n");
+    out.push_str("  }\n");
+    out.push_str(&format!("  {prefix}_napi_cb_finish(req);\n"));
     out.push_str("}\n\n");
+
+    // -- the one static vtable --
+    let entries: Vec<String> = cb
+        .methods
+        .iter()
+        .map(|m| format!("{c_tag}_{}_tramp", m.name))
+        .chain(std::iter::once(format!("{prefix}_napi_cb_free")))
+        .collect();
+    out.push_str(&format!(
+        "static const {} {c_tag}_napi_vtable = {{ {} }};\n\n",
+        cb.vtable_tag,
+        entries.join(", ")
+    ));
 }
 
-/// The `Napi_*` register/unregister entry points for one listener. Register
-/// wraps the JS callback in an unref'd threadsafe function (so live listeners
-/// don't pin the event loop) and stores it in the registry; unregister stops
-/// the producer first, then releases the threadsafe function.
-fn render_listener_napi_fns(
-    out: &mut String,
-    l: &ListenerBinding,
-    cb: &CallbackBinding,
-    prefix: &str,
-) {
-    let register_sym = &l.register_symbol;
-    let unregister_sym = &l.unregister_symbol;
-    let tramp = format!("{}_napi_tramp", cb.c_fn_type);
-    let calljs = format!("{}_napi_calljs", cb.c_fn_type);
-
-    out.push_str(&format!(
-        "static napi_value Napi_{register_sym}(napi_env env, napi_callback_info info) {{\n"
-    ));
-    out.push_str("  size_t argc = 1;\n");
-    out.push_str("  napi_value args[1];\n");
-    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
-    out.push_str(&format!(
-        "  {prefix}_napi_listener_ctx* ctx = ({prefix}_napi_listener_ctx*)calloc(1, sizeof({prefix}_napi_listener_ctx));\n"
-    ));
-    out.push_str("  napi_value resource_name;\n");
-    out.push_str(&format!(
-        "  napi_create_string_utf8(env, \"{register_sym}\", NAPI_AUTO_LENGTH, &resource_name);\n"
-    ));
-    out.push_str(&format!(
-        "  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, {calljs}, &ctx->tsfn);\n"
-    ));
-    out.push_str("  napi_unref_threadsafe_function(env, ctx->tsfn);\n");
-    out.push_str(&format!("  uint64_t id = {register_sym}({tramp}, ctx);\n"));
-    out.push_str("  ctx->id = id;\n");
-    out.push_str(&format!("  ctx->next = {prefix}_napi_listeners;\n"));
-    out.push_str(&format!("  {prefix}_napi_listeners = ctx;\n"));
-    out.push_str("  napi_value ret;\n");
-    out.push_str("  napi_create_double(env, (double)id, &ret);\n");
-    out.push_str("  return ret;\n");
-    out.push_str("}\n\n");
-
-    out.push_str(&format!(
-        "static napi_value Napi_{unregister_sym}(napi_env env, napi_callback_info info) {{\n"
-    ));
-    out.push_str("  size_t argc = 1;\n");
-    out.push_str("  napi_value args[1];\n");
-    out.push_str("  napi_get_cb_info(env, info, &argc, args, NULL, NULL);\n");
-    out.push_str("  double id_d = 0;\n");
-    out.push_str("  napi_get_value_double(env, args[0], &id_d);\n");
-    out.push_str("  uint64_t id = (uint64_t)id_d;\n");
-    // Stop producer-side delivery before tearing down the tsfn so no new
-    // payloads are queued against a released function.
-    out.push_str(&format!("  {unregister_sym}(id);\n"));
-    out.push_str(&format!(
-        "  {prefix}_napi_listener_ctx** link = &{prefix}_napi_listeners;\n"
-    ));
-    out.push_str("  while (*link != NULL) {\n");
-    out.push_str("    if ((*link)->id == id) {\n");
-    out.push_str(&format!(
-        "      {prefix}_napi_listener_ctx* found = *link;\n"
-    ));
-    out.push_str("      *link = found->next;\n");
-    out.push_str("      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);\n");
-    out.push_str("      free(found);\n");
-    out.push_str("      break;\n");
-    out.push_str("    }\n");
-    out.push_str("    link = &(*link)->next;\n");
-    out.push_str("  }\n");
-    out.push_str("  napi_value ret;\n");
-    out.push_str("  napi_get_undefined(env, &ret);\n");
-    out.push_str("  return ret;\n");
-    out.push_str("}\n\n");
+/// Emit the conversion of one callback-method argument from its frame slots
+/// to `argv[idx]`, per its receiving plan.
+fn emit_cb_arg_to_napi(out: &mut String, p: &ParamBinding, pass: &RetPass, idx: usize) {
+    let n0 = &p.abi[0].name;
+    let target = format!("argv[{idx}]");
+    match pass {
+        RetPass::Void => unreachable!("callback parameters are never void"),
+        RetPass::Direct => {
+            let leaf = napi_create_leaf(&p.ty, &format!("f->{n0}"), &target);
+            out.push_str(&format!("  {leaf}\n"));
+        }
+        RetPass::String => out.push_str(&format!(
+            "  napi_create_string_utf8(env, f->{n0} ? f->{n0} : \"\", NAPI_AUTO_LENGTH, &{target});\n"
+        )),
+        RetPass::Bytes | RetPass::Buffer => {
+            let n1 = &p.abi[1].name;
+            out.push_str(&format!(
+                "  napi_create_buffer_copy(env, f->{n1}, f->{n0} ? (const void*)f->{n0} : (const void*)\"\", NULL, &{target});\n"
+            ));
+        }
+        RetPass::Object { .. } => out.push_str(&format!(
+            "  weaveffi_napi_make_handle(env, f->{n0}, &{target});\n"
+        )),
+    }
 }
 
 /// The classified shape of an async function's result, driving what the
@@ -795,7 +1094,7 @@ fn render_listener_napi_fns(
 enum AsyncResultShape {
     /// No result: the promise resolves `undefined`.
     None,
-    /// A by-value scalar, bool, C-style enum, or bare handle.
+    /// A by-value scalar, bool, or C-style enum.
     Value,
     /// An owned `const char*` string (nullable).
     Str,
@@ -804,20 +1103,14 @@ enum AsyncResultShape {
     /// A borrowed value-buffer pair (slots `result_ptr` + `result_len`); the
     /// callback must copy it before returning, and the JS wrapper decodes it.
     Buffered,
-    /// An owned object pointer the callback adopts (interface, typed handle,
-    /// iterator, or nullable interface).
+    /// An owned object reference the JS wrapper adopts (`Interface` or
+    /// `Interface?`).
     Object,
 }
 
 /// Classify an async result type into its marshalling shape via the shared
-/// receiving plan. Typed handles and iterator handles are carved out first:
-/// they cross as owned pointers the callback adopts, which [`plan::ret_pass`]
-/// does not distinguish from by-value returns (and iterator returns have no
-/// `RetPass` at all).
+/// receiving plan.
 fn async_result_shape(ret: Option<&Ty>, module: &str, prefix: &str) -> AsyncResultShape {
-    if let Some(Ty::TypedHandle(_) | Ty::Iterator(_)) = ret {
-        return AsyncResultShape::Object;
-    }
     match plan::ret_pass(ret, module, prefix) {
         RetPass::Void => AsyncResultShape::None,
         RetPass::Direct => AsyncResultShape::Value,
@@ -848,10 +1141,11 @@ fn async_cb_result_params_node(ret: Option<&Ty>, module: &str, prefix: &str) -> 
 ///
 /// The completion callback may fire on any thread, so it must never touch
 /// `napi_env`; the ref'd threadsafe function also keeps the event loop alive
-/// until the promise settles. Borrowed results (strings, bytes, and buffered
-/// values) are deep-copied inside the callback because the producer frees
-/// them after it returns; owned object results are adopted. The error's
-/// message and payload are copied for the same reason.
+/// until the promise settles. Owned results (strings, bytes, and buffered
+/// values) are deep-copied inside the callback and released with the runtime
+/// free symbols; owned object results are adopted (the pointer stays valid
+/// across the thread hop). The error's message and payload are copied for
+/// the same reason.
 fn render_async_machinery(
     out: &mut String,
     f: &FnBinding,
@@ -899,7 +1193,7 @@ fn render_async_machinery(
 
     // -- producer-thread completion callback: deep-copy + queue --
     out.push_str(&format!(
-        "static void {cb_name}(void* context, weaveffi_error* err{cb_result}) {{\n"
+        "static void {cb_name}(void* context, {prefix}_error* err{cb_result}) {{\n"
     ));
     out.push_str(&format!("    {actx}* ctx = ({actx}*)context;\n"));
     out.push_str("    if (err != NULL && err->code != 0) {\n");
@@ -922,14 +1216,16 @@ fn render_async_machinery(
         AsyncResultShape::Str => {
             out.push_str("        ctx->result_null = result == NULL;\n");
             out.push_str("        ctx->result = result ? strdup(result) : NULL;\n");
-            out.push_str("        weaveffi_free_string(result);\n");
+            out.push_str(&format!("        {prefix}_free_string(result);\n"));
         }
         AsyncResultShape::Bytes => {
             out.push_str("        ctx->result_len = result_len;\n");
             out.push_str(
                 "        if (result != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result, result_len); }\n",
             );
-            out.push_str("        weaveffi_free_bytes((uint8_t*)result, result_len);\n");
+            out.push_str(&format!(
+                "        {prefix}_free_bytes((uint8_t*)result, result_len);\n"
+            ));
         }
         // The value buffer is owned: copy, then release the producer
         // allocation; the JS wrapper decodes the copy after the promise
@@ -939,11 +1235,12 @@ fn render_async_machinery(
             out.push_str(
                 "        if (result_ptr != NULL && result_len > 0) { ctx->result = (uint8_t*)malloc(result_len); memcpy(ctx->result, result_ptr, result_len); }\n",
             );
-            out.push_str("        weaveffi_free_bytes((uint8_t*)result_ptr, result_len);\n");
+            out.push_str(&format!(
+                "        {prefix}_free_bytes((uint8_t*)result_ptr, result_len);\n"
+            ));
         }
-        // Owned-object results (interfaces, typed handles, iterators) are
-        // adopted by the receiver, so the pointer stays valid across the
-        // thread hop.
+        // The strong reference is adopted by the receiver, so the pointer
+        // stays valid across the thread hop.
         AsyncResultShape::Object => {
             out.push_str("        ctx->result = (void*)result;\n");
         }
@@ -951,7 +1248,7 @@ fn render_async_machinery(
     out.push_str("    }\n");
     // The heap-boxed error transfers ownership too; a null or zero-code
     // error is a safe no-op to free.
-    out.push_str("    weaveffi_error_free(err);\n");
+    out.push_str(&format!("    {prefix}_error_free(err);\n"));
     out.push_str("    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);\n");
     out.push_str("}\n\n");
 
@@ -972,27 +1269,13 @@ fn render_async_machinery(
     out.push_str("        napi_value val;\n");
     match &shape {
         AsyncResultShape::None => out.push_str("        napi_get_undefined(env, &val);\n"),
-        AsyncResultShape::Value => match f.ret.as_ref() {
-            Some(Ty::I32) => out.push_str("        napi_create_int32(env, ctx->result, &val);\n"),
-            Some(Ty::U32) => out.push_str("        napi_create_uint32(env, ctx->result, &val);\n"),
-            Some(Ty::I64) => out.push_str("        napi_create_int64(env, ctx->result, &val);\n"),
-            Some(Ty::F64) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
-            Some(Ty::I8 | Ty::I16) => {
-                out.push_str("        napi_create_int32(env, ctx->result, &val);\n");
-            }
-            Some(Ty::U8 | Ty::U16) => {
-                out.push_str("        napi_create_uint32(env, ctx->result, &val);\n");
-            }
-            Some(Ty::U64 | Ty::Handle) => {
-                out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
-            }
-            Some(Ty::F32) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
-            Some(Ty::Bool) => out.push_str("        napi_get_boolean(env, ctx->result, &val);\n"),
-            Some(Ty::Enum(_)) => {
-                out.push_str("        napi_create_int32(env, (int32_t)ctx->result, &val);\n");
-            }
-            _ => unreachable!("value shape covers scalars, bools, enums, and handles"),
-        },
+        AsyncResultShape::Value => {
+            let ty = f.ret.as_ref().expect("value shape has a type");
+            out.push_str(&format!(
+                "        {}\n",
+                napi_create_leaf(ty, "ctx->result", "val")
+            ));
+        }
         AsyncResultShape::Str => {
             out.push_str(
                 "        if (ctx->result_null) napi_get_null(env, &val); else napi_create_string_utf8(env, ctx->result ? ctx->result : \"\", NAPI_AUTO_LENGTH, &val);\n",
@@ -1003,19 +1286,11 @@ fn render_async_machinery(
                 "        napi_create_buffer_copy(env, ctx->result_len, ctx->result ? (const void*)ctx->result : (const void*)\"\", NULL, &val);\n",
             );
         }
+        // A nullable interface result resolves `null` for the absent case;
+        // otherwise the strong reference is surfaced as the handle the JS
+        // class adopts.
         AsyncResultShape::Object => {
-            // A nullable interface result resolves `null` for the absent
-            // case; every other object pointer is surfaced as the raw
-            // handle the JS class adopts.
-            if matches!(f.ret.as_ref(), Some(Ty::Optional(_))) {
-                out.push_str(
-                    "        if (ctx->result == NULL) napi_get_null(env, &val); else napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
-                );
-            } else {
-                out.push_str(
-                    "        napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
-                );
-            }
+            out.push_str("        weaveffi_napi_make_handle(env, ctx->result, &val);\n");
         }
     }
     out.push_str("        napi_resolve_deferred(env, ctx->deferred, val);\n");
@@ -1034,19 +1309,33 @@ fn render_async_machinery(
     out.push_str("}\n\n");
 }
 
-/// Read the wrapped interface pointer from `args[0]` and push it as the
-/// leading C argument. Instance methods carry this implicit `self` slot in
-/// their [`AbiFn`](weaveffi_core::model::AbiFn) signatures; the JS class
-/// passes its own handle there.
-fn emit_self_arg(out: &mut String, c_args: &mut Vec<String>, self_tag: &str) {
-    out.push_str("  int64_t self_raw;\n");
-    out.push_str("  napi_get_value_int64(env, args[0], &self_raw);\n");
-    c_args.push(format!("(const {self_tag}*)(intptr_t)self_raw"));
+/// The marshalled arguments of one entry point: the C argument expressions
+/// in slot order, the cleanups to run after the call, and whether any read
+/// can fail (in which case the entry point bails before calling the
+/// producer).
+struct MarshalledArgs {
+    c_args: Vec<String>,
+    cleanups: Vec<String>,
+    /// Extra releases that only run when marshalling bails before the call
+    /// (a registered callback context the producer never received).
+    fail_cleanups: Vec<String>,
+    checked: bool,
 }
 
 /// Read `argc`/`args` for a callable with `n` incoming JS arguments
-/// (including the leading handle of an instance method).
-fn emit_args_read(out: &mut String, n: usize) {
+/// (including the leading handle of an instance method), then marshal each
+/// argument into its C slots. Instance methods carry the implicit `self`
+/// slot in their [`AbiFn`](weaveffi_core::model::AbiFn) signatures; the JS
+/// class passes its own handle there.
+fn emit_args(
+    out: &mut String,
+    f: &FnBinding,
+    module: &str,
+    prefix: &str,
+    self_tag: Option<&str>,
+) -> MarshalledArgs {
+    let offset = usize::from(self_tag.is_some());
+    let n = f.params.len() + offset;
     if n > 0 {
         out.push_str(&format!("  size_t argc = {n};\n"));
         out.push_str(&format!("  napi_value args[{n}];\n"));
@@ -1055,27 +1344,71 @@ fn emit_args_read(out: &mut String, n: usize) {
         out.push_str("  size_t argc = 0;\n");
         out.push_str("  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);\n");
     }
+
+    let checked = self_tag.is_some()
+        || f.params.iter().any(|p| {
+            matches!(
+                p.arg_pass(),
+                ArgPass::Object { .. } | ArgPass::Direct { .. } | ArgPass::Callback { .. }
+            )
+        });
+    if checked {
+        out.push_str("  napi_status arg_status = napi_ok;\n");
+    }
+
+    let mut m = MarshalledArgs {
+        c_args: Vec::new(),
+        cleanups: Vec::new(),
+        fail_cleanups: Vec::new(),
+        checked,
+    };
+    if let Some(tag) = self_tag {
+        out.push_str("  void* self_raw = NULL;\n");
+        out.push_str("  arg_status = weaveffi_napi_get_handle(env, args[0], &self_raw);\n");
+        out.push_str("  if (arg_status == napi_ok && self_raw == NULL) {\n");
+        out.push_str("    napi_throw_type_error(env, NULL, \"object used after close()\");\n");
+        out.push_str("    arg_status = napi_invalid_arg;\n");
+        out.push_str("  }\n");
+        m.c_args.push(format!("(const {tag}*)self_raw"));
+    }
+    for (i, p) in f.params.iter().enumerate() {
+        emit_param(out, &mut m, p, i + offset, module, prefix);
+    }
+    m
+}
+
+/// Emit the bail-out that runs after argument marshalling when any read
+/// failed (a pending JS exception is already set): release what was
+/// allocated so far and return without calling the producer.
+fn emit_arg_check(out: &mut String, m: &MarshalledArgs) {
+    if !m.checked {
+        return;
+    }
+    out.push_str("  if (arg_status != napi_ok) {\n");
+    for cleanup in m.cleanups.iter().chain(&m.fail_cleanups) {
+        out.push_str("  ");
+        out.push_str(cleanup);
+    }
+    out.push_str("    return NULL;\n");
+    out.push_str("  }\n");
 }
 
 /// The body of an async callable's `Napi_*` entry point: marshal arguments,
 /// allocate the context, create the promise and threadsafe function, launch,
 /// and return the pending promise.
-fn render_async_napi_body(out: &mut String, f: &FnBinding, prefix: &str, self_tag: Option<&str>) {
+fn render_async_napi_body(
+    out: &mut String,
+    f: &FnBinding,
+    module: &str,
+    prefix: &str,
+    self_tag: Option<&str>,
+) {
     let c_name = &f.c_base;
     let CallShape::Async(ab) = &f.shape else {
         unreachable!("async body rendered for a non-async callable");
     };
-    let offset = usize::from(self_tag.is_some());
-    emit_args_read(out, f.params.len() + offset);
-
-    let mut c_args: Vec<String> = Vec::new();
-    let mut cleanups: Vec<String> = Vec::new();
-    if let Some(tag) = self_tag {
-        emit_self_arg(out, &mut c_args, tag);
-    }
-    for (i, p) in f.params.iter().enumerate() {
-        emit_param(out, &mut c_args, &mut cleanups, p, i + offset, prefix);
-    }
+    let mut m = emit_args(out, f, module, prefix, self_tag);
+    emit_arg_check(out, &m);
 
     let actx = format!("{c_name}_napi_actx");
     out.push_str(&format!(
@@ -1087,22 +1420,23 @@ fn render_async_napi_body(out: &mut String, f: &FnBinding, prefix: &str, self_ta
     out.push_str(&format!(
         "  napi_create_string_utf8(env, \"{c_name}\", NAPI_AUTO_LENGTH, &resource_name);\n"
     ));
-    // Ref'd (unlike listeners): a pending promise must keep the loop alive.
+    // Ref'd (unlike callback interfaces): a pending promise must keep the
+    // loop alive.
     out.push_str(&format!(
         "  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, {c_name}_napi_settle, &ctx->tsfn);\n"
     ));
 
     if f.cancellable {
-        c_args.push("NULL".into());
+        m.c_args.push("NULL".into());
     }
 
     let cb_name = format!("{c_name}_napi_cb");
-    c_args.push(cb_name);
-    c_args.push("ctx".into());
-    let args_str = c_args.join(", ");
+    m.c_args.push(cb_name);
+    m.c_args.push("ctx".into());
+    let args_str = m.c_args.join(", ");
     out.push_str(&format!("  {}({args_str});\n", ab.launch.symbol));
 
-    for cleanup in &cleanups {
+    for cleanup in &m.cleanups {
         out.push_str(cleanup);
     }
 
@@ -1126,26 +1460,17 @@ fn render_napi_body(
         CallShape::Iterator(ib) => &ib.launch.symbol,
         CallShape::Async(_) => unreachable!("sync body rendered for an async callable"),
     };
-    let offset = usize::from(self_tag.is_some());
-    emit_args_read(out, f.params.len() + offset);
+    let mut m = emit_args(out, f, module, prefix, self_tag);
+    emit_arg_check(out, &m);
 
-    let mut c_args: Vec<String> = Vec::new();
-    let mut cleanups: Vec<String> = Vec::new();
-    if let Some(tag) = self_tag {
-        emit_self_arg(out, &mut c_args, tag);
-    }
-    for (i, p) in f.params.iter().enumerate() {
-        emit_param(out, &mut c_args, &mut cleanups, p, i + offset, prefix);
-    }
-
-    out.push_str("  weaveffi_error err = {0};\n");
+    out.push_str(&format!("  {prefix}_error err = {{0}};\n"));
 
     if let Some(ret) = &f.ret {
-        emit_ret_out_params(out, &mut c_args, ret, module, prefix);
+        emit_ret_out_params(out, &mut m.c_args, ret, module, prefix);
     }
-    c_args.push("&err".to_string());
+    m.c_args.push("&err".to_string());
 
-    let args_str = c_args.join(", ");
+    let args_str = m.c_args.join(", ");
     match &f.ret {
         Some(ret) => {
             let rt = c_ret_type_str(ret, module, prefix);
@@ -1156,7 +1481,7 @@ fn render_napi_body(
         }
     }
 
-    for cleanup in &cleanups {
+    for cleanup in &m.cleanups {
         out.push_str(cleanup);
     }
 
@@ -1175,29 +1500,32 @@ fn render_napi_body(
 /// Marshal one incoming JS argument into its C ABI slot(s), dispatching on
 /// the parameter's passing contract. A buffered parameter arrives as a
 /// `Buffer` the JS loader packed; it lowers to the borrowed
-/// `(const uint8_t*, size_t)` pair the callee decodes and never frees.
-/// Everything else keeps its direct slot lowering.
+/// `(const uint8_t*, size_t)` pair the callee decodes and never frees. An
+/// object arrives as the handle the JS class borrowed from its instance
+/// (`null` for an absent `Interface?`). A callback interface arrives as the
+/// adapter object the JS loader built; it is registered in the handle table
+/// and passed as the entry's address plus the interface's static vtable.
 fn emit_param(
     out: &mut String,
-    c_args: &mut Vec<String>,
-    cleanups: &mut Vec<String>,
+    m: &mut MarshalledArgs,
     p: &ParamBinding,
     idx: usize,
+    module: &str,
     prefix: &str,
 ) {
     let name = p.name.as_str();
     match p.arg_pass() {
-        ArgPass::Buffer { .. } => {
-            out.push_str(&format!("  void* {name}_raw;\n"));
-            out.push_str(&format!("  size_t {name}_len;\n"));
+        ArgPass::Buffer { .. } | ArgPass::Bytes { .. } => {
+            out.push_str(&format!("  void* {name}_raw = NULL;\n"));
+            out.push_str(&format!("  size_t {name}_len = 0;\n"));
             out.push_str(&format!(
                 "  napi_get_buffer_info(env, args[{idx}], &{name}_raw, &{name}_len);\n"
             ));
-            c_args.push(format!("(const uint8_t*){name}_raw"));
-            c_args.push(format!("{name}_len"));
+            m.c_args.push(format!("(const uint8_t*){name}_raw"));
+            m.c_args.push(format!("{name}_len"));
         }
         ArgPass::String { .. } => {
-            out.push_str(&format!("  size_t {name}_len;\n"));
+            out.push_str(&format!("  size_t {name}_len = 0;\n"));
             out.push_str(&format!(
                 "  napi_get_value_string_utf8(env, args[{idx}], NULL, 0, &{name}_len);\n"
             ));
@@ -1207,91 +1535,71 @@ fn emit_param(
             out.push_str(&format!(
                 "  napi_get_value_string_utf8(env, args[{idx}], {name}, {name}_len + 1, &{name}_len);\n"
             ));
-            c_args.push(name.into());
-            cleanups.push(format!("  free({name});\n"));
+            m.c_args.push(name.into());
+            m.cleanups.push(format!("  free({name});\n"));
         }
-        ArgPass::Bytes { .. } => {
-            out.push_str(&format!("  void* {name}_raw;\n"));
-            out.push_str(&format!("  size_t {name}_len;\n"));
-            out.push_str(&format!(
-                "  napi_get_buffer_info(env, args[{idx}], &{name}_raw, &{name}_len);\n"
-            ));
-            c_args.push(format!("(const uint8_t*){name}_raw"));
-            c_args.push(format!("{name}_len"));
-        }
-        // An interface arrives as the int64 handle the JS class unwrapped
-        // from its instance; the callee borrows the pointer for the call.
-        // When nullable (`Interface?`), JS null/undefined passes NULL.
-        ArgPass::Object { slot, nullable } => {
+        // The callee borrows the pointer for the call; the JS wrapper keeps
+        // its own reference. `null` (an absent `Interface?`) passes NULL.
+        ArgPass::Object { slot, .. } => {
             let ptr_ty = slot.ty.render_c(prefix);
-            if nullable {
-                out.push_str(&format!("  napi_valuetype {name}_type;\n"));
-                out.push_str(&format!("  napi_typeof(env, args[{idx}], &{name}_type);\n"));
-                out.push_str(&format!("  int64_t {name}_raw = 0;\n"));
-                out.push_str(&format!(
-                    "  if ({name}_type != napi_null && {name}_type != napi_undefined) {{\n"
-                ));
-                out.push_str(&format!(
-                    "    napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
-                ));
-                out.push_str("  }\n");
-                c_args.push(format!(
-                    "{name}_raw ? ({ptr_ty})(intptr_t){name}_raw : NULL"
-                ));
+            out.push_str(&format!("  void* {name}_raw = NULL;\n"));
+            out.push_str(&format!(
+                "  if (arg_status == napi_ok) arg_status = weaveffi_napi_get_handle(env, args[{idx}], &{name}_raw);\n"
+            ));
+            m.c_args.push(format!("({ptr_ty}){name}_raw"));
+        }
+        ArgPass::Callback { .. } => {
+            let cb =
+                p.ty.callback_interface_name()
+                    .expect("callback-passed parameter names a callback interface");
+            let c_tag = callback_c_tag(cb, module, prefix);
+            out.push_str(&format!("  napi_valuetype {name}_type;\n"));
+            out.push_str(&format!("  napi_typeof(env, args[{idx}], &{name}_type);\n"));
+            out.push_str(&format!("  {prefix}_napi_cb_ctx* {name}_ctx = NULL;\n"));
+            out.push_str(&format!(
+                "  if ({name}_type == napi_object || {name}_type == napi_function) {{\n"
+            ));
+            out.push_str(&format!(
+                "    {name}_ctx = {prefix}_napi_cb_register(env, args[{idx}], \"{c_tag}\", {c_tag}_napi_dispatch);\n"
+            ));
+            out.push_str("  } else {\n");
+            out.push_str(&format!(
+                "    napi_throw_type_error(env, NULL, \"expected a {} implementation\");\n",
+                cb
+            ));
+            out.push_str("    arg_status = napi_object_expected;\n");
+            out.push_str("  }\n");
+            m.c_args.push(format!("(void*){name}_ctx"));
+            m.c_args.push(format!("&{c_tag}_napi_vtable"));
+            m.fail_cleanups.push(format!(
+                "  if ({name}_ctx != NULL) {prefix}_napi_cb_release(env, {name}_ctx);\n"
+            ));
+        }
+        ArgPass::Direct { slot } => {
+            let is_enum = matches!(p.ty, Ty::Enum(_));
+            let ct = if is_enum {
+                "int32_t"
             } else {
-                out.push_str(&format!("  int64_t {name}_raw;\n"));
-                out.push_str(&format!(
-                    "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
-                ));
-                c_args.push(format!("({ptr_ty})(intptr_t){name}_raw"));
+                c_scalar_type(&p.ty)
+            };
+            out.push_str(&format!("  {ct} {name} = 0;\n"));
+            out.push_str("  if (arg_status == napi_ok) {\n");
+            emit_leaf_read(
+                out,
+                "    ",
+                &p.ty,
+                &format!("args[{idx}]"),
+                name,
+                "arg_status",
+            );
+            out.push_str("  }\n");
+            if is_enum {
+                m.c_args
+                    .push(format!("({}){name}", slot.ty.render_c(prefix)));
+            } else {
+                m.c_args.push(name.into());
             }
         }
-        ArgPass::Direct { slot } => match &p.ty {
-            Ty::I32 | Ty::U32 | Ty::I64 | Ty::F64 | Ty::Bool => {
-                let ct = c_scalar_type(&p.ty);
-                let getter = napi_getter(&p.ty);
-                out.push_str(&format!("  {ct} {name};\n"));
-                out.push_str(&format!("  {getter}(env, args[{idx}], &{name});\n"));
-                c_args.push(name.into());
-            }
-            // N-API has no narrower-than-32-bit / float getter, so read into a
-            // correctly-sized temporary and narrow to the real ABI type.
-            Ty::I8 | Ty::I16 | Ty::U8 | Ty::U16 | Ty::U64 | Ty::F32 => {
-                let ct = c_scalar_type(&p.ty);
-                let getter = napi_getter(&p.ty);
-                let raw = napi_read_tmp_type(&p.ty);
-                out.push_str(&format!("  {raw} {name}_raw;\n"));
-                out.push_str(&format!("  {getter}(env, args[{idx}], &{name}_raw);\n"));
-                c_args.push(format!("({ct}){name}_raw"));
-            }
-            // The untyped handle keeps the runtime's literal type name; the
-            // runtime types stay `weaveffi_*` regardless of the configured
-            // business-symbol prefix.
-            Ty::Handle => {
-                out.push_str(&format!("  int64_t {name}_raw;\n"));
-                out.push_str(&format!(
-                    "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
-                ));
-                c_args.push(format!("(weaveffi_handle_t){name}_raw"));
-            }
-            Ty::TypedHandle(_) => {
-                let ptr_ty = slot.ty.render_c(prefix);
-                out.push_str(&format!("  int64_t {name}_raw;\n"));
-                out.push_str(&format!(
-                    "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
-                ));
-                c_args.push(format!("({ptr_ty})(intptr_t){name}_raw"));
-            }
-            Ty::Enum(_) => {
-                let etype = slot.ty.render_c(prefix);
-                out.push_str(&format!("  int32_t {name};\n"));
-                out.push_str(&format!(
-                    "  napi_get_value_int32(env, args[{idx}], &{name});\n"
-                ));
-                c_args.push(format!("({etype}){name}"));
-            }
-            other => unreachable!("direct-slot parameter with non-direct type {other:?}"),
-        },
     }
 }
 
@@ -1312,37 +1620,18 @@ fn emit_ret_out_params(
         plan::ret_pass(Some(ty), module, prefix),
         RetPass::Bytes | RetPass::Buffer
     ) {
-        out.push_str("  size_t out_len;\n");
+        out.push_str("  size_t out_len = 0;\n");
         c_args.push("&out_len".into());
-    }
-}
-
-/// The C statement that creates a napi value `target` from a leaf C expression
-/// `expr` (scalars, bools, enums, handles).
-fn napi_create_leaf(env: &str, ty: &Ty, expr: &str, target: &str) -> String {
-    match ty {
-        Ty::I32 => format!("napi_create_int32({env}, {expr}, &{target});"),
-        Ty::U32 => format!("napi_create_uint32({env}, {expr}, &{target});"),
-        Ty::I64 => format!("napi_create_int64({env}, {expr}, &{target});"),
-        Ty::F64 => format!("napi_create_double({env}, {expr}, &{target});"),
-        Ty::I8 | Ty::I16 => format!("napi_create_int32({env}, {expr}, &{target});"),
-        Ty::U8 | Ty::U16 => format!("napi_create_uint32({env}, {expr}, &{target});"),
-        Ty::U64 => format!("napi_create_int64({env}, (int64_t)({expr}), &{target});"),
-        Ty::F32 => format!("napi_create_double({env}, {expr}, &{target});"),
-        Ty::Bool => format!("napi_get_boolean({env}, {expr}, &{target});"),
-        Ty::Enum(_) => format!("napi_create_int32({env}, (int32_t)({expr}), &{target});"),
-        Ty::Handle | Ty::TypedHandle(_) => {
-            format!("napi_create_int64({env}, (int64_t)(intptr_t)({expr}), &{target});")
-        }
-        _ => format!("napi_get_null({env}, &{target});"),
     }
 }
 
 /// Convert the C `result` (plus `out_len` when present) into the JS return
 /// value and release what the consumer owes, dispatching on the shared
 /// receiving plan. A buffered return is copied into a JS `Buffer` and
-/// released with `weaveffi_free_bytes`; the JS loader decodes it into the
-/// idiomatic value.
+/// released with `{prefix}_free_bytes`; the JS loader decodes it into the
+/// idiomatic value. A returned object is one strong reference surfaced as a
+/// handle the JS class adopts (and eventually destroys); the addon never
+/// releases it here.
 fn emit_ret_to_napi(out: &mut String, ty: &Ty, module: &str, prefix: &str, f: &FnBinding) {
     out.push_str("  napi_value ret;\n");
     if matches!(ty, Ty::Iterator(_)) {
@@ -1369,46 +1658,21 @@ fn emit_ret_to_napi(out: &mut String, ty: &Ty, module: &str, prefix: &str, f: &F
         // differs.
         RetPass::Bytes | RetPass::Buffer => {
             out.push_str("  napi_create_buffer_copy(env, out_len, result, NULL, &ret);\n");
-            out.push_str("  weaveffi_free_bytes((uint8_t*)result, out_len);\n");
+            out.push_str(&format!(
+                "  {prefix}_free_bytes((uint8_t*)result, out_len);\n"
+            ));
         }
         RetPass::String => {
             out.push_str("  napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);\n");
-            out.push_str("  weaveffi_free_string(result);\n");
+            out.push_str(&format!("  {prefix}_free_string(result);\n"));
         }
-        // A returned interface is an owned object reference surfaced as the
-        // raw handle; the JS loader wraps it in its class (which owns
-        // disposal), so the addon must not destroy it here. A nullable
-        // return surfaces JS null for the absent case.
-        RetPass::Object { nullable, .. } => {
-            if nullable {
-                out.push_str("  if (result == NULL) {\n");
-                out.push_str("    napi_get_null(env, &ret);\n");
-                out.push_str("  } else {\n");
-                out.push_str("    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
-                out.push_str("  }\n");
-            } else {
-                out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
-            }
+        // A NULL result (the absent case of `Interface?`) surfaces as null.
+        RetPass::Object { .. } => {
+            out.push_str("  weaveffi_napi_make_handle(env, result, &ret);\n");
         }
-        RetPass::Direct => match ty {
-            Ty::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
-            Ty::U32 => out.push_str("  napi_create_uint32(env, result, &ret);\n"),
-            Ty::I64 => out.push_str("  napi_create_int64(env, result, &ret);\n"),
-            Ty::F64 => out.push_str("  napi_create_double(env, result, &ret);\n"),
-            Ty::I8 | Ty::I16 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
-            Ty::U8 | Ty::U16 => out.push_str("  napi_create_uint32(env, result, &ret);\n"),
-            Ty::U64 => out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n"),
-            Ty::F32 => out.push_str("  napi_create_double(env, result, &ret);\n"),
-            Ty::Bool => out.push_str("  napi_get_boolean(env, result, &ret);\n"),
-            Ty::Enum(_) => {
-                out.push_str("  napi_create_int32(env, (int32_t)result, &ret);\n");
-            }
-            // Handles are opaque tokens surfaced as int64.
-            Ty::Handle | Ty::TypedHandle(_) => {
-                out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
-            }
-            other => unreachable!("direct return with non-direct type {other:?}"),
-        },
+        RetPass::Direct => {
+            out.push_str(&format!("  {}\n", napi_create_leaf(ty, "result", "ret")));
+        }
     }
     out.push_str("  return ret;\n");
 }

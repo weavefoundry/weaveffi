@@ -92,8 +92,9 @@ fn package_skips_unsupported_targets() {
 
     let out_dir = tempfile::tempdir().expect("temp out dir");
 
-    // wasm has no native-matrix packaging, so packaging only wasm fails with a
-    // clear message rather than producing an empty artifact.
+    // The prebuilt tree holds only desktop cdylibs, so a wasm-only package has
+    // no `wasm32` module to carry and must fail with a clear message rather
+    // than producing an empty artifact.
     assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
         .args([

@@ -9,16 +9,18 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Objects   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent); one
+//                strong reference per wrapper, released by close()
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Buffered  -> records, rich enums, optionals, lists, and maps cross
 //                as one value buffer: i32 pointer + i32 length
+//   Callbacks -> i32 context key + i32 pointer to a static vtable
 
 // The ABI revision this glue was generated against.
-const _ABI_VERSION = 1;
+const _ABI_VERSION = 2;
 
 function _checkAbiVersion(wasm) {
   if (typeof wasm.weaveffi_abi_version !== 'function') {
@@ -31,8 +33,9 @@ function _checkAbiVersion(wasm) {
 }
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
- * thrown directly for unknown codes, marshalling failures, and producer
- * panics. Carries the stable ABI `code`. */
+ * thrown directly for unknown codes, marshalling failures, producer
+ * panics, and callback-interface implementations that raised (code -4).
+ * Carries the stable ABI `code`. */
 export class WeaveFFIError extends Error {
   constructor(code, message) {
     super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
@@ -66,14 +69,6 @@ const _DOCS_ERRORS_ERROR_CODES = Object.freeze({
   1: NotFound,
   2: InvalidStatus,
 });
-
-// Build the DocsErrorsError subclass matching `code`, or a generic
-// WeaveFFIError for codes outside the domain (panics, marshalling).
-function _docsErrorsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
-  const _cls = _DOCS_ERRORS_ERROR_CODES[code];
-  const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
-  return _e;
-}
 
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
@@ -154,6 +149,8 @@ class _BufWriter {
   f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }
   len(n) { this.u32(n); }
   flag(present) { this.u8(present ? 1 : 0); }
+  // An object token: the pointer (a wasm32 i32, read unsigned) widened to u64.
+  obj(ptr) { this.u64(BigInt(ptr >>> 0)); }
   str(v) {
     const b = _enc.encode(v);
     this.len(b.length);
@@ -218,6 +215,13 @@ class _BufReader {
     if (b > 1) this._bad('option flag byte out of range');
     return b === 1;
   }
+  // An object token narrowed back to a wasm32 pointer; zero is never a
+  // valid token (an absent `Interface?` uses the option flag instead).
+  obj() {
+    const t = this.u64();
+    if (t === 0n || t > 0xffffffffn) this._bad('object token out of range');
+    return Number(t);
+  }
   str() {
     const n = this.len();
     const at = this._take(n, 'string bytes');
@@ -247,9 +251,11 @@ function _allocErr(wasm) {
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
 // Non-throwing wrappers route here: a non-zero code can only be a
-// producer panic or a marshalling failure, surfaced as the generic
+// producer panic (-2), a marshalling failure (-3), or a callback
+// interface implementation that raised (-4), surfaced as the generic
 // WeaveFFIError.
 function _checkErr(wasm, errPtr) {
+  _pendingForeign = null;
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
@@ -263,21 +269,36 @@ function _checkErr(wasm, errPtr) {
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
+  _pendingForeign = null;
   wasm.weaveffi_dealloc(errPtr, 16);
 }
 
-// Throw the `DocsErrorsError` domain error (and free the slot) if the error slot
-// carries a non-zero code.
-function _checkDocsErrorsError(wasm, errPtr) {
-  const dv = new DataView(wasm.memory.buffer);
-  const code = dv.getInt32(errPtr, true);
-  if (code !== 0) {
-    const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
-    const _e = _docsErrorsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
-    wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 16);
-    throw _e;
-  }
+// The message of a callback-interface failure a trampoline reported through
+// out_err, held until the producer call on the stack returns (every error
+// checker and _freeErr clear it) so later callbacks in that call are refused.
+let _pendingForeign = null;
+
+// Translate an exception raised while a producer call was on the stack.
+// wasm32-unknown-unknown has no unwinding runtime: a producer panic executes
+// `unreachable`, so the engine throws a WebAssembly.RuntimeError instead of
+// the producer writing out_err. A trap that follows a callback-interface
+// failure is labelled with that failure (-4); any other trap is a producer
+// panic (-2). Non-trap exceptions pass through unchanged. The producer
+// frames between the trap and the call are not unwound, so a lock held
+// across a callback stays locked; a producer that snapshots its state
+// before calling out stays usable.
+function _trapError(e) {
+  const foreign = _pendingForeign;
+  _pendingForeign = null;
+  if (!(e instanceof WebAssembly.RuntimeError)) return e;
+  if (foreign !== null) return new WeaveFFIError(-4, foreign);
+  return new WeaveFFIError(-2, 'producer panicked: ' + e.message);
+}
+
+// Release the error slot a failed call never filled, then translate.
+function _trap(wasm, errPtr, e) {
+  _freeErr(wasm, errPtr);
+  return _trapError(e);
 }
 
 // Throw if a heap-boxed (consumer-owned) error carries a non-zero
@@ -286,6 +307,7 @@ function _checkDocsErrorsError(wasm, errPtr) {
 // `mkErr` maps domain codes (and decodes payload fields) for
 // throwing callables; without it the generic WeaveFFIError is thrown.
 function _checkErrRef(wasm, errPtr, mkErr) {
+  _pendingForeign = null;
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code === 0) { wasm.weaveffi_error_free(errPtr); return; }
@@ -295,32 +317,71 @@ function _checkErrRef(wasm, errPtr, mkErr) {
   throw err;
 }
 
-// Serialize a `docs.Document` record into the value-buffer wire format.
-function _write_docs_Document(w, v) {
-  w.i64(v.id);
-  w.str(v.title);
-  w.i32(v.status);
-  const _a1 = v.tags || [];
-  w.len(_a1.length);
-  for (const _e1 of _a1) {
-    w.str(_e1);
+// `using` declarations (explicit resource management) call this symbol;
+// runtimes that predate it get the registered stand-in so the method is
+// still reachable by name.
+const _dispose = typeof Symbol.dispose === 'symbol' ? Symbol.dispose : Symbol.for('Symbol.dispose');
+
+// Finalization backstop: a wrapper that is garbage collected without
+// close() still releases its reference. The held value is the
+// [destroy, handle] pair (never the wrapper, which would keep it alive);
+// the wrapper is the unregister token so close() disarms the backstop and
+// destroy runs exactly once either way. Absent on runtimes without
+// FinalizationRegistry, where close() is the only release path.
+const _finalizer = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(([destroy, handle]) => destroy(handle))
+  : null;
+
+// Bind one strong reference to a wrapper and arm the backstop.
+function _adopt(obj, handle, destroy) {
+  obj._handle = handle;
+  obj._destroy = destroy;
+  if (_finalizer !== null) _finalizer.register(obj, [destroy, handle], obj);
+  return obj;
+}
+
+// Release a wrapper's reference exactly once; later calls are no-ops.
+function _release(obj) {
+  if (!obj._handle) return;
+  if (_finalizer !== null) _finalizer.unregister(obj);
+  obj._destroy(obj._handle);
+  obj._handle = 0;
+}
+
+// The pointer of a live wrapper, lent to the producer for one call (the
+// wrapper keeps its own reference). A closed or non-object argument is a
+// consumer programming error, reported with the marshalling code.
+function _borrow(obj) {
+  if (obj === null || obj === undefined || !obj._handle) {
+    throw new WeaveFFIError(-3, 'expected a live object wrapper');
   }
+  return obj._handle;
 }
 
-// Decode a `docs.Document` record from the value-buffer wire format.
-function _read_docs_Document(r) {
-  const v = {};
-  v.id = r.i64();
-  v.title = r.str();
-  v.status = r.i32();
-  v.tags = (() => { const _n = r.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(r.str()); return _arr; })();
-  return v;
+// Report a callback-interface failure through the trampoline's out_err
+// slot as FOREIGN_ERROR_CODE (-4). weaveffi_error_set copies the message
+// with the producer's allocator, so the staged C string is released as
+// soon as it returns. The message is parked in _pendingForeign until the
+// producer call on the stack returns: the producer can't unwind on wasm32,
+// so it keeps running on the trampoline's default return value, and any
+// further callback it makes during that call is refused with this error
+// instead of reaching the implementation again.
+function _reportForeign(wasm, errPtr, msg) {
+  if (_pendingForeign === null) _pendingForeign = msg;
+  const [p, s] = _cstr(wasm, msg);
+  wasm.weaveffi_error_set(errPtr, -4, p);
+  wasm.weaveffi_dealloc(p, s);
 }
 
-function _registerTrampoline(table, paramTypes, handler) {
+// Report an exception thrown by a callback-interface implementation.
+function _setForeignError(wasm, errPtr, e) {
+  _reportForeign(wasm, errPtr, e instanceof Error ? (e.message || e.name) : String(e));
+}
+
+function _registerTrampoline(table, paramTypes, resultTypes, handler) {
   const idx = table.grow(1);
   table.set(idx, new WebAssembly.Function(
-    { parameters: paramTypes, results: [] },
+    { parameters: paramTypes, results: resultTypes },
     handler
   ));
   return idx;
@@ -333,9 +394,11 @@ export const Status = Object.freeze({
 });
 
 /**
- * Load a WeaveFFI Wasm module from the given URL.
+ * Load a WeaveFFI Wasm module.
  *
- * @param {string} url - URL to the `.wasm` file.
+ * @param {string|URL|BufferSource|WebAssembly.Module} source - A URL to
+ *   fetch the `.wasm` from, its bytes, or an already compiled module
+ *   (use the bytes form where `fetch` cannot read files, e.g. Node).
  * @returns {Promise<Object>} The API bindings.
  *
  * Exported functions follow the C ABI naming convention:
@@ -350,6 +413,12 @@ export const Status = Object.freeze({
  * // Record: plain objects in and out (serialized automatically).
  * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
+ * // Object: a class wrapping one producer reference; close() releases it
+ * // (or let `using` do it). Passing it lends the reference for the call.
+ * const store = new api.kv.Store();
+ * api.kv.inspect(store);
+ * store.close();
+ *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
@@ -360,13 +429,66 @@ export const Status = Object.freeze({
  * // List/Map: pass arrays/objects; receive arrays/objects.
  * const names = api.data.all_names();
  */
-export async function loadWeaveffiWasm(url) {
-  const response = await fetch(url);
-  const bytes = await response.arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+export async function loadWeaveffiWasm(source) {
+  let module;
+  if (source instanceof WebAssembly.Module) {
+    module = source;
+  } else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
+    module = await WebAssembly.compile(source);
+  } else {
+    const response = await fetch(source);
+    module = await WebAssembly.compile(await response.arrayBuffer());
+  }
+  const instance = await WebAssembly.instantiate(module, {});
   const wasm = instance.exports;
 
   _checkAbiVersion(wasm);
+
+  // Build the DocsErrorsError subclass matching `code`, or a generic
+  // WeaveFFIError for codes outside the domain (panics, marshalling,
+  // foreign callback failures).
+  function _docsErrorsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
+    const _cls = _DOCS_ERRORS_ERROR_CODES[code];
+    const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
+    return _e;
+  }
+
+  // Throw the `DocsErrorsError` domain error (and free the slot) if the error slot
+  // carries a non-zero code.
+  function _checkDocsErrorsError(wasm, errPtr) {
+    _pendingForeign = null;
+    const dv = new DataView(wasm.memory.buffer);
+    const code = dv.getInt32(errPtr, true);
+    if (code !== 0) {
+      const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+      const _e = _docsErrorsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
+      wasm.weaveffi_error_clear(errPtr);
+      wasm.weaveffi_dealloc(errPtr, 16);
+      throw _e;
+    }
+  }
+
+  // Serialize a `docs.Document` record into the value-buffer wire format.
+  function _write_docs_Document(w, v) {
+    w.i64(v.id);
+    w.str(v.title);
+    w.i32(v.status);
+    const _a1 = v.tags || [];
+    w.len(_a1.length);
+    for (const _e1 of _a1) {
+      w.str(_e1);
+    }
+  }
+
+  // Decode a `docs.Document` record from the value-buffer wire format.
+  function _read_docs_Document(r) {
+    const v = {};
+    v.id = r.i64();
+    v.title = r.str();
+    v.status = r.i32();
+    v.tags = (() => { const _n = r.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(r.str()); return _arr; })();
+    return v;
+  }
 
   const _table = wasm.__indirect_function_table;
 
@@ -385,21 +507,43 @@ export async function loadWeaveffiWasm(url) {
     }
   }
 
-  const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], _asyncHandler);
+  const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], [], _asyncHandler);
 
-  // Listener subscriptions, keyed by the context id the loader
-  // threads through the C ABI's void* context slot. Each entry
-  // holds the JS callback and the producer's subscription id.
-  let _nextLsnId = 1;
-  const _listeners = new Map();
+  // Callback-interface implementations, keyed by the integer context
+  // the loader passes as `ctx`; an entry lives until the producer
+  // calls the vtable's `free(ctx)`.
+  let _nextCbId = 1;
+  const _callbacks = new Map();
 
-  const _lsnPtr_weaveffi_docs_OnSaved_fn = _registerTrampoline(_table, ['i64', 'i32', 'i32'], (a0, a1, _ctx) => {
-    const _l = _listeners.get(_ctx);
-    if (_l === undefined) return;
-    const _p0 = a0;
-    const _p1 = a1;
-    _l.callback(_p0, _p1);
+  // Trampolines for the `SavedListener` callback interface: one WebAssembly.Function
+  // per vtable entry, mirroring the C signature of each method. Borrowed
+  // arguments are decoded before the JS method runs; object arguments
+  // are adopted; a thrown exception becomes a -4 error on out_err.
+  const _cb_SavedListener_on_saved = _registerTrampoline(_table, ['i32', 'i64', 'i32', 'i32'], [], (_ctx, a0, a1, _err) => {
+    try {
+      const _impl = _callbacks.get(_ctx);
+      const _p0 = a0;
+      const _p1 = a1;
+      if (_pendingForeign !== null) {
+        _reportForeign(wasm, _err, _pendingForeign);
+        return;
+      }
+      _impl.onSaved(_p0, _p1);
+    } catch (e) {
+      _setForeignError(wasm, _err, e);
+    }
   });
+  // `free(ctx)`: the producer dropped its last reference; forget the
+  // implementation so it can be collected.
+  const _cb_SavedListener_free = _registerTrampoline(_table, ['i32'], [], (_ctx) => { _callbacks.delete(_ctx); });
+  // The one static `weaveffi_docs_SavedListener_vtable` for this instance, filled with the table indices
+  // above in declaration order, then `free`.
+  const _vtable_SavedListener = wasm.weaveffi_alloc(8);
+  {
+    const _dv = new DataView(wasm.memory.buffer);
+    _dv.setUint32(_vtable_SavedListener + 0, _cb_SavedListener_on_saved, true);
+    _dv.setUint32(_vtable_SavedListener + 4, _cb_SavedListener_free, true);
+  }
 
   // An ordered collection of documents.
   // 
@@ -407,29 +551,41 @@ export async function loadWeaveffiWasm(url) {
   class Notebook {
     constructor() {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_docs_Notebook_new(_err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_docs_Notebook_new(_err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
-      this._handle = _r;
+      _adopt(this, _r, wasm.weaveffi_docs_Notebook_destroy);
     }
     static _wrap(handle) {
-      const _o = Object.create(Notebook.prototype);
-      _o._handle = handle;
-      return _o;
+      return _adopt(Object.create(Notebook.prototype), handle, wasm.weaveffi_docs_Notebook_destroy);
     }
-    free() {
-      if (this._handle !== 0) {
-        wasm.weaveffi_docs_Notebook_destroy(this._handle);
-        this._handle = 0;
-      }
+    _clone() {
+      return wasm.weaveffi_docs_Notebook_clone(_borrow(this));
+    }
+    close() {
+      _release(this);
+    }
+    [_dispose]() {
+      _release(this);
     }
     insert(document) {
       const a0_w = new _BufWriter();
       _write_docs_Document(a0_w, document);
       const [a0_p, a0_l] = _bytes(wasm, a0_w.finish());
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_docs_Notebook_insert(this._handle, a0_p, a0_l, _err);
-      wasm.weaveffi_dealloc(a0_p, a0_l);
+      let _r;
+      try {
+        _r = wasm.weaveffi_docs_Notebook_insert(_borrow(this), a0_p, a0_l, _err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      } finally {
+        wasm.weaveffi_dealloc(a0_p, a0_l);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
       return _r;
@@ -437,7 +593,13 @@ export async function loadWeaveffiWasm(url) {
     find(id) {
       const _lp = wasm.weaveffi_alloc(4);
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_docs_Notebook_find(this._handle, BigInt(id), _lp, _err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_docs_Notebook_find(_borrow(this), BigInt(id), _lp, _err);
+      } catch (e) {
+        wasm.weaveffi_dealloc(_lp, 4);
+        throw _trap(wasm, _err, e);
+      }
       _checkDocsErrorsError(wasm, _err);
       _freeErr(wasm, _err);
       const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -449,14 +611,24 @@ export async function loadWeaveffiWasm(url) {
     }
     size() {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_docs_Notebook_size(this._handle, _err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_docs_Notebook_size(_borrow(this), _err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
       return _r;
     }
     static maxDocuments() {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_docs_Notebook_max_documents(_err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_docs_Notebook_max_documents(_err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
       return _r;
@@ -477,9 +649,16 @@ export async function loadWeaveffiWasm(url) {
         const [a1_p, a1_l] = _bytes(wasm, a1_w.finish());
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_docs_create_document(a0_p, a1_p, a1_l, _lp, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_s);
-        wasm.weaveffi_dealloc(a1_p, a1_l);
+        let _r;
+        try {
+          _r = wasm.weaveffi_docs_create_document(a0_p, a1_p, a1_l, _lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        } finally {
+          wasm.weaveffi_dealloc(a0_p, a0_s);
+          wasm.weaveffi_dealloc(a1_p, a1_l);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -492,7 +671,13 @@ export async function loadWeaveffiWasm(url) {
       getDocument(id) {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_docs_get_document(BigInt(id), _lp, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_docs_get_document(BigInt(id), _lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -506,21 +691,25 @@ export async function loadWeaveffiWasm(url) {
         return new Promise((resolve, reject) => {
           const ctxId = _nextCtxId++;
           _asyncContexts.set(ctxId, { resolve, reject, unwrap: (w, r) => r !== 0 });
-          wasm.weaveffi_docs_publish_async_async(BigInt(id), _cbPtr_i32_i32_i32, ctxId);
+          try {
+            wasm.weaveffi_docs_publish_async_async(BigInt(id), _cbPtr_i32_i32_i32, ctxId);
+          } catch (e) {
+            _asyncContexts.delete(ctxId);
+            reject(_trapError(e));
+          }
         });
       },
-      /** Subscribe to document-saved notifications */
-      registerSavedListener(callback) {
-        const _id = _nextLsnId++;
-        const _rid = wasm.weaveffi_docs_register_saved_listener(_lsnPtr_weaveffi_docs_OnSaved_fn, _id);
-        _listeners.set(_id, { callback, rid: _rid });
-        return _id;
-      },
-      unregisterSavedListener(id) {
-        const _l = _listeners.get(id);
-        if (_l === undefined) return;
-        _listeners.delete(id);
-        wasm.weaveffi_docs_unregister_saved_listener(_l.rid);
+      watch(listener) {
+        const a0_ctx = _nextCbId++;
+        _callbacks.set(a0_ctx, listener);
+        const _err = _allocErr(wasm);
+        try {
+          wasm.weaveffi_docs_watch(a0_ctx, _vtable_SavedListener, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
       },
       Notebook: Notebook,
     },

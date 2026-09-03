@@ -1,4 +1,4 @@
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: shared
     structs:
@@ -36,16 +36,22 @@ modules:
           - { name: parent, type: "i64?" }
           - { name: token, type: Token, doc: Cross-module struct reference }
           - { name: priority, type: Priority }
-    callbacks:
-      - name: OnReady
-        doc: Fires when an item is ready
-        params:
-          - { name: code, type: i32 }
-          - { name: msg, type: string }
-    listeners:
-      - name: ready_listener
-        event_callback: OnReady
-        doc: Subscribe to OnReady events
+          - { name: gadget, type: "Gadget?", doc: An optional object inside a record }
+    callback_interfaces:
+      - name: ReadyListener
+        doc: Consumer-implemented observer of ready items
+        methods:
+          - name: on_ready
+            doc: Fires when an item is ready
+            params:
+              - { name: code, type: i32 }
+              - { name: msg, type: string }
+          - name: on_item
+            doc: Receives the item itself and says whether to keep listening
+            params:
+              - { name: item, type: Item }
+              - { name: gadget, type: Gadget }
+            return: bool
     errors:
       name: KitchenErrors
       codes:
@@ -105,24 +111,24 @@ modules:
         params:
           - { name: b, type: bytes }
         return: bytes
-      - name: echo_borrowed_str
-        doc: Borrowed string parameter
+      - name: subscribe
+        doc: Register a listener, returning how many are attached
         params:
-          - { name: s, type: "&str" }
-        return: string
-      - name: echo_borrowed_bytes
-        doc: Borrowed bytes parameter
+          - { name: listener, type: ReadyListener }
+        return: i32
+      - name: maybe_gadget
+        doc: Optional object in both directions
         params:
-          - { name: b, type: "&[u8]" }
-        return: bytes
-      - name: open_handle
-        doc: Returns an opaque handle
+          - { name: fallback, type: "Gadget?" }
+        return: "Gadget?"
+      - name: gadgets
+        doc: A list of objects
         params: []
-        return: handle
-      - name: open_typed_handle
-        doc: Returns a typed handle
+        return: "[Gadget]"
+      - name: stream_gadgets
+        doc: An iterator over objects
         params: []
-        return: "handle<Token>"
+        return: "iter<Gadget>"
       - name: maybe_item
         doc: Optional struct return
         params:
@@ -163,12 +169,10 @@ modules:
         params: []
         return: i32
         deprecated: "Use new_op instead"
-        since: "0.1.0"
       - name: new_op
         doc: Replacement for legacy_op
         params: []
         return: i32
-        since: "0.3.0"
     modules:
       - name: nested
         functions:

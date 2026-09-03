@@ -27,7 +27,7 @@ DynamicLibrary _openLibrary() {
 }
 
 // The ABI revision these bindings were generated against.
-const int _abiVersion = 1;
+const int _abiVersion = 2;
 
 DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {
   final int Function() abiVersion;
@@ -60,6 +60,11 @@ final class _WeaveFFIError extends Struct {
   external int payloadLen;
 }
 
+typedef _NativeWeaveffiErrorSet = Void Function(Pointer<_WeaveFFIError>, Int32, Pointer<Utf8>);
+typedef _DartWeaveffiErrorSet = void Function(Pointer<_WeaveFFIError>, int, Pointer<Utf8>);
+final _weaveffiErrorSet = _lib.lookupFunction<
+    _NativeWeaveffiErrorSet, _DartWeaveffiErrorSet>('weaveffi_error_set');
+
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
@@ -80,8 +85,19 @@ typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
 final _weaveffiFreeBytes = _lib.lookupFunction<
     _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
 
-/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
+/// Generic WeaveFFI failure: a producer panic ([panicCode]), a marshalling
+/// error ([marshalCode]), a callback-interface implementation that threw
+/// ([foreignCode], carrying the Dart exception's text), or an unknown code.
 class WeaveFFIException implements Exception {
+  /// The producer reported an untyped error.
+  static const int genericCode = -1;
+  /// The producer panicked; [message] carries the panic text.
+  static const int panicCode = -2;
+  /// An argument could not be lifted by the producer.
+  static const int marshalCode = -3;
+  /// A Dart callback-interface implementation threw; [message] carries the
+  /// exception's text.
+  static const int foreignCode = -4;
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
@@ -341,9 +357,57 @@ final class _BufferReader {
   }
 }
 
-// Live listener trampolines by subscription id. Holding the
-// NativeCallable here keeps its native thunk alive until unregistered.
-final Map<int, NativeCallable> _listenerCallables = {};
+// ── WeaveFFI callback-interface runtime ──
+// A Dart implementation passed to the producer is stored here under an
+// integer key; the key (widened to a pointer) is what crosses as `ctx`, so the
+// producer never holds a Dart object and the GC never sees a raw pointer. The
+// entry lives until the producer calls the vtable's `free(ctx)`.
+final Map<int, Object> _callbackTable = {};
+int _nextCallbackKey = 1;
+
+Pointer<Void> _registerCallback(Object impl) {
+  final key = _nextCallbackKey++;
+  _callbackTable[key] = impl;
+  return Pointer<Void>.fromAddress(key);
+}
+
+Object _callbackFor(Pointer<Void> ctx) {
+  final impl = _callbackTable[ctx.address];
+  if (impl == null) {
+    throw StateError('callback interface context ${ctx.address} is not registered');
+  }
+  return impl;
+}
+
+// Vtable trampolines are process-wide: their NativeCallables are never closed,
+// so they are anchored here to keep the native thunks alive. `keepIsolateAlive`
+// is cleared on each so an idle isolate can still exit.
+final List<NativeCallable<Function>> _callbackCallables = [];
+
+Pointer<NativeFunction<T>> _pinCallable<T extends Function>(
+    NativeCallable<T> callable) {
+  callable.keepIsolateAlive = false;
+  _callbackCallables.add(callable);
+  return callable.nativeFunction;
+}
+
+// Reports a Dart exception thrown by a callback-interface implementation
+// through `weaveffi_error_set` with the reserved foreign error code (-4).
+// The producer copies the message, so the temporary is freed right away. This
+// must never throw: it runs in the catch path of a trampoline whose C frame
+// an exception must not unwind through.
+void _foreignError(Pointer<_WeaveFFIError> outErr, Object error) {
+  if (outErr == nullptr) return;
+  Pointer<Utf8> message = nullptr;
+  try {
+    message = error.toString().toNativeUtf8();
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, message);
+  } catch (_) {
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, nullptr);
+  } finally {
+    if (message != nullptr) calloc.free(message);
+  }
+}
 
 /// Typed error domain `DocsErrors` declared by module `docs`.
 class DocsErrorsException extends WeaveFFIException {
@@ -435,10 +499,78 @@ Document _unpackDocument(_BufferReader r) {
   );
 }
 
+/// Consumer-implemented observer of document-saved notifications.
+///
+/// Implementations must be safe to call from any thread.
+///
+/// A callback interface: implement this class and pass an instance to any
+/// function taking a [SavedListener]. The producer keeps the instance alive
+/// (through a private handle table) until it releases the callback, so no
+/// other reference needs to be held.
+///
+/// Object arguments are owned by the implementation: call `dispose()` on
+/// them (or let the finalizer run) when done. A thrown exception is reported
+/// to the producer, which aborts the call it was making; the original Dart
+/// caller then observes a [WeaveFFIException] with [WeaveFFIException.foreignCode]
+/// carrying the exception's text.
+///
+/// Dart limitation: methods are bound with `NativeCallable.isolateLocal`, so
+/// the producer may only invoke them on the thread of the isolate that
+/// passed the callback. That holds when the producer calls them
+/// synchronously during a call from Dart. A producer that invokes a method
+/// from another thread (an async task, a background worker) is unsupported:
+/// a `NativeCallable.listener` cannot return a value or read borrowed
+/// arguments after the native frame returns.
+abstract class SavedListener {
+  /// Fires after a document has been persisted successfully
+  void onSaved(int docId, int revision);
+}
+
+typedef _NativeSavedListenerVtOnSaved = Void Function(Pointer<Void>, Int64, Int32, Pointer<_WeaveFFIError>);
+typedef _NativeSavedListenerVtFree = Void Function(Pointer<Void>);
+
+// The C `weaveffi_docs_SavedListener_vtable` layout.
+final class _SavedListenerVtableStruct extends Struct {
+  external Pointer<NativeFunction<_NativeSavedListenerVtOnSaved>> onSaved;
+  external Pointer<NativeFunction<_NativeSavedListenerVtFree>> free;
+}
+
+// Vtable entry `weaveffi_docs_SavedListener_vtable.on_saved`.
+void _savedListenerVtOnSaved(Pointer<Void> ctx, int docId, int revision, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as SavedListener;
+    impl.onSaved(docId, revision);
+  } catch (e) {
+    _foreignError(outErr, e);
+  }
+}
+
+void _savedListenerVtFree(Pointer<Void> ctx) {
+  _callbackTable.remove(ctx.address);
+}
+
+// The process-wide static `weaveffi_docs_SavedListener_vtable` every SavedListener passed to the producer
+// shares; the per-instance state travels in `ctx`.
+final Pointer<_SavedListenerVtableStruct> _SavedListenerVtable = () {
+  final vt = calloc<_SavedListenerVtableStruct>();
+  vt.ref.onSaved = _pinCallable(NativeCallable<_NativeSavedListenerVtOnSaved>.isolateLocal(
+      _savedListenerVtOnSaved));
+  vt.ref.free = _pinCallable(NativeCallable<_NativeSavedListenerVtFree>.listener(
+      _savedListenerVtFree));
+  return vt;
+}();
+
+typedef _NativeWeaveffiDocsNotebookClone = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiDocsNotebookClone = Pointer<Void> Function(Pointer<Void>);
+final _weaveffiDocsNotebookClone = _lib.lookupFunction<
+    _NativeWeaveffiDocsNotebookClone, _DartWeaveffiDocsNotebookClone>('weaveffi_docs_Notebook_clone');
+
 typedef _NativeWeaveffiDocsNotebookDestroy = Void Function(Pointer<Void>);
 typedef _DartWeaveffiDocsNotebookDestroy = void Function(Pointer<Void>);
 final _weaveffiDocsNotebookDestroy = _lib.lookupFunction<
     _NativeWeaveffiDocsNotebookDestroy, _DartWeaveffiDocsNotebookDestroy>('weaveffi_docs_Notebook_destroy');
+final _weaveffiDocsNotebookDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_docs_Notebook_destroy'));
 
 typedef _NativeWeaveffiDocsNotebookNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiDocsNotebookNew = Pointer<Void> Function(Pointer<_WeaveFFIError>);
@@ -468,16 +600,45 @@ final _weaveffiDocsNotebookMaxDocuments = _lib.lookupFunction<
 /// An ordered collection of documents.
 ///
 /// Notebooks own their documents and release them when destroyed.
-class Notebook {
-  final Pointer<Void> _handle;
-  Notebook._(this._handle);
+///
+/// A reference-counted native object. Each instance holds one strong
+/// reference, released by [dispose] or, if the instance is collected
+/// without being disposed, by a GC finalizer. Instances stay valid for as
+/// long as the Dart object is reachable; the producer keeps its own
+/// references to any object it retains.
+class Notebook implements Finalizable {
+  final Pointer<Void> _ptr;
+  bool _disposed = false;
 
-  /// Releases the native object reference.
+  /// Adopts one strong reference to the native object.
+  Notebook._(this._ptr) {
+    _weaveffiDocsNotebookDestroyFinalizer.attach(this, _ptr, detach: this);
+  }
+
+  /// The borrowed native pointer for the duration of a call.
+  Pointer<Void> get _handle {
+    if (_disposed) throw StateError('Notebook used after dispose()');
+    return _ptr;
+  }
+
+  /// Mints a second strong reference (the interface's `_clone` symbol) for
+  /// an object token written into a value buffer.
+  Pointer<Void> _cloneRef() => _weaveffiDocsNotebookClone(_handle);
+
+  /// Releases this instance's native reference. Safe to call more than
+  /// once; the native object is dropped when its last reference (this
+  /// one, any other wrapper's, or the producer's) is released.
   void dispose() {
-    _weaveffiDocsNotebookDestroy(_handle);
+    if (_disposed) return;
+    _disposed = true;
+    _weaveffiDocsNotebookDestroyFinalizer.detach(this);
+    _weaveffiDocsNotebookDestroy(_ptr);
   }
 
   /// Create an empty notebook
+  ///
+  /// The returned object is owned by the caller: call its `dispose()` when
+  /// you are done with it.
   factory Notebook() {
     final err = calloc<_WeaveFFIError>();
     try {
@@ -551,35 +712,6 @@ class Notebook {
       calloc.free(err);
     }
   }
-}
-
-typedef _NativeCb_weaveffi_docs_OnSaved_fn = Void Function(Int64, Int32, Pointer<Void>);
-
-typedef _NativeWeaveffiDocsRegisterSavedListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_docs_OnSaved_fn>>, Pointer<Void>);
-typedef _DartWeaveffiDocsRegisterSavedListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_docs_OnSaved_fn>>, Pointer<Void>);
-final _weaveffiDocsRegisterSavedListener = _lib.lookupFunction<
-    _NativeWeaveffiDocsRegisterSavedListener, _DartWeaveffiDocsRegisterSavedListener>('weaveffi_docs_register_saved_listener');
-
-typedef _NativeWeaveffiDocsUnregisterSavedListener = Void Function(Uint64);
-typedef _DartWeaveffiDocsUnregisterSavedListener = void Function(int);
-final _weaveffiDocsUnregisterSavedListener = _lib.lookupFunction<
-    _NativeWeaveffiDocsUnregisterSavedListener, _DartWeaveffiDocsUnregisterSavedListener>('weaveffi_docs_unregister_saved_listener');
-
-/// Subscribe to document-saved notifications
-/// Registers a OnSaved listener. Returns a subscription id for unregisterSavedListener().
-int registerSavedListener(void Function(int docId, int revision) callback) {
-  final callable = NativeCallable<_NativeCb_weaveffi_docs_OnSaved_fn>.isolateLocal((int docId, int revision, Pointer<Void> context) {
-    callback(docId, revision);
-  });
-  final id = _weaveffiDocsRegisterSavedListener(callable.nativeFunction, nullptr);
-  _listenerCallables[id] = callable;
-  return id;
-}
-
-/// Unregisters a listener previously registered with registerSavedListener().
-void unregisterSavedListener(int id) {
-  _weaveffiDocsUnregisterSavedListener(id);
-  _listenerCallables.remove(id)?.close();
 }
 
 typedef _NativeWeaveffiDocsCreateDocument = Pointer<Uint8> Function(Pointer<Utf8>, Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
@@ -680,6 +812,22 @@ Future<bool> publishAsync(int id) {
     rethrow;
   }
   return completer.future;
+}
+
+typedef _NativeWeaveffiDocsWatch = Void Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiDocsWatch = void Function(Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiDocsWatch = _lib.lookupFunction<
+    _NativeWeaveffiDocsWatch, _DartWeaveffiDocsWatch>('weaveffi_docs_watch');
+
+/// Register a listener for saved notifications
+void watch(SavedListener listener) {
+  final err = calloc<_WeaveFFIError>();
+  try {
+    _weaveffiDocsWatch(_registerCallback(listener), _SavedListenerVtable.cast<Void>(), err);
+    _checkError(err);
+  } finally {
+    calloc.free(err);
+  }
 }
 
 // END weaveffi.dart

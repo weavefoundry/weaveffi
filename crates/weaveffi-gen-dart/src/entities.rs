@@ -30,7 +30,8 @@ pub(crate) fn dart_exception_name(raw: &str) -> String {
 /// error's payload buffer into the exception's typed properties. Only
 /// declared (positive) codes gain a `case`; every other code, including the
 /// reserved negative runtime range (generic error, panic, marshalling
-/// failure), falls through to the generic exception.
+/// failure, and a callback-interface implementation that threw), falls
+/// through to the generic exception.
 pub(crate) fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     let exc = dart_exception_name(&eb.type_name);
     let brand = errors::EXCEPTION_BRAND;
@@ -143,15 +144,33 @@ pub(crate) fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorB
     out.push_str(&w.finish());
 }
 
-/// Render one interface as an opaque-object wrapper class: it owns the C
-/// handle behind a private `_handle`, frees it once in `dispose()` via the
-/// interface's destroy symbol, and exposes the canonical `new` constructor as
-/// an unnamed factory (`Store(...)`), every other constructor as a named
-/// factory (`Store.open(...)`), instance methods that pass `_handle` as the
-/// implicit leading FFI argument, and statics as `static` methods. Member FFI
+/// Render one interface as a reference-counted object wrapper class.
+///
+/// The wrapper adopts one strong reference (the pointer behind the private
+/// `_handle`) and owes exactly one `_destroy` for it: `dispose()` releases it
+/// eagerly and a `NativeFinalizer` attached in the constructor releases it
+/// when an undisposed wrapper is collected. The two paths never both fire
+/// because `dispose()` detaches the finalizer before destroying, and a second
+/// `dispose()` is a no-op. Using a disposed wrapper throws a `StateError`.
+/// The private `_cloneRef()` calls the interface's `_clone` symbol to mint a
+/// second strong reference, which the value-buffer codec writes as an object
+/// token.
+///
+/// The canonical `new` constructor renders as an unnamed factory
+/// (`Store(...)`), every other constructor as a named factory
+/// (`Store.open(...)`), instance methods pass `_handle` as the implicit
+/// leading FFI argument, and statics are `static` methods. Member FFI
 /// typedefs and lookups stay at file scope.
 pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding) {
     let class_name = i.name.to_upper_camel_case();
+    emit_typedef_and_lookup(
+        out,
+        &i.clone_symbol,
+        "Pointer<Void>",
+        "Pointer<Void>",
+        "Pointer<Void>",
+        "Pointer<Void>",
+    );
     emit_typedef_and_lookup(
         out,
         &i.destroy_symbol,
@@ -160,6 +179,14 @@ pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &Int
         "Void",
         "void",
     );
+    let destroy_var = i.destroy_symbol.to_lower_camel_case();
+    let clone_var = i.clone_symbol.to_lower_camel_case();
+    let finalizer = format!("_{destroy_var}Finalizer");
+    out.push_str(&format!(
+        "final {finalizer} = NativeFinalizer(\n    \
+         _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('{}'));\n",
+        i.destroy_symbol
+    ));
 
     let exc = module
         .error
@@ -211,20 +238,56 @@ pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &Int
         emit_doc(&mut d, &i.doc, "");
         w.raw(d);
     }
-    w.block(format!("class {class_name} {{"), "}", |w| {
-        w.line("final Pointer<Void> _handle;");
-        w.line(format!("{class_name}._(this._handle);"));
-        w.blank();
-        w.line("/// Releases the native object reference.");
-        w.block("void dispose() {", "}", |w| {
+    if i.doc.is_some() {
+        w.line("///");
+    }
+    w.line("/// A reference-counted native object. Each instance holds one strong");
+    w.line("/// reference, released by [dispose] or, if the instance is collected");
+    w.line("/// without being disposed, by a GC finalizer. Instances stay valid for as");
+    w.line("/// long as the Dart object is reachable; the producer keeps its own");
+    w.line("/// references to any object it retains.");
+    if let Some(msg) = &i.deprecated {
+        w.line(format!("@Deprecated('{}')", dart_str_literal(msg)));
+    }
+    w.block(
+        format!("class {class_name} implements Finalizable {{"),
+        "}",
+        |w| {
+            w.line("final Pointer<Void> _ptr;");
+            w.line("bool _disposed = false;");
+            w.blank();
+            w.line("/// Adopts one strong reference to the native object.");
+            w.block(format!("{class_name}._(this._ptr) {{"), "}", |w| {
+                w.line(format!("{finalizer}.attach(this, _ptr, detach: this);"));
+            });
+            w.blank();
+            w.line("/// The borrowed native pointer for the duration of a call.");
+            w.block("Pointer<Void> get _handle {", "}", |w| {
+                w.line(format!(
+                    "if (_disposed) throw StateError('{class_name} used after dispose()');"
+                ));
+                w.line("return _ptr;");
+            });
+            w.blank();
+            w.line("/// Mints a second strong reference (the interface's `_clone` symbol) for");
+            w.line("/// an object token written into a value buffer.");
             w.line(format!(
-                "_{}(_handle);",
-                i.destroy_symbol.to_lower_camel_case()
+                "Pointer<Void> _cloneRef() => _{clone_var}(_handle);"
             ));
-        });
-        // Reindent the depth-0 member declarations into the class body.
-        w.block_raw(&members);
-    });
+            w.blank();
+            w.line("/// Releases this instance's native reference. Safe to call more than");
+            w.line("/// once; the native object is dropped when its last reference (this");
+            w.line("/// one, any other wrapper's, or the producer's) is released.");
+            w.block("void dispose() {", "}", |w| {
+                w.line("if (_disposed) return;");
+                w.line("_disposed = true;");
+                w.line(format!("{finalizer}.detach(this);"));
+                w.line(format!("_{destroy_var}(_ptr);"));
+            });
+            // Reindent the depth-0 member declarations into the class body.
+            w.block_raw(&members);
+        },
+    );
     out.push_str(&w.finish());
 }
 

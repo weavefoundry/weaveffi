@@ -15,13 +15,11 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
-#include <cstring>
 #include <utility>
+#include <cstring>
 #include <future>
 #include <cstddef>
 #include <iterator>
-#include <functional>
-#include <mutex>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -55,15 +53,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -71,6 +70,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -105,10 +108,20 @@ typedef enum {
 /** Error codes reported by throwing functions in the `kitchen` module tree. */
 typedef enum { weaveffi_kitchen_KitchenErrors_NotFound = 1, weaveffi_kitchen_KitchenErrors_InvalidInput = 2 } weaveffi_kitchen_KitchenErrors;
 typedef struct weaveffi_kitchen_Gadget weaveffi_kitchen_Gadget;
+typedef struct weaveffi_kitchen_StreamGadgetsIterator weaveffi_kitchen_StreamGadgetsIterator;
 typedef struct weaveffi_kitchen_StreamItemsIterator weaveffi_kitchen_StreamItemsIterator;
-typedef struct weaveffi_shared_Token weaveffi_shared_Token;
-/** Fires when an item is ready */
-typedef void (*weaveffi_kitchen_OnReady_fn)(int32_t code, const char* msg, void* context);
+/**
+ * Consumer-implemented observer of ready items
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_kitchen_ReadyListener_vtable {
+    /** Fires when an item is ready */
+    void (*on_ready)(void* ctx, int32_t code, const char* msg, weaveffi_error* out_err);
+    /** Receives the item itself and says whether to keep listening */
+    bool (*on_item)(void* ctx, const uint8_t* item_ptr, size_t item_len, weaveffi_kitchen_Gadget* gadget, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_kitchen_ReadyListener_vtable;
 typedef void (*weaveffi_kitchen_do_async_callback)(void* context, weaveffi_error* err, const char* result);
 typedef void (*weaveffi_kitchen_do_cancellable_callback)(void* context, weaveffi_error* err, const char* result);
 
@@ -124,12 +137,11 @@ WEAVEFFI_API const char* weaveffi_kitchen_Gadget_version(weaveffi_error* out_err
 WEAVEFFI_API const char* weaveffi_kitchen_Gadget_describe(const weaveffi_kitchen_Gadget* self, weaveffi_error* out_err);
 /** Poke the gadget a number of times, failing on a negative count */
 WEAVEFFI_API int32_t weaveffi_kitchen_Gadget_poke(const weaveffi_kitchen_Gadget* self, int32_t times, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_Gadget_clone(const weaveffi_kitchen_Gadget* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_kitchen_Gadget_destroy(weaveffi_kitchen_Gadget* self);
 
-/** Subscribe to OnReady events */
-WEAVEFFI_API uint64_t weaveffi_kitchen_register_ready_listener(weaveffi_kitchen_OnReady_fn callback, void* context);
-/** Subscribe to OnReady events */
-WEAVEFFI_API void weaveffi_kitchen_unregister_ready_listener(uint64_t id);
 /** Identity for bool */
 WEAVEFFI_API bool weaveffi_kitchen_bool_id(bool x, weaveffi_error* out_err);
 WEAVEFFI_API int32_t weaveffi_kitchen_i32_id(int32_t x, weaveffi_error* out_err);
@@ -138,14 +150,16 @@ WEAVEFFI_API int64_t weaveffi_kitchen_i64_id(int64_t x, weaveffi_error* out_err)
 WEAVEFFI_API double weaveffi_kitchen_f64_id(double x, weaveffi_error* out_err);
 WEAVEFFI_API const char* weaveffi_kitchen_echo_string(const char* s, weaveffi_error* out_err);
 WEAVEFFI_API const uint8_t* weaveffi_kitchen_echo_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
-/** Borrowed string parameter */
-WEAVEFFI_API const char* weaveffi_kitchen_echo_borrowed_str(const char* s, weaveffi_error* out_err);
-/** Borrowed bytes parameter */
-WEAVEFFI_API const uint8_t* weaveffi_kitchen_echo_borrowed_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
-/** Returns an opaque handle */
-WEAVEFFI_API weaveffi_handle_t weaveffi_kitchen_open_handle(weaveffi_error* out_err);
-/** Returns a typed handle */
-WEAVEFFI_API weaveffi_shared_Token* weaveffi_kitchen_open_typed_handle(weaveffi_error* out_err);
+/** Register a listener, returning how many are attached */
+WEAVEFFI_API int32_t weaveffi_kitchen_subscribe(void* listener_ctx, const weaveffi_kitchen_ReadyListener_vtable* listener_vtable, weaveffi_error* out_err);
+/** Optional object in both directions */
+WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_maybe_gadget(const weaveffi_kitchen_Gadget* fallback, weaveffi_error* out_err);
+/** A list of objects */
+WEAVEFFI_API const uint8_t* weaveffi_kitchen_gadgets(size_t* out_len, weaveffi_error* out_err);
+/** An iterator over objects */
+WEAVEFFI_API weaveffi_kitchen_StreamGadgetsIterator* weaveffi_kitchen_stream_gadgets(weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_kitchen_StreamGadgetsIterator_next(weaveffi_kitchen_StreamGadgetsIterator* iter, weaveffi_kitchen_Gadget** out_item, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_kitchen_StreamGadgetsIterator_destroy(weaveffi_kitchen_StreamGadgetsIterator* iter);
 /** Optional struct return */
 WEAVEFFI_API const uint8_t* weaveffi_kitchen_maybe_item(int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** List of structs */
@@ -175,7 +189,14 @@ WEAVEFFI_API const char* weaveffi_kitchen_nested_hello(weaveffi_error* out_err);
 
 namespace weaveffi {
 
-/** Base exception for every error reported through the C ABI. */
+/**
+ * Base exception for every error reported through the C ABI.
+ *
+ * Positive codes are the module's declared error codes (see the typed
+ * domain exceptions); negative codes are runtime traps: -1 a generic
+ * producer error, -2 a producer panic, -3 a marshalling failure, -4 a
+ * callback-interface implementation that threw.
+ */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -183,6 +204,17 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+/**
+ * Throws WeaveFFIError when the loaded producer library was built for a
+ * different WeaveFFI ABI revision than this header. Call once at startup.
+ */
+inline void check_abi_version() {
+    uint32_t actual = weaveffi_abi_version();
+    if (actual != WEAVEFFI_ABI_VERSION) {
+        throw WeaveFFIError(-1, "WeaveFFI ABI revision mismatch: header " + std::to_string(WEAVEFFI_ABI_VERSION) + ", library " + std::to_string(actual));
+    }
+}
 
 namespace detail {
 
@@ -268,7 +300,8 @@ public:
  * Decodes values from the WeaveFFI value-buffer wire format. A malformed
  * buffer is a producer/consumer contract violation (both sides are generated
  * from one IDL), so every decode failure throws the generic WeaveFFIError,
- * the same channel as a producer panic.
+ * the same channel as a producer panic. Object tokens adopted before a
+ * failure live in RAII wrappers that release them on unwind.
  */
 class BufferReader {
     const uint8_t* data_;
@@ -386,6 +419,69 @@ enum class Priority : int32_t {
     High = 2
 };
 
+struct Token;
+struct Item;
+class Gadget;
+class ReadyListener;
+
+/** A pocket-sized interface exercising the object surface */
+class Gadget {
+    weaveffi_kitchen_Gadget* handle_;
+
+public:
+    /** Adopts one strong reference to a producer object. */
+    explicit Gadget(weaveffi_kitchen_Gadget* h) : handle_(h) {}
+
+    /** Releases this wrapper's reference; the object is dropped with its last one. */
+    ~Gadget() {
+        if (handle_) weaveffi_kitchen_Gadget_destroy(handle_);
+    }
+
+    /** Copies share the object: the copy takes a new strong reference. */
+    Gadget(const Gadget& other) : handle_(weaveffi_kitchen_Gadget_clone(other.handle_)) {}
+
+    Gadget& operator=(const Gadget& other) {
+        if (this != &other) {
+            weaveffi_kitchen_Gadget* h = weaveffi_kitchen_Gadget_clone(other.handle_);
+            if (handle_) weaveffi_kitchen_Gadget_destroy(handle_);
+            handle_ = h;
+        }
+        return *this;
+    }
+
+    Gadget(Gadget&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Gadget& operator=(Gadget&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kitchen_Gadget_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** The wrapped pointer, borrowed: this wrapper keeps its reference. */
+    const weaveffi_kitchen_Gadget* handle() const { return handle_; }
+
+    /** A new strong reference the caller owns (for example to write into a value buffer). */
+    weaveffi_kitchen_Gadget* clone_handle() const { return weaveffi_kitchen_Gadget_clone(handle_); }
+
+    /** Create a gadget with the given id */
+    Gadget(int64_t id);
+
+    /** Render the gadget as a human-readable string */
+    std::string describe() const;
+
+    /** Poke the gadget a number of times, failing on a negative count */
+    int32_t poke(int32_t times) const;
+
+    /** The gadget subsystem version string */
+    static std::string version();
+
+};
+
 /** A reusable token referenced across modules */
 struct Token {
     int64_t id;
@@ -412,6 +508,8 @@ struct Item {
     /** Cross-module struct reference */
     Token token;
     Priority priority;
+    /** An optional object inside a record */
+    std::optional<Gadget> gadget;
 };
 
 namespace detail {
@@ -424,10 +522,9 @@ inline void write_Token(BufferWriter& w, const Token& v) {
 
 /** Decodes a `Token` from the WeaveFFI value-buffer format. */
 inline Token read_Token(BufferReader& r) {
-    Token out{};
-    out.id = r.read_i64();
-    out.label = r.read_string();
-    return out;
+    int64_t f_id = r.read_i64();
+    std::string f_label = r.read_string();
+    return Token{std::move(f_id), std::move(f_label)};
 }
 
 /** Encodes a `Item` in the WeaveFFI value-buffer format. */
@@ -454,41 +551,52 @@ inline void write_Item(BufferWriter& w, const Item& v) {
     }
     detail::write_Token(w, v.token);
     w.write_i32(static_cast<int32_t>(v.priority));
+    w.write_option_flag(v.gadget.has_value());
+    if (v.gadget.has_value()) {
+        w.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>((*v.gadget).clone_handle())));
+    }
 }
 
 /** Decodes a `Item` from the WeaveFFI value-buffer format. */
 inline Item read_Item(BufferReader& r) {
-    Item out{};
-    out.id = r.read_i64();
-    out.name = r.read_string();
-    out.count = r.read_i32();
-    out.enabled = r.read_bool();
-    out.ratio = r.read_f64();
-    out.nick = r.read_u32();
-    out.payload = r.read_bytes();
+    int64_t f_id = r.read_i64();
+    std::string f_name = r.read_string();
+    int32_t f_count = r.read_i32();
+    bool f_enabled = r.read_bool();
+    double f_ratio = r.read_f64();
+    uint32_t f_nick = r.read_u32();
+    std::vector<uint8_t> f_payload = r.read_bytes();
+    std::vector<std::string> f_tags{};
     {
-        size_t v_tags_n = r.read_len();
-        out.tags.reserve(v_tags_n);
-        for (size_t v_tags_i = 0; v_tags_i < v_tags_n; ++v_tags_i) {
-            std::string v_tags_item = r.read_string();
-            out.tags.push_back(std::move(v_tags_item));
+        size_t f_tags_n = r.read_len();
+        f_tags.reserve(f_tags_n);
+        for (size_t f_tags_i = 0; f_tags_i < f_tags_n; ++f_tags_i) {
+            std::string f_tags_item = r.read_string();
+            f_tags.push_back(std::move(f_tags_item));
         }
     }
+    std::unordered_map<std::string, std::string> f_attrs{};
     {
-        size_t v_attrs_n = r.read_len();
-        for (size_t v_attrs_i = 0; v_attrs_i < v_attrs_n; ++v_attrs_i) {
-            std::string v_attrs_key = r.read_string();
-            std::string v_attrs_val = r.read_string();
-            out.attrs.emplace(std::move(v_attrs_key), std::move(v_attrs_val));
+        size_t f_attrs_n = r.read_len();
+        for (size_t f_attrs_i = 0; f_attrs_i < f_attrs_n; ++f_attrs_i) {
+            std::string f_attrs_key = r.read_string();
+            std::string f_attrs_val = r.read_string();
+            f_attrs.emplace(std::move(f_attrs_key), std::move(f_attrs_val));
         }
     }
+    std::optional<int64_t> f_parent{};
     if (r.read_option_flag()) {
-        int64_t v_parent_v = r.read_i64();
-        out.parent = std::move(v_parent_v);
+        int64_t f_parent_v = r.read_i64();
+        f_parent = std::move(f_parent_v);
     }
-    out.token = detail::read_Token(r);
-    out.priority = static_cast<Priority>(r.read_i32());
-    return out;
+    Token f_token = detail::read_Token(r);
+    Priority f_priority = static_cast<Priority>(r.read_i32());
+    std::optional<Gadget> f_gadget{};
+    if (r.read_option_flag()) {
+        Gadget f_gadget_v = Gadget(reinterpret_cast<weaveffi_kitchen_Gadget*>(static_cast<uintptr_t>(r.read_u64())));
+        f_gadget = std::move(f_gadget_v);
+    }
+    return Item{std::move(f_id), std::move(f_name), std::move(f_count), std::move(f_enabled), std::move(f_ratio), std::move(f_nick), std::move(f_payload), std::move(f_tags), std::move(f_attrs), std::move(f_parent), std::move(f_token), std::move(f_priority), std::move(f_gadget)};
 }
 
 } // namespace detail
@@ -516,6 +624,8 @@ namespace detail {
 /** Map a `kitchen` error code and payload to its typed exception (WeaveFFIError for runtime codes, KitchenErrorsError for unknown codes). */
 inline std::exception_ptr make_kitchen_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
     if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
+    (void)payload_ptr;
+    (void)payload_len;
     switch (code) {
     case 1: return std::make_exception_ptr(NotFoundError(msg));
     case 2: return std::make_exception_ptr(InvalidInputError(msg));
@@ -534,86 +644,103 @@ inline void check_kitchen(weaveffi_error& err) {
 
 } // namespace detail
 
+/**
+ * Consumer-implemented observer of ready items
+ *
+ * Implement this interface and pass a `std::shared_ptr<ReadyListener>` to any function that accepts one. The producer may call the methods from any thread until it releases its last reference to the implementation. An exception thrown by a method is reported to the producer as a foreign error (code -4) and aborts the call that triggered it.
+ */
+class ReadyListener {
+public:
+    virtual ~ReadyListener() = default;
+
+    /** Fires when an item is ready */
+    virtual void on_ready(int32_t code, const std::string& msg) = 0;
+    /** Receives the item itself and says whether to keep listening */
+    virtual bool on_item(const Item& item, Gadget gadget) = 0;
+};
+
 namespace detail {
 
-inline std::mutex& wv_listener_mutex() {
-    static std::mutex m;
-    return m;
-}
+/** Vtable trampolines adapting a `ReadyListener` implementation to `weaveffi_kitchen_ReadyListener_vtable`. */
+struct ReadyListener_trampolines {
+    static void on_ready(void* ctx, int32_t code, const char* msg, weaveffi_error* out_err) {
+        try {
+            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
+            std::string msg_val(msg ? msg : "");
+            impl.on_ready(code, msg_val);
+            return;
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "ReadyListener::on_ready threw a non-standard exception");
+        }
+    }
 
-inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
-    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
-    return registry;
+    static bool on_item(void* ctx, const uint8_t* item_ptr, size_t item_len, weaveffi_kitchen_Gadget* gadget, weaveffi_error* out_err) {
+        Gadget gadget_val(gadget);
+        try {
+            ReadyListener& impl = **static_cast<std::shared_ptr<ReadyListener>*>(ctx);
+            detail::BufferReader item_r(item_ptr, item_len);
+            Item item_val = detail::read_Item(item_r);
+            item_r.expect_end();
+            return impl.on_item(item_val, std::move(gadget_val));
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "ReadyListener::on_item threw a non-standard exception");
+        }
+        return bool{};
+    }
+
+    /** Releases the implementation box once the producer drops its last reference. */
+    static void free_ctx(void* ctx) {
+        delete static_cast<std::shared_ptr<ReadyListener>*>(ctx);
+    }
+};
+
+/** The process-wide vtable every `ReadyListener` implementation is passed with. */
+inline const weaveffi_kitchen_ReadyListener_vtable& ReadyListener_vtable() {
+    static const weaveffi_kitchen_ReadyListener_vtable vtable = {
+        &ReadyListener_trampolines::on_ready,
+        &ReadyListener_trampolines::on_item,
+        &ReadyListener_trampolines::free_ctx,
+    };
+    return vtable;
 }
 
 } // namespace detail
 
-/** A pocket-sized interface exercising the object surface */
-class Gadget {
-    void* handle_;
+inline Gadget::Gadget(int64_t id) : handle_(nullptr) {
+    weaveffi_error err{};
+    auto result = weaveffi_kitchen_Gadget_new(id, &err);
+    detail::check(err);
+    handle_ = result;
+}
 
-public:
-    explicit Gadget(void* h) : handle_(h) {}
+inline std::string Gadget::describe() const {
+    weaveffi_error err{};
+    auto result = weaveffi_kitchen_Gadget_describe(handle_, &err);
+    detail::check(err);
+    std::string ret(result);
+    weaveffi_free_string(result);
+    return ret;
+}
 
-    ~Gadget() {
-        if (handle_) weaveffi_kitchen_Gadget_destroy(static_cast<weaveffi_kitchen_Gadget*>(handle_));
-    }
+inline int32_t Gadget::poke(int32_t times) const {
+    weaveffi_error err{};
+    auto result = weaveffi_kitchen_Gadget_poke(handle_, times, &err);
+    detail::check_kitchen(err);
+    return result;
+}
 
-    Gadget(const Gadget&) = delete;
-    Gadget& operator=(const Gadget&) = delete;
-
-    Gadget(Gadget&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Gadget& operator=(Gadget&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_kitchen_Gadget_destroy(static_cast<weaveffi_kitchen_Gadget*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    void* handle() const { return handle_; }
-
-    /** Create a gadget with the given id */
-    Gadget(int64_t id) : handle_(nullptr) {
-        weaveffi_error err{};
-        auto result = weaveffi_kitchen_Gadget_new(id, &err);
-        detail::check(err);
-        handle_ = result;
-    }
-
-    /** Render the gadget as a human-readable string */
-    std::string describe() const {
-        weaveffi_error err{};
-        auto result = weaveffi_kitchen_Gadget_describe(static_cast<const weaveffi_kitchen_Gadget*>(handle_), &err);
-        detail::check(err);
-        std::string ret(result);
-        weaveffi_free_string(result);
-        return ret;
-    }
-
-    /** Poke the gadget a number of times, failing on a negative count */
-    int32_t poke(int32_t times) const {
-        weaveffi_error err{};
-        auto result = weaveffi_kitchen_Gadget_poke(static_cast<const weaveffi_kitchen_Gadget*>(handle_), times, &err);
-        detail::check_kitchen(err);
-        return result;
-    }
-
-    /** The gadget subsystem version string */
-    static std::string version() {
-        weaveffi_error err{};
-        auto result = weaveffi_kitchen_Gadget_version(&err);
-        detail::check(err);
-        std::string ret(result);
-        weaveffi_free_string(result);
-        return ret;
-    }
-
-};
+inline std::string Gadget::version() {
+    weaveffi_error err{};
+    auto result = weaveffi_kitchen_Gadget_version(&err);
+    detail::check(err);
+    std::string ret(result);
+    weaveffi_free_string(result);
+    return ret;
+}
 
 namespace shared {
 
@@ -630,28 +757,6 @@ inline std::string ping() {
 } // namespace shared
 
 namespace kitchen {
-
-/** Subscribe to OnReady events */
-/** @return A subscription id for unregister_ready_listener(). */
-inline uint64_t register_ready_listener(std::function<void(int32_t, std::string)> callback) {
-    auto fn = std::make_shared<std::function<void(int32_t, std::string)>>(std::move(callback));
-    uint64_t id = weaveffi_kitchen_register_ready_listener(
-        [](int32_t code, const char* msg, void* context) {
-            auto& cb = *static_cast<std::function<void(int32_t, std::string)>*>(context);
-            cb(code, std::string(msg ? msg : ""));
-        },
-        fn.get());
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry()[id] = fn;
-    return id;
-}
-
-/** Unregisters a listener previously registered with register_ready_listener(). */
-inline void unregister_ready_listener(uint64_t id) {
-    weaveffi_kitchen_unregister_ready_listener(id);
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry().erase(id);
-}
 
 /** Identity for bool */
 inline bool bool_id(bool x) {
@@ -708,41 +813,139 @@ inline std::vector<uint8_t> echo_bytes(const std::vector<uint8_t>& b) {
     return ret;
 }
 
-/** Borrowed string parameter */
-inline std::string echo_borrowed_str(const std::string& s) {
+/** Register a listener, returning how many are attached */
+inline int32_t subscribe(std::shared_ptr<ReadyListener> listener) {
+    if (!listener) throw std::invalid_argument("listener: null callback interface");
+    auto* listener_ctx = new std::shared_ptr<ReadyListener>(std::move(listener));
     weaveffi_error err{};
-    auto result = weaveffi_kitchen_echo_borrowed_str(s.c_str(), &err);
-    detail::check(err);
-    std::string ret(result);
-    weaveffi_free_string(result);
-    return ret;
-}
-
-/** Borrowed bytes parameter */
-inline std::vector<uint8_t> echo_borrowed_bytes(const std::vector<uint8_t>& b) {
-    size_t out_len = 0;
-    weaveffi_error err{};
-    auto result = weaveffi_kitchen_echo_borrowed_bytes(b.data(), b.size(), &out_len, &err);
-    detail::check(err);
-    std::vector<uint8_t> ret(result, result + out_len);
-    weaveffi_free_bytes(const_cast<uint8_t*>(result), out_len);
-    return ret;
-}
-
-/** Returns an opaque handle */
-inline void* open_handle() {
-    weaveffi_error err{};
-    auto result = weaveffi_kitchen_open_handle(&err);
-    detail::check(err);
-    return reinterpret_cast<void*>(static_cast<uintptr_t>(result));
-}
-
-/** Returns a typed handle */
-inline weaveffi_shared_Token* open_typed_handle() {
-    weaveffi_error err{};
-    auto result = weaveffi_kitchen_open_typed_handle(&err);
+    auto result = weaveffi_kitchen_subscribe(static_cast<void*>(listener_ctx), &detail::ReadyListener_vtable(), &err);
     detail::check(err);
     return result;
+}
+
+/** Optional object in both directions */
+inline std::optional<Gadget> maybe_gadget(const std::optional<Gadget>& fallback) {
+    weaveffi_error err{};
+    auto result = weaveffi_kitchen_maybe_gadget(fallback.has_value() ? fallback->handle() : nullptr, &err);
+    detail::check(err);
+    if (!result) return std::nullopt;
+    return Gadget(result);
+}
+
+/** A list of objects */
+inline std::vector<Gadget> gadgets() {
+    size_t out_len = 0;
+    weaveffi_error err{};
+    auto result = weaveffi_kitchen_gadgets(&out_len, &err);
+    detail::check(err);
+    detail::BufferGuard result_guard{result, out_len};
+    detail::BufferReader result_r(result, out_len);
+    std::vector<Gadget> ret{};
+    {
+        size_t ret_n = result_r.read_len();
+        ret.reserve(ret_n);
+        for (size_t ret_i = 0; ret_i < ret_n; ++ret_i) {
+            Gadget ret_item = Gadget(reinterpret_cast<weaveffi_kitchen_Gadget*>(static_cast<uintptr_t>(result_r.read_u64())));
+            ret.push_back(std::move(ret_item));
+        }
+    }
+    result_r.expect_end();
+    return ret;
+}
+
+/**
+ * A lazy, move-only range over the `Gadget` elements produced by `stream_gadgets()`.
+ *
+ * Each iteration step pulls exactly one element from the producer, so results stream in constant memory. The range owns the producer-side iterator and releases it exactly once: eagerly when the range is exhausted, or from the destructor when iteration is abandoned early.
+ */
+class StreamGadgetsIterator {
+    weaveffi_kitchen_StreamGadgetsIterator* handle_;
+
+public:
+    /** Adopts ownership of the raw producer iterator. */
+    explicit StreamGadgetsIterator(weaveffi_kitchen_StreamGadgetsIterator* h) : handle_(h) {}
+
+    ~StreamGadgetsIterator() {
+        if (handle_) weaveffi_kitchen_StreamGadgetsIterator_destroy(handle_);
+    }
+
+    StreamGadgetsIterator(const StreamGadgetsIterator&) = delete;
+    StreamGadgetsIterator& operator=(const StreamGadgetsIterator&) = delete;
+
+    StreamGadgetsIterator(StreamGadgetsIterator&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    StreamGadgetsIterator& operator=(StreamGadgetsIterator&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_kitchen_StreamGadgetsIterator_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** Pulls the next element from the producer, or `std::nullopt` once exhausted (which releases the producer iterator eagerly). A producer error throws the generic WeaveFFIError after releasing the iterator. */
+    std::optional<Gadget> next() {
+        if (!handle_) return std::nullopt;
+        weaveffi_error err{};
+        weaveffi_kitchen_Gadget* item{};
+        int32_t has_item = weaveffi_kitchen_StreamGadgetsIterator_next(handle_, &item, &err);
+        if (err.code != 0) {
+            weaveffi_kitchen_StreamGadgetsIterator_destroy(handle_);
+            handle_ = nullptr;
+            detail::check(err);
+        }
+        if (has_item == 0) {
+            weaveffi_kitchen_StreamGadgetsIterator_destroy(handle_);
+            handle_ = nullptr;
+            return std::nullopt;
+        }
+        return Gadget(item);
+    }
+
+    /** Sentinel type marking the end of the range. */
+    struct sentinel {};
+
+    /** Single-pass input iterator; each increment pulls one element from the producer. */
+    class iterator {
+        StreamGadgetsIterator* range_;
+        std::optional<Gadget> current_;
+
+    public:
+        using iterator_category = std::input_iterator_tag;
+        using value_type = Gadget;
+        using difference_type = std::ptrdiff_t;
+        using pointer = Gadget*;
+        using reference = Gadget&;
+
+        /** Binds to `range` and pulls the first element. */
+        explicit iterator(StreamGadgetsIterator* range) : range_(range), current_(range->next()) {}
+        reference operator*() { return *current_; }
+        pointer operator->() { return &*current_; }
+        iterator& operator++() { current_ = range_->next(); return *this; }
+        void operator++(int) { current_ = range_->next(); }
+        bool operator==(sentinel) const { return !current_.has_value(); }
+        bool operator!=(sentinel) const { return current_.has_value(); }
+    };
+
+    /** Begins iteration by pulling the first element. */
+    iterator begin() { return iterator(this); }
+
+    /** The past-the-end sentinel. */
+    sentinel end() const { return sentinel{}; }
+};
+
+/**
+ * An iterator over objects
+ *
+ * @return A lazy `StreamGadgetsIterator` range that streams one element per iteration step and releases the producer iterator when exhausted or destroyed.
+ */
+inline StreamGadgetsIterator stream_gadgets() {
+    weaveffi_error err{};
+    weaveffi_kitchen_StreamGadgetsIterator* iter = weaveffi_kitchen_stream_gadgets(&err);
+    detail::check(err);
+    return StreamGadgetsIterator(iter);
 }
 
 /** Optional struct return */
@@ -813,7 +1016,7 @@ class StreamItemsIterator {
     weaveffi_kitchen_StreamItemsIterator* handle_;
 
 public:
-    /** Adopts ownership of the raw producer iterator handle. */
+    /** Adopts ownership of the raw producer iterator. */
     explicit StreamItemsIterator(weaveffi_kitchen_StreamItemsIterator* h) : handle_(h) {}
 
     ~StreamItemsIterator() {
@@ -923,35 +1126,43 @@ inline std::future<std::string> do_async(const std::string& input) {
     auto future = promise_ptr->get_future();
     weaveffi_kitchen_do_async_async(input.c_str(), [](void* context, weaveffi_error* err, const char* result) {
         auto* p = static_cast<std::promise<std::string>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            std::string value(result ? result : "");
-            weaveffi_free_string(result);
-            p->set_value(std::move(value));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                std::string value(result ? result : "");
+                weaveffi_free_string(result);
+                p->set_value(std::move(value));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
 }
 
 /** Cancellable async operation */
-inline std::future<std::string> do_cancellable(const std::string& input, weaveffi_cancel_token* cancel_token = nullptr) {
+inline std::future<std::string> do_cancellable(const std::string& input, weaveffi_cancel_token* cancel_token) {
     auto* promise_ptr = new std::promise<std::string>();
     auto future = promise_ptr->get_future();
     weaveffi_kitchen_do_cancellable_async(input.c_str(), cancel_token, [](void* context, weaveffi_error* err, const char* result) {
         auto* p = static_cast<std::promise<std::string>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            std::string value(result ? result : "");
-            weaveffi_free_string(result);
-            p->set_value(std::move(value));
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                std::string value(result ? result : "");
+                weaveffi_free_string(result);
+                p->set_value(std::move(value));
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;

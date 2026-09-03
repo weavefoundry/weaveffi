@@ -23,7 +23,7 @@ c_prefix = "kv"
 [generators.swift]
 module_name = "KVStore"
 
-[generators.android]
+[generators.kotlin]
 package = "com.example.kvstore"
 ```
 
@@ -52,8 +52,11 @@ weaveffi generate src/lib.rs -o generated --config ci.toml # a specific file
 Without any config file, every generator runs with its defaults and the
 package name falls back as described under [Package identity](#package-identity).
 
-Unknown tables and keys are rejected, so a typo like `[generator.swift]` or
-`modulename` fails the run instead of silently doing nothing.
+Every unknown table and key is rejected, so a typo like `[generator.swift]`,
+`c_prefx`, or `modulename` fails the run with the offending name, and so does
+a table for a target that no longer exists (such as the pre-0.22
+`[generators.android]`; the target is now `kotlin`). The accepted per-target
+keys are listed in the [table below](#generatorstarget).
 
 ## `[package]`
 
@@ -115,12 +118,13 @@ wrappers call; you rarely set it per target because of the fan-out above.
 | `[generators.cpp]`     | `standard`            | string | `"17"`            | C++ standard for the generated `CMakeLists.txt`                                                                                                                                           |
 | `[generators.swift]`   | `module_name`         | string | identity          | Swift module name in `Package.swift` and the `Sources/` directory                                                                                                                          |
 | `[generators.swift]`   | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Swift symbols                                                                                                                                        |
-| `[generators.android]` | `package`             | string | `"com.weaveffi"`  | Java/Kotlin package declaration in the JNI wrapper                                                                                                                                        |
-| `[generators.android]` | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Kotlin symbols                                                                                                                                       |
+| `[generators.kotlin]`  | `package`             | string | `"com.weaveffi"`  | JVM package for the generated Kotlin wrapper and the `namespace` in `build.gradle.kts`                                                                                                     |
+| `[generators.kotlin]`  | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Kotlin symbols                                                                                                                                       |
 | `[generators.node]`    | `package_name`        | string | identity          | npm package name                                                                                                                                                                          |
 | `[generators.node]`    | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted JS/TS symbols                                                                                                                                        |
 | `[generators.wasm]`    | `module_name`         | string | `"weaveffi_wasm"` | Module name in the Wasm JS loader                                                                                                                                                         |
-| `[generators.wasm]`    | `emscripten`          | bool   | `false`           | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` URL; async, callbacks, and listeners become throwing stubs |
+| `[generators.wasm]`    | `emscripten`          | bool   | `false`           | Target an Emscripten build: the loader accepts a pre-initialized Emscripten `Module` (or its `MODULARIZE` factory promise) instead of a `.wasm` source. Async functions and callback interfaces are unsupported in this mode |
+| `[generators.wasm]`    | `allow_unsupported`   | bool   | `false`           | In Emscripten mode, generate anyway when the API uses async functions or callback interfaces: the capability failure becomes a warning and those entry points are emitted as explicit throwing stubs. No effect outside Emscripten mode |
 | `[generators.python]`  | `package_name`        | string | identity          | Python package name                                                                                                                                                                       |
 | `[generators.python]`  | `strip_module_prefix` | bool   | `true`            | Strip the module prefix from emitted Python symbols                                                                                                                                       |
 | `[generators.dotnet]`  | `namespace`           | string | identity          | .NET namespace and NuGet package id                                                                                                                                                       |
@@ -147,9 +151,17 @@ module_name = "MyAppFFI"
 ```
 
 ```toml
-# Android library
-[generators.android]
+# Android or desktop-JVM library
+[generators.kotlin]
 package = "com.example.myapp.ffi"
+```
+
+```toml
+# Browser bundle linked into an existing Emscripten build (no async or
+# callback interfaces in the API)
+[generators.wasm]
+module_name = "myapp"
+emscripten = true
 ```
 
 ```toml

@@ -10,12 +10,26 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
 namespace WeaveFFI
 {
+    /// <summary>Raised for any WeaveFFI failure that isn't a typed domain
+    /// error: producer bugs, panics, marshalling failures, and exceptions
+    /// thrown by a callback-interface implementation.</summary>
     public class WeaveFFIException : Exception
     {
+        /// <summary>An untyped producer error.</summary>
+        public const int GenericErrorCode = -1;
+        /// <summary>The producer panicked; the message carries the panic text.</summary>
+        public const int PanicErrorCode = -2;
+        /// <summary>An argument couldn't be lifted by the producer.</summary>
+        public const int MarshalErrorCode = -3;
+        /// <summary>A callback-interface implementation threw; the message
+        /// carries the original exception's message.</summary>
+        public const int ForeignErrorCode = -4;
+
         public int Code { get; }
 
         public WeaveFFIException(int code, string message) : base(message)
@@ -93,6 +107,20 @@ namespace WeaveFFI
                 NativeMethods.weaveffi_error_clear(ref err);
                 throw DocsErrorsException.FromCode(code, msg, payload);
             }
+        }
+    }
+
+    /// <summary>One strong reference to a native object, on its way into
+    /// a wrapper that adopts it. A distinct type (rather than a bare
+    /// <c>IntPtr</c>) so the adopting constructor never competes with a
+    /// public constructor taking an integer.</summary>
+    internal readonly struct WeaveFFIHandle
+    {
+        internal readonly IntPtr Value;
+
+        internal WeaveFFIHandle(IntPtr value)
+        {
+            Value = value;
         }
     }
 
@@ -225,6 +253,11 @@ namespace WeaveFFI
             Ensure(v.Length);
             Array.Copy(v, 0, _buf, _len, v.Length);
             _len += v.Length;
+        }
+
+        internal void WriteObject(IntPtr token)
+        {
+            WriteU64((ulong)(nuint)(nint)token);
         }
 
         internal byte[] ToArray()
@@ -373,6 +406,16 @@ namespace WeaveFFI
             return outBuf;
         }
 
+        internal IntPtr ReadObject()
+        {
+            var token = ReadU64();
+            if (token == 0)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: null object token");
+            }
+            return (nint)(nuint)token;
+        }
+
         internal void ExpectEnd()
         {
             if (_pos != _data.Length)
@@ -453,6 +496,79 @@ namespace WeaveFFI
     }
 
     /// <summary>
+    /// Consumer-implemented observer of document-saved notifications.
+    /// 
+    /// Implementations must be safe to call from any thread.
+    /// </summary>
+    /// <remarks>Implement this interface and pass an instance wherever the
+    /// native library expects it. The library may call any method from any
+    /// thread until it releases its last reference to the instance. Object
+    /// arguments are owned by the implementation, which should dispose them
+    /// when done. An exception thrown by a method is reported to the native
+    /// caller as <see cref="WeaveFFIException.ForeignErrorCode"/>.</remarks>
+    public interface ISavedListener
+    {
+        /// <summary>Fires after a document has been persisted successfully</summary>
+        /// <param name="docId">Identifier of the saved document</param>
+        /// <param name="revision">Monotonically increasing revision</param>
+        void OnSaved(long docId, int revision);
+    }
+
+    /// <summary>The process-wide <c>weaveffi_docs_SavedListener_vtable</c> vtable and the trampolines behind
+    /// it, adapting an <see cref="ISavedListener"/> to the C ABI.</summary>
+    internal static unsafe class WeaveFFIVtable_docs_SavedListener
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Layout
+        {
+            public IntPtr on_saved;
+            public IntPtr free;
+        }
+
+        /// <summary>Address of the one static vtable for this interface. It is
+        /// allocated once and never freed, so the producer may keep the pointer
+        /// for the process lifetime.</summary>
+        internal static readonly IntPtr Pointer = Allocate();
+
+        private static IntPtr Allocate()
+        {
+            var layout = new Layout
+            {
+                on_saved = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, long, int, IntPtr, void>)&OnSavedTrampoline,
+                free = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, void>)&FreeTrampoline,
+            };
+            var mem = Marshal.AllocHGlobal(Marshal.SizeOf<Layout>());
+            Marshal.StructureToPtr(layout, mem, false);
+            return mem;
+        }
+
+        private static ISavedListener Target(IntPtr ctx)
+        {
+            return (ISavedListener)GCHandle.FromIntPtr(ctx).Target!;
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void OnSavedTrampoline(IntPtr ctx, long doc_id, int revision, IntPtr out_err)
+        {
+            try
+            {
+                var impl = Target(ctx);
+                impl.OnSaved(doc_id, revision);
+            }
+            catch (Exception ex)
+            {
+                NativeMethods.weaveffi_error_set(out_err, WeaveFFIException.ForeignErrorCode, ex.Message);
+            }
+        }
+
+        [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static void FreeTrampoline(IntPtr ctx)
+        {
+            GCHandle.FromIntPtr(ctx).Free();
+        }
+    }
+
+    /// <summary>
     /// An ordered collection of documents.
     /// 
     /// Notebooks own their documents and release them when destroyed.
@@ -460,14 +576,35 @@ namespace WeaveFFI
     public class Notebook : IDisposable
     {
         private IntPtr _handle;
-        private bool _disposed;
+        private int _released;
 
-        internal Notebook(IntPtr handle)
+        /// <summary>Adopts one strong reference to a native object.</summary>
+        internal Notebook(WeaveFFIHandle handle)
         {
-            _handle = handle;
+            _handle = handle.Value;
         }
 
-        internal IntPtr Handle => _handle;
+        /// <summary>The borrowed native pointer for the duration of a call.</summary>
+        /// <exception cref="ObjectDisposedException">The wrapper was disposed.</exception>
+        internal IntPtr Handle
+        {
+            get
+            {
+                var h = _handle;
+                if (h == IntPtr.Zero)
+                {
+                    throw new ObjectDisposedException(nameof(Notebook));
+                }
+                return h;
+            }
+        }
+
+        /// <summary>Mints a second strong reference the caller owns (for
+        /// example to write this object into a value buffer).</summary>
+        internal IntPtr CloneHandle()
+        {
+            return NativeMethods.weaveffi_docs_Notebook_clone(Handle);
+        }
 
         /// <summary>Create an empty notebook</summary>
         public Notebook()
@@ -489,7 +626,7 @@ namespace WeaveFFI
             var documentPin = GCHandle.Alloc(documentBuf, GCHandleType.Pinned);
             try
             {
-                var result = NativeMethods.weaveffi_docs_Notebook_insert(_handle, documentPin.AddrOfPinnedObject(), (UIntPtr)documentBuf.Length, ref err);
+                var result = NativeMethods.weaveffi_docs_Notebook_insert(Handle, documentPin.AddrOfPinnedObject(), (UIntPtr)documentBuf.Length, ref err);
                 WeaveFFIError.Check(err);
                 return result;
             }
@@ -505,7 +642,7 @@ namespace WeaveFFI
         public Document Find(long id)
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_docs_Notebook_find(_handle, id, out var outLen, ref err);
+            var result = NativeMethods.weaveffi_docs_Notebook_find(Handle, id, out var outLen, ref err);
             WeaveFFIError.CheckDocsErrors(err);
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
@@ -520,7 +657,7 @@ namespace WeaveFFI
         public int Size()
         {
             var err = new WeaveFFIError();
-            var result = NativeMethods.weaveffi_docs_Notebook_size(_handle, ref err);
+            var result = NativeMethods.weaveffi_docs_Notebook_size(Handle, ref err);
             WeaveFFIError.Check(err);
             return result;
         }
@@ -534,19 +671,32 @@ namespace WeaveFFI
             return result;
         }
 
+        /// <summary>Releases this wrapper's reference. The native object is
+        /// dropped when the producer releases its last reference; other
+        /// wrappers to the same object stay valid.</summary>
         public void Dispose()
         {
-            if (!_disposed)
-            {
-                NativeMethods.weaveffi_docs_Notebook_destroy(_handle);
-                _disposed = true;
-            }
+            Release();
             GC.SuppressFinalize(this);
         }
 
         ~Notebook()
         {
-            Dispose();
+            Release();
+        }
+
+        private void Release()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _released, 1) != 0)
+            {
+                return;
+            }
+            var h = _handle;
+            _handle = IntPtr.Zero;
+            if (h != IntPtr.Zero)
+            {
+                NativeMethods.weaveffi_docs_Notebook_destroy(h);
+            }
         }
     }
 
@@ -555,7 +705,7 @@ namespace WeaveFFI
         private const string LibName = "weaveffi";
 
         // The ABI revision these bindings were generated against.
-        internal const uint AbiVersion = 1;
+        internal const uint AbiVersion = 2;
 
         // Runs before the first P/Invoke through this class, so a producer built
         // for a different ABI revision fails loudly instead of misreading the
@@ -582,6 +732,12 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern uint weaveffi_abi_version();
 
+        // Fills a producer-owned error slot with a copy of `message`; callback
+        // trampolines report a thrown exception through it so no managed
+        // allocation is ever handed to the producer's allocator.
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_set(IntPtr err, int code, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_string(IntPtr ptr);
 
@@ -594,38 +750,32 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_error_free(IntPtr err);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_clone", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr weaveffi_docs_Notebook_clone(IntPtr self);
+
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_destroy", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_docs_Notebook_destroy(IntPtr self);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_new", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_Notebook_new(ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_docs_Notebook_new(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_insert", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_docs_Notebook_insert(IntPtr self, IntPtr document_ptr, UIntPtr document_len, ref WeaveFFIError err);
+        internal static extern int weaveffi_docs_Notebook_insert(IntPtr self, IntPtr document_ptr, UIntPtr document_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_find", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_Notebook_find(IntPtr self, long id, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_docs_Notebook_find(IntPtr self, long id, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_size", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_docs_Notebook_size(IntPtr self, ref WeaveFFIError err);
+        internal static extern int weaveffi_docs_Notebook_size(IntPtr self, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_Notebook_max_documents", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int weaveffi_docs_Notebook_max_documents(ref WeaveFFIError err);
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void Cb_weaveffi_docs_OnSaved_fn(long doc_id, int revision, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_docs_register_saved_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_docs_register_saved_listener(Cb_weaveffi_docs_OnSaved_fn callback, IntPtr context);
-
-        [DllImport(LibName, EntryPoint = "weaveffi_docs_unregister_saved_listener", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void weaveffi_docs_unregister_saved_listener(ulong id);
+        internal static extern int weaveffi_docs_Notebook_max_documents(ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_create_document", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_create_document(IntPtr title, IntPtr tags_ptr, UIntPtr tags_len, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_docs_create_document(IntPtr title, IntPtr tags_ptr, UIntPtr tags_len, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_docs_get_document", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_docs_get_document(long id, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_docs_get_document(long id, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void AsyncCb_weaveffi_docs_publish_async(IntPtr context, IntPtr err, byte result);
@@ -633,43 +783,13 @@ namespace WeaveFFI
         [DllImport(LibName, EntryPoint = "weaveffi_docs_publish_async_async", CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_docs_publish_async_async(long id, AsyncCb_weaveffi_docs_publish_async callback, IntPtr context);
 
+        [DllImport(LibName, EntryPoint = "weaveffi_docs_watch", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_docs_watch(IntPtr listener_ctx, IntPtr listener_vtable, ref WeaveFFIError out_err);
+
     }
 
     public static class Docs
     {
-        private static readonly object _listenerLock = new object();
-        // Live listener delegates by subscription id. Holding the delegate
-        // here keeps its native thunk alive until unregistered; without this
-        // the GC could collect a delegate the producer still calls.
-        private static readonly Dictionary<ulong, Delegate> _listenerRefs = new Dictionary<ulong, Delegate>();
-
-        /// <summary>Subscribe to document-saved notifications</summary>
-        /// <returns>A subscription id for UnregisterSavedListener().</returns>
-        public static ulong RegisterSavedListener(Action<long, int> callback)
-        {
-            NativeMethods.Cb_weaveffi_docs_OnSaved_fn trampoline = (doc_id, revision, context) =>
-            {
-                callback(doc_id, revision);
-            };
-            ulong id;
-            lock (_listenerLock)
-            {
-                id = NativeMethods.weaveffi_docs_register_saved_listener(trampoline, IntPtr.Zero);
-                _listenerRefs[id] = trampoline;
-            }
-            return id;
-        }
-
-        /// <summary>Unregisters a listener previously registered with RegisterSavedListener().</summary>
-        public static void UnregisterSavedListener(ulong id)
-        {
-            NativeMethods.weaveffi_docs_unregister_saved_listener(id);
-            lock (_listenerLock)
-            {
-                _listenerRefs.Remove(id);
-            }
-        }
-
         /// <summary>
         /// Create a brand new document.
         /// 
@@ -772,6 +892,16 @@ namespace WeaveFFI
                 throw;
             }
             return await tcs.Task;
+        }
+
+        /// <summary>Register a listener for saved notifications</summary>
+        /// <param name="listener">Receiver of saved notifications</param>
+        public static void Watch(ISavedListener listener)
+        {
+            var err = new WeaveFFIError();
+            var listenerCtx = GCHandle.ToIntPtr(GCHandle.Alloc(listener));
+            NativeMethods.weaveffi_docs_watch(listenerCtx, WeaveFFIVtable_docs_SavedListener.Pointer, ref err);
+            WeaveFFIError.Check(err);
         }
 
     }

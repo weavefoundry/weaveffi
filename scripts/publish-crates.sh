@@ -15,7 +15,7 @@ CRATES=(
   weaveffi
   weaveffi-gen-c
   weaveffi-gen-swift
-  weaveffi-gen-android
+  weaveffi-gen-kotlin
   weaveffi-gen-node
   weaveffi-gen-wasm
   weaveffi-gen-python

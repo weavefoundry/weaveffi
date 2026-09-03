@@ -32,7 +32,7 @@ module WeaveFFI
   # The ABI revision these bindings were generated against. Checked before any
   # other symbol is attached so a mismatched producer fails at require time
   # instead of misreading the error struct or a value buffer later.
-  ABI_VERSION = 1
+  ABI_VERSION = 2
   begin
     attach_function :weaveffi_abi_version, [], :uint32
   rescue FFI::NotFoundError
@@ -51,6 +51,16 @@ module WeaveFFI
            :payload_ptr, :pointer,
            :payload_len, :size_t
   end
+
+  # The runtime-reserved error codes. Positive codes belong to a module's
+  # declared error domain; these negative codes are programming errors the
+  # wrappers raise as a plain Error regardless of the function's `throws`.
+  GENERIC_ERROR_CODE = -1
+  PANIC_ERROR_CODE = -2
+  MARSHAL_ERROR_CODE = -3
+  # A callback-interface implementation raised; the message carries the
+  # exception text.
+  FOREIGN_ERROR_CODE = -4
 
   class Error < StandardError
     attr_reader :code
@@ -225,12 +235,21 @@ module WeaveFFI
       take(read_len, 'byte buffer')
     end
 
+    # An object token: a non-zero u64 carrying one strong reference the
+    # caller adopts into a wrapper.
+    def read_object_token
+      addr = read_u64
+      raise Error.new(-1, 'malformed value buffer: null object token') if addr.zero?
+      FFI::Pointer.new(addr)
+    end
+
     def expect_end!
       return if @pos == @data.bytesize
       raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
+  attach_function :weaveffi_error_set, [:pointer, :int32, :string], :void
   attach_function :weaveffi_error_clear, [:pointer], :void
   attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
@@ -240,15 +259,51 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_error_clear(err.to_ptr)
     raise Error.new(code, msg)
   end
 
-  # Registered listener trampolines, keyed by subscription id. Holding the
-  # FFI::Function objects here keeps them alive until unregistered; without
-  # this the GC could collect a trampoline the producer still calls.
-  @listener_refs = {}
+  # Live callback-interface implementations keyed by the Integer the producer
+  # holds as `ctx`. Keys start at 1 so a context pointer is never NULL.
+  @wv_cb_registry = {}
+  @wv_cb_next_key = 0
+  @wv_cb_mutex = Mutex.new
+
+  # @api private
+  # Registers `impl` and returns the `ctx` pointer to hand the producer.
+  def self._wv_cb_register(impl)
+    @wv_cb_mutex.synchronize do
+      @wv_cb_next_key += 1
+      @wv_cb_registry[@wv_cb_next_key] = impl
+      FFI::Pointer.new(@wv_cb_next_key)
+    end
+  end
+
+  # @api private
+  # Resolves a trampoline's `ctx` back to the registered implementation.
+  def self._wv_cb_lookup(ctx)
+    impl = @wv_cb_mutex.synchronize { @wv_cb_registry[ctx.address] }
+    raise Error.new(FOREIGN_ERROR_CODE, 'callback context is not registered') if impl.nil?
+    impl
+  end
+
+  # @api private
+  # Drops the registry entry when the producer releases its last reference.
+  def self._wv_cb_free(ctx)
+    @wv_cb_mutex.synchronize { @wv_cb_registry.delete(ctx.address) }
+    nil
+  end
+
+  # @api private
+  # Reports a callback implementation's exception through `out_err`. The
+  # producer copies the message, so the Ruby String need not outlive the call.
+  def self._wv_cb_fail(out_err, exception)
+    message = exception.message.to_s
+    message = exception.class.name if message.empty?
+    weaveffi_error_set(out_err, FOREIGN_ERROR_CODE, message)
+    nil
+  end
 
   # === Module: shared ===
 
@@ -295,7 +350,7 @@ module WeaveFFI
     result = weaveffi_shared_ping(err)
     check_error!(err)
     return '' if result.null?
-    str = result.read_string
+    str = result.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_free_string(result)
     str
   end
@@ -331,7 +386,7 @@ module WeaveFFI
 
   # Builds the KitchenErrorsError subclass matching `code`, decoding any payload
   # fields the code declares, or a generic Error for codes outside
-  # the domain (panics, marshalling).
+  # the domain (panics, marshalling, callback failures).
   def self.kitchen_errors_error_from(code, message, payload = nil)
     cls = KITCHEN_ERRORS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
@@ -343,7 +398,7 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     payload_ptr = err[:payload_ptr]
     payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
@@ -392,7 +447,10 @@ module WeaveFFI
 
     attr_reader :priority
 
-    def initialize(id:, name:, count:, enabled:, ratio:, nick:, payload:, tags:, attrs:, parent:, token:, priority:)
+    # An optional object inside a record
+    attr_reader :gadget
+
+    def initialize(id:, name:, count:, enabled:, ratio:, nick:, payload:, tags:, attrs:, parent:, token:, priority:, gadget:)
       @id = id
       @name = name
       @count = count
@@ -405,6 +463,7 @@ module WeaveFFI
       @parent = parent
       @token = token
       @priority = priority
+      @gadget = gadget
     end
 
     # Structural equality over every field.
@@ -422,6 +481,7 @@ module WeaveFFI
       return false unless parent == other.parent
       return false unless token == other.token
       return false unless priority == other.priority
+      return false unless gadget == other.gadget
       true
     end
   end
@@ -453,6 +513,12 @@ module WeaveFFI
     end
     _wv_write_token(w, v.token)
     w.write_i32(v.priority)
+    if v.gadget.nil?
+      w.write_flag(false)
+    else
+      w.write_flag(true)
+      w.write_u64(v.gadget._wv_clone_ptr.address)
+    end
   end
 
   # @api private
@@ -482,9 +548,15 @@ module WeaveFFI
     end
     _wv_token = _wv_read_token(r)
     _wv_priority = r.read_i32
-    Item.new(id: _wv_id, name: _wv_name, count: _wv_count, enabled: _wv_enabled, ratio: _wv_ratio, nick: _wv_nick, payload: _wv_payload, tags: _wv_tags, attrs: _wv_attrs, parent: _wv_parent, token: _wv_token, priority: _wv_priority)
+    if r.read_flag
+      _wv_gadget = Gadget._from_ptr(r.read_object_token)
+    else
+      _wv_gadget = nil
+    end
+    Item.new(id: _wv_id, name: _wv_name, count: _wv_count, enabled: _wv_enabled, ratio: _wv_ratio, nick: _wv_nick, payload: _wv_payload, tags: _wv_tags, attrs: _wv_attrs, parent: _wv_parent, token: _wv_token, priority: _wv_priority, gadget: _wv_gadget)
   end
 
+  attach_function :weaveffi_kitchen_Gadget_clone, [:pointer], :pointer
   attach_function :weaveffi_kitchen_Gadget_destroy, [:pointer], :void
   # Create a gadget with the given id
   attach_function :weaveffi_kitchen_Gadget_new, [:int64, :pointer], :pointer
@@ -494,10 +566,6 @@ module WeaveFFI
   attach_function :weaveffi_kitchen_Gadget_poke, [:pointer, :int32, :pointer], :int32
   # The gadget subsystem version string
   attach_function :weaveffi_kitchen_Gadget_version, [:pointer], :pointer
-  # Fires when an item is ready
-  callback :weaveffi_kitchen_OnReady_fn, [:int32, :string, :pointer], :void
-  attach_function :weaveffi_kitchen_register_ready_listener, [:weaveffi_kitchen_OnReady_fn, :pointer], :uint64
-  attach_function :weaveffi_kitchen_unregister_ready_listener, [:uint64], :void
   # Identity for bool
   attach_function :weaveffi_kitchen_bool_id, [:int32, :pointer], :int32
   attach_function :weaveffi_kitchen_i32_id, [:int32, :pointer], :int32
@@ -506,14 +574,16 @@ module WeaveFFI
   attach_function :weaveffi_kitchen_f64_id, [:double, :pointer], :double
   attach_function :weaveffi_kitchen_echo_string, [:string, :pointer], :pointer
   attach_function :weaveffi_kitchen_echo_bytes, [:pointer, :size_t, :pointer, :pointer], :pointer
-  # Borrowed string parameter
-  attach_function :weaveffi_kitchen_echo_borrowed_str, [:string, :pointer], :pointer
-  # Borrowed bytes parameter
-  attach_function :weaveffi_kitchen_echo_borrowed_bytes, [:pointer, :size_t, :pointer, :pointer], :pointer
-  # Returns an opaque handle
-  attach_function :weaveffi_kitchen_open_handle, [:pointer], :uint64
-  # Returns a typed handle
-  attach_function :weaveffi_kitchen_open_typed_handle, [:pointer], :pointer
+  # Register a listener, returning how many are attached
+  attach_function :weaveffi_kitchen_subscribe, [:pointer, :pointer, :pointer], :int32
+  # Optional object in both directions
+  attach_function :weaveffi_kitchen_maybe_gadget, [:pointer, :pointer], :pointer
+  # A list of objects
+  attach_function :weaveffi_kitchen_gadgets, [:pointer, :pointer], :pointer
+  # An iterator over objects
+  attach_function :weaveffi_kitchen_stream_gadgets, [:pointer], :pointer
+  attach_function :weaveffi_kitchen_StreamGadgetsIterator_next, [:pointer, :pointer, :pointer], :int32
+  attach_function :weaveffi_kitchen_StreamGadgetsIterator_destroy, [:pointer], :void
   # Optional struct return
   attach_function :weaveffi_kitchen_maybe_item, [:int64, :pointer, :pointer], :pointer
   # List of structs
@@ -537,6 +607,80 @@ module WeaveFFI
   # Replacement for legacy_op
   attach_function :weaveffi_kitchen_new_op, [:pointer], :int32
 
+  # Consumer-implemented observer of ready items
+  # Consumer-implemented callback interface. Any object responding to the
+  # methods below is accepted wherever a ReadyListener parameter is expected;
+  # include this module to inherit NotImplementedError defaults. The
+  # producer may call the methods from any thread until it releases the
+  # implementation.
+  module ReadyListener
+    # Fires when an item is ready
+    def on_ready(code, msg)
+      raise NotImplementedError, "#{self.class}#on_ready is not implemented"
+    end
+
+    # Receives the item itself and says whether to keep listening
+    # @return [Object] a bool
+    def on_item(item, gadget)
+      raise NotImplementedError, "#{self.class}#on_item is not implemented"
+    end
+  end
+
+  # @api private
+  # The C vtable layout the producer calls a ReadyListener through.
+  class WvReadyListenerVtable < FFI::Struct
+    layout :on_ready, :pointer,
+           :on_item, :pointer,
+           :free, :pointer
+  end
+
+  # @api private
+  # Trampoline for ReadyListener#on_ready.
+  WV_READY_LISTENER_ON_READY = FFI::Function.new(:void, [:pointer, :int32, :string, :pointer]) do |ctx, code, msg, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      code_v = code
+      msg_v = msg.nil? ? '' : msg.force_encoding(Encoding::UTF_8)
+      impl.on_ready(code_v, msg_v)
+      nil
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      nil
+    end
+  end
+
+  # @api private
+  # Trampoline for ReadyListener#on_item.
+  WV_READY_LISTENER_ON_ITEM = FFI::Function.new(:int32, [:pointer, :pointer, :size_t, :pointer, :pointer]) do |ctx, item_ptr, item_len, gadget, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      item_r = WvBufferReader.new(item_ptr.null? ? ''.b : item_ptr.read_string(item_len))
+      item_v = _wv_read_item(item_r)
+      item_r.expect_end!
+      gadget_v = Gadget._from_ptr(gadget)
+      impl.on_item(item_v, gadget_v) ? 1 : 0
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      0
+    end
+  end
+
+  # @api private
+  # Releases a ReadyListener implementation when the producer drops its last
+  # reference.
+  WV_READY_LISTENER_FREE = FFI::Function.new(:void, [:pointer]) do |ctx|
+    _wv_cb_free(ctx)
+  end
+
+  # The one process-wide ReadyListener vtable every registration hands the
+  # producer; its entries live for the process lifetime.
+  WV_READY_LISTENER_VTABLE = WvReadyListenerVtable.new
+  WV_READY_LISTENER_VTABLE[:on_ready] = WV_READY_LISTENER_ON_READY
+  WV_READY_LISTENER_VTABLE[:on_item] = WV_READY_LISTENER_ON_ITEM
+  WV_READY_LISTENER_VTABLE[:free] = WV_READY_LISTENER_FREE
+
+  # @api private
+  # Owns one strong reference to a Gadget; releases it exactly once.
   class GadgetPtr < FFI::AutoPointer
     def self.release(ptr)
       WeaveFFI.weaveffi_kitchen_Gadget_destroy(ptr)
@@ -545,9 +689,8 @@ module WeaveFFI
 
   # A pocket-sized interface exercising the object surface
   class Gadget
-    attr_reader :handle
-
-    # Wraps an owned pointer the producer handed over, without
+    # @api private
+    # Adopts one strong reference the producer handed over, without
     # re-running initialize.
     def self._from_ptr(ptr)
       obj = allocate
@@ -555,10 +698,37 @@ module WeaveFFI
       obj
     end
 
-    def destroy
+    # The borrowed object pointer passed to producer calls.
+    def handle
+      raise Error.new(-1, 'Gadget used after close') if @handle.nil?
+      @handle
+    end
+
+    # Whether close has released this wrapper's reference.
+    def closed?
+      @handle.nil?
+    end
+
+    # Releases this wrapper's reference now rather than at GC time.
+    # Idempotent; the object itself is dropped when the last reference
+    # anywhere (another wrapper, a record field, the producer) goes.
+    def close
       return if @handle.nil?
       @handle.free
       @handle = nil
+    end
+
+    # @api private
+    # Mints a new strong reference the caller owns (used when this
+    # object is written into a value buffer).
+    def _wv_clone_ptr
+      WeaveFFI.weaveffi_kitchen_Gadget_clone(handle)
+    end
+
+    # dup and clone produce an independent wrapper with its own reference.
+    def initialize_copy(other)
+      super
+      @handle = GadgetPtr.new(WeaveFFI.weaveffi_kitchen_Gadget_clone(other.handle))
     end
 
     # Create a gadget with the given id
@@ -573,10 +743,10 @@ module WeaveFFI
     # Render the gadget as a human-readable string
     def describe()
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_kitchen_Gadget_describe(@handle, err)
+      result = WeaveFFI.weaveffi_kitchen_Gadget_describe(handle, err)
       WeaveFFI.check_error!(err)
       return '' if result.null?
-      str = result.read_string
+      str = result.read_string.force_encoding(Encoding::UTF_8)
       WeaveFFI.weaveffi_free_string(result)
       str
     end
@@ -584,7 +754,7 @@ module WeaveFFI
     # Poke the gadget a number of times, failing on a negative count
     def poke(times)
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_kitchen_Gadget_poke(@handle, times, err)
+      result = WeaveFFI.weaveffi_kitchen_Gadget_poke(handle, times, err)
       WeaveFFI.check_kitchen_errors_error!(err)
       result
     end
@@ -595,29 +765,10 @@ module WeaveFFI
       result = WeaveFFI.weaveffi_kitchen_Gadget_version(err)
       WeaveFFI.check_error!(err)
       return '' if result.null?
-      str = result.read_string
+      str = result.read_string.force_encoding(Encoding::UTF_8)
       WeaveFFI.weaveffi_free_string(result)
       str
     end
-  end
-
-  # Subscribe to OnReady events
-  # Registers a OnReady listener block. Returns a subscription id for
-  # unregister_ready_listener.
-  def self.register_ready_listener(&block)
-    trampoline = FFI::Function.new(:void, [:int32, :string, :pointer]) do |code, msg, _context|
-      block.call(code, msg)
-    end
-    listener_id = weaveffi_kitchen_register_ready_listener(trampoline, FFI::Pointer::NULL)
-    @listener_refs[listener_id] = trampoline
-    listener_id
-  end
-
-  # Unregisters a listener previously registered with register_ready_listener.
-  def self.unregister_ready_listener(listener_id)
-    weaveffi_kitchen_unregister_ready_listener(listener_id)
-    @listener_refs.delete(listener_id)
-    nil
   end
 
   # Identity for bool
@@ -626,7 +777,7 @@ module WeaveFFI
     x_c = x ? 1 : 0
     result = weaveffi_kitchen_bool_id(x_c, err)
     check_error!(err)
-    result != 0
+    (result != 0)
   end
 
   def self.i32_id(x)
@@ -662,7 +813,7 @@ module WeaveFFI
     result = weaveffi_kitchen_echo_string(s, err)
     check_error!(err)
     return '' if result.null?
-    str = result.read_string
+    str = result.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_free_string(result)
     str
   end
@@ -681,47 +832,71 @@ module WeaveFFI
     data
   end
 
-  # Borrowed string parameter
-  def self.echo_borrowed_str(s)
+  # Register a listener, returning how many are attached
+  def self.subscribe(listener)
     err = ErrorStruct.new
-    result = weaveffi_kitchen_echo_borrowed_str(s, err)
-    check_error!(err)
-    return '' if result.null?
-    str = result.read_string
-    weaveffi_free_string(result)
-    str
-  end
-
-  # Borrowed bytes parameter
-  def self.echo_borrowed_bytes(b)
-    err = ErrorStruct.new
-    b_buf = FFI::MemoryPointer.new(:uint8, b.bytesize)
-    b_buf.put_bytes(0, b)
-    out_len = FFI::MemoryPointer.new(:size_t)
-    result = weaveffi_kitchen_echo_borrowed_bytes(b_buf, b.bytesize, out_len, err)
-    check_error!(err)
-    return ''.b if result.null?
-    len = out_len.read(:size_t)
-    data = result.read_string(len)
-    weaveffi_free_bytes(result, len)
-    data
-  end
-
-  # Returns an opaque handle
-  def self.open_handle()
-    err = ErrorStruct.new
-    result = weaveffi_kitchen_open_handle(err)
+    listener_ctx = _wv_cb_register(listener)
+    result = weaveffi_kitchen_subscribe(listener_ctx, WV_READY_LISTENER_VTABLE.to_ptr, err)
     check_error!(err)
     result
   end
 
-  # Returns a typed handle
-  def self.open_typed_handle()
+  # Optional object in both directions
+  def self.maybe_gadget(fallback)
     err = ErrorStruct.new
-    result = weaveffi_kitchen_open_typed_handle(err)
+    result = weaveffi_kitchen_maybe_gadget(fallback&.handle, err)
     check_error!(err)
-    raise Error.new(-1, 'null pointer') if result.null?
-    shared.Token.new(result)
+    return nil if result.null?
+    Gadget._from_ptr(result)
+  end
+
+  # A list of objects
+  def self.gadgets()
+    err = ErrorStruct.new
+    out_len = FFI::MemoryPointer.new(:size_t)
+    result = weaveffi_kitchen_gadgets(out_len, err)
+    check_error!(err)
+    len = out_len.read(:size_t)
+    data = result.null? ? ''.b : result.read_string(len)
+    weaveffi_free_bytes(result, len) unless result.null?
+    _wv_r = WvBufferReader.new(data)
+    _wv_value = Array.new(_wv_r.read_len) do
+      _wv_e0 = Gadget._from_ptr(_wv_r.read_object_token)
+      _wv_e0
+    end
+    _wv_r.expect_end!
+    _wv_value
+  end
+
+  # An iterator over objects
+  # Returns a lazy Enumerator that streams one element per pull; call
+  # `.to_a` to collect eagerly. The underlying producer iterator is
+  # launched on the first pull, so launch errors raise at that point
+  # rather than when this method returns. The iterator handle is
+  # released exactly once, when iteration finishes or is abandoned
+  # early (for example by `break`).
+  def self.stream_gadgets()
+    Enumerator.new do |y|
+      err = ErrorStruct.new
+      iter = weaveffi_kitchen_stream_gadgets(err)
+      begin
+        check_error!(err)
+        unless iter.null?
+          loop do
+            out_item = FFI::MemoryPointer.new(:pointer)
+            item_err = ErrorStruct.new
+            has_item = weaveffi_kitchen_StreamGadgetsIterator_next(iter, out_item, item_err)
+            check_error!(item_err)
+            break if has_item.zero?
+            item_ptr = out_item.read_pointer
+            raise Error.new(-1, 'null pointer') if item_ptr.null?
+            y << Gadget._from_ptr(item_ptr)
+          end
+        end
+      ensure
+        weaveffi_kitchen_StreamGadgetsIterator_destroy(iter) unless iter.null?
+      end
+    end
   end
 
   # Optional struct return
@@ -842,11 +1017,11 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
-        _wv_s = result.null? ? '' : result.read_string
+        _wv_s = result.null? ? '' : result.read_string.force_encoding(Encoding::UTF_8)
         weaveffi_free_string(result) unless result.null?
         queue << _wv_s
       end
@@ -866,11 +1041,11 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
-        _wv_s = result.null? ? '' : result.read_string
+        _wv_s = result.null? ? '' : result.read_string.force_encoding(Encoding::UTF_8)
         weaveffi_free_string(result) unless result.null?
         queue << _wv_s
       end
@@ -908,7 +1083,7 @@ module WeaveFFI
     result = weaveffi_kitchen_nested_hello(err)
     check_error!(err)
     return '' if result.null?
-    str = result.read_string
+    str = result.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_free_string(result)
     str
   end
