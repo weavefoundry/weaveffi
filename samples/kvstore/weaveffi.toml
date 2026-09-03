@@ -1,0 +1,26 @@
+[package]
+name = "kvstore"
+version = "1.0.0"
+description = "An embedded key-value store API with TTLs, iteration, and async compaction."
+license = "MIT"
+authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
+homepage = "https://github.com/weavefoundry/weaveffi"
+repository = "https://github.com/weavefoundry/weaveffi"
+
+[generators.ruby]
+module_name = "Kvstore"
+
+[generators.dotnet]
+namespace = "Kvstore"
+
+[generators.swift]
+module_name = "Kvstore"
+
+[generators.cpp]
+namespace = "kvstore"
+
+[generators.dart]
+package_name = "kvstore"
+
+[generators.go]
+module_path = "github.com/example/kvstore"

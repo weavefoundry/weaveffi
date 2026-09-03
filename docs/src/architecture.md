@@ -18,23 +18,24 @@ Parse        ── weaveffi-ir::parse (IDL) | weaveffi-bridge (.rs): builds an 
    │
    ▼
 Validate     ── weaveffi-core::validate: rejects errors, collects warnings,
-   │            rewrites every parsed type reference to its resolved kind,
-   │            and wraps the result in a `ResolvedApi` proof type
+   │            indexes every user-type declaration, and wraps the untouched
+   │            document in a `ResolvedApi` proof type
    │
    ▼
-Resolve      ── weaveffi-cli `CliConfig`: merges --config TOML and the
-   │            inline generators: section into each target's typed config
+Configure    ── weaveffi-cli `ProjectConfig`: loads the nearest weaveffi.toml
+   │            ([package], [global], [generators.<target>]) and attaches the
+   │            package identity to the `ResolvedApi`
    ▼
 Generate     ── weaveffi-core::codegen::Orchestrator: dispatches every
-   │            selected target generator in parallel via rayon
+   │            selected target in parallel via rayon; each target builds a
+   │            `BindingModel` (every type a resolved `Ty`) and renders it
    ▼
-Output       ── Each generator writes its files under {out_dir}/{target}/
+Output       ── Each target writes its files under {out_dir}/{target}/
                 and updates {out_dir}/.weaveffi-cache/{target}.hash
 ```
 
-Subcommands like `validate`, `lint`, `diff`, `format`, and `watch` re-use
-the parse and validate stages; `generate`, `diff`, and `watch`
-additionally exercise resolve and generate.
+`validate` stops after the second stage; `generate`, `diff`, and `package`
+run all of them.
 
 A `.rs` input is lowered to the IR by `weaveffi-bridge`, the same extractor
 the `#[weaveffi::module]` proc-macro uses to build a producer's C ABI glue.
@@ -77,19 +78,18 @@ weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublish
 
 | Crate                | What it owns                                                                                                                                     |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. |
-| `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens, the `lift_*`/`lower_*` marshalling converters the macro calls, and the `export_runtime!` macro. |
+| `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. The document model only: no package or generator configuration. |
+| `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_abi_version`, `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens, the `lift_*`/`lower_*` marshalling converters the macro calls, and the `export_runtime!` macro. |
 | `weaveffi-bridge`    | The single Rust-to-IR extractor: maps `#[weaveffi::module]`-annotated source (`syn` AST) to an `Api`. Shared by the proc-macro and the CLI's `extract`/`generate <file.rs>`. |
 | `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro family. Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). Emission is decomposed into nine focused submodules under `src/codegen/` (sync calls, async launchers, iterators, records, enums, interfaces, callbacks, marshalling, and shared helpers), each stating which clause of the `weaveffi_core::plan` contracts it implements. |
 | `weaveffi`           | The producer facade a Rust cdylib depends on: re-exports the `weaveffi-macros` attributes, `export_runtime!`, and `weaveffi-abi` as `weaveffi::abi`. |
-| `weaveffi-core`      | The `Generator` trait, the `LanguageBackend` framework + driver, the `Orchestrator`, the `abi` C-ABI lowering model, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `wire` classification of buffer contents, the `lang` per-language keyword tables, the `manifest` escaping helpers, the `BindingModel`, validation rules, generator config resolution, and the per-generator hash cache. |
-| `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` (bridged to `Generator` by `impl_generator_via_backend!`) and produces target-specific output (header, wrapper, package metadata). Each follows a shared internal layout; see [Generator crate layout](#generator-crate-layout). |
-| `weaveffi-cli`       | The `weaveffi` binary. Parses the IDL, applies validation, instantiates every generator (via the `cli_targets!` registry in `config.rs`), and dispatches the `Orchestrator`. Subcommands live under `commands/` (`generate`, `validate`, `diff`, `format`, `package`, `new`, `watch`); `doctor.rs`, `extract.rs`, and `scaffold.rs` sit beside `main.rs`; `config.rs` holds the target registry and config resolution; `report.rs` formats CLI output. |
+| `weaveffi-core`      | Validation and the `ResolvedApi` proof type, the resolved `Ty` type model with its `Family` and `WireType` classifications, the `BindingModel`, the `LanguageBackend` trait and its `Target`/`ConfiguredBackend` object-safe view, the `Orchestrator`, the `abi` C-ABI lowering model, the `cabi` shared C declaration renderer, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `pkg` package-identity policy, the `lang` per-language keyword tables, the `manifest` escaping helpers, and the per-target hash cache. |
+| `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` and produces target-specific output (header, wrapper, package metadata). Each follows a shared internal layout; see [Generator crate layout](#generator-crate-layout). |
+| `weaveffi-cli`       | The `weaveffi` binary. Loads the definition and the project's `weaveffi.toml`, applies validation, instantiates every target (via the `cli_targets!` registry in `config.rs`), and dispatches the `Orchestrator`. Subcommands live under `commands/` (`generate`, `validate`, `diff`, `package`); `extract.rs` sits beside `main.rs`; `config.rs` holds the target registry and `ProjectConfig`; `report.rs` formats CLI output. |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
 Crates that contain `unsafe` code opt in explicitly: `weaveffi-abi`,
-`weaveffi-fuzz`, the scaffold output emitted by `weaveffi generate --scaffold`,
-and any `samples/*` producer that dereferences a raw handle pointer in its own
+`weaveffi-fuzz`, and any `samples/*` producer that dereferences a raw handle pointer in its own
 helpers (such as `kvstore`) add `#![allow(unsafe_code)]` at the top of
 their main source file. The thunks the `#[weaveffi::module]` macro emits
 instead carry a scoped `#[allow(unsafe_code)]` on each generated function, so
@@ -105,17 +105,15 @@ module:
 | Module        | Responsibility                                                        |
 | ------------- | --------------------------------------------------------------------- |
 | `main.rs`     | `clap` definitions and top-level dispatch into `commands/`.           |
-| `config.rs`   | The `cli_targets!` registry macro, the generated `CliConfig`, and config resolution (`--config` TOML + inline `generators:`). |
+| `config.rs`   | The `cli_targets!` registry macro, the generated `Targets` struct, and `ProjectConfig` (`weaveffi.toml` discovery, parsing, and the `[global]` fan-outs). |
 | `report.rs`   | Human-readable formatting of generate/diff results and summaries.     |
-| `commands/`   | One module per subcommand: `generate`, `validate`, `diff`, `format`, `package`, `new`, `watch` (re-exported through `commands/mod.rs`). |
-| `doctor.rs`   | `weaveffi doctor`: probes host toolchains per target.                  |
+| `commands/`   | One module per subcommand: `generate`, `validate`, `diff`, `package` (re-exported through `commands/mod.rs`, alongside the shared `load_project` step every generating command starts with). |
 | `extract.rs`  | `weaveffi extract`: a thin wrapper over `weaveffi-bridge` that serializes the derived IDL. |
-| `scaffold.rs` | the Rust producer stubs emitted by `weaveffi generate --scaffold` (for non-macro producers). |
 
 #### The `cli_targets!` registry
 
 The 11 language targets used to be spelled out a dozen times (config
-struct fields, the `--target` parser, inline-generator merging, and the
+struct fields, the `--target` parser, config merging, and the
 `Orchestrator` wiring). They now live in **one** declarative macro,
 `cli_targets!`, defined and invoked in `config.rs`:
 
@@ -125,74 +123,78 @@ cli_targets! {
     "cpp"     => cpp:     CppConfig     via CppGenerator,
     "swift"   => swift:   SwiftConfig   via SwiftGenerator,   strip,
     // … one line per target …
-    "ruby"    => ruby:    RubyConfig    via RubyGenerator,
+    "ruby"    => ruby:    RubyConfig    via RubyGenerator,    strip,
 }
 ```
 
-That single invocation expands to the `CliConfig` struct (one typed
-field per target), `build_generators`, `apply_inline_target`, and the
-`strip_module_prefix`/input-stamping fan-out. Adding a language is a
-one-line change here; see [Adding a new generator](#adding-a-new-generator).
+That single invocation expands to the `Targets` struct (one typed field
+per target, deserialized from the `[generators.<target>]` tables), the
+`build` method producing the ordered `Box<dyn Target>` list, and the
+`strip_module_prefix`/`c_prefix`/input-stamping fan-outs. Adding a
+language is a one-line change here; see
+[Adding a new generator](#adding-a-new-generator).
 
-#### Format canonicalization
+#### Canonical serialization
 
-`weaveffi format` (and `format --check`) round-trips an IDL through the
-IR and re-serializes it, so the on-disk form is *canonical*. For the
-check to be a no-op on an already-formatted file, serialization must omit
-every field that is at its default; otherwise `serde` would inject
-`null`, `[]`, and `false` noise that the parser then drops on the next
-read, making `format` non-idempotent. The IR types therefore tag their
-optional/defaulted fields with `#[serde(skip_serializing_if = …)]`
-(`Option::is_none`, `Vec::is_empty`, and a local `is_false` for booleans
-that default to `false`). This keeps canonical IDLs terse and makes
-`format` idempotent; it also removes the now-meaningless `default`
-annotations from the generated `weaveffi.schema.json`.
+`weaveffi extract` serializes the derived IDL, so the IR types keep the
+on-disk form *canonical*: every field at its default is omitted via
+`#[serde(skip_serializing_if = …)]` (`Option::is_none`, `Vec::is_empty`,
+and a local `is_false` for booleans that default to `false`). Without
+that, `serde` would inject `null`, `[]`, and `false` noise that the parser
+drops on the next read. It also keeps the generated `weaveffi.schema.json`
+free of meaningless `default` annotations.
 
 ## The IR
 
 `weaveffi_ir::ir` defines a small algebraic type system. The shapes
 that matter most:
 
-- `Api { version, modules, generators }`: root node.
-- `Module { name, functions, interfaces, structs, enums, callbacks,
+- `Api { version, modules }`: root node. Unknown top-level keys are
+  rejected (`deny_unknown_fields`), so a stale `package:` or
+  `generators:` block fails to parse instead of being silently dropped.
+- `Module { name, doc, functions, interfaces, structs, enums, callbacks,
   listeners, errors, modules }`: modules can nest.
 - `Function { name, params, returns, doc, throws, async, cancellable,
   deprecated, since }`. The same shape describes an interface's
   constructors, methods, and statics.
 - `InterfaceDef { name, doc, constructors, methods, statics }`: an opaque
   object type; every interface also receives an implicit destroy symbol.
-- `TypeRef` enumerates every supported type reference: primitives
-  (`I32`, `U32`, `I64`, `F64`, `Bool`, `StringUtf8`, `Bytes`, `Handle`,
-  `BorrowedStr`, `BorrowedBytes`), user types (`Named(String)`,
-  `Record(String)`, `RichEnum(String)`, `Enum(String)`,
-  `Interface(String)`, `TypedHandle(String)`), and the four composite
+- `TypeRef` enumerates every type reference a document can *write*:
+  primitives (`I32`, `U32`, `I64`, `F64`, `Bool`, `StringUtf8`, `Bytes`,
+  `Handle`, `BorrowedStr`, `BorrowedBytes`), the two user-type spellings
+  (`Named(String)` for any record, enum, or interface by bare or
+  dot-qualified name, and `TypedHandle(String)`), and the four composite
   shapes (`Optional`, `List`, `Map`, `Iterator`).
 
-User-type references are two-phase. The parser cannot know whether a
-bare identifier names a record, an enum, or an interface, so every
-user-type reference starts life as `TypeRef::Named`. The resolution
-pass (`weaveffi_core::validate::resolve_type_refs`, run by
-`validate_api` after the rule checks pass) rewrites each occurrence
-into `Record` (a struct), `RichEnum` (an algebraic enum), `Enum` (a
-C-style enum), or `Interface`, and qualifies cross-module references
-with the owning module's dot-joined path. The post-resolution
-guarantee is carried in the type system:
-`weaveffi_core::resolved::ResolvedApi` wraps an `Api` that has passed
-validation and resolution, and it is the only way to reach
-`BindingModel::build`, the `LanguageBackend` trait, and the
-`Orchestrator`. Generators therefore run strictly post-resolution: no
-`Named` reference remains, and a generator may treat one as a bug (the
-core ABI lowering panics on it). `Record` and
-`RichEnum` are *buffered* types (`weaveffi_core::abi::is_buffered`
-returns true for both, along with optionals, lists, and maps): they
-cross the ABI by value as one serialized `(const uint8_t*, size_t)`
-pair (see the [Value Buffer Protocol](reference/value-buffers.md)),
-while `Enum` lowers by value as an integer.
+The document never learns what a `Named` reference *is*. That knowledge
+lives one layer up, in `weaveffi_core`:
 
-Every IR type derives `Debug`, `Clone`, `PartialEq`, `Serialize`, and
-`Deserialize`. `Eq` is derived everywhere except `Api` itself, which
-omits it because its `generators` overrides hold `toml::Value`, which
-contains `f64`.
+- `weaveffi_core::resolved::ResolvedApi` wraps an `Api` that has passed
+  validation together with an index of every user-type declaration (bare
+  name to owning module path and `TypeKind`). It is the only way to reach
+  `BindingModel::build`, the `LanguageBackend` trait, and the
+  `Orchestrator`. `ResolvedApi::resolve(type_ref, module_path)` maps a
+  written reference to its resolved type; the document itself is never
+  mutated, so an IDL always round-trips through `extract` unchanged.
+- `weaveffi_core::model::Ty` is the *resolved* type every generator
+  consumes: the same primitives and composites as `TypeRef`, but every
+  user type carries its kind and dot-qualified name (`Record`, `RichEnum`,
+  `Enum`, `Interface`, `TypedHandle`). There is no unresolved variant, so
+  a generator can't forget to handle one.
+- Two total classifications hang off `Ty`. `Ty::family()` says how a
+  value crosses a *call boundary* (`Direct`, `String`, `Bytes`, `Buffer`,
+  `Object { nullable }`, `Iterator`); the ABI lowering, the marshalling
+  plan, and every backend's argument handling dispatch on it.
+  `Ty::wire()` says how a value is encoded *inside a value buffer*
+  (`WireType::Prim`, `Handle`, `Enum`, `User`, `Optional`, `List`,
+  `Map`); every backend's codec emitter dispatches on it. Records, rich
+  enums, optionals, lists, and maps are the `Buffer` family: they cross
+  the ABI by value as one serialized `(const uint8_t*, size_t)` pair (see
+  the [Value Buffer Protocol](reference/value-buffers.md)), while `Enum`
+  lowers by value as an integer.
+
+Every IR type derives `Debug`, `Clone`, `PartialEq`, `Eq`, `Serialize`,
+and `Deserialize`.
 
 `TypeRef` (de)serializes as a string with custom syntax (`i32`,
 `handle<T>`, `[T]`, `{K:V}`, `T?`, `&str`, `&[u8]`). The parser is
@@ -201,15 +203,16 @@ JSON Schema export rely on it.
 
 ### Schema versioning
 
-`CURRENT_SCHEMA_VERSION` (currently `"0.7.0"`) lives in
+`CURRENT_SCHEMA_VERSION` (currently `"0.8.0"`) lives in
 [`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
 contains exactly the current version; older schema revisions are rejected
 by validation with an actionable error. When you change the schema:
 
 1. Bump `CURRENT_SCHEMA_VERSION` (and the `weaveffi-ir` minor version).
 2. Document the changes in `CHANGELOG.md` under a "Migration" section.
-3. Update every sample IDL, the `weaveffi new` template, the README
-   quickstart, and the [Getting Started](getting-started.md) doc.
+3. Update every fixture IDL under `crates/weaveffi-cli/tests/fixtures/`,
+   the README quickstart, and the [Getting Started](getting-started.md)
+   doc.
 
 The [stability page](stability.md#ir-schema-version-policy) is the
 external contract; this section is the implementation note.
@@ -219,12 +222,12 @@ external contract; this section is the implementation note.
 `weaveffi_core::validate::validate_api` is the single entry point. It
 consumes the parsed `Api` and returns
 `Result<ResolvedApi, ValidationDiagnostics>`: on success the API has
-passed every rule check and type-reference resolution, and the
-`ResolvedApi` proof type is the only way into the generation stage; on
-failure the diagnostics carry every error found, each renderable as an
-actionable miette report. Advisory warnings are separate:
-`validate::collect_warnings` returns `Vec<ValidationWarning>`, which
-the `lint` subcommand surfaces.
+passed every rule check and every type reference has a declaration to
+resolve to, and the `ResolvedApi` proof type is the only way into the
+generation stage; on failure the diagnostics carry every error found,
+each renderable as an actionable miette report. Advisory warnings are
+separate: `validate::collect_warnings` returns `Vec<ValidationWarning>`,
+which `validate --warn` and `generate --warn` surface.
 
 Errors enforced today:
 
@@ -239,10 +242,9 @@ Errors enforced today:
 - Structs must have at least one field; enums at least one variant;
   interfaces at least one member.
 - Enum discriminant uniqueness within an enum.
-- Type references resolve by bare name across the whole API and are
-  qualified to their owning module during resolution, which also
-  rewrites each parsed `TypeRef::Named` reference into its resolved
-  kind (see [The IR](#the-ir) and
+- Type references resolve by bare name across the whole API; the
+  `ResolvedApi` index qualifies each to its owning module and kind (see
+  [The IR](#the-ir) and
   [Cross-module references](reference/idl.md#cross-module-type-references)).
 - Interface members (constructors, methods, statics) share one namespace
   per interface; constructors declare no return and cannot be async;
@@ -266,7 +268,6 @@ Warnings emitted today:
 - `DeepNesting` (composite types nested deeper than 3 levels).
 - `EmptyModuleDoc` (no `doc:` on any function in the module).
 - `AsyncVoidFunction` (async without a return type).
-- `MutableOnValueType` (`mutable: true` on a non-pointer parameter).
 - `DeprecatedFunction` (informational).
 
 Interfaces, typed error domains, async functions, cancellable functions,
@@ -291,24 +292,33 @@ from the TypeScript declarations) because Emscripten modules do not
 portably expose the trampoline machinery. Capability failures and mode
 gaps must stay loud: never skip a definition silently.
 
-## Generator configuration resolution
+## Project configuration
 
-There is no single global config object. Each generator owns its own
-typed `Generator::Config` (`CConfig`, `SwiftConfig`, `PythonConfig`, …),
-so adding a knob to one target only touches that target's crate. The CLI
-gathers all of them into one `CliConfig` struct (generated by the
-`cli_targets!` macro, one field per target) and resolves it from three
-sources (later wins):
+The API definition describes the API and nothing else. Package identity
+and generator options live in `weaveffi.toml`, modelled by
+`weaveffi_cli::config::ProjectConfig`:
 
-1. Defaults baked into each `Config::default()`.
-2. The `--config <file.toml>` external file passed to `generate`.
-3. The inline `generators:` section of the IDL.
+- `[package]` deserializes straight into `weaveffi_core::pkg::Package`
+  and is attached to the `ResolvedApi` (`ResolvedApi::with_package`), so
+  every generator reads the same identity through `api.package()` and
+  the shared `pkg::resolve` policy (explicit per-target key, then the
+  package name normalized per ecosystem, then the input file stem, then
+  the `weaveffi` default). For a `src/lib.rs` input the CLI substitutes
+  the crate directory name for the useless `lib` stem.
+- `[global]` holds the cross-target knobs (`c_prefix`,
+  `strip_module_prefix`, and the `pre_generate`/`post_generate` hooks)
+  that `ProjectConfig::finalize` fans out to every per-target config.
+- `[generators.<target>]` deserializes into the `Targets` struct the
+  `cli_targets!` macro generates: one field per target, each the
+  generator crate's own `Config` type (`CConfig`, `SwiftConfig`, …), so
+  adding a knob to one target only touches that target's crate.
 
-The IDL section is the project-local source of truth and overrides any
-machine-local TOML; see the
-[Generator Configuration guide](guides/config.md#inline-generator-configuration).
-Each resolved config is hashed (via `serde_json`) into the per-generator
-cache key, so a config-only change re-runs just that target.
+Discovery mirrors Cargo: the CLI walks up from the input file's directory
+to the first `weaveffi.toml`, or uses `--config <path>`. The file uses
+`deny_unknown_fields` throughout, so a misspelled table or key is an
+error. Each resolved config is hashed (via `serde_json`) into the
+per-target cache key alongside the `ResolvedApi` (package included), so a
+config-only change re-runs just the targets it affects.
 
 ## Orchestrator
 
@@ -316,59 +326,46 @@ cache key, so a config-only change re-runs just that target.
 
 1. If `--force` is set, every cache entry under
    `{out_dir}/.weaveffi-cache/{target}.hash` is invalidated.
-2. For each registered generator, the orchestrator hashes
-   `(api, generator.name(), config)` and compares against the persisted
-   hash, so an IR *or* config change re-runs just the affected target.
+2. For each registered target, the orchestrator hashes
+   `(resolved api, target.name(), config)` and compares against the
+   persisted hash, so an IR, package, *or* config change re-runs just
+   the affected target.
 3. If a `pre_generate` hook is configured (`OrchestratorHooks`), the
    orchestrator shells out to it (cmd on Windows, sh elsewhere) and
    aborts on non-zero exit.
-4. The pending generators run **in parallel** via
-   `rayon::par_iter`. Generators must therefore be `Send + Sync`.
-5. `post_generate` runs once after every generator has succeeded.
-6. Each successful generator's hash is persisted.
+4. The pending targets run **in parallel** via `rayon::par_iter`.
+   Backends must therefore be `Send + Sync`.
+5. `post_generate` runs once after every target has succeeded.
+6. Each successful target's hash is persisted.
 
-This per-generator caching is what lets `weaveffi generate` skip every
-target whose IR has not changed since the last run; see the
-[Generator Configuration guide](guides/config.md#per-generator-incremental-cache).
+This per-target caching is what lets `weaveffi generate` skip every
+target whose inputs have not changed since the last run; see
+[Project Configuration](guides/config.md#performance-and-caching).
 
-## The `Generator` trait and the language-backend framework
+## `LanguageBackend` and the `Target` view
 
-The orchestrator consumes the object-safe `Generator` trait
-(`weaveffi_core::codegen::Generator`). Each generator owns a typed,
-serializable `Config`; the orchestrator stays config-agnostic by working
-through the object-safe `DynGenerator` view:
+There is one generator trait. Every target implements
+`weaveffi_core::backend::LanguageBackend`, which owns a typed,
+serializable `Config`; the orchestrator stays config-agnostic by storing
+the object-safe `weaveffi_core::codegen::Target` view instead:
 
 ```rust,ignore
-pub trait Generator: Send + Sync {
-    /// Per-target options. Must round-trip through `serde_json` so the
-    /// orchestrator can fold the config into the cache key.
-    type Config: Serialize + Default + Clone + Send + Sync;
-
-    /// Stable short name (`"swift"`, `"c"`, …): the `--target` token and
-    /// the per-generator cache-file basename.
-    fn name(&self) -> &'static str;
-
-    /// Render the bindings under `out_dir`.
-    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
-
-    /// Files `generate` would write (used by `--dry-run` and `diff`).
-    fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Vec<String>;
+pub trait Target: Send + Sync {
+    fn name(&self) -> &'static str;               // the `--target` token
+    fn capabilities(&self) -> TargetCapabilities;
+    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Result<()>;
+    fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Vec<String>;
+    fn package(&self, api: &ResolvedApi, ctx: &PackageContext, out_dir: &Utf8Path)
+        -> Option<Vec<PackagedFile>>;
+    fn config_hash_input(&self) -> Vec<u8>;      // folded into the cache key
 }
 ```
 
-To erase the associated `Config`, a typed generator is paired with a
-concrete config value via `ConfiguredGenerator::new(gen, config)`, which
-implements the object-safe `DynGenerator` trait the `Orchestrator`
-stores. The CLI builds one `ConfiguredGenerator` per selected target
-from the resolved `CliConfig`.
-
-### `LanguageBackend` and the shared driver
-
-Generators are **not** written against `Generator` directly. Each target
-implements `weaveffi_core::backend::LanguageBackend` and is bridged to
-`Generator` by the `impl_generator_via_backend!` macro, so the model
-construction, the file I/O, and the `output_files` derivation live in one
-place instead of being re-implemented eleven times:
+`ConfiguredBackend::new(backend, config)` pairs a backend with a concrete
+config value and implements `Target` by delegating to the shared driver.
+The CLI builds one `ConfiguredBackend` per selected target from the
+`Targets` struct; the driver does the model construction, the file I/O,
+and the `output_files` derivation once instead of eleven times:
 
 ```rust,ignore
 pub trait LanguageBackend: Send + Sync {
@@ -398,8 +395,9 @@ pub trait LanguageBackend: Send + Sync {
 The free `backend::run` builds the `BindingModel` once (with the
 backend's `prefix`), calls `files`, and writes each `OutputFile`
 (creating parent directories). `backend::output_files` calls the same
-`files` and returns the sorted path list, so `generate` and
-`output_files` are derived from a single source and **cannot drift**.
+`files` and returns the sorted path list, and `backend::package_files`
+drives the optional `package` hook, so `generate`, `output_files`, and
+`package` are derived from a single source and **cannot drift**.
 Python, Ruby, Go, Dart, and .NET are single-pass backends: they
 override the per-entity hooks and compose `emit_members` inside their
 module scoping. The rest build their layout directly in `files`: C and
@@ -415,24 +413,28 @@ managed by the `CodeWriter` toolkit (see below) rather than by hand-rolled
 `\n`/space bookkeeping. Shared rendering infrastructure lives in
 `weaveffi_core`:
 
-- `backend`: the `LanguageBackend` trait, the `run`/`output_files`
-  driver, the `OutputFile` type, and the `impl_generator_via_backend!`
-  bridge macro.
+- `backend`: the `LanguageBackend` trait, the `run`/`output_files`/
+  `package_files` driver, and the `OutputFile` type.
 - `model::BindingModel`: the normalized, fully-lowered view every
-  backend renders from (precomputed C symbol names and ABI signatures).
+  backend renders from (precomputed C symbol names and ABI signatures,
+  every type a resolved `model::Ty`), plus the `roots`/`children`
+  module-tree walkers and the `any_type` predicate scan.
 - `codegen::writer::CodeWriter`: the structured code-emission toolkit
   (see [The `CodeWriter` emission toolkit](#the-codewriter-emission-toolkit)).
-- `codegen::common`: module-tree traversal (`walk_modules`,
+- `codegen::common`: IR module-tree traversal (`walk_modules`,
   `walk_modules_with_path`), doc-comment emission (`emit_doc`), and
   `pascal_case` naming.
 - `plan`: the marshalling plan, the language-neutral calling contracts
   every backend renders (see [The marshalling plan](#the-marshalling-plan)).
-- `wire`: the canonical classification of every IR type into its wire
-  shape inside a value buffer (`wire::classify` folds a `TypeRef` into a
-  `WireType`), so backend codec emitters dispatch on one closed alphabet
-  instead of each re-deriving the folds (handles encode as `u64` tokens,
-  borrowed views encode like their owned forms, records and rich enums
-  share one user-codec shape).
+- `model::ty`: `Ty::wire()` folds every type into its wire shape inside
+  a value buffer (`WireType`), so backend codec emitters dispatch on one
+  closed alphabet instead of each re-deriving the folds (handles encode
+  as `u64` tokens, borrowed views encode like their owned forms, records
+  and rich enums share one user-codec shape).
+- `cabi`: the shared renderer for C declarations (runtime prototypes,
+  including `{prefix}_abi_version` and the `{PREFIX}_ABI_VERSION` macro,
+  enums, interface typedefs, function prototypes) that both the C and C++
+  headers are produced from, so the two cannot drift.
 - `lang`: per-language reserved-word tables (`PYTHON_KEYWORDS`,
   `GO_KEYWORDS`, …) and the single `escape_ident` rule (a reserved name
   gains a trailing underscore), so a field named `type` or a parameter
@@ -505,7 +507,27 @@ The `c_prefix` configuration is honored end-to-end: when set, the
 generated C output uses it consistently, including references to
 `weaveffi-abi` runtime symbols (`{c_prefix}_error`,
 `{c_prefix}_error_clear`, `{c_prefix}_free_string`,
-`{c_prefix}_free_bytes`).
+`{c_prefix}_free_bytes`, `{c_prefix}_abi_version`). Because the Rust
+runtime always exports the canonical `weaveffi_*` names, the header
+`#define`s each prefixed runtime name to its canonical symbol (the
+`utils::ABI_RUNTIME_SYMBOLS` table, kept in lockstep with
+`export_runtime!`).
+
+### ABI revision
+
+`weaveffi_abi::ABI_VERSION` (mirrored as `weaveffi_core::cabi::ABI_VERSION`
+and kept equal by a test in the `weaveffi` facade crate) numbers the
+runtime surface: the `weaveffi_error` layout, the value-buffer encoding,
+and the set and signatures of the `weaveffi_*` runtime symbols.
+`export_runtime!` exports it as `weaveffi_abi_version()`; the C header
+declares it and defines `{PREFIX}_ABI_VERSION`. Generated consumers embed
+the revision they were built for and, where a check costs one call at
+load time, compare it before touching anything else: Python raises
+`ImportError`, Ruby `LoadError`, Dart `StateError`, Go panics in `init`,
+.NET throws from the `NativeMethods` static constructor, the Node addon
+throws from `Init`, and the Wasm loader throws before returning the API
+object. A producer that predates versioning fails the same way (missing
+symbol), so the mismatch is never a garbled value buffer later.
 
 Interface lifecycle symbols and enum constants follow the patterns in
 the [C generator reference](generators/c.md).
@@ -516,8 +538,8 @@ The C ABI is the foundation every binding sits on: a flat, C-callable
 surface where each IDL type lowers to a fixed sequence of C parameters.
 A `string` becomes one `const char*`; `bytes` becomes
 `const uint8_t* {name}_ptr, size_t {name}_len`; every buffered type
-(records, rich enums, optionals, lists, maps; see
-[`is_buffered`][abi-source]) becomes the same borrowed
+(records, rich enums, optionals, lists, maps; the `Buffer`
+[`Family`](#the-ir)) becomes the same borrowed
 `{name}_ptr` / `{name}_len` pair holding its serialized
 [value buffer](reference/value-buffers.md); bytes and buffered returns
 append a `size_t* out_len` pointer; and every fallible call ends with a
@@ -560,10 +582,9 @@ their generator rather than leaking into the shared model:
   generator.
 
 Imperative generators (Go cgo, Node, Dart, Swift) build their FFI
-signatures inline with marshalling code and share the single
-`is_c_pointer_type` classifier in `weaveffi_core::codegen::common`. The
-Android (JNI) and Wasm backends target different ABIs entirely and do
-not consume the C lowering.
+signatures inline with marshalling code and dispatch on `Ty::family()`
+for the shape of each slot. The Android (JNI) and Wasm backends target
+different ABIs entirely and do not consume the C lowering.
 
 When you add a parameter shape or change how a type crosses the
 boundary, change `weaveffi_core::abi` and let the consumers inherit it;
@@ -582,8 +603,8 @@ independently (and inconsistently):
   (`plan::ret_pass`): how one parameter or return crosses the boundary
   (a direct scalar slot, a string pointer, a bytes or buffer
   `ptr`/`len` pair, or an object handle), so marshalling code dispatches
-  on the plan instead of re-deriving the shape from `TypeRef` with local
-  `is_buffered` checks.
+  on the plan instead of re-deriving the shape with local matches on
+  `Ty`.
 - **Errors.** `ErrorStrategy` (`Throws` | `Trap`): when a call reports
   through `out_err`, is the non-zero code a typed domain error the
   caller can catch (`throws: true`), or a producer bug the wrapper must
@@ -631,7 +652,7 @@ doesn't need):
 | ------------- | ----------------------------------------------------------------- |
 | `types.rs`    | Target type mapping, identifier naming and keyword escaping       |
 | `docs.rs`     | Doc-comment emission in the target's comment syntax               |
-| `codec.rs`    | Value-buffer encode/decode emitters, dispatched on `wire::classify` |
+| `codec.rs`    | Value-buffer encode/decode emitters, dispatched on `Ty::wire()`    |
 | `runtime.rs`  | The fixed runtime prelude the generated code relies on            |
 | `calls.rs`    | Sync/async/iterator wrappers, callbacks, listeners, marshalling   |
 | `entities.rs` | Enums, records, interfaces, typed error domains                   |
@@ -658,10 +679,13 @@ non-deterministically on different platforms or insta orderings.
 ## Snapshot tests
 
 `crates/weaveffi-cli/tests/snapshots.rs` runs every generator across a
-ten-fixture corpus (`tests/fixtures/01_calculator` … `10_shapes`:
-calculator, contacts, inventory, async-demo, events, kitchen-sink,
-docs-everywhere, kvstore, nested-modules, and shapes). Output is diffed via
-[`cargo-insta`][insta]. When a snapshot diff is intentional:
+four-fixture corpus under `tests/fixtures/` (`kitchen_sink`, which
+exercises every IDL feature; `shapes`, rich enums and records;
+`nested_modules`, cross-module references; and `docs_everywhere`,
+doc-comment emission). The eleven targets are driven by one data-driven
+`snapshot_tests!` macro, so adding a fixture or a target is a one-line
+change. Output is diffed via [`cargo-insta`][insta]. When a snapshot diff
+is intentional:
 
 ```bash
 cargo install cargo-insta --locked
@@ -691,21 +715,18 @@ A condensed checklist (the long version lives in
    a `c_prefix`), and `files` (returning every `OutputFile`). For a
    single-pass layout, override the `render_enum`/`render_struct`/
    `render_function` hooks and compose `emit_members`; otherwise build the
-   layout directly in `files`. Then add
-   `weaveffi_core::impl_generator_via_backend!(<Generator>);` to bridge it
-   to `Generator` (this derives `generate` and `output_files`). Reuse
-   `BindingModel` and `weaveffi_core::codegen::common` instead of
-   re-deriving traversal or ABI classification.
+   layout directly in `files`. Reuse `BindingModel`, `Ty::family()`, and
+   `Ty::wire()` instead of re-deriving traversal or ABI classification.
 3. Wire the generator into the `cli_targets!` registry macro in
    `crates/weaveffi-cli/src/config.rs`: add one line
    (`"<name>" => <field>: <Config> via <Generator>`, plus `strip` if the
    generator honors `strip_module_prefix`). That single entry is the
-   source of truth: it expands to the `CliConfig` field, the
-   `--target <name>` parser entry, inline-config merging, and the
-   `Orchestrator` registration. No other CLI edits are required.
-4. Add snapshot fixtures in `crates/weaveffi-cli/tests/snapshots.rs`
-   covering at minimum the calculator, contacts, inventory,
-   async-demo, and events sample IDLs.
+   source of truth: it expands to the `Targets` field (the
+   `[generators.<name>]` table), the `--target <name>` parser entry, and
+   the `Orchestrator` registration. No other CLI edits are required.
+4. Add the target to the `snapshot_tests!` invocation in
+   `crates/weaveffi-cli/tests/snapshots.rs` and to the determinism test;
+   every fixture in the corpus then runs against it.
 5. Document the generator under `docs/src/generators/<lang>.md` and
    link it from `docs/src/SUMMARY.md`.
 6. Add conformance consumers under `conformance/<lang>/` and wire them
@@ -717,8 +738,8 @@ A condensed checklist (the long version lives in
 
 - [IDL Schema](reference/idl.md): the type system and validation
   rules from a user's perspective.
-- [Generator Configuration](guides/config.md): every option a
-  consumer can set.
+- [Project Configuration](guides/config.md): every option a
+  consumer can set in `weaveffi.toml`.
 - [Stability and Versioning](stability.md): what counts as a
   breaking change once we hit 1.0.
 - [Memory Ownership](guides/memory.md): the per-target memory rules

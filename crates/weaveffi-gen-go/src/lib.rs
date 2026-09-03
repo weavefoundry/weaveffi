@@ -20,23 +20,20 @@ mod docs;
 mod entities;
 mod package;
 mod runtime;
-#[cfg(test)]
-mod tests;
 mod types;
 
 use camino::Utf8Path;
 use heck::ToUpperCamelCase;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::is_buffered;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{BindingModel, CallShape};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::plan::{elem_free, ElemFree};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, wrapper_name, CommentStyle};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{
     collect_trampoline_externs, render_async_function, render_callback_trampoline, render_function,
@@ -48,7 +45,8 @@ use crate::entities::{
 };
 use crate::package::{package_files, render_go_mod, render_readme};
 use crate::runtime::{
-    render_bool_helpers, render_buffer_runtime, render_callback_registry, render_error_infra,
+    render_abi_version_check, render_bool_helpers, render_buffer_runtime, render_callback_registry,
+    render_error_infra,
 };
 
 /// Per-target configuration for [`GoGenerator`].
@@ -168,16 +166,14 @@ impl LanguageBackend for GoGenerator {
     }
 }
 
-weaveffi_core::impl_generator_via_backend!(GoGenerator);
-
 // ── Import scanning ──
 
 /// `true` when `ty` is a bare bool in a returned position (including an
 /// iterator element), needing the `cToBool` helper.
-fn ret_direct_bool(ty: &TypeRef) -> bool {
+fn ret_direct_bool(ty: &Ty) -> bool {
     match ty {
-        TypeRef::Bool => true,
-        TypeRef::Iterator(inner) => matches!(inner.as_ref(), TypeRef::Bool),
+        Ty::Bool => true,
+        Ty::Iterator(inner) => matches!(inner.as_ref(), Ty::Bool),
         _ => false,
     }
 }
@@ -186,8 +182,6 @@ fn ret_direct_bool(ty: &TypeRef) -> bool {
 /// the lowered model.
 #[derive(Default, Clone, Copy)]
 struct Imports {
-    /// `fmt` (error formatting); implied by [`err_infra`](Self::err_infra).
-    fmt: bool,
     /// `iter` (lazy sequences returned by `iter<T>` functions).
     iter: bool,
     /// `unsafe` (pointer staging for strings/bytes/buffers, callback
@@ -233,10 +227,10 @@ fn scan_imports(model: &BindingModel) -> Imports {
             any_callable = true;
             has_async |= f.is_async;
             has_iter |= matches!(f.shape, CallShape::Iterator(_));
-            buffer_runtime |= f.params.iter().any(|p| is_buffered(&p.ty));
-            bool_helpers |= f.params.iter().any(|p| matches!(p.ty, TypeRef::Bool));
+            buffer_runtime |= f.params.iter().any(|p| p.ty.is_buffered());
+            bool_helpers |= f.params.iter().any(|p| matches!(p.ty, Ty::Bool));
             if let Some(ret) = &f.ret {
-                buffer_runtime |= is_buffered(ret);
+                buffer_runtime |= ret.is_buffered();
                 bool_helpers |= ret_direct_bool(ret);
             }
             if let CallShape::Iterator(ib) = &f.shape {
@@ -246,8 +240,8 @@ fn scan_imports(model: &BindingModel) -> Imports {
         }
         for cb in &m.callbacks {
             any_callbacks = true;
-            buffer_runtime |= cb.params.iter().any(|p| is_buffered(&p.ty));
-            bool_helpers |= cb.params.iter().any(|p| matches!(p.ty, TypeRef::Bool));
+            buffer_runtime |= cb.params.iter().any(|p| p.ty.is_buffered());
+            bool_helpers |= cb.params.iter().any(|p| matches!(p.ty, Ty::Bool));
         }
     }
 
@@ -260,7 +254,6 @@ fn scan_imports(model: &BindingModel) -> Imports {
     let unsafe_ptr = err_infra || buffer_runtime || any_callbacks || has_listeners || has_async;
 
     Imports {
-        fmt: err_infra,
         iter: has_iter,
         unsafe_ptr,
         bool_helpers,
@@ -314,32 +307,31 @@ pub(crate) fn render_go(
     out.push_str("*/\n");
     out.push_str("import \"C\"\n");
 
-    if imports.fmt || imports.iter || imports.unsafe_ptr || imports.sync || imports.buffer_runtime {
-        out.push_str("\nimport (\n");
-        if imports.buffer_runtime {
-            out.push_str("\t\"encoding/binary\"\n");
-        }
-        if imports.fmt {
-            out.push_str("\t\"fmt\"\n");
-        }
-        if imports.iter {
-            out.push_str("\t\"iter\"\n");
-        }
-        if imports.buffer_runtime {
-            out.push_str("\t\"math\"\n");
-        }
-        if imports.sync {
-            out.push_str("\t\"sync\"\n");
-        }
-        if imports.buffer_runtime {
-            out.push_str("\t\"unicode/utf8\"\n");
-        }
-        if imports.unsafe_ptr {
-            out.push_str("\t\"unsafe\"\n");
-        }
-        out.push_str(")\n");
+    // The ABI check in `init` formats its panic message, so `fmt` is always
+    // imported; the rest of the block is driven by what the model uses.
+    out.push_str("\nimport (\n");
+    if imports.buffer_runtime {
+        out.push_str("\t\"encoding/binary\"\n");
     }
-    out.push('\n');
+    out.push_str("\t\"fmt\"\n");
+    if imports.iter {
+        out.push_str("\t\"iter\"\n");
+    }
+    if imports.buffer_runtime {
+        out.push_str("\t\"math\"\n");
+    }
+    if imports.sync {
+        out.push_str("\t\"sync\"\n");
+    }
+    if imports.buffer_runtime {
+        out.push_str("\t\"unicode/utf8\"\n");
+    }
+    if imports.unsafe_ptr {
+        out.push_str("\t\"unsafe\"\n");
+    }
+    out.push_str(")\n\n");
+
+    render_abi_version_check(&mut out);
 
     if imports.bool_helpers {
         render_bool_helpers(&mut out);

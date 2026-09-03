@@ -89,7 +89,9 @@ pub fn render_json_prelude(input_basename: &str) -> String {
 pub const ABI_RUNTIME_SYMBOLS: &[&str] = &[
     "error",
     "handle_t",
+    "abi_version",
     "error_clear",
+    "error_free",
     "free_string",
     "free_bytes",
     "arena_create",

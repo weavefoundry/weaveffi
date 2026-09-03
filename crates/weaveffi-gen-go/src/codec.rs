@@ -4,12 +4,12 @@
 //! Both emitters dispatch on the shared [`wire::classify`] classification,
 //! so the non-obvious folds (handles as `u64` tokens, borrowed views like
 //! their owned forms, records and rich enums through one user codec) are
-//! decided centrally rather than re-derived from `TypeRef` here.
+//! decided centrally rather than re-derived from `Ty` here.
 
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::c_abi_struct_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::{go_local, go_type, handle_wrapper, optional_derefs};
 
@@ -20,48 +20,48 @@ pub(crate) fn emit_buffer_write(
     w: &mut CodeWriter,
     writer: &str,
     expr: &str,
-    ty: &TypeRef,
+    ty: &Ty,
     site: &str,
     depth: usize,
 ) {
-    match wire::classify(ty) {
-        WireType::Bool => {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("{writer}.writeBool({expr})"));
         }
-        WireType::I8 => {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("{writer}.writeI8({expr})"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("{writer}.writeI16({expr})"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("{writer}.writeI32({expr})"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("{writer}.writeI64({expr})"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("{writer}.writeU8({expr})"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("{writer}.writeU16({expr})"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("{writer}.writeU32({expr})"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("{writer}.writeU64({expr})"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("{writer}.writeF32({expr})"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("{writer}.writeF64({expr})"));
         }
         // Both handle flavors encode as one u64 token; only the Go-side
         // representation differs (a bare int64 versus a wrapper pointer).
-        WireType::Handle => {
-            if matches!(ty, TypeRef::TypedHandle(_)) {
+        WireType::Handle(_) => {
+            if matches!(ty, Ty::TypedHandle(_)) {
                 w.line(format!(
                     "{writer}.writeU64(uint64(uintptr(unsafe.Pointer({expr}.ptr))))"
                 ));
@@ -69,10 +69,10 @@ pub(crate) fn emit_buffer_write(
                 w.line(format!("{writer}.writeU64(uint64({expr}))"));
             }
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("{writer}.writeString({expr})"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("{writer}.writeBytes({expr})"));
         }
         WireType::Enum(_) => {
@@ -125,51 +125,51 @@ pub(crate) fn emit_buffer_read(
     w: &mut CodeWriter,
     reader: &str,
     dst: &str,
-    ty: &TypeRef,
+    ty: &Ty,
     site: &str,
     depth: usize,
     prefix: &str,
     module: &str,
 ) {
-    match wire::classify(ty) {
-        WireType::Bool => {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("{dst} = {reader}.readBool()"));
         }
-        WireType::I8 => {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("{dst} = {reader}.readI8()"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("{dst} = {reader}.readI16()"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("{dst} = {reader}.readI32()"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("{dst} = {reader}.readI64()"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("{dst} = {reader}.readU8()"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("{dst} = {reader}.readU16()"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("{dst} = {reader}.readU32()"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("{dst} = {reader}.readU64()"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("{dst} = {reader}.readF32()"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("{dst} = {reader}.readF64()"));
         }
         // The u64 token decodes back into the Go representation: a bare
         // int64 for `handle`, a wrapper around the C pointer for
         // `handle<T>`.
-        WireType::Handle => {
-            if let TypeRef::TypedHandle(n) = ty {
+        WireType::Handle(_) => {
+            if let Ty::TypedHandle(n) = ty {
                 let g = handle_wrapper(n);
                 let tag = c_abi_struct_name(n, module, prefix);
                 w.line(format!(
@@ -179,10 +179,10 @@ pub(crate) fn emit_buffer_read(
                 w.line(format!("{dst} = int64({reader}.readU64())"));
             }
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("{dst} = {reader}.readString()"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("{dst} = {reader}.readBytes()"));
         }
         WireType::Enum(n) => {

@@ -13,5 +13,9 @@ categories = ["development-tools::ffi"]
 weaveffi-abi = { path = "../weaveffi-abi", version = "0.21.0" }
 weaveffi-macros = { path = "../weaveffi-macros", version = "0.21.0" }
 
+[dev-dependencies]
+# Only for the ABI-revision lockstep test; the facade never links core at runtime.
+weaveffi-core = { path = "../weaveffi-core", version = "0.21.0" }
+
 [lints]
 workspace = true

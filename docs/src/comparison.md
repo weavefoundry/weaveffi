@@ -105,9 +105,9 @@ WeaveFFI is the right pick when you want:
    self-contained: a Swift consumer adds your `.xcframework` + a SwiftPM
    manifest and is done. No "install WeaveFFI" step on the consumer side.
 3. **A native library that isn't (only) Rust.** WeaveFFI works against
-   anything that exposes a stable C ABI: Rust (with `--scaffold`
-   convenience), C, C++, Zig, etc. UniFFI and diplomat assume Rust;
-   autocxx assumes C++.
+   anything that exposes a stable C ABI: Rust (with the
+   `#[weaveffi::module]` macro generating the ABI for you), C, C++, Zig,
+   etc. UniFFI and diplomat assume Rust; autocxx assumes C++.
 4. **Idiomatic per-target output, not a lowest-common-denominator API.**
    Async functions become `async/await` in Swift, `Promise`s in Node,
    `suspend fun` in Kotlin, `async def` in Python, and `Task<T>` in C#,

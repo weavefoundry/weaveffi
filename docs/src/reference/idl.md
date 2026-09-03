@@ -26,12 +26,10 @@ and objects:
 
 ```text
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.7.0"
-package:
-  name: my_app
-  version: "1.0.0"
+version: "0.8.0"
 modules:
   - name: my_module
+    doc: "..."
     structs: [...]
     enums: [...]
     interfaces: [...]
@@ -40,20 +38,21 @@ modules:
     listeners: [...]
     errors: { ... }
     modules: [...]
-generators:
-  swift:
-    module_name: MyApp
 ```
+
+The document describes only the API. Package identity and per-generator
+options live in a `weaveffi.toml` next to it; see
+[Project Configuration](../guides/config.md). Unknown top-level keys are
+rejected, so a stray `package:` or `generators:` block fails validation
+instead of being silently ignored.
 
 A complete, validating example lives at the bottom of this page in the
 [Complete example](#complete-example) section.
 
 | Field        | Type                        | Required | Description                              |
 |--------------|-----------------------------|----------|------------------------------------------|
-| `version`    | string                      | yes      | Schema version; only the current version (`"0.7.0"`) is accepted |
-| `package`    | Package                     | no       | Publishable identity stamped into every generated manifest (see [Package metadata](#package-metadata)) |
+| `version`    | string                      | yes      | Schema version; only the current version (`"0.8.0"`) is accepted |
 | `modules`    | array of Module             | yes      | One or more modules                      |
-| `generators` | map of string to object     | no       | Per-generator configuration (see [generators section](#generators-section)) |
 
 ### Module
 
@@ -96,71 +95,24 @@ A complete, validating example lives at the bottom of this page in the
 
 ## Package metadata
 
-The optional top-level `package` block is the single source of truth for the
-publishable identity stamped into every generated ecosystem manifest:
-`package.json` (Node/Wasm), `pyproject.toml`/`setup.py` (Python),
-`*.gemspec` (Ruby), `*.csproj`/`*.nuspec` (.NET), `pubspec.yaml` (Dart),
-`Package.swift` (Swift), `go.mod` (Go), `settings.gradle` (Android), and
-`CMakeLists.txt` (C++). Declaring it once keeps the name, version, and
-metadata consistent across all eleven targets instead of every generator
-hardcoding `weaveffi` / `0.1.0`.
+The IDL carries no package metadata. The name, version, and other
+distribution identity stamped into every generated ecosystem manifest
+(`package.json`, `pyproject.toml`, `*.gemspec`, `*.csproj`, `pubspec.yaml`,
+`Package.swift`, `go.mod`, `settings.gradle`, `CMakeLists.txt`) come from the
+`[package]` table of the `weaveffi.toml` beside the definition:
 
-### Package schema
-
-| Field         | Type            | Required | Description                                         |
-|---------------|-----------------|----------|-----------------------------------------------------|
-| `name`        | string          | yes      | Distribution name (npm/PyPI/gem/NuGet/pub/...)      |
-| `version`     | string          | yes      | Semantic version stamped into each manifest         |
-| `description` | string          | no       | One-line package description                        |
-| `license`     | string          | no       | SPDX license expression (e.g. `MIT`, `Apache-2.0`)  |
-| `authors`     | array of string | no       | Author entries (`Name <email>`)                     |
-| `homepage`    | string          | no       | Project homepage URL                                |
-| `repository`  | string          | no       | Source repository URL                               |
-
-### Name and version resolution
-
-Each target resolves its package name with the following precedence (first
-non-empty wins):
-
-1. an explicit per-target override (e.g. `python.package_name`,
-   `dart.package_name`, `ruby.gem_name`),
-2. `package.name`,
-3. the IDL file stem (e.g. `kvstore.yml` → `kvstore`),
-4. the built-in default `weaveffi`.
-
-The version resolves from `package.version`, falling back to `0.1.0`. Names
-are normalized per ecosystem, e.g. a Python import package or Ruby `require`
-path lowercases and replaces non-alphanumerics with `_` (`my-kv.store` →
-`my_kv_store`), while the published distribution name keeps the original
-spelling.
-
-> Code-level identity that has no manifest of its own still follows the
-> package where it is unambiguous: the Swift module name defaults to the
-> PascalCased `package.name` (`async-demo` → `AsyncDemo`). The stable C ABI
-> symbol prefix is **not** affected: it stays `weaveffi` (or your global
-> `c_prefix`) so the generated bindings keep calling the symbols the producer
-> exports.
-
-### Package example
-
-```yaml
-version: "0.7.0"
-package:
-  name: kvstore
-  version: "1.0.0"
-  description: An embedded key-value store API.
-  license: MIT
-  authors:
-    - WeaveFoundry <hello@weavefoundry.dev>
-  homepage: https://github.com/weavefoundry/weaveffi
-  repository: https://github.com/weavefoundry/weaveffi
-modules:
-  - name: kv
-    functions:
-      - name: count
-        params: []
-        return: i64
+```toml
+[package]
+name = "kvstore"
+version = "1.0.0"
+description = "An embedded key-value store API."
+license = "MIT"
+authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
+repository = "https://github.com/weavefoundry/weaveffi"
 ```
+
+See [Project Configuration](../guides/config.md#package) for the schema and
+the per-ecosystem name resolution rules.
 
 ---
 
@@ -196,7 +148,7 @@ parameters and return types.
 ### Primitive examples
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: primitives
     structs:
@@ -276,7 +228,7 @@ knows how to spell the handle's type. At the C ABI level, `handle<T>` is
 still a `uint64_t`.
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: sessions
     structs:
@@ -330,7 +282,7 @@ Each field:
 ### Struct example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: geometry
     structs:
@@ -414,7 +366,7 @@ Each variant:
 ### Enum example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -448,7 +400,7 @@ Swift `enum` with associated values). A *unit* variant (no `fields`) and a *data
 variant may coexist in the same enum.
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: shapes
     enums:
@@ -560,7 +512,7 @@ positions.
 A trimmed version of the `kvstore` sample's `Store` interface:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: kv
     errors:
@@ -650,7 +602,7 @@ the default is null.
 ### Optional example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     structs:
@@ -692,7 +644,7 @@ Wrap a type in `[T]` brackets to declare a list (variable-length sequence).
 ### List example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: lists
     structs:
@@ -737,7 +689,7 @@ valid `TypeRef`.
 ### Map example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: maps
     structs:
@@ -821,7 +773,7 @@ because every composite serializes into one value buffer:
 ### Nested type example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: nested
     structs:
@@ -868,7 +820,7 @@ one at a time and are suitable for large or streaming result sets.
 ### Iterator example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: streaming
     structs:
@@ -922,7 +874,7 @@ invokes a caller-provided function.
 ### Callback example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: events
     functions: []
@@ -962,7 +914,7 @@ with subscribe/unsubscribe lifecycle management.
 ### Listener example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: events
     functions: []
@@ -990,7 +942,7 @@ modules.
 ### Nested module example
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: app
     functions:
@@ -1039,7 +991,7 @@ For example, a nested `stats` module can take the parent `kv` module's
 `Store` interface as a parameter:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: kv
     errors:
@@ -1086,7 +1038,7 @@ Functions can be marked as asynchronous. See the
 behaviour.
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: net
     errors:
@@ -1125,7 +1077,7 @@ return a list instead or make the function synchronous.
 Mark a function as deprecated with a migration message:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: legacy
     functions:
@@ -1147,7 +1099,7 @@ Generators propagate the deprecation message to the target language
 Mark a parameter as mutable when the callee may modify it in-place:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: buffers
     functions:
@@ -1161,38 +1113,24 @@ generated wrapper code in target languages.
 
 ---
 
-## Generators section
+## Generator options
 
-The top-level `generators` key provides per-generator configuration
-directly in the IDL file. This is an alternative to using a separate
-TOML configuration file with `--config`.
+Per-generator options (Swift module name, Android package, Go module path,
+and so on) are not part of the IDL. They live under `[generators.<target>]`
+tables in `weaveffi.toml`, where `<target>` matches the `--target` flag:
 
-```yaml
-version: "0.7.0"
-modules:
-  - name: math
-    functions:
-      - name: add
-        params:
-          - { name: a, type: i32 }
-          - { name: b, type: i32 }
-        return: i32
+```toml
+[generators.swift]
+module_name = "MyMathLib"
 
-generators:
-  swift:
-    module_name: MyMathLib
-  android:
-    package: com.example.math
-  ruby:
-    module_name: MathBindings
-    gem_name: math_bindings
-  go:
-    module_path: github.com/myorg/mathlib
+[generators.android]
+package = "com.example.math"
+
+[generators.go]
+module_path = "github.com/myorg/mathlib"
 ```
 
-Each key under `generators` is the target name (matching the `--target`
-flag). The value is a target-specific configuration object. See the
-[Generator Configuration guide](../guides/config.md) for the full list
+See the [Project Configuration guide](../guides/config.md) for the full list
 of options.
 
 ---
@@ -1239,7 +1177,7 @@ A full IDL combining structs, enums, optionals, lists, an interface, and a
 typed error domain (a trimmed version of the `contacts` sample):
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -1422,7 +1360,7 @@ Declaring a domain reserves the codes; a function, method, or constructor
 joins the typed error path by declaring `throws: true`:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     errors:
@@ -1507,7 +1445,7 @@ Per-target syntax:
 Example IDL:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: docs
     structs:

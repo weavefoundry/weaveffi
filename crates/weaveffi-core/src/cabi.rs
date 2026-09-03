@@ -19,6 +19,15 @@ use crate::model::{
     AbiFn, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
 };
 
+/// The revision of the WeaveFFI C ABI the generators emit bindings for.
+///
+/// Mirrors `weaveffi_abi::ABI_VERSION`; the two are kept equal by a test in
+/// the `weaveffi` facade crate, which depends on both. Generated consumers
+/// embed this value and, where a load-time check is cheap, compare it against
+/// the producer's exported `{prefix}_abi_version()` before making any other
+/// call.
+pub const ABI_VERSION: u32 = 1;
+
 /// Emit a `/** ... */` doc comment at `indent`.
 pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
     common_emit_doc(out, doc, indent, DocCommentStyle::Javadoc);
@@ -129,12 +138,19 @@ pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
 /// bytes, and arrays into linear memory before each call. Native consumers
 /// never call them, but a producer targeting WebAssembly (for example a C
 /// library built with Emscripten) must export them; the generated
-/// `{prefix}.c` scaffold provides malloc/free-backed defaults.
+/// `{prefix}.c` convenience file provides malloc/free-backed defaults.
 pub fn render_runtime_decls(out: &mut String, prefix: &str) {
     let api = export_macro(prefix);
+    let upper = prefix.to_uppercase();
     let _ = write!(
         out,
-        "typedef uint64_t {prefix}_handle_t;\n\n\
+        "/* The WeaveFFI C ABI revision this header was generated against. The\n   \
+           producer exports {prefix}_abi_version() so a consumer can refuse to load\n   \
+           a library built for a different revision instead of misreading its\n   \
+           error struct or value buffers. */\n\
+         #define {upper}_ABI_VERSION {ABI_VERSION}u\n\
+         {api} uint32_t {prefix}_abi_version(void);\n\n\
+         typedef uint64_t {prefix}_handle_t;\n\n\
          /* Error slot written by every fallible call. `payload_ptr`/`payload_len`\n   \
            hold the matched error code's fields serialized in the WeaveFFI value\n   \
            buffer format (null when the code declares no fields); both the message\n   \

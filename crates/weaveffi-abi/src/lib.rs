@@ -22,6 +22,27 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The revision of the WeaveFFI C ABI this runtime implements.
+///
+/// Every producer cdylib exports it as `weaveffi_abi_version()` (via
+/// [`export_runtime!`]), and every generated consumer embeds the revision it
+/// was generated against. Consumers that can do so cheaply compare the two
+/// at load time and refuse to run against a producer built for a different
+/// revision, turning a silent memory-layout mismatch into a clear error.
+///
+/// The number only changes when the runtime surface (the `weaveffi_error`
+/// layout, the value-buffer encoding, or the set and signatures of the
+/// `weaveffi_*` runtime symbols) changes incompatibly. It is independent of
+/// the crate version and of the IDL schema version.
+pub const ABI_VERSION: u32 = 1;
+
+/// Return [`ABI_VERSION`]; the body behind the exported
+/// `weaveffi_abi_version` thunk.
+#[must_use]
+pub const fn abi_version() -> u32 {
+    ABI_VERSION
+}
+
 /// Public opaque handle type exposed to foreign callers.
 pub type weaveffi_handle_t = u64;
 

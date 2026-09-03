@@ -4,12 +4,11 @@
 
 use std::fmt::Write as _;
 
-use weaveffi_core::abi;
 use weaveffi_core::codegen::common::pascal_case;
 use weaveffi_core::lang;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{FnBinding, IteratorBinding, ParamBinding};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 /// Escape a user-chosen identifier for a Kotlin declaration or expression
 /// position: a reserved word gains the shared trailing underscore
@@ -35,53 +34,52 @@ pub(crate) fn c_local(name: &str) -> String {
 /// The idiomatic (public) Kotlin type for an IR type: records and rich enums
 /// surface as their generated value classes, lists and maps as `List`/`Map`,
 /// optionals as nullable types, and handles as raw `Long` tokens.
-pub(crate) fn kotlin_type(t: &TypeRef) -> String {
+pub(crate) fn kotlin_type(t: &Ty) -> String {
     match t {
-        TypeRef::I8 | TypeRef::U8 => "Byte".to_string(),
-        TypeRef::I16 | TypeRef::U16 => "Short".to_string(),
-        TypeRef::I32 => "Int".to_string(),
-        TypeRef::U32 => "Long".to_string(),
-        TypeRef::I64 | TypeRef::U64 => "Long".to_string(),
-        TypeRef::F32 => "Float".to_string(),
-        TypeRef::F64 => "Double".to_string(),
-        TypeRef::Bool => "Boolean".to_string(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "ByteArray".to_string(),
+        Ty::I8 | Ty::U8 => "Byte".to_string(),
+        Ty::I16 | Ty::U16 => "Short".to_string(),
+        Ty::I32 => "Int".to_string(),
+        Ty::U32 => "Long".to_string(),
+        Ty::I64 | Ty::U64 => "Long".to_string(),
+        Ty::F32 => "Float".to_string(),
+        Ty::F64 => "Double".to_string(),
+        Ty::Bool => "Boolean".to_string(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "String".to_string(),
+        Ty::Bytes | Ty::BorrowedBytes => "ByteArray".to_string(),
         // Handles (typed or not) are opaque u64 tokens; both surface as `Long`.
-        TypeRef::Handle | TypeRef::TypedHandle(_) => "Long".to_string(),
+        Ty::Handle | Ty::TypedHandle(_) => "Long".to_string(),
         // An interface surfaces as its generated Kotlin wrapper class; the
         // JNI layer carries the raw `Long` pointer.
-        TypeRef::Interface(name) => local_type_name(name).to_string(),
+        Ty::Interface(name) => local_type_name(name).to_string(),
         // Records and rich enums are value types: the generated data class or
         // sealed class, decoded from the value buffer by the wrapper layer.
         // Cross-module references (e.g. `geo.Point`) name the bare local
         // Kotlin class `Point`, never the dot-qualified IR name.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).to_string(),
-        TypeRef::Enum(name) => local_type_name(name).to_string(),
-        TypeRef::Optional(inner) => format!("{}?", kotlin_type(inner)),
-        TypeRef::List(inner) => format!("List<{}>", kotlin_type(inner)),
-        TypeRef::Iterator(inner) => format!("Iterator<{}>", kotlin_type(inner)),
-        TypeRef::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        Ty::Record(name) | Ty::RichEnum(name) => local_type_name(name).to_string(),
+        Ty::Enum(name) => local_type_name(name).to_string(),
+        Ty::Optional(inner) => format!("{}?", kotlin_type(inner)),
+        Ty::List(inner) => format!("List<{}>", kotlin_type(inner)),
+        Ty::Iterator(inner) => format!("Iterator<{}>", kotlin_type(inner)),
+        Ty::Map(k, v) => format!("Map<{}, {}>", kotlin_type(k), kotlin_type(v)),
     }
 }
 
 /// The Kotlin type a value crosses the JNI boundary as: buffered values pack
 /// into a `ByteArray`, enums cross as their raw `Int`, interfaces and
 /// iterator handles as raw `Long`s. Everything else matches [`kotlin_type`].
-pub(crate) fn kotlin_jni_type(t: &TypeRef) -> String {
-    if abi::is_buffered(t) {
+pub(crate) fn kotlin_jni_type(t: &Ty) -> String {
+    if t.is_buffered() {
         return "ByteArray".to_string();
     }
     match t {
-        TypeRef::Enum(_) => "Int".to_string(),
-        TypeRef::Interface(_) => "Long".to_string(),
+        Ty::Enum(_) => "Int".to_string(),
+        Ty::Interface(_) => "Long".to_string(),
         // Only `Interface?` reaches here (every other optional is buffered):
         // the JNI layer carries the nullable pointer as a boxed `Long?`.
-        TypeRef::Optional(_) => "Long?".to_string(),
+        Ty::Optional(_) => "Long?".to_string(),
         // An iterator crosses JNI as the raw handle returned by the launcher;
         // the public wrapper adopts it into the generated iterator class.
-        TypeRef::Iterator(_) => "Long".to_string(),
+        Ty::Iterator(_) => "Long".to_string(),
         other => kotlin_type(other),
     }
 }
@@ -91,16 +89,16 @@ pub(crate) fn kotlin_jni_type(t: &TypeRef) -> String {
 /// runs, so they surface as their idiomatic value types. Enums stay raw `Int`
 /// and interfaces raw `Long`: trampolines box arguments on arbitrary producer
 /// threads where only bootstrap classes (`java/lang/*`) are loadable.
-pub(crate) fn kotlin_cb_type(t: &TypeRef) -> String {
-    if abi::is_buffered(t) {
+pub(crate) fn kotlin_cb_type(t: &Ty) -> String {
+    if t.is_buffered() {
         return kotlin_type(t);
     }
     match t {
-        TypeRef::Enum(_) => "Int".to_string(),
-        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => "Long".to_string(),
+        Ty::Enum(_) => "Int".to_string(),
+        Ty::TypedHandle(_) | Ty::Interface(_) => "Long".to_string(),
         // Only `Interface?` reaches here: a nullable raw pointer.
-        TypeRef::Optional(_) => "Long?".to_string(),
-        TypeRef::Iterator(_) => unreachable!("validation rejects iterator callback params"),
+        Ty::Optional(_) => "Long?".to_string(),
+        Ty::Iterator(_) => unreachable!("validation rejects iterator callback params"),
         other => kotlin_type(other),
     }
 }
@@ -108,8 +106,8 @@ pub(crate) fn kotlin_cb_type(t: &TypeRef) -> String {
 /// The Kotlin parameter types of the JNI-facing listener callback lambda the
 /// trampoline invokes: buffered arguments arrive as a raw `ByteArray` copy;
 /// everything else matches [`kotlin_cb_type`].
-pub(crate) fn kotlin_cb_jni_type(t: &TypeRef) -> String {
-    if abi::is_buffered(t) {
+pub(crate) fn kotlin_cb_jni_type(t: &Ty) -> String {
+    if t.is_buffered() {
         return "ByteArray".to_string();
     }
     kotlin_cb_type(t)
@@ -118,41 +116,37 @@ pub(crate) fn kotlin_cb_jni_type(t: &TypeRef) -> String {
 /// The JNI C parameter type (`jint`, `jbyteArray`, ...) an IR type crosses
 /// the JNI export boundary as. Buffered values arrive as one packed
 /// `jbyteArray`.
-pub(crate) fn jni_param_type(t: &TypeRef) -> String {
-    if abi::is_buffered(t) {
+pub(crate) fn jni_param_type(t: &Ty) -> String {
+    if t.is_buffered() {
         return "jbyteArray".to_string();
     }
     match t {
-        TypeRef::I8 | TypeRef::U8 => "jbyte".to_string(),
-        TypeRef::I16 | TypeRef::U16 => "jshort".to_string(),
-        TypeRef::I32 | TypeRef::Enum(_) => "jint".to_string(),
-        TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Handle
-        | TypeRef::Interface(_) => "jlong".to_string(),
-        TypeRef::F32 => "jfloat".to_string(),
-        TypeRef::F64 => "jdouble".to_string(),
-        TypeRef::Bool => "jboolean".to_string(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "jstring".to_string(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "jbyteArray".to_string(),
+        Ty::I8 | Ty::U8 => "jbyte".to_string(),
+        Ty::I16 | Ty::U16 => "jshort".to_string(),
+        Ty::I32 | Ty::Enum(_) => "jint".to_string(),
+        Ty::U32 | Ty::I64 | Ty::U64 | Ty::TypedHandle(_) | Ty::Handle | Ty::Interface(_) => {
+            "jlong".to_string()
+        }
+        Ty::F32 => "jfloat".to_string(),
+        Ty::F64 => "jdouble".to_string(),
+        Ty::Bool => "jboolean".to_string(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "jstring".to_string(),
+        Ty::Bytes | Ty::BorrowedBytes => "jbyteArray".to_string(),
         // Only `Interface?` reaches here: Kotlin's `Long?` boxes to
         // `java.lang.Long`, so the slot is a nullable `jobject`.
-        TypeRef::Optional(_) => "jobject".to_string(),
+        Ty::Optional(_) => "jobject".to_string(),
         // An iterator return crosses as the raw handle (`jlong`); it is never
         // a parameter (validation rejects that position).
-        TypeRef::Iterator(_) => "jlong".to_string(),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        Ty::Iterator(_) => "jlong".to_string(),
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered types are handled above")
         }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
 /// The JNI C return type of an export: `void` for no return, otherwise the
 /// same lowering as [`jni_param_type`].
-pub(crate) fn jni_ret_type(t: Option<&TypeRef>) -> String {
+pub(crate) fn jni_ret_type(t: Option<&Ty>) -> String {
     match t {
         None => "void".to_string(),
         Some(t) => jni_param_type(t),
@@ -162,68 +156,65 @@ pub(crate) fn jni_ret_type(t: Option<&TypeRef>) -> String {
 /// The C declaration type for the scalar-shaped returns handled by the
 /// generic fallthrough in `write_return_handling`. Buffered, string, bytes,
 /// optional, iterator, and typed-handle returns have dedicated emitters.
-pub(crate) fn c_type_for_return(t: &TypeRef) -> &'static str {
+pub(crate) fn c_type_for_return(t: &Ty) -> &'static str {
     match t {
-        TypeRef::I8 => "int8_t",
-        TypeRef::U8 => "uint8_t",
-        TypeRef::I16 => "int16_t",
-        TypeRef::U16 => "uint16_t",
-        TypeRef::I32 | TypeRef::Enum(_) => "int32_t",
-        TypeRef::U32 => "uint32_t",
-        TypeRef::I64 => "int64_t",
-        TypeRef::U64 => "uint64_t",
-        TypeRef::F32 => "float",
-        TypeRef::F64 => "double",
-        TypeRef::Bool => "bool",
-        TypeRef::Handle => "weaveffi_handle_t",
-        TypeRef::Interface(_) => "void*",
+        Ty::I8 => "int8_t",
+        Ty::U8 => "uint8_t",
+        Ty::I16 => "int16_t",
+        Ty::U16 => "uint16_t",
+        Ty::I32 | Ty::Enum(_) => "int32_t",
+        Ty::U32 => "uint32_t",
+        Ty::I64 => "int64_t",
+        Ty::U64 => "uint64_t",
+        Ty::F32 => "float",
+        Ty::F64 => "double",
+        Ty::Bool => "bool",
+        Ty::Handle => "weaveffi_handle_t",
+        Ty::Interface(_) => "void*",
         other => unreachable!("return type {other:?} is handled by a dedicated emitter"),
     }
 }
 
 /// The `return ...;` statement an error path exits an export with, per JNI
 /// return type. Empty for `void` exports.
-pub(crate) fn jni_default_return(t: Option<&TypeRef>) -> &'static str {
+pub(crate) fn jni_default_return(t: Option<&Ty>) -> &'static str {
     let Some(t) = t else {
         return "";
     };
-    if abi::is_buffered(t) {
+    if t.is_buffered() {
         return "return NULL;";
     }
     match t {
-        TypeRef::I8 | TypeRef::U8 | TypeRef::I16 | TypeRef::U16 => "return 0;",
-        TypeRef::I32 | TypeRef::Enum(_) => "return 0;",
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::TypedHandle(_) | TypeRef::Handle => {
-            "return 0;"
-        }
-        TypeRef::F32 => "return 0.0f;",
-        TypeRef::F64 => "return 0.0;",
-        TypeRef::Bool => "return JNI_FALSE;",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "return NULL;",
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "return NULL;",
-        TypeRef::Interface(_) => "return 0;",
+        Ty::I8 | Ty::U8 | Ty::I16 | Ty::U16 => "return 0;",
+        Ty::I32 | Ty::Enum(_) => "return 0;",
+        Ty::U32 | Ty::I64 | Ty::U64 | Ty::TypedHandle(_) | Ty::Handle => "return 0;",
+        Ty::F32 => "return 0.0f;",
+        Ty::F64 => "return 0.0;",
+        Ty::Bool => "return JNI_FALSE;",
+        Ty::StringUtf8 | Ty::BorrowedStr => "return NULL;",
+        Ty::Bytes | Ty::BorrowedBytes => "return NULL;",
+        Ty::Interface(_) => "return 0;",
         // Only `Interface?` reaches here (a nullable boxed `Long`).
-        TypeRef::Optional(_) => "return NULL;",
+        Ty::Optional(_) => "return NULL;",
         // The iterator launcher returns the handle as a `jlong`; 0 = failed.
-        TypeRef::Iterator(_) => "return 0;",
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        Ty::Iterator(_) => "return 0;",
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered types are handled above")
         }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
 /// The C-to-JNI cast prefix for the scalar-shaped returns rendered by the
 /// generic fallthrough in `write_return_handling`.
-pub(crate) fn jni_cast_for(t: &TypeRef) -> &'static str {
+pub(crate) fn jni_cast_for(t: &Ty) -> &'static str {
     match t {
-        TypeRef::I8 | TypeRef::U8 => "(jbyte)",
-        TypeRef::I16 | TypeRef::U16 => "(jshort)",
-        TypeRef::I32 | TypeRef::Enum(_) => "(jint)",
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => "(jlong)",
-        TypeRef::F32 => "(jfloat)",
-        TypeRef::F64 => "(jdouble)",
-        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => "(jlong)(intptr_t)",
+        Ty::I8 | Ty::U8 => "(jbyte)",
+        Ty::I16 | Ty::U16 => "(jshort)",
+        Ty::I32 | Ty::Enum(_) => "(jint)",
+        Ty::U32 | Ty::I64 | Ty::U64 | Ty::Handle => "(jlong)",
+        Ty::F32 => "(jfloat)",
+        Ty::F64 => "(jdouble)",
+        Ty::TypedHandle(_) | Ty::Interface(_) => "(jlong)(intptr_t)",
         _ => "",
     }
 }
@@ -293,13 +284,13 @@ pub(crate) fn camel_params(params: &[ParamBinding]) -> Vec<ParamBinding> {
 /// and iterator returns (the raw `Long` handle is adopted into the generated
 /// iterator class).
 pub(crate) fn needs_wrapper_split(f: &FnBinding) -> bool {
-    fn differs(t: &TypeRef) -> bool {
-        abi::is_buffered(t)
-            || matches!(t, TypeRef::Enum(_) | TypeRef::Interface(_))
-            || matches!(t, TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Interface(_)))
+    fn differs(t: &Ty) -> bool {
+        t.is_buffered()
+            || matches!(t, Ty::Enum(_) | Ty::Interface(_))
+            || matches!(t, Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)))
     }
     f.params.iter().any(|p| differs(&p.ty))
-        || matches!(&f.ret, Some(TypeRef::Iterator(_)))
+        || matches!(&f.ret, Some(Ty::Iterator(_)))
         || f.ret.as_ref().is_some_and(differs)
 }
 

@@ -48,7 +48,7 @@ Booleans cross as `Int32` (`0`/`1`) and the wrapper converts both ways.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:

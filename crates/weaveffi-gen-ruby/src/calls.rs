@@ -4,19 +4,19 @@
 //!
 //! Marshalling dispatch goes through the shared plan layer
 //! ([`ArgPass`], [`RetPass`], [`ElemFree`]) rather than crate-local
-//! `TypeRef` folds, so this backend cannot drift from the others on
+//! `Ty` folds, so this backend cannot drift from the others on
 //! call-boundary semantics.
 
 use heck::ToSnakeCase;
 use weaveffi_core::abi::CType;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     AsyncBinding, CallShape, CallbackBinding, FnBinding, IteratorBinding, ListenerBinding,
     ModuleBinding, ParamBinding,
 };
 use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy, RetPass};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::docs::{emit_doc, emit_param_docs};
 use crate::entities::{rb_checker_name, rb_error_factory_name};
@@ -384,7 +384,7 @@ fn rb_cb_arg_expr(p: &ParamBinding) -> String {
         } => n,
         ArgPass::Object { nullable: true, .. } => format!("({n}.null? ? nil : {n})"),
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Bool => format!("({n} != 0)"),
+            Ty::Bool => format!("({n} != 0)"),
             // Scalars, enums (their integer constants), and handles pass raw.
             _ => n,
         },
@@ -623,7 +623,7 @@ fn render_async_function_wrapper(
 /// finalizer-bearing wrapper instead.
 fn render_async_result_push(
     out: &mut String,
-    ret: &Option<TypeRef>,
+    ret: &Option<Ty>,
     ind: &str,
     qualifier: Option<&str>,
 ) {
@@ -678,9 +678,9 @@ fn render_async_result_push(
         // return surfaces nil for null instead of trapping.
         RetPass::Object { nullable, .. } => {
             let name = match ret.as_ref() {
-                Some(TypeRef::Interface(name)) => name,
-                Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-                    TypeRef::Interface(name) => name,
+                Some(Ty::Interface(name)) => name,
+                Some(Ty::Optional(inner)) => match inner.as_ref() {
+                    Ty::Interface(name) => name,
                     _ => unreachable!("only optional interfaces adopt object returns"),
                 },
                 _ => unreachable!("object return must be an interface type"),
@@ -703,10 +703,10 @@ fn render_async_result_push(
             }
         }
         RetPass::Direct => match ret.as_ref() {
-            Some(TypeRef::Bool) => {
+            Some(Ty::Bool) => {
                 w.line("queue << (result != 0)");
             }
-            Some(TypeRef::TypedHandle(name)) => {
+            Some(Ty::TypedHandle(name)) => {
                 let local = local_type_name(name);
                 w.line("if result.null?");
                 w.scope(|w| {
@@ -848,15 +848,10 @@ fn render_iterator_function_wrapper(
 /// cannot leak the element). `qualifier` is the top-level Ruby module name
 /// when rendering inside a class body, where `weaveffi_free_*` calls need an
 /// explicit receiver.
-fn render_iterator_item_yield(
-    out: &mut String,
-    elem: &TypeRef,
-    ind: &str,
-    qualifier: Option<&str>,
-) {
+fn render_iterator_item_yield(out: &mut String, elem: &Ty, ind: &str, qualifier: Option<&str>) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
-    if weaveffi_core::abi::is_buffered(elem) {
+    if elem.is_buffered() {
         // A buffered element is a producer-allocated value buffer: copy the
         // bytes, release them, then decode and yield the value.
         w.line("item_ptr = out_item.read_pointer");
@@ -873,7 +868,7 @@ fn render_iterator_item_yield(
         return;
     }
     match elem {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             w.line("item_ptr = out_item.read_pointer");
             w.line("if item_ptr.null?");
             w.scope(|w| {
@@ -887,7 +882,7 @@ fn render_iterator_item_yield(
             });
             w.line("end");
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::Bytes | Ty::BorrowedBytes => {
             w.line("item_ptr = out_item.read_pointer");
             w.line("item_len = out_item_len.read(:size_t)");
             w.line("if item_ptr.null?");
@@ -904,21 +899,21 @@ fn render_iterator_item_yield(
         }
         // A yielded typed handle is a new owned reference; the wrapper adopts
         // the pointer.
-        TypeRef::TypedHandle(name) => {
+        Ty::TypedHandle(name) => {
             let local = local_type_name(name);
             w.line("item_ptr = out_item.read_pointer");
             w.line(format!("y << {local}.new(item_ptr) unless item_ptr.null?"));
         }
         // A yielded interface is a new owned reference; wrap it without
         // re-running initialize.
-        TypeRef::Interface(name) => {
+        Ty::Interface(name) => {
             let local = local_type_name(name);
             w.line("item_ptr = out_item.read_pointer");
             w.line(format!(
                 "y << {local}._from_ptr(item_ptr) unless item_ptr.null?"
             ));
         }
-        TypeRef::Bool => {
+        Ty::Bool => {
             w.line("y << (out_item.read_int32 != 0)");
         }
         _ => {
@@ -945,10 +940,10 @@ fn rb_call_args(p: &ParamBinding) -> Vec<String> {
         // A nullable borrowed object pointer: nil passes as NULL.
         ArgPass::Object { nullable: true, .. } => vec![format!("{name}&.handle")],
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Bool => vec![format!("{name}_c")],
+            Ty::Bool => vec![format!("{name}_c")],
             // Typed handles occupy an opaque pointer slot borrowed from the
             // wrapper object.
-            TypeRef::TypedHandle(_) => vec![format!("{name}.handle")],
+            Ty::TypedHandle(_) => vec![format!("{name}.handle")],
             _ => vec![name],
         },
     }
@@ -980,7 +975,7 @@ fn render_param_conversion(out: &mut String, p: &ParamBinding, ind: &str, qualif
             ));
             w.line(format!("{name}_buf.put_bytes(0, {name})"));
         }
-        ArgPass::Direct { .. } if matches!(p.ty, TypeRef::Bool) => {
+        ArgPass::Direct { .. } if matches!(p.ty, Ty::Bool) => {
             w.line(format!("{name}_c = {name} ? 1 : 0"));
         }
         _ => {}
@@ -993,7 +988,7 @@ fn render_param_conversion(out: &mut String, p: &ParamBinding, ind: &str, qualif
 /// [`RetPass`] contract. A buffered return is a producer-allocated value
 /// buffer paired with `out_len`: the bytes are copied, released with
 /// `weaveffi_free_bytes`, then decoded.
-fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Option<&str>) {
+fn render_return_code(out: &mut String, ty: &Ty, ind: &str, qualifier: Option<&str>) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
     match plan::ret_pass(Some(ty), "", "") {
@@ -1027,9 +1022,9 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
         // return surfaces nil for null.
         RetPass::Object { nullable, .. } => {
             let name = match ty {
-                TypeRef::Interface(name) => name,
-                TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Interface(name) => name,
+                Ty::Interface(name) => name,
+                Ty::Optional(inner) => match inner.as_ref() {
+                    Ty::Interface(name) => name,
                     _ => unreachable!("only optional interfaces adopt object returns"),
                 },
                 _ => unreachable!("object return must be an interface type"),
@@ -1044,10 +1039,10 @@ fn render_return_code(out: &mut String, ty: &TypeRef, ind: &str, qualifier: Opti
             }
         }
         RetPass::Direct => match ty {
-            TypeRef::Bool => {
+            Ty::Bool => {
                 w.line("result != 0");
             }
-            TypeRef::TypedHandle(name) => {
+            Ty::TypedHandle(name) => {
                 w.line("raise Error.new(-1, 'null pointer') if result.null?");
                 w.line(format!("{name}.new(result)"));
             }

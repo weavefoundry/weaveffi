@@ -1,18 +1,22 @@
 //! `weaveffi diff`: regenerate into a temp directory and compare against
 //! the on-disk output (`--check` for CI gating with distinct exit codes).
 
-use crate::config::{merge_inline_generators, CliConfig};
 use camino::Utf8Path;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
 use similar::TextDiff;
 use std::collections::BTreeSet;
 use weaveffi_core::codegen::Orchestrator;
 
-pub(crate) fn cmd_diff(input: &str, out: Option<&str>, check: bool, quiet: bool) -> Result<()> {
+pub(crate) fn cmd_diff(
+    input: &str,
+    out: Option<&str>,
+    config_path: Option<&str>,
+    check: bool,
+    quiet: bool,
+) -> Result<()> {
     let out = out.unwrap_or("./generated");
 
-    let in_path = Utf8Path::new(input);
-    let (api, _contents) = super::load_validated_api(input)?;
+    let (config, api) = super::load_project(input, config_path, false)?;
 
     let tmp = tempfile::tempdir()
         .into_diagnostic()
@@ -20,17 +24,12 @@ pub(crate) fn cmd_diff(input: &str, out: Option<&str>, check: bool, quiet: bool)
     let tmp_path = Utf8Path::from_path(tmp.path())
         .ok_or_else(|| miette!("temp directory path is not valid UTF-8"))?;
 
-    let mut config = CliConfig::default();
-    if let Some(ref generators) = api.generators {
-        merge_inline_generators(&mut config, generators);
-    }
-    config.finalize(in_path.file_name().map(str::to_string));
     let hooks = config.hooks();
-    let generators = config.build_generators();
+    let targets = config.select_targets(None)?;
 
     let mut orchestrator = Orchestrator::new();
-    for gen in &generators {
-        orchestrator = orchestrator.with_generator(gen.as_ref());
+    for target in &targets {
+        orchestrator = orchestrator.with_target(target.as_ref());
     }
     orchestrator
         .run(&api, tmp_path, &hooks, true)
@@ -152,7 +151,7 @@ mod tests {
         std::fs::write(
             &yml,
             concat!(
-                "version: \"0.7.0\"\n",
+                "version: \"0.8.0\"\n",
                 "modules:\n",
                 "  - name: math\n",
                 "    functions:\n",

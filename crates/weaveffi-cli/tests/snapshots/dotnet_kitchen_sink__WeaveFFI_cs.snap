@@ -652,6 +652,34 @@ namespace WeaveFFI
     {
         private const string LibName = "weaveffi";
 
+        // The ABI revision these bindings were generated against.
+        internal const uint AbiVersion = 1;
+
+        // Runs before the first P/Invoke through this class, so a producer built
+        // for a different ABI revision fails loudly instead of misreading the
+        // error struct or a value buffer later.
+        static NativeMethods()
+        {
+            uint found;
+            try
+            {
+                found = weaveffi_abi_version();
+            }
+            catch (EntryPointNotFoundException e)
+            {
+                throw new InvalidOperationException(
+                    $"the loaded WeaveFFI library predates ABI versioning (these bindings expect ABI revision {AbiVersion})", e);
+            }
+            if (found != AbiVersion)
+            {
+                throw new InvalidOperationException(
+                    $"WeaveFFI ABI mismatch: these bindings expect revision {AbiVersion} but the loaded library reports revision {found}");
+            }
+        }
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern uint weaveffi_abi_version();
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_string(IntPtr ptr);
 

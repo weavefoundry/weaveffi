@@ -5,18 +5,18 @@
 //! each result's receiving contract from [`plan::ret_pass`], and each
 //! iterator element's release plan from [`plan::elem_free`], so this module
 //! only spells those shared contracts in JavaScript; it never re-derives
-//! them from `TypeRef` shapes.
+//! them from `Ty` shapes.
 
 use heck::ToLowerCamelCase;
-use weaveffi_core::abi::{is_buffered, CType};
+use weaveffi_core::abi::CType;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, FnBinding, IteratorBinding, ListenerBinding,
     ModuleBinding, ParamBinding,
 };
 use weaveffi_core::plan::{self, ArgPass, ElemFree, RetPass};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{buf_read_expr, emit_buf_write_stmts};
 use crate::docs::emit_doc;
@@ -25,14 +25,14 @@ use crate::types::{js_checker_name, js_err_factory, js_fn_name, js_param_name, J
 /// The byte size of the linear-memory slot an iterator `next` writes one
 /// element of `ty` into: 8 for a `ptr` + `len` pair (bytes and buffered
 /// values), pointer or scalar width otherwise.
-fn iter_slot_size(ty: &TypeRef) -> u32 {
+fn iter_slot_size(ty: &Ty) -> u32 {
     match plan::elem_free(ty) {
         ElemFree::Bytes => 8,
         ElemFree::String => 4,
         ElemFree::None => match ty {
-            TypeRef::Bool | TypeRef::I8 | TypeRef::U8 => 1,
-            TypeRef::I16 | TypeRef::U16 => 2,
-            TypeRef::I64 | TypeRef::U64 | TypeRef::F64 | TypeRef::Handle => 8,
+            Ty::Bool | Ty::I8 | Ty::U8 => 1,
+            Ty::I16 | Ty::U16 => 2,
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::Handle => 8,
             _ => 4,
         },
     }
@@ -40,19 +40,19 @@ fn iter_slot_size(ty: &TypeRef) -> u32 {
 
 /// A JS expression reading one by-value scalar of `ty` from `DataView` `dv`
 /// at byte offset `at`.
-fn read_scalar_at(ty: &TypeRef, dv: &str, at: &str) -> String {
+fn read_scalar_at(ty: &Ty, dv: &str, at: &str) -> String {
     match ty {
-        TypeRef::Bool => format!("{dv}.getUint8({at}) !== 0"),
-        TypeRef::I8 => format!("{dv}.getInt8({at})"),
-        TypeRef::U8 => format!("{dv}.getUint8({at})"),
-        TypeRef::I16 => format!("{dv}.getInt16({at}, true)"),
-        TypeRef::U16 => format!("{dv}.getUint16({at}, true)"),
-        TypeRef::U32 => format!("{dv}.getUint32({at}, true)"),
-        TypeRef::I32 | TypeRef::Enum(_) => format!("{dv}.getInt32({at}, true)"),
-        TypeRef::I64 => format!("{dv}.getBigInt64({at}, true)"),
-        TypeRef::U64 | TypeRef::Handle => format!("{dv}.getBigUint64({at}, true)"),
-        TypeRef::F32 => format!("{dv}.getFloat32({at}, true)"),
-        TypeRef::F64 => format!("{dv}.getFloat64({at}, true)"),
+        Ty::Bool => format!("{dv}.getUint8({at}) !== 0"),
+        Ty::I8 => format!("{dv}.getInt8({at})"),
+        Ty::U8 => format!("{dv}.getUint8({at})"),
+        Ty::I16 => format!("{dv}.getInt16({at}, true)"),
+        Ty::U16 => format!("{dv}.getUint16({at}, true)"),
+        Ty::U32 => format!("{dv}.getUint32({at}, true)"),
+        Ty::I32 | Ty::Enum(_) => format!("{dv}.getInt32({at}, true)"),
+        Ty::I64 => format!("{dv}.getBigInt64({at}, true)"),
+        Ty::U64 | Ty::Handle => format!("{dv}.getBigUint64({at}, true)"),
+        Ty::F32 => format!("{dv}.getFloat32({at}, true)"),
+        Ty::F64 => format!("{dv}.getFloat64({at}, true)"),
         // Opaque pointers (typed handles, interfaces) are i32 slots.
         _ => format!("{dv}.getUint32({at}, true)"),
     }
@@ -60,10 +60,10 @@ fn read_scalar_at(ty: &TypeRef, dv: &str, at: &str) -> String {
 
 /// A direct JS call argument for a scalar/handle value (coercing bool to 0/1
 /// and 64-bit values to `BigInt` as the wasm calling convention requires).
-fn js_arg_scalar(ty: &TypeRef, val: &str) -> String {
+fn js_arg_scalar(ty: &Ty, val: &str) -> String {
     match ty {
-        TypeRef::Bool => format!("{val} ? 1 : 0"),
-        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => format!("BigInt({val})"),
+        Ty::Bool => format!("{val} ? 1 : 0"),
+        Ty::I64 | Ty::U64 | Ty::Handle => format!("BigInt({val})"),
         _ => val.to_string(),
     }
 }
@@ -138,7 +138,7 @@ pub(crate) fn emit_stage_input(
 pub(crate) fn emit_return_decode(
     out: &mut String,
     indent: &str,
-    ret: Option<&TypeRef>,
+    ret: Option<&Ty>,
     symbol: &str,
     in_args: &[String],
     cleanup: &[String],
@@ -183,11 +183,11 @@ pub(crate) fn emit_return_decode(
 ///
 /// Panics when `ret` is not an interface or optional interface, which cannot
 /// happen for a return classified as [`RetPass::Object`].
-fn object_ret_name(ret: &TypeRef) -> &str {
+fn object_ret_name(ret: &Ty) -> &str {
     match ret {
-        TypeRef::Interface(name) => name,
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Interface(name) => name,
+        Ty::Interface(name) => name,
+        Ty::Optional(inner) => match inner.as_ref() {
+            Ty::Interface(name) => name,
             _ => unreachable!("non-interface optionals are buffered"),
         },
         _ => unreachable!("only interface returns classify as RetPass::Object"),
@@ -203,7 +203,7 @@ fn object_ret_name(ret: &TypeRef) -> &str {
 fn emit_decode_value(
     out: &mut String,
     indent: &str,
-    ret: Option<&TypeRef>,
+    ret: Option<&Ty>,
     r: &str,
     module: &str,
     prefix: &str,
@@ -227,7 +227,7 @@ fn emit_decode_value(
             w.line("_rd.end();");
             w.line("return _out;");
         }
-        RetPass::Direct if matches!(ret, TypeRef::Bool) => {
+        RetPass::Direct if matches!(ret, Ty::Bool) => {
             w.line(format!("return {r} !== 0;"));
         }
         RetPass::Direct => {
@@ -402,7 +402,7 @@ fn emit_cb_param_decode(
             ));
             w.line(format!("{target}_r.end();"));
         }
-        ArgPass::Direct { .. } if matches!(p.ty, TypeRef::Bool) => {
+        ArgPass::Direct { .. } if matches!(p.ty, Ty::Bool) => {
             w.line(format!("const {target} = {a} !== 0;"));
         }
         ArgPass::Direct { .. } => {
@@ -586,9 +586,9 @@ fn emit_js_function_wrapper(
 /// `ptr` + `len` pair and freed with `free_bytes` (buffered elements are then
 /// decoded through the buffer reader), an interface pointer is adopted by
 /// `_wrap`, and a by-value element is read directly.
-fn js_iter_decode_closure(elem: &TypeRef, module: &str) -> String {
+fn js_iter_decode_closure(elem: &Ty, module: &str) -> String {
     match plan::elem_free(elem) {
-        ElemFree::Bytes if is_buffered(elem) => {
+        ElemFree::Bytes if elem.is_buffered() => {
             let read = buf_read_expr(elem, module, "_rd");
             format!(
                 "(w, p) => {{ const dv = new DataView(w.memory.buffer); const _rd = new _BufReader(_takeBytes(w, dv.getUint32(p, true), dv.getUint32(p + 4, true))); const _v = {read}; _rd.end(); return _v; }}"
@@ -601,7 +601,7 @@ fn js_iter_decode_closure(elem: &TypeRef, module: &str) -> String {
             "(w, p) => _takeCStr(w, new DataView(w.memory.buffer).getUint32(p, true))".into()
         }
         ElemFree::None => match elem {
-            TypeRef::Interface(name) => {
+            Ty::Interface(name) => {
                 let cls = local_type_name(name);
                 format!("(w, p) => {cls}._wrap(new DataView(w.memory.buffer).getUint32(p, true))")
             }
@@ -704,51 +704,50 @@ fn emit_js_iterator_function_wrapper(
 /// return: always `(ctx i32, err i32, ...result)`. Pointers are i32 on
 /// wasm32; only `i64`/`u64` widen to i64; a buffered result arrives as a
 /// borrowed `ptr` + `len` pair (two i32 slots).
-pub(crate) fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static str> {
+pub(crate) fn async_cb_wasm_params(returns: Option<&Ty>) -> Vec<&'static str> {
     let mut params = vec!["i32", "i32"];
     let Some(ty) = returns else {
         return params;
     };
-    if is_buffered(ty) {
+    if ty.is_buffered() {
         params.push("i32");
         params.push("i32");
         return params;
     }
     match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::Bool
-        | TypeRef::Enum(_)
-        | TypeRef::StringUtf8
-        | TypeRef::BorrowedStr
-        | TypeRef::Interface(_)
-        | TypeRef::TypedHandle(_)
-        | TypeRef::Iterator(_)
+        Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::Bool
+        | Ty::Enum(_)
+        | Ty::StringUtf8
+        | Ty::BorrowedStr
+        | Ty::Interface(_)
+        | Ty::TypedHandle(_)
+        | Ty::Iterator(_)
         // Only `Interface?` reaches here: a nullable object pointer.
-        | TypeRef::Optional(_) => {
+        | Ty::Optional(_) => {
             params.push("i32");
         }
-        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle => {
+        Ty::I64 | Ty::U64 | Ty::Handle => {
             params.push("i64");
         }
-        TypeRef::F32 => {
+        Ty::F32 => {
             params.push("f32");
         }
-        TypeRef::F64 => {
+        Ty::F64 => {
             params.push("f64");
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::Bytes | Ty::BorrowedBytes => {
             params.push("i32");
             params.push("i32");
         }
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered type handled above")
         }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
     params
 }
@@ -768,7 +767,7 @@ pub(crate) fn async_cb_wasm_params(returns: Option<&TypeRef>) -> Vec<&'static st
 fn emit_async_unwrap(
     out: &mut String,
     indent: &str,
-    ret: Option<&TypeRef>,
+    ret: Option<&Ty>,
     mk_err: Option<&str>,
     module: &str,
     prefix: &str,
@@ -801,7 +800,7 @@ fn emit_async_unwrap(
                 w.line("return _v;");
             });
         }
-        RetPass::Direct if matches!(ret, TypeRef::Bool) => {
+        RetPass::Direct if matches!(ret, Ty::Bool) => {
             w.line(format!("{open}(w, r) => r !== 0 }});"));
         }
         RetPass::Direct => {

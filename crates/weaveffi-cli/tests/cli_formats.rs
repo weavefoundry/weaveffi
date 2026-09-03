@@ -8,9 +8,9 @@ fn repo_root() -> &'static Path {
 }
 
 fn load_calculator_api() -> Api {
-    let yml = std::fs::read_to_string(repo_root().join("samples/calculator/calculator.yml"))
-        .expect("failed to read calculator.yml");
-    serde_yaml::from_str(&yml).expect("failed to parse calculator.yml")
+    let src = std::fs::read_to_string(repo_root().join("samples/calculator/src/lib.rs"))
+        .expect("failed to read calculator lib.rs");
+    weaveffi_bridge::api_from_src_stringly(&src).expect("failed to extract calculator API")
 }
 
 #[test]

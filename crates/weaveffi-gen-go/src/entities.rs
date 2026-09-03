@@ -6,12 +6,12 @@ use std::collections::HashSet;
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, ErrorBinding, InterfaceBinding, ModuleBinding,
     StructBinding,
 };
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{render_async_function, render_function, ErrCtx};
 use crate::codec::{emit_buffer_read, emit_buffer_write};
@@ -464,23 +464,23 @@ pub(crate) fn render_interface(
 /// keeps the emitted set deterministic).
 pub(crate) fn collect_typed_handles(model: &BindingModel, prefix: &str) -> Vec<(String, String)> {
     fn visit(
-        ty: &TypeRef,
+        ty: &Ty,
         module: &str,
         prefix: &str,
         seen: &mut HashSet<String>,
         out: &mut Vec<(String, String)>,
     ) {
         match ty {
-            TypeRef::TypedHandle(n) => {
+            Ty::TypedHandle(n) => {
                 let name = handle_wrapper(n);
                 if seen.insert(name.clone()) {
                     out.push((name, c_abi_struct_name(n, module, prefix)));
                 }
             }
-            TypeRef::Optional(i) | TypeRef::List(i) | TypeRef::Iterator(i) => {
+            Ty::Optional(i) | Ty::List(i) | Ty::Iterator(i) => {
                 visit(i, module, prefix, seen, out);
             }
-            TypeRef::Map(k, v) => {
+            Ty::Map(k, v) => {
                 visit(k, module, prefix, seen, out);
                 visit(v, module, prefix, seen, out);
             }

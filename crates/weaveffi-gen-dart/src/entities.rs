@@ -4,10 +4,10 @@
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     EnumBinding, ErrorBinding, InterfaceBinding, ModuleBinding, StructBinding,
 };
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{err_ctx, render_callable, DartDecl};
 use crate::codec::{fresh, read_expr, write_stmts};
@@ -294,7 +294,7 @@ pub(crate) fn render_struct(out: &mut String, s: &StructBinding) {
                 .iter()
                 .map(|f| {
                     let n = dart_ident(&f.name);
-                    if matches!(f.ty, TypeRef::Optional(_)) {
+                    if matches!(f.ty, Ty::Optional(_)) {
                         format!("this.{n}")
                     } else {
                         format!("required this.{n}")

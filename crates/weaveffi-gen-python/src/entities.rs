@@ -3,11 +3,11 @@
 
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, EnumBinding, ErrorBinding, ErrorCodeBinding, FieldBinding, FnBinding,
     InterfaceBinding, ModuleBinding, StructBinding,
 };
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{render_callable, render_iterator_class, FnScope};
 use crate::codec::{py_read_expr, render_record_codecs, render_rich_enum_codecs};
@@ -386,7 +386,7 @@ pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &Int
     // wrapper so nothing nests inside the class body. The interface name
     // qualifies the helper so two interfaces can share a method name.
     for m in i.methods.iter().chain(i.statics.iter()) {
-        if let (Some(TypeRef::Iterator(inner)), CallShape::Iterator(it)) = (&m.ret, &m.shape) {
+        if let (Some(Ty::Iterator(inner)), CallShape::Iterator(it)) = (&m.ret, &m.shape) {
             let checker = py_checker_name(m, error);
             render_iterator_class(
                 out,

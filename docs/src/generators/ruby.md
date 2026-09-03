@@ -57,7 +57,7 @@ directions.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -464,11 +464,10 @@ write and read the tagged wire format.
    - Windows: place `weaveffi.dll` next to the script or add its
      directory to `PATH`.
 
-The Ruby module name and gem name can be customised via generator
-configuration:
+The Ruby module name and gem name can be customised in `weaveffi.toml`:
 
 ```toml
-[ruby]
+[generators.ruby]
 module_name = "MyBindings"
 gem_name = "my_bindings"
 ```

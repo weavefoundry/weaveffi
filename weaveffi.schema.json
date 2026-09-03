@@ -9,19 +9,8 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.7.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.8.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
-    },
-    "package": {
-      "description": "Package identity used to name, version, and describe every generated consumer package (npm, PyPI, gem, NuGet, pub.dev, SwiftPM, Gradle, Go). When omitted, generators fall back to the IDL file stem and version `0.1.0`, but publishable artifacts should always set this explicitly.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Package"
-        },
-        {
-          "type": "null"
-        }
-      ]
     },
     "modules": {
       "description": "Top-level modules that make up the API surface. Each is an independent namespace; modules may nest further through [`Module::modules`].",
@@ -29,70 +18,10 @@
       "items": {
         "$ref": "#/definitions/Module"
       }
-    },
-    "generators": {
-      "description": "Per-generator configuration keyed by backend name (for example `swift` or `python`). The opaque [`toml::Value`] payload is interpreted by each generator, so unrecognized keys pass through untouched. `None` when the IDL declares no `generators:` block.",
-      "type": [
-        "object",
-        "null"
-      ],
-      "additionalProperties": true
     }
   },
+  "additionalProperties": false,
   "definitions": {
-    "Package": {
-      "description": "Package identity for the generated consumer artifacts.",
-      "type": "object",
-      "required": [
-        "name",
-        "version"
-      ],
-      "properties": {
-        "name": {
-          "description": "Canonical package name (e.g. `kvstore`). Per-target name overrides in `generators:` (such as `python.package_name`) still take precedence.",
-          "type": "string"
-        },
-        "version": {
-          "description": "Semantic version stamped into every manifest (e.g. `1.2.0`).",
-          "type": "string"
-        },
-        "description": {
-          "description": "Short summary written into each manifest's description field. Omitted from generated manifests when absent.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "license": {
-          "description": "License identifier, typically an SPDX expression such as `MIT` or `Apache-2.0`, written into each manifest's license field.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "authors": {
-          "description": "Package authors, each commonly formatted as `Name <email>`, mapped to whatever author or maintainer field the target ecosystem uses. Empty by default.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "homepage": {
-          "description": "Project homepage URL recorded in manifests that expose one.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "repository": {
-          "description": "Source repository URL recorded in manifests that expose one.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
     "Module": {
       "description": "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors.",
       "type": "object",
@@ -103,6 +32,13 @@
         "name": {
           "description": "Module name, used as a namespace segment and a symbol-prefix component in generated code (for example `contacts`).",
           "type": "string"
+        },
+        "doc": {
+          "description": "Human-readable documentation for the module as a whole, propagated to the generated namespace, class, or file header. `None` when undocumented.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "functions": {
           "description": "Free functions this module exports across the FFI boundary.",
@@ -286,6 +222,13 @@
             "null"
           ]
         },
+        "deprecated": {
+          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted class. `None` means the interface is current.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "constructors": {
           "description": "Constructors: static functions returning a new instance. A constructor declares no `return` (the instance is implicit) and may not be `async`.",
           "type": "array",
@@ -323,6 +266,13 @@
         },
         "doc": {
           "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deprecated": {
+          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted record. `None` means the struct is current.",
           "type": [
             "string",
             "null"
@@ -380,6 +330,13 @@
         },
         "doc": {
           "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deprecated": {
+          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted enum. `None` means the enum is current.",
           "type": [
             "string",
             "null"

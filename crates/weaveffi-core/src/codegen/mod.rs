@@ -1,17 +1,16 @@
-//! Generator trait, dyn-erasure wrapper, and orchestration.
+//! Target erasure and orchestration.
 //!
-//! Each language target implements [`Generator`] with its own associated
-//! `Config` type. The orchestrator works on the object-safe [`DynGenerator`]
-//! trait, which erases the concrete config and is what tests and the CLI
-//! pass into [`Orchestrator::with_generator`]. The recommended way to
-//! produce a `&dyn DynGenerator` is to build a [`ConfiguredGenerator`]
-//! that pairs a typed generator with its concrete config value.
+//! Each language target implements [`LanguageBackend`] with its own typed
+//! `Config`. The orchestrator works on the object-safe [`Target`] trait, which
+//! erases the concrete config; [`ConfiguredBackend`] is the adapter that pairs
+//! a backend with a concrete config value and is what the CLI and tests pass
+//! into [`Orchestrator::with_target`].
 
 use anyhow::{bail, Result};
 use camino::Utf8Path;
 use rayon::prelude::*;
-use serde::Serialize;
 
+use crate::backend::{self, LanguageBackend};
 use crate::cache;
 use crate::capabilities::{self, TargetCapabilities};
 use crate::package::{PackageContext, PackagedFile};
@@ -39,110 +38,30 @@ fn run_hook(label: &str, cmd: &str) -> Result<()> {
     Ok(())
 }
 
-/// A language code generator.
+/// Object-safe view of a [`LanguageBackend`] paired with a concrete config.
 ///
-/// Generators are dispatched in parallel, so every implementation must be
-/// safe to share across threads. The associated [`Config`] type is owned
-/// by the generator crate so `weaveffi-core` does not have to know about
-/// target-specific options like `swift_module_name` or `cpp_namespace`.
-///
-/// [`Config`]: Generator::Config
-pub trait Generator: Send + Sync {
-    /// Per-target, fully-typed configuration consumed by [`generate`] and
-    /// [`output_files`]. Must round-trip through `serde_json` so the
-    /// orchestrator can hash it as part of the cache key.
-    ///
-    /// [`generate`]: Generator::generate
-    /// [`output_files`]: Generator::output_files
-    type Config: Serialize + Default + Clone + Send + Sync;
-
-    /// Stable short name for the target (`"swift"`, `"c"`, `"node"`, …).
-    /// Used as the cache file basename and the `--target` filter token.
-    fn name(&self) -> &'static str;
-
-    /// The gated IDL features this target implements. The orchestrator
-    /// refuses to run a generator against an API that uses a feature its
-    /// declared capabilities do not cover: a target either generates a
-    /// feature or fails loudly; it never silently omits one.
-    fn capabilities(&self) -> TargetCapabilities;
-
-    /// Whether the user explicitly opted in to generating this target even
-    /// though the API uses features the target does not support (via an
-    /// `allow_unsupported: true` flag in the target's config). When `true` the
-    /// orchestrator downgrades the capability failure to a loud warning and
-    /// the generator must emit an explicit unsupported surface (throwing
-    /// stubs, documentation) rather than silently omitting the feature.
-    /// Default: `false`. Opting in must always be an explicit config act.
-    fn allows_unsupported(&self, config: &Self::Config) -> bool {
-        let _ = config;
-        false
-    }
-
-    /// Render the bindings under `out_dir`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the target cannot render the API or cannot write its
-    /// output files (for example a filesystem failure).
-    fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path, config: &Self::Config) -> Result<()>;
-
-    /// Files that [`generate`](Generator::generate) would write, relative
-    /// to (or anchored under) `out_dir`. Used by `--dry-run` and `diff`.
-    /// Default implementation returns the empty list; generators override
-    /// to surface the list without doing any I/O.
-    fn output_files(
-        &self,
-        _api: &ResolvedApi,
-        _out_dir: &Utf8Path,
-        _config: &Self::Config,
-    ) -> Vec<String> {
-        vec![]
-    }
-
-    /// Assemble a distributable package that bundles the prebuilt native
-    /// libraries in `ctx`, anchored under `out_dir`, or `None` when this target
-    /// does not support packaging. Mirrors
-    /// [`LanguageBackend::package`](crate::backend::LanguageBackend::package);
-    /// the default returns `None`.
-    fn package(
-        &self,
-        _api: &ResolvedApi,
-        _ctx: &PackageContext,
-        _out_dir: &Utf8Path,
-        _config: &Self::Config,
-    ) -> Option<Vec<PackagedFile>> {
-        None
-    }
-}
-
-/// Object-safe view of a [`Generator`] paired with a concrete config.
-///
-/// The orchestrator stores generators as `&dyn DynGenerator` so it can
-/// hold a heterogeneous set of targets whose `Config` types differ.
-/// [`ConfiguredGenerator`] is the canonical adapter.
-pub trait DynGenerator: Send + Sync {
-    /// The target's stable short name. Mirrors [`Generator::name`].
+/// The orchestrator stores targets as `&dyn Target` so it can hold a
+/// heterogeneous set whose `Config` types differ. [`ConfiguredBackend`] is
+/// the canonical adapter.
+pub trait Target: Send + Sync {
+    /// The target's stable short name. Mirrors [`LanguageBackend::name`].
     fn name(&self) -> &'static str;
     /// The gated features the target implements. Mirrors
-    /// [`Generator::capabilities`].
+    /// [`LanguageBackend::capabilities`].
     fn capabilities(&self) -> TargetCapabilities;
-    /// See [`Generator::allows_unsupported`], evaluated against the bound
-    /// config.
+    /// See [`LanguageBackend::allows_unsupported`], evaluated against the
+    /// bound config.
     fn allows_unsupported(&self) -> bool;
-    /// Render the bindings under `out_dir`, using the bound config. Mirrors
-    /// [`Generator::generate`].
+    /// Render the bindings under `out_dir`, using the bound config.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying [`Generator::generate`] fails to
-    /// render or write its output.
+    /// Returns an error if the backend fails to render or write its output.
     fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Result<()>;
-    /// The files [`generate`](Self::generate) would write. Mirrors
-    /// [`Generator::output_files`].
+    /// The files [`generate`](Self::generate) would write.
     fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Vec<String>;
     /// Assemble the distributable package for this target, using the bound
-    /// config. Mirrors [`Generator::package`]; returns `None` when the target
-    /// does not support packaging.
+    /// config. Returns `None` when the target does not support packaging.
     fn package(
         &self,
         api: &ResolvedApi,
@@ -154,36 +73,36 @@ pub trait DynGenerator: Send + Sync {
     fn config_hash_input(&self) -> Vec<u8>;
 }
 
-/// Binds a [`Generator`] to a concrete [`Generator::Config`] value so it
-/// can be erased to `&dyn DynGenerator`.
+/// Binds a [`LanguageBackend`] to a concrete config value so it can be erased
+/// to `&dyn Target`.
 ///
 /// ```ignore
-/// let swift = ConfiguredGenerator::new(SwiftGenerator, SwiftConfig::default());
-/// orchestrator.with_generator(&swift);
+/// let swift = ConfiguredBackend::new(SwiftBackend, SwiftConfig::default());
+/// orchestrator.with_target(&swift);
 /// ```
-pub struct ConfiguredGenerator<G: Generator> {
-    inner: G,
-    config: G::Config,
+pub struct ConfiguredBackend<B: LanguageBackend> {
+    inner: B,
+    config: B::Config,
 }
 
-impl<G: Generator> ConfiguredGenerator<G> {
-    /// Pair a typed generator with the concrete config it should run under.
-    pub fn new(inner: G, config: G::Config) -> Self {
+impl<B: LanguageBackend> ConfiguredBackend<B> {
+    /// Pair a backend with the concrete config it should run under.
+    pub fn new(inner: B, config: B::Config) -> Self {
         Self { inner, config }
     }
 
     /// Borrow the bound config value.
-    pub fn config(&self) -> &G::Config {
+    pub fn config(&self) -> &B::Config {
         &self.config
     }
 
-    /// Borrow the wrapped typed generator.
-    pub fn inner(&self) -> &G {
+    /// Borrow the wrapped backend.
+    pub fn inner(&self) -> &B {
         &self.inner
     }
 }
 
-impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
+impl<B: LanguageBackend> Target for ConfiguredBackend<B> {
     fn name(&self) -> &'static str {
         self.inner.name()
     }
@@ -197,11 +116,11 @@ impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
     }
 
     fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Result<()> {
-        self.inner.generate(api, out_dir, &self.config)
+        backend::run(&self.inner, api, out_dir, &self.config)
     }
 
     fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Vec<String> {
-        self.inner.output_files(api, out_dir, &self.config)
+        backend::output_files(&self.inner, api, out_dir, &self.config)
     }
 
     fn package(
@@ -210,12 +129,12 @@ impl<G: Generator> DynGenerator for ConfiguredGenerator<G> {
         ctx: &PackageContext,
         out_dir: &Utf8Path,
     ) -> Option<Vec<PackagedFile>> {
-        self.inner.package(api, ctx, out_dir, &self.config)
+        backend::package_files(&self.inner, api, ctx, out_dir, &self.config)
     }
 
     fn config_hash_input(&self) -> Vec<u8> {
         let value =
-            serde_json::to_value(&self.config).expect("generator config should serialize to JSON");
+            serde_json::to_value(&self.config).expect("backend config should serialize to JSON");
         serde_json::to_vec(&value).expect("JSON Value should serialize")
     }
 }
@@ -230,12 +149,11 @@ pub struct OrchestratorHooks {
     pub post_generate: Option<String>,
 }
 
-/// Runs a set of configured generators: it capability-gates each target,
-/// skips the ones whose cached hash is still current, and renders the rest in
-/// parallel.
+/// Runs a set of configured targets: it capability-gates each one, skips the
+/// ones whose cached hash is still current, and renders the rest in parallel.
 #[derive(Default)]
 pub struct Orchestrator<'a> {
-    generators: Vec<&'a dyn DynGenerator>,
+    targets: Vec<&'a dyn Target>,
 }
 
 impl<'a> Orchestrator<'a> {
@@ -244,9 +162,9 @@ impl<'a> Orchestrator<'a> {
         Self::default()
     }
 
-    /// Register one erased generator to run, returning `self` for chaining.
-    pub fn with_generator(mut self, gen: &'a dyn DynGenerator) -> Self {
-        self.generators.push(gen);
+    /// Register one erased target to run, returning `self` for chaining.
+    pub fn with_target(mut self, target: &'a dyn Target) -> Self {
+        self.targets.push(target);
         self
     }
 
@@ -261,8 +179,8 @@ impl<'a> Orchestrator<'a> {
     ///
     /// Returns an error if a selected target does not support a feature the IDL
     /// uses (without `allow_unsupported`), the `force` cache reset fails, a
-    /// `pre_generate` or `post_generate` hook exits non-zero, any generator
-    /// fails while rendering, or a cache entry cannot be written.
+    /// `pre_generate` or `post_generate` hook exits non-zero, any target fails
+    /// while rendering, or a cache entry cannot be written.
     pub fn run(
         &self,
         api: &ResolvedApi,
@@ -272,20 +190,20 @@ impl<'a> Orchestrator<'a> {
     ) -> Result<()> {
         // Capability gate: every selected target must support every gated
         // feature the API uses. Collect all violations before failing so the
-        // user sees the complete picture in one run. A generator whose config
+        // user sees the complete picture in one run. A target whose config
         // explicitly opted in via `allow_unsupported` downgrades its failure
-        // to a loud warning: the generator emits an explicit unsupported
+        // to a loud warning: the backend emits an explicit unsupported
         // surface (throwing stubs) for the missing features instead.
         let mut violations: Vec<String> = Vec::new();
-        for g in &self.generators {
-            let Err(err) = capabilities::check(api.api(), g.name(), &g.capabilities()) else {
+        for t in &self.targets {
+            let Err(err) = capabilities::check(api.api(), t.name(), &t.capabilities()) else {
                 continue;
             };
-            if g.allows_unsupported() {
+            if t.allows_unsupported() {
                 eprintln!(
                     "warning: target '{}' does not support every feature this IDL uses; \
                      generating anyway because allow_unsupported is set:",
-                    g.name()
+                    t.name()
                 );
                 for (feature, locations) in &err.violations {
                     eprintln!("  - {feature} (used by: {})", locations.join(", "));
@@ -302,16 +220,14 @@ impl<'a> Orchestrator<'a> {
             cache::invalidate_all(out_dir)?;
         }
 
-        // Pair each generator with its expected hash and decide individually
-        // whether it needs to run, so a single generator can be re-run while
+        // Pair each target with its expected hash and decide individually
+        // whether it needs to run, so a single target can be re-run while
         // the others stay cached.
-        let mut pending: Vec<(&'a dyn DynGenerator, String)> = Vec::new();
-        for &g in &self.generators {
-            let cfg_bytes = g.config_hash_input();
-            let hash = cache::hash_generator_inputs(api.api(), g.name(), &cfg_bytes);
-            let cached = cache::read_generator_cache(out_dir, g.name());
-            if cached.as_deref() != Some(hash.as_str()) {
-                pending.push((g, hash));
+        let mut pending: Vec<(&'a dyn Target, String)> = Vec::new();
+        for &t in &self.targets {
+            let hash = cache::hash_generator_inputs(api, t.name(), &t.config_hash_input());
+            if cache::read_generator_cache(out_dir, t.name()).as_deref() != Some(hash.as_str()) {
+                pending.push((t, hash));
             }
         }
 
@@ -326,15 +242,15 @@ impl<'a> Orchestrator<'a> {
 
         pending
             .par_iter()
-            .map(|(g, _)| g.generate(api, out_dir))
+            .map(|(t, _)| t.generate(api, out_dir))
             .collect::<Result<Vec<_>>>()?;
 
         if let Some(cmd) = &hooks.post_generate {
             run_hook("post_generate", cmd)?;
         }
 
-        for (g, hash) in &pending {
-            cache::write_generator_cache(out_dir, g.name(), hash)?;
+        for (t, hash) in &pending {
+            cache::write_generator_cache(out_dir, t.name(), hash)?;
         }
         Ok(())
     }
@@ -343,25 +259,25 @@ impl<'a> Orchestrator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::OutputFile;
+    use crate::model::BindingModel;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
+    use weaveffi_ir::ir::{Api, CallbackDef, ListenerDef, Module};
 
-    /// Test generator with a minimal config so tests don't have to depend
-    /// on any real per-language generator crate.
-    #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+    #[derive(Default, Clone, serde::Serialize)]
     struct TestConfig {
         knob: Option<String>,
         allow_unsupported: bool,
     }
 
-    struct CountingGenerator {
+    struct Counting {
         name: &'static str,
         calls: Arc<AtomicUsize>,
         caps: TargetCapabilities,
     }
 
-    impl Generator for CountingGenerator {
+    impl LanguageBackend for Counting {
         type Config = TestConfig;
 
         fn name(&self) -> &'static str {
@@ -376,103 +292,84 @@ mod tests {
             config.allow_unsupported
         }
 
-        fn generate(
+        fn files(
             &self,
             _api: &ResolvedApi,
+            _model: &BindingModel,
             out_dir: &Utf8Path,
             _config: &Self::Config,
-        ) -> Result<()> {
+        ) -> Vec<OutputFile> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let dir = out_dir.join(self.name);
-            std::fs::create_dir_all(dir.as_std_path())?;
-            std::fs::write(dir.join("output.txt").as_std_path(), "generated")?;
-            Ok(())
+            vec![OutputFile::new(
+                out_dir.join(self.name).join("output.txt"),
+                "generated",
+            )]
         }
     }
 
-    fn test_api() -> ResolvedApi {
-        ResolvedApi::assume_resolved(Api {
-            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.to_string(),
-            modules: vec![Module {
-                name: "math".to_string(),
-                functions: vec![Function {
-                    name: "add".to_string(),
-                    params: vec![
-                        Param {
-                            name: "a".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".to_string(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                    ],
-                    returns: Some(TypeRef::I32),
-                    doc: None,
-                    throws: false,
-                    r#async: false,
-                    cancellable: false,
-                    deprecated: None,
-                    since: None,
-                }],
-                interfaces: vec![],
-                structs: vec![],
-                enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
-                errors: None,
-                modules: vec![],
-            }],
-            generators: None,
-            package: None,
+    fn module(name: &str) -> Module {
+        Module {
+            name: name.into(),
+            doc: None,
+            functions: vec![],
+            interfaces: vec![],
+            structs: vec![],
+            enums: vec![],
+            callbacks: vec![],
+            listeners: vec![],
+            errors: None,
+            modules: vec![],
+        }
+    }
+
+    fn api() -> ResolvedApi {
+        ResolvedApi::assume_valid(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
+            modules: vec![module("math")],
         })
     }
 
-    fn configured(
-        name: &'static str,
-        calls: Arc<AtomicUsize>,
-    ) -> ConfiguredGenerator<CountingGenerator> {
-        ConfiguredGenerator::new(
-            CountingGenerator {
+    /// An API that uses listeners, so a target without listener support
+    /// trips the capability gate.
+    fn listener_api() -> ResolvedApi {
+        let mut m = module("math");
+        m.callbacks = vec![CallbackDef {
+            name: "OnChange".into(),
+            params: vec![],
+            doc: None,
+        }];
+        m.listeners = vec![ListenerDef {
+            name: "on_change".into(),
+            event_callback: "OnChange".into(),
+            doc: None,
+        }];
+        ResolvedApi::assume_valid(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
+            modules: vec![m],
+        })
+    }
+
+    fn full(name: &'static str, calls: &Arc<AtomicUsize>) -> ConfiguredBackend<Counting> {
+        ConfiguredBackend::new(
+            Counting {
                 name,
-                calls,
+                calls: Arc::clone(calls),
                 caps: TargetCapabilities::full(),
             },
             TestConfig::default(),
         )
     }
 
-    /// An API that uses listeners, so a target without listener support
-    /// trips the capability gate.
-    fn listener_api() -> ResolvedApi {
-        let mut api = test_api().api().clone();
-        api.modules[0].listeners = vec![weaveffi_ir::ir::ListenerDef {
-            name: "on_change".to_string(),
-            event_callback: "OnChange".to_string(),
-            doc: None,
-        }];
-        api.modules[0].callbacks = vec![weaveffi_ir::ir::CallbackDef {
-            name: "OnChange".to_string(),
-            params: vec![],
-            doc: None,
-        }];
-        ResolvedApi::assume_resolved(api)
-    }
-
     fn partial(
-        calls: Arc<AtomicUsize>,
+        name: &'static str,
+        calls: &Arc<AtomicUsize>,
         allow_unsupported: bool,
-    ) -> ConfiguredGenerator<CountingGenerator> {
-        ConfiguredGenerator::new(
-            CountingGenerator {
-                name: "partial",
-                calls,
+    ) -> ConfiguredBackend<Counting> {
+        ConfiguredBackend::new(
+            Counting {
+                name,
+                calls: Arc::clone(calls),
                 caps: TargetCapabilities {
-                    callbacks: false,
                     listeners: false,
                     ..TargetCapabilities::full()
                 },
@@ -484,246 +381,74 @@ mod tests {
         )
     }
 
-    #[test]
-    fn capability_gate_blocks_unsupported_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let gen = partial(Arc::clone(&calls), false);
-
-        let err = Orchestrator::new()
-            .with_generator(&gen)
-            .run(
-                &listener_api(),
-                out_dir,
-                &OrchestratorHooks::default(),
-                false,
-            )
-            .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("target 'partial' does not support"), "{msg}");
-        assert!(msg.contains("math.on_change"), "{msg}");
-        assert!(msg.contains("allow_unsupported"), "{msg}");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "gated generator must not run"
-        );
+    fn out_dir(dir: &tempfile::TempDir) -> &Utf8Path {
+        Utf8Path::from_path(dir.path()).unwrap()
     }
 
     #[test]
-    fn allow_unsupported_downgrades_gate_to_warning() {
+    fn capability_gate_blocks_unless_opted_in_and_never_relaxes_others() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let gen = partial(Arc::clone(&calls), true);
+        let hooks = OrchestratorHooks::default();
+        let strict_calls = Arc::new(AtomicUsize::new(0));
+        let opted_calls = Arc::new(AtomicUsize::new(0));
+        let strict = partial("strict", &strict_calls, false);
+        let opted = partial("opted", &opted_calls, true);
+
+        let err = Orchestrator::new()
+            .with_target(&strict)
+            .with_target(&opted)
+            .run(&listener_api(), out_dir(&dir), &hooks, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("target 'strict' does not support"), "{err}");
+        assert!(err.contains("math.on_change"), "{err}");
+        assert!(!err.contains("target 'opted'"), "{err}");
+        assert_eq!(strict_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(opted_calls.load(Ordering::SeqCst), 0);
 
         Orchestrator::new()
-            .with_generator(&gen)
-            .run(
-                &listener_api(),
-                out_dir,
-                &OrchestratorHooks::default(),
-                false,
-            )
+            .with_target(&opted)
+            .run(&listener_api(), out_dir(&dir), &hooks, false)
             .expect("allow_unsupported must let generation proceed");
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "generator should run");
+        assert_eq!(opted_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn allow_unsupported_does_not_relax_other_targets() {
+    fn cache_skips_unchanged_and_invalidates_per_target() {
         let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let opted_calls = Arc::new(AtomicUsize::new(0));
-        let strict_calls = Arc::new(AtomicUsize::new(0));
-        let opted = partial(Arc::clone(&opted_calls), true);
-        let strict = ConfiguredGenerator::new(
-            CountingGenerator {
-                name: "strict",
-                calls: Arc::clone(&strict_calls),
-                caps: TargetCapabilities {
-                    listeners: false,
-                    ..TargetCapabilities::full()
-                },
-            },
-            TestConfig::default(),
-        );
-
-        let err = Orchestrator::new()
-            .with_generator(&opted)
-            .with_generator(&strict)
-            .run(
-                &listener_api(),
-                out_dir,
-                &OrchestratorHooks::default(),
-                false,
-            )
-            .unwrap_err();
-
-        let msg = err.to_string();
-        assert!(msg.contains("target 'strict'"), "{msg}");
-        assert!(!msg.contains("target 'partial'"), "{msg}");
-        assert_eq!(opted_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(strict_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn incremental_skips_when_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let api = test_api();
+        let out = out_dir(&dir);
         let hooks = OrchestratorHooks::default();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let gen = configured("counting", Arc::clone(&calls));
-
-        let orch = Orchestrator::new().with_generator(&gen);
-
-        orch.run(&api, out_dir, &hooks, false).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let content_after_first =
-            std::fs::read_to_string(out_dir.join("counting/output.txt")).unwrap();
-
-        orch.run(&api, out_dir, &hooks, false).unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "generator should not run again"
-        );
-        let content_after_second =
-            std::fs::read_to_string(out_dir.join("counting/output.txt")).unwrap();
-
-        assert_eq!(content_after_first, content_after_second);
-    }
-
-    #[test]
-    fn force_bypasses_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let api = test_api();
-        let hooks = OrchestratorHooks::default();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let gen = configured("counting", Arc::clone(&calls));
-
-        let orch = Orchestrator::new().with_generator(&gen);
-
-        orch.run(&api, out_dir, &hooks, false).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        orch.run(&api, out_dir, &hooks, true).unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "force should bypass cache");
-    }
-
-    #[test]
-    fn parallel_orchestrator_runs_all_generators() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let api = test_api();
-        let hooks = OrchestratorHooks::default();
-
-        let names = ["g0", "g1", "g2", "g3", "g4", "g5"];
-        let counters: Vec<Arc<AtomicUsize>> = names
-            .iter()
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect();
-        let gens: Vec<ConfiguredGenerator<CountingGenerator>> = names
-            .iter()
-            .zip(counters.iter())
-            .map(|(name, calls)| configured(name, Arc::clone(calls)))
-            .collect();
-
-        let mut orch = Orchestrator::new();
-        for g in &gens {
-            orch = orch.with_generator(g);
-        }
-
-        orch.run(&api, out_dir, &hooks, false).unwrap();
-
-        for (name, calls) in names.iter().zip(counters.iter()) {
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                1,
-                "generator '{name}' should have run exactly once",
-            );
-            assert!(
-                out_dir.join(name).join("output.txt").exists(),
-                "generator '{name}' should have written its output",
-            );
-        }
-    }
-
-    #[test]
-    fn single_generator_cache_invalidates_independently() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let hooks = OrchestratorHooks::default();
-
         let c_calls = Arc::new(AtomicUsize::new(0));
         let s_calls = Arc::new(AtomicUsize::new(0));
-        let c_gen = configured("c", Arc::clone(&c_calls));
-        let s_gen = configured("swift", Arc::clone(&s_calls));
+        let c = full("c", &c_calls);
+        let s = full("swift", &s_calls);
+        let orch = Orchestrator::new().with_target(&c).with_target(&s);
 
-        let orch = Orchestrator::new()
-            .with_generator(&c_gen)
-            .with_generator(&s_gen);
+        orch.run(&api(), out, &hooks, false).unwrap();
+        orch.run(&api(), out, &hooks, false).unwrap();
+        assert_eq!(c_calls.load(Ordering::SeqCst), 1, "unchanged inputs skip");
+        assert!(out.join("c/output.txt").exists());
 
-        let api = test_api();
-        orch.run(&api, out_dir, &hooks, false).unwrap();
-        assert_eq!(c_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(s_calls.load(Ordering::SeqCst), 1);
+        orch.run(&api(), out, &hooks, true).unwrap();
+        assert_eq!(c_calls.load(Ordering::SeqCst), 2, "force bypasses cache");
 
-        // Mutate the API in a way that affects both generators' hashes by
-        // renaming a module. Then pre-seed the Swift cache with the *new*
-        // expected hash so only the C entry stays stale and re-runs.
-        let mut modified = api.api().clone();
-        modified.modules[0].name = "math2".to_string();
-        let modified = ResolvedApi::assume_resolved(modified);
+        // Change the API, but pre-seed Swift's entry with the new hash so only
+        // C is stale.
+        let modified = ResolvedApi::assume_valid(Api {
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
+            modules: vec![module("math2")],
+        });
+        let swift_hash = cache::hash_generator_inputs(&modified, "swift", &s.config_hash_input());
+        cache::write_generator_cache(out, "swift", &swift_hash).unwrap();
+        orch.run(&modified, out, &hooks, false).unwrap();
+        assert_eq!(c_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(s_calls.load(Ordering::SeqCst), 2);
 
-        let new_swift_hash =
-            cache::hash_generator_inputs(modified.api(), "swift", &s_gen.config_hash_input());
-        cache::write_generator_cache(out_dir, "swift", &new_swift_hash).unwrap();
-
-        orch.run(&modified, out_dir, &hooks, false).unwrap();
-        assert_eq!(
-            c_calls.load(Ordering::SeqCst),
-            2,
-            "C generator should re-run because its cache entry no longer matches",
-        );
-        assert_eq!(
-            s_calls.load(Ordering::SeqCst),
-            1,
-            "Swift generator's cache matched the new API and must be skipped",
-        );
-    }
-
-    #[test]
-    fn config_change_invalidates_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let hooks = OrchestratorHooks::default();
-        let api = test_api();
-
-        let calls = Arc::new(AtomicUsize::new(0));
-        let g1 = ConfiguredGenerator::new(
-            CountingGenerator {
-                name: "counting",
-                calls: Arc::clone(&calls),
-                caps: TargetCapabilities::full(),
-            },
-            TestConfig::default(),
-        );
-        Orchestrator::new()
-            .with_generator(&g1)
-            .run(&api, out_dir, &hooks, false)
-            .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        // Same generator, different config value: must re-run.
-        let g2 = ConfiguredGenerator::new(
-            CountingGenerator {
-                name: "counting",
-                calls: Arc::clone(&calls),
+        // A config-only change re-runs.
+        let reconfigured = ConfiguredBackend::new(
+            Counting {
+                name: "c",
+                calls: Arc::clone(&c_calls),
                 caps: TargetCapabilities::full(),
             },
             TestConfig {
@@ -732,13 +457,34 @@ mod tests {
             },
         );
         Orchestrator::new()
-            .with_generator(&g2)
-            .run(&api, out_dir, &hooks, false)
+            .with_target(&reconfigured)
+            .run(&modified, out, &hooks, false)
             .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "config-only change must invalidate the cache",
-        );
+        assert_eq!(c_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn all_targets_run_in_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = ["g0", "g1", "g2", "g3", "g4", "g5"];
+        let counters: Vec<Arc<AtomicUsize>> = names
+            .iter()
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
+        let targets: Vec<ConfiguredBackend<Counting>> = names
+            .iter()
+            .zip(&counters)
+            .map(|(name, calls)| full(name, calls))
+            .collect();
+        let mut orch = Orchestrator::new();
+        for t in &targets {
+            orch = orch.with_target(t);
+        }
+        orch.run(&api(), out_dir(&dir), &OrchestratorHooks::default(), false)
+            .unwrap();
+        for (name, calls) in names.iter().zip(&counters) {
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{name}");
+            assert!(out_dir(&dir).join(name).join("output.txt").exists());
+        }
     }
 }

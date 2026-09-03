@@ -6,6 +6,7 @@
 //! [`crate::entities`], keyed off which features the API actually uses.
 
 use heck::ToShoutySnakeCase;
+use weaveffi_core::cabi::ABI_VERSION;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{BindingModel, ErrorBinding};
@@ -264,6 +265,25 @@ pub(crate) fn emit_error_slot_helpers(out: &mut String) {
     out.push_str("// Release an error slot on the success path.\n");
     out.push_str("function _freeErr(wasm, errPtr) {\n");
     out.push_str("  wasm.weaveffi_dealloc(errPtr, 16);\n");
+    out.push_str("}\n\n");
+}
+
+/// Emit `_checkAbiVersion`, which the loader calls on the bound export table
+/// before returning the API object. A module that does not export
+/// `weaveffi_abi_version` predates versioning; one reporting a different
+/// revision was built against an incompatible runtime. Both throw so the
+/// mismatch surfaces at load time rather than as a garbled value buffer.
+pub(crate) fn emit_abi_version_check(out: &mut String) {
+    out.push_str("// The ABI revision this glue was generated against.\n");
+    out.push_str(&format!("const _ABI_VERSION = {ABI_VERSION};\n\n"));
+    out.push_str("function _checkAbiVersion(wasm) {\n");
+    out.push_str("  if (typeof wasm.weaveffi_abi_version !== 'function') {\n");
+    out.push_str("    throw new Error(`the loaded WeaveFFI module predates ABI versioning (this glue expects ABI revision ${_ABI_VERSION})`);\n");
+    out.push_str("  }\n");
+    out.push_str("  const found = wasm.weaveffi_abi_version() >>> 0;\n");
+    out.push_str("  if (found !== _ABI_VERSION) {\n");
+    out.push_str("    throw new Error(`WeaveFFI ABI mismatch: this glue expects revision ${_ABI_VERSION} but the loaded module reports revision ${found}`);\n");
+    out.push_str("  }\n");
     out.push_str("}\n\n");
 }
 

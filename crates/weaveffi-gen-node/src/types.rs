@@ -8,9 +8,9 @@
 use heck::ToLowerCamelCase;
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::lang;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{ErrorBinding, FnBinding, ParamBinding};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 /// The exported JS name of a free function or listener endpoint:
 /// [`wrapper_name`] (module-prefixed or stripped per config) converted to
@@ -43,47 +43,46 @@ pub(crate) fn js_str_literal(s: &str) -> String {
 }
 
 /// The TS annotation of one IR type.
-pub(crate) fn ts_type_for(ty: &TypeRef) -> String {
+pub(crate) fn ts_type_for(ty: &Ty) -> String {
     match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::I32
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64 => "number".into(),
-        TypeRef::Bool => "boolean".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "Buffer".into(),
-        TypeRef::Handle => "bigint".into(),
+        Ty::I8
+        | Ty::I16
+        | Ty::U8
+        | Ty::U16
+        | Ty::I32
+        | Ty::U32
+        | Ty::I64
+        | Ty::U64
+        | Ty::F32
+        | Ty::F64 => "number".into(),
+        Ty::Bool => "boolean".into(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
+        Ty::Bytes | Ty::BorrowedBytes => "Buffer".into(),
+        Ty::Handle => "bigint".into(),
         // Records, rich enums, plain enums, interfaces, and typed handles
         // surface as bare local TS names. A cross-module reference (e.g.
         // `handle<Store>` resolved to `kv.Store`) must annotate the *local*
         // type `Store`; the qualified IR name is not a declared TS type in
         // this module.
-        TypeRef::TypedHandle(name) => local_type_name(name).to_string(),
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).to_string(),
-        TypeRef::Interface(name) => local_type_name(name).to_string(),
-        TypeRef::Enum(name) => local_type_name(name).to_string(),
-        TypeRef::Optional(inner) => format!("{} | null", ts_type_for(inner)),
-        TypeRef::List(inner) => {
+        Ty::TypedHandle(name) => local_type_name(name).to_string(),
+        Ty::Record(name) | Ty::RichEnum(name) => local_type_name(name).to_string(),
+        Ty::Interface(name) => local_type_name(name).to_string(),
+        Ty::Enum(name) => local_type_name(name).to_string(),
+        Ty::Optional(inner) => format!("{} | null", ts_type_for(inner)),
+        Ty::List(inner) => {
             let inner_ts = ts_type_for(inner);
-            if matches!(inner.as_ref(), TypeRef::Optional(_)) {
+            if matches!(inner.as_ref(), Ty::Optional(_)) {
                 format!("({inner_ts})[]")
             } else {
                 format!("{inner_ts}[]")
             }
         }
-        TypeRef::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
+        Ty::Map(k, v) => format!("Record<{}, {}>", ts_type_for(k), ts_type_for(v)),
         // `iter<T>` is a lazy pull stream, not a materialized array.
-        TypeRef::Iterator(inner) => {
+        Ty::Iterator(inner) => {
             let t = ts_type_for(inner);
             format!("IterableIterator<{t}>")
         }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 

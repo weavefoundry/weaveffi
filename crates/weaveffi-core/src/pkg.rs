@@ -1,24 +1,53 @@
 //! Shared package-identity resolution.
 //!
-//! A single `package:` block in the IDL ([`weaveffi_ir::ir::Package`]) is the
+//! The `[package]` table of a project's `weaveffi.toml` ([`Package`]) is the
 //! source of truth for the name, version, and metadata stamped into every
 //! ecosystem manifest (`package.json`, `pyproject.toml`, `*.gemspec`,
 //! `*.csproj`, `pubspec.yaml`, `Package.swift`, `build.gradle`, `go.mod`).
+//! The CLI attaches it to the [`ResolvedApi`] it hands every backend.
 //!
 //! This module centralizes the *resolution* rules (precedence and defaults)
 //! so all eleven generators agree on the package identity instead of each one
-//! hardcoding `weaveffi` / `0.1.0`. Generators read [`resolve`] in their
+//! hardcoding `weaveffi` / `0.1.0`. Generators call [`resolve`] in their
 //! manifest code and map the [`ResolvedPackage`] fields onto whatever their
 //! ecosystem's manifest format requires.
 
-use weaveffi_ir::ir::Api;
+use serde::{Deserialize, Serialize};
 
-/// Fallback package version when the IDL omits `package.version`.
+use crate::resolved::ResolvedApi;
+
+/// Fallback package version when the project omits `package.version`.
 pub const DEFAULT_VERSION: &str = "0.1.0";
 
-/// Fallback package name when the IDL omits `package.name` and no per-target
-/// override or input basename is available.
+/// Fallback package name when the project omits `package.name` and no
+/// per-target override or input basename is available.
 pub const DEFAULT_NAME: &str = "weaveffi";
+
+/// Package identity and metadata declared in the `[package]` table of
+/// `weaveffi.toml`.
+///
+/// Every field is optional in the file; [`resolve`] applies the defaults and
+/// precedence rules. The same struct is what `weaveffi generate` hashes into
+/// each target's cache key, so editing the table regenerates every target.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Package {
+    /// Distribution name used across every ecosystem unless a per-target
+    /// override (e.g. `python.package_name`) supplies one.
+    pub name: Option<String>,
+    /// Semantic version stamped into every manifest.
+    pub version: Option<String>,
+    /// Short package description.
+    pub description: Option<String>,
+    /// License identifier, typically an SPDX expression.
+    pub license: Option<String>,
+    /// Package authors.
+    pub authors: Vec<String>,
+    /// Project homepage URL.
+    pub homepage: Option<String>,
+    /// Source repository URL.
+    pub repository: Option<String>,
+}
 
 /// Package identity resolved for one generator/manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,12 +56,12 @@ pub struct ResolvedPackage {
     pub name: String,
     /// Semantic version stamped into the manifest.
     pub version: String,
-    /// Short package description, or `None` when the IDL omits it. See
+    /// Short package description, or `None` when unset. See
     /// [`description_or_default`](Self::description_or_default) for the fallback.
     pub description: Option<String>,
     /// License identifier (typically an SPDX expression), or `None` when unset.
     pub license: Option<String>,
-    /// Package authors, taken verbatim from the `package:` block (empty when
+    /// Package authors, taken verbatim from the `[package]` table (empty when
     /// none are declared).
     pub authors: Vec<String>,
     /// Project homepage URL, or `None` when unset.
@@ -42,7 +71,7 @@ pub struct ResolvedPackage {
 }
 
 impl ResolvedPackage {
-    /// Human-readable description, or a generated default when the IDL omits it.
+    /// Human-readable description, or a generated default when unset.
     pub fn description_or_default(&self) -> String {
         self.description
             .clone()
@@ -52,14 +81,14 @@ impl ResolvedPackage {
 
     /// The `name` rewritten so it is a legal lower-snake identifier (e.g. a
     /// Python import package or a Ruby `require` path): non-alphanumerics
-    /// collapse to `_`. `"my-kv.store"` → `"my_kv_store"`.
+    /// collapse to `_`. `"my-kv.store"` becomes `"my_kv_store"`.
     pub fn ident_name(&self) -> String {
         sanitize_ident(&self.name)
     }
 
     /// The `name` rewritten as an UpperCamelCase identifier suitable for a
     /// language-level module or namespace (Ruby `module`, .NET `namespace`,
-    /// Swift module, Dart class prefix). `"my-kv.store"` → `"MyKvStore"`.
+    /// Swift module, Dart class prefix). `"my-kv.store"` becomes `"MyKvStore"`.
     pub fn module_name(&self) -> String {
         pascal_ident(&self.name)
     }
@@ -67,7 +96,8 @@ impl ResolvedPackage {
 
 /// UpperCamelCase identifier-safe form of an arbitrary package name. Word
 /// boundaries are any run of non-alphanumerics (and existing camel humps are
-/// preserved). `"my-kv.store"` → `"MyKvStore"`, `"kvstore"` → `"Kvstore"`.
+/// preserved). `"my-kv.store"` becomes `"MyKvStore"`, `"kvstore"` becomes
+/// `"Kvstore"`.
 pub fn pascal_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut start_word = true;
@@ -112,8 +142,8 @@ pub fn sanitize_ident(name: &str) -> String {
 }
 
 /// Strip directory and extension from an IDL basename to use as a fallback
-/// package name. `"path/kvstore.yml"` → `"kvstore"`, `None`/empty →
-/// [`DEFAULT_NAME`].
+/// package name. `"path/kvstore.yml"` becomes `"kvstore"`; `None` or empty
+/// becomes [`DEFAULT_NAME`].
 pub fn name_from_basename(basename: Option<&str>) -> String {
     basename
         .and_then(|b| b.rsplit(['/', '\\']).next())
@@ -123,72 +153,65 @@ pub fn name_from_basename(basename: Option<&str>) -> String {
         .to_string()
 }
 
+fn non_empty(s: Option<&String>) -> Option<String> {
+    s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Resolve package identity for a generator.
 ///
 /// Name precedence (first non-empty wins):
 /// 1. explicit per-target `name_override` (e.g. `python.package_name`),
-/// 2. `api.package.name`,
+/// 2. `[package] name` from the project's `weaveffi.toml`,
 /// 3. the IDL file stem (`input_basename`),
 /// 4. [`DEFAULT_NAME`].
 ///
-/// Version: `api.package.version` → [`DEFAULT_VERSION`]. All other metadata is
-/// taken verbatim from the `package:` block (absent → `None`/empty).
+/// Version: `[package] version`, then [`DEFAULT_VERSION`]. All other metadata
+/// is taken verbatim from the `[package]` table (absent becomes `None` or
+/// empty).
 pub fn resolve(
-    api: &Api,
+    api: &ResolvedApi,
     name_override: Option<&str>,
     input_basename: Option<&str>,
 ) -> ResolvedPackage {
-    let pkg = api.package.as_ref();
+    let pkg = api.package();
     let name = name_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            pkg.map(|p| p.name.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| non_empty(pkg.and_then(|p| p.name.as_ref())))
         .unwrap_or_else(|| name_from_basename(input_basename));
-    let version = pkg
-        .map(|p| p.version.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_VERSION.to_string());
     ResolvedPackage {
         name,
-        version,
-        description: pkg
-            .and_then(|p| p.description.clone())
-            .filter(|s| !s.is_empty()),
-        license: pkg
-            .and_then(|p| p.license.clone())
-            .filter(|s| !s.is_empty()),
+        version: non_empty(pkg.and_then(|p| p.version.as_ref()))
+            .unwrap_or_else(|| DEFAULT_VERSION.to_string()),
+        description: non_empty(pkg.and_then(|p| p.description.as_ref())),
+        license: non_empty(pkg.and_then(|p| p.license.as_ref())),
         authors: pkg.map(|p| p.authors.clone()).unwrap_or_default(),
-        homepage: pkg
-            .and_then(|p| p.homepage.clone())
-            .filter(|s| !s.is_empty()),
-        repository: pkg
-            .and_then(|p| p.repository.clone())
-            .filter(|s| !s.is_empty()),
+        homepage: non_empty(pkg.and_then(|p| p.homepage.as_ref())),
+        repository: non_empty(pkg.and_then(|p| p.repository.as_ref())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::Package;
+    use weaveffi_ir::ir::{Api, CURRENT_SCHEMA_VERSION};
 
-    fn api_with(pkg: Option<Package>) -> Api {
-        Api {
-            version: "0.7.0".into(),
-            package: pkg,
+    fn api_with(pkg: Option<Package>) -> ResolvedApi {
+        let api = ResolvedApi::assume_valid(Api {
+            version: CURRENT_SCHEMA_VERSION.into(),
             modules: vec![],
-            generators: None,
+        });
+        match pkg {
+            Some(p) => api.with_package(p),
+            None => api,
         }
     }
 
     fn full_pkg() -> Package {
         Package {
-            name: "kvstore".into(),
-            version: "1.2.0".into(),
+            name: Some("kvstore".into()),
+            version: Some("1.2.0".into()),
             description: Some("KV store".into()),
             license: Some("MIT".into()),
             authors: vec!["Ada".into()],
@@ -198,21 +221,15 @@ mod tests {
     }
 
     #[test]
-    fn package_block_drives_identity() {
+    fn package_table_drives_identity_and_overrides_win() {
         let api = api_with(Some(full_pkg()));
         let r = resolve(&api, None, Some("ignored.yml"));
         assert_eq!(r.name, "kvstore");
         assert_eq!(r.version, "1.2.0");
         assert_eq!(r.license.as_deref(), Some("MIT"));
         assert_eq!(r.authors, vec!["Ada".to_string()]);
-    }
-
-    #[test]
-    fn target_override_beats_package_name() {
-        let api = api_with(Some(full_pkg()));
         let r = resolve(&api, Some("kvstore_py"), Some("kvstore.yml"));
         assert_eq!(r.name, "kvstore_py");
-        // Version still comes from the package block.
         assert_eq!(r.version, "1.2.0");
     }
 
@@ -222,33 +239,30 @@ mod tests {
         let r = resolve(&api, None, Some("path/to/contacts.yml"));
         assert_eq!(r.name, "contacts");
         assert_eq!(r.version, DEFAULT_VERSION);
-
-        let r2 = resolve(&api, None, None);
-        assert_eq!(r2.name, DEFAULT_NAME);
-    }
-
-    #[test]
-    fn description_default_is_generated() {
-        let api = api_with(None);
-        let r = resolve(&api, Some("widgets"), None);
+        assert_eq!(resolve(&api, None, None).name, DEFAULT_NAME);
         assert_eq!(
-            r.description_or_default(),
+            resolve(&api, Some("widgets"), None).description_or_default(),
             "widgets bindings generated by WeaveFFI"
         );
     }
 
     #[test]
-    fn ident_name_sanitizes() {
-        assert_eq!(sanitize_ident("my-kv.store"), "my_kv_store");
-        assert_eq!(sanitize_ident("Kvstore"), "kvstore");
-        assert_eq!(sanitize_ident("--"), DEFAULT_NAME);
+    fn package_table_parses_from_toml() {
+        let pkg: Package =
+            toml::from_str("name = \"kv\"\nversion = \"2.0.0\"\nauthors = [\"A\", \"B\"]\n")
+                .unwrap();
+        assert_eq!(pkg.name.as_deref(), Some("kv"));
+        assert_eq!(pkg.authors.len(), 2);
+        assert!(toml::from_str::<Package>("bogus = 1").is_err());
     }
 
     #[test]
-    fn pascal_ident_upper_camels() {
+    fn identifiers_sanitize() {
+        assert_eq!(sanitize_ident("my-kv.store"), "my_kv_store");
+        assert_eq!(sanitize_ident("Kvstore"), "kvstore");
+        assert_eq!(sanitize_ident("--"), DEFAULT_NAME);
         assert_eq!(pascal_ident("my-kv.store"), "MyKvStore");
         assert_eq!(pascal_ident("kvstore"), "Kvstore");
-        assert_eq!(pascal_ident("contacts"), "Contacts");
         assert_eq!(pascal_ident("--"), "Weaveffi");
     }
 }

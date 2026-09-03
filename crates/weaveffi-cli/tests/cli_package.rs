@@ -21,7 +21,7 @@ fn write_prebuilt(root: &Path, lib_base: &str) {
 fn package_bundles_native_libraries_per_ecosystem() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/contacts/contacts.yml");
+    let input = repo_root.join("samples/contacts/src/lib.rs");
 
     let bins = tempfile::tempdir().expect("temp bins dir");
     write_prebuilt(bins.path(), "contacts");
@@ -85,7 +85,7 @@ fn package_bundles_native_libraries_per_ecosystem() {
 fn package_skips_unsupported_targets() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/contacts/contacts.yml");
+    let input = repo_root.join("samples/contacts/src/lib.rs");
 
     let bins = tempfile::tempdir().expect("temp bins dir");
     write_prebuilt(bins.path(), "contacts");
@@ -114,7 +114,7 @@ fn package_skips_unsupported_targets() {
 fn package_requires_a_binary_source() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/contacts/contacts.yml");
+    let input = repo_root.join("samples/contacts/src/lib.rs");
     let out_dir = tempfile::tempdir().expect("temp out dir");
 
     // Neither --binaries nor --build: nothing to bundle.

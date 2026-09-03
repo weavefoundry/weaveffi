@@ -7,10 +7,10 @@
 //! their owned forms, records and rich enums as one user-codec shape).
 
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{EnumBinding, StructBinding};
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::py_field;
 
@@ -46,23 +46,23 @@ pub(crate) fn py_unpack_fn_name(name: &str) -> String {
 /// Python evaluates a comprehension's `range(_r.read_len())` before its body
 /// and a conditional expression's test before its arms, which matches the
 /// wire order exactly.
-pub(crate) fn py_read_expr(ty: &TypeRef, depth: usize) -> String {
-    match wire::classify(ty) {
-        WireType::Bool => "_r.read_bool()".into(),
-        WireType::I8 => "_r.read_i8()".into(),
-        WireType::I16 => "_r.read_i16()".into(),
-        WireType::I32 => "_r.read_i32()".into(),
-        WireType::I64 => "_r.read_i64()".into(),
-        WireType::U8 => "_r.read_u8()".into(),
-        WireType::U16 => "_r.read_u16()".into(),
-        WireType::U32 => "_r.read_u32()".into(),
-        WireType::U64 => "_r.read_u64()".into(),
-        WireType::F32 => "_r.read_f32()".into(),
-        WireType::F64 => "_r.read_f64()".into(),
+pub(crate) fn py_read_expr(ty: &Ty, depth: usize) -> String {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => "_r.read_bool()".into(),
+        WireType::Prim(Prim::I8) => "_r.read_i8()".into(),
+        WireType::Prim(Prim::I16) => "_r.read_i16()".into(),
+        WireType::Prim(Prim::I32) => "_r.read_i32()".into(),
+        WireType::Prim(Prim::I64) => "_r.read_i64()".into(),
+        WireType::Prim(Prim::U8) => "_r.read_u8()".into(),
+        WireType::Prim(Prim::U16) => "_r.read_u16()".into(),
+        WireType::Prim(Prim::U32) => "_r.read_u32()".into(),
+        WireType::Prim(Prim::U64) => "_r.read_u64()".into(),
+        WireType::Prim(Prim::F32) => "_r.read_f32()".into(),
+        WireType::Prim(Prim::F64) => "_r.read_f64()".into(),
         // Handles serialize as u64 tokens inside buffers.
-        WireType::Handle => "_r.read_u64()".into(),
-        WireType::String => "_r.read_string()".into(),
-        WireType::Bytes => "_r.read_bytes()".into(),
+        WireType::Handle(_) => "_r.read_u64()".into(),
+        WireType::Prim(Prim::String) => "_r.read_string()".into(),
+        WireType::Prim(Prim::Bytes) => "_r.read_bytes()".into(),
         WireType::Enum(name) => format!("{}(_r.read_i32())", local_type_name(name)),
         WireType::User(name) => format!("{}(_r)", py_read_fn_name(name)),
         WireType::Optional(inner) => format!(
@@ -84,54 +84,48 @@ pub(crate) fn py_read_expr(ty: &TypeRef, depth: usize) -> String {
 /// Append the statements writing `expr` (one `ty` value) into the
 /// `_BufferWriter` named `writer`, following the value-buffer wire format.
 /// `depth` uniquifies loop variables when composites nest.
-pub(crate) fn py_write_stmts(
-    w: &mut CodeWriter,
-    writer: &str,
-    expr: &str,
-    ty: &TypeRef,
-    depth: usize,
-) {
-    match wire::classify(ty) {
-        WireType::Bool => {
+pub(crate) fn py_write_stmts(w: &mut CodeWriter, writer: &str, expr: &str, ty: &Ty, depth: usize) {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("{writer}.write_bool({expr})"));
         }
-        WireType::I8 => {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("{writer}.write_i8({expr})"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("{writer}.write_i16({expr})"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("{writer}.write_i32({expr})"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("{writer}.write_i64({expr})"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("{writer}.write_u8({expr})"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("{writer}.write_u16({expr})"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("{writer}.write_u32({expr})"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("{writer}.write_u64({expr})"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("{writer}.write_f32({expr})"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("{writer}.write_f64({expr})"));
         }
-        WireType::Handle => {
+        WireType::Handle(_) => {
             w.line(format!("{writer}.write_u64({expr})"));
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("{writer}.write_string({expr})"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("{writer}.write_bytes({expr})"));
         }
         // IntEnum members are ints, so the discriminant packs directly.
@@ -173,9 +167,9 @@ pub(crate) fn py_write_stmts(
 /// The expression decoding a borrowed `(ptr, len)` buffer pair (a callback
 /// or listener argument) into its idiomatic value. The producer owns the
 /// buffer for the dispatch, so the bytes are copied before decoding.
-pub(crate) fn py_decode_borrowed_expr(ptr: &str, len: &str, ty: &TypeRef) -> String {
+pub(crate) fn py_decode_borrowed_expr(ptr: &str, len: &str, ty: &Ty) -> String {
     let data = format!("ctypes.string_at({ptr}, {len}) if {ptr} else b\"\"");
-    match wire::classify(ty) {
+    match ty.wire() {
         WireType::User(name) => format!("{}({data})", py_unpack_fn_name(name)),
         _ => format!("_decode_buffer({data}, lambda _r: {})", py_read_expr(ty, 0)),
     }
@@ -185,9 +179,9 @@ pub(crate) fn py_decode_borrowed_expr(ptr: &str, len: &str, ty: &TypeRef) -> Str
 /// completion result) into its idiomatic value. The consumer owns the buffer,
 /// so `_take_buffer` copies it and releases the producer allocation with
 /// `weaveffi_free_bytes`.
-pub(crate) fn py_decode_owned_expr(ptr: &str, len: &str, ty: &TypeRef) -> String {
+pub(crate) fn py_decode_owned_expr(ptr: &str, len: &str, ty: &Ty) -> String {
     let data = format!("_take_buffer(ctypes.cast({ptr}, ctypes.c_void_p).value, {len})");
-    match wire::classify(ty) {
+    match ty.wire() {
         WireType::User(name) => format!("{}({data})", py_unpack_fn_name(name)),
         _ => format!("_decode_buffer({data}, lambda _r: {})", py_read_expr(ty, 0)),
     }

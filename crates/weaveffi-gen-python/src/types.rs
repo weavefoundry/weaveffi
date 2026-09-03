@@ -6,77 +6,71 @@ use heck::ToSnakeCase;
 use weaveffi_core::abi::{self, CType};
 use weaveffi_core::lang;
 use weaveffi_core::model::ParamBinding;
+use weaveffi_core::model::Ty;
 use weaveffi_core::plan::{self, ArgPass, RetPass};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 /// The `ctypes` spelling of one *direct* (non-buffered) type's C slot.
 ///
 /// Buffered types (records, rich enums, lists, maps, and non-interface
 /// optionals) never occupy a scalar slot: they cross the ABI as one value
 /// buffer and are handled by the buffer codec paths instead.
-pub(crate) fn py_ctypes_scalar(ty: &TypeRef) -> &'static str {
+pub(crate) fn py_ctypes_scalar(ty: &Ty) -> &'static str {
     match ty {
-        TypeRef::I8 => "ctypes.c_int8",
-        TypeRef::I16 => "ctypes.c_int16",
-        TypeRef::I32 => "ctypes.c_int32",
-        TypeRef::U8 => "ctypes.c_uint8",
-        TypeRef::U16 => "ctypes.c_uint16",
-        TypeRef::U32 => "ctypes.c_uint32",
-        TypeRef::I64 => "ctypes.c_int64",
-        TypeRef::U64 => "ctypes.c_uint64",
-        TypeRef::F32 => "ctypes.c_float",
-        TypeRef::F64 => "ctypes.c_double",
-        TypeRef::Bool => "ctypes.c_int32",
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "ctypes.c_char_p",
-        TypeRef::Handle => "ctypes.c_uint64",
+        Ty::I8 => "ctypes.c_int8",
+        Ty::I16 => "ctypes.c_int16",
+        Ty::I32 => "ctypes.c_int32",
+        Ty::U8 => "ctypes.c_uint8",
+        Ty::U16 => "ctypes.c_uint16",
+        Ty::U32 => "ctypes.c_uint32",
+        Ty::I64 => "ctypes.c_int64",
+        Ty::U64 => "ctypes.c_uint64",
+        Ty::F32 => "ctypes.c_float",
+        Ty::F64 => "ctypes.c_double",
+        Ty::Bool => "ctypes.c_int32",
+        Ty::StringUtf8 | Ty::BorrowedStr => "ctypes.c_char_p",
+        Ty::Handle => "ctypes.c_uint64",
         // Typed handles, interfaces, and iterators cross as opaque pointers.
-        TypeRef::TypedHandle(_) | TypeRef::Interface(_) | TypeRef::Iterator(_) => "ctypes.c_void_p",
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "ctypes.c_uint8",
-        TypeRef::Enum(_) => "ctypes.c_int32",
-        TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Optional(_)
-        | TypeRef::List(_)
-        | TypeRef::Map(_, _) => {
+        Ty::TypedHandle(_) | Ty::Interface(_) | Ty::Iterator(_) => "ctypes.c_void_p",
+        Ty::Bytes | Ty::BorrowedBytes => "ctypes.c_uint8",
+        Ty::Enum(_) => "ctypes.c_int32",
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::Optional(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered types have no scalar ctypes slot")
         }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
     }
 }
 
 /// The Python typing hint for `ty` as it appears in signatures and stubs.
-pub(crate) fn py_type_hint(ty: &TypeRef) -> String {
+pub(crate) fn py_type_hint(ty: &Ty) -> String {
     match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::Handle => "int".into(),
+        Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::I64
+        | Ty::U64
+        | Ty::Handle => "int".into(),
         // A typed handle is an opaque pointer-sized token; Python surfaces it
         // as a plain integer address, exactly like an untyped handle.
-        TypeRef::TypedHandle(_) => "int".into(),
-        TypeRef::F32 | TypeRef::F64 => "float".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "str".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "bytes".into(),
+        Ty::TypedHandle(_) => "int".into(),
+        Ty::F32 | Ty::F64 => "float".into(),
+        Ty::Bool => "bool".into(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "str".into(),
+        Ty::Bytes | Ty::BorrowedBytes => "bytes".into(),
         // Records, rich enums, plain enums, and interfaces surface as bare
         // local class names in the generated module. A cross-module reference
         // (e.g. `types.Contact`) must still annotate the *local* `Contact`,
         // not the qualified IR name, which is not a symbol in this module.
-        TypeRef::Enum(name) => format!("\"{}\"", local_type_name(name)),
-        TypeRef::Record(name) | TypeRef::RichEnum(name) | TypeRef::Interface(name) => {
+        Ty::Enum(name) => format!("\"{}\"", local_type_name(name)),
+        Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
             format!("\"{}\"", local_type_name(name))
         }
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-        TypeRef::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
-        TypeRef::List(inner) => format!("List[{}]", py_type_hint(inner)),
-        TypeRef::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
-        TypeRef::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
+        Ty::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
+        Ty::List(inner) => format!("List[{}]", py_type_hint(inner)),
+        Ty::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
+        Ty::Iterator(inner) => format!("Iterator[{}]", py_type_hint(inner)),
     }
 }
 
@@ -132,11 +126,11 @@ pub(crate) fn py_param_argtypes(p: &ParamBinding) -> Vec<String> {
 }
 
 /// Returns `(restype, out_param_argtypes)` for a return type.
-pub(crate) fn py_return_info(ty: &TypeRef) -> (String, Vec<String>) {
+pub(crate) fn py_return_info(ty: &Ty) -> (String, Vec<String>) {
     // Iterator constructors return the opaque iterator handle; the `_next`
     // signature is emitted separately by the iterator code path (and
     // `ret_pass` deliberately rejects iterators).
-    if matches!(ty, TypeRef::Iterator(_)) {
+    if matches!(ty, Ty::Iterator(_)) {
         return ("ctypes.c_void_p".into(), vec![]);
     }
     // Module and prefix only shape an object return's destroy symbol, which

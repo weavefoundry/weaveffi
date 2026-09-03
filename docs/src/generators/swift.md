@@ -16,8 +16,8 @@ Swift module (`WeaveFFI`) that wraps the C ABI in idiomatic Swift with
 | `generated/swift/Sources/WeaveFFI/WeaveFFI.swift` | Swift wrapper: enums, struct classes, namespaced module functions |
 
 The module name shown above (`WeaveFFI`) is the default. It is overridden by
-`[swift] module_name` or, failing that, by the IDL
-[`package:` name](../reference/idl.md#package-metadata) PascalCased
+`[generators.swift] module_name` in `weaveffi.toml` or, failing that, by the
+[`[package]` name](../guides/config.md#package) PascalCased
 (`async-demo` → `AsyncDemo`). The Swift wrapper, its `Sources/<Module>/`
 directory, the system-library target, and its `Sources/C<Module>/` module map
 all move together (e.g. `AsyncDemo` + `CAsyncDemo`), so the generated package
@@ -53,7 +53,7 @@ stays buildable under any name.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -133,7 +133,7 @@ public struct Contact {
 
 Module functions live as static methods on a namespace enum in
 lowerCamelCase with real argument labels; the module prefix is stripped by
-default (`strip_module_prefix = false` in `[swift]` restores it), since the
+default (`strip_module_prefix = false` in `[generators.swift]` restores it), since the
 namespace enum already scopes the name. A function with `throws: true`
 becomes a Swift `throws` function delivering the typed domain error. String
 parameters are passed as NUL-terminated C strings via `withCString`:
@@ -336,7 +336,7 @@ its module resolves to `Contacts` + `CContacts` from the package name):
 
 ```bash
 cargo build -p contacts
-weaveffi generate samples/contacts/contacts.yml -o generated
+weaveffi generate samples/contacts/src/lib.rs -o generated
 
 swiftc \
   -I generated/swift/Sources/CContacts \

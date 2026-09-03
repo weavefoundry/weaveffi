@@ -3,6 +3,37 @@
 //! value-buffer writer/reader pair, and the `lookupFunction` binding helper.
 
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use weaveffi_core::cabi::ABI_VERSION;
+
+/// Emit `_checkAbiVersion`, which the `_lib` initializer routes the freshly
+/// opened library through. It runs before any other lookup, so a producer
+/// built for a different ABI revision (or one predating versioning) fails
+/// with a clear `StateError` the first time the library is touched.
+pub(crate) fn render_abi_version_check(out: &mut String) {
+    out.push_str("// The ABI revision these bindings were generated against.\n");
+    out.push_str(&format!("const int _abiVersion = {ABI_VERSION};\n\n"));
+    out.push_str("DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {\n");
+    out.push_str("  final int Function() abiVersion;\n");
+    out.push_str("  try {\n");
+    out.push_str(
+        "    abiVersion = lib.lookupFunction<Uint32 Function(), int Function()>('weaveffi_abi_version');\n",
+    );
+    out.push_str("  } on ArgumentError {\n");
+    out.push_str("    throw StateError(\n");
+    out.push_str("      'the loaded WeaveFFI library predates ABI versioning '\n");
+    out.push_str("      '(these bindings expect ABI revision $_abiVersion)',\n");
+    out.push_str("    );\n");
+    out.push_str("  }\n");
+    out.push_str("  final found = abiVersion();\n");
+    out.push_str("  if (found != _abiVersion) {\n");
+    out.push_str("    throw StateError(\n");
+    out.push_str("      'WeaveFFI ABI mismatch: these bindings expect revision $_abiVersion '\n");
+    out.push_str("      'but the loaded library reports revision $found',\n");
+    out.push_str("    );\n");
+    out.push_str("  }\n");
+    out.push_str("  return lib;\n");
+    out.push_str("}\n\n");
+}
 
 /// Reproduce the exact `_openLibrary` block the module renderer emits in
 /// `generate` mode for `lib_base`, so the packager can swap it.

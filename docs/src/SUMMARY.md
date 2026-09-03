@@ -35,7 +35,7 @@
   - [Error Handling](guides/errors.md)
   - [Async Functions](guides/async.md)
   - [Annotated Rust Extraction](guides/extract.md)
-  - [Generator Configuration](guides/config.md)
+  - [Project Configuration](guides/config.md)
   - [Packaging and Distribution](guides/packaging.md)
 - [Tutorials](tutorials/README.md)
   - [Calculator](tutorials/calculator.md)

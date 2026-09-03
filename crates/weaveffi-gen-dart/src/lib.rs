@@ -23,9 +23,6 @@ mod package;
 mod runtime;
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -43,7 +40,8 @@ use crate::calls::{render_callback_typedef, render_function, render_listener};
 use crate::entities::{render_enum, render_error, render_interface, render_struct};
 use crate::package::{render_packaged_readme, render_pubspec, render_readme};
 use crate::runtime::{
-    dart_loader_original, dart_loader_packaged, render_buffer_runtime, render_error_plumbing,
+    dart_loader_original, dart_loader_packaged, render_abi_version_check, render_buffer_runtime,
+    render_error_plumbing,
 };
 
 /// Per-target configuration for [`DartGenerator`].
@@ -137,7 +135,8 @@ impl DartGenerator {
 
         out.push_str(&dart_loader_original(&lib_base));
         out.push('\n');
-        out.push_str("final DynamicLibrary _lib = _openLibrary();\n\n");
+        render_abi_version_check(&mut out);
+        out.push_str("final DynamicLibrary _lib = _checkAbiVersion(_openLibrary());\n\n");
 
         render_error_plumbing(&mut out);
         render_buffer_runtime(&mut out);
@@ -342,5 +341,3 @@ impl LanguageBackend for DartGenerator {
         Some(files)
     }
 }
-
-weaveffi_core::impl_generator_via_backend!(DartGenerator);

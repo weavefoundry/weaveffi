@@ -46,23 +46,20 @@ mod codec;
 mod entities;
 mod package;
 mod runtime;
-#[cfg(test)]
-mod tests;
 mod types;
 
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
-use weaveffi_core::abi::is_buffered;
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
 use weaveffi_core::capabilities::TargetCapabilities;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{BindingModel, CallShape, EnumBinding, InterfaceBinding, ModuleBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::render_cpp_module_ns;
 use crate::entities::{
@@ -212,8 +209,6 @@ impl LanguageBackend for CppGenerator {
     }
 }
 
-weaveffi_core::impl_generator_via_backend!(CppGenerator);
-
 /// True when the API surface moves any value through the WeaveFFI buffer
 /// format, which requires emitting the private reader/writer runtime: any
 /// record or rich enum exists, any error code declares payload fields, or any
@@ -227,12 +222,12 @@ fn model_needs_buffers(model: &BindingModel) -> bool {
                 .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
             || m.callbacks
                 .iter()
-                .any(|cb| cb.params.iter().any(|p| is_buffered(&p.ty)))
+                .any(|cb| cb.params.iter().any(|p| p.ty.is_buffered()))
             || m.callables().any(|f| {
-                f.params.iter().any(|p| is_buffered(&p.ty))
+                f.params.iter().any(|p| p.ty.is_buffered())
                     || f.ret.as_ref().is_some_and(|r| match r {
-                        TypeRef::Iterator(inner) => is_buffered(inner),
-                        other => is_buffered(other),
+                        Ty::Iterator(inner) => inner.is_buffered(),
+                        other => other.is_buffered(),
                     })
             })
     })

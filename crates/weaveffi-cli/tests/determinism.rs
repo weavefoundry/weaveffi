@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use camino::Utf8Path;
-use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator};
+use weaveffi_core::codegen::{ConfiguredBackend, Target};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
 use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
@@ -25,7 +25,7 @@ use weaveffi_gen_swift::{SwiftConfig, SwiftGenerator};
 use weaveffi_gen_wasm::{WasmConfig, WasmGenerator};
 use weaveffi_ir::parse::parse_api_str;
 
-const KITCHEN_SINK: &str = "06_kitchen_sink.yml";
+const KITCHEN_SINK: &str = "kitchen_sink.yml";
 
 fn load_kitchen_sink() -> ResolvedApi {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -60,7 +60,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn run_into_tempdir(gen: &dyn DynGenerator, api: &ResolvedApi) -> (tempfile::TempDir, PathBuf) {
+fn run_into_tempdir(gen: &dyn Target, api: &ResolvedApi) -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let out_dir = Utf8Path::from_path(tmp.path()).expect("utf8 tempdir");
     gen.generate(api, out_dir).expect("generator failed");
@@ -68,7 +68,7 @@ fn run_into_tempdir(gen: &dyn DynGenerator, api: &ResolvedApi) -> (tempfile::Tem
     (tmp, gen_root)
 }
 
-fn assert_byte_identical(gen: &dyn DynGenerator) {
+fn assert_byte_identical(gen: &dyn Target) {
     let api = load_kitchen_sink();
 
     let (_tmp_a, root_a) = run_into_tempdir(gen, &api);
@@ -114,42 +114,30 @@ fn assert_byte_identical(gen: &dyn DynGenerator) {
 
 #[test]
 fn generator_output_is_byte_identical_across_runs() {
-    let generators: Vec<Box<dyn DynGenerator>> = vec![
-        Box::new(ConfiguredGenerator::new(CGenerator, CConfig::default())),
-        Box::new(ConfiguredGenerator::new(CppGenerator, CppConfig::default())),
-        Box::new(ConfiguredGenerator::new(
+    let generators: Vec<Box<dyn Target>> = vec![
+        Box::new(ConfiguredBackend::new(CGenerator, CConfig::default())),
+        Box::new(ConfiguredBackend::new(CppGenerator, CppConfig::default())),
+        Box::new(ConfiguredBackend::new(
             SwiftGenerator,
             SwiftConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(
             AndroidGenerator,
             AndroidConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
-            NodeGenerator,
-            NodeConfig::default(),
-        )),
-        Box::new(ConfiguredGenerator::new(
-            WasmGenerator,
-            WasmConfig::default(),
-        )),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(NodeGenerator, NodeConfig::default())),
+        Box::new(ConfiguredBackend::new(WasmGenerator, WasmConfig::default())),
+        Box::new(ConfiguredBackend::new(
             PythonGenerator,
             PythonConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(
             DotnetGenerator,
             DotnetConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
-            DartGenerator,
-            DartConfig::default(),
-        )),
-        Box::new(ConfiguredGenerator::new(GoGenerator, GoConfig::default())),
-        Box::new(ConfiguredGenerator::new(
-            RubyGenerator,
-            RubyConfig::default(),
-        )),
+        Box::new(ConfiguredBackend::new(DartGenerator, DartConfig::default())),
+        Box::new(ConfiguredBackend::new(GoGenerator, GoConfig::default())),
+        Box::new(ConfiguredBackend::new(RubyGenerator, RubyConfig::default())),
     ];
     for gen in &generators {
         assert_byte_identical(gen.as_ref());

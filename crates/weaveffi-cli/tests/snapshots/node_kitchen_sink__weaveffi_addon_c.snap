@@ -7,6 +7,7 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 #include <node_api.h>
 #include "weaveffi.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -743,6 +744,15 @@ static napi_value Napi_weaveffi_kitchen_nested_hello(napi_env env, napi_callback
 }
 
 static napi_value Init(napi_env env, napi_value exports) {
+  {
+    uint32_t found = weaveffi_abi_version();
+    if (found != WEAVEFFI_ABI_VERSION) {
+      char msg[160];
+      snprintf(msg, sizeof msg, "WeaveFFI ABI mismatch: these bindings expect revision %u but the loaded library reports revision %u", (unsigned)WEAVEFFI_ABI_VERSION, (unsigned)found);
+      napi_throw_error(env, NULL, msg);
+      return NULL;
+    }
+  }
   napi_property_descriptor props[] = {
     { "ping", NULL, Napi_weaveffi_shared_ping, NULL, NULL, NULL, napi_default, NULL },
     { "Gadget_new", NULL, Napi_weaveffi_kitchen_Gadget_new, NULL, NULL, NULL, napi_default, NULL },

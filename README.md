@@ -1,6 +1,6 @@
 # WeaveFFI
 
-[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.7.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
+[![CI](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml/badge.svg)](https://github.com/weavefoundry/weaveffi/actions/workflows/ci.yml) [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT) [![crates.io](https://img.shields.io/crates/v/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli) [![Schema](https://img.shields.io/badge/schema-0.8.0-orange)](./weaveffi.schema.json) [![downloads](https://img.shields.io/crates/d/weaveffi-cli.svg)](https://crates.io/crates/weaveffi-cli)
 
 WeaveFFI generates type-safe bindings for 11 languages for any native library
 that exposes a C ABI, whether it's written in Rust, C, C++, Zig, or anything
@@ -29,7 +29,7 @@ declares. An interface is a real object with methods; an error domain plus
 `throws: true` gives its fallible members typed errors:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: kv
     errors:
@@ -260,33 +260,55 @@ Verify the install:
 
 ```bash
 weaveffi --version
-weaveffi schema-version    # prints 0.7.0
+weaveffi schema-version    # prints 0.8.0
 ```
 
 ## CLI reference
 
 | Command | Description |
 |---------|-------------|
-| `weaveffi new <name>` | Scaffold a new project with a starter IDL and `Cargo.toml` |
-| `weaveffi generate <file> -o <dir>` | Generate bindings from annotated Rust (`.rs`) or an IDL (`.yml`/`.json`/`.toml`); `--target c,swift,...` to subset, `--config cfg.toml` for options, `--scaffold` to emit Rust FFI stubs (for non-macro producers), `--dry-run` to preview |
+| `weaveffi generate <file> -o <dir>` | Generate bindings from annotated Rust (`.rs`) or an IDL (`.yml`/`.json`/`.toml`); `--target c,swift,...` to subset, `--config weaveffi.toml` to override the auto-discovered project config, `--dry-run` to preview, `--force` to bypass the output cache |
 | `weaveffi package <file> -o <dir>` | Assemble publishable, per-platform packages that bundle a prebuilt native library; `--binaries <dir>` for prebuilt libs or `--build <crate>` to cross-compile a Rust producer |
-| `weaveffi validate <file>` | Validate an IDL definition without generating; `--format json` for machine-readable output |
-| `weaveffi lint <file>` | Lint an IDL and report non-fatal warnings |
+| `weaveffi validate <file>` | Validate an API definition without generating; `--warn` to also report advisory lints, `--format json` for machine-readable output |
 | `weaveffi diff <file>` | Show what would change if bindings were regenerated; `--check` for CI |
-| `weaveffi extract <file.rs>` | Derive an IDL from `#[weaveffi::module]`-annotated Rust source |
-| `weaveffi format <file>` | Rewrite an IDL file in canonical form (sorted keys); `--check` for CI |
-| `weaveffi watch <file>` | Re-run `generate` whenever the IDL file changes |
+| `weaveffi extract <file.rs>` | Derive an IDL document from `#[weaveffi::module]`-annotated Rust source |
 | `weaveffi schema --format json-schema` | Print the JSON Schema for the IDL |
-| `weaveffi schema-version` | Print the current IR schema version (`0.7.0`) |
-| `weaveffi doctor` | Check for required toolchains; `--target swift` to scope to one language, `--format json` for CI |
+| `weaveffi schema-version` | Print the current IDL schema version (`0.8.0`) |
 | `weaveffi completions <shell>` | Print shell completion scripts (`bash`, `zsh`, `fish`, `powershell`, `elvish`) |
-| `weaveffi man --out <dir>` | Generate roff man pages for the CLI to the specified directory |
+
+### Project configuration: `weaveffi.toml`
+
+The API definition describes only the API. Everything about how it's
+published lives in an optional `weaveffi.toml` next to it (the CLI looks for
+the nearest one at or above the input file; `--config` points at a specific
+one):
+
+```toml
+[package]
+name = "kvstore"          # stamped into every generated manifest
+version = "0.1.0"
+description = "An embedded key-value store"
+license = "MIT"
+
+[global]
+c_prefix = "kv"           # rename the C ABI symbol prefix for every target
+
+[generators.swift]
+module_name = "KVStore"
+
+[generators.node]
+strip_module_prefix = true
+```
+
+Without a `weaveffi.toml`, a Rust producer's package name defaults to its
+crate directory name, and every generator runs with its defaults. See
+[Configuration](docs/src/guides/config.md) for every key.
 
 Reference the JSON Schema from your IDL for editor autocompletion:
 
 ```yaml
 # yaml-language-server: $schema=./weaveffi.schema.json
-version: "0.7.0"
+version: "0.8.0"
 modules: ...
 ```
 

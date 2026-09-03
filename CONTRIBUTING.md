@@ -77,10 +77,10 @@ cargo test -p weaveffi-ir
 ## Adding a new generator
 
 Each target language is implemented as its own crate (`weaveffi-gen-<lang>`)
-that implements the `Generator` trait from `weaveffi_core::codegen`. Before
-starting, read the [architecture overview](docs/src/architecture.md) for the
-crate dependency graph, the IDL → IR → Validate → Resolve → Generate → Output
-data flow, and the snapshot-test layout new generators must hook into.
+that implements the `LanguageBackend` trait from `weaveffi_core::backend`.
+Before starting, read the [architecture overview](docs/src/architecture.md)
+for the crate dependency graph, the Parse → Validate → Configure → Generate →
+Output data flow, and the snapshot-test layout new generators must hook into.
 
 The short version:
 
@@ -91,17 +91,16 @@ The short version:
    associated `Config` type, then `name`, `prefix` (if the config carries a
    `c_prefix`), and `files`. For a single-pass layout, override the
    `render_enum`/`render_struct`/`render_function` hooks and compose
-   `emit_members`; otherwise build the layout directly in `files`. Add
-   `weaveffi_core::impl_generator_via_backend!(<Generator>);` to bridge it to
-   `Generator`. Reuse `BindingModel` and the shared
-   `weaveffi_core::codegen::common` helpers instead of re-deriving traversal
-   or ABI classification.
-3. Wire the generator into `crates/weaveffi-cli/src/main.rs` so the
-   `--targets` flag accepts it.
-4. Add snapshot fixtures under
-   `crates/weaveffi-cli/tests/snapshots.rs` covering at minimum the
-   `calculator`, `contacts`, `inventory`, `async_demo`, and `events` sample
-   IDLs.
+   `emit_members`; otherwise build the layout directly in `files`. Reuse
+   `BindingModel`, `Ty::family()`, and `Ty::wire()` instead of re-deriving
+   traversal or ABI classification.
+3. Add one line to the `cli_targets!` registry in
+   `crates/weaveffi-cli/src/config.rs`; that wires the `--target` token,
+   the `[generators.<lang>]` table in `weaveffi.toml`, and the orchestrator
+   registration at once.
+4. Add the target to the `snapshot_tests!` invocation in
+   `crates/weaveffi-cli/tests/snapshots.rs` and to the determinism test in
+   `tests/determinism.rs`; every fixture in the corpus then runs against it.
 5. Document the generator under `docs/src/generators/<lang>.md` and link it
    from `docs/src/SUMMARY.md`.
 

@@ -9,14 +9,14 @@
 use weaveffi_core::manifest::xml_escape;
 use weaveffi_core::package::PackageContext;
 use weaveffi_core::pkg::{self, ResolvedPackage};
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::DotnetConfig;
 
 /// Resolve the NuGet/package identity for the .NET target, applying the
 /// namespace-as-name fallback when nothing else identifies the package.
-pub(crate) fn resolve_dotnet_package(api: &Api, config: &DotnetConfig) -> ResolvedPackage {
+pub(crate) fn resolve_dotnet_package(api: &ResolvedApi, config: &DotnetConfig) -> ResolvedPackage {
     let namespace = config.namespace();
     let mut p = pkg::resolve(
         api,
@@ -26,7 +26,10 @@ pub(crate) fn resolve_dotnet_package(api: &Api, config: &DotnetConfig) -> Resolv
     // The C# namespace doubles as the file basename; when nothing identifies
     // the package, keep the PascalCase brand as the NuGet id so
     // `WeaveFFI.csproj` and `<PackageId>` stay consistent.
-    if api.package.is_none() && config.namespace.is_none() && config.input_basename.is_none() {
+    if api.package().and_then(|p| p.name.as_deref()).is_none()
+        && config.namespace.is_none()
+        && config.input_basename.is_none()
+    {
         p.name = namespace.to_string();
     }
     p

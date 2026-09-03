@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::abi::lower::split_qualified;
 use weaveffi_core::lang;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{EnumBinding, IteratorBinding};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 /// The Swift spelling of a user-chosen identifier in a lowerCamel position
 /// (parameters, fields, enum cases, wrapper names): camel-cased, then
@@ -29,36 +29,34 @@ pub(crate) fn swift_str(s: &str) -> String {
 ///
 /// Panics on an unresolved named reference or a non-return iterator, both of
 /// which validation rejects before rendering.
-pub(crate) fn swift_type_for(t: &TypeRef) -> String {
+pub(crate) fn swift_type_for(t: &Ty) -> String {
     match t {
-        TypeRef::I8 => "Int8".to_string(),
-        TypeRef::I16 => "Int16".to_string(),
-        TypeRef::I32 => "Int32".to_string(),
-        TypeRef::U8 => "UInt8".to_string(),
-        TypeRef::U16 => "UInt16".to_string(),
-        TypeRef::U32 => "UInt32".to_string(),
-        TypeRef::U64 => "UInt64".to_string(),
-        TypeRef::I64 => "Int64".to_string(),
-        TypeRef::F32 => "Float".to_string(),
-        TypeRef::F64 => "Double".to_string(),
-        TypeRef::Bool => "Bool".to_string(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String".to_string(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "Data".to_string(),
+        Ty::I8 => "Int8".to_string(),
+        Ty::I16 => "Int16".to_string(),
+        Ty::I32 => "Int32".to_string(),
+        Ty::U8 => "UInt8".to_string(),
+        Ty::U16 => "UInt16".to_string(),
+        Ty::U32 => "UInt32".to_string(),
+        Ty::U64 => "UInt64".to_string(),
+        Ty::I64 => "Int64".to_string(),
+        Ty::F32 => "Float".to_string(),
+        Ty::F64 => "Double".to_string(),
+        Ty::Bool => "Bool".to_string(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "String".to_string(),
+        Ty::Bytes | Ty::BorrowedBytes => "Data".to_string(),
         // Handles, plain and typed alike, are opaque `u64` resource tokens in
         // the wire format; Swift surfaces both as `UInt64` and converts to
         // the typed C pointer at the direct ABI boundary.
-        TypeRef::Handle | TypeRef::TypedHandle(_) => "UInt64".to_string(),
-        TypeRef::Enum(name)
-        | TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Interface(name) => local_type_name(name).to_string(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
-        TypeRef::Optional(inner) => format!("{}?", swift_type_for(inner)),
-        TypeRef::List(inner) => format!("[{}]", swift_type_for(inner)),
-        TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
+        Ty::Handle | Ty::TypedHandle(_) => "UInt64".to_string(),
+        Ty::Enum(name) | Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
+            local_type_name(name).to_string()
+        }
+        Ty::Optional(inner) => format!("{}?", swift_type_for(inner)),
+        Ty::List(inner) => format!("[{}]", swift_type_for(inner)),
+        Ty::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
         // An iterator return renders as its per-function sequence class (see
         // `render_swift_iterator_class`), never through this generic mapping.
-        TypeRef::Iterator(_) => unreachable!("iterator type is only valid as a function return"),
+        Ty::Iterator(_) => unreachable!("iterator type is only valid as a function return"),
     }
 }
 
@@ -102,15 +100,14 @@ impl SwiftCtx<'_> {
 
 /// Like [`swift_type_for`] but disambiguates wrapper-type names that collide
 /// with a module namespace (see [`SwiftCtx::ty_name`]).
-pub(crate) fn swift_type_ctx(t: &TypeRef, ctx: SwiftCtx) -> String {
+pub(crate) fn swift_type_ctx(t: &Ty, ctx: SwiftCtx) -> String {
     match t {
-        TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Enum(name)
-        | TypeRef::Interface(name) => ctx.ty_name(local_type_name(name)),
-        TypeRef::Optional(inner) => format!("{}?", swift_type_ctx(inner, ctx)),
-        TypeRef::List(inner) => format!("[{}]", swift_type_ctx(inner, ctx)),
-        TypeRef::Map(k, v) => format!("[{}: {}]", swift_type_ctx(k, ctx), swift_type_ctx(v, ctx)),
+        Ty::Record(name) | Ty::RichEnum(name) | Ty::Enum(name) | Ty::Interface(name) => {
+            ctx.ty_name(local_type_name(name))
+        }
+        Ty::Optional(inner) => format!("{}?", swift_type_ctx(inner, ctx)),
+        Ty::List(inner) => format!("[{}]", swift_type_ctx(inner, ctx)),
+        Ty::Map(k, v) => format!("[{}: {}]", swift_type_ctx(k, ctx), swift_type_ctx(v, ctx)),
         _ => swift_type_for(t),
     }
 }
@@ -146,8 +143,8 @@ pub(crate) fn iterator_class_name(it: &IteratorBinding, c_prefix: &str) -> Strin
 
 /// Swift literal initializing the by-value `out_item` slot used while pulling
 /// from an iterator whose element lowers to a C value type.
-pub(crate) fn swift_scalar_default(ty: &TypeRef) -> String {
-    if matches!(ty, TypeRef::Bool) {
+pub(crate) fn swift_scalar_default(ty: &Ty) -> String {
+    if matches!(ty, Ty::Bool) {
         "false".to_string()
     } else {
         "0".to_string()

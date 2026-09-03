@@ -9,45 +9,39 @@
 
 use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{EnumBinding, StructBinding};
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::{cpp_ident, cpp_type};
 
 /// Emit statements appending `expr` (a C++ lvalue of IDL type `ty`) to the
 /// buffer writer variable `wtr`, in wire order. `depth` disambiguates nested
 /// loop variable names.
-pub(crate) fn emit_write_value(
-    w: &mut CodeWriter,
-    ty: &TypeRef,
-    expr: &str,
-    wtr: &str,
-    depth: usize,
-) {
+pub(crate) fn emit_write_value(w: &mut CodeWriter, ty: &Ty, expr: &str, wtr: &str, depth: usize) {
     let leaf = |w: &mut CodeWriter, method: &str| {
         w.line(format!("{wtr}.{method}({expr});"));
     };
-    match wire::classify(ty) {
-        WireType::Bool => leaf(w, "write_bool"),
-        WireType::I8 => leaf(w, "write_i8"),
-        WireType::U8 => leaf(w, "write_u8"),
-        WireType::I16 => leaf(w, "write_i16"),
-        WireType::U16 => leaf(w, "write_u16"),
-        WireType::I32 => leaf(w, "write_i32"),
-        WireType::U32 => leaf(w, "write_u32"),
-        WireType::I64 => leaf(w, "write_i64"),
-        WireType::U64 => leaf(w, "write_u64"),
-        WireType::F32 => leaf(w, "write_f32"),
-        WireType::F64 => leaf(w, "write_f64"),
-        WireType::String => leaf(w, "write_string"),
-        WireType::Bytes => leaf(w, "write_bytes"),
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => leaf(w, "write_bool"),
+        WireType::Prim(Prim::I8) => leaf(w, "write_i8"),
+        WireType::Prim(Prim::U8) => leaf(w, "write_u8"),
+        WireType::Prim(Prim::I16) => leaf(w, "write_i16"),
+        WireType::Prim(Prim::U16) => leaf(w, "write_u16"),
+        WireType::Prim(Prim::I32) => leaf(w, "write_i32"),
+        WireType::Prim(Prim::U32) => leaf(w, "write_u32"),
+        WireType::Prim(Prim::I64) => leaf(w, "write_i64"),
+        WireType::Prim(Prim::U64) => leaf(w, "write_u64"),
+        WireType::Prim(Prim::F32) => leaf(w, "write_f32"),
+        WireType::Prim(Prim::F64) => leaf(w, "write_f64"),
+        WireType::Prim(Prim::String) => leaf(w, "write_string"),
+        WireType::Prim(Prim::Bytes) => leaf(w, "write_bytes"),
         WireType::Enum(_) => {
             w.line(format!("{wtr}.write_i32(static_cast<int32_t>({expr}));"));
         }
         // Handles are opaque tokens encoded as their pointer bits in a u64.
-        WireType::Handle => {
+        WireType::Handle(_) => {
             w.line(format!(
                 "{wtr}.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>({expr})));"
             ));
@@ -84,25 +78,25 @@ pub(crate) fn emit_write_value(
 
 /// The single expression decoding one leaf value from the reader variable
 /// `rdr`, or `None` when `ty` is a composite that needs statements.
-fn read_leaf_expr(ty: &TypeRef, rdr: &str, module: &str, prefix: &str) -> Option<String> {
-    Some(match wire::classify(ty) {
-        WireType::Bool => format!("{rdr}.read_bool()"),
-        WireType::I8 => format!("{rdr}.read_i8()"),
-        WireType::U8 => format!("{rdr}.read_u8()"),
-        WireType::I16 => format!("{rdr}.read_i16()"),
-        WireType::U16 => format!("{rdr}.read_u16()"),
-        WireType::I32 => format!("{rdr}.read_i32()"),
-        WireType::U32 => format!("{rdr}.read_u32()"),
-        WireType::I64 => format!("{rdr}.read_i64()"),
-        WireType::U64 => format!("{rdr}.read_u64()"),
-        WireType::F32 => format!("{rdr}.read_f32()"),
-        WireType::F64 => format!("{rdr}.read_f64()"),
-        WireType::String => format!("{rdr}.read_string()"),
-        WireType::Bytes => format!("{rdr}.read_bytes()"),
+fn read_leaf_expr(ty: &Ty, rdr: &str, module: &str, prefix: &str) -> Option<String> {
+    Some(match ty.wire() {
+        WireType::Prim(Prim::Bool) => format!("{rdr}.read_bool()"),
+        WireType::Prim(Prim::I8) => format!("{rdr}.read_i8()"),
+        WireType::Prim(Prim::U8) => format!("{rdr}.read_u8()"),
+        WireType::Prim(Prim::I16) => format!("{rdr}.read_i16()"),
+        WireType::Prim(Prim::U16) => format!("{rdr}.read_u16()"),
+        WireType::Prim(Prim::I32) => format!("{rdr}.read_i32()"),
+        WireType::Prim(Prim::U32) => format!("{rdr}.read_u32()"),
+        WireType::Prim(Prim::I64) => format!("{rdr}.read_i64()"),
+        WireType::Prim(Prim::U64) => format!("{rdr}.read_u64()"),
+        WireType::Prim(Prim::F32) => format!("{rdr}.read_f32()"),
+        WireType::Prim(Prim::F64) => format!("{rdr}.read_f64()"),
+        WireType::Prim(Prim::String) => format!("{rdr}.read_string()"),
+        WireType::Prim(Prim::Bytes) => format!("{rdr}.read_bytes()"),
         WireType::Enum(n) => format!("static_cast<{}>({rdr}.read_i32())", local_type_name(n)),
         // Both handle spellings decode from the same u64 token; the C++
         // pointer type (`void*` or the prefixed tag) comes from the type map.
-        WireType::Handle => format!(
+        WireType::Handle(_) => format!(
             "reinterpret_cast<{}>(static_cast<uintptr_t>({rdr}.read_u64()))",
             cpp_type(ty, module, prefix)
         ),
@@ -116,7 +110,7 @@ fn read_leaf_expr(ty: &TypeRef, rdr: &str, module: &str, prefix: &str) -> Option
 /// `tmp` seeds unique names for any temporaries the composite cases need.
 pub(crate) fn emit_read_into(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     target: &str,
     tmp: &str,
     rdr: &str,
@@ -127,7 +121,7 @@ pub(crate) fn emit_read_into(
         w.line(format!("{target} = {expr};"));
         return;
     }
-    match wire::classify(ty) {
+    match ty.wire() {
         WireType::Optional(inner) => {
             w.line(format!("if ({rdr}.read_option_flag()) {{"));
             w.scope(|w| {
@@ -183,7 +177,7 @@ pub(crate) fn emit_read_into(
 /// a single declaration; composites declare then fill.
 pub(crate) fn emit_read_decl(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     var: &str,
     rdr: &str,
     module: &str,

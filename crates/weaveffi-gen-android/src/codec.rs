@@ -1,11 +1,10 @@
 //! Value-buffer codec expressions: the Kotlin read and write expression for
 //! every wire shape, dispatched on the shared [`wire::classify`] fold.
 
-use weaveffi_core::abi;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{BindingModel, CallShape, EnumBinding};
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::kt_escape;
 
@@ -13,19 +12,21 @@ use crate::types::kt_escape;
 /// `t`) into the value-buffer writer named `w`. Optionals, lists, and maps
 /// recurse through the writer's lambda helpers; `depth` uniquifies the lambda
 /// parameter names at each nesting level.
-pub(crate) fn kt_write_expr(t: &TypeRef, w: &str, expr: &str, depth: usize) -> String {
-    match wire::classify(t) {
-        WireType::Bool => format!("{w}.writeBool({expr})"),
-        WireType::I8 | WireType::U8 => format!("{w}.writeI8({expr})"),
-        WireType::I16 | WireType::U16 => format!("{w}.writeI16({expr})"),
-        WireType::I32 => format!("{w}.writeI32({expr})"),
-        WireType::U32 => format!("{w}.writeU32({expr})"),
-        WireType::I64 | WireType::U64 | WireType::Handle => format!("{w}.writeI64({expr})"),
-        WireType::F32 => format!("{w}.writeF32({expr})"),
-        WireType::F64 => format!("{w}.writeF64({expr})"),
+pub(crate) fn kt_write_expr(t: &Ty, w: &str, expr: &str, depth: usize) -> String {
+    match t.wire() {
+        WireType::Prim(Prim::Bool) => format!("{w}.writeBool({expr})"),
+        WireType::Prim(Prim::I8) | WireType::Prim(Prim::U8) => format!("{w}.writeI8({expr})"),
+        WireType::Prim(Prim::I16) | WireType::Prim(Prim::U16) => format!("{w}.writeI16({expr})"),
+        WireType::Prim(Prim::I32) => format!("{w}.writeI32({expr})"),
+        WireType::Prim(Prim::U32) => format!("{w}.writeU32({expr})"),
+        WireType::Prim(Prim::I64) | WireType::Prim(Prim::U64) | WireType::Handle(_) => {
+            format!("{w}.writeI64({expr})")
+        }
+        WireType::Prim(Prim::F32) => format!("{w}.writeF32({expr})"),
+        WireType::Prim(Prim::F64) => format!("{w}.writeF64({expr})"),
         WireType::Enum(_) => format!("{w}.writeI32({expr}.value)"),
-        WireType::String => format!("{w}.writeString({expr})"),
-        WireType::Bytes => format!("{w}.writeBytes({expr})"),
+        WireType::Prim(Prim::String) => format!("{w}.writeString({expr})"),
+        WireType::Prim(Prim::Bytes) => format!("{w}.writeBytes({expr})"),
         WireType::User(name) => format!("pack{}({w}, {expr})", local_type_name(name)),
         WireType::Optional(inner) => {
             let v = format!("v{depth}");
@@ -55,19 +56,21 @@ pub(crate) fn kt_write_expr(t: &TypeRef, w: &str, expr: &str, depth: usize) -> S
 
 /// The Kotlin expression reading a value of type `t` from the value-buffer
 /// reader named `r`. The inverse of [`kt_write_expr`].
-pub(crate) fn kt_read_expr(t: &TypeRef, r: &str) -> String {
-    match wire::classify(t) {
-        WireType::Bool => format!("{r}.readBool()"),
-        WireType::I8 | WireType::U8 => format!("{r}.readI8()"),
-        WireType::I16 | WireType::U16 => format!("{r}.readI16()"),
-        WireType::I32 => format!("{r}.readI32()"),
-        WireType::U32 => format!("{r}.readU32()"),
-        WireType::I64 | WireType::U64 | WireType::Handle => format!("{r}.readI64()"),
-        WireType::F32 => format!("{r}.readF32()"),
-        WireType::F64 => format!("{r}.readF64()"),
+pub(crate) fn kt_read_expr(t: &Ty, r: &str) -> String {
+    match t.wire() {
+        WireType::Prim(Prim::Bool) => format!("{r}.readBool()"),
+        WireType::Prim(Prim::I8) | WireType::Prim(Prim::U8) => format!("{r}.readI8()"),
+        WireType::Prim(Prim::I16) | WireType::Prim(Prim::U16) => format!("{r}.readI16()"),
+        WireType::Prim(Prim::I32) => format!("{r}.readI32()"),
+        WireType::Prim(Prim::U32) => format!("{r}.readU32()"),
+        WireType::Prim(Prim::I64) | WireType::Prim(Prim::U64) | WireType::Handle(_) => {
+            format!("{r}.readI64()")
+        }
+        WireType::Prim(Prim::F32) => format!("{r}.readF32()"),
+        WireType::Prim(Prim::F64) => format!("{r}.readF64()"),
         WireType::Enum(name) => format!("{}.fromValue({r}.readI32())", local_type_name(name)),
-        WireType::String => format!("{r}.readString()"),
-        WireType::Bytes => format!("{r}.readBytes()"),
+        WireType::Prim(Prim::String) => format!("{r}.readString()"),
+        WireType::Prim(Prim::Bytes) => format!("{r}.readBytes()"),
         WireType::User(name) => format!("unpack{}({r})", local_type_name(name)),
         WireType::Optional(inner) => {
             format!("{r}.readOptional {{ {} }}", kt_read_expr(inner, r))
@@ -83,20 +86,20 @@ pub(crate) fn kt_read_expr(t: &TypeRef, r: &str) -> String {
 
 /// The Kotlin expression packing the public value `expr` of type `t` into a
 /// freshly encoded `ByteArray`.
-pub(crate) fn kt_encode_expr(t: &TypeRef, expr: &str) -> String {
+pub(crate) fn kt_encode_expr(t: &Ty, expr: &str) -> String {
     format!("weaveEncode {{ w -> {} }}", kt_write_expr(t, "w", expr, 0))
 }
 
 /// The Kotlin expression decoding the `ByteArray` expression `expr` into the
 /// public value of type `t`, rejecting malformed or trailing bytes.
-pub(crate) fn kt_decode_expr(t: &TypeRef, expr: &str) -> String {
+pub(crate) fn kt_decode_expr(t: &Ty, expr: &str) -> String {
     format!("weaveDecode({expr}) {{ r -> {} }}", kt_read_expr(t, "r"))
 }
 
 /// The Kotlin statement writing field `field` of the value `v` (a record or
 /// rich-enum variant) into the writer `w`, spelling the property access with
 /// the keyword-escaped field name.
-pub(crate) fn kt_write_field(ty: &TypeRef, w: &str, field: &str) -> String {
+pub(crate) fn kt_write_field(ty: &Ty, w: &str, field: &str) -> String {
     kt_write_expr(ty, w, &format!("v.{}", kt_escape(field)), 0)
 }
 
@@ -113,11 +116,11 @@ pub(crate) fn model_uses_buffers(model: &BindingModel) -> bool {
                 .is_some_and(|e| e.codes.iter().any(|c| !c.fields.is_empty()))
             || m.callbacks
                 .iter()
-                .any(|cb| cb.params.iter().any(|p| abi::is_buffered(&p.ty)))
+                .any(|cb| cb.params.iter().any(|p| p.ty.is_buffered()))
             || m.callables().any(|f| {
-                f.params.iter().any(|p| abi::is_buffered(&p.ty))
-                    || f.ret.as_ref().is_some_and(abi::is_buffered)
-                    || matches!(&f.shape, CallShape::Iterator(it) if abi::is_buffered(&it.elem))
+                f.params.iter().any(|p| p.ty.is_buffered())
+                    || f.ret.as_ref().is_some_and(Ty::is_buffered)
+                    || matches!(&f.shape, CallShape::Iterator(it) if it.elem.is_buffered())
             })
     })
 }

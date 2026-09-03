@@ -25,7 +25,30 @@ DynamicLibrary _openLibrary() {
   throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
 }
 
-final DynamicLibrary _lib = _openLibrary();
+// The ABI revision these bindings were generated against.
+const int _abiVersion = 1;
+
+DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {
+  final int Function() abiVersion;
+  try {
+    abiVersion = lib.lookupFunction<Uint32 Function(), int Function()>('weaveffi_abi_version');
+  } on ArgumentError {
+    throw StateError(
+      'the loaded WeaveFFI library predates ABI versioning '
+      '(these bindings expect ABI revision $_abiVersion)',
+    );
+  }
+  final found = abiVersion();
+  if (found != _abiVersion) {
+    throw StateError(
+      'WeaveFFI ABI mismatch: these bindings expect revision $_abiVersion '
+      'but the loaded library reports revision $found',
+    );
+  }
+  return lib;
+}
+
+final DynamicLibrary _lib = _checkAbiVersion(_openLibrary());
 
 final class _WeaveFFIError extends Struct {
   @Int32()

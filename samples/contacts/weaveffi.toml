@@ -1,0 +1,8 @@
+[package]
+name = "contacts"
+version = "1.0.0"
+description = "A small contacts book API demonstrating interfaces, enums, and typed errors."
+license = "MIT"
+authors = ["WeaveFoundry <hello@weavefoundry.dev>"]
+homepage = "https://github.com/weavefoundry/weaveffi"
+repository = "https://github.com/weavefoundry/weaveffi"

@@ -10,13 +10,12 @@
 //! user-codec shape) live in `weaveffi-core`, not here. The composition is
 //! fixed at generation time from the IR; no runtime type dispatch happens.
 
-use weaveffi_core::abi::is_buffered;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{BindingModel, ModuleBinding};
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 /// The reader/writer method of the private buffer runtime for a scalar wire
 /// shape (including strings and bytes, whose length-prefixed reads live in
@@ -28,19 +27,19 @@ use weaveffi_ir::ir::TypeRef;
 /// codecs, and containers before falling through to a scalar method.
 fn scalar_method(wt: WireType<'_>) -> &'static str {
     match wt {
-        WireType::Bool => "bool",
-        WireType::I8 => "i8",
-        WireType::U8 => "u8",
-        WireType::I16 => "i16",
-        WireType::U16 => "u16",
-        WireType::I32 => "i32",
-        WireType::U32 => "u32",
-        WireType::I64 => "i64",
-        WireType::U64 => "u64",
-        WireType::F32 => "f32",
-        WireType::F64 => "f64",
-        WireType::String => "str",
-        WireType::Bytes => "bytes",
+        WireType::Prim(Prim::Bool) => "bool",
+        WireType::Prim(Prim::I8) => "i8",
+        WireType::Prim(Prim::U8) => "u8",
+        WireType::Prim(Prim::I16) => "i16",
+        WireType::Prim(Prim::U16) => "u16",
+        WireType::Prim(Prim::I32) => "i32",
+        WireType::Prim(Prim::U32) => "u32",
+        WireType::Prim(Prim::I64) => "i64",
+        WireType::Prim(Prim::U64) => "u64",
+        WireType::Prim(Prim::F32) => "f32",
+        WireType::Prim(Prim::F64) => "f64",
+        WireType::Prim(Prim::String) => "str",
+        WireType::Prim(Prim::Bytes) => "bytes",
         other => unreachable!("composite wire shape dispatched by the caller: {other:?}"),
     }
 }
@@ -48,10 +47,10 @@ fn scalar_method(wt: WireType<'_>) -> &'static str {
 /// A JS function expression `(w, v) => void` writing one value of `ty` in the
 /// wire format. Records and rich enums name their generated pack function;
 /// optionals, lists, and maps compose the generic combinators.
-pub(crate) fn js_writer_fn(ty: &TypeRef) -> String {
-    match wire::classify(ty) {
+pub(crate) fn js_writer_fn(ty: &Ty) -> String {
+    match ty.wire() {
         WireType::Enum(_) => "(w, v) => w.i32(v)".into(),
-        WireType::Handle => "(w, v) => w.u64(v)".into(),
+        WireType::Handle(_) => "(w, v) => w.u64(v)".into(),
         WireType::User(n) => format!("__pack{}", local_type_name(n)),
         WireType::Optional(inner) => format!("(w, v) => __wOpt(w, v, {})", js_writer_fn(inner)),
         WireType::List(inner) => format!("(w, v) => __wList(w, v, {})", js_writer_fn(inner)),
@@ -67,12 +66,12 @@ pub(crate) fn js_writer_fn(ty: &TypeRef) -> String {
 /// A JS function expression `(w, k) => void` writing one *map key*. JS object
 /// keys arrive as strings from `Object.keys`, so numeric key types coerce
 /// through `Number` (or `BigInt`, inside the 64-bit writer methods) first.
-fn js_map_key_writer_fn(ty: &TypeRef) -> String {
-    match wire::classify(ty) {
-        WireType::String => "(w, k) => w.str(k)".into(),
-        WireType::Bool => "(w, k) => w.bool(k === true || k === 'true')".into(),
-        WireType::I64 => "(w, k) => w.i64(k)".into(),
-        WireType::U64 | WireType::Handle => "(w, k) => w.u64(k)".into(),
+fn js_map_key_writer_fn(ty: &Ty) -> String {
+    match ty.wire() {
+        WireType::Prim(Prim::String) => "(w, k) => w.str(k)".into(),
+        WireType::Prim(Prim::Bool) => "(w, k) => w.bool(k === true || k === 'true')".into(),
+        WireType::Prim(Prim::I64) => "(w, k) => w.i64(k)".into(),
+        WireType::Prim(Prim::U64) | WireType::Handle(_) => "(w, k) => w.u64(k)".into(),
         WireType::Enum(_) => "(w, k) => w.i32(Number(k))".into(),
         leaf => format!("(w, k) => w.{}(Number(k))", scalar_method(leaf)),
     }
@@ -82,15 +81,13 @@ fn js_map_key_writer_fn(ty: &TypeRef) -> String {
 /// wire format. 64-bit integers surface as numbers (matching the TS surface);
 /// handles surface as `BigInt`s except typed handles, which keep the numeric
 /// handle spelling the addon uses.
-pub(crate) fn js_reader_fn(ty: &TypeRef) -> String {
-    match wire::classify(ty) {
-        WireType::I64 => "(r) => Number(r.i64())".into(),
-        WireType::U64 => "(r) => Number(r.u64())".into(),
+pub(crate) fn js_reader_fn(ty: &Ty) -> String {
+    match ty.wire() {
+        WireType::Prim(Prim::I64) => "(r) => Number(r.i64())".into(),
+        WireType::Prim(Prim::U64) => "(r) => Number(r.u64())".into(),
         // Both handle kinds share the u64 token; only the JS surface differs.
-        WireType::Handle if matches!(ty, TypeRef::TypedHandle(_)) => {
-            "(r) => Number(r.u64())".into()
-        }
-        WireType::Handle => "(r) => r.u64()".into(),
+        WireType::Handle(_) if matches!(ty, Ty::TypedHandle(_)) => "(r) => Number(r.u64())".into(),
+        WireType::Handle(_) => "(r) => r.u64()".into(),
         WireType::Enum(_) => "(r) => r.i32()".into(),
         WireType::User(n) => format!("__unpack{}", local_type_name(n)),
         WireType::Optional(inner) => format!("(r) => __rOpt(r, {})", js_reader_fn(inner)),
@@ -105,10 +102,10 @@ pub(crate) fn js_reader_fn(ty: &TypeRef) -> String {
 /// The JS statement expression writing `val` of type `ty` onto writer `w`.
 /// Direct spellings for leaves and generated pack functions; combinator calls
 /// for optionals, lists, and maps.
-fn js_write_expr(ty: &TypeRef, val: &str) -> String {
-    match wire::classify(ty) {
+fn js_write_expr(ty: &Ty, val: &str) -> String {
+    match ty.wire() {
         WireType::Enum(_) => format!("w.i32({val})"),
-        WireType::Handle => format!("w.u64({val})"),
+        WireType::Handle(_) => format!("w.u64({val})"),
         WireType::User(n) => format!("__pack{}(w, {val})", local_type_name(n)),
         WireType::Optional(inner) => format!("__wOpt(w, {val}, {})", js_writer_fn(inner)),
         WireType::List(inner) => format!("__wList(w, {val}, {})", js_writer_fn(inner)),
@@ -122,13 +119,13 @@ fn js_write_expr(ty: &TypeRef, val: &str) -> String {
 }
 
 /// The JS expression reading one value of type `ty` from reader `r`.
-pub(crate) fn js_read_expr(ty: &TypeRef) -> String {
-    match wire::classify(ty) {
-        WireType::I64 => "Number(r.i64())".into(),
-        WireType::U64 => "Number(r.u64())".into(),
+pub(crate) fn js_read_expr(ty: &Ty) -> String {
+    match ty.wire() {
+        WireType::Prim(Prim::I64) => "Number(r.i64())".into(),
+        WireType::Prim(Prim::U64) => "Number(r.u64())".into(),
         // As in [`js_reader_fn`]: one wire token, two JS spellings.
-        WireType::Handle if matches!(ty, TypeRef::TypedHandle(_)) => "Number(r.u64())".into(),
-        WireType::Handle => "r.u64()".into(),
+        WireType::Handle(_) if matches!(ty, Ty::TypedHandle(_)) => "Number(r.u64())".into(),
+        WireType::Handle(_) => "r.u64()".into(),
         WireType::Enum(_) => "r.i32()".into(),
         WireType::User(n) => format!("__unpack{}(r)", local_type_name(n)),
         WireType::Optional(inner) => format!("__rOpt(r, {})", js_reader_fn(inner)),
@@ -150,12 +147,11 @@ pub(crate) fn model_uses_buffers(model: &BindingModel) -> bool {
                 .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
             || m.callbacks
                 .iter()
-                .any(|cb| cb.params.iter().any(|p| is_buffered(&p.ty)))
+                .any(|cb| cb.params.iter().any(|p| p.ty.is_buffered()))
             || m.callables().any(|f| {
-                f.params.iter().any(|p| is_buffered(&p.ty))
+                f.params.iter().any(|p| p.ty.is_buffered())
                     || f.ret.as_ref().is_some_and(|t| {
-                        is_buffered(t)
-                            || matches!(t, TypeRef::Iterator(inner) if is_buffered(inner))
+                        t.is_buffered() || matches!(t, Ty::Iterator(inner) if inner.is_buffered())
                     })
             })
     })

@@ -47,7 +47,7 @@ layer bridges them to the C ABI.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -78,7 +78,7 @@ modules:
 The Kotlin wrapper declares `external fun` entries inside a companion
 object and loads the JNI library on first use. Function names are
 lowerCamelCase with the module prefix stripped by default
-(`strip_module_prefix = false` in `[android]` restores prefixed names).
+(`strip_module_prefix = false` in `[generators.android]` restores prefixed names).
 Where a parameter or return value needs wrapping (enums, buffered
 values), the external entry is a private `...Jni` function with lowered
 types and a public wrapper converts at the boundary. A buffered value

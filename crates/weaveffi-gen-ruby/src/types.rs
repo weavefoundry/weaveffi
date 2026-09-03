@@ -5,7 +5,7 @@
 use heck::ToSnakeCase;
 use weaveffi_core::abi::{AbiParam, CType};
 use weaveffi_core::lang::{escape_ident, RUBY_KEYWORDS};
-use weaveffi_ir::ir::TypeRef;
+use weaveffi_core::model::Ty;
 
 /// The Ruby spelling of a user-chosen parameter name: snake_case via heck,
 /// then keyword-escaped (a reserved name like `end` gains a trailing `_`).
@@ -63,38 +63,38 @@ pub(crate) fn rb_abi_types(params: &[AbiParam], string_as_pointer: bool) -> Vec<
 /// This is ABI-slot vocabulary, not wire vocabulary: a typed handle crosses
 /// a `next` slot as an opaque pointer, so anything non-scalar reads a
 /// pointer.
-pub(crate) fn rb_read_method(ty: &TypeRef) -> &'static str {
+pub(crate) fn rb_read_method(ty: &Ty) -> &'static str {
     match ty {
-        TypeRef::I8 => "read_int8",
-        TypeRef::I16 => "read_int16",
-        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => "read_int32",
-        TypeRef::U8 => "read_uint8",
-        TypeRef::U16 => "read_uint16",
-        TypeRef::U32 => "read_uint32",
-        TypeRef::I64 => "read_int64",
-        TypeRef::U64 => "read_uint64",
-        TypeRef::F32 => "read_float",
-        TypeRef::F64 => "read_double",
-        TypeRef::Handle => "read_uint64",
+        Ty::I8 => "read_int8",
+        Ty::I16 => "read_int16",
+        Ty::I32 | Ty::Bool | Ty::Enum(_) => "read_int32",
+        Ty::U8 => "read_uint8",
+        Ty::U16 => "read_uint16",
+        Ty::U32 => "read_uint32",
+        Ty::I64 => "read_int64",
+        Ty::U64 => "read_uint64",
+        Ty::F32 => "read_float",
+        Ty::F64 => "read_double",
+        Ty::Handle => "read_uint64",
         _ => "read_pointer",
     }
 }
 
 /// The `FFI::MemoryPointer` element type allocated for one iterator element
 /// out-slot, mirroring [`rb_read_method`].
-pub(crate) fn rb_mem_type(ty: &TypeRef) -> &'static str {
+pub(crate) fn rb_mem_type(ty: &Ty) -> &'static str {
     match ty {
-        TypeRef::I8 => ":int8",
-        TypeRef::I16 => ":int16",
-        TypeRef::I32 | TypeRef::Bool | TypeRef::Enum(_) => ":int32",
-        TypeRef::U8 => ":uint8",
-        TypeRef::U16 => ":uint16",
-        TypeRef::U32 => ":uint32",
-        TypeRef::I64 => ":int64",
-        TypeRef::U64 => ":uint64",
-        TypeRef::F32 => ":float",
-        TypeRef::F64 => ":double",
-        TypeRef::Handle => ":uint64",
+        Ty::I8 => ":int8",
+        Ty::I16 => ":int16",
+        Ty::I32 | Ty::Bool | Ty::Enum(_) => ":int32",
+        Ty::U8 => ":uint8",
+        Ty::U16 => ":uint16",
+        Ty::U32 => ":uint32",
+        Ty::I64 => ":int64",
+        Ty::U64 => ":uint64",
+        Ty::F32 => ":float",
+        Ty::F64 => ":double",
+        Ty::Handle => ":uint64",
         _ => ":pointer",
     }
 }

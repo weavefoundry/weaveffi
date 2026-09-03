@@ -29,6 +29,22 @@ module WeaveFFI
     end
   end
 
+  # The ABI revision these bindings were generated against. Checked before any
+  # other symbol is attached so a mismatched producer fails at require time
+  # instead of misreading the error struct or a value buffer later.
+  ABI_VERSION = 1
+  begin
+    attach_function :weaveffi_abi_version, [], :uint32
+  rescue FFI::NotFoundError
+    raise LoadError, 'the loaded WeaveFFI library predates ABI versioning ' \
+                     "(these bindings expect ABI revision #{ABI_VERSION})"
+  end
+  _wv_abi = weaveffi_abi_version
+  unless _wv_abi == ABI_VERSION
+    raise LoadError, "WeaveFFI ABI mismatch: these bindings expect revision #{ABI_VERSION} " \
+                     "but the loaded library reports revision #{_wv_abi}"
+  end
+
   class ErrorStruct < FFI::Struct
     layout :code, :int32,
            :message, :pointer,

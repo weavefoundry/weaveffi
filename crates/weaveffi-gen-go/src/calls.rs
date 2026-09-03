@@ -4,18 +4,18 @@
 //! Marshalling dispatch follows the shared plan layer: each parameter's
 //! passing contract comes from [`ParamBinding::arg_pass`], each result's
 //! receiving contract from [`plan::ret_pass`], so this module only spells
-//! those contracts in Go rather than re-deriving them from `TypeRef`.
+//! those contracts in Go rather than re-deriving them from `Ty`.
 
 use heck::ToUpperCamelCase;
 use weaveffi_core::abi::AbiParam;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     AsyncBinding, BindingModel, CallShape, CallbackBinding, FnBinding, IteratorBinding,
     ListenerBinding, ModuleBinding, ParamBinding,
 };
 use weaveffi_core::plan::{self, elem_free, ArgPass, ElemFree, ErrorStrategy, RetPass};
 use weaveffi_core::utils::{c_abi_struct_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{emit_buffer_read, emit_buffer_write};
 use crate::docs::{emit_doc, emit_fn_doc};
@@ -83,7 +83,7 @@ impl<'a> ErrCtx<'a> {
     /// The Go return-type suffix (including the leading space) of a wrapper
     /// returning `ret`: `(T, error)`/`error` when throwing, `T`/nothing when
     /// plain.
-    fn ret_sig(&self, ret: &Option<TypeRef>) -> String {
+    fn ret_sig(&self, ret: &Option<Ty>) -> String {
         match (ret, self.throws) {
             (Some(r), true) => format!(" ({}, error)", go_type(r)),
             (Some(r), false) => format!(" {}", go_type(r)),
@@ -207,10 +207,10 @@ fn emit_cb_param_arg(
         ArgPass::Object { slot, nullable } => {
             let n = &slot.name;
             if nullable {
-                let TypeRef::Optional(inner) = &p.ty else {
+                let Ty::Optional(inner) = &p.ty else {
                     unreachable!("nullable object params are optional interfaces")
                 };
-                let TypeRef::Interface(name) = inner.as_ref() else {
+                let Ty::Interface(name) = inner.as_ref() else {
                     unreachable!("every other optional is buffered")
                 };
                 let g = go_local(name);
@@ -225,12 +225,12 @@ fn emit_cb_param_arg(
         ArgPass::Direct { slot } => {
             let n = &slot.name;
             match &p.ty {
-                TypeRef::Bool => {
+                Ty::Bool => {
                     w.line(format!("{arg} := cToBool({n})"));
                 }
                 // A typed handle is a borrowed opaque pointer wrapped
                 // without ownership, like an interface.
-                TypeRef::TypedHandle(_) => {
+                Ty::TypedHandle(_) => {
                     w.line(format!("{arg} := {}", go_wrap_expr(&p.ty, n)));
                 }
                 _ => {
@@ -369,7 +369,7 @@ fn async_outcome_type(prefix: &str, f: &FnBinding) -> String {
 /// adopted by the wrapper instead (its `Close` calls the destroy symbol).
 fn emit_async_result_send(
     out: &mut String,
-    ret: &Option<TypeRef>,
+    ret: &Option<Ty>,
     outcome: &str,
     prefix: &str,
     module: &str,
@@ -412,10 +412,10 @@ fn emit_async_result_send(
         // calls the destroy symbol).
         RetPass::Object { nullable, .. } => {
             if nullable {
-                let TypeRef::Optional(inner) = ty else {
+                let Ty::Optional(inner) = ty else {
                     unreachable!("nullable object results are optional interfaces")
                 };
-                let TypeRef::Interface(name) = inner.as_ref() else {
+                let Ty::Interface(name) = inner.as_ref() else {
                     unreachable!("every other optional is buffered")
                 };
                 let g = go_local(name);
@@ -432,11 +432,11 @@ fn emit_async_result_send(
             }
         }
         RetPass::Direct => match ty {
-            TypeRef::Bool => {
+            Ty::Bool => {
                 w.line(format!("ch <- {outcome}{{val: cToBool(result)}}"));
             }
             // A typed handle is a borrowed id wrapped without ownership.
-            TypeRef::TypedHandle(_) => {
+            Ty::TypedHandle(_) => {
                 w.line(format!(
                     "ch <- {outcome}{{val: {}}}",
                     go_wrap_expr(ty, "result")
@@ -686,12 +686,12 @@ pub(crate) fn render_function(
 /// Go type of the `out_item` local whose address is passed to an iterator's
 /// `next` (the C slot is `T*`, so the local is one indirection less).
 /// Buffered and bytes elements arrive as a `const uint8_t*` buffer pointer.
-fn iter_out_item_type(inner: &TypeRef, prefix: &str, module: &str) -> String {
+fn iter_out_item_type(inner: &Ty, prefix: &str, module: &str) -> String {
     match elem_free(inner) {
         ElemFree::String => "*C.char".into(),
         ElemFree::Bytes => "*C.uint8_t".into(),
         ElemFree::None => match inner {
-            TypeRef::TypedHandle(n) | TypeRef::Interface(n) => {
+            Ty::TypedHandle(n) | Ty::Interface(n) => {
                 format!("*C.{}", c_abi_struct_name(n, module, prefix))
             }
             _ => c_scalar_type(inner, prefix, module).unwrap_or_else(|| "C.int64_t".into()),
@@ -721,20 +721,14 @@ fn indent_block(block: &str) -> String {
 /// are freed after copying, bytes and buffered elements are copied/decoded
 /// and released with `weaveffi_free_bytes` (via `wvCopyBuffer`), and by-value
 /// elements owe nothing.
-fn emit_iter_elem_bind(
-    w: &mut CodeWriter,
-    inner: &TypeRef,
-    ef: &ElemFree,
-    prefix: &str,
-    module: &str,
-) {
+fn emit_iter_elem_bind(w: &mut CodeWriter, inner: &Ty, ef: &ElemFree, prefix: &str, module: &str) {
     match ef {
         ElemFree::String => {
             w.line("item := C.GoString(outItem)");
             w.line("C.weaveffi_free_string(outItem)");
         }
         ElemFree::Bytes => {
-            if matches!(inner, TypeRef::Bytes | TypeRef::BorrowedBytes) {
+            if matches!(inner, Ty::Bytes | Ty::BorrowedBytes) {
                 w.line("item := wvCopyBuffer(outItem, outLen)");
             } else {
                 w.line("rItem := &wvReader{buf: wvCopyBuffer(outItem, outLen)}");
@@ -744,12 +738,12 @@ fn emit_iter_elem_bind(
             }
         }
         ElemFree::None => match inner {
-            TypeRef::Bool => {
+            Ty::Bool => {
                 w.line("item := cToBool(outItem)");
             }
             // Typed handles and interfaces are opaque pointers the consumer
             // adopts, even though `elem_free` owes no runtime call for them.
-            TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+            Ty::TypedHandle(_) | Ty::Interface(_) => {
                 w.line(format!("item := {}", go_wrap_expr(inner, "outItem")));
             }
             _ => {
@@ -970,9 +964,9 @@ fn emit_param(
             }
         }
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Handle => args.push(format!("C.weaveffi_handle_t({name})")),
+            Ty::Handle => args.push(format!("C.weaveffi_handle_t({name})")),
             // A typed handle passes its wrapped opaque pointer by value.
-            TypeRef::TypedHandle(_) => args.push(format!("{name}.ptr")),
+            Ty::TypedHandle(_) => args.push(format!("{name}.ptr")),
             _ => args.push(c_scalar_conv(&name, &p.ty, prefix, module)),
         },
     }
@@ -985,7 +979,7 @@ fn emit_param(
 fn emit_return_out_params(
     pre: &mut String,
     args: &mut Vec<String>,
-    ty: &TypeRef,
+    ty: &Ty,
     prefix: &str,
     module: &str,
 ) {
@@ -1007,7 +1001,7 @@ fn emit_return_out_params(
 /// A buffered return is copied out of the producer-allocated buffer (which
 /// `wvCopyBuffer` releases with `weaveffi_free_bytes`), decoded, and checked
 /// for trailing bytes.
-fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail: &str) {
+fn emit_return(out: &mut String, ty: &Ty, prefix: &str, module: &str, tail: &str) {
     let mut w = CodeWriter::tabs().with_depth(1);
     match plan::ret_pass(Some(ty), module, prefix) {
         RetPass::Void => unreachable!("a present return type is never void"),
@@ -1035,10 +1029,10 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
         // return means none.
         RetPass::Object { nullable, .. } => {
             if nullable {
-                let TypeRef::Optional(inner) = ty else {
+                let Ty::Optional(inner) = ty else {
                     unreachable!("nullable object returns are optional interfaces")
                 };
-                let TypeRef::Interface(n) = inner.as_ref() else {
+                let Ty::Interface(n) = inner.as_ref() else {
                     unreachable!("every other optional is buffered")
                 };
                 let g = go_local(n);
@@ -1051,11 +1045,11 @@ fn emit_return(out: &mut String, ty: &TypeRef, prefix: &str, module: &str, tail:
             }
         }
         RetPass::Direct => match ty {
-            TypeRef::Bool => {
+            Ty::Bool => {
                 w.line(format!("return cToBool(result){tail}"));
             }
             // A typed handle is a borrowed id wrapped without ownership.
-            TypeRef::TypedHandle(_) => {
+            Ty::TypedHandle(_) => {
                 w.line(format!("return {}{tail}", go_wrap_expr(ty, "result")));
             }
             _ => {

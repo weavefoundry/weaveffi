@@ -48,7 +48,7 @@ directory can be dropped into any CMake build.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:

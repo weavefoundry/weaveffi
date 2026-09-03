@@ -18,9 +18,6 @@ mod package;
 mod runtime;
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -136,7 +133,6 @@ impl LanguageBackend for WasmGenerator {
             OutputFile::new(
                 wasm_dir.join(&js_filename),
                 render_wasm_js_stub(
-                    api,
                     model,
                     module_name,
                     prefix,
@@ -148,7 +144,6 @@ impl LanguageBackend for WasmGenerator {
             OutputFile::new(
                 wasm_dir.join(&dts_filename),
                 render_wasm_dts(
-                    api,
                     model,
                     module_name,
                     input_basename,
@@ -159,5 +154,3 @@ impl LanguageBackend for WasmGenerator {
         ]
     }
 }
-
-weaveffi_core::impl_generator_via_backend!(WasmGenerator);

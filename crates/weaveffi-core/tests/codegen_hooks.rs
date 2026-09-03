@@ -8,88 +8,63 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
 use camino::Utf8Path;
-use weaveffi_core::codegen::{ConfiguredGenerator, Generator, Orchestrator, OrchestratorHooks};
+use weaveffi_core::backend::{LanguageBackend, OutputFile};
+use weaveffi_core::capabilities::TargetCapabilities;
+use weaveffi_core::codegen::{ConfiguredBackend, Orchestrator, OrchestratorHooks};
+use weaveffi_core::model::BindingModel;
 use weaveffi_core::resolved::ResolvedApi;
-use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
+use weaveffi_ir::ir::{Api, Module, CURRENT_SCHEMA_VERSION};
 
 const HOOK_HELPER: &str = env!("CARGO_BIN_EXE_hook_helper");
 
-fn quote_arg(arg: &str) -> String {
-    if arg.contains(' ') || arg.contains('"') {
-        format!("\"{}\"", arg.replace('"', "\\\""))
-    } else {
-        arg.to_string()
-    }
-}
-
 fn helper_cmd(arg: &str) -> String {
-    format!("{} {}", quote_arg(HOOK_HELPER), arg)
+    let exe = if HOOK_HELPER.contains(' ') || HOOK_HELPER.contains('"') {
+        format!("\"{}\"", HOOK_HELPER.replace('"', "\\\""))
+    } else {
+        HOOK_HELPER.to_string()
+    };
+    format!("{exe} {arg}")
 }
 
-#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, serde::Serialize)]
 struct TestConfig;
 
-struct CountingGenerator {
-    name: &'static str,
-    calls: Arc<AtomicUsize>,
-}
+struct Counting(Arc<AtomicUsize>);
 
-impl Generator for CountingGenerator {
+impl LanguageBackend for Counting {
     type Config = TestConfig;
 
     fn name(&self) -> &'static str {
-        self.name
+        "counting"
     }
 
-    fn capabilities(&self) -> weaveffi_core::capabilities::TargetCapabilities {
-        weaveffi_core::capabilities::TargetCapabilities::full()
+    fn capabilities(&self) -> TargetCapabilities {
+        TargetCapabilities::full()
     }
 
-    fn generate(
+    fn files(
         &self,
         _api: &ResolvedApi,
+        _model: &BindingModel,
         out_dir: &Utf8Path,
         _config: &Self::Config,
-    ) -> Result<()> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        let dir = out_dir.join(self.name);
-        std::fs::create_dir_all(dir.as_std_path())?;
-        std::fs::write(dir.join("output.txt").as_std_path(), "generated")?;
-        Ok(())
+    ) -> Vec<OutputFile> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        vec![OutputFile::new(
+            out_dir.join("counting/output.txt"),
+            "generated",
+        )]
     }
 }
 
-fn test_api() -> ResolvedApi {
-    ResolvedApi::assume_resolved(Api {
-        version: "0.5.0".to_string(),
+fn api() -> ResolvedApi {
+    ResolvedApi::assume_valid(Api {
+        version: CURRENT_SCHEMA_VERSION.into(),
         modules: vec![Module {
-            name: "math".to_string(),
-            functions: vec![Function {
-                name: "add".to_string(),
-                params: vec![
-                    Param {
-                        name: "a".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                    Param {
-                        name: "b".to_string(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    },
-                ],
-                returns: Some(TypeRef::I32),
-                doc: None,
-                throws: false,
-                r#async: false,
-                cancellable: false,
-                deprecated: None,
-                since: None,
-            }],
+            name: "math".into(),
+            doc: None,
+            functions: vec![],
             interfaces: vec![],
             structs: vec![],
             enums: vec![],
@@ -98,84 +73,41 @@ fn test_api() -> ResolvedApi {
             errors: None,
             modules: vec![],
         }],
-        generators: None,
-        package: None,
     })
 }
 
-fn configured(
-    name: &'static str,
-    calls: Arc<AtomicUsize>,
-) -> ConfiguredGenerator<CountingGenerator> {
-    ConfiguredGenerator::new(CountingGenerator { name, calls }, TestConfig)
+/// Run one orchestration with `hooks`, returning `(result, generate_calls)`.
+fn run(hooks: OrchestratorHooks) -> (anyhow::Result<()>, usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = Utf8Path::from_path(dir.path()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let target = ConfiguredBackend::new(Counting(Arc::clone(&calls)), TestConfig);
+    let result = Orchestrator::new()
+        .with_target(&target)
+        .run(&api(), out_dir, &hooks, true);
+    (result, calls.load(Ordering::SeqCst))
 }
 
 #[test]
-fn pre_hook_runs_before_generate() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-    let api = test_api();
-    let hooks = OrchestratorHooks {
+fn hooks_run_around_generation_and_failures_propagate() {
+    let (ok, calls) = run(OrchestratorHooks {
         pre_generate: Some(helper_cmd("ok")),
-        ..OrchestratorHooks::default()
-    };
-    let calls = Arc::new(AtomicUsize::new(0));
-    let gen = configured("counting", Arc::clone(&calls));
-
-    let orch = Orchestrator::new().with_generator(&gen);
-    orch.run(&api, out_dir, &hooks, true).unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn pre_hook_failure_aborts() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-    let api = test_api();
-    let hooks = OrchestratorHooks {
-        pre_generate: Some(helper_cmd("fail")),
-        ..OrchestratorHooks::default()
-    };
-    let calls = Arc::new(AtomicUsize::new(0));
-    let gen = configured("counting", Arc::clone(&calls));
-
-    let orch = Orchestrator::new().with_generator(&gen);
-    let result = orch.run(&api, out_dir, &hooks, true);
-    assert!(result.is_err());
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "generator should not run");
-}
-
-#[test]
-fn post_hook_runs_after_generate() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-    let api = test_api();
-    let hooks = OrchestratorHooks {
         post_generate: Some(helper_cmd("ok")),
-        ..OrchestratorHooks::default()
-    };
-    let calls = Arc::new(AtomicUsize::new(0));
-    let gen = configured("counting", Arc::clone(&calls));
+    });
+    ok.unwrap();
+    assert_eq!(calls, 1);
 
-    let orch = Orchestrator::new().with_generator(&gen);
-    orch.run(&api, out_dir, &hooks, true).unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
+    let (err, calls) = run(OrchestratorHooks {
+        pre_generate: Some(helper_cmd("fail")),
+        post_generate: None,
+    });
+    assert!(err.is_err());
+    assert_eq!(calls, 0, "a failing pre hook must prevent generation");
 
-#[test]
-fn post_hook_failure_returns_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-    let api = test_api();
-    let hooks = OrchestratorHooks {
+    let (err, calls) = run(OrchestratorHooks {
+        pre_generate: None,
         post_generate: Some(helper_cmd("fail")),
-        ..OrchestratorHooks::default()
-    };
-    let calls = Arc::new(AtomicUsize::new(0));
-    let gen = configured("counting", Arc::clone(&calls));
-
-    let orch = Orchestrator::new().with_generator(&gen);
-    let result = orch.run(&api, out_dir, &hooks, true);
-    assert!(result.is_err());
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "generator should have run");
+    });
+    assert!(err.is_err());
+    assert_eq!(calls, 1, "the post hook runs after generation");
 }

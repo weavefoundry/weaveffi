@@ -18,9 +18,6 @@ mod runtime;
 mod stubs;
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -99,9 +96,7 @@ pub struct PythonGenerator;
 
 impl PythonGenerator {
     /// Render the primary `weaveffi.py` source by composing the shared
-    /// [`LanguageBackend::emit_members`] walk over every module. Shared by the
-    /// [`LanguageBackend::files`] hook and the test-facing
-    /// `render_python_module` wrapper so there is one assembly path.
+    /// [`LanguageBackend::emit_members`] walk over every module.
     fn render_py_source(
         &self,
         model: &BindingModel,
@@ -364,20 +359,4 @@ impl LanguageBackend for PythonGenerator {
         }
         Some(files)
     }
-}
-
-weaveffi_core::impl_generator_via_backend!(PythonGenerator);
-
-/// Render the `weaveffi.py` module source. Thin wrapper over the shared
-/// [`LanguageBackend::emit_members`] walk (via
-/// [`PythonGenerator::render_py_source`]); retained for direct use in tests.
-#[cfg(test)]
-fn render_python_module(
-    api: &ResolvedApi,
-    strip_module_prefix: bool,
-    prefix: &str,
-    input_basename: &str,
-) -> String {
-    let model = BindingModel::build(api, prefix);
-    PythonGenerator.render_py_source(&model, strip_module_prefix, input_basename)
 }

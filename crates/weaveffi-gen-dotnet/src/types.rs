@@ -5,8 +5,8 @@ use heck::ToLowerCamelCase;
 use weaveffi_core::abi::{AbiParam, CType};
 use weaveffi_core::lang;
 use weaveffi_core::model::FnBinding;
+use weaveffi_core::model::Ty;
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 /// The C# type of a `handle<T>` reference: a generated `{T}Handle` wrapper
 /// struct named after the referent's bare local type name.
@@ -16,92 +16,90 @@ pub(crate) fn typed_handle_cs(name: &str) -> String {
 
 /// The idiomatic C# surface type for one IR type, as it appears in wrapper
 /// signatures, properties, and locals.
-pub(crate) fn cs_type(ty: &TypeRef) -> String {
+pub(crate) fn cs_type(ty: &Ty) -> String {
     match ty {
-        TypeRef::I8 => "sbyte".into(),
-        TypeRef::I16 => "short".into(),
-        TypeRef::I32 => "int".into(),
-        TypeRef::U8 => "byte".into(),
-        TypeRef::U16 => "ushort".into(),
-        TypeRef::U32 => "uint".into(),
-        TypeRef::I64 => "long".into(),
-        TypeRef::U64 => "ulong".into(),
-        TypeRef::F32 => "float".into(),
-        TypeRef::F64 => "double".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
-        TypeRef::Handle => "ulong".into(),
+        Ty::I8 => "sbyte".into(),
+        Ty::I16 => "short".into(),
+        Ty::I32 => "int".into(),
+        Ty::U8 => "byte".into(),
+        Ty::U16 => "ushort".into(),
+        Ty::U32 => "uint".into(),
+        Ty::I64 => "long".into(),
+        Ty::U64 => "ulong".into(),
+        Ty::F32 => "float".into(),
+        Ty::F64 => "double".into(),
+        Ty::Bool => "bool".into(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
+        Ty::Handle => "ulong".into(),
         // Typed handles surface as a generated `{T}Handle` wrapper struct; a
         // cross-module referent (e.g. `kv.Token`) uses the bare local name.
-        TypeRef::TypedHandle(name) => typed_handle_cs(name),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "byte[]".into(),
+        Ty::TypedHandle(name) => typed_handle_cs(name),
+        Ty::Bytes | Ty::BorrowedBytes => "byte[]".into(),
         // Records are plain data classes; rich enums are abstract sum types.
         // Both are value types decoded from value buffers.
-        TypeRef::Record(name) | TypeRef::RichEnum(name) => local_type_name(name).into(),
-        TypeRef::Enum(name) => local_type_name(name).into(),
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::I8 => "sbyte?".into(),
-            TypeRef::I16 => "short?".into(),
-            TypeRef::I32 => "int?".into(),
-            TypeRef::U8 => "byte?".into(),
-            TypeRef::U16 => "ushort?".into(),
-            TypeRef::U32 => "uint?".into(),
-            TypeRef::I64 => "long?".into(),
-            TypeRef::U64 => "ulong?".into(),
-            TypeRef::F32 => "float?".into(),
-            TypeRef::F64 => "double?".into(),
-            TypeRef::Bool => "bool?".into(),
-            TypeRef::Handle => "ulong?".into(),
-            TypeRef::TypedHandle(name) => format!("{}?", typed_handle_cs(name)),
-            TypeRef::Enum(name) => format!("{}?", local_type_name(name)),
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string?".into(),
-            TypeRef::Record(name) | TypeRef::RichEnum(name) => {
+        Ty::Record(name) | Ty::RichEnum(name) => local_type_name(name).into(),
+        Ty::Enum(name) => local_type_name(name).into(),
+        Ty::Optional(inner) => match inner.as_ref() {
+            Ty::I8 => "sbyte?".into(),
+            Ty::I16 => "short?".into(),
+            Ty::I32 => "int?".into(),
+            Ty::U8 => "byte?".into(),
+            Ty::U16 => "ushort?".into(),
+            Ty::U32 => "uint?".into(),
+            Ty::I64 => "long?".into(),
+            Ty::U64 => "ulong?".into(),
+            Ty::F32 => "float?".into(),
+            Ty::F64 => "double?".into(),
+            Ty::Bool => "bool?".into(),
+            Ty::Handle => "ulong?".into(),
+            Ty::TypedHandle(name) => format!("{}?", typed_handle_cs(name)),
+            Ty::Enum(name) => format!("{}?", local_type_name(name)),
+            Ty::StringUtf8 | Ty::BorrowedStr => "string?".into(),
+            Ty::Record(name) | Ty::RichEnum(name) => {
                 format!("{}?", local_type_name(name))
             }
             _ => format!("{}?", cs_type(inner)),
         },
-        TypeRef::List(inner) => format!("{}[]", cs_type(inner)),
-        TypeRef::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
-        TypeRef::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
+        Ty::List(inner) => format!("{}[]", cs_type(inner)),
+        Ty::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
+        Ty::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
         // Interfaces surface as their opaque-handle wrapper class; a
         // cross-module reference (`kv.Store`) uses the bare local name.
-        TypeRef::Interface(name) => local_type_name(name).into(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        Ty::Interface(name) => local_type_name(name).into(),
     }
 }
 
 /// The P/Invoke spelling of one IR type in a delegate or result slot: value
 /// types pass directly, everything pointer-shaped collapses to `IntPtr`.
-pub(crate) fn pinvoke_type(ty: &TypeRef) -> String {
+pub(crate) fn pinvoke_type(ty: &Ty) -> String {
     match ty {
-        TypeRef::I8 => "sbyte".into(),
-        TypeRef::I16 => "short".into(),
-        TypeRef::I32 => "int".into(),
-        TypeRef::U8 => "byte".into(),
-        TypeRef::U16 => "ushort".into(),
-        TypeRef::U32 => "uint".into(),
-        TypeRef::I64 => "long".into(),
-        TypeRef::U64 => "ulong".into(),
-        TypeRef::F32 => "float".into(),
-        TypeRef::F64 => "double".into(),
+        Ty::I8 => "sbyte".into(),
+        Ty::I16 => "short".into(),
+        Ty::I32 => "int".into(),
+        Ty::U8 => "byte".into(),
+        Ty::U16 => "ushort".into(),
+        Ty::U32 => "uint".into(),
+        Ty::I64 => "long".into(),
+        Ty::U64 => "ulong".into(),
+        Ty::F32 => "float".into(),
+        Ty::F64 => "double".into(),
         // C `bool` is one byte; marshalling it as `int` would read past the
         // slot in arrays and leave garbage in the upper bits of returns.
-        TypeRef::Bool => "byte".into(),
-        TypeRef::StringUtf8
-        | TypeRef::BorrowedStr
-        | TypeRef::Bytes
-        | TypeRef::BorrowedBytes
-        | TypeRef::Record(_)
-        | TypeRef::RichEnum(_)
-        | TypeRef::Interface(_)
-        | TypeRef::Optional(_)
-        | TypeRef::List(_)
-        | TypeRef::Iterator(_)
-        | TypeRef::Map(_, _) => "IntPtr".into(),
-        TypeRef::Handle => "ulong".into(),
-        TypeRef::TypedHandle(_) => "IntPtr".into(),
-        TypeRef::Enum(_) => "int".into(),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        Ty::Bool => "byte".into(),
+        Ty::StringUtf8
+        | Ty::BorrowedStr
+        | Ty::Bytes
+        | Ty::BorrowedBytes
+        | Ty::Record(_)
+        | Ty::RichEnum(_)
+        | Ty::Interface(_)
+        | Ty::Optional(_)
+        | Ty::List(_)
+        | Ty::Iterator(_)
+        | Ty::Map(_, _) => "IntPtr".into(),
+        Ty::Handle => "ulong".into(),
+        Ty::TypedHandle(_) => "IntPtr".into(),
+        Ty::Enum(_) => "int".into(),
     }
 }
 
@@ -147,23 +145,23 @@ pub(crate) fn cs_out_param(p: &AbiParam) -> String {
 /// `Nullable<T>` and a present value is read through `.Value`. Strings, byte
 /// arrays, records, rich enums, interfaces, and collections are reference
 /// types and use plain `null` checks instead.
-pub(crate) fn is_cs_value_type(ty: &TypeRef) -> bool {
+pub(crate) fn is_cs_value_type(ty: &Ty) -> bool {
     matches!(
         ty,
-        TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool
-            | TypeRef::Handle
-            | TypeRef::Enum(_)
-            | TypeRef::TypedHandle(_)
+        Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::I64
+            | Ty::U64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Handle
+            | Ty::Enum(_)
+            | Ty::TypedHandle(_)
     )
 }
 

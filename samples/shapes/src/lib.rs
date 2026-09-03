@@ -8,7 +8,7 @@
 //! for the type instead of emitting per-variant C symbols. `Channel` is a
 //! plain C-style enum that crosses as its `i32` discriminant. The producer
 //! writes only safe Rust; the macro emits the `weaveffi_shapes_*` thunks that
-//! line up 1:1 with the generated header (see `weaveffi generate shapes.yml
+//! line up 1:1 with the generated header (see `weaveffi generate src/lib.rs
 //! --target c`).
 
 /// Rich-enum + numerics smoke test

@@ -22,8 +22,6 @@ mod entities;
 mod package;
 mod pinvoke;
 mod runtime;
-#[cfg(test)]
-mod tests;
 mod types;
 
 use camino::Utf8Path;
@@ -232,8 +230,6 @@ impl LanguageBackend for DotnetGenerator {
         Some(files)
     }
 }
-
-weaveffi_core::impl_generator_via_backend!(DotnetGenerator);
 
 /// Render the complete generated C# source file: the prelude, usings, the
 /// shared runtime types, every module's entities, the `NativeMethods` extern

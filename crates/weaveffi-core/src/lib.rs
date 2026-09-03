@@ -1,4 +1,6 @@
-//! Core logic: Generator trait, codegen orchestration, validation, and shared utilities.
+//! Core logic shared by every WeaveFFI generator and the CLI: validation, the
+//! resolved API and binding model, the C ABI lowering, the marshalling plan,
+//! the `LanguageBackend` trait, and code-generation orchestration.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
@@ -21,6 +23,5 @@ pub mod platform;
 pub mod resolved;
 pub mod utils;
 pub mod validate;
-pub mod wire;
 
 pub use resolved::ResolvedApi;

@@ -22,6 +22,15 @@ import (
 	"unsafe"
 )
 
+// The ABI revision these bindings were generated against.
+const wvABIVersion uint32 = 1
+
+func init() {
+	if found := uint32(C.weaveffi_abi_version()); found != wvABIVersion {
+		panic(fmt.Sprintf("WeaveFFI ABI mismatch: these bindings expect revision %d but the loaded library reports revision %d", wvABIVersion, found))
+	}
+}
+
 // WeaveFFIError reports a failure crossing the C boundary that no typed
 // error domain claims: an unknown code, a marshalling failure, or a
 // producer panic.

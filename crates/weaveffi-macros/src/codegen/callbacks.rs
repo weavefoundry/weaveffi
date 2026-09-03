@@ -4,8 +4,8 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{CallbackBinding, ListenerBinding, ModuleBinding, ParamBinding};
-use weaveffi_ir::ir::TypeRef;
 
 use super::helpers::{ctype_to_rust, ident, is_copy, rust_type_ident, typeref_to_rust};
 use super::unsupported;
@@ -40,7 +40,7 @@ fn emit_callback_param(
     // A buffered payload is borrowed for the dispatch: encode it once into a
     // local value buffer, hand every subscriber the same `(ptr, len)` view,
     // and let the encoding drop after the loop.
-    if weaveffi_core::abi::is_buffered(&pb.ty) {
+    if pb.ty.is_buffered() {
         let rt = typeref_to_rust(&pb.ty)?;
         let tmp = ident(&format!("__wv_cb_{}", pb.name));
         return Ok((
@@ -51,7 +51,7 @@ fn emit_callback_param(
         ));
     }
     Ok(match &pb.ty {
-        TypeRef::Enum(name) => {
+        Ty::Enum(name) => {
             let et = rust_type_ident(name);
             (
                 quote!(#n: #et),
@@ -64,7 +64,7 @@ fn emit_callback_param(
             let rt = typeref_to_rust(ty)?;
             (quote!(#n: #rt), none.clone(), vec![quote!(#n)], none)
         }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             let tmp = ident(&format!("__wv_cb_{}", pb.name));
             (
                 quote!(#n: &str),
@@ -73,7 +73,7 @@ fn emit_callback_param(
                 quote!(::weaveffi::abi::free_string(#tmp);),
             )
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => (
+        Ty::Bytes | Ty::BorrowedBytes => (
             quote!(#n: &[u8]),
             none.clone(),
             vec![quote!(#n.as_ptr()), quote!(#n.len())],

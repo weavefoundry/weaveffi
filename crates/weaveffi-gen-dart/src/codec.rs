@@ -7,8 +7,8 @@
 //! their owned forms, records and rich enums as one user-codec shape).
 
 use weaveffi_core::codegen::CodeWriter;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
+use weaveffi_core::model::Ty;
+use weaveffi_core::model::{Prim, WireType};
 
 use crate::types::{dart_class, dart_type};
 
@@ -36,23 +36,23 @@ pub(crate) fn fresh(tmp: &mut usize) -> String {
 /// Optionals, lists, and maps recurse; records and rich enums call their
 /// generated `_unpack{Name}` helper. All read expressions evaluate strictly
 /// left to right, so composing them preserves the wire order.
-pub(crate) fn read_expr(r: &str, ty: &TypeRef) -> String {
-    match wire::classify(ty) {
-        WireType::Bool => format!("{r}.readBool()"),
-        WireType::I8 => format!("{r}.readInt8()"),
-        WireType::I16 => format!("{r}.readInt16()"),
-        WireType::I32 => format!("{r}.readInt32()"),
-        WireType::I64 => format!("{r}.readInt64()"),
-        WireType::U8 => format!("{r}.readUint8()"),
-        WireType::U16 => format!("{r}.readUint16()"),
-        WireType::U32 => format!("{r}.readUint32()"),
-        WireType::U64 => format!("{r}.readUint64()"),
-        WireType::F32 => format!("{r}.readFloat32()"),
-        WireType::F64 => format!("{r}.readFloat64()"),
+pub(crate) fn read_expr(r: &str, ty: &Ty) -> String {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => format!("{r}.readBool()"),
+        WireType::Prim(Prim::I8) => format!("{r}.readInt8()"),
+        WireType::Prim(Prim::I16) => format!("{r}.readInt16()"),
+        WireType::Prim(Prim::I32) => format!("{r}.readInt32()"),
+        WireType::Prim(Prim::I64) => format!("{r}.readInt64()"),
+        WireType::Prim(Prim::U8) => format!("{r}.readUint8()"),
+        WireType::Prim(Prim::U16) => format!("{r}.readUint16()"),
+        WireType::Prim(Prim::U32) => format!("{r}.readUint32()"),
+        WireType::Prim(Prim::U64) => format!("{r}.readUint64()"),
+        WireType::Prim(Prim::F32) => format!("{r}.readFloat32()"),
+        WireType::Prim(Prim::F64) => format!("{r}.readFloat64()"),
         // Both handle kinds decode from one u64 token; only the Dart surface
         // differs (a bare int versus a wrapper class adopting the address).
-        WireType::Handle => {
-            if let TypeRef::TypedHandle(n) = ty {
+        WireType::Handle(_) => {
+            if let Ty::TypedHandle(n) = ty {
                 format!(
                     "{}._(Pointer<Void>.fromAddress({r}.readUint64()))",
                     dart_class(n)
@@ -62,8 +62,8 @@ pub(crate) fn read_expr(r: &str, ty: &TypeRef) -> String {
             }
         }
         WireType::Enum(n) => format!("{}.fromValue({r}.readInt32())", dart_class(n)),
-        WireType::String => format!("{r}.readString()"),
-        WireType::Bytes => format!("{r}.readBytes()"),
+        WireType::Prim(Prim::String) => format!("{r}.readString()"),
+        WireType::Prim(Prim::Bytes) => format!("{r}.readBytes()"),
         WireType::User(n) => format!("{}({r})", unpack_fn(n)),
         WireType::Optional(inner) => {
             format!("({r}.readOptionFlag() ? {} : null)", read_expr(r, inner))
@@ -87,45 +87,45 @@ pub(crate) fn read_expr(r: &str, ty: &TypeRef) -> String {
 /// named `wr`. Optionals, lists, and maps recurse through fresh `t{n}`
 /// temporaries; records and rich enums call their generated `_pack{Name}`
 /// helper.
-pub(crate) fn write_stmts(w: &mut CodeWriter, wr: &str, expr: &str, ty: &TypeRef, tmp: &mut usize) {
-    match wire::classify(ty) {
-        WireType::Bool => {
+pub(crate) fn write_stmts(w: &mut CodeWriter, wr: &str, expr: &str, ty: &Ty, tmp: &mut usize) {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("{wr}.writeBool({expr});"));
         }
-        WireType::I8 => {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("{wr}.writeInt8({expr});"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("{wr}.writeInt16({expr});"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("{wr}.writeInt32({expr});"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("{wr}.writeInt64({expr});"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("{wr}.writeUint8({expr});"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("{wr}.writeUint16({expr});"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("{wr}.writeUint32({expr});"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("{wr}.writeUint64({expr});"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("{wr}.writeFloat32({expr});"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("{wr}.writeFloat64({expr});"));
         }
         // Both handle kinds encode as one u64 token; a typed handle
         // contributes its wrapped pointer's address.
-        WireType::Handle => {
-            if matches!(ty, TypeRef::TypedHandle(_)) {
+        WireType::Handle(_) => {
+            if matches!(ty, Ty::TypedHandle(_)) {
                 w.line(format!("{wr}.writeUint64({expr}._handle.address);"));
             } else {
                 w.line(format!("{wr}.writeUint64({expr});"));
@@ -134,10 +134,10 @@ pub(crate) fn write_stmts(w: &mut CodeWriter, wr: &str, expr: &str, ty: &TypeRef
         WireType::Enum(_) => {
             w.line(format!("{wr}.writeInt32({expr}.value);"));
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("{wr}.writeString({expr});"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("{wr}.writeBytes({expr});"));
         }
         WireType::User(n) => {

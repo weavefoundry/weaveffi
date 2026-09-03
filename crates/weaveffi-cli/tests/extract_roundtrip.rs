@@ -3,7 +3,7 @@
 //! `roundtrip_kitchen_sink` proves the extractor recovers the same shape
 //! as the original kitchen-sink IDL when run on the hand-annotated Rust
 //! file at `crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`,
-//! including the 0.7.0 surface: the `Gadget` interface, the `KitchenErrors`
+//! including the full surface: the `Gadget` interface, the `KitchenErrors`
 //! domain, and per-function `throws`. Lossy fields (struct field defaults,
 //! iterator returns, standalone `since` without `#[deprecated]`, callback
 //! param docs, error-code `doc:` separate from `message:`) are documented
@@ -15,23 +15,15 @@ use std::collections::BTreeMap;
 use weaveffi_ir::ir::{Api, Function, InterfaceDef, Module, StructDef, TypeRef};
 use weaveffi_ir::parse::parse_api_str;
 
-/// The validator that runs inside `weaveffi extract` rewrites cross-module
-/// struct refs (e.g. `Token` → `shared.Token`) and resolves each bare name
-/// to its kind (`Record`, `RichEnum`, `Enum`, `Interface`). Neither rewrite
-/// survives the YAML round-trip because a string like `"Priority"` always
-/// re-parses as `Named("Priority")` regardless of which kind it was. Compare
-/// types modulo those two transforms so a fresh parse matches a validated
-/// one.
+/// Compare user-type references by their final path segment so a
+/// module-qualified spelling (`shared.Token`) matches the bare one the
+/// extractor emits for an in-scope Rust type.
 fn normalize(ty: &TypeRef) -> TypeRef {
     fn last_segment(name: &str) -> String {
         name.rsplit('.').next().unwrap_or(name).to_string()
     }
     match ty {
-        TypeRef::Named(name)
-        | TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Enum(name)
-        | TypeRef::Interface(name) => TypeRef::Named(last_segment(name)),
+        TypeRef::Named(name) => TypeRef::Named(last_segment(name)),
         TypeRef::TypedHandle(name) => TypeRef::TypedHandle(last_segment(name)),
         TypeRef::Optional(inner) => TypeRef::Optional(Box::new(normalize(inner))),
         TypeRef::List(inner) => TypeRef::List(Box::new(normalize(inner))),
@@ -110,7 +102,7 @@ fn assert_functions_equivalent(extracted: &Function, orig: &Function, ctx: &str)
 #[test]
 fn roundtrip_kitchen_sink() {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let idl_path = format!("{manifest}/tests/fixtures/06_kitchen_sink.yml");
+    let idl_path = format!("{manifest}/tests/fixtures/kitchen_sink.yml");
     let annotated_path = format!("{manifest}/tests/fixtures/kitchen_sink_annotated.rs");
 
     let original_src = std::fs::read_to_string(&idl_path).expect("read kitchen-sink IDL");

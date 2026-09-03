@@ -12,9 +12,9 @@
 //! * **Errors** ([`ErrorStrategy`]): when a call reports through `out_err`,
 //!   is that a typed domain error the caller can catch, or a producer bug the
 //!   wrapper must trap on?
-//! * **Ownership** ([`ReturnFree`], [`ElemFree`]): after copying a returned
-//!   value into a native one, exactly which runtime release call does the
-//!   wrapper owe, if any?
+//! * **Ownership** ([`RetPass::free`], [`ElemFree`]): after copying a
+//!   returned value into a native one, exactly which runtime release call
+//!   does the wrapper owe, if any?
 //! * **Iterators** ([`IteratorProtocol`]): the pull contract of `iter<T>`,
 //!   including the requirement that wrappers stay **lazy** (one producer
 //!   `next` per consumer step, never a hidden drain into a list).
@@ -22,14 +22,13 @@
 //!   including the rule that results and errors are owned by the consumer
 //!   and released through the runtime free symbols.
 //!
-//! A backend that renders these plans in its own syntax cannot drift from the
-//! others on semantics; only the spelling differs.
+//! Every classification here derives from [`Ty::family`], so a backend that
+//! renders these plans in its own syntax cannot drift from the others on
+//! semantics; only the spelling differs.
 
-use weaveffi_ir::ir::TypeRef;
-
-use crate::abi::lower::{is_buffered, split_qualified};
+use crate::abi::split_qualified;
 use crate::abi::AbiParam;
-use crate::model::{AsyncBinding, FnBinding, IteratorBinding, ParamBinding};
+use crate::model::{AsyncBinding, Family, FnBinding, IteratorBinding, ParamBinding, Ty};
 
 /// How a callable's `out_err` slot is interpreted by idiomatic wrappers.
 ///
@@ -99,8 +98,8 @@ pub enum ArgPass<'a> {
     },
     /// A buffered value (record, rich enum, optional, list, or map): the
     /// wrapper serializes it into the value-buffer wire format
-    /// ([`crate::wire`]), passes the encoding as a borrowed `(ptr, len)`
-    /// pair, and releases its own encoding after the call returns.
+    /// ([`Ty::wire`]), passes the encoding as a borrowed `(ptr, len)` pair,
+    /// and releases its own encoding after the call returns.
     Buffer {
         /// The `const uint8_t*` data slot.
         ptr: &'a AbiParam,
@@ -123,8 +122,8 @@ impl ParamBinding {
     ///
     /// # Panics
     ///
-    /// Panics if the parameter's precomputed ABI slots disagree with its IR
-    /// type's shape, which would be a bug in the model construction, not a
+    /// Panics if the parameter's precomputed ABI slots disagree with its
+    /// type's family, which would be a bug in the model construction, not a
     /// user error.
     pub fn arg_pass(&self) -> ArgPass<'_> {
         let pair = || {
@@ -143,39 +142,44 @@ impl ParamBinding {
             );
             &self.abi[0]
         };
-        if is_buffered(&self.ty) {
-            let (ptr, len) = pair();
-            return ArgPass::Buffer { ptr, len };
-        }
-        match &self.ty {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => ArgPass::String { slot: single() },
-            TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        match self.ty.family() {
+            Family::Direct => ArgPass::Direct { slot: single() },
+            Family::String => ArgPass::String { slot: single() },
+            Family::Bytes => {
                 let (ptr, len) = pair();
                 ArgPass::Bytes { ptr, len }
             }
-            TypeRef::Interface(_) => ArgPass::Object {
+            Family::Buffer => {
+                let (ptr, len) = pair();
+                ArgPass::Buffer { ptr, len }
+            }
+            Family::Object { nullable } => ArgPass::Object {
                 slot: single(),
-                nullable: false,
+                nullable,
             },
-            // Only `Interface?` reaches here; every other optional is
-            // buffered.
-            TypeRef::Optional(_) => ArgPass::Object {
-                slot: single(),
-                nullable: true,
-            },
-            _ => ArgPass::Direct { slot: single() },
+            Family::Iterator => unreachable!("iterators are never parameters"),
         }
     }
+}
+
+/// The runtime release a consumer wrapper owes for a producer-allocated
+/// value it has copied or decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Free {
+    /// By-value: nothing to free.
+    None,
+    /// A `const char*`: release with `{prefix}_free_string`.
+    String,
+    /// A `ptr` + `len` allocation (raw bytes or a value buffer): release with
+    /// `{prefix}_free_bytes(ptr, len)`.
+    Bytes,
 }
 
 /// How a callable's result crosses back to the wrapper: the receiving
 /// contract, including the decode step and the release obligation.
 ///
-/// This is [`ReturnFree`] completed with the *decode* dimension: a bytes
-/// return and a buffered return share a free obligation but differ in what
-/// the wrapper does before freeing (copy versus decode). Only the sync and
-/// async call shapes consult this; an iterator's result contract lives in
-/// [`IteratorProtocol`].
+/// Only the sync and async call shapes consult this; an iterator's result
+/// contract lives in [`IteratorProtocol`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetPass {
     /// No return value.
@@ -184,13 +188,13 @@ pub enum RetPass {
     /// nothing to free.
     Direct,
     /// Owned `const char*`: copy into the native string, then release with
-    /// `{runtime}_free_string`.
+    /// `{prefix}_free_string`.
     String,
     /// Owned `(const uint8_t*, out_len)` raw bytes: copy, then release with
-    /// `{runtime}_free_bytes`.
+    /// `{prefix}_free_bytes`.
     Bytes,
     /// Owned `(const uint8_t*, out_len)` value buffer: decode via the wire
-    /// format ([`crate::wire`]), then release with `{runtime}_free_bytes`.
+    /// format ([`Ty::wire`]), then release with `{prefix}_free_bytes`.
     Buffer,
     /// An owned object reference the wrapper adopts into its disposal idiom.
     /// When `nullable`, the IDL type is `Interface?` and a null return means
@@ -204,6 +208,19 @@ pub enum RetPass {
     },
 }
 
+impl RetPass {
+    /// The runtime release owed after copying or decoding the result.
+    /// Adopted objects owe their `destroy` symbol instead (see
+    /// [`RetPass::Object`]), so they report [`Free::None`] here.
+    pub fn free(&self) -> Free {
+        match self {
+            RetPass::String => Free::String,
+            RetPass::Bytes | RetPass::Buffer => Free::Bytes,
+            RetPass::Void | RetPass::Direct | RetPass::Object { .. } => Free::None,
+        }
+    }
+}
+
 /// The receiving contract for a value of type `ty` returned from a callable
 /// declared inside `module` under `prefix`. `None` (a void return) is
 /// [`RetPass::Void`].
@@ -213,119 +230,44 @@ pub enum RetPass {
 /// Panics on an iterator return, whose contract is [`IteratorProtocol`], not
 /// a value-passing plan; backends dispatch on
 /// [`CallShape`](crate::model::CallShape) before consulting this.
-pub fn ret_pass(ty: Option<&TypeRef>, module: &str, prefix: &str) -> RetPass {
+pub fn ret_pass(ty: Option<&Ty>, module: &str, prefix: &str) -> RetPass {
     let Some(ty) = ty else {
         return RetPass::Void;
     };
-    if is_buffered(ty) {
-        return RetPass::Buffer;
-    }
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => RetPass::String,
-        TypeRef::Bytes | TypeRef::BorrowedBytes => RetPass::Bytes,
-        TypeRef::Interface(name) => RetPass::Object {
-            destroy_symbol: destroy_symbol(name, module, prefix),
-            nullable: false,
+    match ty.family() {
+        Family::Direct => RetPass::Direct,
+        Family::String => RetPass::String,
+        Family::Bytes => RetPass::Bytes,
+        Family::Buffer => RetPass::Buffer,
+        Family::Object { nullable } => RetPass::Object {
+            destroy_symbol: destroy_symbol(
+                ty.interface_name()
+                    .expect("object family names an interface"),
+                module,
+                prefix,
+            ),
+            nullable,
         },
-        // Only `Interface?` reaches here (every other optional is buffered).
-        TypeRef::Optional(inner) => {
-            let TypeRef::Interface(name) = inner.as_ref() else {
-                unreachable!("only optional interfaces escape buffering")
-            };
-            RetPass::Object {
-                destroy_symbol: destroy_symbol(name, module, prefix),
-                nullable: true,
-            }
-        }
-        TypeRef::Iterator(_) => {
-            panic!("iterator returns follow IteratorProtocol, not a RetPass")
-        }
-        _ => RetPass::Direct,
+        Family::Iterator => panic!("iterator returns follow IteratorProtocol, not a RetPass"),
     }
 }
 
 /// The release call a consumer wrapper owes for one *element* it copied out
-/// of an iterator `next` slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ElemFree {
-    /// By-value element (scalar, bool, C-style enum, handle): nothing to free.
-    None,
-    /// A `const char*` element: release with `{runtime}_free_string`.
-    String,
-    /// A `ptr` + `len` element (bytes, or any buffered value the wrapper
-    /// decodes): copy or decode, then `{runtime}_free_bytes(ptr, len)`.
-    Bytes,
-}
-
-/// The release call a consumer wrapper owes after copying a *returned*
-/// value into a native one.
-///
-/// This is the single statement of the ownership contract the producer runtime
-/// implements (`weaveffi-abi`'s lowering helpers): strings via
-/// `{runtime}_free_string`, byte and value buffers via `{runtime}_free_bytes`,
-/// owned interface objects via their `_destroy` symbol. A backend renders
-/// these as its disposal calls (or wraps the object and defers the release to
-/// its finalizer idiom).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReturnFree {
-    /// By-value return: nothing to free.
-    None,
-    /// `const char*`: copy, then `{runtime}_free_string(ptr)`.
-    String,
-    /// `const uint8_t* + out_len`: copy (bytes) or decode (a buffered value),
-    /// then `{runtime}_free_bytes(ptr, len)`.
-    Bytes,
-    /// An owned interface object: the caller owns the reference and
-    /// eventually calls `destroy_symbol`. Wrappers adopt the pointer into
-    /// their disposal idiom (RAII, `__del__`, finalizers, `close()`), rather
-    /// than freeing eagerly.
-    OwnedObject {
-        /// The `{prefix}_{module}_{Name}_destroy` symbol to call.
-        destroy_symbol: String,
-    },
-}
+/// of an iterator `next` slot. This is [`Free`] under its historical name.
+pub type ElemFree = Free;
 
 /// The per-element release owed for one iterator element of type `ty`.
-pub fn elem_free(ty: &TypeRef) -> ElemFree {
-    if is_buffered(ty) {
-        return ElemFree::Bytes;
-    }
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ElemFree::String,
-        TypeRef::Bytes | TypeRef::BorrowedBytes => ElemFree::Bytes,
-        _ => ElemFree::None,
-    }
-}
-
-/// The release plan for a value of type `ty` *returned* from a callable
-/// declared inside `module` under `prefix`. `None` (a void return) owes
-/// nothing.
-pub fn return_free(ty: Option<&TypeRef>, module: &str, prefix: &str) -> ReturnFree {
-    let Some(ty) = ty else {
-        return ReturnFree::None;
-    };
-    if is_buffered(ty) {
-        return ReturnFree::Bytes;
-    }
-    match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => ReturnFree::String,
-        TypeRef::Bytes | TypeRef::BorrowedBytes => ReturnFree::Bytes,
-        TypeRef::Interface(name) => ReturnFree::OwnedObject {
-            destroy_symbol: destroy_symbol(name, module, prefix),
-        },
-        // Only `Interface?` reaches here (every other optional is buffered):
-        // a nullable owned object pointer, null meaning none.
-        TypeRef::Optional(inner) => return_free(Some(inner), module, prefix),
-        // The iterator handle's lifecycle is the iterator protocol's own
-        // destroy symbol (see `IteratorProtocol`), not a buffer release.
-        TypeRef::Iterator(_) => ReturnFree::None,
-        _ => ReturnFree::None,
+pub fn elem_free(ty: &Ty) -> ElemFree {
+    match ty.family() {
+        Family::String => Free::String,
+        Family::Bytes | Family::Buffer => Free::Bytes,
+        _ => Free::None,
     }
 }
 
 /// The `{prefix}_{module}_{Name}_destroy` symbol for a (possibly
 /// dot-qualified) interface name referenced from `current_module`.
-fn destroy_symbol(name: &str, current_module: &str, prefix: &str) -> String {
+pub fn destroy_symbol(name: &str, current_module: &str, prefix: &str) -> String {
     let (module, name) = split_qualified(name, current_module);
     format!("{prefix}_{module}_{name}_destroy")
 }
@@ -409,37 +351,21 @@ pub struct AsyncProtocol<'a> {
     /// Whether the launcher carries a `cancel_token` slot before
     /// `callback`/`context`.
     pub cancellable: bool,
-    /// The release owed for an *owned interface* result adopted by the
-    /// callback; [`ReturnFree::None`] for results copied or decoded and
-    /// then released through the runtime free symbols.
-    pub result_adopt: ReturnFree,
+    /// How the callback's result slots are received, including the release
+    /// owed ([`RetPass::free`]) or the destroy symbol an adopted object owes.
+    pub result: RetPass,
     /// How the callback's `err` slot is interpreted.
     pub error: ErrorStrategy,
 }
 
 impl AsyncBinding {
     /// Build the full completion contract for this async function, resolving
-    /// the result-adoption plan against the declaring `module` and `prefix`.
-    ///
-    /// A direct or optional interface result (where an optional's null slot
-    /// simply means none) is adopted by the callback; every other result
-    /// shape is copied or decoded, then freed through the runtime symbols.
+    /// the result plan against the declaring `module` and `prefix`.
     pub fn protocol<'a>(&'a self, f: &FnBinding, module: &str, prefix: &str) -> AsyncProtocol<'a> {
-        fn adoptable(ty: &TypeRef) -> Option<&TypeRef> {
-            match ty {
-                TypeRef::Interface(_) => Some(ty),
-                TypeRef::Optional(inner) => adoptable(inner),
-                _ => None,
-            }
-        }
-        let result_adopt = match f.ret.as_ref().and_then(|ty| adoptable(ty)) {
-            Some(ty) => return_free(Some(ty), module, prefix),
-            None => ReturnFree::None,
-        };
         AsyncProtocol {
             binding: self,
             cancellable: f.cancellable,
-            result_adopt,
+            result: ret_pass(f.ret.as_ref(), module, prefix),
             error: f.error_strategy(),
         }
     }
@@ -450,100 +376,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strings_and_bytes_have_runtime_frees() {
-        assert_eq!(
-            return_free(Some(&TypeRef::StringUtf8), "m", "weaveffi"),
-            ReturnFree::String
-        );
-        assert_eq!(
-            return_free(Some(&TypeRef::Bytes), "m", "weaveffi"),
-            ReturnFree::Bytes
-        );
-        assert_eq!(return_free(None, "m", "weaveffi"), ReturnFree::None);
-    }
-
-    #[test]
-    fn buffered_returns_are_freed_as_bytes() {
-        for ty in [
-            TypeRef::Record("Contact".into()),
-            TypeRef::RichEnum("Shape".into()),
-            TypeRef::List(Box::new(TypeRef::StringUtf8)),
-            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32)),
-            TypeRef::Optional(Box::new(TypeRef::I64)),
-            TypeRef::Optional(Box::new(TypeRef::Record("Contact".into()))),
-        ] {
-            assert_eq!(
-                return_free(Some(&ty), "m", "weaveffi"),
-                ReturnFree::Bytes,
-                "{ty:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn interface_returns_are_adopted_with_destroy_symbols() {
-        assert_eq!(
-            return_free(
-                Some(&TypeRef::Interface("kv.Store".into())),
-                "kv_stats",
-                "weaveffi"
-            ),
-            ReturnFree::OwnedObject {
-                destroy_symbol: "weaveffi_kv_Store_destroy".into()
-            }
-        );
-        // A nullable interface shares the plan; null means none.
-        assert_eq!(
-            return_free(
-                Some(&TypeRef::Optional(Box::new(TypeRef::Interface(
-                    "Store".into()
-                )))),
-                "kv",
-                "weaveffi"
-            ),
-            ReturnFree::OwnedObject {
-                destroy_symbol: "weaveffi_kv_Store_destroy".into()
-            }
-        );
-    }
-
-    #[test]
     fn arg_pass_classifies_every_family() {
-        use crate::abi::lower_param;
-        let pb = |name: &str, ty: TypeRef| ParamBinding {
-            abi: lower_param(name, &ty, "m", false),
-            name: name.into(),
-            ty,
-            mutable: false,
-            doc: None,
-        };
-
+        let pb = |name: &str, ty: Ty| ParamBinding::new(name, ty, false, None, "m");
         assert!(matches!(
-            pb("x", TypeRef::I32).arg_pass(),
+            pb("x", Ty::I32).arg_pass(),
             ArgPass::Direct { slot } if slot.name == "x"
         ));
         assert!(matches!(
-            pb("h", TypeRef::Handle).arg_pass(),
+            pb("h", Ty::Handle).arg_pass(),
             ArgPass::Direct { .. }
         ));
         assert!(matches!(
-            pb("s", TypeRef::StringUtf8).arg_pass(),
+            pb("s", Ty::StringUtf8).arg_pass(),
             ArgPass::String { slot } if slot.name == "s"
         ));
         assert!(matches!(
-            pb("data", TypeRef::Bytes).arg_pass(),
+            pb("data", Ty::Bytes).arg_pass(),
             ArgPass::Bytes { ptr, len } if ptr.name == "data_ptr" && len.name == "data_len"
         ));
         assert!(matches!(
-            pb("c", TypeRef::Record("Contact".into())).arg_pass(),
+            pb("c", Ty::Record("Contact".into())).arg_pass(),
             ArgPass::Buffer { ptr, len } if ptr.name == "c_ptr" && len.name == "c_len"
         ));
         assert!(matches!(
-            pb("o", TypeRef::Optional(Box::new(TypeRef::I32))).arg_pass(),
+            pb("o", Ty::Optional(Box::new(Ty::I32))).arg_pass(),
             ArgPass::Buffer { .. }
         ));
         assert!(matches!(
-            pb("store", TypeRef::Interface("Store".into())).arg_pass(),
+            pb("store", Ty::Interface("Store".into())).arg_pass(),
             ArgPass::Object {
                 nullable: false,
                 ..
@@ -552,7 +412,7 @@ mod tests {
         assert!(matches!(
             pb(
                 "store",
-                TypeRef::Optional(Box::new(TypeRef::Interface("Store".into())))
+                Ty::Optional(Box::new(Ty::Interface("Store".into())))
             )
             .arg_pass(),
             ArgPass::Object { nullable: true, .. }
@@ -562,28 +422,26 @@ mod tests {
     #[test]
     fn ret_pass_distinguishes_copy_decode_and_adopt() {
         assert_eq!(ret_pass(None, "m", "weaveffi"), RetPass::Void);
+        assert_eq!(ret_pass(Some(&Ty::I64), "m", "weaveffi"), RetPass::Direct);
         assert_eq!(
-            ret_pass(Some(&TypeRef::I64), "m", "weaveffi"),
-            RetPass::Direct
-        );
-        assert_eq!(
-            ret_pass(Some(&TypeRef::StringUtf8), "m", "weaveffi"),
+            ret_pass(Some(&Ty::StringUtf8), "m", "weaveffi"),
             RetPass::String
         );
+        assert_eq!(ret_pass(Some(&Ty::Bytes), "m", "weaveffi"), RetPass::Bytes);
+        for ty in [
+            Ty::Record("Contact".into()),
+            Ty::RichEnum("Shape".into()),
+            Ty::List(Box::new(Ty::StringUtf8)),
+            Ty::Optional(Box::new(Ty::I64)),
+        ] {
+            assert_eq!(
+                ret_pass(Some(&ty), "m", "weaveffi"),
+                RetPass::Buffer,
+                "{ty}"
+            );
+        }
         assert_eq!(
-            ret_pass(Some(&TypeRef::Bytes), "m", "weaveffi"),
-            RetPass::Bytes
-        );
-        assert_eq!(
-            ret_pass(Some(&TypeRef::Record("Contact".into())), "m", "weaveffi"),
-            RetPass::Buffer
-        );
-        assert_eq!(
-            ret_pass(
-                Some(&TypeRef::Interface("kv.Store".into())),
-                "m",
-                "weaveffi"
-            ),
+            ret_pass(Some(&Ty::Interface("kv.Store".into())), "m", "weaveffi"),
             RetPass::Object {
                 destroy_symbol: "weaveffi_kv_Store_destroy".into(),
                 nullable: false,
@@ -591,9 +449,7 @@ mod tests {
         );
         assert_eq!(
             ret_pass(
-                Some(&TypeRef::Optional(Box::new(TypeRef::Interface(
-                    "Store".into()
-                )))),
+                Some(&Ty::Optional(Box::new(Ty::Interface("Store".into())))),
                 "kv",
                 "weaveffi"
             ),
@@ -602,17 +458,17 @@ mod tests {
                 nullable: true,
             }
         );
+        assert_eq!(RetPass::String.free(), Free::String);
+        assert_eq!(RetPass::Buffer.free(), Free::Bytes);
+        assert_eq!(RetPass::Direct.free(), Free::None);
     }
 
     #[test]
     fn iterator_elements_split_string_bytes_and_none() {
-        assert_eq!(elem_free(&TypeRef::I32), ElemFree::None);
-        assert_eq!(elem_free(&TypeRef::StringUtf8), ElemFree::String);
-        assert_eq!(elem_free(&TypeRef::Bytes), ElemFree::Bytes);
-        assert_eq!(elem_free(&TypeRef::Record("Entry".into())), ElemFree::Bytes);
-        assert_eq!(
-            elem_free(&TypeRef::Optional(Box::new(TypeRef::I32))),
-            ElemFree::Bytes
-        );
+        assert_eq!(elem_free(&Ty::I32), Free::None);
+        assert_eq!(elem_free(&Ty::StringUtf8), Free::String);
+        assert_eq!(elem_free(&Ty::Bytes), Free::Bytes);
+        assert_eq!(elem_free(&Ty::Record("Entry".into())), Free::Bytes);
+        assert_eq!(elem_free(&Ty::Optional(Box::new(Ty::I32))), Free::Bytes);
     }
 }
