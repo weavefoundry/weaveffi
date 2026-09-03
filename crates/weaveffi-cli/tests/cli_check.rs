@@ -1,5 +1,5 @@
 //! Integration tests for the CI-oriented flags: `weaveffi diff --check` and
-//! `weaveffi validate|lint --format json`. Each test runs the binary as a
+//! `weaveffi validate [--warn] --format json`. Each test runs the binary as a
 //! subprocess and either asserts on the structured stdout or on the process
 //! exit code.
 
@@ -22,7 +22,7 @@ fn calculator_idl() -> std::path::PathBuf {
         .unwrap()
         .parent()
         .unwrap()
-        .join("samples/calculator/calculator.yml")
+        .join("samples/calculator/src/lib.rs")
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.7.0\"\n",
+            "version: \"0.8.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -102,7 +102,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.7.0\"\n",
+            "version: \"0.8.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -183,13 +183,13 @@ fn validate_json_format_outputs_object() {
 }
 
 #[test]
-fn lint_json_format_outputs_warnings_array() {
+fn validate_warn_json_format_outputs_warnings_array() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nodocs.yml");
     write_file(
         &path,
         concat!(
-            "version: \"0.7.0\"\n",
+            "version: \"0.8.0\"\n",
             "modules:\n",
             "  - name: nodocs\n",
             "    functions:\n",
@@ -200,14 +200,15 @@ fn lint_json_format_outputs_warnings_array() {
 
     let output = cargo_bin()
         .args([
-            "lint",
+            "validate",
             path.to_str().unwrap(),
+            "--warn",
             "--format",
             "json",
             "--quiet",
         ])
         .output()
-        .expect("failed to run weaveffi lint --format json");
+        .expect("failed to run weaveffi validate --warn --format json");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
@@ -230,7 +231,8 @@ fn lint_json_format_outputs_warnings_array() {
 
     assert_eq!(
         parsed["ok"],
-        serde_json::Value::Bool(false),
-        "ok should be false when warnings are present"
+        serde_json::Value::Bool(true),
+        "warnings are advisory, so a valid IDL still reports ok"
     );
+    assert!(output.status.success(), "warnings must not fail validate");
 }

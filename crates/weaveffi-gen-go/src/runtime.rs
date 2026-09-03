@@ -2,8 +2,32 @@
 //! error plumbing, the value-buffer reader/writer pair, and the callback
 //! registry.
 
+use weaveffi_core::cabi::ABI_VERSION;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
+
+/// Emit the package `init` that compares the producer's exported
+/// `weaveffi_abi_version()` against the revision these bindings were
+/// generated for. cgo resolves the symbol at link time, so a producer that
+/// predates versioning fails to link; one built for a different revision
+/// panics at package initialization with both numbers in the message.
+pub(crate) fn render_abi_version_check(out: &mut String) {
+    let mut w = CodeWriter::tabs();
+    w.line("// The ABI revision these bindings were generated against.");
+    w.line(format!("const wvABIVersion uint32 = {ABI_VERSION}"));
+    w.blank();
+    w.block("func init() {", "}", |w| {
+        w.block(
+            "if found := uint32(C.weaveffi_abi_version()); found != wvABIVersion {",
+            "}",
+            |w| {
+                w.line("panic(fmt.Sprintf(\"WeaveFFI ABI mismatch: these bindings expect revision %d but the loaded library reports revision %d\", wvABIVersion, found))");
+            },
+        );
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
 
 /// The `boolToC`/`cToBool` pair converting between Go `bool` and cgo's
 /// `C._Bool`.

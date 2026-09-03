@@ -65,7 +65,7 @@ standard fixed-width boolean type across ABIs.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:

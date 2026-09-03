@@ -4,17 +4,17 @@
 //!
 //! Parameter marshalling dispatches on the shared [`ArgPass`] contract and
 //! return handling on [`RetPass`], so this module never re-derives the
-//! buffered-versus-direct split from raw `TypeRef`s.
+//! buffered-versus-direct split from raw `Ty`s.
 
 use heck::ToLowerCamelCase;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, CallbackBinding, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding,
     ParamBinding,
 };
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy, RetPass};
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{read_expr, write_stmts};
 use crate::docs::{emit_doc, emit_wrapper_doc};
@@ -311,25 +311,25 @@ fn emit_cb_args(w: &mut CodeWriter, cb: &CallbackBinding) -> Vec<String> {
             ArgPass::Object {
                 nullable: false, ..
             } => {
-                let TypeRef::Interface(name) = &p.ty else {
+                let Ty::Interface(name) = &p.ty else {
                     unreachable!("non-nullable object params are interfaces")
                 };
                 format!("{}._({n0})", dart_class(name))
             }
             // A nullable borrowed object pointer: null means none.
             ArgPass::Object { nullable: true, .. } => {
-                let TypeRef::Optional(inner) = &p.ty else {
+                let Ty::Optional(inner) = &p.ty else {
                     unreachable!("nullable object params are optional interfaces")
                 };
-                let TypeRef::Interface(name) = inner.as_ref() else {
+                let Ty::Interface(name) = inner.as_ref() else {
                     unreachable!("only optional interfaces stay unbuffered")
                 };
                 format!("{n0} == nullptr ? null : {}._({n0})", dart_class(name))
             }
             ArgPass::Direct { .. } => match &p.ty {
-                TypeRef::Enum(name) => format!("{}.fromValue({n0})", dart_class(name)),
+                Ty::Enum(name) => format!("{}.fromValue({n0})", dart_class(name)),
                 // Borrowed for the duration of the callback: do not dispose().
-                TypeRef::TypedHandle(name) => format!("{}._({n0})", dart_class(name)),
+                Ty::TypedHandle(name) => format!("{}._({n0})", dart_class(name)),
                 _ => n0,
             },
         });
@@ -431,7 +431,7 @@ pub(crate) fn render_listener(
 /// after its `(context, err)` prefix. Bytes and buffered results arrive as
 /// owned `(result, resultLen)` pairs the consumer frees; interfaces as
 /// adopted pointers; everything else by value.
-fn async_cb_result_slots(ret: Option<&TypeRef>) -> Vec<(String, String, String)> {
+fn async_cb_result_slots(ret: Option<&Ty>) -> Vec<(String, String, String)> {
     let Some(ty) = ret else {
         return vec![];
     };
@@ -446,7 +446,7 @@ fn async_cb_result_slots(ret: Option<&TypeRef>) -> Vec<(String, String, String)>
         RetPass::Object { .. } => vec![pair("Pointer<Void>", "Pointer<Void>", "result")],
         RetPass::Void | RetPass::Direct => match ty {
             // A typed handle's slot is an opaque adopted pointer.
-            TypeRef::TypedHandle(_) => vec![pair("Pointer<Void>", "Pointer<Void>", "result")],
+            Ty::TypedHandle(_) => vec![pair("Pointer<Void>", "Pointer<Void>", "result")],
             ty => {
                 let (n, d) = scalar_ffi(ty);
                 vec![pair(n, d, "result")]
@@ -632,7 +632,7 @@ fn render_async_function(
 /// return): strings are freed with `weaveffi_free_string`, byte and value
 /// buffers with `weaveffi_free_bytes`, and an owned interface result is
 /// adopted by its wrapper class.
-fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
+fn emit_async_complete(out: &mut String, ty: Option<&Ty>, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     let Some(ty) = ty else {
         w.line("completer.complete();");
@@ -645,9 +645,12 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
             w.line("final resultData = _copyNativeBytes(result, resultLen);");
             w.line("_weaveffiFreeBytes(result, resultLen);");
             w.line("final resultReader = _BufferReader(resultData);");
-            w.line(format!("final value = {};", read_expr("resultReader", ty)));
+            w.line(format!(
+                "final decoded = {};",
+                read_expr("resultReader", ty)
+            ));
             w.line("resultReader.expectEnd();");
-            w.line("completer.complete(value);");
+            w.line("completer.complete(decoded);");
         }
         RetPass::Bytes => {
             w.line("final resultData = _copyNativeBytes(result, resultLen);");
@@ -656,9 +659,9 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
         }
         // Copy the owned C string, then release the producer allocation.
         RetPass::String => {
-            w.line("final value = result.toDartString();");
+            w.line("final decoded = result.toDartString();");
             w.line("_weaveffiFreeString(result);");
-            w.line("completer.complete(value);");
+            w.line("completer.complete(decoded);");
         }
         // The callback receives ownership of an object result; the wrapper
         // adopts the pointer and its `dispose()` owns the eventual destroy.
@@ -673,14 +676,14 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
             }
         }
         RetPass::Void | RetPass::Direct => match ty {
-            TypeRef::Enum(name) => {
+            Ty::Enum(name) => {
                 w.line(format!(
                     "completer.complete({}.fromValue(result));",
                     dart_class(name)
                 ));
             }
             // An adopted typed-handle pointer, wrapped like an interface.
-            TypeRef::TypedHandle(name) => {
+            Ty::TypedHandle(name) => {
                 w.line(format!(
                     "completer.complete({}._(result));",
                     dart_class(name)
@@ -695,10 +698,10 @@ fn emit_async_complete(out: &mut String, ty: Option<&TypeRef>, indent: &str) {
 }
 
 /// The Dart wrapper class of a direct or nullable interface reference.
-fn object_class(ty: &TypeRef) -> String {
+fn object_class(ty: &Ty) -> String {
     match ty {
-        TypeRef::Interface(name) => dart_class(name),
-        TypeRef::Optional(inner) => object_class(inner),
+        Ty::Interface(name) => dart_class(name),
+        Ty::Optional(inner) => object_class(inner),
         _ => unreachable!("object returns are (optional) interfaces"),
     }
 }
@@ -752,9 +755,9 @@ fn emit_input(
             vec![format!("{name}?._handle ?? nullptr")]
         }
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Enum(_) => vec![format!("{name}.value")],
+            Ty::Enum(_) => vec![format!("{name}.value")],
             // A typed handle passes its wrapped pointer, like an interface.
-            TypeRef::TypedHandle(_) => vec![format!("{name}._handle")],
+            Ty::TypedHandle(_) => vec![format!("{name}._handle")],
             _ => vec![name],
         },
     }
@@ -763,7 +766,7 @@ fn emit_input(
 /// Allocate the out-parameter locals a bytes or buffered return needs before
 /// the call, returning the extra call-argument expressions and recording
 /// cleanup.
-fn emit_return_alloc(w: &mut CodeWriter, ty: &TypeRef, frees: &mut Vec<String>) -> Vec<String> {
+fn emit_return_alloc(w: &mut CodeWriter, ty: &Ty, frees: &mut Vec<String>) -> Vec<String> {
     if returns_buffer(ty) {
         w.line("final outLen = calloc<Size>();");
         frees.push("calloc.free(outLen);".into());
@@ -777,7 +780,7 @@ fn emit_return_alloc(w: &mut CodeWriter, ty: &TypeRef, frees: &mut Vec<String>) 
 /// value, dispatching on the return's [`RetPass`] contract. A buffered return
 /// is copied out of the producer's buffer, released with
 /// `weaveffi_free_bytes`, and decoded through the buffer reader.
-fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
+fn emit_return_decode(out: &mut String, ty: &Ty, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match plan::ret_pass(Some(ty), "", "") {
         RetPass::Buffer => {
@@ -785,9 +788,10 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
             w.line("final data = _copyNativeBytes(result, n);");
             w.line("if (result != nullptr) _weaveffiFreeBytes(result, n);");
             w.line("final reader = _BufferReader(data);");
-            w.line(format!("final value = {};", read_expr("reader", ty)));
+            // Named so it cannot shadow a user parameter (`value` is common).
+            w.line(format!("final decoded = {};", read_expr("reader", ty)));
             w.line("reader.expectEnd();");
-            w.line("return value;");
+            w.line("return decoded;");
         }
         RetPass::Bytes => {
             w.line("final n = outLen.value;");
@@ -798,9 +802,9 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
             w.line("return bytes;");
         }
         RetPass::String => {
-            w.line("final value = result.toDartString();");
+            w.line("final decoded = result.toDartString();");
             w.line("_weaveffiFreeString(result);");
-            w.line("return value;");
+            w.line("return decoded;");
         }
         // An owned object pointer the wrapper class adopts; when nullable,
         // null means none.
@@ -812,11 +816,11 @@ fn emit_return_decode(out: &mut String, ty: &TypeRef, indent: &str) {
             w.line(format!("return {name}._(result);"));
         }
         RetPass::Void | RetPass::Direct => match ty {
-            TypeRef::Enum(name) => {
+            Ty::Enum(name) => {
                 w.line(format!("return {}.fromValue(result);", dart_class(name)));
             }
             // An adopted typed-handle pointer, wrapped like an interface.
-            TypeRef::TypedHandle(name) => {
+            Ty::TypedHandle(name) => {
                 w.line(format!("return {}._(result);", dart_class(name)));
             }
             _ => {
@@ -882,12 +886,12 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx)
 /// The dart:ffi pointee type of an iterator's `out_item` slot, plus whether
 /// the element also carries a `size_t* out_len` slot (bytes and every
 /// buffered element do), driven by the element's [`ElemFree`] plan.
-fn iter_item_slot(elem: &TypeRef) -> (String, bool) {
+fn iter_item_slot(elem: &Ty) -> (String, bool) {
     match plan::elem_free(elem) {
         ElemFree::Bytes => ("Pointer<Uint8>".into(), true),
         ElemFree::String => ("Pointer<Utf8>".into(), false),
         ElemFree::None => match elem {
-            TypeRef::Interface(_) | TypeRef::TypedHandle(_) => ("Pointer<Void>".into(), false),
+            Ty::Interface(_) | Ty::TypedHandle(_) => ("Pointer<Void>".into(), false),
             _ => (scalar_ffi(elem).0.to_string(), false),
         },
     }
@@ -896,10 +900,10 @@ fn iter_item_slot(elem: &TypeRef) -> (String, bool) {
 /// Convert a single native by-value element (`expr`) into its Dart
 /// representation: enums map through `fromValue`, interface elements are
 /// adopted by their wrapper class, scalars pass through.
-fn direct_elem_read(expr: &str, ty: &TypeRef) -> String {
+fn direct_elem_read(expr: &str, ty: &Ty) -> String {
     match ty {
-        TypeRef::Enum(n) => format!("{}.fromValue({expr})", dart_class(n)),
-        TypeRef::Interface(n) | TypeRef::TypedHandle(n) => {
+        Ty::Enum(n) => format!("{}.fromValue({expr})", dart_class(n)),
+        Ty::Interface(n) | Ty::TypedHandle(n) => {
             format!("{}._({expr})", dart_class(n))
         }
         _ => expr.to_string(),
@@ -1021,7 +1025,7 @@ fn emit_iterator_body(
                 ElemFree::Bytes => {
                     w.line("final itemPtr = outItem.value;");
                     w.line("final itemLen = outLen.value;");
-                    if matches!(wire::classify(elem), WireType::Bytes) {
+                    if matches!(elem.wire(), WireType::Prim(Prim::Bytes)) {
                         w.line("final item = _copyNativeBytes(itemPtr, itemLen);");
                         w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
                         w.line("yield item;");

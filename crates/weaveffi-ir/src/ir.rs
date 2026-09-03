@@ -1,15 +1,23 @@
 //! In-memory intermediate representation: the data model a parsed WeaveFFI IDL
 //! document becomes.
 //!
-//! Backends read this tree, never the raw IDL text. [`Api`] is the root and
-//! owns a forest of [`Module`]s, each grouping [`Function`]s,
-//! [`InterfaceDef`]s, [`StructDef`]s, [`EnumDef`]s, [`CallbackDef`]s,
-//! [`ListenerDef`]s, and an optional [`ErrorDomain`]. Types are referenced
-//! throughout by [`TypeRef`], which (de)serializes as a compact string (`i32`,
-//! `[string]`, `{string:i32}`, `Contact?`, and so on) rather than as a tagged
-//! object.
-
-use std::collections::BTreeMap;
+//! This is the *document* model: [`Api`] is the root and owns a forest of
+//! [`Module`]s, each grouping [`Function`]s, [`InterfaceDef`]s, [`StructDef`]s,
+//! [`EnumDef`]s, [`CallbackDef`]s, [`ListenerDef`]s, and an optional
+//! [`ErrorDomain`]. Types are referenced throughout by [`TypeRef`], which
+//! (de)serializes as a compact string (`i32`, `[string]`, `{string:i32}`,
+//! `Contact?`, and so on) rather than as a tagged object.
+//!
+//! The document model is deliberately *unresolved*: every user-defined type
+//! reference is a [`TypeRef::Named`] carrying the name exactly as written.
+//! Whether that name is a record, an enum, or an interface is decided by
+//! `weaveffi-core`'s validator, which lowers the document into the resolved
+//! binding model generators consume. Keeping the two representations distinct
+//! means an IDL document always round-trips losslessly through this crate.
+//!
+//! Package identity and per-generator options are not part of the IDL: they
+//! describe how bindings are *shipped*, not what the API *is*, and live in the
+//! `weaveffi.toml` project configuration instead.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,14 +26,14 @@ use serde::{Deserialize, Serialize};
 /// generator expect.
 ///
 /// Pre-1.0 there is exactly one supported schema version: the current one.
-/// Older schema revisions (0.1.0 through 0.5.0) are not accepted and have no
-/// automated migration path: update the `version` field and adjust the
-/// document to the current schema by hand. Post-1.0, schema bumps will ship
-/// with a migration tool and [`SUPPORTED_VERSIONS`] will widen accordingly.
+/// Older schema revisions are not accepted and have no automated migration
+/// path: update the `version` field and adjust the document to the current
+/// schema by hand. Post-1.0, schema bumps will ship with a migration tool and
+/// [`SUPPORTED_VERSIONS`] will widen accordingly.
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.7.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.8.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -35,8 +43,8 @@ pub const CURRENT_SCHEMA_VERSION: &str = "0.7.0";
 pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
 
 /// `skip_serializing_if` predicate for `bool` fields that default to `false`.
-/// Keeps the canonical IDL emitted by `weaveffi format`/`extract` minimal by
-/// omitting flags the user never set (e.g. `async: false`, `mutable: false`).
+/// Keeps the canonical IDL emitted by `weaveffi extract` minimal by omitting
+/// flags the user never set (e.g. `async: false`, `mutable: false`).
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -45,69 +53,18 @@ fn is_false(b: &bool) -> bool {
 /// Top-level WeaveFFI API definition: the root of a parsed IDL document.
 ///
 /// This is the value an entire `.yml`, `.json`, or `.toml` IDL file
-/// deserializes into (see [`crate::parse`]) and the single input every code
-/// generator consumes. It pairs the schema version with the module forest,
-/// optional package identity, and any per-generator overrides.
-// `Eq` is omitted because `generators` holds `toml::Value`, which contains `f64`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// deserializes into (see [`crate::parse`]) and the single input the validator
+/// consumes. It pairs the schema version with the module forest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.7.0`).
+    /// IR schema version this document targets (for example `0.8.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
-    /// Package identity used to name, version, and describe every generated
-    /// consumer package (npm, PyPI, gem, NuGet, pub.dev, SwiftPM, Gradle, Go).
-    /// When omitted, generators fall back to the IDL file stem and version
-    /// `0.1.0`, but publishable artifacts should always set this explicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub package: Option<Package>,
     /// Top-level modules that make up the API surface. Each is an independent
     /// namespace; modules may nest further through [`Module::modules`].
     pub modules: Vec<Module>,
-    /// Per-generator configuration keyed by backend name (for example `swift`
-    /// or `python`). The opaque [`toml::Value`] payload is interpreted by each
-    /// generator, so unrecognized keys pass through untouched. `None` when the
-    /// IDL declares no `generators:` block.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
-    pub generators: Option<BTreeMap<String, toml::Value>>,
-}
-
-/// Package identity for the generated consumer artifacts.
-///
-/// A single `package:` block in the IDL is the source of truth for the
-/// name, version, and metadata stamped into every ecosystem manifest
-/// (`package.json`, `pyproject.toml`, `*.gemspec`, `*.csproj`, `pubspec.yaml`,
-/// `Package.swift`, `build.gradle`, `go.mod`). This is what makes the
-/// generated packages standalone and publishable rather than all sharing a
-/// placeholder identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[schemars(description = "Package identity for the generated consumer artifacts.")]
-pub struct Package {
-    /// Canonical package name (e.g. `kvstore`). Per-target name overrides in
-    /// `generators:` (such as `python.package_name`) still take precedence.
-    pub name: String,
-    /// Semantic version stamped into every manifest (e.g. `1.2.0`).
-    pub version: String,
-    /// Short summary written into each manifest's description field. Omitted
-    /// from generated manifests when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// License identifier, typically an SPDX expression such as `MIT` or
-    /// `Apache-2.0`, written into each manifest's license field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub license: Option<String>,
-    /// Package authors, each commonly formatted as `Name <email>`, mapped to
-    /// whatever author or maintainer field the target ecosystem uses. Empty by
-    /// default.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub authors: Vec<String>,
-    /// Project homepage URL recorded in manifests that expose one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub homepage: Option<String>,
-    /// Source repository URL recorded in manifests that expose one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository: Option<String>,
 }
 
 /// A module: a named namespace grouping related functions, types, callbacks,
@@ -125,6 +82,11 @@ pub struct Module {
     /// Module name, used as a namespace segment and a symbol-prefix component
     /// in generated code (for example `contacts`).
     pub name: String,
+    /// Human-readable documentation for the module as a whole, propagated to
+    /// the generated namespace, class, or file header. `None` when
+    /// undocumented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
     /// Free functions this module exports across the FFI boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub functions: Vec<Function>,
@@ -226,6 +188,10 @@ pub struct InterfaceDef {
     /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Deprecation notice for the whole type; when set, generators annotate
+    /// the emitted class. `None` means the interface is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<String>,
     /// Constructors: static functions returning a new instance. A constructor
     /// declares no `return` (the instance is implicit) and may not be `async`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -296,7 +262,13 @@ pub struct ListenerDef {
     pub doc: Option<String>,
 }
 
-/// A reference to a type in the IDL.
+/// A reference to a type in the IDL, exactly as written.
+///
+/// Every user-defined type (record, enum, or interface) is a
+/// [`Named`](Self::Named) reference at this level; the validator resolves the
+/// name against the declarations in scope and lowers it into the resolved
+/// kind generators consume. Keeping the document model unresolved is what
+/// makes an IDL round-trip losslessly.
 ///
 /// Callback-style behavior is **not** expressed as a `TypeRef` variant.
 /// Instead, callbacks and listeners are declared at the module level via
@@ -340,36 +312,10 @@ pub enum TypeRef {
     /// Opaque resource handle tagged with the name of what it refers to
     /// (`handle<Name>`), giving generators a distinct type per resource kind.
     TypedHandle(String),
-    /// An unresolved reference to a user-defined type, exactly as parsed.
-    ///
-    /// The parser cannot know whether a bare identifier names a record, an
-    /// enum, or an interface, so every user-type reference starts life as
-    /// `Named`. The resolution pass (`weaveffi_core::validate::resolve`)
-    /// rewrites each occurrence into [`Record`](Self::Record),
-    /// [`RichEnum`](Self::RichEnum), [`Enum`](Self::Enum), or
-    /// [`Interface`](Self::Interface); after a successful validate-and-resolve
-    /// no `Named` reference remains, and generators may treat one as a bug.
+    /// A reference to a user-defined type (record, enum, or interface) by its
+    /// bare or dot-qualified name (`Contact`, `shared.Status`), exactly as
+    /// parsed. Resolution happens in the validator, not here.
     Named(String),
-    /// A user record (struct): a plain value type. Crosses the C ABI by value
-    /// as a serialized buffer (`ptr` + `len`), borrowed for a call as a
-    /// parameter and owned (freed with `weaveffi_free_bytes`) as a return.
-    Record(String),
-    /// An algebraic (rich) enum: a sum type with at least one payload-carrying
-    /// variant. A value type that crosses the C ABI as a serialized buffer
-    /// (an `i32` tag followed by the active variant's fields), exactly like a
-    /// [`Record`](Self::Record).
-    RichEnum(String),
-    /// A C-style integer enum (no variant payloads). Lowers by value.
-    Enum(String),
-    /// A user interface (see [`InterfaceDef`]): an opaque object reference.
-    /// As a parameter the object is borrowed for the call; as a return the
-    /// caller receives a new owned reference it must eventually release.
-    ///
-    /// The IDL spells an interface reference as its bare (or dotted-qualified)
-    /// name, exactly like a record; the resolution pass rewrites the parsed
-    /// [`Named`](Self::Named) into this variant when the name resolves to an
-    /// interface declaration.
-    Interface(String),
     /// Borrowed string slice (`&str`): a non-owning view valid only for the
     /// duration of a call, used to pass input without copying.
     BorrowedStr,
@@ -380,8 +326,7 @@ pub enum TypeRef {
     Optional(Box<TypeRef>),
     /// Homogeneous list (`[T]`) of the inner element type.
     List(Box<TypeRef>),
-    /// Map (`{K:V}`) from a key type to a value type. Crosses the C ABI as
-    /// parallel key and value arrays.
+    /// Map (`{K:V}`) from a key type to a value type.
     Map(Box<TypeRef>, Box<TypeRef>),
     /// Lazy sequence (`iter<T>`) of the inner type, lowered to a next/destroy
     /// iterator object rather than a materialized collection.
@@ -394,9 +339,7 @@ pub enum TypeRef {
 /// borrowed forms (`&str`, `&[u8]`), typed handles (`handle<Name>`), iterators
 /// (`iter<T>`), lists (`[T]`), maps (`{K:V}`), and the optional suffix (`T?`).
 /// Any other bare identifier is taken to be a user-defined record, enum, or
-/// interface name and returned as [`TypeRef::Named`]; the
-/// record-versus-enum-versus-interface distinction is resolved later against
-/// the module's declarations.
+/// interface name and returned as [`TypeRef::Named`].
 ///
 /// # Errors
 ///
@@ -422,9 +365,8 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     }
     if s.starts_with('{') && s.ends_with('}') {
         let inner = &s[1..s.len() - 1];
-        let colon = inner
-            .find(':')
-            .ok_or_else(|| "map type missing ':' separator".to_string())?;
+        let colon =
+            map_separator(inner).ok_or_else(|| "map type missing ':' separator".to_string())?;
         let key = parse_type_ref(&inner[..colon])?;
         let val = parse_type_ref(&inner[colon + 1..])?;
         return Ok(TypeRef::Map(Box::new(key), Box::new(val)));
@@ -465,31 +407,30 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     }
 }
 
-impl TypeRef {
-    /// The referenced user-type name for any user-defined reference variant
-    /// ([`Named`](Self::Named), [`Record`](Self::Record),
-    /// [`RichEnum`](Self::RichEnum), [`Enum`](Self::Enum),
-    /// [`Interface`](Self::Interface), or
-    /// [`TypedHandle`](Self::TypedHandle)), or `None` for every other type.
-    pub fn user_name(&self) -> Option<&str> {
-        match self {
-            TypeRef::Named(n)
-            | TypeRef::Record(n)
-            | TypeRef::RichEnum(n)
-            | TypeRef::Enum(n)
-            | TypeRef::Interface(n)
-            | TypeRef::TypedHandle(n) => Some(n),
-            _ => None,
+/// The byte offset of the top-level `:` separating a map's key from its value,
+/// skipping any `:` nested inside a bracketed key such as `{ {a:b}: c }`.
+fn map_separator(inner: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '[' | '{' | '<' => depth += 1,
+            ']' | '}' | '>' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return Some(i),
+            _ => {}
         }
     }
+    None
+}
 
-    /// `true` when this reference names a user-declared data type that
-    /// crosses the C ABI by value as a serialized buffer: a
-    /// [`Record`](Self::Record) or a [`RichEnum`](Self::RichEnum). Interfaces
-    /// are excluded because they cross as opaque object pointers with a
-    /// distinct ownership convention.
-    pub fn is_object_ref(&self) -> bool {
-        matches!(self, TypeRef::Record(_) | TypeRef::RichEnum(_))
+impl TypeRef {
+    /// The referenced user-type name for a [`Named`](Self::Named) or
+    /// [`TypedHandle`](Self::TypedHandle) reference, or `None` for every
+    /// other type.
+    pub fn user_name(&self) -> Option<&str> {
+        match self {
+            TypeRef::Named(n) | TypeRef::TypedHandle(n) => Some(n),
+            _ => None,
+        }
     }
 }
 
@@ -512,15 +453,17 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::BorrowedBytes => "&[u8]".to_string(),
         TypeRef::Handle => "handle".to_string(),
         TypeRef::TypedHandle(name) => format!("handle<{name}>"),
-        TypeRef::Named(name)
-        | TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Enum(name)
-        | TypeRef::Interface(name) => name.clone(),
+        TypeRef::Named(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
         TypeRef::Map(k, v) => format!("{{{}:{}}}", type_ref_to_string(k), type_ref_to_string(v)),
         TypeRef::Iterator(inner) => format!("iter<{}>", type_ref_to_string(inner)),
+    }
+}
+
+impl std::fmt::Display for TypeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&type_ref_to_string(self))
     }
 }
 
@@ -546,7 +489,7 @@ impl<'de> Deserialize<'de> for TypeRef {
 /// Manual `JsonSchema` impl because `TypeRef` (de)serializes as a string with
 /// custom syntax: primitive names (`i32`, `string`, ...), `&str`, `&[u8]`,
 /// `handle<{name}>`, `iter<{T}>`, `[{T}]`, `{ {K}: {V} }`, `{name}?`, or any
-/// user-defined struct/enum name.
+/// user-defined struct/enum/interface name.
 impl JsonSchema for TypeRef {
     fn schema_name() -> String {
         "TypeRef".to_string()
@@ -581,8 +524,8 @@ impl JsonSchema for TypeRef {
 /// [`is_rich`](Self::is_rich)).
 ///
 /// A C-style enum lowers across the C ABI by value as an integer, while an
-/// algebraic enum lowers as an opaque object with a tag getter plus per-variant
-/// constructors and field getters.
+/// algebraic enum is a value type that crosses the ABI serialized in a value
+/// buffer (an `i32` tag followed by the active variant's fields).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(
     description = "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields."
@@ -594,6 +537,10 @@ pub struct EnumDef {
     /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Deprecation notice for the whole type; when set, generators annotate
+    /// the emitted enum. `None` means the enum is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<String>,
     /// The variants in declaration order. Whether any of them carries fields
     /// decides if this is a C-style or an algebraic enum.
     pub variants: Vec<EnumVariant>,
@@ -601,9 +548,8 @@ pub struct EnumDef {
 
 impl EnumDef {
     /// `true` when this is an *algebraic* enum (a sum type): at least one
-    /// variant carries associated data. Such enums lower across the C ABI as
-    /// opaque objects (a tag getter plus per-variant constructors and field
-    /// getters); a C-style enum (every variant a bare discriminant) lowers by
+    /// variant carries associated data. Such enums cross the C ABI as value
+    /// buffers; a C-style enum (every variant a bare discriminant) lowers by
     /// value as an integer.
     pub fn is_rich(&self) -> bool {
         self.variants.iter().any(|v| !v.fields.is_empty())
@@ -639,6 +585,10 @@ pub struct StructDef {
     /// `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
+    /// Deprecation notice for the whole type; when set, generators annotate
+    /// the emitted record. `None` means the struct is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<String>,
     /// The fields in declaration order; order is preserved in the generated
     /// type, its constructors, and its serialized buffer encoding.
     pub fields: Vec<StructField>,
@@ -695,1067 +645,181 @@ pub struct ErrorCode {
 mod tests {
     use super::*;
 
-    #[test]
-    fn struct_def_round_trip_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: geometry
-    functions: []
-    structs:
-      - name: Point
-        doc: "A 2D point"
-        fields:
-          - name: x
-            type: f64
-          - name: "y"
-            type: f64
-            doc: "Y coordinate"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let m = &api.modules[0];
-        assert_eq!(m.structs.len(), 1);
-        let s = &m.structs[0];
-        assert_eq!(s.name, "Point");
-        assert_eq!(s.doc.as_deref(), Some("A 2D point"));
-        assert_eq!(s.fields.len(), 2);
-        assert_eq!(s.fields[0].name, "x");
-        assert_eq!(s.fields[0].ty, TypeRef::F64);
-        assert_eq!(s.fields[0].doc, None);
-        assert_eq!(s.fields[1].name, "y");
-        assert_eq!(s.fields[1].doc.as_deref(), Some("Y coordinate"));
+    fn rt(s: &str) -> TypeRef {
+        let ty = parse_type_ref(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        assert_eq!(ty.to_string(), s, "type syntax must round-trip");
+        ty
     }
 
     #[test]
-    fn struct_def_round_trip_json() {
-        let json = r#"{
-            "version": "0.7.0",
-            "modules": [{
-                "name": "geo",
-                "functions": [],
-                "structs": [{
-                    "name": "Rect",
-                    "fields": [
-                        {"name": "width", "type": "i32"},
-                        {"name": "height", "type": "i32"}
-                    ]
-                }]
-            }]
-        }"#;
-        let api: Api = serde_json::from_str(json).unwrap();
-        let s = &api.modules[0].structs[0];
-        assert_eq!(s.name, "Rect");
-        assert_eq!(s.doc, None);
-        assert_eq!(s.fields[0].ty, TypeRef::I32);
-    }
-
-    #[test]
-    fn structs_default_to_empty() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].structs.is_empty());
-    }
-
-    #[test]
-    fn package_block_round_trips_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-package:
-  name: kvstore
-  version: 1.2.0
-  description: "An embedded key/value store"
-  license: MIT
-  authors:
-    - "Ada Lovelace <ada@example.com>"
-  homepage: "https://example.com/kvstore"
-  repository: "https://github.com/example/kvstore"
-modules:
-  - name: kv
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let pkg = api.package.as_ref().expect("package should parse");
-        assert_eq!(pkg.name, "kvstore");
-        assert_eq!(pkg.version, "1.2.0");
-        assert_eq!(
-            pkg.description.as_deref(),
-            Some("An embedded key/value store")
-        );
-        assert_eq!(pkg.license.as_deref(), Some("MIT"));
-        assert_eq!(pkg.authors, vec!["Ada Lovelace <ada@example.com>"]);
-        assert_eq!(pkg.homepage.as_deref(), Some("https://example.com/kvstore"));
-        assert_eq!(
-            pkg.repository.as_deref(),
-            Some("https://github.com/example/kvstore")
-        );
-
-        // Re-serialize and confirm the block survives the round trip.
-        let out = serde_yaml::to_string(&api).unwrap();
-        assert!(out.contains("name: kvstore"));
-        assert!(out.contains("version: 1.2.0"));
-    }
-
-    #[test]
-    fn package_is_optional() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.package.is_none());
-        // Absent package must not appear in the canonical serialization.
-        let out = serde_yaml::to_string(&api).unwrap();
-        assert!(!out.contains("package:"));
-    }
-
-    #[test]
-    fn package_minimal_requires_name_and_version() {
-        let yaml = r#"
-version: "0.7.0"
-package:
-  name: tiny
-  version: 0.0.1
-modules: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let pkg = api.package.as_ref().unwrap();
-        assert_eq!(pkg.name, "tiny");
-        assert_eq!(pkg.version, "0.0.1");
-        assert!(pkg.description.is_none());
-        assert!(pkg.authors.is_empty());
-    }
-
-    #[test]
-    fn typeref_struct_variant_serializes() {
-        let ty = TypeRef::Named("Point".to_string());
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""Point""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn struct_field_with_struct_type() {
-        let field = StructField {
-            name: "origin".to_string(),
-            ty: TypeRef::Named("Point".to_string()),
-            doc: None,
-        };
-        let json = serde_json::to_string(&field).unwrap();
-        let back: StructField = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, field);
-    }
-
-    #[test]
-    fn typeref_is_not_copy() {
-        let a = TypeRef::Named("Foo".to_string());
-        let b = a.clone();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn enum_def_round_trip_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: graphics
-    functions: []
-    enums:
-      - name: Color
-        doc: "Primary colors"
-        variants:
-          - name: Red
-            value: 0
-          - name: Green
-            value: 1
-            doc: "The color green"
-          - name: Blue
-            value: 2
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let m = &api.modules[0];
-        assert_eq!(m.enums.len(), 1);
-        let e = &m.enums[0];
-        assert_eq!(e.name, "Color");
-        assert_eq!(e.doc.as_deref(), Some("Primary colors"));
-        assert_eq!(e.variants.len(), 3);
-        assert_eq!(e.variants[0].name, "Red");
-        assert_eq!(e.variants[0].value, 0);
-        assert_eq!(e.variants[0].doc, None);
-        assert_eq!(e.variants[1].name, "Green");
-        assert_eq!(e.variants[1].value, 1);
-        assert_eq!(e.variants[1].doc.as_deref(), Some("The color green"));
-        assert_eq!(e.variants[2].name, "Blue");
-        assert_eq!(e.variants[2].value, 2);
-    }
-
-    #[test]
-    fn enum_def_round_trip_json() {
-        let json = r#"{
-            "version": "0.7.0",
-            "modules": [{
-                "name": "status",
-                "functions": [],
-                "enums": [{
-                    "name": "Status",
-                    "variants": [
-                        {"name": "Ok", "value": 0},
-                        {"name": "Error", "value": 1}
-                    ]
-                }]
-            }]
-        }"#;
-        let api: Api = serde_json::from_str(json).unwrap();
-        let e = &api.modules[0].enums[0];
-        assert_eq!(e.name, "Status");
-        assert_eq!(e.doc, None);
-        assert_eq!(e.variants.len(), 2);
-        assert_eq!(e.variants[1].value, 1);
-    }
-
-    #[test]
-    fn enums_default_to_empty() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].enums.is_empty());
-    }
-
-    #[test]
-    fn typeref_enum_variant_serializes_as_name() {
-        let ty = TypeRef::Enum("Color".to_string());
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""Color""#);
-    }
-
-    #[test]
-    fn enum_def_clone_and_eq() {
-        let e = EnumDef {
-            name: "Direction".to_string(),
-            doc: Some("Cardinal directions".to_string()),
-            variants: vec![
-                EnumVariant {
-                    name: "North".to_string(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![],
-                },
-                EnumVariant {
-                    name: "South".to_string(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-            ],
-        };
-        assert_eq!(e, e.clone());
-        assert!(!e.is_rich());
-    }
-
-    #[test]
-    fn enum_def_is_rich_when_a_variant_has_fields() {
-        let e = EnumDef {
-            name: "Shape".to_string(),
-            doc: None,
-            variants: vec![
-                EnumVariant {
-                    name: "Circle".to_string(),
-                    value: 0,
-                    doc: None,
-                    fields: vec![StructField {
-                        name: "radius".to_string(),
-                        ty: TypeRef::F64,
-                        doc: None,
-                    }],
-                },
-                EnumVariant {
-                    name: "Empty".to_string(),
-                    value: 1,
-                    doc: None,
-                    fields: vec![],
-                },
-            ],
-        };
-        assert!(e.is_rich());
-    }
-
-    #[test]
-    fn struct_def_clone_and_eq() {
-        let s = StructDef {
-            name: "Color".to_string(),
-            doc: Some("RGB color".to_string()),
-            fields: vec![
-                StructField {
-                    name: "r".to_string(),
-                    ty: TypeRef::U32,
-                    doc: None,
-                },
-                StructField {
-                    name: "g".to_string(),
-                    ty: TypeRef::U32,
-                    doc: None,
-                },
-                StructField {
-                    name: "b".to_string(),
-                    ty: TypeRef::U32,
-                    doc: None,
-                },
-            ],
-        };
-        assert_eq!(s, s.clone());
-    }
-
-    #[test]
-    fn parse_type_ref_primitives() {
-        assert_eq!(parse_type_ref("i32"), Ok(TypeRef::I32));
-        assert_eq!(parse_type_ref("u32"), Ok(TypeRef::U32));
-        assert_eq!(parse_type_ref("i64"), Ok(TypeRef::I64));
-        assert_eq!(parse_type_ref("f64"), Ok(TypeRef::F64));
-        assert_eq!(parse_type_ref("bool"), Ok(TypeRef::Bool));
-        assert_eq!(parse_type_ref("string"), Ok(TypeRef::StringUtf8));
-        assert_eq!(parse_type_ref("bytes"), Ok(TypeRef::Bytes));
-        assert_eq!(parse_type_ref("handle"), Ok(TypeRef::Handle));
-    }
-
-    #[test]
-    fn parse_type_ref_struct() {
-        assert_eq!(
-            parse_type_ref("Contact"),
-            Ok(TypeRef::Named("Contact".into()))
-        );
-        assert_eq!(
-            parse_type_ref("MyWidget"),
-            Ok(TypeRef::Named("MyWidget".into()))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_optional() {
-        assert_eq!(
-            parse_type_ref("string?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::StringUtf8)))
-        );
-        assert_eq!(
-            parse_type_ref("i32?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::I32)))
-        );
-        assert_eq!(
-            parse_type_ref("Contact?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::Named(
-                "Contact".into()
-            ))))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_list() {
-        assert_eq!(
-            parse_type_ref("[i32]"),
-            Ok(TypeRef::List(Box::new(TypeRef::I32)))
-        );
-        assert_eq!(
-            parse_type_ref("[string]"),
-            Ok(TypeRef::List(Box::new(TypeRef::StringUtf8)))
-        );
-        assert_eq!(
-            parse_type_ref("[Contact]"),
-            Ok(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_u8_list_canonicalizes_to_bytes() {
-        assert_eq!(parse_type_ref("[u8]"), Ok(TypeRef::Bytes));
-        assert_eq!(
-            parse_type_ref("[u8]?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::Bytes)))
-        );
-        // Only the direct element position canonicalizes; nested u8 lists
-        // keep their list shape.
-        assert_eq!(
-            parse_type_ref("[[u8]]"),
-            Ok(TypeRef::List(Box::new(TypeRef::Bytes)))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_nested() {
-        assert_eq!(
-            parse_type_ref("[i32?]"),
-            Ok(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
-                TypeRef::I32
-            )))))
-        );
-        assert_eq!(
-            parse_type_ref("[Contact]?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::List(Box::new(
-                TypeRef::Named("Contact".into())
-            )))))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_empty_is_error() {
-        assert!(parse_type_ref("").is_err());
-        assert!(parse_type_ref("  ").is_err());
-    }
-
-    #[test]
-    fn typeref_primitive_round_trips() {
-        for ty in [
-            TypeRef::I32,
-            TypeRef::U32,
-            TypeRef::I64,
-            TypeRef::F64,
-            TypeRef::Bool,
-            TypeRef::StringUtf8,
-            TypeRef::Bytes,
-            TypeRef::Handle,
-        ] {
-            let json = serde_json::to_string(&ty).unwrap();
-            let back: TypeRef = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, ty);
+    fn primitives_round_trip() {
+        let cases: &[(&str, TypeRef)] = &[
+            ("i8", TypeRef::I8),
+            ("i16", TypeRef::I16),
+            ("i32", TypeRef::I32),
+            ("i64", TypeRef::I64),
+            ("u8", TypeRef::U8),
+            ("u16", TypeRef::U16),
+            ("u32", TypeRef::U32),
+            ("u64", TypeRef::U64),
+            ("f32", TypeRef::F32),
+            ("f64", TypeRef::F64),
+            ("bool", TypeRef::Bool),
+            ("string", TypeRef::StringUtf8),
+            ("bytes", TypeRef::Bytes),
+            ("handle", TypeRef::Handle),
+            ("&str", TypeRef::BorrowedStr),
+            ("&[u8]", TypeRef::BorrowedBytes),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(&rt(s), expected);
         }
     }
 
     #[test]
-    fn typeref_optional_round_trip() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::StringUtf8));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""string?""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
+    fn composites_round_trip() {
+        assert_eq!(rt("Contact"), TypeRef::Named("Contact".into()));
+        assert_eq!(rt("shared.Status"), TypeRef::Named("shared.Status".into()));
+        assert_eq!(
+            rt("handle<Session>"),
+            TypeRef::TypedHandle("Session".into())
+        );
+        assert_eq!(
+            rt("Contact?"),
+            TypeRef::Optional(Box::new(TypeRef::Named("Contact".into())))
+        );
+        assert_eq!(rt("[string]"), TypeRef::List(Box::new(TypeRef::StringUtf8)));
+        assert_eq!(
+            rt("{string:i32}"),
+            TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32))
+        );
+        assert_eq!(
+            rt("iter<Contact>"),
+            TypeRef::Iterator(Box::new(TypeRef::Named("Contact".into())))
+        );
+        assert_eq!(
+            rt("[{string:[i32?]}]"),
+            TypeRef::List(Box::new(TypeRef::Map(
+                Box::new(TypeRef::StringUtf8),
+                Box::new(TypeRef::List(Box::new(TypeRef::Optional(Box::new(
+                    TypeRef::I32
+                )))))
+            )))
+        );
     }
 
     #[test]
-    fn typeref_list_round_trip() {
-        let ty = TypeRef::List(Box::new(TypeRef::I32));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""[i32]""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
+    fn u8_list_canonicalizes_to_bytes() {
+        assert_eq!(parse_type_ref("[u8]").unwrap(), TypeRef::Bytes);
+        assert_eq!(
+            parse_type_ref("[[u8]]").unwrap(),
+            TypeRef::List(Box::new(TypeRef::Bytes))
+        );
     }
 
     #[test]
-    fn typeref_optional_struct_round_trip() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::Named("Contact".into())));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""Contact?""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
+    fn map_separator_skips_nested_colons() {
+        assert_eq!(
+            parse_type_ref("{{string:i32}:bool}").unwrap(),
+            TypeRef::Map(
+                Box::new(TypeRef::Map(
+                    Box::new(TypeRef::StringUtf8),
+                    Box::new(TypeRef::I32)
+                )),
+                Box::new(TypeRef::Bool)
+            )
+        );
     }
 
     #[test]
-    fn typeref_list_struct_round_trip() {
-        let ty = TypeRef::List(Box::new(TypeRef::Named("Contact".into())));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""[Contact]""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
+    fn malformed_types_are_errors() {
+        assert!(parse_type_ref("").is_err());
+        assert!(parse_type_ref("   ").is_err());
+        assert!(parse_type_ref("{string}").is_err());
+        assert!(parse_type_ref("[]").is_err());
+        assert!(parse_type_ref("?").is_err());
     }
 
     #[test]
-    fn typeref_optional_yaml_deser() {
+    fn document_round_trips_through_yaml_and_json() {
         let yaml = r#"
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
+    doc: Address book
+    structs:
+      - name: Contact
+        deprecated: use Person
+        fields:
+          - { name: name, type: string }
+          - { name: tags, type: "[string]" }
+    enums:
+      - name: Shape
+        variants:
+          - { name: Circle, value: 0, fields: [{ name: r, type: f64 }] }
+          - { name: Dot, value: 1 }
+    interfaces:
+      - name: Book
+        constructors:
+          - { name: open, params: [{ name: path, type: "&str" }], throws: true }
+        methods:
+          - { name: find, params: [{ name: q, type: string }], return: "Contact?" }
+    callbacks:
+      - { name: on_change, params: [{ name: id, type: i64 }] }
+    listeners:
+      - { name: changes, event_callback: on_change }
+    errors:
+      name: BookError
+      codes:
+        - { name: NotFound, code: 1, message: missing, fields: [{ name: id, type: i64 }] }
     functions:
-      - name: find
-        params:
-          - name: id
-            type: i32
-        return: "Contact?"
+      - name: count
+        params: []
+        return: i64
+        async: true
+        cancellable: true
+        deprecated: gone
+        since: "0.2.0"
+    modules:
+      - name: inner
+        functions:
+          - { name: ping, params: [], return: string }
 "#;
         let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let f = &api.modules[0].functions[0];
+        assert_eq!(api.version, CURRENT_SCHEMA_VERSION);
+        let m = &api.modules[0];
+        assert_eq!(m.doc.as_deref(), Some("Address book"));
+        assert_eq!(m.structs[0].deprecated.as_deref(), Some("use Person"));
+        assert!(m.enums[0].is_rich());
         assert_eq!(
-            f.returns,
+            m.interfaces[0].methods[0].returns,
             Some(TypeRef::Optional(Box::new(TypeRef::Named(
                 "Contact".into()
             ))))
         );
-    }
-
-    #[test]
-    fn typeref_list_yaml_deser() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: contacts
-    functions:
-      - name: list_all
-        params: []
-        return: "[Contact]"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let f = &api.modules[0].functions[0];
-        assert_eq!(
-            f.returns,
-            Some(TypeRef::List(Box::new(TypeRef::Named("Contact".into()))))
-        );
-    }
-
-    #[test]
-    fn typeref_hash_works_with_box_variants() {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        set.insert(TypeRef::I32);
-        set.insert(TypeRef::Optional(Box::new(TypeRef::I32)));
-        set.insert(TypeRef::List(Box::new(TypeRef::I32)));
-        set.insert(TypeRef::Optional(Box::new(TypeRef::Named("Foo".into()))));
-        set.insert(TypeRef::Map(
-            Box::new(TypeRef::StringUtf8),
-            Box::new(TypeRef::I32),
-        ));
-        assert_eq!(set.len(), 5);
-    }
-
-    #[test]
-    fn parse_type_ref_map_primitives() {
-        assert_eq!(
-            parse_type_ref("{string:i32}"),
-            Ok(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32)
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_map_struct_value() {
-        assert_eq!(
-            parse_type_ref("{string:Contact}"),
-            Ok(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::Named("Contact".into()))
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_map_nested_value() {
-        assert_eq!(
-            parse_type_ref("{string:[i32]}"),
-            Ok(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::List(Box::new(TypeRef::I32)))
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_map_missing_colon() {
-        assert!(parse_type_ref("{string}").is_err());
-    }
-
-    #[test]
-    fn typeref_map_round_trip() {
-        let ty = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""{string:i32}""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn typeref_map_struct_round_trip() {
-        let ty = TypeRef::Map(
-            Box::new(TypeRef::StringUtf8),
-            Box::new(TypeRef::Named("Contact".into())),
-        );
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""{string:Contact}""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn typeref_map_yaml_deser() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: contacts
-    functions:
-      - name: get_metadata
-        params: []
-        return: "{string:i32}"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let f = &api.modules[0].functions[0];
-        assert_eq!(
-            f.returns,
-            Some(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32)
-            ))
-        );
-    }
-
-    #[test]
-    fn typeref_optional_map_round_trip() {
-        let ty = TypeRef::Optional(Box::new(TypeRef::Map(
-            Box::new(TypeRef::StringUtf8),
-            Box::new(TypeRef::I32),
-        )));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""{string:i32}?""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn parse_map_string_to_i32() {
-        assert_eq!(
-            parse_type_ref("{string:i32}"),
-            Ok(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32),
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_map_string_to_struct() {
-        assert_eq!(
-            parse_type_ref("{string:Contact}"),
-            Ok(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::Named("Contact".into())),
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_map_roundtrip() {
-        let ty = TypeRef::Map(Box::new(TypeRef::StringUtf8), Box::new(TypeRef::I32));
-        let json = serde_json::to_string(&ty).unwrap();
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn parse_optional_map() {
-        assert_eq!(
-            parse_type_ref("{string:i32}?"),
-            Ok(TypeRef::Optional(Box::new(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::I32),
-            ))))
-        );
-    }
-
-    #[test]
-    fn parse_map_of_lists() {
-        assert_eq!(
-            parse_type_ref("{string:[i32]}"),
-            Ok(TypeRef::Map(
-                Box::new(TypeRef::StringUtf8),
-                Box::new(TypeRef::List(Box::new(TypeRef::I32))),
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_type_ref_iterator() {
-        assert_eq!(
-            parse_type_ref("iter<i32>"),
-            Ok(TypeRef::Iterator(Box::new(TypeRef::I32)))
-        );
-        assert_eq!(
-            parse_type_ref("iter<string>"),
-            Ok(TypeRef::Iterator(Box::new(TypeRef::StringUtf8)))
-        );
-        assert_eq!(
-            parse_type_ref("iter<Contact>"),
-            Ok(TypeRef::Iterator(Box::new(TypeRef::Named(
-                "Contact".into()
-            ))))
-        );
-    }
-
-    #[test]
-    fn typeref_iterator_round_trip() {
-        let ty = TypeRef::Iterator(Box::new(TypeRef::I32));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""iter<i32>""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn typeref_iterator_struct_round_trip() {
-        let ty = TypeRef::Iterator(Box::new(TypeRef::Named("Contact".into())));
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""iter<Contact>""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn parse_type_ref_borrowed() {
-        assert_eq!(parse_type_ref("&str"), Ok(TypeRef::BorrowedStr));
-        assert_eq!(parse_type_ref("&[u8]"), Ok(TypeRef::BorrowedBytes));
-    }
-
-    #[test]
-    fn typeref_borrowed_round_trip() {
-        for ty in [TypeRef::BorrowedStr, TypeRef::BorrowedBytes] {
-            let json = serde_json::to_string(&ty).unwrap();
-            let back: TypeRef = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, ty);
-        }
-    }
-
-    #[test]
-    fn typeref_borrowed_str_serializes_as_ampersand_str() {
-        let json = serde_json::to_string(&TypeRef::BorrowedStr).unwrap();
-        assert_eq!(json, r#""&str""#);
-    }
-
-    #[test]
-    fn typeref_borrowed_bytes_serializes_as_ampersand_u8() {
-        let json = serde_json::to_string(&TypeRef::BorrowedBytes).unwrap();
-        assert_eq!(json, r#""&[u8]""#);
-    }
-
-    #[test]
-    fn typeref_borrowed_yaml_deser() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: io
-    functions:
-      - name: write
-        params:
-          - name: data
-            type: "&str"
-          - name: raw
-            type: "&[u8]"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let f = &api.modules[0].functions[0];
-        assert_eq!(f.params[0].ty, TypeRef::BorrowedStr);
-        assert_eq!(f.params[1].ty, TypeRef::BorrowedBytes);
-    }
-
-    #[test]
-    fn parse_typed_handle() {
-        assert_eq!(
-            parse_type_ref("handle<Session>"),
-            Ok(TypeRef::TypedHandle("Session".into()))
-        );
-        assert_eq!(parse_type_ref("handle"), Ok(TypeRef::Handle));
-    }
-
-    #[test]
-    fn generators_field_parses_from_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-generators:
-  swift:
-    module_name: MySwiftModule
-  android:
-    package: com.example.app
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let generators = api.generators.as_ref().unwrap();
-        let swift = generators["swift"].as_table().unwrap();
-        assert_eq!(swift["module_name"].as_str(), Some("MySwiftModule"));
-        let android = generators["android"].as_table().unwrap();
-        assert_eq!(android["package"].as_str(), Some("com.example.app"));
-    }
-
-    #[test]
-    fn generators_defaults_to_none() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.generators.is_none());
-    }
-
-    #[test]
-    fn parse_typed_handle_roundtrip() {
-        let ty = TypeRef::TypedHandle("Connection".into());
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""handle<Connection>""#);
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ty);
-    }
-
-    #[test]
-    fn callback_def_round_trip_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: events
-    functions: []
-    callbacks:
-      - name: on_data
-        params:
-          - name: payload
-            type: string
-        doc: "Fired when data arrives"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let m = &api.modules[0];
-        assert_eq!(m.callbacks.len(), 1);
-        let cb = &m.callbacks[0];
-        assert_eq!(cb.name, "on_data");
-        assert_eq!(cb.params.len(), 1);
-        assert_eq!(cb.params[0].name, "payload");
-        assert_eq!(cb.params[0].ty, TypeRef::StringUtf8);
-        assert_eq!(cb.doc.as_deref(), Some("Fired when data arrives"));
-    }
-
-    #[test]
-    fn listener_def_round_trip_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: events
-    functions: []
-    callbacks:
-      - name: on_data
-        params: []
-    listeners:
-      - name: data_stream
-        event_callback: on_data
-        doc: "Subscribe to data events"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let m = &api.modules[0];
-        assert_eq!(m.listeners.len(), 1);
-        let l = &m.listeners[0];
-        assert_eq!(l.name, "data_stream");
-        assert_eq!(l.event_callback, "on_data");
-        assert_eq!(l.doc.as_deref(), Some("Subscribe to data events"));
-    }
-
-    #[test]
-    fn callbacks_and_listeners_default_to_empty() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].callbacks.is_empty());
-        assert!(api.modules[0].listeners.is_empty());
-    }
-
-    #[test]
-    fn callback_def_json_round_trip() {
-        let cb = CallbackDef {
-            name: "on_event".to_string(),
-            params: vec![Param {
-                name: "data".to_string(),
-                ty: TypeRef::I32,
-                mutable: false,
-                doc: None,
-            }],
-            doc: Some("event callback".to_string()),
-        };
-        let json = serde_json::to_string(&cb).unwrap();
-        let back: CallbackDef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, cb);
-    }
-
-    #[test]
-    fn listener_def_json_round_trip() {
-        let l = ListenerDef {
-            name: "watcher".to_string(),
-            event_callback: "on_change".to_string(),
-            doc: None,
-        };
-        let json = serde_json::to_string(&l).unwrap();
-        let back: ListenerDef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, l);
-    }
-
-    #[test]
-    fn error_code_fields_default_to_empty() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: kv
-    functions: []
-    errors:
-      name: KvError
-      codes:
-        - name: NOT_FOUND
-          code: 1
-          message: "key not found"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let code = &api.modules[0].errors.as_ref().unwrap().codes[0];
-        assert!(code.fields.is_empty());
-        // Absent payload fields must not appear in the canonical serialization.
-        let out = serde_yaml::to_string(&api).unwrap();
-        assert!(!out.contains("fields:"));
-    }
-
-    #[test]
-    fn error_code_payload_fields_round_trip() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: kv
-    functions: []
-    errors:
-      name: KvError
-      codes:
-        - name: QUOTA_EXCEEDED
-          code: 2
-          message: "quota exceeded"
-          fields:
-            - name: used
-              type: u64
-            - name: limit
-              type: u64
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let code = &api.modules[0].errors.as_ref().unwrap().codes[0];
-        assert_eq!(code.fields.len(), 2);
-        assert_eq!(code.fields[0].name, "used");
-        assert_eq!(code.fields[0].ty, TypeRef::U64);
-        assert_eq!(code.fields[1].name, "limit");
+        assert_eq!(m.errors.as_ref().unwrap().codes[0].fields.len(), 1);
+        assert!(m.functions[0].r#async && m.functions[0].cancellable);
+        assert_eq!(m.modules[0].functions[0].name, "ping");
 
         let json = serde_json::to_string(&api).unwrap();
         let back: Api = serde_json::from_str(&json).unwrap();
         assert_eq!(back, api);
-    }
-
-    #[test]
-    fn param_mutable_defaults_to_false() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: io
-    functions:
-      - name: write
-        params:
-          - name: data
-            type: string
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(!api.modules[0].functions[0].params[0].mutable);
-    }
-
-    #[test]
-    fn param_mutable_true_round_trip() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: io
-    functions:
-      - name: fill_buffer
-        params:
-          - name: buf
-            type: bytes
-            mutable: true
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].functions[0].params[0].mutable);
-
-        let json = serde_json::to_string(&api).unwrap();
-        let back: Api = serde_json::from_str(&json).unwrap();
-        assert!(back.modules[0].functions[0].params[0].mutable);
-    }
-
-    #[test]
-    fn param_mutable_false_explicit() {
-        let json = r#"{
-            "version": "0.7.0",
-            "modules": [{
-                "name": "io",
-                "functions": [{
-                    "name": "read",
-                    "params": [{"name": "buf", "type": "bytes", "mutable": false}]
-                }]
-            }]
-        }"#;
-        let api: Api = serde_json::from_str(json).unwrap();
-        assert!(!api.modules[0].functions[0].params[0].mutable);
-    }
-
-    #[test]
-    fn deprecated_and_since_default_to_none() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions:
-      - name: add
-        params: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let f = &api.modules[0].functions[0];
-        assert_eq!(f.deprecated, None);
-        assert_eq!(f.since, None);
-    }
-
-    #[test]
-    fn deprecated_and_since_round_trip() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions:
-      - name: add_old
-        params: []
-        deprecated: "Use add_v2 instead"
-        since: "0.1.0"
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let f = &api.modules[0].functions[0];
-        assert_eq!(f.deprecated.as_deref(), Some("Use add_v2 instead"));
-        assert_eq!(f.since.as_deref(), Some("0.1.0"));
-
-        let json = serde_json::to_string(&api).unwrap();
-        let back: Api = serde_json::from_str(&json).unwrap();
-        let f2 = &back.modules[0].functions[0];
-        assert_eq!(f2.deprecated.as_deref(), Some("Use add_v2 instead"));
-        assert_eq!(f2.since.as_deref(), Some("0.1.0"));
+        let yaml2 = serde_yaml::to_string(&api).unwrap();
+        let back2: Api = serde_yaml::from_str(&yaml2).unwrap();
+        assert_eq!(back2, api);
     }
 
     #[test]
     fn serialization_omits_defaulted_fields() {
-        // A minimal API whose every optional/defaulted field is at its
-        // default must serialize without emitting those fields, so the
-        // canonical IDL produced by `weaveffi format`/`extract` stays terse.
         let api = Api {
-            version: "0.7.0".into(),
+            version: CURRENT_SCHEMA_VERSION.into(),
             modules: vec![Module {
-                name: "calc".into(),
+                name: "m".into(),
+                doc: None,
                 functions: vec![Function {
-                    name: "add".into(),
-                    params: vec![Param {
-                        name: "a".into(),
-                        ty: TypeRef::I32,
-                        mutable: false,
-                        doc: None,
-                    }],
-                    returns: Some(TypeRef::I32),
+                    name: "f".into(),
+                    params: vec![],
+                    returns: None,
                     doc: None,
                     throws: false,
                     r#async: false,
@@ -1771,185 +835,23 @@ modules:
                 errors: None,
                 modules: vec![],
             }],
-            generators: None,
-            package: None,
         };
         let yaml = serde_yaml::to_string(&api).unwrap();
-        for needle in [
-            "generators",
-            "interfaces",
-            "structs",
-            "enums",
-            "callbacks",
-            "listeners",
-            "errors",
-            "modules:\n", // nested module list (top-level key is "modules")
-            "doc",
-            "throws",
-            "async",
-            "cancellable",
-            "deprecated",
-            "since",
-            "mutable",
-            "null",
-            "[]",
-            "false",
-        ] {
-            // `modules:` appears once at the top level; assert the *nested*
-            // empty module list under a module is gone by checking it never
-            // shows an empty sequence.
-            if needle == "modules:\n" {
-                continue;
-            }
+        for noise in ["null", "[]", "false", "async", "throws", "doc", "params"] {
             assert!(
-                !yaml.contains(needle),
-                "default field `{needle}` leaked into canonical YAML:\n{yaml}"
+                !yaml.contains(noise),
+                "{noise} leaked into canonical form:\n{yaml}"
             );
         }
-        // Round-trips back to an equal value.
-        let back: Api = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(back, api);
     }
 
     #[test]
-    fn parse_type_ref_does_not_yield_callback() {
-        assert_eq!(
-            parse_type_ref("callback"),
-            Ok(TypeRef::Named("callback".into()))
-        );
-    }
-
-    #[test]
-    fn api_json_schema_derives() {
+    fn json_schema_types_are_strings() {
         let schema = schemars::schema_for!(Api);
         let json = serde_json::to_value(&schema).unwrap();
-        assert!(json.get("$schema").is_some());
-        assert!(json.get("properties").is_some());
-        assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("Api"));
-        let defs = json
-            .get("definitions")
-            .and_then(|v| v.as_object())
-            .expect("definitions");
-        assert!(defs.contains_key("Module"));
-        assert!(defs.contains_key("Function"));
-        assert!(defs.contains_key("Param"));
-        assert!(defs.contains_key("TypeRef"));
-        assert!(defs.contains_key("InterfaceDef"));
-        assert!(defs.contains_key("StructDef"));
-        assert!(defs.contains_key("StructField"));
-        assert!(defs.contains_key("EnumDef"));
-        assert!(defs.contains_key("EnumVariant"));
-        assert!(defs.contains_key("CallbackDef"));
-        assert!(defs.contains_key("ListenerDef"));
-        assert!(defs.contains_key("ErrorDomain"));
-        assert!(defs.contains_key("ErrorCode"));
-    }
-
-    #[test]
-    fn interface_round_trip_yaml() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: kv
-    interfaces:
-      - name: Store
-        doc: "A key/value store"
-        constructors:
-          - name: open
-            params:
-              - name: path
-                type: string
-            throws: true
-        methods:
-          - name: put
-            params:
-              - name: key
-                type: string
-              - name: value
-                type: bytes
-            return: bool
-            throws: true
-          - name: count
-            return: i64
-        statics:
-          - name: default_path
-            return: string
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        let m = &api.modules[0];
-        assert!(m.functions.is_empty());
-        assert_eq!(m.interfaces.len(), 1);
-        let i = &m.interfaces[0];
-        assert_eq!(i.name, "Store");
-        assert_eq!(i.doc.as_deref(), Some("A key/value store"));
-        assert_eq!(i.constructors.len(), 1);
-        assert!(i.constructors[0].throws);
-        assert_eq!(i.constructors[0].returns, None);
-        assert_eq!(i.methods.len(), 2);
-        assert!(i.methods[0].throws);
-        assert!(!i.methods[1].throws);
-        assert_eq!(i.methods[1].returns, Some(TypeRef::I64));
-        assert_eq!(i.statics.len(), 1);
-        assert_eq!(i.statics[0].returns, Some(TypeRef::StringUtf8));
-
-        // Round trip preserves the interface block.
-        let out = serde_yaml::to_string(&api).unwrap();
-        let back: Api = serde_yaml::from_str(&out).unwrap();
-        assert_eq!(back, api);
-    }
-
-    #[test]
-    fn interfaces_default_to_empty() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: math
-    functions: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].interfaces.is_empty());
-    }
-
-    #[test]
-    fn throws_defaults_to_false_and_round_trips() {
-        let yaml = r#"
-version: "0.7.0"
-modules:
-  - name: kv
-    functions:
-      - name: open
-        params: []
-        throws: true
-      - name: count
-        params: []
-"#;
-        let api: Api = serde_yaml::from_str(yaml).unwrap();
-        assert!(api.modules[0].functions[0].throws);
-        assert!(!api.modules[0].functions[1].throws);
-        let json = serde_json::to_string(&api).unwrap();
-        let back: Api = serde_json::from_str(&json).unwrap();
-        assert!(back.modules[0].functions[0].throws);
-        assert!(!back.modules[0].functions[1].throws);
-    }
-
-    #[test]
-    fn typeref_interface_serializes_as_name() {
-        let ty = TypeRef::Interface("Store".to_string());
-        let json = serde_json::to_string(&ty).unwrap();
-        assert_eq!(json, r#""Store""#);
-        // Deserialization yields `Named`; the resolver rewrites it later.
-        let back: TypeRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, TypeRef::Named("Store".into()));
-    }
-
-    #[test]
-    fn typeref_json_schema_is_string_with_description() {
-        let schema = schemars::schema_for!(TypeRef);
-        let json = serde_json::to_value(&schema).unwrap();
-        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("string"));
-        assert!(json
-            .get("description")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s.contains("handle<") && s.contains("iter<")));
+        let type_ref = &json["definitions"]["TypeRef"];
+        assert_eq!(type_ref["type"], "string");
+        assert!(json["properties"].get("package").is_none());
+        assert!(json["properties"].get("generators").is_none());
     }
 }

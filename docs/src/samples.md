@@ -3,13 +3,11 @@
 This repo includes sample projects under `samples/` that showcase end-to-end
 usage of WeaveFFI. Every producer is written as safe Rust and annotated with the
 `#[weaveffi::module]` family of attributes, so the macro generates its C ABI
-(see [The Rust Producer Macro](guides/producer-macro.md)). The simpler producers
-(`calculator`, `contacts`, and `inventory`) generate bindings straight from
-their annotated source. The advanced samples (`async-demo`, `events`, `kvstore`,
-`shapes`) are macro-annotated too, and they keep a committed YAML IDL as the
-generation source of truth because their surfaces carry metadata the extractor
-does not yet recover from source, such as package and per-generator
-configuration and standalone `since` tags.
+(see [The Rust Producer Macro](guides/producer-macro.md)), and every sample
+generates its bindings straight from that annotated `src/lib.rs`: there is no
+parallel IDL file to keep in sync. Package identity and per-target options
+live in each sample's `weaveffi.toml`, which the CLI discovers automatically
+next to the crate.
 
 ## Kvstore (kitchen-sink reference)
 
@@ -38,16 +36,16 @@ real-world pattern for a new generator.
 - A deprecated method (`legacy_put`)
 - A nested sub-module (`kv.stats`) with its own struct (`Stats`) and a function
   that takes a cross-module `Store` parameter
-- Inline `generators:` overrides for `swift.module_name`,
-  `cpp.namespace`, `dotnet.namespace`, `dart.package_name`,
-  `go.module_path`, and `ruby.module_name`
+- A `weaveffi.toml` with `[generators.<target>]` overrides for
+  `swift.module_name`, `cpp.namespace`, `dotnet.namespace`,
+  `dart.package_name`, `go.module_path`, and `ruby.module_name`
 
 **Build, generate bindings, and run the C ABI tests:**
 
 ```bash
 cargo build -p kvstore
 cargo test -p kvstore
-weaveffi generate samples/kvstore/kvstore.yml -o generated
+weaveffi generate samples/kvstore/src/lib.rs -o generated
 ```
 
 The `conformance/` harness ships a kvstore consumer for every language that
@@ -81,7 +79,7 @@ how each backend surfaces it as an idiomatic sum type.
 ```bash
 cargo build -p shapes
 cargo test -p shapes
-weaveffi generate samples/shapes/shapes.yml -o generated
+weaveffi generate samples/shapes/src/lib.rs -o generated
 ```
 
 The `conformance/` harness ships a `shapes` consumer for every language that

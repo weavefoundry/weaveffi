@@ -155,6 +155,7 @@ mod tests {
     fn leaf(name: &str) -> Module {
         Module {
             name: name.to_string(),
+            doc: None,
             functions: vec![],
             interfaces: vec![],
             structs: vec![],

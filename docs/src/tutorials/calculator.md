@@ -25,8 +25,8 @@ by zero.
 
 ### 1. Generate every target
 
-Point the generator at the annotated source (the `calculator.yml` IDL still
-works too, and produces the same bindings):
+Point the generator at the annotated source; the sample's `weaveffi.toml`
+beside it supplies the package identity:
 
 ```bash
 weaveffi generate samples/calculator/src/lib.rs -o generated

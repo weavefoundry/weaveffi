@@ -5,7 +5,8 @@
 # asserts concrete results, then exits non-zero on any mismatch. The harness:
 #
 #   1. builds each producer cdylib from samples/,
-#   2. runs `weaveffi generate` for that sample into the cargo target dir, and
+#   2. runs `weaveffi generate` on that producer's annotated `src/lib.rs` (the
+#      single source of truth for its API) into the cargo target dir, and
 #   3. compiles + runs every per-(language, sample) consumer, requiring exit 0.
 #
 # This is the regression oracle for the code generators: a backend that lowers a
@@ -81,7 +82,7 @@ build_producer() {
 # invocations (e.g. per-language lanes running in parallel) share one
 # pre-generated tree instead of racing on the rm -rf below.
 generate() {
-    local sample=$1 idl=$2
+    local sample=$1 idl=${2:-samples/$1/src/lib.rs}
     if [ -n "${SKIP_GEN:-}" ]; then
         echo "--- reusing bindings: $sample"
         return 0
@@ -504,17 +505,17 @@ wasm_async_demo() { wasm_consumer async-demo async_demo.mjs; }
 # Producers + generation
 # ---------------------------------------------------------------------------
 build_producer contacts
-generate contacts samples/contacts/contacts.yml
+generate contacts
 build_producer events
-generate events samples/events/events.yml
+generate events
 build_producer kvstore
-generate kvstore samples/kvstore/kvstore.yml
+generate kvstore
 build_producer shapes
-generate shapes samples/shapes/shapes.yml
+generate shapes
 build_producer async-demo
-generate async-demo samples/async-demo/async_demo.yml
+generate async-demo
 # Header-only: the producer-export lane implements this in C, no Rust cdylib.
-generate calculator samples/calculator/calculator.yml
+generate calculator
 
 # ---------------------------------------------------------------------------
 # Run matrix: every language runs the events lane (callbacks/listeners +

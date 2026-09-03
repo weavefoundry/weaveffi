@@ -4,20 +4,20 @@
 //! Marshalling dispatch is driven by the shared plans: [`ArgPass`] decides
 //! how each parameter crosses, [`RetPass`] how the result comes back, and
 //! [`plan::elem_free`] what an iterator step owes, so this module never
-//! re-derives those shapes from `TypeRef` matches.
+//! re-derives those shapes from `Ty` matches.
 
 use weaveffi_core::abi;
 use weaveffi_core::codegen::common::pascal_case;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::lang;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, CallbackBinding, ErrorBinding, FnBinding, ListenerBinding, ModuleBinding,
     ParamBinding,
 };
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy, RetPass};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{
     py_decode_borrowed_expr, py_decode_owned_expr, py_pack_fn_name, py_read_expr,
@@ -145,7 +145,7 @@ pub(crate) fn render_callable(
 
     // The `_...Iterator` helper class is module-level; a member's helper is
     // emitted by `render_interface` ahead of the wrapper class instead.
-    if let (Some(TypeRef::Iterator(inner)), CallShape::Iterator(it)) = (&f.ret, &f.shape) {
+    if let (Some(Ty::Iterator(inner)), CallShape::Iterator(it)) = (&f.ret, &f.shape) {
         if !scope.is_member() {
             render_iterator_class(out, &it.iter_tag, &f.name, inner, &checker);
         }
@@ -325,7 +325,7 @@ fn py_param_conversion(p: &ParamBinding, ind: &str) -> Vec<String> {
         // buffered shapes (optionals, lists, maps) inline their write
         // statements through a per-parameter writer (so several buffered
         // parameters in one call never collide).
-        ArgPass::Buffer { .. } => match wire::classify(&p.ty) {
+        ArgPass::Buffer { .. } => match p.ty.wire() {
             WireType::User(n) => {
                 vec![format!("{ind}_{name}_buf = {}({name})", py_pack_fn_name(n))]
             }
@@ -367,8 +367,8 @@ fn py_param_call_args(p: &ParamBinding) -> Vec<String> {
             vec![format!("{name}._ptr if {name} is not None else None")]
         }
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Bool => vec![format!("1 if {name} else 0")],
-            TypeRef::Enum(_) => vec![format!("{name}.value")],
+            Ty::Bool => vec![format!("1 if {name} else 0")],
+            Ty::Enum(_) => vec![format!("{name}.value")],
             // Scalars, handles, and typed handles are already the raw slot
             // value the C signature wants.
             _ => vec![name],
@@ -379,10 +379,10 @@ fn py_param_call_args(p: &ParamBinding) -> Vec<String> {
 // ── Return helpers ──
 
 /// The interface name behind a direct or optional interface return.
-fn object_interface_name(ty: &TypeRef) -> &str {
+fn object_interface_name(ty: &Ty) -> &str {
     match ty {
-        TypeRef::Interface(name) => name,
-        TypeRef::Optional(inner) => object_interface_name(inner),
+        Ty::Interface(name) => name,
+        Ty::Optional(inner) => object_interface_name(inner),
         _ => unreachable!("object returns are direct or optional interfaces"),
     }
 }
@@ -390,7 +390,7 @@ fn object_interface_name(ty: &TypeRef) -> &str {
 /// Append the statements converting `_result` (and `_out_len` when present)
 /// into the wrapper's return value, honoring the receive-and-release
 /// contract of [`RetPass`].
-fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
+fn render_return_value(out: &mut String, ty: &Ty, ind: &str) {
     let mut w = CodeWriter::four_space().with_depth(ind.len() / 4);
     // Module and prefix only shape an object return's destroy symbol, which
     // Python defers to the wrapper class's `__del__`; empty context is fine.
@@ -399,7 +399,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         // bytes, release them with `weaveffi_free_bytes`, then decode.
         RetPass::Buffer => {
             w.line("_data = _take_buffer(_result, _out_len.value)");
-            match wire::classify(ty) {
+            match ty.wire() {
                 WireType::User(name) => {
                     w.line(format!("return {}(_data)", py_unpack_fn_name(name)));
                 }
@@ -445,13 +445,13 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
         RetPass::Direct => match ty {
             // The `c_void_p` restype surfaces null as `None`; normalize to
             // the integer handle representation.
-            TypeRef::TypedHandle(_) => {
+            Ty::TypedHandle(_) => {
                 w.line("return _result or 0");
             }
-            TypeRef::Bool => {
+            Ty::Bool => {
                 w.line("return bool(_result)");
             }
-            TypeRef::Enum(name) => {
+            Ty::Enum(name) => {
                 let name = local_type_name(name);
                 w.line(format!("return {name}(_result)"));
             }
@@ -468,7 +468,7 @@ fn render_return_value(out: &mut String, ty: &TypeRef, ind: &str) {
 // ── Async rendering ──
 
 /// `(param_name, ctypes_type)` pairs for async C callback parameters after `(context, err)`.
-fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
+fn py_async_cb_trailing_fields(ret: &Option<Ty>) -> Vec<(String, String)> {
     match ret {
         None => vec![],
         Some(ty) => abi::callback_result_params(ty, "")
@@ -493,7 +493,7 @@ fn py_async_cb_trailing_fields(ret: &Option<TypeRef>) -> Vec<(String, String)> {
 /// are released with `weaveffi_free_string`, value buffers with
 /// `weaveffi_free_bytes`, and an owned interface pointer is adopted by its
 /// wrapper class.
-fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &str) {
+fn append_async_success_handler(out: &mut String, ret: &Option<Ty>, ind: &str) {
     let Some(ty) = ret else {
         out.push_str(&format!("{ind}_state[\"val\"] = None\n"));
         return;
@@ -549,13 +549,13 @@ fn append_async_success_handler(out: &mut String, ret: &Option<TypeRef>, ind: &s
         }
         RetPass::Direct => match ty {
             // A typed handle's `c_void_p` slot surfaces as `int | None`.
-            TypeRef::TypedHandle(_) => {
+            Ty::TypedHandle(_) => {
                 out.push_str(&format!("{ind}_state[\"val\"] = result or 0\n"));
             }
-            TypeRef::Bool => {
+            Ty::Bool => {
                 out.push_str(&format!("{ind}_state[\"val\"] = bool(result)\n"));
             }
-            TypeRef::Enum(name) => {
+            Ty::Enum(name) => {
                 let name = local_type_name(name);
                 out.push_str(&format!("{ind}_state[\"val\"] = {name}(result)\n"));
             }
@@ -728,7 +728,7 @@ fn render_async_ffi_call_body(
 /// the `next` signature carries a trailing `size_t* out_len`. Owned pointer
 /// elements (strings, bytes, buffered values) stay raw `c_void_p` addresses
 /// so they survive to be freed, per [`plan::elem_free`].
-fn py_iter_slots(inner: &TypeRef) -> (String, bool) {
+fn py_iter_slots(inner: &Ty) -> (String, bool) {
     match plan::elem_free(inner) {
         ElemFree::Bytes => ("ctypes.c_void_p".into(), true),
         ElemFree::String => ("ctypes.c_void_p".into(), false),
@@ -739,13 +739,13 @@ fn py_iter_slots(inner: &TypeRef) -> (String, bool) {
 /// The Python expression converting a pulled `_out_item` slot into the
 /// element the consumer receives, honoring the owed per-element release
 /// ([`plan::elem_free`]).
-fn py_read_iter_item(inner: &TypeRef) -> String {
+fn py_read_iter_item(inner: &Ty) -> String {
     match plan::elem_free(inner) {
         // A `ptr` + `len` element: copy the bytes, free them with
         // `weaveffi_free_bytes` (via `_take_buffer`), then decode any
         // buffered value.
-        ElemFree::Bytes => match wire::classify(inner) {
-            WireType::Bytes => "_take_buffer(_out_item.value, _out_len.value)".into(),
+        ElemFree::Bytes => match inner.wire() {
+            WireType::Prim(Prim::Bytes) => "_take_buffer(_out_item.value, _out_len.value)".into(),
             WireType::User(name) => format!(
                 "{}(_take_buffer(_out_item.value, _out_len.value))",
                 py_unpack_fn_name(name)
@@ -759,15 +759,15 @@ fn py_read_iter_item(inner: &TypeRef) -> String {
         // slot is a raw `c_void_p`, so the address survives to be freed.
         ElemFree::String => "_take_string(_out_item.value)".into(),
         ElemFree::None => match inner {
-            TypeRef::Enum(name) => {
+            Ty::Enum(name) => {
                 format!("{}(_out_item.value)", local_type_name(name))
             }
             // An owned interface element is adopted by its wrapper class.
-            TypeRef::Interface(name) => {
+            Ty::Interface(name) => {
                 format!("{}._from_ptr(_out_item.value)", local_type_name(name))
             }
-            TypeRef::TypedHandle(_) => "_out_item.value or 0".into(),
-            TypeRef::Bool => "bool(_out_item.value)".into(),
+            Ty::TypedHandle(_) => "_out_item.value or 0".into(),
+            Ty::Bool => "bool(_out_item.value)".into(),
             _ => "_out_item.value".into(),
         },
     }
@@ -792,7 +792,7 @@ pub(crate) fn render_iterator_class(
     out: &mut String,
     iter_tag: &str,
     func_name: &str,
-    inner: &TypeRef,
+    inner: &Ty,
     checker: &str,
 ) {
     let class_name = py_iterator_class_name(func_name);
@@ -919,8 +919,8 @@ fn py_cb_param_expr(p: &ParamBinding) -> String {
         // an owning class whose `__del__` would free them.
         ArgPass::Object { .. } => esc,
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Bool => format!("bool({esc})"),
-            TypeRef::Enum(name) => format!("{}({esc})", local_type_name(name)),
+            Ty::Bool => format!("bool({esc})"),
+            Ty::Enum(name) => format!("{}({esc})", local_type_name(name)),
             // Scalars, handles, and typed handles pass through unchanged.
             _ => esc,
         },

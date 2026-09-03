@@ -1,28 +1,26 @@
 //! The canonical WeaveFFI C ABI model.
 //!
-//! This module is the single source of truth for *how a validated `Api`
-//! lowers onto the stable C ABI*: which symbols exist, the exact ordered
-//! parameter list of each, and how every [`TypeRef`] crosses the boundary
-//! (by value, as a pointer, as `ptr`+`len`, as a serialized value buffer,
-//! with a trailing `out_err`, …).
+//! This module is the single source of truth for *how a resolved API lowers
+//! onto the stable C ABI*: which symbols exist, the exact ordered parameter
+//! list of each, and how every [`Ty`] crosses the boundary (by value, as a
+//! pointer, as `ptr`+`len`, as a serialized value buffer, with a trailing
+//! `out_err`, and so on).
 //!
-//! Before this module existed, each of the eleven language generators *and*
-//! the Rust scaffold re-derived the calling convention independently, kept in
-//! sync only by snapshot tests. They now share [`lower_param`],
-//! [`lower_return`], [`is_buffered`], [`callback_result_params`], and the
-//! signature assembly helpers below, and map the resulting [`CType`] onto
-//! their own FFI vocabulary. The C rendering ([`CType::render_c`]) is the
-//! canonical one.
+//! Every language generator and the producer macro share [`lower_param`],
+//! [`lower_return`], [`callback_result_params`], and the signature assembly
+//! helpers below, and map the resulting [`CType`] onto their own FFI
+//! vocabulary. The C rendering ([`CType::render_c`]) is the canonical one.
 
 pub mod ctype;
 pub mod lower;
 
 pub use ctype::{CType, ConstPos};
 pub use lower::{
-    callback_result_params, is_buffered, lower_param, lower_return, struct_tag, AbiParam, AbiReturn,
+    callback_result_params, lower_param, lower_return, split_qualified, struct_tag, AbiParam,
+    AbiReturn,
 };
 
-use weaveffi_ir::ir::{Function, Param, TypeRef};
+use crate::model::{ParamBinding, Ty};
 
 /// A fully-assembled C ABI signature: the ordered parameter slots and the
 /// C return type.
@@ -51,12 +49,9 @@ pub fn cancel_token_param() -> AbiParam {
 }
 
 /// Assemble the full C signature of a *synchronous* function: every input
-/// parameter, then the return type's out-parameters, then `out_err`.
-pub fn sync_signature(params: &[Param], returns: Option<&TypeRef>, module: &str) -> AbiSig {
-    let mut out = Vec::new();
-    for p in params {
-        out.extend(lower_param(&p.name, &p.ty, module, p.mutable));
-    }
+/// parameter's slots, then the return type's out-parameters, then `out_err`.
+pub fn sync_signature(params: &[ParamBinding], returns: Option<&Ty>, module: &str) -> AbiSig {
+    let mut out: Vec<AbiParam> = params.iter().flat_map(|p| p.abi.iter().cloned()).collect();
     let ret = match returns {
         Some(ty) => {
             let r = lower_return(ty, module);
@@ -71,7 +66,7 @@ pub fn sync_signature(params: &[Param], returns: Option<&TypeRef>, module: &str)
 
 /// Assemble the parameters of the async completion callback typedef:
 /// `(void* context, {prefix}_error* err, <result fields>)`.
-pub fn async_callback_params(returns: Option<&TypeRef>, module: &str) -> Vec<AbiParam> {
+pub fn async_callback_params(returns: Option<&Ty>, module: &str) -> Vec<AbiParam> {
     let mut params = vec![
         context_param(),
         AbiParam::new("err", CType::ptr(CType::Error)),
@@ -86,29 +81,20 @@ pub fn async_callback_params(returns: Option<&TypeRef>, module: &str) -> Vec<Abi
 /// trailing `callback` and `context`, which are appended by the caller because
 /// the callback's C type name is generator-derived). `cancellable` inserts the
 /// cancel-token slot in the canonical position.
-pub fn async_input_params(f: &Function, module: &str) -> Vec<AbiParam> {
-    let mut params = Vec::new();
-    for p in &f.params {
-        params.extend(lower_param(&p.name, &p.ty, module, p.mutable));
+pub fn async_input_params(params: &[ParamBinding], cancellable: bool) -> Vec<AbiParam> {
+    let mut out: Vec<AbiParam> = params.iter().flat_map(|p| p.abi.iter().cloned()).collect();
+    if cancellable {
+        out.push(cancel_token_param());
     }
-    if f.cancellable {
-        params.push(cancel_token_param());
-    }
-    params
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::TypeRef;
 
-    fn param(name: &str, ty: TypeRef) -> Param {
-        Param {
-            name: name.into(),
-            ty,
-            mutable: false,
-            doc: None,
-        }
+    fn param(name: &str, ty: Ty) -> ParamBinding {
+        ParamBinding::new(name, ty, false, None, "math")
     }
 
     fn render(params: &[AbiParam]) -> Vec<String> {
@@ -121,8 +107,8 @@ mod tests {
     #[test]
     fn sync_signature_appends_out_err_last() {
         let sig = sync_signature(
-            &[param("a", TypeRef::I32), param("b", TypeRef::I32)],
-            Some(&TypeRef::I32),
+            &[param("a", Ty::I32), param("b", Ty::I32)],
+            Some(&Ty::I32),
             "math",
         );
         assert_eq!(sig.ret, CType::Int32);
@@ -130,34 +116,27 @@ mod tests {
             render(&sig.params),
             ["int32_t a", "int32_t b", "weaveffi_error* out_err"]
         );
-    }
-
-    #[test]
-    fn sync_signature_void_return() {
-        let sig = sync_signature(&[param("x", TypeRef::I32)], None, "m");
-        assert_eq!(sig.ret, CType::Void);
-        assert_eq!(
-            render(&sig.params),
-            ["int32_t x", "weaveffi_error* out_err"]
-        );
-    }
-
-    #[test]
-    fn sync_signature_bytes_return_inserts_out_len_before_out_err() {
-        let sig = sync_signature(&[], Some(&TypeRef::Bytes), "m");
+        let sig = sync_signature(&[], Some(&Ty::Bytes), "m");
         assert_eq!(sig.ret.render_c("weaveffi"), "const uint8_t*");
         assert_eq!(
             render(&sig.params),
             ["size_t* out_len", "weaveffi_error* out_err"]
         );
+        let sig = sync_signature(&[param("x", Ty::I32)], None, "m");
+        assert_eq!(sig.ret, CType::Void);
     }
 
     #[test]
-    fn async_callback_prefix_is_context_then_err() {
-        let params = async_callback_params(Some(&TypeRef::I32), "m");
+    fn async_shapes() {
+        let params = async_callback_params(Some(&Ty::I32), "m");
         assert_eq!(
             render(&params),
             ["void* context", "weaveffi_error* err", "int32_t result"]
+        );
+        let inputs = async_input_params(&[param("id", Ty::I64)], true);
+        assert_eq!(
+            render(&inputs),
+            ["int64_t id", "weaveffi_cancel_token* cancel_token"]
         );
     }
 }

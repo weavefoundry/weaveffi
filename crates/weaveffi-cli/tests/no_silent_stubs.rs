@@ -43,9 +43,9 @@ fn generator_sources_ban_unimplemented_and_todo() {
     for entry in fs::read_dir(&crates_dir).expect("read crates/") {
         let path = entry.expect("dir entry").path();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // The CLI's `scaffold` output intentionally emits `todo!()` for the
-        // *user's* Rust producer skeleton, so only generator + core crates
-        // (the code that produces consumer bindings) are in scope.
+        // Only generator + core crates (the code that produces consumer
+        // bindings) are in scope; test helpers and the CLI are free to use
+        // placeholder macros.
         if !(name.starts_with("weaveffi-gen-") || name == "weaveffi-core") {
             continue;
         }
@@ -86,9 +86,9 @@ fn generator_sources_ban_unimplemented_and_todo() {
 fn generated_output_has_no_stub_markers() {
     let root = workspace_root();
     let samples = [
-        root.join("samples/contacts/contacts.yml"),
-        root.join("samples/events/events.yml"),
-        root.join("samples/kvstore/kvstore.yml"),
+        root.join("samples/contacts/src/lib.rs"),
+        root.join("samples/events/src/lib.rs"),
+        root.join("samples/kvstore/src/lib.rs"),
     ];
 
     // Case-insensitive marker list. Bare "not supported" is deliberately

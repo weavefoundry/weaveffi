@@ -3,12 +3,13 @@
 //! exactly.
 
 use weaveffi_core::abi::{self, AbiParam, CType};
+use weaveffi_core::cabi::ABI_VERSION;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, FnBinding, InterfaceBinding, IteratorBinding,
     ListenerBinding, ParamBinding,
 };
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::async_result_is_ptr_len;
 use crate::types::{cs_out_param, cs_pinvoke_ctype, pinvoke_type, safe_cs_name};
@@ -30,7 +31,7 @@ pub(crate) fn pinvoke_param_list(p: &ParamBinding) -> Vec<String> {
 
 /// The extern return type plus any trailing out-params (for example the
 /// `size_t* out_len` slot of a buffered return) for one IR return type.
-pub(crate) fn pinvoke_return_info(ty: &TypeRef) -> (String, Vec<String>) {
+pub(crate) fn pinvoke_return_info(ty: &Ty) -> (String, Vec<String>) {
     let r = abi::lower_return(ty, "");
     (
         cs_pinvoke_ctype(&r.ret),
@@ -43,16 +44,44 @@ pub(crate) fn is_error_slot(slot: &AbiParam) -> bool {
     matches!(&slot.ty, CType::Ptr { pointee, .. } if matches!(pointee.as_ref(), CType::Error))
 }
 
-/// Render the `NativeMethods` static class: the shared runtime imports
-/// (`free_string`, `free_bytes`, `error_clear`, `error_free`) followed by
-/// every interface,
-/// callback, listener, and function extern in declaration order.
+/// Render the `NativeMethods` static class: the ABI-revision check in its
+/// static constructor, the shared runtime imports (`abi_version`,
+/// `free_string`, `free_bytes`, `error_clear`, `error_free`), and then every
+/// interface, callback, listener, and function extern in declaration order.
 pub(crate) fn render_native_methods(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.line("internal static class NativeMethods");
     w.line("{");
     w.indent();
     w.line("private const string LibName = \"weaveffi\";");
+    w.blank();
+    w.line("// The ABI revision these bindings were generated against.");
+    w.line(format!("internal const uint AbiVersion = {ABI_VERSION};"));
+    w.blank();
+    w.line("// Runs before the first P/Invoke through this class, so a producer built");
+    w.line("// for a different ABI revision fails loudly instead of misreading the");
+    w.line("// error struct or a value buffer later.");
+    w.line("static NativeMethods()");
+    w.block("{", "}", |w| {
+        w.line("uint found;");
+        w.line("try");
+        w.block("{", "}", |w| {
+            w.line("found = weaveffi_abi_version();");
+        });
+        w.line("catch (EntryPointNotFoundException e)");
+        w.block("{", "}", |w| {
+            w.line("throw new InvalidOperationException(");
+            w.line("    $\"the loaded WeaveFFI library predates ABI versioning (these bindings expect ABI revision {AbiVersion})\", e);");
+        });
+        w.line("if (found != AbiVersion)");
+        w.block("{", "}", |w| {
+            w.line("throw new InvalidOperationException(");
+            w.line("    $\"WeaveFFI ABI mismatch: these bindings expect revision {AbiVersion} but the loaded library reports revision {found}\");");
+        });
+    });
+    w.blank();
+    w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
+    w.line("internal static extern uint weaveffi_abi_version();");
     w.blank();
     w.line("[DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]");
     w.line("internal static extern void weaveffi_free_string(IntPtr ptr);");
@@ -277,7 +306,7 @@ pub(crate) fn render_iterator_pinvoke(out: &mut String, it: &IteratorBinding) {
 /// The completion delegate's result parameters for one async return type:
 /// nothing for void, a borrowed `(ptr, len)` pair for bytes and buffered
 /// values, and a single by-value slot otherwise.
-pub(crate) fn async_cb_delegate_result_params(ret: &Option<TypeRef>) -> String {
+pub(crate) fn async_cb_delegate_result_params(ret: &Option<Ty>) -> String {
     match ret {
         None => String::new(),
         Some(ty) if async_result_is_ptr_len(ty) => ", IntPtr result, UIntPtr resultLen".into(),

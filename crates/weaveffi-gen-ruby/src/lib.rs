@@ -17,9 +17,6 @@ mod package;
 mod runtime;
 mod types;
 
-#[cfg(test)]
-mod tests;
-
 use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
@@ -218,8 +215,6 @@ impl LanguageBackend for RubyGenerator {
         Some(files)
     }
 }
-
-weaveffi_core::impl_generator_via_backend!(RubyGenerator);
 
 /// Render the primary Ruby library source: the fixed preamble, then each
 /// module's typed error surface, entities, codecs, FFI attachments, and

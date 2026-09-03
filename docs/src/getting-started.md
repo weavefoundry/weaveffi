@@ -40,10 +40,7 @@ Describe the API once in a language-neutral IDL. Create `math.yml` with a
 record and a function:
 
 ```yaml
-version: "0.7.0"
-package:
-  name: my-math
-  version: "0.1.0"
+version: "0.8.0"
 modules:
   - name: math
     structs:
@@ -59,18 +56,27 @@ modules:
         return: i32
 ```
 
-The optional `package:` block sets the name and version stamped into every
-generated package manifest (`package.json`, `pyproject.toml`, `Package.swift`,
-and so on). The IDL also supports primitives (`i32`, `f64`, `bool`, `string`,
-`bytes`, `handle`), optionals (`string?`), lists (`[i32]`), interfaces
-(objects with constructors, methods, and statics), and typed error domains
-(opt in per function with `throws: true`). See the
-[IDL Schema](reference/idl.md#package-metadata) reference for the full
-specification.
+The IDL describes only the API. It supports primitives (`i32`, `f64`, `bool`,
+`string`, `bytes`, `handle`), optionals (`string?`), lists (`[i32]`),
+interfaces (objects with constructors, methods, and statics), and typed error
+domains (opt in per function with `throws: true`). See the
+[IDL Schema](reference/idl.md) reference for the full specification.
 
-> **Prefer not to hand-write YAML?** Run `weaveffi new my-project` to scaffold a
-> starter project (an example IDL plus a `Cargo.toml` and `src/lib.rs` stub) you
-> can edit instead.
+Everything about how the API is *published* lives in an optional
+`weaveffi.toml` next to it. Create one so the generated package manifests
+(`package.json`, `pyproject.toml`, `Package.swift`, and so on) carry your name
+and version:
+
+```toml
+[package]
+name = "my-math"
+version = "0.1.0"
+```
+
+The CLI picks up the nearest `weaveffi.toml` at or above the input file
+automatically; pass `--config` to point at a different one. The same file
+holds per-target options under `[generators.<target>]` tables; see
+[Configuration](guides/config.md).
 
 > **Writing a Rust producer?** You can make annotated Rust the single source of
 > truth instead of a separate IDL: annotate a module with `#[weaveffi::module]`
@@ -84,20 +90,25 @@ specification.
 Run the generator to produce bindings for all targets:
 
 ```bash
-weaveffi generate math.yml -o generated --scaffold
+weaveffi generate math.yml -o generated
 ```
 
-The `--scaffold` flag also emits a `scaffold.rs` with Rust FFI stubs you can
-use as a starting point. The output tree looks like:
+Pass `--target c,swift,node` to generate a subset. The output tree has one
+directory per target:
 
 ```text
 generated/
 ├── c/          # C header + convenience stubs
+├── cpp/        # RAII C++ header + CMakeLists.txt
 ├── swift/      # SwiftPM package + Swift wrapper
 ├── android/    # Kotlin JNI wrapper + Gradle skeleton
-├── node/       # N-API loader + TypeScript types
-├── wasm/       # Wasm loader stub
-└── scaffold.rs # Rust FFI function stubs
+├── node/       # N-API addon + TypeScript types
+├── wasm/       # JavaScript loader + TypeScript types
+├── python/     # ctypes bindings + .pyi stubs
+├── dotnet/     # C# P/Invoke bindings
+├── dart/       # dart:ffi bindings
+├── go/         # cgo bindings
+└── ruby/       # FFI gem bindings
 ```
 
 ## 4) Examine the generated output
@@ -161,9 +172,8 @@ export function add(a: number, b: number): number
 The generated C header (`generated/c/weaveffi.h`) is the contract your native
 library must satisfy, and it's the same contract every language binding calls
 into. You can implement it in any language that can expose a C ABI; here we use
-Rust, starting from the generated `scaffold.rs`, which already contains a
-`#[no_mangle] extern "C"` stub (with a `todo!()` body) for every symbol in the
-header.
+Rust and write the one `#[no_mangle] extern "C"` function the header declares
+by hand.
 
 Create a library crate, add the WeaveFFI ABI helpers, and build a `cdylib`:
 
@@ -180,8 +190,7 @@ In `Cargo.toml`:
 crate-type = ["cdylib"]
 ```
 
-Copy `scaffold.rs` into `src/lib.rs` and fill in the bodies. Implementing `add`
-looks like this:
+Implementing `add` in `src/lib.rs` looks like this:
 
 ```rust
 #![allow(unsafe_code)]
@@ -199,9 +208,9 @@ pub extern "C" fn weaveffi_math_add(
     a + b
 }
 
-// Emit the fixed WeaveFFI C ABI runtime surface (free_string, free_bytes,
-// error_clear, cancel_token_*) in one line. Call this exactly once per
-// cdylib.
+// Emit the fixed WeaveFFI C ABI runtime surface (abi_version, free_string,
+// free_bytes, error_clear, cancel_token_*) in one line. Call this exactly
+// once per cdylib.
 abi::export_runtime!();
 ```
 
@@ -214,6 +223,9 @@ Key points:
 - The library must export the WeaveFFI runtime symbols: invoke
   [`weaveffi_abi::export_runtime!()`][export-runtime-doc] to emit all of
   them in one line instead of writing each `#[no_mangle]` thunk by hand.
+  Among them is `weaveffi_abi_version()`, which the generated Python, Ruby,
+  Dart, Go, .NET, Node.js, and Wasm bindings call at load time to refuse a
+  library built against a different ABI revision.
 
 [export-runtime-doc]: https://docs.rs/weaveffi-abi/latest/weaveffi_abi/macro.export_runtime.html
 
@@ -276,64 +288,14 @@ add(3, 4) = 7
 
 ## Next steps
 
-- Run `weaveffi doctor` to check which platform toolchains are available.
 - Read the [IDL Schema](reference/idl.md) reference for all supported types
   and features.
 - Writing a Rust producer? See
-  [The Rust Producer Macro](guides/producer-macro.md) to skip the scaffold and
-  generate the C ABI directly from annotated Rust.
+  [The Rust Producer Macro](guides/producer-macro.md) to generate the C ABI
+  directly from annotated Rust instead of implementing the header by hand.
 - See the [Calculator tutorial](tutorials/calculator.md) for a full end-to-end
   walkthrough including Swift and Node.js.
 - Explore the [Generators](generators/README.md) section for target-specific
-  details.
-
-## Checking a single target
-
-`weaveffi doctor` runs every toolchain check it knows about. To narrow it
-down to a single target, pass `--target {name}`:
-
-```bash
-weaveffi doctor --target dart
-weaveffi doctor --target cpp
-weaveffi doctor --target go
-weaveffi doctor --target ruby
-weaveffi doctor --target dotnet
-weaveffi doctor --target python
-weaveffi doctor --target swift
-weaveffi doctor --target android
-weaveffi doctor --target node
-weaveffi doctor --target wasm
-```
-
-Only checks whose `applies_to` set contains the chosen target (plus the
-required Rust toolchain, which always runs) are executed. When `--target`
-is set the command exits with a non-zero status if any of those checks
-failed, making it scriptable in CI:
-
-```bash
-if ! weaveffi doctor --target dart; then
-  echo "Dart toolchain not ready" >&2
-  exit 1
-fi
-```
-
-For machine-readable output (handy for piping into `jq` or aggregating
-results across CI matrices), use `--format json`:
-
-```bash
-weaveffi doctor --target ruby --format json | jq '.[] | select(.ok == false)'
-```
-
-Each entry has `id`, `name`, `ok`, `version`, `hint`, and `applies_to` fields.
-
-## Generating Man Pages
-
-The CLI can generate its own man pages. Pass an output directory to `--out`:
-
-```bash
-mkdir -p ./man
-weaveffi man --out ./man
-man ./man/weaveffi.1
-```
-
-This writes `weaveffi.1` as well as one man page per subcommand (e.g., `weaveffi-generate.1`) into the specified directory.
+  details, and [Configuration](guides/config.md) for `weaveffi.toml`.
+- Add `weaveffi diff --check` to CI so regenerated bindings can't drift from
+  the committed ones; see [Stability and Versioning](stability.md).

@@ -70,6 +70,7 @@ export declare const Priority: Readonly<{
   /** High priority */
   High: 2;
 }>;
+export type Priority = (typeof Priority)[keyof typeof Priority];
 
 /** A pocket-sized interface exercising the object surface */
 export declare class Gadget {

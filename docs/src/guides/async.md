@@ -43,7 +43,7 @@ Avoid async for:
 ### 1. Declare the function in the IDL
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: net
     errors:

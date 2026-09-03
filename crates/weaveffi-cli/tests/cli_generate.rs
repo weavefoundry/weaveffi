@@ -5,7 +5,7 @@ use std::path::Path;
 fn generate_produces_expected_files() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -47,7 +47,7 @@ fn generate_produces_expected_files() {
 fn generate_with_target_filter() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -79,7 +79,7 @@ fn generate_with_target_filter() {
 fn generate_cpp_target_filter() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();
@@ -111,7 +111,7 @@ fn generate_cpp_target_filter() {
 fn validate_command_succeeds() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     assert_cmd::Command::cargo_bin("weaveffi")
         .expect("binary not found")
@@ -125,7 +125,7 @@ fn validate_command_succeeds() {
 fn quiet_flag_suppresses_output() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     let out_dir = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = out_dir.path();

@@ -26,10 +26,8 @@ gets them one of two ways:
   rustup target and a working cross-linker installed
   (`rustup target add aarch64-unknown-linux-gnu`, and so on).
 
-The two are mutually exclusive. Before a `--build` run, `weaveffi doctor --target
-package` reports which producer cross-targets are installed (and the
-`rustup target add` command for any that are missing), and exits non-zero if any
-are absent so it can gate the build in CI.
+The two are mutually exclusive. A `--build` run fails with the missing
+`rustup target add` command when a platform's Rust target isn't installed.
 
 ### The `--binaries` layout
 

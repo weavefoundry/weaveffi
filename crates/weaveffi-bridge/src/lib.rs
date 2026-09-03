@@ -554,6 +554,7 @@ fn extract_struct(item: &syn::ItemStruct) -> syn::Result<StructDef> {
     Ok(StructDef {
         name,
         doc: extract_doc(&item.attrs),
+        deprecated: parse_deprecated(&item.attrs).1,
         fields,
     })
 }
@@ -648,6 +649,7 @@ fn extract_enum(item: &syn::ItemEnum) -> syn::Result<EnumDef> {
     Ok(EnumDef {
         name,
         doc: extract_doc(&item.attrs),
+        deprecated: parse_deprecated(&item.attrs).1,
         variants,
     })
 }
@@ -749,6 +751,7 @@ pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
                     interfaces.push(InterfaceDef {
                         name: s.ident.to_string(),
                         doc: extract_doc(&s.attrs),
+                        deprecated: parse_deprecated(&s.attrs).1,
                         constructors: vec![],
                         methods: vec![],
                         statics: vec![],
@@ -798,6 +801,7 @@ pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
 
     Ok(Module {
         name,
+        doc: extract_doc(&item_mod.attrs),
         functions,
         interfaces,
         structs,
@@ -827,8 +831,6 @@ pub fn api_from_file(file: &syn::File) -> syn::Result<Api> {
     Ok(Api {
         version: CURRENT_SCHEMA_VERSION.to_string(),
         modules,
-        generators: None,
-        package: None,
     })
 }
 

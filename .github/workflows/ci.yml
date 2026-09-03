@@ -54,12 +54,12 @@ jobs:
       - name: Build CLI (release)
         run: cargo build -p weaveffi-cli --release
 
-      - name: Generate bindings from calculator IDL
+      - name: Generate bindings from calculator source
         shell: bash
         run: |
           BIN=target/release/weaveffi
           [ "${{ runner.os }}" = "Windows" ] && BIN="${BIN}.exe"
-          "$BIN" generate samples/calculator/calculator.yml -o generated
+          "$BIN" generate samples/calculator/src/lib.rs -o generated
 
       - name: Build sample producer cdylibs (debug)
         run: cargo build -p calculator -p contacts -p kvstore
@@ -186,8 +186,8 @@ jobs:
       - name: Build calculator cdylib (debug)
         run: cargo build -p calculator
 
-      - name: Generate bindings from calculator IDL
-        run: ./target/release/weaveffi.exe generate samples/calculator/calculator.yml -o generated
+      - name: Generate bindings from calculator source
+        run: ./target/release/weaveffi.exe generate samples/calculator/src/lib.rs -o generated
 
       - name: Verify generated bindings
         shell: pwsh
@@ -240,8 +240,8 @@ jobs:
 
       - name: Generate Android + C bindings for contacts
         run: |
-          target/release/weaveffi generate samples/contacts/contacts.yml -o generated --target c
-          target/release/weaveffi generate samples/contacts/contacts.yml -o generated --target android
+          target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target c
+          target/release/weaveffi generate samples/contacts/src/lib.rs -o generated --target android
 
       - name: Compile JNI shim with NDK clang
         env:

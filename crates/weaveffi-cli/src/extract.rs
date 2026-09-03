@@ -38,8 +38,8 @@ pub(crate) fn cmd_extract(
         .map_err(|e| miette!("failed to extract API from Rust source {input}:\n{e}"))?;
 
     // Serialize the resolved form when the API validates (so cross-module
-    // references are emitted qualified, matching `weaveffi format`); fall
-    // back to the raw extracted document under `--warn`.
+    // references are emitted qualified and stable across runs); fall back
+    // to the raw extracted document under `--warn`.
     let api = match weaveffi_core::validate::validate_api(api.clone(), None) {
         Ok(resolved) => resolved.api().clone(),
         Err(e) => {

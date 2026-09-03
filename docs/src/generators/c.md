@@ -79,7 +79,7 @@ helpers, is rewritten with the new prefix.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -374,7 +374,7 @@ macOS:
 
 ```bash
 cargo build -p contacts
-weaveffi generate samples/contacts/contacts.yml -o generated
+weaveffi generate samples/contacts/src/lib.rs -o generated
 
 cc -I generated/c conformance/c/contacts.c -L target/debug -lcontacts -o c_contacts
 DYLD_LIBRARY_PATH=target/debug ./c_contacts
@@ -384,7 +384,7 @@ Linux:
 
 ```bash
 cargo build -p contacts
-weaveffi generate samples/contacts/contacts.yml -o generated
+weaveffi generate samples/contacts/src/lib.rs -o generated
 
 cc -I generated/c conformance/c/contacts.c -L target/debug -lcontacts -o c_contacts
 LD_LIBRARY_PATH=target/debug ./c_contacts
@@ -394,7 +394,7 @@ Windows:
 
 ```powershell
 cargo build -p contacts
-weaveffi generate samples\contacts\contacts.yml -o generated
+weaveffi generate samples\contacts\src\lib.rs -o generated
 cl /I generated\c conformance\c\contacts.c /link contacts.lib
 .\contacts.exe
 ```

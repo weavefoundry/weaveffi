@@ -130,11 +130,11 @@ panics or traps instead of surfacing an error type. See the
 
 Yes, via two escape hatches in increasing order of power:
 
-1. **Generator config** (`--config cfg.toml` or inline `generators:`
-   table in the IDL). Controls Swift module names, Android package,
-   C prefix, C++ namespace, Dart/Go/Ruby package names, module-prefix
-   stripping (`strip_module_prefix`), and other per-target knobs. See
-   the [Generator Configuration guide](guides/config.md).
+1. **Project config** (`[generators.<target>]` tables in the
+   `weaveffi.toml` next to your definition). Controls Swift module
+   names, Android package, C prefix, C++ namespace, Dart/Go/Ruby package
+   names, module-prefix stripping (`strip_module_prefix`), and other
+   per-target knobs. See the [Project Configuration guide](guides/config.md).
 2. **Hook commands** (`pre_generate` / `post_generate` in the
    config). Run arbitrary shell commands before and after generation,
    useful for `prettier`, `swiftformat`, `gofmt`, etc.
@@ -202,9 +202,9 @@ ship it alongside the generated package. Three common patterns:
 
 The name, version, and metadata stamped into every generated manifest
 (`package.json`, `pyproject.toml`, `*.gemspec`, `*.csproj`, `pubspec.yaml`,
-`Package.swift`, `go.mod`, ...) come from a single
-[`package:` block](reference/idl.md#package-metadata) in your IDL, so you set
-your identity once and every ecosystem stays in sync.
+`Package.swift`, `go.mod`, ...) come from the single
+[`[package]` table](guides/config.md#package) of your `weaveffi.toml`, so you
+set your identity once and every ecosystem stays in sync.
 
 There is no opinionated "weaveffi publish" command today; you use
 each ecosystem's normal publish flow. The

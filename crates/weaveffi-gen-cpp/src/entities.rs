@@ -6,11 +6,11 @@ use std::collections::HashMap;
 
 use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, EnumBinding, ErrorBinding, InterfaceBinding, ModuleBinding, StructBinding,
 };
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{render_cpp_callable, FnKind};
 use crate::codec::emit_read_decl;
@@ -87,11 +87,11 @@ impl ValueDef<'_> {
 
 /// Collect the local names of value types (records and rich enums) reachable
 /// from `ty`, recursing through optional/list/map wrappers.
-fn collect_value_deps(ty: &TypeRef, deps: &mut Vec<String>) {
+fn collect_value_deps(ty: &Ty, deps: &mut Vec<String>) {
     match ty {
-        TypeRef::Record(n) | TypeRef::RichEnum(n) => deps.push(local_type_name(n).to_string()),
-        TypeRef::Optional(inner) | TypeRef::List(inner) => collect_value_deps(inner, deps),
-        TypeRef::Map(k, v) => {
+        Ty::Record(n) | Ty::RichEnum(n) => deps.push(local_type_name(n).to_string()),
+        Ty::Optional(inner) | Ty::List(inner) => collect_value_deps(inner, deps),
+        Ty::Map(k, v) => {
             collect_value_deps(k, deps);
             collect_value_deps(v, deps);
         }
@@ -103,10 +103,10 @@ fn collect_value_deps(ty: &TypeRef, deps: &mut Vec<String>) {
 /// signatures (returned or accepted by value, so their classes must be
 /// complete first).
 pub(crate) fn interface_deps(i: &InterfaceBinding) -> Vec<String> {
-    fn collect(ty: &TypeRef, deps: &mut Vec<String>) {
+    fn collect(ty: &Ty, deps: &mut Vec<String>) {
         match ty {
-            TypeRef::Interface(n) => deps.push(local_type_name(n).to_string()),
-            TypeRef::Optional(inner) | TypeRef::Iterator(inner) => collect(inner, deps),
+            Ty::Interface(n) => deps.push(local_type_name(n).to_string()),
+            Ty::Optional(inner) | Ty::Iterator(inner) => collect(inner, deps),
             _ => {}
         }
     }

@@ -15,9 +15,9 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use weaveffi_core::abi::{is_buffered, CType};
+use weaveffi_core::abi::CType;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{FieldBinding, ParamBinding};
-use weaveffi_ir::ir::TypeRef;
 
 use super::helpers::{ident, is_copy, rust_type_ident, sentinel};
 use super::unsupported;
@@ -55,7 +55,7 @@ pub(crate) fn lift_param(
     // call site. A malformed buffer is a producer/consumer contract
     // violation, reported through `out_err` with the reserved marshalling
     // code so it can't shadow a domain's typed codes.
-    if is_buffered(&pb.ty) {
+    if pb.ty.is_buffered() {
         let ptr = ident(&format!("{}_ptr", pb.name));
         let len = ident(&format!("{}_len", pb.name));
         let slice = buffer_slice_expr(&ptr, &len);
@@ -81,8 +81,8 @@ pub(crate) fn lift_param(
     }
 
     Ok(match &pb.ty {
-        ty if is_copy(ty) && !matches!(ty, TypeRef::Enum(_)) => (TokenStream::new(), owned()),
-        TypeRef::Enum(enum_name) => {
+        ty if is_copy(ty) && !matches!(ty, Ty::Enum(_)) => (TokenStream::new(), owned()),
+        Ty::Enum(enum_name) => {
             let et = rust_type_ident(enum_name);
             let pre = quote! {
                 let #name = match #et::__weaveffi_from_i32(#name) {
@@ -99,7 +99,7 @@ pub(crate) fn lift_param(
             };
             (pre, owned())
         }
-        TypeRef::StringUtf8 => {
+        Ty::StringUtf8 => {
             let pre = quote! {
                 let #name = match ::weaveffi::abi::c_ptr_to_string(#name) {
                     ::std::option::Option::Some(__s) => __s,
@@ -118,7 +118,7 @@ pub(crate) fn lift_param(
         // A borrowed string is lifted zero-copy: the thunk borrows the
         // caller's NUL-terminated buffer for the duration of the call, which
         // is the whole point of a producer taking `&str` over `String`.
-        TypeRef::BorrowedStr => {
+        Ty::BorrowedStr => {
             let pre = quote! {
                 // SAFETY: the C contract guarantees the argument is null or a
                 // NUL-terminated string valid for the duration of the call.
@@ -136,7 +136,7 @@ pub(crate) fn lift_param(
             };
             (pre, owned())
         }
-        TypeRef::Bytes => {
+        Ty::Bytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
             let len = ident(&format!("{}_len", pb.name));
             (
@@ -144,7 +144,7 @@ pub(crate) fn lift_param(
                 owned(),
             )
         }
-        TypeRef::BorrowedBytes => {
+        Ty::BorrowedBytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
             let len = ident(&format!("{}_len", pb.name));
             (
@@ -154,7 +154,7 @@ pub(crate) fn lift_param(
         }
         // An interface parameter borrows the caller-owned object for the call;
         // the slot is a `const {tag}*`, so the producer must accept `&T`.
-        TypeRef::Interface(_) => {
+        Ty::Interface(_) => {
             if !is_ref {
                 return Err(unsupported(
                     &pb.name,
@@ -175,11 +175,11 @@ pub(crate) fn lift_param(
             };
             (pre, owned())
         }
-        TypeRef::TypedHandle(_) => (TokenStream::new(), owned()),
+        Ty::TypedHandle(_) => (TokenStream::new(), owned()),
         // Only `Interface?` is optional and unbuffered; the macro does not
         // marshal it yet.
-        TypeRef::Optional(_) => return Err(unsupported(&pb.name, "optional interface parameter")),
-        TypeRef::Iterator(_) => return Err(unsupported(&pb.name, "iterator parameter")),
+        Ty::Optional(_) => return Err(unsupported(&pb.name, "optional interface parameter")),
+        Ty::Iterator(_) => return Err(unsupported(&pb.name, "iterator parameter")),
         _ => return Err(unsupported(&pb.name, "parameter type")),
     })
 }
@@ -191,10 +191,10 @@ pub(crate) fn lift_param(
 /// [`weaveffi_core::plan::return_free`]: strings are released with
 /// `{prefix}_free_string`, byte and value buffers with `{prefix}_free_bytes`,
 /// and owned interface pointers with the type's `_destroy` symbol.
-pub(crate) fn lower_value(ty: &TypeRef, value: TokenStream) -> syn::Result<TokenStream> {
+pub(crate) fn lower_value(ty: &Ty, value: TokenStream) -> syn::Result<TokenStream> {
     // A buffered return is encoded into a producer-allocated value buffer and
     // returned exactly like a bytes return: base pointer plus `*out_len`.
-    if is_buffered(ty) {
+    if ty.is_buffered() {
         return Ok(quote! {
             unsafe {
                 ::weaveffi::abi::lower_bytes(
@@ -205,25 +205,25 @@ pub(crate) fn lower_value(ty: &TypeRef, value: TokenStream) -> syn::Result<Token
         });
     }
     Ok(match ty {
-        t if is_copy(t) && !matches!(t, TypeRef::Enum(_)) => value,
-        TypeRef::Enum(_) => quote!((#value) as i32),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        t if is_copy(t) && !matches!(t, Ty::Enum(_)) => value,
+        Ty::Enum(_) => quote!((#value) as i32),
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             quote!(::weaveffi::abi::string_to_c_ptr(&(#value)))
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::Bytes | Ty::BorrowedBytes => {
             quote!(unsafe { ::weaveffi::abi::lower_bytes(#value, out_len) })
         }
         // A returned interface moves to the heap; the caller owns the new
         // reference and releases it with the type's `_destroy` symbol
         // (`ReturnFree::OwnedObject` in the plan).
-        TypeRef::Interface(_) => {
+        Ty::Interface(_) => {
             quote!(::std::boxed::Box::into_raw(::std::boxed::Box::new(#value)))
         }
-        TypeRef::TypedHandle(_) => value,
+        Ty::TypedHandle(_) => value,
         // Only `Interface?` is optional and unbuffered; the macro does not
         // marshal it yet.
-        TypeRef::Optional(_) => return Err(unsupported("return", "optional interface return")),
-        TypeRef::Iterator(_) => return Err(unsupported("return", "iterator return")),
+        Ty::Optional(_) => return Err(unsupported("return", "optional interface return")),
+        Ty::Iterator(_) => return Err(unsupported("return", "iterator return")),
         _ => return Err(unsupported("return", "return type")),
     })
 }
@@ -237,7 +237,7 @@ pub(crate) fn lower_value(ty: &TypeRef, value: TokenStream) -> syn::Result<Token
 /// matched code's serialized payload fields; `Trap` leaves `out_err` to the
 /// panic path only).
 pub(crate) fn build_call_body(
-    ret_ty: &Option<TypeRef>,
+    ret_ty: &Option<Ty>,
     ret_ctype: &CType,
     is_throws: bool,
     call: TokenStream,
@@ -300,7 +300,7 @@ pub(crate) fn build_call_body(
 /// exception is a typed handle, whose pointer identity crosses as a `u64`.
 pub(crate) fn field_write_stmt(field: &FieldBinding, access: TokenStream) -> TokenStream {
     match &field.ty {
-        TypeRef::TypedHandle(_) => quote!(__wv_w.write_u64(#access as u64);),
+        Ty::TypedHandle(_) => quote!(__wv_w.write_u64(#access as u64);),
         _ => quote!(::weaveffi::abi::BufferValue::write_value(&#access, __wv_w);),
     }
 }
@@ -312,7 +312,7 @@ pub(crate) fn field_write_stmt(field: &FieldBinding, access: TokenStream) -> Tok
 /// what decoding targets.
 pub(crate) fn field_read_expr(field: &FieldBinding) -> TokenStream {
     match &field.ty {
-        TypeRef::TypedHandle(_) => quote!(__wv_r.read_u64().map(|__v| __v as _)),
+        Ty::TypedHandle(_) => quote!(__wv_r.read_u64().map(|__v| __v as _)),
         _ => quote!(::weaveffi::abi::BufferValue::read_value(__wv_r)),
     }
 }
@@ -322,7 +322,7 @@ pub(crate) fn field_read_expr(field: &FieldBinding) -> TokenStream {
 /// [`field_write_stmt`] with reference access.
 pub(crate) fn field_write_stmt_ref(field: &FieldBinding, binding: &syn::Ident) -> TokenStream {
     match &field.ty {
-        TypeRef::TypedHandle(_) => quote!(__wv_w.write_u64(*#binding as u64);),
+        Ty::TypedHandle(_) => quote!(__wv_w.write_u64(*#binding as u64);),
         _ => quote!(::weaveffi::abi::BufferValue::write_value(#binding, __wv_w);),
     }
 }

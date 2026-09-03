@@ -3,9 +3,9 @@
 //! assembler that composes them with the runtime prelude.
 
 use heck::ToLowerCamelCase;
-use weaveffi_core::abi::is_buffered;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::{type_name as error_type_name, ERROR_BRAND};
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, ErrorBinding, FnBinding, InterfaceBinding, ListenerBinding, ModuleBinding,
     ParamBinding,
@@ -14,7 +14,6 @@ use weaveffi_core::plan::ArgPass;
 use weaveffi_core::utils::{
     local_type_name, render_prelude, render_trailer, wrapper_name, CommentStyle,
 };
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{
     js_read_expr, js_reader_fn, js_writer_fn, model_uses_buffers, render_pack_fns_js,
@@ -36,10 +35,10 @@ struct RetWrap {
 }
 
 /// Recognize a class-typed (interface) return, direct or optional.
-fn js_ret_wrap(ret: Option<&TypeRef>) -> Option<RetWrap> {
-    fn direct(ty: &TypeRef, optional: bool) -> Option<RetWrap> {
+fn js_ret_wrap(ret: Option<&Ty>) -> Option<RetWrap> {
+    fn direct(ty: &Ty, optional: bool) -> Option<RetWrap> {
         match ty {
-            TypeRef::Interface(n) => Some(RetWrap {
+            Ty::Interface(n) => Some(RetWrap {
                 cls: local_type_name(n).to_string(),
                 optional,
             }),
@@ -47,7 +46,7 @@ fn js_ret_wrap(ret: Option<&TypeRef>) -> Option<RetWrap> {
         }
     }
     match ret? {
-        TypeRef::Optional(inner) => direct(inner, true),
+        Ty::Optional(inner) => direct(inner, true),
         ty => direct(ty, false),
     }
 }
@@ -61,9 +60,9 @@ fn js_arg_expr(js_name: &str, p: &ParamBinding) -> String {
         ArgPass::Buffer { .. } => format!("__encode({}, {js_name})", js_writer_fn(&p.ty)),
         ArgPass::Object { .. } => {
             let cls = match &p.ty {
-                TypeRef::Interface(n) => local_type_name(n),
-                TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Interface(n) => local_type_name(n),
+                Ty::Interface(n) => local_type_name(n),
+                Ty::Optional(inner) => match inner.as_ref() {
+                    Ty::Interface(n) => local_type_name(n),
                     other => unreachable!("non-interface optional is buffered: {other:?}"),
                 },
                 other => unreachable!("object-passed parameter with type {other:?}"),
@@ -220,11 +219,11 @@ fn emit_wrapper_body_js(
     };
     let call = format!("{invoke}(addon.{addon_name}, [{args}], {map_expr})");
 
-    if let Some(TypeRef::Iterator(inner)) = f.ret.as_ref() {
+    if let Some(Ty::Iterator(inner)) = f.ret.as_ref() {
         // Launch, then wrap the external in the lazy iterator: one native
         // `next` per consumer step, `destroy` on exhaustion or early exit.
         // Buffered elements arrive as encoded buffers decoded per step.
-        let wrap_elem = if is_buffered(inner) {
+        let wrap_elem = if inner.is_buffered() {
             format!("(_e) => __decode({}, _e)", js_reader_fn(inner))
         } else {
             "null".to_string()
@@ -237,7 +236,7 @@ fn emit_wrapper_body_js(
     }
 
     if let Some(ret) = f.ret.as_ref() {
-        if is_buffered(ret) {
+        if ret.is_buffered() {
             let reader = js_reader_fn(ret);
             if f.is_async {
                 w.line(format!(
@@ -404,7 +403,7 @@ fn render_listener_wrapper_js(
     let Some(cb) = m.callback(&l.event_callback) else {
         return;
     };
-    if !cb.params.iter().any(|p| is_buffered(&p.ty)) {
+    if !cb.params.iter().any(|p| p.ty.is_buffered()) {
         return;
     }
     let register = js_fn_name(&m.path, &format!("register_{}", l.name), strip);
@@ -414,7 +413,7 @@ fn render_listener_wrapper_js(
         .iter()
         .map(|p| {
             let n = js_param_name(&p.name);
-            if is_buffered(&p.ty) {
+            if p.ty.is_buffered() {
                 format!("__decode({}, {n})", js_reader_fn(&p.ty))
             } else {
                 n

@@ -20,9 +20,9 @@ measure the full code-generation surface (all 11 generators) end-to-end.
 
 | Benchmark                   | Target  | Inputs                                                  |
 | --------------------------- | ------- | ------------------------------------------------------- |
-| `validate_kitchen_sink`     | < 5 ms  | `crates/weaveffi-cli/tests/fixtures/06_kitchen_sink.yml` |
+| `validate_kitchen_sink`     | < 5 ms  | `crates/weaveffi-cli/tests/fixtures/kitchen_sink.yml`    |
 | `hash_kitchen_sink`         | < 1 ms  | Same fixture, post-validation                           |
-| `full_codegen_calculator`   | < 500 ms| `samples/calculator/calculator.yml`, all 11 generators  |
+| `full_codegen_calculator`   | < 500 ms| `samples/calculator/src/lib.rs`, all 11 generators      |
 | `full_codegen_kitchen_sink` | < 2000 ms | Kitchen-sink fixture, all 11 generators                |
 
 A regression that pushes any of these benchmarks past its target is a

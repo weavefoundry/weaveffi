@@ -4,14 +4,13 @@
 
 use std::fmt::Write as _;
 
-use weaveffi_core::abi;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, CallbackBinding, FnBinding, InterfaceBinding, IteratorBinding, ListenerBinding,
     ModuleBinding, ParamBinding,
 };
 use weaveffi_core::plan::{self, ArgPass, ElemFree, RetPass};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::interface_native_name;
 use crate::docs::splice;
@@ -81,8 +80,8 @@ pub(crate) fn render_jni_sync_export(
 
     // Bytes and buffered returns share the `const uint8_t*` + trailing
     // `size_t* out_len` shape.
-    let needs_out_len = matches!(f.ret, Some(TypeRef::Bytes | TypeRef::BorrowedBytes))
-        || f.ret.as_ref().is_some_and(abi::is_buffered);
+    let needs_out_len = matches!(f.ret, Some(Ty::Bytes | Ty::BorrowedBytes))
+        || f.ret.as_ref().is_some_and(Ty::is_buffered);
     if needs_out_len {
         let _ = writeln!(jni_c, "    size_t out_len = 0;");
     }
@@ -200,9 +199,9 @@ pub(crate) fn render_jni_interface(
 /// the pinned `WeaveContinuation`. Buffered results arrive as an owned
 /// `(result_ptr, result_len)` pair, copied into a `jbyteArray` the Kotlin
 /// wrapper decodes and then released with `weaveffi_free_bytes`.
-fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
+fn write_jni_box_result(out: &mut String, ret: Option<&Ty>) {
     let mut w = CodeWriter::four_space().with_depth(2);
-    if ret.is_some_and(abi::is_buffered) {
+    if ret.is_some_and(Ty::is_buffered) {
         w.line("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);");
         w.line("if (boxed && result_ptr) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result_ptr); }");
         w.line("weaveffi_free_bytes((uint8_t*)result_ptr, result_len);");
@@ -218,54 +217,54 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
         None => {
             w.line("jobject boxed = NULL;");
         }
-        Some(TypeRef::I8 | TypeRef::U8) => {
+        Some(Ty::I8 | Ty::U8) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Byte\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(B)Ljava/lang/Byte;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jbyte)result);");
         }
-        Some(TypeRef::I16 | TypeRef::U16) => {
+        Some(Ty::I16 | Ty::U16) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Short\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(S)Ljava/lang/Short;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jshort)result);");
         }
-        Some(TypeRef::I32 | TypeRef::Enum(_)) => {
+        Some(Ty::I32 | Ty::Enum(_)) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Integer\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(I)Ljava/lang/Integer;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jint)result);");
         }
-        Some(TypeRef::U32 | TypeRef::I64 | TypeRef::U64 | TypeRef::Handle) => {
+        Some(Ty::U32 | Ty::I64 | Ty::U64 | Ty::Handle) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)result);");
         }
         // A typed handle or owned interface result arrives as a pointer slot;
         // the boxed `Long` carries the pointer bits for the wrapper to adopt.
-        Some(TypeRef::TypedHandle(_) | TypeRef::Interface(_)) => {
+        Some(Ty::TypedHandle(_) | Ty::Interface(_)) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Long\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(J)Ljava/lang/Long;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jlong)(intptr_t)result);");
         }
-        Some(TypeRef::F64) => {
+        Some(Ty::F64) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Double\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(D)Ljava/lang/Double;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jdouble)result);");
         }
-        Some(TypeRef::F32) => {
+        Some(Ty::F32) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Float\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(F)Ljava/lang/Float;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, (jfloat)result);");
         }
-        Some(TypeRef::Bool) => {
+        Some(Ty::Bool) => {
             w.line("jclass boxCls = (*env)->FindClass(env, \"java/lang/Boolean\");");
             w.line("jmethodID valueOf = (*env)->GetStaticMethodID(env, boxCls, \"valueOf\", \"(Z)Ljava/lang/Boolean;\");");
             w.line("jobject boxed = (*env)->CallStaticObjectMethod(env, boxCls, valueOf, result ? JNI_TRUE : JNI_FALSE);");
         }
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+        Some(Ty::StringUtf8 | Ty::BorrowedStr) => {
             // Owned by the consumer: copy, then free.
             w.line("jobject boxed = result ? (jobject)(*env)->NewStringUTF(env, result) : (jobject)(*env)->NewStringUTF(env, \"\");");
             w.line("weaveffi_free_string(result);");
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+        Some(Ty::Bytes | Ty::BorrowedBytes) => {
             // Owned by the consumer: copy, then free.
             w.line("jbyteArray boxed = (*env)->NewByteArray(env, (jsize)result_len);");
             w.line("if (boxed && result) { (*env)->SetByteArrayRegion(env, boxed, 0, (jsize)result_len, (const jbyte*)result); }");
@@ -273,23 +272,16 @@ fn write_jni_box_result(out: &mut String, ret: Option<&TypeRef>) {
         }
         // Only `Interface?` reaches here (every other optional is buffered):
         // a nullable owned pointer boxed as `Long`, null crossing as `null`.
-        Some(TypeRef::Optional(_)) => {
+        Some(Ty::Optional(_)) => {
             w.line("jobject boxed = NULL;");
             w.block("if (result != NULL) {", "}", |w| {
                 splice(w, |o| {
-                    write_boxed_scalar(o, &TypeRef::Handle, "_opt", "(intptr_t)result", "        ")
+                    write_boxed_scalar(o, &Ty::Handle, "_opt", "(intptr_t)result", "        ")
                 });
                 w.line("boxed = _opt;");
             });
         }
-        Some(
-            TypeRef::Record(_)
-            | TypeRef::RichEnum(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-            | TypeRef::Iterator(_)
-            | TypeRef::Named(_),
-        ) => {
+        Some(Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) | Ty::Iterator(_)) => {
             unreachable!("buffered results are handled above; iterators cannot be async")
         }
     }
@@ -451,7 +443,7 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
     let slots = &p.abi;
     let n0 = c_local(&slots[0].name);
     let mut w = CodeWriter::four_space().with_depth(1);
-    if abi::is_buffered(&p.ty) {
+    if p.ty.is_buffered() {
         let n1 = &slots[1].name;
         w.line(format!(
             "jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
@@ -463,27 +455,27 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
         return;
     }
     match &p.ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64
-        | TypeRef::Bool
-        | TypeRef::Enum(_)
-        | TypeRef::Handle => {
+        Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::I64
+        | Ty::U64
+        | Ty::F32
+        | Ty::F64
+        | Ty::Bool
+        | Ty::Enum(_)
+        | Ty::Handle => {
             splice(&mut w, |o| write_boxed_scalar(o, &p.ty, var, &n0, "    "));
         }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             w.line(format!(
                 "jobject {var} = {n0} ? (jobject)(*env)->NewStringUTF(env, {n0}) : (jobject)(*env)->NewStringUTF(env, \"\");"
             ));
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::Bytes | Ty::BorrowedBytes => {
             let n1 = &slots[1].name;
             w.line(format!(
                 "jbyteArray {var} = (*env)->NewByteArray(env, (jsize){n1});"
@@ -492,20 +484,20 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
                 "if ({var} && {n0}) {{ (*env)->SetByteArrayRegion(env, {var}, 0, (jsize){n1}, (const jbyte*){n0}); }}"
             ));
         }
-        TypeRef::TypedHandle(_) | TypeRef::Interface(_) => {
+        Ty::TypedHandle(_) | Ty::Interface(_) => {
             splice(&mut w, |o| {
-                write_boxed_scalar(o, &TypeRef::Handle, var, &format!("(intptr_t){n0}"), "    ")
+                write_boxed_scalar(o, &Ty::Handle, var, &format!("(intptr_t){n0}"), "    ")
             });
         }
         // Only `Interface?` reaches here: a nullable borrowed pointer boxed
         // as `Long`, null crossing as `null`.
-        TypeRef::Optional(_) => {
+        Ty::Optional(_) => {
             w.line(format!("jobject {var} = NULL;"));
             w.block(format!("if ({n0}) {{"), "}", |w| {
                 splice(w, |o| {
                     write_boxed_scalar(
                         o,
-                        &TypeRef::Handle,
+                        &Ty::Handle,
                         &format!("{var}_box"),
                         &format!("(intptr_t){n0}"),
                         "        ",
@@ -514,11 +506,10 @@ fn write_jni_cb_box_arg(out: &mut String, p: &ParamBinding, var: &str) {
                 w.line(format!("{var} = {var}_box;"));
             });
         }
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered callback arguments are handled above")
         }
-        TypeRef::Iterator(_) => unreachable!("validation rejects iterator callback params"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        Ty::Iterator(_) => unreachable!("validation rejects iterator callback params"),
     }
     out.push_str(&w.finish());
 }
@@ -610,7 +601,7 @@ pub(crate) fn render_jni_listener_fns(
     );
     // When the callback has buffered params, the Kotlin external is the
     // private `{register}Jni` behind the decoding wrapper.
-    if cb.params.iter().any(|p| abi::is_buffered(&p.ty)) {
+    if cb.params.iter().any(|p| p.ty.is_buffered()) {
         register_kt.push_str("Jni");
     }
     let unregister_kt = kotlin_fn_name(
@@ -765,9 +756,9 @@ fn build_c_call_args(args: &mut Vec<String>, p: &ParamBinding, module: &str, c_p
         // nullable spelling passes the unboxed pointer value acquired above.
         ArgPass::Object { nullable, .. } => {
             let iname = match &p.ty {
-                TypeRef::Interface(iname) => iname,
-                TypeRef::Optional(inner) => match inner.as_ref() {
-                    TypeRef::Interface(iname) => iname,
+                Ty::Interface(iname) => iname,
+                Ty::Optional(inner) => match inner.as_ref() {
+                    Ty::Interface(iname) => iname,
                     _ => unreachable!("non-interface optionals are buffered"),
                 },
                 _ => unreachable!("object-passed parameters are interfaces"),
@@ -780,26 +771,26 @@ fn build_c_call_args(args: &mut Vec<String>, p: &ParamBinding, module: &str, c_p
             }
         }
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Bool => args.push(format!("(bool)({} == JNI_TRUE)", name)),
-            TypeRef::I8 => args.push(format!("(int8_t){}", name)),
-            TypeRef::U8 => args.push(format!("(uint8_t){}", name)),
-            TypeRef::I16 => args.push(format!("(int16_t){}", name)),
-            TypeRef::U16 => args.push(format!("(uint16_t){}", name)),
-            TypeRef::I32 => args.push(format!("(int32_t){}", name)),
-            TypeRef::U32 => args.push(format!("(uint32_t){}", name)),
-            TypeRef::I64 => args.push(format!("(int64_t){}", name)),
-            TypeRef::U64 => args.push(format!("(uint64_t){}", name)),
-            TypeRef::F32 => args.push(format!("(float){}", name)),
-            TypeRef::F64 => args.push(format!("(double){}", name)),
-            TypeRef::Handle => args.push(format!("(weaveffi_handle_t){}", name)),
+            Ty::Bool => args.push(format!("(bool)({} == JNI_TRUE)", name)),
+            Ty::I8 => args.push(format!("(int8_t){}", name)),
+            Ty::U8 => args.push(format!("(uint8_t){}", name)),
+            Ty::I16 => args.push(format!("(int16_t){}", name)),
+            Ty::U16 => args.push(format!("(uint16_t){}", name)),
+            Ty::I32 => args.push(format!("(int32_t){}", name)),
+            Ty::U32 => args.push(format!("(uint32_t){}", name)),
+            Ty::I64 => args.push(format!("(int64_t){}", name)),
+            Ty::U64 => args.push(format!("(uint64_t){}", name)),
+            Ty::F32 => args.push(format!("(float){}", name)),
+            Ty::F64 => args.push(format!("(double){}", name)),
+            Ty::Handle => args.push(format!("(weaveffi_handle_t){}", name)),
             // A typed handle lowers to the owner-qualified C struct pointer
             // (mutable receiver), so the cross-module JNI shim must cast
             // through that pointer rather than the generic integer handle.
-            TypeRef::TypedHandle(sname) => {
+            Ty::TypedHandle(sname) => {
                 let c_struct = weaveffi_core::utils::c_abi_struct_name(sname, module, c_prefix);
                 args.push(format!("({}*)(intptr_t){}", c_struct, name));
             }
-            TypeRef::Enum(_) => args.push(format!("(int32_t){}", name)),
+            Ty::Enum(_) => args.push(format!("(int32_t){}", name)),
             other => unreachable!("{other:?} is not passed directly"),
         },
     }
@@ -831,7 +822,7 @@ fn write_return_handling(
     jni_c: &mut String,
     c_sym: &str,
     call_args: &[String],
-    returns: Option<&TypeRef>,
+    returns: Option<&Ty>,
     params: &[ParamBinding],
     module: &str,
     c_prefix: &str,
@@ -873,10 +864,10 @@ fn write_return_handling(
         // returns a nullable owned pointer, boxed for Kotlin's `Long?` as a
         // `java.lang.Long` or NULL.
         RetPass::Object { nullable: true, .. } => {
-            let TypeRef::Optional(inner) = ret_type else {
+            let Ty::Optional(inner) = ret_type else {
                 unreachable!("nullable object returns are optionals")
             };
-            let TypeRef::Interface(iname) = inner.as_ref() else {
+            let Ty::Interface(iname) = inner.as_ref() else {
                 unreachable!("non-interface optionals are buffered")
             };
             let c_ty = weaveffi_core::utils::c_abi_struct_name(iname, module, c_prefix);
@@ -894,7 +885,7 @@ fn write_return_handling(
         | RetPass::Object {
             nullable: false, ..
         } => match ret_type {
-            TypeRef::Bool => {
+            Ty::Bool => {
                 w.line(format!("bool rv = {}({});", c_sym, call_with_err));
                 splice(&mut w, |o| release_jni_resources(o, params));
                 splice(&mut w, |o| write_error_check(o, returns, thrower));
@@ -904,7 +895,7 @@ fn write_return_handling(
             // so the return variable must be that pointer (not the generic
             // integer handle) and round-trip through `intptr_t`. The untyped
             // `Handle` case stays in the scalar fallthrough below.
-            TypeRef::TypedHandle(name) => {
+            Ty::TypedHandle(name) => {
                 let c_ty = weaveffi_core::utils::c_abi_struct_name(name, module, c_prefix);
                 w.line(format!("{}* rv = {}({});", c_ty, c_sym, call_with_err));
                 splice(&mut w, |o| release_jni_resources(o, params));
@@ -926,71 +917,71 @@ fn write_return_handling(
 
 /// The C declaration type of an iterator's `out_item` pointee, rendered from
 /// the same lowering the C header uses.
-fn iter_item_c_type(elem: &TypeRef, module: &str, c_prefix: &str) -> String {
+fn iter_item_c_type(elem: &Ty, module: &str, c_prefix: &str) -> String {
     weaveffi_core::model::iterator_item_ctype(elem, module).render_c(c_prefix)
 }
 
 /// Box one iterator element scalar `src` (a plain lvalue) into a JVM
 /// reference `var`.
-fn write_boxed_scalar(out: &mut String, ty: &TypeRef, var: &str, src: &str, indent: &str) {
+fn write_boxed_scalar(out: &mut String, ty: &Ty, var: &str, src: &str, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     match ty {
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             w.line(format!(
                 "jstring {v} = {s} ? (*env)->NewStringUTF(env, {s}) : (*env)->NewStringUTF(env, \"\");",
                 v = var, s = src
             ));
         }
-        TypeRef::I8 | TypeRef::U8 => {
+        Ty::I8 | Ty::U8 => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Byte\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(B)Ljava/lang/Byte;\"), (jbyte){s});", v = var, s = src));
         }
-        TypeRef::I16 | TypeRef::U16 => {
+        Ty::I16 | Ty::U16 => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Short\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(S)Ljava/lang/Short;\"), (jshort){s});", v = var, s = src));
         }
-        TypeRef::I32 | TypeRef::Enum(_) => {
+        Ty::I32 | Ty::Enum(_) => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Integer\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(I)Ljava/lang/Integer;\"), (jint){s});", v = var, s = src));
         }
-        TypeRef::U32 | TypeRef::I64 | TypeRef::U64 => {
+        Ty::U32 | Ty::I64 | Ty::U64 => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong){s});", v = var, s = src));
         }
-        TypeRef::TypedHandle(_) | TypeRef::Handle | TypeRef::Interface(_) => {
+        Ty::TypedHandle(_) | Ty::Handle | Ty::Interface(_) => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Long\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(J)Ljava/lang/Long;\"), (jlong)(intptr_t){s});", v = var, s = src));
         }
-        TypeRef::F32 => {
+        Ty::F32 => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Float\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(F)Ljava/lang/Float;\"), (jfloat){s});", v = var, s = src));
         }
-        TypeRef::F64 => {
+        Ty::F64 => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Double\");",
                 v = var
             ));
             w.line(format!("jobject {v} = (*env)->CallStaticObjectMethod(env, {v}_cls, (*env)->GetStaticMethodID(env, {v}_cls, \"valueOf\", \"(D)Ljava/lang/Double;\"), (jdouble){s});", v = var, s = src));
         }
-        TypeRef::Bool => {
+        Ty::Bool => {
             w.line(format!(
                 "jclass {v}_cls = (*env)->FindClass(env, \"java/lang/Boolean\");",
                 v = var
@@ -1021,7 +1012,7 @@ fn write_iterator_launch(
 ) {
     let args_str = call_args.join(", ");
     let launch_call = join_call_args(&args_str, "&err");
-    let iter_ret = TypeRef::Iterator(Box::new(it.elem.clone()));
+    let iter_ret = Ty::Iterator(Box::new(it.elem.clone()));
 
     let mut w = CodeWriter::four_space().with_depth(1);
     w.line(format!(
@@ -1060,7 +1051,7 @@ pub(crate) fn render_jni_iterator_natives(
     // Only `Interface?` elements stay a nullable pointer (boxed as 0L for
     // none); every other optional is buffered.
     let leaf = match &it.elem {
-        TypeRef::Optional(inner) => inner.as_ref(),
+        Ty::Optional(inner) => inner.as_ref(),
         other => other,
     };
 
@@ -1135,7 +1126,7 @@ pub(crate) fn render_jni_iterator_natives(
 
 /// Emit the `if (err.code != 0)` check dispatching to `thrower` and exiting
 /// with the JNI default return for `ret_type`.
-fn write_error_check(out: &mut String, ret_type: Option<&TypeRef>, thrower: &str) {
+fn write_error_check(out: &mut String, ret_type: Option<&Ty>, thrower: &str) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.block("if (err.code != 0) {", "}", |w| {
         w.line(format!("{thrower}(env, &err);"));

@@ -61,9 +61,8 @@ impl fmt::Display for Feature {
     }
 }
 
-/// The feature set a generator implements. Declared by every backend via
-/// [`LanguageBackend::capabilities`](crate::backend::LanguageBackend::capabilities)
-/// / [`Generator::capabilities`](crate::codegen::Generator::capabilities).
+/// The feature set a backend implements. Declared by every backend via
+/// [`LanguageBackend::capabilities`](crate::backend::LanguageBackend::capabilities).
 ///
 /// There is intentionally no `Default` impl: a backend must state what it
 /// supports explicitly so a new gated feature cannot be claimed by omission.
@@ -128,8 +127,20 @@ fn collect_module(module: &Module, parent: &str, used: &mut BTreeMap<Feature, Ve
             .or_default()
             .push(format!("{path}.{}", l.name));
     }
-    for f in &module.functions {
-        let loc = format!("{path}.{}", f.name);
+    let members = module.interfaces.iter().flat_map(|i| {
+        i.constructors
+            .iter()
+            .chain(&i.methods)
+            .chain(&i.statics)
+            .map(move |f| (format!("{}.{}", i.name, f.name), f))
+    });
+    for (name, f) in module
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f))
+        .chain(members)
+    {
+        let loc = format!("{path}.{name}");
         if f.r#async {
             used.entry(Feature::AsyncFunctions)
                 .or_default()
@@ -168,8 +179,9 @@ impl fmt::Display for UnsupportedFeatures {
         write!(
             f,
             "remove the unsupported declarations, drop '{}' from --target, or set \
-             `generators.{}.allow_unsupported: true` in the IDL to generate the supported \
-             surface anyway (unsupported entry points become explicit throwing stubs)",
+             `allow_unsupported = true` under `[generators.{}]` in weaveffi.toml to generate \
+             the supported surface anyway (unsupported entry points become explicit throwing \
+             stubs)",
             self.target, self.target
         )
     }
@@ -230,6 +242,7 @@ mod tests {
     fn module(name: &str) -> Module {
         Module {
             name: name.into(),
+            doc: None,
             functions: vec![],
             interfaces: vec![],
             structs: vec![],
@@ -243,10 +256,8 @@ mod tests {
 
     fn api(modules: Vec<Module>) -> Api {
         Api {
-            version: "0.7.0".into(),
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
             modules,
-            generators: None,
-            package: None,
         }
     }
 

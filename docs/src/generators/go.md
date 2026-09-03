@@ -53,7 +53,7 @@ Booleans map to `C._Bool`, matching CGo's representation of `_Bool`.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -181,22 +181,12 @@ C.weaveffi_free_bytes(raw, cOutLen)
 ids := /* generated unpack routine over buf */
 ```
 
-The Go module path defaults to `weaveffi`; override it via the
-generator config:
+The Go module path follows the `[package]` name in `weaveffi.toml`
+(falling back to `weaveffi`); override it directly with:
 
-```yaml
-version: "0.7.0"
-modules:
-  - name: math
-    functions:
-      - name: add
-        params:
-          - { name: a, type: i32 }
-          - { name: b, type: i32 }
-        return: i32
-generators:
-  go:
-    module_path: "github.com/myorg/mylib"
+```toml
+[generators.go]
+module_path = "github.com/myorg/mylib"
 ```
 
 ## Typed errors

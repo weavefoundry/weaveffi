@@ -1,7 +1,7 @@
 //! IDL validation. This module owns the [`ValidationError`] catalog and the
 //! [`validate_api`] entry point; the work is split across submodules:
-//! `rules` (per-module checks), `resolve` (type-reference qualification),
-//! `diagnostic` (miette span attachment), and `warnings` (advisory lints).
+//! `rules` (per-module checks), `diagnostic` (miette span attachment), and
+//! `warnings` (advisory lints).
 //!
 //! Validation collects *every* rule violation before failing, so a document
 //! with several problems reports them all in one run rather than one per
@@ -14,14 +14,12 @@ use weaveffi_ir::ir::{Api, SUPPORTED_VERSIONS};
 use crate::resolved::ResolvedApi;
 
 mod diagnostic;
-mod resolve;
 mod rules;
 #[cfg(test)]
 mod tests;
 mod warnings;
 
 pub use diagnostic::ValidationDiagnostic;
-pub use resolve::{find_type_in_api, resolve_type_refs};
 pub use warnings::{collect_warnings, ValidationWarning};
 
 /// Every way an [`Api`] can fail validation.
@@ -534,10 +532,10 @@ impl Diagnostic for ValidationDiagnostics {
 /// on-disk source.
 ///
 /// This is the one checked way to turn a parsed document into the
-/// [`ResolvedApi`] every generator consumes. On success, type references are
-/// resolved (see [`resolve_type_refs`]): enum and interface references are
-/// distinguished from struct references, and cross-module references are
-/// qualified with their owning module's path.
+/// [`ResolvedApi`] every generator consumes. The document is never rewritten;
+/// the resolved view indexes its declarations so that
+/// [`ResolvedApi::resolve`] can turn each written reference into a
+/// [`Ty`](crate::model::Ty) whose kind and owning module are known.
 ///
 /// # Errors
 ///
@@ -546,12 +544,12 @@ impl Diagnostic for ValidationDiagnostics {
 /// an unknown or misplaced type, an empty struct or enum, a `throws` without
 /// an error domain, or any other rule violation in the catalog above.
 pub fn validate_api(
-    mut api: Api,
+    api: Api,
     source: Option<(&str, &str)>,
 ) -> Result<ResolvedApi, ValidationDiagnostics> {
-    let errors = validate_api_inner(&mut api);
+    let errors = validate_api_inner(&api);
     if errors.is_empty() {
-        return Ok(ResolvedApi::assume_resolved(api));
+        return Ok(ResolvedApi::assume_valid(api));
     }
     Err(ValidationDiagnostics {
         diagnostics: errors
@@ -561,7 +559,7 @@ pub fn validate_api(
     })
 }
 
-fn validate_api_inner(api: &mut Api) -> Vec<ValidationError> {
+fn validate_api_inner(api: &Api) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     if !SUPPORTED_VERSIONS.contains(&api.version.as_str()) {
         // A wrong-schema document is checked no further: the rules below
@@ -571,17 +569,15 @@ fn validate_api_inner(api: &mut Api) -> Vec<ValidationError> {
             supported: SUPPORTED_VERSIONS.join(", "),
         }];
     }
+    let types = rules::TypeIndex::build(&api.modules);
     let mut module_names = BTreeSet::new();
     for m in &api.modules {
         if !module_names.insert(m.name.clone()) {
             errors.push(ValidationError::DuplicateModuleName(m.name.clone()));
         }
-        rules::validate_module(m, &api.modules, false, &mut errors);
+        rules::validate_module(m, &types, false, &mut errors);
     }
     rules::check_global_type_names(&api.modules, &mut errors);
     rules::check_global_error_code_names(&api.modules, &mut errors);
-    if errors.is_empty() {
-        resolve_type_refs(api);
-    }
     errors
 }

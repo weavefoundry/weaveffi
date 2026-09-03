@@ -15,9 +15,19 @@ use std::fmt::Write;
 use crate::abi::{AbiParam, CType};
 use crate::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use crate::codegen::CodeWriter;
+use crate::lang::{is_reserved, CPP_KEYWORDS, C_KEYWORDS};
 use crate::model::{
     AbiFn, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
 };
+
+/// The revision of the WeaveFFI C ABI the generators emit bindings for.
+///
+/// Mirrors `weaveffi_abi::ABI_VERSION`; the two are kept equal by a test in
+/// the `weaveffi` facade crate, which depends on both. Generated consumers
+/// embed this value and, where a load-time check is cheap, compare it against
+/// the producer's exported `{prefix}_abi_version()` before making any other
+/// call.
+pub const ABI_VERSION: u32 = 1;
 
 /// Emit a `/** ... */` doc comment at `indent`.
 pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
@@ -25,12 +35,33 @@ pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
 }
 
 /// Join lowered ABI slots into a `"<c-type> <name>, ..."` declaration string.
+///
+/// Parameter names are the one position in a header where an IDL-chosen
+/// identifier lands verbatim (every other name carries the symbol prefix), so
+/// each is escaped with [`c_param_name`] before it's printed.
 pub fn params_str(params: &[AbiParam], prefix: &str) -> String {
     params
         .iter()
-        .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
+        .map(|p| format!("{} {}", p.ty.render_c(prefix), c_param_name(&p.name)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The spelling of an IDL parameter name inside a C prototype.
+///
+/// The header is consumed from C and, through `#ifdef __cplusplus` guards or
+/// the C++ generator's inlined `extern "C"` block, from C++. A name reserved
+/// in either language (`register`, `class`, `new`, ...) gains the shared
+/// trailing-underscore escape so the same declaration compiles in both.
+/// Derived slot names (`{name}_ptr`, `out_len`) never collide and pass
+/// through unchanged.
+#[must_use]
+pub fn c_param_name(name: &str) -> String {
+    if is_reserved(name, C_KEYWORDS) || is_reserved(name, CPP_KEYWORDS) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
 }
 
 /// The export-visibility macro name for `prefix`, for example `WEAVEFFI_API`.
@@ -129,12 +160,19 @@ pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
 /// bytes, and arrays into linear memory before each call. Native consumers
 /// never call them, but a producer targeting WebAssembly (for example a C
 /// library built with Emscripten) must export them; the generated
-/// `{prefix}.c` scaffold provides malloc/free-backed defaults.
+/// `{prefix}.c` convenience file provides malloc/free-backed defaults.
 pub fn render_runtime_decls(out: &mut String, prefix: &str) {
     let api = export_macro(prefix);
+    let upper = prefix.to_uppercase();
     let _ = write!(
         out,
-        "typedef uint64_t {prefix}_handle_t;\n\n\
+        "/* The WeaveFFI C ABI revision this header was generated against. The\n   \
+           producer exports {prefix}_abi_version() so a consumer can refuse to load\n   \
+           a library built for a different revision instead of misreading its\n   \
+           error struct or value buffers. */\n\
+         #define {upper}_ABI_VERSION {ABI_VERSION}u\n\
+         {api} uint32_t {prefix}_abi_version(void);\n\n\
+         typedef uint64_t {prefix}_handle_t;\n\n\
          /* Error slot written by every fallible call. `payload_ptr`/`payload_len`\n   \
            hold the matched error code's fields serialized in the WeaveFFI value\n   \
            buffer format (null when the code declares no fields); both the message\n   \

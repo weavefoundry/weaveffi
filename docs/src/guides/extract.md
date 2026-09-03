@@ -236,9 +236,9 @@ The extractor parses syntax, not semantics. The items below cannot be inferred
 from Rust source alone and either must be added to the generated IDL by hand or
 are documented as round-trip gaps.
 
-- **Package and per-generator configuration.** The `package:` and
-  `generators:` blocks have no source-level spelling; add them to the
-  extracted IDL by hand (this is why the advanced samples commit a YAML).
+- **Package and per-generator configuration.** These aren't part of the
+  API definition at all; they live in the `weaveffi.toml` beside the crate
+  and apply equally to extracted and hand-written IDLs.
 - **Struct field default values.** The IDL's `default:` field cannot be
   derived from Rust syntax (Rust struct fields have no default expressions).
 - **Standalone `since:` without `#[deprecated]`.** `since` is only recovered

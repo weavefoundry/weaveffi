@@ -16,8 +16,6 @@ mod entities;
 mod jni;
 mod package;
 mod runtime;
-#[cfg(test)]
-mod tests;
 mod types;
 
 use camino::Utf8Path;
@@ -156,8 +154,6 @@ impl LanguageBackend for AndroidGenerator {
         ]
     }
 }
-
-weaveffi_core::impl_generator_via_backend!(AndroidGenerator);
 
 /// Render the complete `WeaveFFI.kt`: the `WeaveFFI` entry class (listener
 /// registration and free functions inside the companion), then the entity

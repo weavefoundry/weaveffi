@@ -51,7 +51,7 @@ camelCased function wrappers.
 ## Example IDL → generated code
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -109,7 +109,7 @@ export enum Color {
 ```
 
 Functions are exported flat in lowerCamelCase with the module prefix
-stripped by default (`strip_module_prefix = false` in `[node]` restores
+stripped by default (`strip_module_prefix = false` in `[generators.node]` restores
 `<module>_`-prefixed names); parameters are camelCased too. Optional
 return and parameter types use `| null`, arrays use `T[]`:
 
@@ -293,7 +293,7 @@ producer cdylib on the linker path:
 
 ```bash
 cargo build -p kvstore
-weaveffi generate samples/kvstore/kvstore.yml -o generated
+weaveffi generate samples/kvstore/src/lib.rs -o generated
 
 cd generated/node
 npm install          # builds build/Release/weaveffi.node

@@ -1,0 +1,21 @@
+[package]
+name = "shapes"
+version = "0.1.0"
+
+[generators.ruby]
+module_name = "Shapes"
+
+[generators.dotnet]
+namespace = "Shapes"
+
+[generators.swift]
+module_name = "Shapes"
+
+[generators.cpp]
+namespace = "shapes"
+
+[generators.dart]
+package_name = "shapes"
+
+[generators.go]
+module_path = "github.com/example/shapes"

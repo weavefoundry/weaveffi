@@ -26,7 +26,30 @@ DynamicLibrary _openLibrary() {
   throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
 }
 
-final DynamicLibrary _lib = _openLibrary();
+// The ABI revision these bindings were generated against.
+const int _abiVersion = 1;
+
+DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {
+  final int Function() abiVersion;
+  try {
+    abiVersion = lib.lookupFunction<Uint32 Function(), int Function()>('weaveffi_abi_version');
+  } on ArgumentError {
+    throw StateError(
+      'the loaded WeaveFFI library predates ABI versioning '
+      '(these bindings expect ABI revision $_abiVersion)',
+    );
+  }
+  final found = abiVersion();
+  if (found != _abiVersion) {
+    throw StateError(
+      'WeaveFFI ABI mismatch: these bindings expect revision $_abiVersion '
+      'but the loaded library reports revision $found',
+    );
+  }
+  return lib;
+}
+
+final DynamicLibrary _lib = _checkAbiVersion(_openLibrary());
 
 final class _WeaveFFIError extends Struct {
   @Int32()
@@ -496,9 +519,9 @@ class Notebook {
       final data = _copyNativeBytes(result, n);
       if (result != nullptr) _weaveffiFreeBytes(result, n);
       final reader = _BufferReader(data);
-      final value = _unpackDocument(reader);
+      final decoded = _unpackDocument(reader);
       reader.expectEnd();
-      return value;
+      return decoded;
     } finally {
       calloc.free(outLen);
       calloc.free(err);
@@ -587,9 +610,9 @@ Document createDocument(String title, List<String> tags) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = _unpackDocument(reader);
+    final decoded = _unpackDocument(reader);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(titlePtr);
     calloc.free(tagsPtr);
@@ -614,9 +637,9 @@ Document? getDocument(int id) {
     final data = _copyNativeBytes(result, n);
     if (result != nullptr) _weaveffiFreeBytes(result, n);
     final reader = _BufferReader(data);
-    final value = (reader.readOptionFlag() ? _unpackDocument(reader) : null);
+    final decoded = (reader.readOptionFlag() ? _unpackDocument(reader) : null);
     reader.expectEnd();
-    return value;
+    return decoded;
   } finally {
     calloc.free(outLen);
     calloc.free(err);

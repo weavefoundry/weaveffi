@@ -24,7 +24,7 @@ emulator or a physical device.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: greeter
     errors:
@@ -56,7 +56,7 @@ domain when the language is unknown.
 ### 2. Generate bindings
 
 ```bash
-weaveffi generate greeter.yml -o generated --scaffold
+weaveffi generate greeter.yml -o generated
 ```
 
 You should see, among other targets:
@@ -65,15 +65,14 @@ You should see, among other targets:
 generated/
 ├── c/
 │   └── weaveffi.h
-├── android/
-│   ├── settings.gradle
-│   ├── build.gradle
-│   └── src/main/
-│       ├── kotlin/com/weaveffi/WeaveFFI.kt
-│       └── cpp/
-│           ├── weaveffi_jni.c
-│           └── CMakeLists.txt
-└── scaffold.rs
+└── android/
+    ├── settings.gradle
+    ├── build.gradle
+    └── src/main/
+        ├── kotlin/com/weaveffi/WeaveFFI.kt
+        └── cpp/
+            ├── weaveffi_jni.c
+            └── CMakeLists.txt
 ```
 
 ### 3. Implement the Rust library
@@ -118,13 +117,17 @@ pub extern "C" fn weaveffi_greeter_hello(
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
 
-// Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
-// error_clear, cancel_token_*), one line per cdylib.
+// Emit the WeaveFFI C ABI runtime symbols (abi_version, free_string,
+// free_bytes, error_clear, cancel_token_*), one line per cdylib.
 abi::export_runtime!();
 ```
 
-Use `scaffold.rs` for the rest of the API (`weaveffi_greeter_greeting`,
-which returns the `Greeting` record as a serialized value buffer).
+The generated `generated/c/weaveffi.h` lists every remaining symbol with
+its exact signature; implement `weaveffi_greeter_greeting` the same way
+(it returns the `Greeting` record as a serialized value buffer).
+Alternatively, annotate the module with `#[weaveffi::module]` and let the
+macro emit the whole C ABI; see
+[The Rust Producer Macro](../guides/producer-macro.md).
 
 ### 4. Configure the NDK toolchain
 

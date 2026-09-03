@@ -6,7 +6,7 @@ use predicates::prelude::*;
 fn diff_against_empty_dir() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let empty_out = tmp.path().join("empty");
@@ -39,7 +39,7 @@ fn diff_against_empty_dir() {
 fn diff_no_changes() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/calculator/calculator.yml");
+    let input = repo_root.join("samples/calculator/src/lib.rs");
 
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = tmp.path().join("generated");
@@ -76,7 +76,7 @@ fn diff_no_changes() {
 fn diff_check_honors_inline_generators() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let repo_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
-    let input = repo_root.join("samples/kvstore/kvstore.yml");
+    let input = repo_root.join("samples/kvstore/src/lib.rs");
 
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let out_path = tmp.path().join("generated");

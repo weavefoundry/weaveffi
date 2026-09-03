@@ -652,6 +652,34 @@ namespace WeaveFFI
     {
         private const string LibName = "weaveffi";
 
+        // The ABI revision these bindings were generated against.
+        internal const uint AbiVersion = 1;
+
+        // Runs before the first P/Invoke through this class, so a producer built
+        // for a different ABI revision fails loudly instead of misreading the
+        // error struct or a value buffer later.
+        static NativeMethods()
+        {
+            uint found;
+            try
+            {
+                found = weaveffi_abi_version();
+            }
+            catch (EntryPointNotFoundException e)
+            {
+                throw new InvalidOperationException(
+                    $"the loaded WeaveFFI library predates ABI versioning (these bindings expect ABI revision {AbiVersion})", e);
+            }
+            if (found != AbiVersion)
+            {
+                throw new InvalidOperationException(
+                    $"WeaveFFI ABI mismatch: these bindings expect revision {AbiVersion} but the loaded library reports revision {found}");
+            }
+        }
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern uint weaveffi_abi_version();
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_string(IntPtr ptr);
 
@@ -965,15 +993,15 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            Item? value = null;
-            if (valueReader.ReadOptionFlag())
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            Item? decoded = null;
+            if (decodedReader.ReadOptionFlag())
             {
-                var valueValue = Item.ReadFrom(valueReader);
-                value = valueValue;
+                var decodedValue = Item.ReadFrom(decodedReader);
+                decoded = decodedValue;
             }
-            valueReader.ExpectEnd();
-            return value;
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>List of structs</summary>
@@ -985,16 +1013,16 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var valueCount = valueReader.ReadLen();
-            var value = new Item[valueCount];
-            for (int i0 = 0; i0 < valueCount; i0++)
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decodedCount = decodedReader.ReadLen();
+            var decoded = new Item[decodedCount];
+            for (int i0 = 0; i0 < decodedCount; i0++)
             {
-                var valueItem = Item.ReadFrom(valueReader);
-                value[i0] = valueItem;
+                var decodedItem = Item.ReadFrom(decodedReader);
+                decoded[i0] = decodedItem;
             }
-            valueReader.ExpectEnd();
-            return value;
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>Map return type</summary>
@@ -1006,17 +1034,17 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var valueCount = valueReader.ReadLen();
-            var value = new Dictionary<string, int>(valueCount);
-            for (int i0 = 0; i0 < valueCount; i0++)
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decodedCount = decodedReader.ReadLen();
+            var decoded = new Dictionary<string, int>(decodedCount);
+            for (int i0 = 0; i0 < decodedCount; i0++)
             {
-                var valueKey = valueReader.ReadString();
-                var valueVal = valueReader.ReadI32();
-                value[valueKey] = valueVal;
+                var decodedKey = decodedReader.ReadString();
+                var decodedVal = decodedReader.ReadI32();
+                decoded[decodedKey] = decodedVal;
             }
-            valueReader.ExpectEnd();
-            return value;
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>Iterator return type</summary>
@@ -1070,10 +1098,10 @@ namespace WeaveFFI
             var resultBuf = new byte[(int)outLen];
             if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);
             NativeMethods.weaveffi_free_bytes(result, outLen);
-            var valueReader = new WeaveFFIBufferReader(resultBuf);
-            var value = Token.ReadFrom(valueReader);
-            valueReader.ExpectEnd();
-            return value;
+            var decodedReader = new WeaveFFIBufferReader(resultBuf);
+            var decoded = Token.ReadFrom(decodedReader);
+            decodedReader.ExpectEnd();
+            return decoded;
         }
 
         /// <summary>Async operation</summary>

@@ -4,7 +4,7 @@ build:
 
 # Generate bindings from the calculator sample
 generate: build
-    cargo run -p weaveffi-cli -- generate samples/calculator/calculator.yml -o generated
+    cargo run -p weaveffi-cli -- generate samples/calculator/src/lib.rs -o generated
 
 # Run all tests
 test:

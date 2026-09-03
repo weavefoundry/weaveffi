@@ -17,6 +17,19 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //   Buffered  -> records, rich enums, optionals, lists, and maps cross
 //                as one value buffer: i32 pointer + i32 length
 
+// The ABI revision this glue was generated against.
+const _ABI_VERSION = 1;
+
+function _checkAbiVersion(wasm) {
+  if (typeof wasm.weaveffi_abi_version !== 'function') {
+    throw new Error(`the loaded WeaveFFI module predates ABI versioning (this glue expects ABI revision ${_ABI_VERSION})`);
+  }
+  const found = wasm.weaveffi_abi_version() >>> 0;
+  if (found !== _ABI_VERSION) {
+    throw new Error(`WeaveFFI ABI mismatch: this glue expects revision ${_ABI_VERSION} but the loaded module reports revision ${found}`);
+  }
+}
+
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
  * thrown directly for unknown codes, marshalling failures, and producer
  * panics. Carries the stable ABI `code`. */
@@ -451,6 +464,8 @@ export async function loadWeaveffiWasm(url) {
   const bytes = await response.arrayBuffer();
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const wasm = instance.exports;
+
+  _checkAbiVersion(wasm);
 
   const _table = wasm.__indirect_function_table;
 

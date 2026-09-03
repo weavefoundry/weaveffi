@@ -22,7 +22,7 @@ package shape ready to publish.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: greeter
     errors:
@@ -54,7 +54,7 @@ domain when the language is unknown.
 ### 2. Generate bindings
 
 ```bash
-weaveffi generate greeter.yml -o generated --scaffold
+weaveffi generate greeter.yml -o generated
 ```
 
 Among other targets you should see:
@@ -63,13 +63,12 @@ Among other targets you should see:
 generated/
 ├── c/
 │   └── weaveffi.h
-├── node/
-│   ├── binding.gyp
-│   ├── index.js
-│   ├── package.json
-│   ├── types.d.ts
-│   └── weaveffi_addon.c
-└── scaffold.rs
+└── node/
+    ├── binding.gyp
+    ├── index.js
+    ├── package.json
+    ├── types.d.ts
+    └── weaveffi_addon.c
 ```
 
 `weaveffi_addon.c` is a complete N-API addon that bridges Node's
@@ -118,13 +117,17 @@ pub extern "C" fn weaveffi_greeter_hello(
     CString::new(msg).unwrap().into_raw() as *const c_char
 }
 
-// Emit the WeaveFFI C ABI runtime symbols (free_string, free_bytes,
-// error_clear, cancel_token_*), one line per cdylib.
+// Emit the WeaveFFI C ABI runtime symbols (abi_version, free_string,
+// free_bytes, error_clear, cancel_token_*), one line per cdylib.
 abi::export_runtime!();
 ```
 
-Use `scaffold.rs` for the rest of the API; it lists every symbol the
-addon expects, with exact signatures.
+The generated `generated/c/weaveffi.h` lists every remaining symbol the
+addon expects, with exact signatures; implement `weaveffi_greeter_greeting`
+the same way (it returns the `Greeting` record as a serialized value
+buffer). Alternatively, annotate the module with `#[weaveffi::module]` and
+let the macro emit the whole C ABI; see
+[The Rust Producer Macro](../guides/producer-macro.md).
 
 ### 4. Build the cdylib and the N-API addon
 

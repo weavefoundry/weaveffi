@@ -14,11 +14,9 @@
 //!   for each platform's Rust target triple. Convenient locally, but each
 //!   target needs its rustup target and a working cross-linker installed.
 
-use crate::config::{merge_inline_generators, CliConfig};
 use camino::{Utf8Path, Utf8PathBuf};
 use miette::{bail, miette, IntoDiagnostic, Result, WrapErr};
 use std::process::{Command, Stdio};
-use weaveffi_core::codegen::DynGenerator;
 use weaveffi_core::package::{summarize, write_package, PackageContext};
 use weaveffi_core::pkg;
 use weaveffi_core::platform::{BinarySet, Platform};
@@ -55,19 +53,8 @@ pub(crate) fn cmd_package(
         ),
     };
 
-    let mut config = CliConfig::load(config_path)?;
+    let (config, api) = super::load_project(input, config_path, warn)?;
     let in_path = Utf8Path::new(input);
-    let (api, _contents) = super::load_validated_api(input)?;
-    if let Some(ref generators) = api.generators {
-        merge_inline_generators(&mut config, generators);
-    }
-    config.finalize(in_path.file_name().map(str::to_string));
-
-    if warn {
-        for w in weaveffi_core::validate::collect_warnings(&api) {
-            eprintln!("warning: {w}");
-        }
-    }
 
     let selected_platforms = parse_platforms(platforms)?;
     let input_basename = in_path.file_name();
@@ -91,13 +78,7 @@ pub(crate) fn cmd_package(
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create output directory: {out}"))?;
 
-    let generators = config.build_generators();
-    let filter: Option<Vec<&str>> = targets.map(|t| t.split(',').map(str::trim).collect());
-    let selected: Vec<&dyn DynGenerator> = generators
-        .iter()
-        .map(|g| g.as_ref())
-        .filter(|g| filter.as_ref().is_none_or(|ts| ts.contains(&g.name())))
-        .collect();
+    let selected = config.select_targets(targets)?;
 
     if selected.is_empty() {
         bail!("no targets selected to package");

@@ -2,16 +2,15 @@
 //! exception hierarchy, interface wrapper classes, and the lazy iterator
 //! classes, plus the per-type buffer codecs.
 
-use weaveffi_core::abi;
 use weaveffi_core::codegen::common::pascal_case;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, IteratorBinding,
     StructBinding,
 };
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{
     interface_native_call, interface_native_decl, interface_native_name, kotlin_error_mapper,
@@ -344,18 +343,18 @@ pub(crate) fn render_kotlin_struct_codecs(out: &mut String, s: &StructBinding) {
 
 /// The Kotlin expression converting a boxed element pulled from `nativeNext`
 /// (typed `Any`, spelled `raw`) into the iterator's public element type.
-pub(crate) fn kotlin_iter_elem_convert(elem: &TypeRef) -> String {
+pub(crate) fn kotlin_iter_elem_convert(elem: &Ty) -> String {
     // A buffered element crosses as a packed `ByteArray`: decode it into the
     // idiomatic Kotlin value.
-    if abi::is_buffered(elem) {
+    if elem.is_buffered() {
         return kt_decode_expr(elem, "(raw as ByteArray)");
     }
     match elem {
-        TypeRef::Enum(name) => format!("{}.fromValue(raw as Int)", local_type_name(name)),
-        TypeRef::Interface(name) => format!("{}(raw as Long)", local_type_name(name)),
+        Ty::Enum(name) => format!("{}.fromValue(raw as Int)", local_type_name(name)),
+        Ty::Interface(name) => format!("{}(raw as Long)", local_type_name(name)),
         // Only `Interface?` reaches here: 0L crosses for none.
-        TypeRef::Optional(inner) => {
-            let TypeRef::Interface(name) = inner.as_ref() else {
+        Ty::Optional(inner) => {
+            let Ty::Interface(name) = inner.as_ref() else {
                 unreachable!("non-interface optionals are buffered")
             };
             format!(

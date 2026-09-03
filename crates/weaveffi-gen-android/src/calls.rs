@@ -3,16 +3,15 @@
 
 use std::fmt::Write as _;
 
-use weaveffi_core::abi;
 use weaveffi_core::codegen::common::pascal_case;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, ErrorBinding, FnBinding, ListenerBinding, ModuleBinding, ParamBinding,
 };
 use weaveffi_core::plan::ErrorStrategy;
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{kt_decode_expr, kt_encode_expr};
 use crate::docs::emit_doc;
@@ -82,7 +81,7 @@ pub(crate) fn render_listener_api(
     // Buffered callback arguments arrive as raw `ByteArray` copies:
     // the public register wrapper decodes them before the user's
     // lambda runs, so the JNI-facing external takes a wrapper lambda.
-    let has_buffered = cb.params.iter().any(|p| abi::is_buffered(&p.ty));
+    let has_buffered = cb.params.iter().any(|p| p.ty.is_buffered());
     if has_buffered {
         let jni_params: Vec<String> = cb
             .params
@@ -100,7 +99,7 @@ pub(crate) fn render_listener_api(
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                if abi::is_buffered(&p.ty) {
+                if p.ty.is_buffered() {
                     kt_decode_expr(&p.ty, &format!("a{i}"))
                 } else {
                     format!("a{i}")
@@ -212,14 +211,14 @@ pub(crate) fn render_kotlin_free_fn(
 /// pass the raw `.handle` (nullable via `?.`).
 pub(crate) fn kotlin_unwrap_arg(p: &ParamBinding) -> String {
     let n = kt_param(&p.name);
-    if abi::is_buffered(&p.ty) {
+    if p.ty.is_buffered() {
         return kt_encode_expr(&p.ty, &n);
     }
     match &p.ty {
-        TypeRef::Enum(_) => format!("{n}.value"),
-        TypeRef::Interface(_) => format!("{n}.handle"),
+        Ty::Enum(_) => format!("{n}.value"),
+        Ty::Interface(_) => format!("{n}.handle"),
         // Only `Interface?` reaches here (every other optional is buffered).
-        TypeRef::Optional(_) => format!("{n}?.handle"),
+        Ty::Optional(_) => format!("{n}?.handle"),
         _ => n,
     }
 }
@@ -229,19 +228,17 @@ pub(crate) fn kotlin_unwrap_arg(p: &ParamBinding) -> String {
 /// type: buffered returns decode the `ByteArray`, enums round-trip through
 /// `fromValue`, interfaces through the class constructor (nullable via
 /// `?.let`).
-pub(crate) fn kotlin_wrap_return(ret: Option<&TypeRef>, expr: &str) -> Option<String> {
+pub(crate) fn kotlin_wrap_return(ret: Option<&Ty>, expr: &str) -> Option<String> {
     let ret = ret?;
-    if abi::is_buffered(ret) {
+    if ret.is_buffered() {
         return Some(kt_decode_expr(ret, expr));
     }
     match ret {
-        TypeRef::Enum(name) => Some(format!("{}.fromValue({expr})", local_type_name(name))),
-        TypeRef::Interface(name) => Some(format!("{}({expr})", local_type_name(name))),
+        Ty::Enum(name) => Some(format!("{}.fromValue({expr})", local_type_name(name))),
+        Ty::Interface(name) => Some(format!("{}({expr})", local_type_name(name))),
         // Only `Interface?` reaches here (every other optional is buffered).
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Interface(name) => {
-                Some(format!("{expr}?.let {{ {}(it) }}", local_type_name(name)))
-            }
+        Ty::Optional(inner) => match inner.as_ref() {
+            Ty::Interface(name) => Some(format!("{expr}?.let {{ {}(it) }}", local_type_name(name))),
             _ => unreachable!("buffered optionals are handled above"),
         },
         _ => None,

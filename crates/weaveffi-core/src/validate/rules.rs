@@ -8,47 +8,7 @@
 
 use super::ValidationError;
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{ErrorDomain, Function, InterfaceDef, Module, Param, TypeRef};
-
-/// Whether a type may appear as a callback parameter. Callback arguments
-/// cross the boundary *into* the foreign language, either as a direct slot
-/// (scalars, strings, bytes, handles) or as a borrowed serialized buffer
-/// (records, rich enums, optionals, lists, maps), so nearly everything is
-/// marshalable. The exceptions: iterators have no callback protocol, and a
-/// borrowed view can appear only as the parameter's own type (a buffer
-/// cannot hold a borrow). Interfaces are rejected separately.
-fn callback_param_type_supported(ty: &TypeRef) -> bool {
-    if contains_iterator(ty) {
-        return false;
-    }
-    match ty {
-        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => true,
-        _ => contains_borrowed(ty).is_none(),
-    }
-}
-
-/// The types allowed as map keys: scalars, bool, enums, and strings. Every
-/// target language must be able to use the key in its native dictionary
-/// idiom, so composites, optionals, bytes, and handles are rejected.
-fn scalar_element(ty: &TypeRef) -> bool {
-    matches!(
-        ty,
-        TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool
-            | TypeRef::Enum(_)
-            | TypeRef::StringUtf8
-            | TypeRef::BorrowedStr
-    )
-}
+use weaveffi_ir::ir::{ErrorDomain, Function, InterfaceDef, Module, Param, StructField, TypeRef};
 
 const RESERVED: &[&str] = &[
     "if", "else", "for", "while", "loop", "match", "type", "return", "async", "await", "break",
@@ -77,6 +37,87 @@ fn check_identifier(name: &str, errors: &mut Vec<ValidationError>) -> bool {
         return false;
     }
     true
+}
+
+/// The kinds of declarations a bare name can refer to, gathered from the
+/// whole module forest before any rule runs. Validation operates on the
+/// document as written (every user reference is a [`TypeRef::Named`]), so
+/// positional rules consult this index to learn what a name is.
+#[derive(Default)]
+pub(super) struct TypeIndex {
+    /// Bare names of every struct, enum, and interface anywhere in the API.
+    pub all: BTreeSet<String>,
+    /// Bare names of every interface anywhere in the API.
+    pub interfaces: BTreeSet<String>,
+    /// Bare names of every C-style (payload-free) enum anywhere in the API.
+    pub plain_enums: BTreeSet<String>,
+}
+
+impl TypeIndex {
+    pub(super) fn build(modules: &[Module]) -> Self {
+        let mut index = Self::default();
+        index.walk(modules);
+        index
+    }
+
+    fn walk(&mut self, modules: &[Module]) {
+        for m in modules {
+            for s in &m.structs {
+                self.all.insert(s.name.clone());
+            }
+            for e in &m.enums {
+                self.all.insert(e.name.clone());
+                if !e.is_rich() {
+                    self.plain_enums.insert(e.name.clone());
+                }
+            }
+            for i in &m.interfaces {
+                self.all.insert(i.name.clone());
+                self.interfaces.insert(i.name.clone());
+            }
+            self.walk(&m.modules);
+        }
+    }
+
+    /// Is `name` (bare or dot-qualified) an interface?
+    fn is_interface(&self, name: &str) -> bool {
+        self.interfaces.contains(bare(name))
+    }
+
+    /// Does a struct, enum, or interface with this (bare or dot-qualified)
+    /// name exist anywhere in the API?
+    fn exists(&self, name: &str) -> bool {
+        self.all.contains(bare(name))
+    }
+
+    /// May `ty` be a map key? Every target must be able to use the key in
+    /// its native dictionary idiom, so only scalars, bools, strings, and
+    /// C-style enums qualify; composites, optionals, bytes, and handles are
+    /// rejected.
+    fn is_map_key(&self, ty: &TypeRef) -> bool {
+        match ty {
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::StringUtf8
+            | TypeRef::BorrowedStr => true,
+            TypeRef::Named(name) => self.plain_enums.contains(bare(name)),
+            _ => false,
+        }
+    }
+}
+
+/// The final segment of a possibly dot-qualified name.
+fn bare(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
 }
 
 /// Enforce global bare-name uniqueness for the type namespace: structs,
@@ -163,22 +204,9 @@ pub(super) fn check_global_error_code_names(modules: &[Module], errors: &mut Vec
     walk(modules, "", &mut seen, errors);
 }
 
-/// Collect the bare names of every interface declared anywhere in the module
-/// tree. Validation runs before reference resolution, so an interface
-/// reference is still spelled `TypeRef::Named(name)` and positional rules
-/// need this set to recognize one.
-pub(super) fn collect_interface_names(modules: &[Module], out: &mut BTreeSet<String>) {
-    for m in modules {
-        for i in &m.interfaces {
-            out.insert(i.name.clone());
-        }
-        collect_interface_names(&m.modules, out);
-    }
-}
-
 pub(super) fn validate_module(
     module: &Module,
-    all_modules: &[Module],
+    types: &TypeIndex,
     ancestor_has_domain: bool,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -198,16 +226,14 @@ pub(super) fn validate_module(
         ));
     }
 
-    let mut interface_names = BTreeSet::new();
-    collect_interface_names(all_modules, &mut interface_names);
     let has_domain = ancestor_has_domain || module.errors.is_some();
 
     // Every C symbol suffix a module-level callable claims: free functions,
     // interface members, and implicit destructors. Two entries with the same
     // suffix would produce two identical C symbols.
-    let mut symbol_suffixes: BTreeMap<String, ()> = BTreeMap::new();
+    let mut symbol_suffixes: BTreeSet<String> = BTreeSet::new();
     let mut claim_symbol = |suffix: String, errors: &mut Vec<ValidationError>| {
-        if symbol_suffixes.insert(suffix.clone(), ()).is_some() {
+        if !symbol_suffixes.insert(suffix.clone()) {
             errors.push(ValidationError::AbiSymbolCollision {
                 module: module.name.clone(),
                 symbol: suffix,
@@ -312,38 +338,25 @@ pub(super) fn validate_module(
         validate_interface(module, i, has_domain, &mut claim_symbol, errors);
     }
 
-    let known_types: BTreeSet<&str> = struct_names
-        .iter()
-        .map(|s| s.as_str())
-        .chain(enum_names.iter().map(|s| s.as_str()))
-        .chain(local_interface_names.iter().map(|s| s.as_str()))
-        .collect();
-    let ctx = TypeCtx {
-        known: &known_types,
-        all_modules,
-        interfaces: &interface_names,
-    };
-
     // A field of a record, a rich-enum variant, or an error payload is
     // serialized inside a value buffer, so it obeys the buffered positional
     // rules: no borrowed views, no iterators, no interfaces, and every
     // reference must resolve.
-    let mut check_buffered_field =
-        |f: &weaveffi_ir::ir::StructField, location: &dyn Fn() -> String| {
-            if let Some(ty) = contains_borrowed(&f.ty) {
-                errors.push(ValidationError::BorrowedTypeInInvalidPosition {
-                    ty: ty.to_string(),
-                    location: location(),
-                });
-            }
-            if contains_iterator(&f.ty) {
-                errors.push(ValidationError::IteratorInInvalidPosition {
-                    location: location(),
-                });
-            }
-            validate_type_ref(&f.ty, &ctx, errors);
-            check_interface_positions(&f.ty, &ctx, false, location, errors);
-        };
+    let mut check_buffered_field = |f: &StructField, location: &dyn Fn() -> String| {
+        if let Some(ty) = contains_borrowed(&f.ty) {
+            errors.push(ValidationError::BorrowedTypeInInvalidPosition {
+                ty: ty.to_string(),
+                location: location(),
+            });
+        }
+        if contains_iterator(&f.ty) {
+            errors.push(ValidationError::IteratorInInvalidPosition {
+                location: location(),
+            });
+        }
+        validate_type_ref(&f.ty, types, errors);
+        check_interface_positions(&f.ty, types, false, location, errors);
+    };
     for s in &module.structs {
         for f in &s.fields {
             let location = || format!("field '{}' of struct '{}'", f.name, s.name);
@@ -372,20 +385,12 @@ pub(super) fn validate_module(
         }
     }
     for f in &module.functions {
-        validate_callable_types(&module.name, &f.name, f, &ctx, errors);
+        validate_callable_types(&module.name, &f.name, f, types, errors);
     }
     for i in &module.interfaces {
-        for c in &i.constructors {
-            let display = format!("{}.{}", i.name, c.name);
-            validate_callable_types(&module.name, &display, c, &ctx, errors);
-        }
-        for m in &i.methods {
-            let display = format!("{}.{}", i.name, m.name);
-            validate_callable_types(&module.name, &display, m, &ctx, errors);
-        }
-        for s in &i.statics {
-            let display = format!("{}.{}", i.name, s.name);
-            validate_callable_types(&module.name, &display, s, &ctx, errors);
+        for f in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
+            let display = format!("{}.{}", i.name, f.name);
+            validate_callable_types(&module.name, &display, f, types, errors);
         }
     }
 
@@ -400,9 +405,10 @@ pub(super) fn validate_module(
         }
         for p in &cb.params {
             validate_param(p, errors);
-            if references_interface(&p.ty, &ctx) {
+            validate_type_ref(&p.ty, types, errors);
+            if references_interface(&p.ty, types) {
                 errors.push(ValidationError::InterfaceInInvalidPosition {
-                    name: type_ref_display(&p.ty),
+                    name: user_name_in(&p.ty),
                     location: format!("param '{}' of callback '{}'", p.name, cb.name),
                 });
             } else if !callback_param_type_supported(&p.ty) {
@@ -410,7 +416,7 @@ pub(super) fn validate_module(
                     module: module.name.clone(),
                     callback: cb.name.clone(),
                     param: p.name.clone(),
-                    ty: format!("{:?}", p.ty),
+                    ty: p.ty.to_string(),
                 });
             }
         }
@@ -443,7 +449,7 @@ pub(super) fn validate_module(
         if !sub_module_names.insert(sub.name.clone()) {
             errors.push(ValidationError::DuplicateModuleName(sub.name.clone()));
         }
-        validate_module(sub, all_modules, has_domain, errors);
+        validate_module(sub, types, has_domain, errors);
     }
 }
 
@@ -536,7 +542,7 @@ fn validate_callable_types(
     module_name: &str,
     display_name: &str,
     f: &Function,
-    ctx: &TypeCtx<'_>,
+    types: &TypeIndex,
     errors: &mut Vec<ValidationError>,
 ) {
     for p in &f.params {
@@ -577,11 +583,11 @@ fn validate_callable_types(
             errors.push(ValidationError::MutableParamUnsupported {
                 function: format!("{module_name}::{display_name}"),
                 param: p.name.clone(),
-                ty: format!("{:?}", p.ty),
+                ty: p.ty.to_string(),
             });
         }
-        validate_type_ref(&p.ty, ctx, errors);
-        check_interface_positions(&p.ty, ctx, true, location, errors);
+        validate_type_ref(&p.ty, types, errors);
+        check_interface_positions(&p.ty, types, true, location, errors);
     }
     if let Some(ret) = &f.returns {
         let location = || format!("return type of {module_name}::{display_name}");
@@ -601,8 +607,8 @@ fn validate_callable_types(
                 function: display_name.to_string(),
             });
         }
-        validate_type_ref(ret, ctx, errors);
-        check_interface_positions(ret, ctx, true, location, errors);
+        validate_type_ref(ret, types, errors);
+        check_interface_positions(ret, types, true, location, errors);
     }
 }
 
@@ -610,48 +616,45 @@ fn validate_param(p: &Param, errors: &mut Vec<ValidationError>) {
     check_identifier(&p.name, errors);
 }
 
-/// Shared context for type-reference checks: the current module's own type
-/// names, the full module forest for cross-module lookups, and the global set
-/// of interface names.
-struct TypeCtx<'a> {
-    known: &'a BTreeSet<&'a str>,
-    all_modules: &'a [Module],
-    interfaces: &'a BTreeSet<String>,
-}
-
-impl TypeCtx<'_> {
-    /// Is `name` (bare or dot-qualified) an interface?
-    fn is_interface(&self, name: &str) -> bool {
-        let bare = name.rsplit('.').next().unwrap_or(name);
-        self.interfaces.contains(bare)
+/// Whether a type may appear as a callback parameter. Callback arguments
+/// cross the boundary *into* the foreign language, either as a direct slot
+/// (scalars, strings, bytes, handles) or as a borrowed serialized buffer
+/// (records, rich enums, optionals, lists, maps), so nearly everything is
+/// marshalable. The exceptions: iterators have no callback protocol, and a
+/// borrowed view can appear only as the parameter's own type (a buffer
+/// cannot hold a borrow). Interfaces are rejected separately.
+fn callback_param_type_supported(ty: &TypeRef) -> bool {
+    if contains_iterator(ty) {
+        return false;
+    }
+    match ty {
+        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => true,
+        _ => contains_borrowed(ty).is_none(),
     }
 }
 
 /// Does `ty` reference an interface anywhere in its structure? Used for
 /// positions where interfaces are wholly disallowed (callback parameters).
-fn references_interface(ty: &TypeRef, ctx: &TypeCtx<'_>) -> bool {
+fn references_interface(ty: &TypeRef, types: &TypeIndex) -> bool {
     match ty {
-        TypeRef::Named(name) | TypeRef::Interface(name) => ctx.is_interface(name),
+        TypeRef::Named(name) => types.is_interface(name),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            references_interface(inner, ctx)
+            references_interface(inner, types)
         }
-        TypeRef::Map(k, v) => references_interface(k, ctx) || references_interface(v, ctx),
+        TypeRef::Map(k, v) => references_interface(k, types) || references_interface(v, types),
         _ => false,
     }
 }
 
-/// Render the interface name inside `ty` for an error message, falling back
-/// to the debug spelling for composite shapes.
-fn type_ref_display(ty: &TypeRef) -> String {
+/// The innermost user-type name inside `ty` for an error message, falling
+/// back to the IDL spelling for shapes without one.
+fn user_name_in(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::Named(name)
-        | TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Interface(name) => name.clone(),
+        TypeRef::Named(name) => name.clone(),
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            type_ref_display(inner)
+            user_name_in(inner)
         }
-        other => format!("{other:?}"),
+        other => other.to_string(),
     }
 }
 
@@ -663,14 +666,14 @@ fn type_ref_display(ty: &TypeRef) -> String {
 /// copies the object cannot provide.
 fn check_interface_positions(
     ty: &TypeRef,
-    ctx: &TypeCtx<'_>,
+    types: &TypeIndex,
     top: bool,
     location: impl Fn() -> String + Copy,
     errors: &mut Vec<ValidationError>,
 ) {
     match ty {
-        TypeRef::Named(name) | TypeRef::Interface(name) => {
-            if ctx.is_interface(name) && !top {
+        TypeRef::Named(name) => {
+            if types.is_interface(name) && !top {
                 errors.push(ValidationError::InterfaceInInvalidPosition {
                     name: name.clone(),
                     location: location(),
@@ -680,7 +683,7 @@ fn check_interface_positions(
         // A typed handle names a token *type tag*, not an object; pointing
         // one at an interface would conflate u64 tokens with object pointers.
         TypeRef::TypedHandle(name) => {
-            if ctx.is_interface(name) {
+            if types.is_interface(name) {
                 errors.push(ValidationError::InterfaceInInvalidPosition {
                     name: name.clone(),
                     location: format!("typed handle in {}", location()),
@@ -689,13 +692,13 @@ fn check_interface_positions(
         }
         // Optionality does not change the position: `Store?` is still a
         // top-level object reference.
-        TypeRef::Optional(inner) => check_interface_positions(inner, ctx, top, location, errors),
+        TypeRef::Optional(inner) => check_interface_positions(inner, types, top, location, errors),
         TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            check_interface_positions(inner, ctx, false, location, errors);
+            check_interface_positions(inner, types, false, location, errors);
         }
         TypeRef::Map(k, v) => {
-            check_interface_positions(k, ctx, false, location, errors);
-            check_interface_positions(v, ctx, false, location, errors);
+            check_interface_positions(k, types, false, location, errors);
+            check_interface_positions(v, types, false, location, errors);
         }
         _ => {}
     }
@@ -722,49 +725,24 @@ fn contains_iterator(ty: &TypeRef) -> bool {
     }
 }
 
-/// Does a struct, enum, or interface named `name` exist anywhere in the
-/// module tree, including nested submodules? Validation runs before reference
-/// qualification, so an unqualified reference is valid if its bare name is
-/// defined anywhere; the resolver later rewrites it to the owning module's
-/// full path.
-fn type_exists(modules: &[Module], name: &str) -> bool {
-    modules.iter().any(|m| {
-        m.structs.iter().any(|s| s.name == name)
-            || m.enums.iter().any(|e| e.name == name)
-            || m.interfaces.iter().any(|i| i.name == name)
-            || type_exists(&m.modules, name)
-    })
-}
-
-fn validate_type_ref(ty: &TypeRef, ctx: &TypeCtx<'_>, errors: &mut Vec<ValidationError>) {
+fn validate_type_ref(ty: &TypeRef, types: &TypeIndex, errors: &mut Vec<ValidationError>) {
     match ty {
-        TypeRef::Named(name)
-        | TypeRef::Record(name)
-        | TypeRef::RichEnum(name)
-        | TypeRef::Interface(name)
-        | TypeRef::Enum(name)
-        | TypeRef::TypedHandle(name) => {
-            if !ctx.known.contains(name.as_str()) && !type_exists(ctx.all_modules, name) {
+        TypeRef::Named(name) | TypeRef::TypedHandle(name) => {
+            if !types.exists(name) {
                 errors.push(ValidationError::UnknownTypeRef { name: name.clone() });
             }
         }
         TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            validate_type_ref(inner, ctx, errors);
+            validate_type_ref(inner, types, errors);
         }
         TypeRef::Map(k, v) => {
-            if !scalar_element(k) {
-                let key_type = match k.as_ref() {
-                    TypeRef::Named(name) | TypeRef::Record(name) | TypeRef::RichEnum(name) => {
-                        format!("struct {name}")
-                    }
-                    TypeRef::List(_) => "list".to_string(),
-                    TypeRef::Map(_, _) => "map".to_string(),
-                    other => format!("{other:?}"),
-                };
-                errors.push(ValidationError::InvalidMapKey { key_type });
+            if !types.is_map_key(k) {
+                errors.push(ValidationError::InvalidMapKey {
+                    key_type: k.to_string(),
+                });
             }
-            validate_type_ref(k, ctx, errors);
-            validate_type_ref(v, ctx, errors);
+            validate_type_ref(k, types, errors);
+            validate_type_ref(v, types, errors);
         }
         _ => {}
     }

@@ -22,8 +22,6 @@ mod docs;
 mod entities;
 mod package;
 mod runtime;
-#[cfg(test)]
-mod tests;
 mod types;
 
 use std::collections::{HashMap, HashSet};
@@ -244,8 +242,6 @@ impl LanguageBackend for SwiftGenerator {
         Some(files)
     }
 }
-
-weaveffi_core::impl_generator_via_backend!(SwiftGenerator);
 
 /// Render the complete generated Swift wrapper file: prelude and imports,
 /// the runtime helpers the model needs, every module's file-scope types, and

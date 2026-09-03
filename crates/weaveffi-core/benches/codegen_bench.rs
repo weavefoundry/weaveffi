@@ -8,9 +8,10 @@ use weaveffi_ir::parse::parse_api_str;
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.7.0".to_string(),
+        version: "0.8.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
+            doc: None,
             functions: vec![
                 Function {
                     name: "add".to_string(),
@@ -109,8 +110,6 @@ fn calculator_api() -> Api {
             interfaces: vec![],
             modules: vec![],
         }],
-        generators: None,
-        package: None,
     }
 }
 
@@ -124,6 +123,7 @@ fn large_api() -> Api {
                 .map(|s| StructDef {
                     name: format!("M{m}Struct{s}"),
                     doc: None,
+                    deprecated: None,
                     fields: vec![
                         StructField {
                             name: "id".to_string(),
@@ -148,6 +148,7 @@ fn large_api() -> Api {
                 .map(|e| EnumDef {
                     name: format!("M{m}Enum{e}"),
                     doc: None,
+                    deprecated: None,
                     variants: vec![
                         EnumVariant {
                             name: "Alpha".to_string(),
@@ -208,6 +209,7 @@ fn large_api() -> Api {
 
             Module {
                 name: format!("mod{m}"),
+                doc: None,
                 functions,
                 structs,
                 enums,
@@ -221,10 +223,8 @@ fn large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.7.0".to_string(),
+        version: "0.8.0".to_string(),
         modules,
-        generators: None,
-        package: None,
     }
 }
 
@@ -259,7 +259,7 @@ fn bench_hash_api(c: &mut Criterion) {
 /// measures a complete pre-resolved → validated pass on every iteration.
 fn load_kitchen_sink_unvalidated() -> Api {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../weaveffi-cli/tests/fixtures/06_kitchen_sink.yml");
+        .join("../weaveffi-cli/tests/fixtures/kitchen_sink.yml");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     parse_api_str(&contents, "yaml")

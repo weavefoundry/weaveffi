@@ -6,7 +6,7 @@ use quote::quote;
 use syn::Ident;
 use weaveffi_core::abi::{AbiParam, CType, ConstPos};
 use weaveffi_core::model::FnBinding;
-use weaveffi_ir::ir::TypeRef;
+use weaveffi_core::model::Ty;
 
 use super::{unsupported, PREFIX};
 
@@ -97,22 +97,22 @@ pub(crate) fn sentinel(ret: &CType) -> TokenStream {
 
 /// True when this enum/struct field/param type crosses the ABI without owning
 /// heap data (so a getter can read it by copy rather than clone).
-pub(crate) fn is_copy(ty: &TypeRef) -> bool {
+pub(crate) fn is_copy(ty: &Ty) -> bool {
     matches!(
         ty,
-        TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::I64
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Bool
-            | TypeRef::Handle
-            | TypeRef::Enum(_)
+        Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Handle
+            | Ty::Enum(_)
     )
 }
 
@@ -176,7 +176,7 @@ fn typed_handle_user_type<'a>(
     sig: &'a syn::Signature,
 ) -> Option<&'a syn::Type> {
     let pb = f.params.iter().find(|pb| pb.name == p.name)?;
-    if !matches!(pb.ty, TypeRef::TypedHandle(_)) {
+    if !matches!(pb.ty, Ty::TypedHandle(_)) {
         return None;
     }
     user_param_type(sig, &p.name)
@@ -185,7 +185,7 @@ fn typed_handle_user_type<'a>(
 /// Render the `-> T` return clause, preferring the producer's own type for a
 /// typed-handle return (so a parent-module `super::T` stays in scope).
 pub(crate) fn ret_arrow_for(ret: &CType, f: &FnBinding, sig: &syn::Signature) -> TokenStream {
-    if matches!(f.ret, Some(TypeRef::TypedHandle(_))) {
+    if matches!(f.ret, Some(Ty::TypedHandle(_))) {
         if let syn::ReturnType::Type(_, ty) = &sig.output {
             let ty = weaveffi_bridge::peel_result(ty);
             return quote!(-> #ty);
@@ -281,44 +281,43 @@ pub(crate) fn wrap_unwind(body: TokenStream, sentinel: Option<&TokenStream>) -> 
 /// Spell an IR type as the Rust type a producer uses, for the cases the macro
 /// needs to name a generic argument (currently the element of `iter<T>`). The
 /// map flavor is not recorded by the IR, so it defaults to `HashMap`.
-pub(crate) fn typeref_to_rust(ty: &TypeRef) -> syn::Result<TokenStream> {
+pub(crate) fn typeref_to_rust(ty: &Ty) -> syn::Result<TokenStream> {
     Ok(match ty {
-        TypeRef::I8 => quote!(i8),
-        TypeRef::I16 => quote!(i16),
-        TypeRef::I32 => quote!(i32),
-        TypeRef::I64 => quote!(i64),
-        TypeRef::U8 => quote!(u8),
-        TypeRef::U16 => quote!(u16),
-        TypeRef::U32 => quote!(u32),
-        TypeRef::U64 => quote!(u64),
-        TypeRef::F32 => quote!(f32),
-        TypeRef::F64 => quote!(f64),
-        TypeRef::Bool => quote!(bool),
-        TypeRef::Handle => quote!(u64),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => quote!(::std::string::String),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => quote!(::std::vec::Vec<u8>),
-        TypeRef::Record(s) | TypeRef::RichEnum(s) | TypeRef::Enum(s) | TypeRef::Interface(s) => {
+        Ty::I8 => quote!(i8),
+        Ty::I16 => quote!(i16),
+        Ty::I32 => quote!(i32),
+        Ty::I64 => quote!(i64),
+        Ty::U8 => quote!(u8),
+        Ty::U16 => quote!(u16),
+        Ty::U32 => quote!(u32),
+        Ty::U64 => quote!(u64),
+        Ty::F32 => quote!(f32),
+        Ty::F64 => quote!(f64),
+        Ty::Bool => quote!(bool),
+        Ty::Handle => quote!(u64),
+        Ty::StringUtf8 | Ty::BorrowedStr => quote!(::std::string::String),
+        Ty::Bytes | Ty::BorrowedBytes => quote!(::std::vec::Vec<u8>),
+        Ty::Record(s) | Ty::RichEnum(s) | Ty::Enum(s) | Ty::Interface(s) => {
             let ty = rust_type_ident(s);
             quote!(#ty)
         }
-        TypeRef::Named(n) => unreachable!("unresolved type reference '{n}'"),
-        TypeRef::TypedHandle(n) => {
+        Ty::TypedHandle(n) => {
             let ty = rust_type_ident(n);
             quote!(*mut #ty)
         }
-        TypeRef::Optional(inner) => {
+        Ty::Optional(inner) => {
             let inner = typeref_to_rust(inner)?;
             quote!(::std::option::Option<#inner>)
         }
-        TypeRef::List(inner) => {
+        Ty::List(inner) => {
             let inner = typeref_to_rust(inner)?;
             quote!(::std::vec::Vec<#inner>)
         }
-        TypeRef::Map(k, v) => {
+        Ty::Map(k, v) => {
             let k = typeref_to_rust(k)?;
             let v = typeref_to_rust(v)?;
             quote!(::std::collections::HashMap<#k, #v>)
         }
-        TypeRef::Iterator(_) => return Err(unsupported("type", "nested iterator")),
+        Ty::Iterator(_) => return Err(unsupported("type", "nested iterator")),
     })
 }

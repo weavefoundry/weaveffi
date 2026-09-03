@@ -1,0 +1,282 @@
+version: "0.8.0"
+# Shapes the mainstream fixtures do not reach: identifiers that are reserved
+# words in one or more target languages, deeply nested composites, optional and
+# mutable parameters, interfaces in every legal position, async functions with
+# non-string results, type-level deprecation, scalar and string iterators, and
+# callbacks carrying composite payloads. Snapshots pin how every generator
+# renders each of these, so a regression in keyword escaping or a codec edge
+# shows up as a diff instead of as a compile error in a downstream project.
+modules:
+  - name: edge_cases
+    enums:
+      - name: Legacy
+        doc: Deprecated enum with non-contiguous values and keyword-like variants
+        deprecated: "Use Mode instead"
+        variants:
+          - { name: None, value: 0 }
+          - { name: Default, value: 5 }
+          - { name: Class, value: 10 }
+      - name: Mode
+        variants:
+          - { name: Fast, value: 1 }
+          - { name: Safe, value: 2 }
+    structs:
+      - name: Leaf
+        fields:
+          - { name: weight, type: f32 }
+      - name: Inner
+        doc: Middle layer of a three-deep struct nesting
+        fields:
+          - { name: leaf, type: Leaf }
+          - { name: leaves, type: "[Leaf]" }
+      - name: Outer
+        fields:
+          - { name: inner, type: Inner }
+          - { name: maybe_inner, type: "Inner?" }
+          - { name: by_name, type: "{string:Inner}" }
+          - { name: modes, type: "[Mode]" }
+          - { name: matrix, type: "[[i32]]" }
+          - { name: sparse, type: "[i64?]" }
+          - { name: blob, type: "bytes?" }
+          - { name: note, type: "string?" }
+          - { name: by_id, type: "{i64:string}" }
+          - { name: _hidden, type: bool }
+          - { name: v2, type: u8 }
+      - name: Keywords
+        doc: Every field is a reserved word somewhere
+        fields:
+          - { name: class, type: i32 }
+          - { name: def, type: i32 }
+          - { name: import, type: i32 }
+          - { name: from, type: i32 }
+          - { name: func, type: i32 }
+          - { name: range, type: i32 }
+          - { name: register, type: i32 }
+          - { name: volatile, type: i32 }
+          - { name: new, type: i32 }
+          - { name: default, type: i32 }
+          - { name: end, type: i32 }
+          - { name: in, type: i32 }
+          - { name: is, type: i32 }
+          - { name: int, type: i32 }
+          - { name: var, type: i32 }
+          - { name: val, type: i32 }
+          - { name: self, type: i32 }
+          - { name: this, type: i32 }
+          - { name: object, type: i32 }
+          - { name: string, type: i32 }
+          - { name: case, type: i32 }
+          - { name: select, type: i32 }
+          - { name: switch, type: i32 }
+          - { name: void, type: i32 }
+          - { name: union, type: i32 }
+          - { name: namespace, type: i32 }
+          - { name: operator, type: i32 }
+          - { name: template, type: i32 }
+          - { name: package, type: i32 }
+          - { name: protocol, type: i32 }
+          - { name: guard, type: i32 }
+          - { name: defer, type: i32 }
+          - { name: inout, type: i32 }
+          - { name: internal, type: i32 }
+          - { name: when, type: i32 }
+          - { name: fun, type: i32 }
+          - { name: data, type: i32 }
+          - { name: late, type: i32 }
+          - { name: part, type: i32 }
+          - { name: out, type: i32 }
+          - { name: ref, type: i32 }
+          - { name: event, type: i32 }
+          - { name: base, type: i32 }
+          - { name: lambda, type: i32 }
+          - { name: yield, type: i32 }
+          - { name: nil, type: i32 }
+          - { name: null, type: i32 }
+          - { name: begin, type: i32 }
+          - { name: rescue, type: i32 }
+          - { name: module, type: i32 }
+          - { name: chan, type: i32 }
+          - { name: go, type: i32 }
+          - { name: let, type: i32 }
+          - { name: export, type: i32 }
+          - { name: delete, type: i32 }
+          - { name: typedef, type: i32 }
+          - { name: sizeof, type: i32 }
+          - { name: static, type: i32 }
+          - { name: super, type: i32 }
+      - name: Retired
+        doc: Deprecated struct
+        deprecated: "Use Outer instead"
+        fields:
+          - { name: id, type: i64 }
+    callbacks:
+      - name: OnBatch
+        doc: Callback carrying composite payloads
+        params:
+          - { name: items, type: "[Outer]" }
+          - { name: raw, type: bytes }
+          - { name: first, type: "Outer?" }
+          - { name: mode, type: Mode }
+      - name: OnTick
+        params: []
+    listeners:
+      - name: batch_listener
+        event_callback: OnBatch
+      - name: tick_listener
+        event_callback: OnTick
+    errors:
+      name: EdgeErrors
+      codes:
+        - { name: Busy, code: 7, message: "Resource is busy" }
+    interfaces:
+      - name: Widget
+        doc: Interface with no constructor; instances come from make_widget
+        methods:
+          - name: refresh
+            doc: Void method that can fail
+            params: []
+            throws: true
+          - name: rename
+            params:
+              - { name: class, type: string }
+              - { name: import, type: "string?" }
+            return: string
+          - name: fetch
+            doc: Async method with a struct result
+            params:
+              - { name: id, type: i64 }
+            return: Outer
+            async: true
+            throws: true
+          - name: old_name
+            deprecated: "Use rename instead"
+            params: []
+            return: string
+      - name: Vault
+        doc: Deprecated interface with a throwing constructor
+        deprecated: "Use Widget instead"
+        constructors:
+          - name: open
+            doc: Fails when the vault is busy
+            params:
+              - { name: path, type: string }
+            throws: true
+        methods:
+          - name: peek
+            params: []
+            return: "Widget?"
+        statics:
+          - name: probe
+            doc: Throwing static
+            params: []
+            return: bool
+            throws: true
+    functions:
+      - name: noop
+        doc: No parameters and no result
+        params: []
+      - name: select
+        doc: Function named after a keyword whose parameters are all keywords
+        params:
+          - { name: class, type: i32 }
+          - { name: from, type: string }
+          - { name: func, type: "[string]" }
+          - { name: range, type: "i32?" }
+          - { name: type_, type: bool }
+        return: i32
+      - name: nested_optional
+        doc: Optional list of optional structs, the deepest legal nesting
+        params:
+          - { name: items, type: "[Outer?]?" }
+        return: "[Outer?]?"
+      - name: optional_params
+        params:
+          - { name: text, type: "string?" }
+          - { name: count, type: "i32?" }
+          - { name: outer, type: "Outer?" }
+          - { name: tags, type: "[string]?" }
+          - { name: blob, type: "bytes?" }
+          - { name: mode, type: "Mode?" }
+        return: "Mode?"
+      - name: mutable_params
+        doc: Write-back parameters
+        params:
+          - { name: text, type: string, mutable: true }
+          - { name: blob, type: bytes, mutable: true }
+      - name: make_widget
+        doc: Factory for an interface with no constructor
+        params:
+          - { name: label, type: string }
+        return: Widget
+      - name: find_widget
+        doc: Optional interface return
+        params:
+          - { name: id, type: i64 }
+        return: "Widget?"
+        throws: true
+      - name: inspect_widget
+        doc: Interface parameter, including an optional one
+        params:
+          - { name: widget, type: Widget }
+          - { name: fallback, type: "Widget?" }
+        return: string
+      - name: typed_handle_param
+        params:
+          - { name: token, type: "handle<Leaf>" }
+          - { name: raw, type: handle }
+        return: "handle<Leaf>"
+      - name: string_stream
+        doc: Iterator of strings
+        params: []
+        return: "iter<string>"
+      - name: scalar_stream
+        doc: Iterator of scalars
+        params: []
+        return: "iter<i32>"
+      - name: mode_stream
+        doc: Iterator of enums
+        params: []
+        return: "iter<Mode>"
+      - name: async_void
+        doc: Async with no result
+        params: []
+        async: true
+      - name: async_bytes
+        params:
+          - { name: size, type: u32 }
+        return: bytes
+        async: true
+      - name: async_struct
+        params: []
+        return: Outer
+        async: true
+        throws: true
+      - name: async_list
+        params: []
+        return: "[Outer]"
+        async: true
+        cancellable: true
+        throws: true
+      - name: async_optional
+        params: []
+        return: "i64?"
+        async: true
+      - name: async_enum
+        params: []
+        return: Mode
+        async: true
+      - name: async_keywords
+        params:
+          - { name: class, type: string }
+          - { name: import, type: i32 }
+        return: string
+        async: true
+      - name: keywords_roundtrip
+        params:
+          - { name: value, type: Keywords }
+        return: Keywords
+      - name: legacy_value
+        deprecated: "Use Mode-based APIs"
+        params:
+          - { name: value, type: Legacy }
+        return: Retired

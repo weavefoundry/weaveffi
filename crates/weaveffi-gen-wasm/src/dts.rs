@@ -2,18 +2,15 @@
 //! record and enum type shapes, ambient interface classes, and the nested
 //! module interface the loader's promise resolves to.
 
-use std::collections::HashMap;
-
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
-use weaveffi_core::codegen::common::{walk_modules_with_path, DocCommentStyle};
+use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    BindingModel, CallShape, ErrorBinding, FnBinding, InterfaceBinding, ListenerBinding,
-    ModuleBinding,
+    BindingModel, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    ListenerBinding, ModuleBinding,
 };
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::{Api, EnumDef, Module};
 
 use crate::docs::{emit_doc, emit_fn_doc};
 use crate::types::{js_code_class_name, js_fn_name, js_param_name, ts_type_for};
@@ -24,7 +21,6 @@ use crate::types::{js_code_class_name, js_fn_name, js_param_name, ts_type_for};
 /// members and listeners are omitted in Emscripten mode, turning their
 /// runtime stubs into compile-time errors for TS consumers.
 pub(crate) fn render_wasm_dts(
-    api: &Api,
     model: &BindingModel,
     module_name: &str,
     input_basename: &str,
@@ -34,15 +30,13 @@ pub(crate) fn render_wasm_dts(
     let pascal_name = module_name.to_upper_camel_case();
     let interface_name = format!("{pascal_name}Module");
     let load_fn = format!("load{pascal_name}");
-    let by_path: HashMap<&str, &ModuleBinding> =
-        model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str("// Generated TypeScript declarations for WeaveFFI Wasm bindings\n\n");
 
     emit_dts_error_classes(&mut out, model);
 
-    for (m, path) in walk_modules_with_path(&api.modules) {
-        for s in &m.structs {
+    for mb in &model.modules {
+        for s in &mb.structs {
             emit_doc(&mut out, &s.doc, "");
             out.push_str(&format!("export interface {} {{\n", s.name));
             for field in &s.fields {
@@ -52,7 +46,7 @@ pub(crate) fn render_wasm_dts(
             out.push_str("}\n\n");
         }
 
-        for e in &m.enums {
+        for e in &mb.enums {
             // A rich (algebraic) enum is a tagged plain-object union, not a
             // by-value discriminant constant.
             if e.is_rich() {
@@ -60,18 +54,22 @@ pub(crate) fn render_wasm_dts(
                 continue;
             }
             emit_doc(&mut out, &e.doc, "");
+            // The const object holds the values; the same-named type alias
+            // is their union, so `Mode` works in both value and type positions.
             out.push_str(&format!("export declare const {}: Readonly<{{\n", e.name));
             for v in &e.variants {
                 emit_doc(&mut out, &v.doc, "  ");
                 out.push_str(&format!("  {}: {};\n", v.name, v.value));
             }
-            out.push_str("}>;\n\n");
+            out.push_str("}>;\n");
+            out.push_str(&format!(
+                "export type {0} = (typeof {0})[keyof typeof {0}];\n\n",
+                e.name
+            ));
         }
 
-        if let Some(mb) = by_path.get(path.as_str()) {
-            for i in &mb.interfaces {
-                emit_dts_interface_class(&mut out, mb, i, emscripten);
-            }
+        for i in &mb.interfaces {
+            emit_dts_interface_class(&mut out, mb, i, emscripten);
         }
     }
 
@@ -88,8 +86,8 @@ pub(crate) fn render_wasm_dts(
         } else {
             out.push_str("  _raw: WebAssembly.Exports;\n");
         }
-        for module in &api.modules {
-            render_dts_module_interface(&mut out, module, &module.name, &by_path, "  ", emscripten);
+        for module in model.roots() {
+            render_dts_module_interface(&mut out, model, module, "  ", emscripten);
         }
     }
     out.push_str("}\n\n");
@@ -111,7 +109,7 @@ pub(crate) fn render_wasm_dts(
 /// discriminated union of plain object shapes, one member per variant, keyed
 /// by the string `tag`. Mirrors the runtime representation the buffer codecs
 /// pack and unpack.
-fn emit_dts_rich_enum_type(out: &mut String, e: &EnumDef) {
+fn emit_dts_rich_enum_type(out: &mut String, e: &EnumBinding) {
     let name = &e.name;
     let mut w = CodeWriter::two_space();
     w.doc(&e.doc, DocCommentStyle::Javadoc);
@@ -193,39 +191,25 @@ fn dts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
 /// content.
 fn render_dts_module_interface(
     out: &mut String,
-    m: &Module,
-    module_path: &str,
-    by_path: &HashMap<&str, &ModuleBinding>,
+    model: &BindingModel,
+    mb: &ModuleBinding,
     indent: &str,
     emscripten: bool,
 ) {
-    fn tree_has_content(
-        m: &Module,
-        path: &str,
-        by_path: &HashMap<&str, &ModuleBinding>,
-        include_listeners: bool,
-    ) -> bool {
-        let here = by_path.get(path).is_some_and(|mb| {
-            !mb.functions.is_empty()
-                || !mb.interfaces.is_empty()
-                || (include_listeners && !mb.listeners.is_empty())
-        });
-        here || m.modules.iter().any(|sub| {
-            tree_has_content(
-                sub,
-                &format!("{path}_{}", sub.name),
-                by_path,
-                include_listeners,
-            )
-        })
+    fn tree_has_content(model: &BindingModel, mb: &ModuleBinding, include_listeners: bool) -> bool {
+        !mb.functions.is_empty()
+            || !mb.interfaces.is_empty()
+            || (include_listeners && !mb.listeners.is_empty())
+            || model
+                .children(mb)
+                .any(|sub| tree_has_content(model, sub, include_listeners))
     }
-    if !tree_has_content(m, module_path, by_path, !emscripten) {
+    if !tree_has_content(model, mb, !emscripten) {
         return;
     }
-    let mb = by_path[module_path];
     let error = mb.error.as_ref();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.block(format!("{}: {{", m.name), "};", |w| {
+    w.block(format!("{}: {{", mb.name), "};", |w| {
         let inner = w.indent_str();
         for f in &mb.functions {
             // Async functions are throwing stubs in Emscripten mode; omitting
@@ -257,10 +241,9 @@ fn render_dts_module_interface(
         for i in &mb.interfaces {
             w.line(format!("{}: typeof {};", i.name, i.name));
         }
-        for sub in &m.modules {
-            let sub_path = format!("{module_path}_{}", sub.name);
+        for sub in model.children(mb) {
             let mut tmp = String::new();
-            render_dts_module_interface(&mut tmp, sub, &sub_path, by_path, &inner, emscripten);
+            render_dts_module_interface(&mut tmp, model, sub, &inner, emscripten);
             w.raw(tmp);
         }
     });

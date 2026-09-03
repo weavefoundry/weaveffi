@@ -31,7 +31,7 @@ use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use weaveffi_core::model::{BindingModel, ErrorBinding, ModuleBinding};
 use weaveffi_core::plan::ErrorStrategy;
-use weaveffi_ir::ir::{Api, Module, TypeRef, CURRENT_SCHEMA_VERSION};
+use weaveffi_ir::ir::{Api, CURRENT_SCHEMA_VERSION};
 
 use self::helpers::{ident, CallTarget};
 use self::sync::gen_function;
@@ -50,35 +50,25 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
         ));
     }
 
-    // 1. Lower to IR through the shared bridge, then resolve type references so
-    //    C-style enum references are distinguished from record references and
-    //    cross-module references are qualified. The bridge recurses into nested
-    //    `#[weaveffi::module]` submodules, so this single lowering covers the
-    //    whole module tree.
+    // 1. Lower to IR through the shared bridge. The bridge recurses into
+    //    nested `#[weaveffi::module]` submodules, so this single lowering
+    //    covers the whole module tree.
     //
-    //    We run `resolve_type_refs` rather than the full `validate_api`: a
-    //    `#[weaveffi::module]` is expanded in isolation, so a reference to a type
-    //    declared in a *sibling* top-level module (e.g. `orders` using a
-    //    `products::Product`) must not be rejected as an unknown type here. A
-    //    cross-module struct still crosses the ABI as a value buffer, and the
-    //    emitted thunk decodes into the producer's real Rust type, so the symbol
-    //    and calling convention match the header regardless. Whole-API rule
-    //    checks remain enforced by the CLI's `validate`/`extract`/`generate`,
-    //    and the Rust compiler rejects any genuinely undefined type in the
-    //    thunks.
+    //    We skip the full `validate_api`: a `#[weaveffi::module]` is expanded
+    //    in isolation, so a reference to a type declared in a *sibling*
+    //    top-level module (e.g. `orders` using a `products::Product`) must not
+    //    be rejected as an unknown type here. `ResolvedApi::assume_valid`
+    //    resolves such names to `Ty::Record`, which is the right marshalling
+    //    for either a record or a rich enum (both cross as value buffers), and
+    //    the emitted thunk decodes into the producer's real Rust type, so the
+    //    symbol and calling convention match the header regardless. Whole-API
+    //    rule checks remain enforced by the CLI's `validate`/`generate`, and
+    //    the Rust compiler rejects any genuinely undefined type in the thunks.
     let module_ir = weaveffi_bridge::module_from_item_mod(item_mod)?;
-    let mut api = Api {
+    let api = weaveffi_core::ResolvedApi::assume_valid(Api {
         version: CURRENT_SCHEMA_VERSION.to_string(),
-        package: None,
         modules: vec![module_ir],
-        generators: None,
-    };
-    weaveffi_core::validate::resolve_type_refs(&mut api);
-    resolve_sibling_named_refs(&mut api);
-    // After `resolve_type_refs` plus the sibling rewrite above, no `Named`
-    // reference remains, which is exactly the contract `assume_resolved`
-    // asserts (see the doc on `resolve_sibling_named_refs`).
-    let api = weaveffi_core::ResolvedApi::assume_resolved(api);
+    });
 
     // 2. Build the canonical lowered model. Nested modules are flattened into
     //    one binding each, keyed here by their path segments (e.g. `["kv",
@@ -96,79 +86,6 @@ pub fn expand_module(item_mod: &syn::ItemMod) -> syn::Result<TokenStream> {
     //    modules expand here (with the correct prefix) instead of re-expanding
     //    standalone under the wrong one.
     rebuild_module(item_mod, &[], &by_path)
-}
-
-/// Rewrite every [`TypeRef::Named`] left after resolution into
-/// [`TypeRef::Record`].
-///
-/// The resolver only rewrites names it finds in the expanded module tree, and
-/// the macro expands each `#[weaveffi::module]` in isolation, so a reference
-/// to a type declared in a sibling top-level module stays `Named` here (the
-/// CLI, which sees the whole API, always resolves it). Such a reference
-/// crosses the ABI as a value buffer regardless of whether the sibling
-/// declares a record or a rich enum - both are buffered value types - so
-/// `Record` marshalling is correct for both, and the core's ABI lowering
-/// would otherwise panic on a leftover `Named`. A genuinely undefined type
-/// still fails: rustc rejects the thunk that names it.
-fn resolve_sibling_named_refs(api: &mut Api) {
-    fn walk_type(ty: &mut TypeRef) {
-        match ty {
-            TypeRef::Named(name) => {
-                let name = std::mem::take(name);
-                *ty = TypeRef::Record(name);
-            }
-            TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-                walk_type(inner);
-            }
-            TypeRef::Map(k, v) => {
-                walk_type(k);
-                walk_type(v);
-            }
-            _ => {}
-        }
-    }
-    fn walk_module(module: &mut Module) {
-        let callables = module
-            .functions
-            .iter_mut()
-            .chain(module.interfaces.iter_mut().flat_map(|i| {
-                i.constructors
-                    .iter_mut()
-                    .chain(i.methods.iter_mut())
-                    .chain(i.statics.iter_mut())
-            }));
-        for f in callables {
-            for p in &mut f.params {
-                walk_type(&mut p.ty);
-            }
-            if let Some(ret) = &mut f.returns {
-                walk_type(ret);
-            }
-        }
-        for s in &mut module.structs {
-            for field in &mut s.fields {
-                walk_type(&mut field.ty);
-            }
-        }
-        for e in &mut module.enums {
-            for v in &mut e.variants {
-                for field in &mut v.fields {
-                    walk_type(&mut field.ty);
-                }
-            }
-        }
-        for cb in &mut module.callbacks {
-            for p in &mut cb.params {
-                walk_type(&mut p.ty);
-            }
-        }
-        for child in &mut module.modules {
-            walk_module(child);
-        }
-    }
-    for module in &mut api.modules {
-        walk_module(module);
-    }
 }
 
 /// Re-emit `item_mod` with its generated thunks appended, recursing into nested

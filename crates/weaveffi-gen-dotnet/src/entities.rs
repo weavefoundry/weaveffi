@@ -3,12 +3,12 @@
 
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, CallShape, EnumBinding, EnumVariantBinding, ErrorBinding, FieldBinding,
     FnBinding, InterfaceBinding, StructBinding,
 };
 use weaveffi_core::utils::local_type_name;
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::{
     build_call_args, param_needs_marshal, render_marshal_cleanup, render_marshal_setup,
@@ -23,15 +23,15 @@ use crate::types::{camel_fn, cs_type, safe_cs_name, typed_handle_cs};
 /// parameters, and error payload fields), so one `{T}Handle` wrapper struct
 /// is emitted per referent. The `BTreeSet` keeps emission order stable.
 pub(crate) fn collect_typed_handles(model: &BindingModel) -> std::collections::BTreeSet<String> {
-    fn visit(ty: &TypeRef, acc: &mut std::collections::BTreeSet<String>) {
+    fn visit(ty: &Ty, acc: &mut std::collections::BTreeSet<String>) {
         match ty {
-            TypeRef::TypedHandle(name) => {
+            Ty::TypedHandle(name) => {
                 acc.insert(local_type_name(name).to_string());
             }
-            TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+            Ty::Optional(inner) | Ty::List(inner) | Ty::Iterator(inner) => {
                 visit(inner, acc);
             }
-            TypeRef::Map(k, v) => {
+            Ty::Map(k, v) => {
                 visit(k, acc);
                 visit(v, acc);
             }

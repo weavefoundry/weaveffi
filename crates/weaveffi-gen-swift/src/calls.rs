@@ -12,12 +12,12 @@ use heck::ToLowerCamelCase;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::lang;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
 };
 use weaveffi_core::plan::{ret_pass, ArgPass, ElemFree, ErrorStrategy, RetPass};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{fresh, read_value_stmts, write_value_stmts};
 use crate::docs::emit_fn_doc;
@@ -291,14 +291,14 @@ fn build_c_call_args(params: &[ParamBinding], c_prefix: &str, module_name: &str)
                 }
             }
             ArgPass::Direct { .. } => match &p.ty {
-                TypeRef::Enum(enum_name) => args.push(format!(
+                Ty::Enum(enum_name) => args.push(format!(
                     "{}({}.rawValue)",
                     c_enum_type(enum_name, c_prefix, module_name),
                     p.name
                 )),
                 // A typed handle is a `UInt64` token in Swift; the C slot is
                 // an opaque typed pointer, so reinterpret the bits.
-                TypeRef::TypedHandle(_) => {
+                Ty::TypedHandle(_) => {
                     args.push(format!("OpaquePointer(bitPattern: UInt({}))", p.name));
                 }
                 _ => args.push(p.name.clone()),
@@ -327,8 +327,8 @@ fn raw_return_swift(
         RetPass::String => "UnsafePointer<CChar>?".to_string(),
         RetPass::Object { .. } => "OpaquePointer?".to_string(),
         RetPass::Direct => match f.ret.as_ref() {
-            Some(TypeRef::TypedHandle(_)) => "OpaquePointer?".to_string(),
-            Some(TypeRef::Enum(name)) => c_enum_type(name, c_prefix, module_name),
+            Some(Ty::TypedHandle(_)) => "OpaquePointer?".to_string(),
+            Some(Ty::Enum(name)) => c_enum_type(name, c_prefix, module_name),
             Some(other) => swift_type_for(other),
             None => unreachable!("a direct return carries a type"),
         },
@@ -339,9 +339,9 @@ fn raw_return_swift(
 /// nullable).
 fn ret_interface_name(f: &FnBinding) -> &str {
     match f.ret.as_ref() {
-        Some(TypeRef::Interface(name)) => name,
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::Interface(name) => name,
+        Some(Ty::Interface(name)) => name,
+        Some(Ty::Optional(inner)) => match inner.as_ref() {
+            Ty::Interface(name) => name,
             _ => unreachable!("non-interface optional is buffered"),
         },
         _ => unreachable!("object return implies an interface type"),
@@ -543,11 +543,11 @@ fn render_return_tail(
             ));
         }
         Some(RetPass::Direct) => match f.ret.as_ref() {
-            Some(TypeRef::Enum(name)) => {
+            Some(Ty::Enum(name)) => {
                 let ty_name = ctx.ty_name(local_type_name(name));
                 w.line(format!("return {ty_name}(rawValue: rv.rawValue)!"));
             }
-            Some(TypeRef::TypedHandle(_)) => {
+            Some(Ty::TypedHandle(_)) => {
                 w.line("return UInt64(UInt(bitPattern: rv))");
             }
             _ => {
@@ -562,10 +562,10 @@ fn render_return_tail(
 /// owning Swift class would `*_destroy` a borrowed handle on ARC release.
 /// Buffered parameters are decoded to their idiomatic value types before the
 /// closure is invoked.
-fn swift_cb_param_type(ty: &TypeRef, ctx: SwiftCtx) -> String {
+fn swift_cb_param_type(ty: &Ty, ctx: SwiftCtx) -> String {
     match ty {
-        TypeRef::Interface(_) => "OpaquePointer?".into(),
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Interface(_)) => {
+        Ty::Interface(_) => "OpaquePointer?".into(),
+        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
             "OpaquePointer?".into()
         }
         other => swift_type_ctx(other, ctx),
@@ -586,16 +586,16 @@ fn cb_slot_ident(name: &str) -> String {
 fn swift_cb_direct_arg(p: &ParamBinding, ctx: SwiftCtx) -> String {
     let n0 = cb_slot_ident(&p.abi[0].name);
     match &p.ty {
-        TypeRef::Enum(_) => {
+        Ty::Enum(_) => {
             let local = swift_type_ctx(&p.ty, ctx);
             format!("{local}(rawValue: {n0}.rawValue)!")
         }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => format!("String(cString: {n0}!)"),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::StringUtf8 | Ty::BorrowedStr => format!("String(cString: {n0}!)"),
+        Ty::Bytes | Ty::BorrowedBytes => {
             let n1 = cb_slot_ident(&p.abi[1].name);
             format!("{n0}.map {{ Data(bytes: $0, count: {n1}) }} ?? Data()")
         }
-        TypeRef::TypedHandle(_) => format!("UInt64(UInt(bitPattern: {n0}))"),
+        Ty::TypedHandle(_) => format!("UInt64(UInt(bitPattern: {n0}))"),
         // Interfaces (and nullable interfaces) stay raw borrowed pointers.
         _ => n0,
     }
@@ -983,13 +983,13 @@ fn render_async_resume_result(
             ));
         }
         RetPass::Direct => match f.ret.as_ref() {
-            Some(TypeRef::Enum(name)) => {
+            Some(Ty::Enum(name)) => {
                 let ty_name = ctx.ty_name(local_type_name(name));
                 w.line(format!(
                     "contRef.value.resume(returning: {ty_name}(rawValue: result.rawValue)!)"
                 ));
             }
-            Some(TypeRef::TypedHandle(_)) => {
+            Some(Ty::TypedHandle(_)) => {
                 w.line("contRef.value.resume(returning: UInt64(UInt(bitPattern: result)))");
             }
             _ => {
@@ -1032,7 +1032,7 @@ pub(crate) fn render_swift_iterator_class(
     let stem = domain_stem(mb);
     let throws = protocol.error == ErrorStrategy::Throws;
     let has_len_slot = protocol.elem_free == ElemFree::Bytes;
-    let is_bytes_elem = matches!(inner, TypeRef::Bytes | TypeRef::BorrowedBytes);
+    let is_bytes_elem = matches!(inner, Ty::Bytes | Ty::BorrowedBytes);
     // A `(ptr, len)` element that isn't raw bytes is a buffered value the
     // wrapper decodes.
     let is_buffered_elem = has_len_slot && !is_bytes_elem;
@@ -1055,13 +1055,13 @@ pub(crate) fn render_swift_iterator_class(
     // The `out_item` slot declaration.
     let (c_var, default): (String, String) = match inner {
         _ if has_len_slot => ("UnsafePointer<UInt8>?".to_string(), "nil".to_string()),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             ("UnsafePointer<CChar>?".to_string(), "nil".to_string())
         }
-        TypeRef::Interface(_) | TypeRef::TypedHandle(_) | TypeRef::Optional(_) => {
+        Ty::Interface(_) | Ty::TypedHandle(_) | Ty::Optional(_) => {
             ("OpaquePointer?".to_string(), "nil".to_string())
         }
-        TypeRef::Enum(_) => (elem_c_type.clone(), format!("{elem_c_type}(0)")),
+        Ty::Enum(_) => (elem_c_type.clone(), format!("{elem_c_type}(0)")),
         _ => (swift_type_for(inner), swift_scalar_default(inner)),
     };
 
@@ -1174,14 +1174,14 @@ pub(crate) fn render_swift_iterator_class(
         w.line("return element");
     } else {
         let convert = match inner {
-            TypeRef::StringUtf8 | TypeRef::BorrowedStr => "String(cString: item!)".to_string(),
+            Ty::StringUtf8 | Ty::BorrowedStr => "String(cString: item!)".to_string(),
             // An owned interface element is adopted by the wrapper class,
             // whose deinit owes the `_destroy`.
-            TypeRef::Interface(name) => {
+            Ty::Interface(name) => {
                 format!("{}(ptr: item!)", ctx.ty_name(local_type_name(name)))
             }
-            TypeRef::TypedHandle(_) => "UInt64(UInt(bitPattern: item))".to_string(),
-            TypeRef::Enum(name) => format!(
+            Ty::TypedHandle(_) => "UInt64(UInt(bitPattern: item))".to_string(),
+            Ty::Enum(name) => format!(
                 "{}(rawValue: item.rawValue)!",
                 ctx.ty_name(local_type_name(name))
             ),

@@ -1,16 +1,13 @@
 //! `weaveffi` command-line entry point: `clap` definitions and dispatch.
 //!
-//! Each subcommand's implementation lives in `commands` (or its own
-//! top-level module for the self-contained ones: `doctor`, `extract`,
-//! `scaffold`); the generator registry and config plumbing live in
-//! `config`.
+//! Each subcommand's implementation lives in `commands` (or `extract` for the
+//! Rust-source extractor); project configuration and the generator registry
+//! live in `config`.
 
 mod commands;
 mod config;
-mod doctor;
 mod extract;
 mod report;
-mod scaffold;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
@@ -45,11 +42,9 @@ impl HumanJsonFormat {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    New {
-        name: String,
-    },
+    /// Generate bindings for every (or the selected) language target
     Generate {
-        /// Input IDL/IR file (yaml|yml|json|toml)
+        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
         input: String,
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
@@ -57,10 +52,7 @@ enum Commands {
         /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby)
         #[arg(short, long)]
         target: Option<String>,
-        /// Also generate a scaffold.rs with Rust FFI function stubs
-        #[arg(long)]
-        scaffold: bool,
-        /// Path to a TOML configuration file for generator options
+        /// Path to weaveffi.toml (default: the nearest one at or above the input file)
         #[arg(long)]
         config: Option<String>,
         /// Print non-fatal warnings after validation
@@ -73,18 +65,20 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Validate an API definition without generating anything
     Validate {
-        /// Input IDL/IR file (yaml|yml|json|toml)
+        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
         input: String,
-        /// Print non-fatal warnings after validation
+        /// Also report non-fatal warnings (advisory lints)
         #[arg(long)]
         warn: bool,
         /// Output format: `json` for machine-readable output, otherwise human-readable
         #[arg(long)]
         format: Option<HumanJsonFormat>,
     },
+    /// Assemble publishable packages that bundle prebuilt native libraries
     Package {
-        /// Input IDL/IR file (yaml|yml|json|toml)
+        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
         input: String,
         /// Output directory for the packaged artifacts
         #[arg(short, long, default_value = "./dist")]
@@ -92,7 +86,7 @@ enum Commands {
         /// Comma-separated list of targets to package (e.g. node,python,dotnet)
         #[arg(short, long)]
         target: Option<String>,
-        /// Path to a TOML configuration file for generator options
+        /// Path to weaveffi.toml (default: the nearest one at or above the input file)
         #[arg(long)]
         config: Option<String>,
         /// Directory of prebuilt native libraries laid out as `<dir>/<platform>/<lib>`
@@ -109,6 +103,7 @@ enum Commands {
         #[arg(long)]
         warn: bool,
     },
+    /// Extract an IDL document from annotated Rust source
     Extract {
         /// Path to a Rust source file to extract API definitions from
         input: String,
@@ -124,63 +119,30 @@ enum Commands {
         #[arg(long)]
         warn: bool,
     },
-    Lint {
-        /// Input IDL/IR file (yaml|yml|json|toml)
-        input: String,
-        /// Output format: `json` for machine-readable output, otherwise human-readable
-        #[arg(long)]
-        format: Option<HumanJsonFormat>,
-    },
+    /// Show how regenerating would change an existing output directory
     Diff {
-        /// Input IDL/IR file (yaml|yml|json|toml)
+        /// Input: annotated Rust source (.rs) or an IDL document (yaml|yml|json|toml)
         input: String,
         /// Output directory to compare against (defaults to ./generated)
         #[arg(short, long)]
         out: Option<String>,
+        /// Path to weaveffi.toml (default: the nearest one at or above the input file)
+        #[arg(long)]
+        config: Option<String>,
         /// Exit non-zero if regeneration would change `out` (2 if files
         /// differ, 3 if files are missing/extra). Prints only a summary,
         /// not per-file diffs.
         #[arg(long)]
         check: bool,
     },
-    Doctor {
-        /// Only run checks whose `applies_to` includes this target (e.g. `dart`, `swift`, or `package` for the cross-build producer targets)
-        #[arg(long)]
-        target: Option<String>,
-        /// Output format: `json` for machine-readable output, otherwise human-readable
-        #[arg(long)]
-        format: Option<HumanJsonFormat>,
-    },
+    /// Print shell completions
     Completions {
         /// Shell to generate completions for
         shell: clap_complete::Shell,
     },
-    Man {
-        /// Output directory for generated man pages
-        #[arg(long)]
-        out: String,
-    },
+    /// Print the IDL schema version this build reads and writes
     SchemaVersion,
-    Watch {
-        /// Input IDL/IR file (yaml|yml|json|toml)
-        input: String,
-        /// Output directory for generated artifacts
-        #[arg(short, long, default_value = "./generated")]
-        out: String,
-        /// Comma-separated list of targets to generate
-        #[arg(short, long)]
-        target: Option<String>,
-        /// Path to a TOML configuration file for generator options
-        #[arg(long)]
-        config: Option<String>,
-    },
-    Format {
-        /// Input IDL/IR file (yaml|yml|json|toml)
-        input: String,
-        /// Exit non-zero if the file is not already canonically formatted
-        #[arg(long)]
-        check: bool,
-    },
+    /// Print the IDL document schema
     Schema {
         /// Schema export format (currently only json-schema is supported)
         #[arg(long, default_value = "json-schema")]
@@ -214,12 +176,10 @@ fn main() -> Result<()> {
 
     let quiet = cli.quiet;
     match cli.command {
-        Commands::New { name } => commands::new::cmd_new(&name, quiet)?,
         Commands::Generate {
             input,
             out,
             target,
-            scaffold,
             config,
             warn,
             force,
@@ -228,7 +188,6 @@ fn main() -> Result<()> {
             &input,
             &out,
             target.as_deref(),
-            scaffold,
             config.as_deref(),
             warn,
             force,
@@ -277,27 +236,14 @@ fn main() -> Result<()> {
             warn,
             quiet,
         )?,
-        Commands::Lint { input, format } => {
-            if !commands::validate::cmd_lint(&input, format.map(HumanJsonFormat::as_str), quiet)? {
-                std::process::exit(1);
-            }
-        }
-        Commands::Diff { input, out, check } => {
-            commands::diff::cmd_diff(&input, out.as_deref(), check, quiet)?
-        }
-        Commands::Doctor { target, format } => {
-            doctor::cmd_doctor(target.as_deref(), format.map(HumanJsonFormat::as_str))?
-        }
-        Commands::Completions { shell } => cmd_completions(shell),
-        Commands::Man { out } => cmd_man(&out, quiet)?,
-        Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
-        Commands::Watch {
+        Commands::Diff {
             input,
             out,
-            target,
             config,
-        } => commands::watch::cmd_watch(&input, &out, target.as_deref(), config.as_deref(), quiet)?,
-        Commands::Format { input, check } => commands::format::cmd_format(&input, check, quiet)?,
+            check,
+        } => commands::diff::cmd_diff(&input, out.as_deref(), config.as_deref(), check, quiet)?,
+        Commands::Completions { shell } => cmd_completions(shell),
+        Commands::SchemaVersion => println!("{CURRENT_SCHEMA_VERSION}"),
         Commands::Schema { format } => cmd_schema(&format)?,
     }
     Ok(())
@@ -310,23 +256,6 @@ fn cmd_completions(shell: clap_complete::Shell) {
         "weaveffi",
         &mut std::io::stdout(),
     );
-}
-
-fn cmd_man(out: &str, quiet: bool) -> Result<()> {
-    let out_dir = std::path::PathBuf::from(out);
-    std::fs::create_dir_all(&out_dir)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create directory: {out}"))?;
-
-    clap_mangen::generate_to(Cli::command(), &out_dir)
-        .into_diagnostic()
-        .wrap_err("failed to generate man pages")?;
-
-    if !quiet {
-        println!("Man pages written to {}", out_dir.display());
-    }
-
-    Ok(())
 }
 
 fn cmd_schema(format: &str) -> Result<()> {
@@ -352,167 +281,40 @@ mod tests {
 
     #[test]
     fn rejects_unknown_human_json_output_formats() {
-        for args in [
-            &["weaveffi", "validate", "input.yml", "--format", "jsonn"][..],
-            &["weaveffi", "lint", "input.yml", "--format", "xml"],
-            &["weaveffi", "doctor", "--target", "swift", "--format", "xml"],
-        ] {
-            let error = Cli::try_parse_from(args).expect_err("unknown format should be rejected");
-            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
-            let message = error.to_string();
+        let args = ["weaveffi", "validate", "input.yml", "--format", "jsonn"];
+        let error = Cli::try_parse_from(args).expect_err("unknown format should be rejected");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        assert!(
+            error.to_string().contains("possible values: human, json"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn removed_subcommands_are_gone() {
+        for cmd in ["new", "lint", "doctor", "man", "watch", "format"] {
             assert!(
-                message.contains("possible values: human, json"),
-                "{message}"
+                Cli::try_parse_from(["weaveffi", cmd]).is_err(),
+                "`{cmd}` should no longer parse"
             );
         }
     }
 
     #[test]
-    fn doctor_checks_cross_targets() {
-        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .arg("doctor")
-            .output()
-            .expect("failed to run weaveffi doctor");
-
-        let stdout = String::from_utf8_lossy(&cmd.stdout);
-        assert!(cmd.status.success(), "doctor failed: {stdout}");
-        assert!(
-            stdout.contains("Cross-compilation targets:"),
-            "missing cross-target section in doctor output: {stdout}"
-        );
-        assert!(
-            stdout.contains("aarch64-apple-ios"),
-            "missing iOS target check: {stdout}"
-        );
-        assert!(
-            stdout.contains("aarch64-linux-android"),
-            "missing Android target check: {stdout}"
-        );
-        assert!(
-            stdout.contains("wasm32-unknown-unknown"),
-            "missing Wasm target check: {stdout}"
-        );
-        assert!(
-            stdout.contains("WebAssembly tools:"),
-            "missing wasm tools section: {stdout}"
-        );
-        assert!(
-            stdout.contains("wasm-pack"),
-            "missing wasm-pack check: {stdout}"
-        );
-        assert!(
-            stdout.contains("wasm-bindgen-cli"),
-            "missing wasm-bindgen-cli check: {stdout}"
-        );
-    }
-
-    #[test]
-    fn completions_bash() {
-        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .args(["completions", "bash"])
-            .output()
-            .expect("failed to run weaveffi completions bash");
-
-        let stdout = String::from_utf8_lossy(&cmd.stdout);
-        assert!(cmd.status.success(), "completions bash failed: {stdout}");
-        assert!(
-            stdout.contains("weaveffi"),
-            "bash completions should reference weaveffi: {stdout}"
-        );
-        assert!(
-            stdout.contains("complete"),
-            "bash completions should contain 'complete': {stdout}"
-        );
-    }
-
-    #[test]
-    fn completions_zsh() {
-        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .args(["completions", "zsh"])
-            .output()
-            .expect("failed to run weaveffi completions zsh");
-
-        let stdout = String::from_utf8_lossy(&cmd.stdout);
-        assert!(cmd.status.success(), "completions zsh failed: {stdout}");
-        assert!(
-            stdout.contains("weaveffi"),
-            "zsh completions should reference weaveffi: {stdout}"
-        );
-        assert!(
-            stdout.contains("compdef"),
-            "zsh completions should contain 'compdef': {stdout}"
-        );
-    }
-
-    #[test]
-    fn schema_version_prints_current() {
-        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .arg("schema-version")
-            .output()
-            .expect("failed to run weaveffi schema-version");
-
-        let stdout = String::from_utf8_lossy(&cmd.stdout);
-        assert!(cmd.status.success(), "schema-version failed: {stdout}");
-        assert_eq!(stdout.trim(), CURRENT_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn man_generation() {
-        let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let out_dir = temp_dir.path().join("man");
-
-        let cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .args(["man", "--out", out_dir.to_str().unwrap()])
-            .output()
-            .expect("failed to run weaveffi man");
-
-        let stdout = String::from_utf8_lossy(&cmd.stdout);
-        assert!(cmd.status.success(), "man generation failed: {stdout}");
-        assert!(
-            stdout.contains("Man pages written to"),
-            "should print where pages were written (not quiet): {stdout}"
-        );
-
-        // Verify top-level
-        let main_page = out_dir.join("weaveffi.1");
-        assert!(main_page.exists(), "weaveffi.1 not generated");
-        assert!(
-            std::fs::metadata(&main_page).unwrap().len() > 0,
-            "weaveffi.1 is empty"
-        );
-
-        // Verify subcommands exist. At minimum we know `generate` and `doctor` exist.
-        let generate_page = out_dir.join("weaveffi-generate.1");
-        assert!(generate_page.exists(), "weaveffi-generate.1 not generated");
-        assert!(
-            std::fs::metadata(&generate_page).unwrap().len() > 0,
-            "weaveffi-generate.1 is empty"
-        );
-
-        let doctor_page = out_dir.join("weaveffi-doctor.1");
-        assert!(doctor_page.exists(), "weaveffi-doctor.1 not generated");
-        assert!(
-            std::fs::metadata(&doctor_page).unwrap().len() > 0,
-            "weaveffi-doctor.1 is empty"
-        );
-
-        // Verify quiet respects global flag
-        let quiet_cmd = assert_cmd::Command::cargo_bin("weaveffi")
-            .expect("binary not found")
-            .args(["--quiet", "man", "--out", out_dir.to_str().unwrap()])
-            .output()
-            .expect("failed to run weaveffi --quiet man");
-
-        let quiet_stdout = String::from_utf8_lossy(&quiet_cmd.stdout);
-        assert!(quiet_cmd.status.success());
-        assert!(
-            !quiet_stdout.contains("Man pages written to"),
-            "quiet mode should suppress output"
-        );
+    fn completions_and_schema_version() {
+        for (args, needle) in [
+            (&["completions", "bash"][..], "complete"),
+            (&["completions", "zsh"][..], "compdef"),
+            (&["schema-version"][..], CURRENT_SCHEMA_VERSION),
+        ] {
+            let cmd = assert_cmd::Command::cargo_bin("weaveffi")
+                .expect("binary not found")
+                .args(args)
+                .output()
+                .expect("failed to run weaveffi");
+            let stdout = String::from_utf8_lossy(&cmd.stdout);
+            assert!(cmd.status.success(), "{args:?} failed: {stdout}");
+            assert!(stdout.contains(needle), "{args:?}: {stdout}");
+        }
     }
 }

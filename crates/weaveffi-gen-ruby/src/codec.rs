@@ -8,10 +8,10 @@
 
 use heck::ToSnakeCase;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{EnumBinding, StructBinding};
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::rb_field_name;
 
@@ -27,19 +27,19 @@ pub(crate) fn wv_stem(name: &str) -> String {
 /// encode as their `i32` discriminant; handles as raw `u64` tokens.
 fn wv_scalar_writer(shape: &WireType) -> Option<&'static str> {
     Some(match shape {
-        WireType::Bool => "write_bool",
-        WireType::I8 => "write_i8",
-        WireType::U8 => "write_u8",
-        WireType::I16 => "write_i16",
-        WireType::U16 => "write_u16",
-        WireType::I32 | WireType::Enum(_) => "write_i32",
-        WireType::U32 => "write_u32",
-        WireType::I64 => "write_i64",
-        WireType::U64 | WireType::Handle => "write_u64",
-        WireType::F32 => "write_f32",
-        WireType::F64 => "write_f64",
-        WireType::String => "write_string",
-        WireType::Bytes => "write_bytes",
+        WireType::Prim(Prim::Bool) => "write_bool",
+        WireType::Prim(Prim::I8) => "write_i8",
+        WireType::Prim(Prim::U8) => "write_u8",
+        WireType::Prim(Prim::I16) => "write_i16",
+        WireType::Prim(Prim::U16) => "write_u16",
+        WireType::Prim(Prim::I32) | WireType::Enum(_) => "write_i32",
+        WireType::Prim(Prim::U32) => "write_u32",
+        WireType::Prim(Prim::I64) => "write_i64",
+        WireType::Prim(Prim::U64) | WireType::Handle(_) => "write_u64",
+        WireType::Prim(Prim::F32) => "write_f32",
+        WireType::Prim(Prim::F64) => "write_f64",
+        WireType::Prim(Prim::String) => "write_string",
+        WireType::Prim(Prim::Bytes) => "write_bytes",
         _ => return None,
     })
 }
@@ -48,19 +48,19 @@ fn wv_scalar_writer(shape: &WireType) -> Option<&'static str> {
 /// [`wv_scalar_writer`].
 fn wv_scalar_reader(shape: &WireType) -> Option<&'static str> {
     Some(match shape {
-        WireType::Bool => "read_bool",
-        WireType::I8 => "read_i8",
-        WireType::U8 => "read_u8",
-        WireType::I16 => "read_i16",
-        WireType::U16 => "read_u16",
-        WireType::I32 | WireType::Enum(_) => "read_i32",
-        WireType::U32 => "read_u32",
-        WireType::I64 => "read_i64",
-        WireType::U64 | WireType::Handle => "read_u64",
-        WireType::F32 => "read_f32",
-        WireType::F64 => "read_f64",
-        WireType::String => "read_string",
-        WireType::Bytes => "read_bytes",
+        WireType::Prim(Prim::Bool) => "read_bool",
+        WireType::Prim(Prim::I8) => "read_i8",
+        WireType::Prim(Prim::U8) => "read_u8",
+        WireType::Prim(Prim::I16) => "read_i16",
+        WireType::Prim(Prim::U16) => "read_u16",
+        WireType::Prim(Prim::I32) | WireType::Enum(_) => "read_i32",
+        WireType::Prim(Prim::U32) => "read_u32",
+        WireType::Prim(Prim::I64) => "read_i64",
+        WireType::Prim(Prim::U64) | WireType::Handle(_) => "read_u64",
+        WireType::Prim(Prim::F32) => "read_f32",
+        WireType::Prim(Prim::F64) => "read_f64",
+        WireType::Prim(Prim::String) => "read_string",
+        WireType::Prim(Prim::Bytes) => "read_bytes",
         _ => return None,
     })
 }
@@ -73,11 +73,11 @@ pub(crate) fn render_wv_write(
     w: &mut CodeWriter,
     wvar: &str,
     expr: &str,
-    ty: &TypeRef,
+    ty: &Ty,
     depth: usize,
     q: &str,
 ) {
-    let shape = wire::classify(ty);
+    let shape = ty.wire();
     if let Some(m) = wv_scalar_writer(&shape) {
         w.line(format!("{wvar}.{m}({expr})"));
         return;
@@ -125,11 +125,11 @@ pub(crate) fn render_wv_read(
     w: &mut CodeWriter,
     rvar: &str,
     var: &str,
-    ty: &TypeRef,
+    ty: &Ty,
     depth: usize,
     q: &str,
 ) {
-    let shape = wire::classify(ty);
+    let shape = ty.wire();
     if let Some(m) = wv_scalar_reader(&shape) {
         w.line(format!("{var} = {rvar}.{m}"));
         return;

@@ -28,9 +28,16 @@ After the 1.0.0 release, the following surfaces will be governed by SemVer:
   `weaveffi-gen-swift`, `weaveffi-gen-android`, `weaveffi-gen-node`,
   `weaveffi-gen-wasm`, `weaveffi-gen-python`, `weaveffi-gen-dotnet`,
   `weaveffi-gen-dart`, `weaveffi-gen-go`, `weaveffi-gen-ruby`, and
-  `weaveffi-cli`. The `Generator` trait, the `Orchestrator`, the IR types,
-  and the C ABI runtime symbols exported from `weaveffi-abi` are all public
-  contracts.
+  `weaveffi-cli`. The `LanguageBackend` trait, the `Orchestrator`, the IR
+  types, and the C ABI runtime symbols exported from `weaveffi-abi` are all
+  public contracts.
+- **The C ABI revision.** The `weaveffi_abi_version()` runtime symbol
+  reports the revision of the runtime surface (the `weaveffi_error` layout,
+  the value-buffer encoding, and the `weaveffi_*` symbol set). Generated
+  consumers embed the revision they were built for and, where a load-time
+  check is cheap (Python, Ruby, Dart, Go, .NET, Node.js, Wasm), refuse to
+  run against a producer reporting a different one. The revision only
+  changes with a major release.
 
 ## What is NOT covered pre-1.0
 
@@ -67,9 +74,19 @@ contract." Things that have already changed during 0.x:
   `*_with_config` method pair. A prototype Tera template hook
   (`generate_with_templates`, `--templates`, `template_dir`) was added
   and then removed in `0.4.0` because no generator ever consumed it.
+  Schema `0.8.0` folded `Generator` into the single `LanguageBackend`
+  trait (`Target` is its object-safe view), and generators now consume a
+  fully resolved `Ty` type model rather than matching on the IDL's
+  `TypeRef` strings.
 - The C ABI runtime added `weaveffi_arena_*` and `weaveffi_cancel_token_*`
-  families.
-- `weaveffi doctor` gained `--target` and `--format json`.
+  families, and then `weaveffi_abi_version`.
+- Schema `0.8.0` removed the top-level `package:` and `generators:` blocks
+  from the IDL. Package identity and per-target options moved to a
+  `weaveffi.toml` next to the definition (auto-discovered, or named with
+  `--config`), and unknown top-level IDL keys are now rejected. The
+  peripheral `new`, `scaffold`, `watch`, `format`, `lint`, `doctor`, and
+  `man` CLI commands were removed; `validate --warn` reports the former
+  lint warnings.
 
 Pin the WeaveFFI version in CI (`cargo install weaveffi-cli --version
 =0.3.0`) and vendor the generated output in your repository so that
@@ -103,7 +120,7 @@ tied to `weaveffi-ir`'s minor version: each `weaveffi-ir` minor bump
 corresponds to at most one schema version bump.
 [`CURRENT_SCHEMA_VERSION`](https://github.com/weavefoundry/weaveffi/blob/main/crates/weaveffi-ir/src/ir.rs)
 in `crates/weaveffi-ir/src/ir.rs` is the source of truth; the current
-schema version is `0.7.0`.
+schema version is `0.8.0`.
 
 Pre-1.0, **only the current schema version is accepted**
 (`SUPPORTED_VERSIONS` contains exactly `CURRENT_SCHEMA_VERSION`), so a
@@ -166,9 +183,8 @@ A typical GitHub Actions step:
     weaveffi diff idl/api.yml --out generated/ --check
 ```
 
-Combine it with `weaveffi format --check idl/api.yml` (canonical IDL) and
-`weaveffi validate idl/api.yml` (schema correctness) for a complete CI
-guard.
+Combine it with `weaveffi validate --warn idl/api.yml` (schema correctness
+plus advisory lints) for a complete CI guard.
 
 ## See also
 

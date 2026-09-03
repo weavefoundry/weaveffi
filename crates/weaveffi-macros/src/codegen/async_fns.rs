@@ -16,8 +16,8 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{AsyncBinding, FnBinding, ParamBinding};
-use weaveffi_ir::ir::TypeRef;
 
 use super::helpers::{
     ctype_to_rust, fn_slots, ident, is_copy, sentinel, user_param_type, CallTarget,
@@ -46,7 +46,7 @@ fn lift_async_input(
     // caller's thread, decode on the worker thread (inside its catch_unwind,
     // so a malformed buffer is delivered through the callback's `err` with
     // the panic code rather than unwinding across the C boundary).
-    if weaveffi_core::abi::is_buffered(&pb.ty) {
+    if pb.ty.is_buffered() {
         let ptr = ident(&format!("{}_ptr", pb.name));
         let len = ident(&format!("{}_len", pb.name));
         let panic_msg = format!("{}: malformed WeaveFFI value buffer", pb.name);
@@ -65,12 +65,12 @@ fn lift_async_input(
         ));
     }
     Ok(match &pb.ty {
-        ty if is_copy(ty) && !matches!(ty, TypeRef::Enum(_)) => (none.clone(), none, quote!(#name)),
+        ty if is_copy(ty) && !matches!(ty, Ty::Enum(_)) => (none.clone(), none, quote!(#name)),
         // A typed handle is an opaque pointer, which is not `Send`. Carry it
         // across the worker-thread boundary as a `usize` and rebuild it inside
         // the closure with the producer's own pointer type (so a `super::T`
         // path stays in scope), mirroring the hand-written async sample.
-        TypeRef::TypedHandle(_) => {
+        Ty::TypedHandle(_) => {
             let addr = ident(&format!("__wv_addr_{}", pb.name));
             let uty = user_param_type(sig, &pb.name)
                 .ok_or_else(|| unsupported(&pb.name, "async typed-handle parameter"))?;
@@ -80,17 +80,17 @@ fn lift_async_input(
                 quote!(#name),
             )
         }
-        TypeRef::StringUtf8 => (
+        Ty::StringUtf8 => (
             quote!(let #name = ::weaveffi::abi::c_ptr_to_string(#name).unwrap_or_default();),
             none,
             quote!(#name),
         ),
-        TypeRef::BorrowedStr => (
+        Ty::BorrowedStr => (
             quote!(let #name = ::weaveffi::abi::c_ptr_to_string(#name).unwrap_or_default();),
             none,
             quote!(&#name),
         ),
-        TypeRef::Bytes => {
+        Ty::Bytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
             let len = ident(&format!("{}_len", pb.name));
             (
@@ -99,7 +99,7 @@ fn lift_async_input(
                 quote!(#name),
             )
         }
-        TypeRef::BorrowedBytes => {
+        Ty::BorrowedBytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
             let len = ident(&format!("{}_len", pb.name));
             (
@@ -121,14 +121,11 @@ fn lift_async_input(
 /// and an owned interface result is adopted (the consumer eventually calls
 /// `_destroy`). Ownership transfer is what lets consumers defer decoding past
 /// the callback's return. `bytes` results are not yet supported.
-fn async_result_args(
-    ty: &TypeRef,
-    value: TokenStream,
-) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
+fn async_result_args(ty: &Ty, value: TokenStream) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
     let none = TokenStream::new();
     // A buffered result crosses as an owned `(ptr, len)` pair the consumer
     // decodes at its leisure and releases with `weaveffi_free_bytes`.
-    if weaveffi_core::abi::is_buffered(ty) {
+    if ty.is_buffered() {
         return Ok((
             quote! {
                 let __wv_res_buf = ::weaveffi::abi::encode_value(&(#value)).into_boxed_slice();
@@ -139,16 +136,16 @@ fn async_result_args(
         ));
     }
     Ok(match ty {
-        t if is_copy(t) && !matches!(t, TypeRef::Enum(_)) => (none.clone(), vec![value]),
-        TypeRef::Enum(_) => (none.clone(), vec![quote!((#value) as i32)]),
+        t if is_copy(t) && !matches!(t, Ty::Enum(_)) => (none.clone(), vec![value]),
+        Ty::Enum(_) => (none.clone(), vec![quote!((#value) as i32)]),
         // An owned string the consumer releases with `weaveffi_free_string`.
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => (
+        Ty::StringUtf8 | Ty::BorrowedStr => (
             quote!(let __wv_res = ::weaveffi::abi::string_to_c_ptr(&(#value));),
             vec![quote!(__wv_res)],
         ),
         // An owned-object result: the callback adopts the pointer (the plan's
         // `result_adopt`) and the consumer eventually calls `_destroy`.
-        TypeRef::Interface(_) => (
+        Ty::Interface(_) => (
             none.clone(),
             vec![quote!(::std::boxed::Box::into_raw(::std::boxed::Box::new(#value)))],
         ),

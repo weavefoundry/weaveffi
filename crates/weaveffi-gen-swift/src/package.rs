@@ -8,20 +8,24 @@
 
 use heck::ToUpperCamelCase;
 use weaveffi_core::package::PackageContext;
+use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::Api;
 
 use crate::types::swift_str;
 use crate::SwiftConfig;
 
 /// The SwiftPM package/module name: an explicit `[swift] module_name` wins;
-/// otherwise the IDL `package:` name (PascalCased to a legal Swift module)
-/// drives it; falling back to the `WeaveFFI` brand.
-pub(crate) fn resolve_module_name(api: &Api, config: &SwiftConfig) -> String {
+/// otherwise the `[package] name` from `weaveffi.toml` (PascalCased to a
+/// legal Swift module) drives it; falling back to the `WeaveFFI` brand.
+pub(crate) fn resolve_module_name(api: &ResolvedApi, config: &SwiftConfig) -> String {
     config
         .module_name
         .clone()
-        .or_else(|| api.package.as_ref().map(|p| p.name.to_upper_camel_case()))
+        .or_else(|| {
+            api.package()
+                .and_then(|p| p.name.as_deref())
+                .map(ToUpperCamelCase::to_upper_camel_case)
+        })
         .unwrap_or_else(|| "WeaveFFI".to_string())
 }
 

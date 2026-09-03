@@ -4,12 +4,12 @@
 //! Both emitters dispatch on the shared [`wire::classify`] classification,
 //! so the non-obvious folds (handles as `u64` tokens, borrowed views like
 //! their owned forms, records and rich enums through one user codec) are
-//! decided centrally rather than re-derived from `TypeRef` here.
+//! decided centrally rather than re-derived from `Ty` here.
 
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::{swift_type_ctx, SwiftCtx};
 
@@ -26,55 +26,55 @@ pub(crate) fn fresh(counter: &mut usize, prefix: &str) -> String {
 /// delegating records and rich enums to their generated `wvWrite*` codecs.
 pub(crate) fn write_value_stmts(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     expr: &str,
     writer: &str,
     ctx: SwiftCtx,
     counter: &mut usize,
 ) {
-    match wire::classify(ty) {
-        WireType::Bool => {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("{writer}.writeBool({expr})"));
         }
-        WireType::I8 => {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("{writer}.writeInt8({expr})"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("{writer}.writeUInt8({expr})"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("{writer}.writeInt16({expr})"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("{writer}.writeUInt16({expr})"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("{writer}.writeInt32({expr})"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("{writer}.writeUInt32({expr})"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("{writer}.writeInt64({expr})"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("{writer}.writeUInt64({expr})"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("{writer}.writeFloat({expr})"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("{writer}.writeDouble({expr})"));
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("{writer}.writeString({expr})"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("{writer}.writeBytes({expr})"));
         }
         // Both handle flavors surface as `UInt64` in Swift, so one write
         // covers them.
-        WireType::Handle => {
+        WireType::Handle(_) => {
             w.line(format!("{writer}.writeUInt64({expr})"));
         }
         WireType::Enum(name) => {
@@ -134,53 +134,53 @@ pub(crate) fn write_value_stmts(
 /// `WvReader` variable named `reader`, binding the result to `out`.
 pub(crate) fn read_value_stmts(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     out: &str,
     reader: &str,
     ctx: SwiftCtx,
     counter: &mut usize,
 ) {
-    match wire::classify(ty) {
-        WireType::Bool => {
+    match ty.wire() {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("let {out} = {reader}.readBool()"));
         }
-        WireType::I8 => {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("let {out} = {reader}.readInt8()"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("let {out} = {reader}.readUInt8()"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("let {out} = {reader}.readInt16()"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("let {out} = {reader}.readUInt16()"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("let {out} = {reader}.readInt32()"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("let {out} = {reader}.readUInt32()"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("let {out} = {reader}.readInt64()"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("let {out} = {reader}.readUInt64()"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("let {out} = {reader}.readFloat()"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("let {out} = {reader}.readDouble()"));
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("let {out} = {reader}.readString()"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("let {out} = {reader}.readBytes()"));
         }
-        WireType::Handle => {
+        WireType::Handle(_) => {
             w.line(format!("let {out} = {reader}.readUInt64()"));
         }
         WireType::Enum(name) => {

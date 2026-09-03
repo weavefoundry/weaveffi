@@ -1,6 +1,46 @@
 //! The emitted Python runtime prelude: error base classes, library loading,
-//! the owned-pointer helpers, and the `_BufferWriter`/`_BufferReader` pair
-//! implementing the value-buffer wire format.
+//! the ABI-revision check, the owned-pointer helpers, and the
+//! `_BufferWriter`/`_BufferReader` pair implementing the value-buffer wire
+//! format.
+
+use weaveffi_core::cabi::ABI_VERSION;
+
+/// Emit the load-time ABI-revision check that runs right after `_lib` is
+/// opened and before any other symbol is bound. A missing symbol means the
+/// producer predates ABI versioning; a different value means it was built
+/// against an incompatible runtime. Both raise `ImportError` so the failure
+/// surfaces at `import` time with a message naming both revisions.
+fn render_abi_version_check(out: &mut String) {
+    out.push_str(&format!(
+        r#"
+# The ABI revision these bindings were generated against. Checked before any
+# other symbol is bound so a mismatched producer fails at import time instead
+# of misreading the error struct or a value buffer later.
+_ABI_VERSION = {ABI_VERSION}
+
+
+def _check_abi_version(lib: ctypes.CDLL) -> None:
+    try:
+        fn = lib.weaveffi_abi_version
+    except AttributeError:
+        raise ImportError(
+            "the loaded WeaveFFI library predates ABI versioning "
+            f"(these bindings expect ABI revision {{_ABI_VERSION}})"
+        ) from None
+    fn.argtypes = []
+    fn.restype = ctypes.c_uint32
+    found = fn()
+    if found != _ABI_VERSION:
+        raise ImportError(
+            f"WeaveFFI ABI mismatch: these bindings expect revision {{_ABI_VERSION}} "
+            f"but the loaded library reports revision {{found}}"
+        )
+
+
+_check_abi_version(_lib)
+"#
+    ));
+}
 
 /// Append the fixed runtime prelude every generated `weaveffi.py` starts
 /// with.
@@ -50,7 +90,11 @@ def _load_library() -> ctypes.CDLL:
 
 
 _lib = _load_library()
-_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+"#,
+    );
+    render_abi_version_check(out);
+    out.push_str(
+        r#"_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 # Async completion callbacks receive a heap-boxed error the consumer owns;
 # weaveffi_error_free releases the message, the payload, and the box.

@@ -148,6 +148,7 @@ mod tests {
     fn module_with_errors(name: &str, codes: Vec<(&str, i32, &str)>) -> Module {
         Module {
             name: name.into(),
+            doc: None,
             functions: vec![],
             interfaces: vec![],
             structs: vec![],
@@ -173,10 +174,8 @@ mod tests {
 
     fn api_with(mods: Vec<Module>) -> Api {
         Api {
-            version: "0.7.0".into(),
-            package: None,
+            version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
             modules: mods,
-            generators: None,
         }
     }
 
@@ -231,6 +230,7 @@ mod tests {
     fn no_domains_is_empty() {
         let api = api_with(vec![Module {
             name: "m".into(),
+            doc: None,
             functions: vec![],
             interfaces: vec![],
             structs: vec![],

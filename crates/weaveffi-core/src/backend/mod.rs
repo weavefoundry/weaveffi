@@ -1,23 +1,23 @@
 //! The language-backend framework.
 //!
 //! Every idiomatic WeaveFFI generator does the same three things: it walks the
-//! [`BindingModel`] in a fixed order (enums → structs → callbacks → listeners
-//! → functions), dispatches each function on its [`CallShape`], and writes a
-//! primary source file plus a handful of package manifests. Before this module
-//! existed, all eleven generators hand-rolled that walk, that dispatch, that
-//! file I/O, and their own copy of the [`Generator`] glue; they drifted.
+//! [`BindingModel`] in a fixed order (errors, enums, structs, interfaces,
+//! callbacks, listeners, functions), dispatches each function on its
+//! [`CallShape`], and writes a primary source file plus a handful of package
+//! manifests.
 //!
-//! [`LanguageBackend`] captures the common structure as a trait whose hooks a
-//! backend implements, and the free [`run`]/[`output_files`] functions plus the
-//! [`impl_generator_via_backend!`](crate::impl_generator_via_backend) macro provide the shared driver. A backend
-//! now owns *only* language-specific rendering: type mapping, marshalling, and
-//! the exact text of each declaration. The traversal order, the call-shape
-//! dispatch, the model construction, and the bridge to the object-safe
-//! [`Generator`]/`DynGenerator` layer all live here, once.
+//! [`LanguageBackend`] is the one trait a target implements. It captures the
+//! common structure as hooks, and the free [`run`], [`output_files`], and
+//! [`package_files`] functions provide the shared driver that
+//! [`ConfiguredBackend`](crate::codegen::ConfiguredBackend) exposes to the
+//! orchestrator through the object-safe [`Target`](crate::codegen::Target)
+//! trait. A backend owns *only* language-specific rendering: type mapping,
+//! marshalling, and the exact text of each declaration. The traversal order,
+//! the call-shape dispatch, the model construction, and the erasure all live
+//! here, once.
 //!
 //! [`BindingModel`]: crate::model::BindingModel
 //! [`CallShape`]: crate::model::CallShape
-//! [`Generator`]: crate::codegen::Generator
 
 use anyhow::Result;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -54,12 +54,13 @@ impl OutputFile {
 
 /// An idiomatic language backend over the shared [`BindingModel`].
 ///
-/// The single required method is [`files`](Self::files), which assembles the
-/// complete output set; pair it with [`impl_generator_via_backend!`](crate::impl_generator_via_backend) to wire
-/// the type into the [`Generator`](crate::codegen::Generator) trait the CLI and
-/// orchestrator consume. That alone gives every backend the shared driver, the
-/// [`OutputFile`] model (rendering is pure; the driver does the I/O), an
-/// automatically-derived `output_files`, and one uniform `Generator` bridge.
+/// The required methods are [`name`](Self::name),
+/// [`capabilities`](Self::capabilities), and [`files`](Self::files), which
+/// assembles the complete output set; wrap the type in
+/// [`ConfiguredBackend`](crate::codegen::ConfiguredBackend) to hand it to the
+/// orchestrator. That alone gives every backend the shared driver, the
+/// [`OutputFile`] model (rendering is pure; the driver does the I/O), and an
+/// automatically-derived `output_files`.
 ///
 /// Backends whose primary file is a straightforward per-module walk (Python,
 /// Ruby, Go, Dart, .NET) override the per-entity hooks (`render_enum`,
@@ -80,11 +81,12 @@ impl OutputFile {
 /// to centralise here, but every backend shares
 /// [`emit_doc`](crate::codegen::common::emit_doc) for the line/block flavours.
 pub trait LanguageBackend: Send + Sync {
-    /// Per-target, fully-typed configuration. Mirrors
-    /// [`Generator::Config`](crate::codegen::Generator::Config).
+    /// Per-target, fully-typed configuration. Must round-trip through
+    /// `serde_json` so the orchestrator can hash it as part of the cache key.
     type Config: Serialize + Default + Clone + Send + Sync;
 
-    /// Stable short name (`"swift"`, `"python"`, …): the `--target` token.
+    /// Stable short name (`"swift"`, `"python"`, ...): the `--target` token
+    /// and the cache file basename.
     fn name(&self) -> &'static str;
 
     /// The gated IDL features this backend implements (async functions,
@@ -93,9 +95,12 @@ pub trait LanguageBackend: Send + Sync {
     /// backend silently skipping a feature it never implemented.
     fn capabilities(&self) -> TargetCapabilities;
 
-    /// Whether the bound config explicitly opted in to generating despite
-    /// unsupported features (see
-    /// [`Generator::allows_unsupported`](crate::codegen::Generator::allows_unsupported)).
+    /// Whether the user explicitly opted in to generating this target even
+    /// though the API uses features the target does not support (via an
+    /// `allow_unsupported = true` flag in the target's config). When `true`
+    /// the orchestrator downgrades the capability failure to a loud warning
+    /// and the backend must emit an explicit unsupported surface (throwing
+    /// stubs, documentation) rather than silently omitting the feature.
     /// Backends with partial capabilities override this to read their
     /// `allow_unsupported` config flag; full-capability backends keep the
     /// `false` default.
@@ -267,10 +272,8 @@ pub trait LanguageBackend: Send + Sync {
     }
 }
 
-/// Build the model and write every file a backend produces.
-///
-/// This is the body of the [`Generator::generate`](crate::codegen::Generator)
-/// impl that [`impl_generator_via_backend!`](crate::impl_generator_via_backend) generates.
+/// Build the model and write every file a backend produces. This is the body
+/// of [`Target::generate`](crate::codegen::Target::generate).
 ///
 /// # Errors
 ///
@@ -308,11 +311,10 @@ fn forward_slashes(path: Utf8PathBuf) -> String {
     }
 }
 
-/// The sorted list of paths a backend would write, the body of the
-/// [`Generator::output_files`](crate::codegen::Generator::output_files) impl
-/// that [`impl_generator_via_backend!`](crate::impl_generator_via_backend) generates. Used by `--dry-run` and
-/// `weaveffi diff`. Paths are normalised to `/` separators so the listing is
-/// identical across operating systems.
+/// The sorted list of paths a backend would write, the body of
+/// [`Target::output_files`](crate::codegen::Target::output_files). Used by
+/// `--dry-run` and `weaveffi diff`. Paths are normalised to `/` separators so
+/// the listing is identical across operating systems.
 pub fn output_files<B: LanguageBackend>(
     backend: &B,
     api: &ResolvedApi,
@@ -330,9 +332,8 @@ pub fn output_files<B: LanguageBackend>(
 }
 
 /// Build the model and assemble the package a backend produces, the body of
-/// the [`Generator::package`](crate::codegen::Generator::package) impl that
-/// [`impl_generator_via_backend!`](crate::impl_generator_via_backend)
-/// generates. Returns `None` when the backend does not support packaging.
+/// [`Target::package`](crate::codegen::Target::package). Returns `None` when
+/// the backend does not support packaging.
 pub fn package_files<B: LanguageBackend>(
     backend: &B,
     api: &ResolvedApi,
@@ -344,74 +345,10 @@ pub fn package_files<B: LanguageBackend>(
     backend.package(api, &model, ctx, out_dir, config)
 }
 
-/// Re-export of `anyhow` so [`impl_generator_via_backend!`](crate::impl_generator_via_backend)
-/// can name the `Generator::generate` return type in its expansion without
-/// forcing every backend crate to declare a direct `anyhow` dependency it never
-/// references in its own source. Not part of the public API.
-#[doc(hidden)]
-pub use anyhow as __anyhow;
-
-/// Implement the object-safe [`Generator`](crate::codegen::Generator) trait for
-/// a type that implements [`LanguageBackend`], delegating to the shared driver.
-///
-/// ```ignore
-/// pub struct PythonGenerator;
-/// impl weaveffi_core::backend::LanguageBackend for PythonGenerator { /* … */ }
-/// weaveffi_core::impl_generator_via_backend!(PythonGenerator);
-/// ```
-#[macro_export]
-macro_rules! impl_generator_via_backend {
-    ($backend:ty) => {
-        impl $crate::codegen::Generator for $backend {
-            type Config = <$backend as $crate::backend::LanguageBackend>::Config;
-
-            fn name(&self) -> &'static str {
-                <$backend as $crate::backend::LanguageBackend>::name(self)
-            }
-
-            fn capabilities(&self) -> $crate::capabilities::TargetCapabilities {
-                <$backend as $crate::backend::LanguageBackend>::capabilities(self)
-            }
-
-            fn allows_unsupported(&self, config: &Self::Config) -> bool {
-                <$backend as $crate::backend::LanguageBackend>::allows_unsupported(self, config)
-            }
-
-            fn generate(
-                &self,
-                api: &$crate::resolved::ResolvedApi,
-                out_dir: &::camino::Utf8Path,
-                config: &Self::Config,
-            ) -> $crate::backend::__anyhow::Result<()> {
-                $crate::backend::run(self, api, out_dir, config)
-            }
-
-            fn output_files(
-                &self,
-                api: &$crate::resolved::ResolvedApi,
-                out_dir: &::camino::Utf8Path,
-                config: &Self::Config,
-            ) -> ::std::vec::Vec<::std::string::String> {
-                $crate::backend::output_files(self, api, out_dir, config)
-            }
-
-            fn package(
-                &self,
-                api: &$crate::resolved::ResolvedApi,
-                ctx: &$crate::package::PackageContext,
-                out_dir: &::camino::Utf8Path,
-                config: &Self::Config,
-            ) -> ::core::option::Option<::std::vec::Vec<$crate::package::PackagedFile>> {
-                $crate::backend::package_files(self, api, ctx, out_dir, config)
-            }
-        }
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::Generator;
+    use crate::model::CallShape;
     use weaveffi_ir::ir::{Api, Function, Module, Param, TypeRef};
 
     #[derive(Default, Clone, serde::Serialize)]
@@ -438,20 +375,6 @@ mod tests {
             config.prefix.as_deref().unwrap_or("weaveffi")
         }
 
-        fn render_enum(&self, out: &mut String, e: &EnumBinding, _c: &Self::Config) {
-            out.push_str(&format!("enum {}\n", e.name));
-        }
-
-        fn render_struct(
-            &self,
-            out: &mut String,
-            _m: &ModuleBinding,
-            s: &StructBinding,
-            _c: &Self::Config,
-        ) {
-            out.push_str(&format!("struct {}\n", s.name));
-        }
-
         fn render_function(
             &self,
             out: &mut String,
@@ -460,9 +383,9 @@ mod tests {
             _c: &Self::Config,
         ) {
             let shape = match &f.shape {
-                crate::model::CallShape::Sync(_) => "sync",
-                crate::model::CallShape::Async(_) => "async",
-                crate::model::CallShape::Iterator(_) => "iter",
+                CallShape::Sync(_) => "sync",
+                CallShape::Async(_) => "async",
+                CallShape::Iterator(_) => "iter",
             };
             out.push_str(&format!("fn {} [{}] {}\n", f.name, shape, f.c_base));
         }
@@ -503,13 +426,19 @@ mod tests {
     }
 
     fn api() -> ResolvedApi {
-        ResolvedApi::assume_resolved(Api {
+        ResolvedApi::assume_valid(Api {
             version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
             modules: vec![Module {
                 name: "math".into(),
+                doc: None,
                 functions: vec![
                     func("add", Some(TypeRef::I32), false),
                     func("fetch", Some(TypeRef::StringUtf8), true),
+                    func(
+                        "scan",
+                        Some(TypeRef::Iterator(Box::new(TypeRef::I32))),
+                        false,
+                    ),
                 ],
                 interfaces: vec![],
                 structs: vec![],
@@ -519,59 +448,30 @@ mod tests {
                 errors: None,
                 modules: vec![],
             }],
-            generators: None,
-            package: None,
         })
     }
 
     #[test]
-    fn driver_walks_and_dispatches_in_canonical_order() {
+    fn driver_walks_dispatches_and_honors_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         run(&FakeBackend, &api(), out_dir, &FakeConfig::default()).unwrap();
         let body = std::fs::read_to_string(out_dir.join("fake/out.txt")).unwrap();
         assert_eq!(
             body,
-            "module math\nfn add [sync] weaveffi_math_add\nfn fetch [async] weaveffi_math_fetch\n"
+            "module math\nfn add [sync] weaveffi_math_add\nfn fetch [async] weaveffi_math_fetch\nfn scan [iter] weaveffi_math_scan\n"
         );
-    }
 
-    #[test]
-    fn prefix_flows_into_symbols() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let cfg = FakeConfig {
             prefix: Some("acme".into()),
         };
         run(&FakeBackend, &api(), out_dir, &cfg).unwrap();
         let body = std::fs::read_to_string(out_dir.join("fake/out.txt")).unwrap();
-        assert!(
-            body.contains("acme_math_add"),
-            "prefix must reach symbols: {body}"
-        );
+        assert!(body.contains("acme_math_add"), "{body}");
         assert!(!body.contains("weaveffi_math_add"));
-    }
 
-    #[test]
-    fn output_files_are_sorted_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
         let files = output_files(&FakeBackend, &api(), out_dir, &FakeConfig::default());
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("fake/out.txt"));
-    }
-
-    // Exercise the generated Generator impl.
-    impl_generator_via_backend!(FakeBackend);
-
-    #[test]
-    fn generator_bridge_delegates_to_driver() {
-        let dir = tempfile::tempdir().unwrap();
-        let out_dir = Utf8Path::from_path(dir.path()).unwrap();
-        let g = FakeBackend;
-        Generator::generate(&g, &api(), out_dir, &FakeConfig::default()).unwrap();
-        assert!(out_dir.join("fake/out.txt").exists());
-        let listed = Generator::output_files(&g, &api(), out_dir, &FakeConfig::default());
-        assert_eq!(listed.len(), 1);
     }
 }

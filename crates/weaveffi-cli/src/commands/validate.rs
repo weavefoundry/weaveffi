@@ -1,5 +1,5 @@
-//! `weaveffi validate` and `weaveffi lint`: schema validation with
-//! human-readable or `--format json` output, and advisory warnings.
+//! `weaveffi validate`: schema validation with human-readable or `--format
+//! json` output, plus advisory warnings under `--warn`.
 
 use miette::{Report, Result};
 use weaveffi_core::validate::{collect_warnings, validate_api, ValidationError, ValidationWarning};
@@ -15,11 +15,11 @@ pub(crate) fn cmd_validate(
 
     match validate_api(api, Some((input, &contents))) {
         Ok(api) => {
-            if warn && !quiet {
-                for w in collect_warnings(&api) {
-                    eprintln!("warning: {w}");
-                }
-            }
+            let warnings = if warn {
+                collect_warnings(&api)
+            } else {
+                Vec::new()
+            };
             let n_modules = api.modules.len();
             let n_functions: usize = api.modules.iter().map(|m| m.functions.len()).sum();
             let n_structs: usize = api.modules.iter().map(|m| m.structs.len()).sum();
@@ -31,9 +31,13 @@ pub(crate) fn cmd_validate(
                     "functions": n_functions,
                     "structs": n_structs,
                     "enums": n_enums,
+                    "warnings": warnings.iter().map(warning_to_json).collect::<Vec<_>>(),
                 });
                 println!("{json}");
             } else if !quiet {
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
                 println!("Validation passed");
                 println!(
                     "  {} modules, {} functions, {} structs, {} enums",
@@ -57,39 +61,6 @@ pub(crate) fn cmd_validate(
             }
             Err(Report::new(diags))
         }
-    }
-}
-
-/// Returns `Ok(true)` when the file is clean, `Ok(false)` when warnings were found.
-pub(crate) fn cmd_lint(input: &str, format: Option<&str>, quiet: bool) -> Result<bool> {
-    let json_mode = format == Some("json");
-    let (api, _contents) = super::load_validated_api(input)?;
-
-    let warnings = collect_warnings(&api);
-    if json_mode {
-        let json = serde_json::json!({
-            "ok": warnings.is_empty(),
-            "warnings": warnings
-                .iter()
-                .map(warning_to_json)
-                .collect::<Vec<_>>(),
-        });
-        println!("{json}");
-        return Ok(warnings.is_empty());
-    }
-
-    if warnings.is_empty() {
-        if !quiet {
-            println!("No warnings.");
-        }
-        Ok(true)
-    } else {
-        if !quiet {
-            for w in &warnings {
-                eprintln!("warning: {w}");
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -334,14 +305,6 @@ fn warning_to_json(w: &ValidationWarning) -> serde_json::Value {
         ValidationWarning::AsyncVoidFunction { module, function } => {
             ("AsyncVoidFunction", format!("{module}::{function}"))
         }
-        ValidationWarning::MutableOnValueType {
-            module,
-            function,
-            param,
-        } => (
-            "MutableOnValueType",
-            format!("{module}::{function}::{param}"),
-        ),
         ValidationWarning::DeprecatedFunction {
             module, function, ..
         } => ("DeprecatedFunction", format!("{module}::{function}")),
@@ -351,21 +314,4 @@ fn warning_to_json(w: &ValidationWarning) -> serde_json::Value {
         "location": location,
         "message": w.to_string(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lint_clean_file_succeeds() {
-        let sample = format!(
-            "{}/../../samples/calculator/calculator.yml",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        assert!(
-            cmd_lint(&sample, None, false).unwrap(),
-            "calculator sample should be lint-clean"
-        );
-    }
 }

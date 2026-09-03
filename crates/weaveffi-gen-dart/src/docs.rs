@@ -4,8 +4,8 @@
 
 use weaveffi_core::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{CallShape, FnBinding};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::calls::ErrCtx;
 
@@ -39,7 +39,7 @@ pub(crate) fn emit_wrapper_doc(w: &mut CodeWriter, f: &FnBinding, err: ErrCtx) {
         w.line("/// The native iterator handle is destroyed exactly once: eagerly when");
         w.line("/// the iteration completes or fails, or by a GC finalizer if the");
         w.line("/// iteration is abandoned before it is exhausted.");
-        if matches!(ib.elem, TypeRef::Interface(_)) {
+        if matches!(ib.elem, Ty::Interface(_)) {
             w.line("///");
             w.line("/// Each yielded element is owned by the caller: call its `dispose()`");
             w.line("/// when you are done with it.");

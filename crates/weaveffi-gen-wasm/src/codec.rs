@@ -13,8 +13,8 @@ use weaveffi_core::abi::lower::split_qualified;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::BindingModel;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
+use weaveffi_core::model::Ty;
+use weaveffi_core::model::{Prim, WireType};
 
 /// The `_write_*`/`_read_*` codec function names for a (possibly
 /// `module.Name`-qualified) record or rich enum referenced from
@@ -36,19 +36,19 @@ pub(crate) fn buf_codec_names(name: &str, current_module: &str) -> (String, Stri
 /// and containers before falling through to a leaf method.
 fn scalar_method(wt: WireType<'_>) -> &'static str {
     match wt {
-        WireType::Bool => "bool",
-        WireType::I8 => "i8",
-        WireType::U8 => "u8",
-        WireType::I16 => "i16",
-        WireType::U16 => "u16",
-        WireType::I32 => "i32",
-        WireType::U32 => "u32",
-        WireType::I64 => "i64",
-        WireType::U64 | WireType::Handle => "u64",
-        WireType::F32 => "f32",
-        WireType::F64 => "f64",
-        WireType::String => "str",
-        WireType::Bytes => "bytes",
+        WireType::Prim(Prim::Bool) => "bool",
+        WireType::Prim(Prim::I8) => "i8",
+        WireType::Prim(Prim::U8) => "u8",
+        WireType::Prim(Prim::I16) => "i16",
+        WireType::Prim(Prim::U16) => "u16",
+        WireType::Prim(Prim::I32) => "i32",
+        WireType::Prim(Prim::U32) => "u32",
+        WireType::Prim(Prim::I64) => "i64",
+        WireType::Prim(Prim::U64) | WireType::Handle(_) => "u64",
+        WireType::Prim(Prim::F32) => "f32",
+        WireType::Prim(Prim::F64) => "f64",
+        WireType::Prim(Prim::String) => "str",
+        WireType::Prim(Prim::Bytes) => "bytes",
         other => unreachable!("composite wire shape dispatched by the caller: {other:?}"),
     }
 }
@@ -58,13 +58,13 @@ fn scalar_method(wt: WireType<'_>) -> &'static str {
 /// references against `module`. `tmp` supplies collision-free local names.
 pub(crate) fn emit_buf_write_stmts(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     wtr: &str,
     val: &str,
     module: &str,
     tmp: &mut u32,
 ) {
-    match wire::classify(ty) {
+    match ty.wire() {
         WireType::Enum(_) => {
             w.line(format!("{wtr}.i32({val});"));
         }
@@ -124,11 +124,11 @@ pub(crate) fn emit_buf_write_stmts(
 /// named `rdr`, resolving record and rich-enum references against `module`.
 /// Composite types recurse; lists and maps expand to inline arrow IIFEs so
 /// the whole decode stays a single expression.
-pub(crate) fn buf_read_expr(ty: &TypeRef, module: &str, rdr: &str) -> String {
-    match wire::classify(ty) {
+pub(crate) fn buf_read_expr(ty: &Ty, module: &str, rdr: &str) -> String {
+    match ty.wire() {
         // A typed handle is an i32 pointer at the ABI but a u64 on the wire;
         // narrowing back to a JS number keeps the two spellings interchangeable.
-        WireType::Handle if matches!(ty, TypeRef::TypedHandle(_)) => {
+        WireType::Handle(_) if matches!(ty, Ty::TypedHandle(_)) => {
             format!("Number({rdr}.u64())")
         }
         WireType::Enum(_) => format!("{rdr}.i32()"),

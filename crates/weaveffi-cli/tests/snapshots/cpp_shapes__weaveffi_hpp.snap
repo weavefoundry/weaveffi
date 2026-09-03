@@ -47,6 +47,13 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 
 extern "C" {
 
+/* The WeaveFFI C ABI revision this header was generated against. The
+   producer exports weaveffi_abi_version() so a consumer can refuse to load
+   a library built for a different revision instead of misreading its
+   error struct or value buffers. */
+#define WEAVEFFI_ABI_VERSION 1u
+WEAVEFFI_API uint32_t weaveffi_abi_version(void);
+
 typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`

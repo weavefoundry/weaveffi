@@ -8,13 +8,13 @@
 
 use weaveffi_core::abi;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     iterator_item_ctype, BindingModel, CallShape, CallbackBinding, FnBinding, InterfaceBinding,
     IteratorBinding, ListenerBinding, ParamBinding,
 };
 use weaveffi_core::plan::{self, elem_free, ArgPass, ElemFree, RetPass};
 use weaveffi_core::utils::{render_prelude, render_trailer, wrapper_name, CommentStyle};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::runtime::model_has_iterators;
 use crate::types::{iface_member_base, js_fn_name};
@@ -22,45 +22,43 @@ use crate::types::{iface_member_base, js_fn_name};
 /// The C return-type spelling of `ty` at a call site. Buffered values render
 /// as `const uint8_t*` (the encoded buffer); an iterator launcher's handle is
 /// held as `void*` so the shared state cell can adopt it.
-fn c_ret_type_str(ty: &TypeRef, module: &str, prefix: &str) -> String {
-    if matches!(ty, TypeRef::Iterator(_)) {
+fn c_ret_type_str(ty: &Ty, module: &str, prefix: &str) -> String {
+    if matches!(ty, Ty::Iterator(_)) {
         return "void*".into();
     }
     abi::lower_return(ty, module).ret.render_c(prefix)
 }
 
 /// The bare C type of a scalar (or C-enum-free leaf) parameter temporary.
-fn c_scalar_type(ty: &TypeRef) -> &'static str {
+fn c_scalar_type(ty: &Ty) -> &'static str {
     match ty {
-        TypeRef::I8 => "int8_t",
-        TypeRef::I16 => "int16_t",
-        TypeRef::I32 => "int32_t",
-        TypeRef::I64 => "int64_t",
-        TypeRef::U8 => "uint8_t",
-        TypeRef::U16 => "uint16_t",
-        TypeRef::U32 => "uint32_t",
-        TypeRef::U64 => "uint64_t",
-        TypeRef::F32 => "float",
-        TypeRef::F64 => "double",
-        TypeRef::Bool => "bool",
+        Ty::I8 => "int8_t",
+        Ty::I16 => "int16_t",
+        Ty::I32 => "int32_t",
+        Ty::I64 => "int64_t",
+        Ty::U8 => "uint8_t",
+        Ty::U16 => "uint16_t",
+        Ty::U32 => "uint32_t",
+        Ty::U64 => "uint64_t",
+        Ty::F32 => "float",
+        Ty::F64 => "double",
+        Ty::Bool => "bool",
         _ => unreachable!("not a scalar type"),
     }
 }
 
 /// The N-API getter that reads one direct-slot JS argument.
-fn napi_getter(ty: &TypeRef) -> &'static str {
+fn napi_getter(ty: &Ty) -> &'static str {
     match ty {
         // i8/i16 are read through the 32-bit signed getter (N-API has no
         // narrower int getter) and narrowed at the use site.
-        TypeRef::I8 | TypeRef::I16 | TypeRef::I32 | TypeRef::Enum(_) => "napi_get_value_int32",
-        TypeRef::U8 | TypeRef::U16 | TypeRef::U32 => "napi_get_value_uint32",
+        Ty::I8 | Ty::I16 | Ty::I32 | Ty::Enum(_) => "napi_get_value_int32",
+        Ty::U8 | Ty::U16 | Ty::U32 => "napi_get_value_uint32",
         // u64 mirrors i64/handle: read as a 64-bit int, reinterpreted as needed.
-        TypeRef::I64 | TypeRef::U64 | TypeRef::Handle | TypeRef::TypedHandle(_) => {
-            "napi_get_value_int64"
-        }
+        Ty::I64 | Ty::U64 | Ty::Handle | Ty::TypedHandle(_) => "napi_get_value_int64",
         // f32 is read as a double then narrowed to float at the use site.
-        TypeRef::F32 | TypeRef::F64 => "napi_get_value_double",
-        TypeRef::Bool => "napi_get_value_bool",
+        Ty::F32 | Ty::F64 => "napi_get_value_double",
+        Ty::Bool => "napi_get_value_bool",
         _ => "napi_get_value_int64",
     }
 }
@@ -70,12 +68,12 @@ fn napi_getter(ty: &TypeRef) -> &'static str {
 /// and `double` getters, so `i8/i16/u8/u16/f32` must be read into a wider
 /// temporary and then narrowed with an explicit cast to the real ABI type;
 /// `u64` is read as `int64_t` then reinterpreted.
-fn napi_read_tmp_type(ty: &TypeRef) -> &'static str {
+fn napi_read_tmp_type(ty: &Ty) -> &'static str {
     match ty {
-        TypeRef::I8 | TypeRef::I16 => "int32_t",
-        TypeRef::U8 | TypeRef::U16 => "uint32_t",
-        TypeRef::U64 => "int64_t",
-        TypeRef::F32 => "double",
+        Ty::I8 | Ty::I16 => "int32_t",
+        Ty::U8 | Ty::U16 => "uint32_t",
+        Ty::U64 => "int64_t",
+        Ty::F32 => "double",
         _ => "int64_t",
     }
 }
@@ -314,7 +312,7 @@ pub(crate) fn render_addon_c(
     let prefix = model.prefix.as_str();
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
     out.push_str(&format!(
-        "#include <node_api.h>\n#include \"{prefix}.h\"\n#include <stdlib.h>\n#include <string.h>\n\n"
+        "#include <node_api.h>\n#include \"{prefix}.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n"
     ));
 
     let mut all_exports: Vec<(String, String)> = Vec::new();
@@ -435,6 +433,23 @@ pub(crate) fn render_addon_c(
     }
 
     out.push_str("static napi_value Init(napi_env env, napi_value exports) {\n");
+    // The addon links the producer directly, so a missing symbol already
+    // fails at load; this catches a producer built for a different revision.
+    out.push_str("  {\n");
+    out.push_str(&format!("    uint32_t found = {prefix}_abi_version();\n"));
+    out.push_str(&format!(
+        "    if (found != {upper}_ABI_VERSION) {{\n",
+        upper = prefix.to_uppercase()
+    ));
+    out.push_str("      char msg[160];\n");
+    out.push_str(&format!(
+        "      snprintf(msg, sizeof msg, \"WeaveFFI ABI mismatch: these bindings expect revision %u but the loaded library reports revision %u\", (unsigned){upper}_ABI_VERSION, (unsigned)found);\n",
+        upper = prefix.to_uppercase()
+    ));
+    out.push_str("      napi_throw_error(env, NULL, msg);\n");
+    out.push_str("      return NULL;\n");
+    out.push_str("    }\n");
+    out.push_str("  }\n");
     if !all_exports.is_empty() {
         out.push_str("  napi_property_descriptor props[] = {\n");
         for (js_name, napi_fn) in &all_exports {
@@ -542,7 +557,7 @@ fn render_cb_payload_struct(out: &mut String, cb: &CallbackBinding, prefix: &str
                         w.line(format!("void* {n0};"));
                     }
                     ArgPass::Direct { slot } => {
-                        if matches!(p.ty, TypeRef::TypedHandle(_)) {
+                        if matches!(p.ty, Ty::TypedHandle(_)) {
                             w.line(format!("void* {n0};"));
                         } else {
                             w.line(format!("{} {n0};", slot.ty.render_c(prefix)));
@@ -597,7 +612,7 @@ fn render_cb_tramp(out: &mut String, cb: &CallbackBinding, prefix: &str) {
                 out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
             }
             ArgPass::Direct { .. } => {
-                if matches!(p.ty, TypeRef::TypedHandle(_)) {
+                if matches!(p.ty, Ty::TypedHandle(_)) {
                     out.push_str(&format!("    p->{n0} = (void*){n0};\n"));
                 } else {
                     out.push_str(&format!("    p->{n0} = {n0};\n"));
@@ -628,7 +643,7 @@ fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize) {
             "        if (p->{n0}) napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target}); else napi_get_null(env, &{target});\n"
         )),
         ArgPass::Direct { .. } => {
-            if matches!(p.ty, TypeRef::TypedHandle(_)) {
+            if matches!(p.ty, Ty::TypedHandle(_)) {
                 out.push_str(&format!(
                     "        napi_create_int64(env, (int64_t)(intptr_t)p->{n0}, &{target});\n"
                 ));
@@ -641,19 +656,19 @@ fn emit_payload_to_napi(out: &mut String, p: &ParamBinding, idx: usize) {
 }
 
 /// One scalar-ish payload value to a `napi_value` (single statement).
-fn payload_leaf_to_napi(ty: &TypeRef, expr: &str, target: &str) -> String {
+fn payload_leaf_to_napi(ty: &Ty, expr: &str, target: &str) -> String {
     match ty {
-        TypeRef::I32 => format!("napi_create_int32(env, {expr}, &{target});"),
-        TypeRef::U32 => format!("napi_create_uint32(env, {expr}, &{target});"),
-        TypeRef::I64 => format!("napi_create_int64(env, {expr}, &{target});"),
-        TypeRef::F64 => format!("napi_create_double(env, {expr}, &{target});"),
-        TypeRef::I8 | TypeRef::I16 => format!("napi_create_int32(env, {expr}, &{target});"),
-        TypeRef::U8 | TypeRef::U16 => format!("napi_create_uint32(env, {expr}, &{target});"),
-        TypeRef::U64 => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
-        TypeRef::F32 => format!("napi_create_double(env, {expr}, &{target});"),
-        TypeRef::Bool => format!("napi_get_boolean(env, {expr}, &{target});"),
-        TypeRef::Handle => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
-        TypeRef::Enum(_) => format!("napi_create_int32(env, (int32_t){expr}, &{target});"),
+        Ty::I32 => format!("napi_create_int32(env, {expr}, &{target});"),
+        Ty::U32 => format!("napi_create_uint32(env, {expr}, &{target});"),
+        Ty::I64 => format!("napi_create_int64(env, {expr}, &{target});"),
+        Ty::F64 => format!("napi_create_double(env, {expr}, &{target});"),
+        Ty::I8 | Ty::I16 => format!("napi_create_int32(env, {expr}, &{target});"),
+        Ty::U8 | Ty::U16 => format!("napi_create_uint32(env, {expr}, &{target});"),
+        Ty::U64 => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
+        Ty::F32 => format!("napi_create_double(env, {expr}, &{target});"),
+        Ty::Bool => format!("napi_get_boolean(env, {expr}, &{target});"),
+        Ty::Handle => format!("napi_create_int64(env, (int64_t){expr}, &{target});"),
+        Ty::Enum(_) => format!("napi_create_int32(env, (int32_t){expr}, &{target});"),
         _ => format!("napi_get_null(env, &{target});"),
     }
 }
@@ -799,8 +814,8 @@ enum AsyncResultShape {
 /// they cross as owned pointers the callback adopts, which [`plan::ret_pass`]
 /// does not distinguish from by-value returns (and iterator returns have no
 /// `RetPass` at all).
-fn async_result_shape(ret: Option<&TypeRef>, module: &str, prefix: &str) -> AsyncResultShape {
-    if let Some(TypeRef::TypedHandle(_) | TypeRef::Iterator(_)) = ret {
+fn async_result_shape(ret: Option<&Ty>, module: &str, prefix: &str) -> AsyncResultShape {
+    if let Some(Ty::TypedHandle(_) | Ty::Iterator(_)) = ret {
         return AsyncResultShape::Object;
     }
     match plan::ret_pass(ret, module, prefix) {
@@ -816,7 +831,7 @@ fn async_result_shape(ret: Option<&TypeRef>, module: &str, prefix: &str) -> Asyn
 /// The `, <c-type> <name>` suffix of an async completion callback's result
 /// slots, rendered from the shared ABI lowering so the signature matches the
 /// producer's typedef exactly.
-fn async_cb_result_params_node(ret: Option<&TypeRef>, module: &str, prefix: &str) -> String {
+fn async_cb_result_params_node(ret: Option<&Ty>, module: &str, prefix: &str) -> String {
     match ret {
         None => String::new(),
         Some(ty) => abi::callback_result_params(ty, module)
@@ -958,34 +973,22 @@ fn render_async_machinery(
     match &shape {
         AsyncResultShape::None => out.push_str("        napi_get_undefined(env, &val);\n"),
         AsyncResultShape::Value => match f.ret.as_ref() {
-            Some(TypeRef::I32) => {
-                out.push_str("        napi_create_int32(env, ctx->result, &val);\n")
-            }
-            Some(TypeRef::U32) => {
-                out.push_str("        napi_create_uint32(env, ctx->result, &val);\n")
-            }
-            Some(TypeRef::I64) => {
-                out.push_str("        napi_create_int64(env, ctx->result, &val);\n")
-            }
-            Some(TypeRef::F64) => {
-                out.push_str("        napi_create_double(env, ctx->result, &val);\n")
-            }
-            Some(TypeRef::I8 | TypeRef::I16) => {
+            Some(Ty::I32) => out.push_str("        napi_create_int32(env, ctx->result, &val);\n"),
+            Some(Ty::U32) => out.push_str("        napi_create_uint32(env, ctx->result, &val);\n"),
+            Some(Ty::I64) => out.push_str("        napi_create_int64(env, ctx->result, &val);\n"),
+            Some(Ty::F64) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
+            Some(Ty::I8 | Ty::I16) => {
                 out.push_str("        napi_create_int32(env, ctx->result, &val);\n");
             }
-            Some(TypeRef::U8 | TypeRef::U16) => {
+            Some(Ty::U8 | Ty::U16) => {
                 out.push_str("        napi_create_uint32(env, ctx->result, &val);\n");
             }
-            Some(TypeRef::U64 | TypeRef::Handle) => {
+            Some(Ty::U64 | Ty::Handle) => {
                 out.push_str("        napi_create_int64(env, (int64_t)ctx->result, &val);\n");
             }
-            Some(TypeRef::F32) => {
-                out.push_str("        napi_create_double(env, ctx->result, &val);\n")
-            }
-            Some(TypeRef::Bool) => {
-                out.push_str("        napi_get_boolean(env, ctx->result, &val);\n")
-            }
-            Some(TypeRef::Enum(_)) => {
+            Some(Ty::F32) => out.push_str("        napi_create_double(env, ctx->result, &val);\n"),
+            Some(Ty::Bool) => out.push_str("        napi_get_boolean(env, ctx->result, &val);\n"),
+            Some(Ty::Enum(_)) => {
                 out.push_str("        napi_create_int32(env, (int32_t)ctx->result, &val);\n");
             }
             _ => unreachable!("value shape covers scalars, bools, enums, and handles"),
@@ -1004,7 +1007,7 @@ fn render_async_machinery(
             // A nullable interface result resolves `null` for the absent
             // case; every other object pointer is surfaced as the raw
             // handle the JS class adopts.
-            if matches!(f.ret.as_ref(), Some(TypeRef::Optional(_))) {
+            if matches!(f.ret.as_ref(), Some(Ty::Optional(_))) {
                 out.push_str(
                     "        if (ctx->result == NULL) napi_get_null(env, &val); else napi_create_int64(env, (int64_t)(intptr_t)ctx->result, &val);\n",
                 );
@@ -1244,7 +1247,7 @@ fn emit_param(
             }
         }
         ArgPass::Direct { slot } => match &p.ty {
-            TypeRef::I32 | TypeRef::U32 | TypeRef::I64 | TypeRef::F64 | TypeRef::Bool => {
+            Ty::I32 | Ty::U32 | Ty::I64 | Ty::F64 | Ty::Bool => {
                 let ct = c_scalar_type(&p.ty);
                 let getter = napi_getter(&p.ty);
                 out.push_str(&format!("  {ct} {name};\n"));
@@ -1253,12 +1256,7 @@ fn emit_param(
             }
             // N-API has no narrower-than-32-bit / float getter, so read into a
             // correctly-sized temporary and narrow to the real ABI type.
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U64
-            | TypeRef::F32 => {
+            Ty::I8 | Ty::I16 | Ty::U8 | Ty::U16 | Ty::U64 | Ty::F32 => {
                 let ct = c_scalar_type(&p.ty);
                 let getter = napi_getter(&p.ty);
                 let raw = napi_read_tmp_type(&p.ty);
@@ -1269,14 +1267,14 @@ fn emit_param(
             // The untyped handle keeps the runtime's literal type name; the
             // runtime types stay `weaveffi_*` regardless of the configured
             // business-symbol prefix.
-            TypeRef::Handle => {
+            Ty::Handle => {
                 out.push_str(&format!("  int64_t {name}_raw;\n"));
                 out.push_str(&format!(
                     "  napi_get_value_int64(env, args[{idx}], &{name}_raw);\n"
                 ));
                 c_args.push(format!("(weaveffi_handle_t){name}_raw"));
             }
-            TypeRef::TypedHandle(_) => {
+            Ty::TypedHandle(_) => {
                 let ptr_ty = slot.ty.render_c(prefix);
                 out.push_str(&format!("  int64_t {name}_raw;\n"));
                 out.push_str(&format!(
@@ -1284,7 +1282,7 @@ fn emit_param(
                 ));
                 c_args.push(format!("({ptr_ty})(intptr_t){name}_raw"));
             }
-            TypeRef::Enum(_) => {
+            Ty::Enum(_) => {
                 let etype = slot.ty.render_c(prefix);
                 out.push_str(&format!("  int32_t {name};\n"));
                 out.push_str(&format!(
@@ -1303,11 +1301,11 @@ fn emit_param(
 fn emit_ret_out_params(
     out: &mut String,
     c_args: &mut Vec<String>,
-    ty: &TypeRef,
+    ty: &Ty,
     module: &str,
     prefix: &str,
 ) {
-    if matches!(ty, TypeRef::Iterator(_)) {
+    if matches!(ty, Ty::Iterator(_)) {
         return;
     }
     if matches!(
@@ -1321,19 +1319,19 @@ fn emit_ret_out_params(
 
 /// The C statement that creates a napi value `target` from a leaf C expression
 /// `expr` (scalars, bools, enums, handles).
-fn napi_create_leaf(env: &str, ty: &TypeRef, expr: &str, target: &str) -> String {
+fn napi_create_leaf(env: &str, ty: &Ty, expr: &str, target: &str) -> String {
     match ty {
-        TypeRef::I32 => format!("napi_create_int32({env}, {expr}, &{target});"),
-        TypeRef::U32 => format!("napi_create_uint32({env}, {expr}, &{target});"),
-        TypeRef::I64 => format!("napi_create_int64({env}, {expr}, &{target});"),
-        TypeRef::F64 => format!("napi_create_double({env}, {expr}, &{target});"),
-        TypeRef::I8 | TypeRef::I16 => format!("napi_create_int32({env}, {expr}, &{target});"),
-        TypeRef::U8 | TypeRef::U16 => format!("napi_create_uint32({env}, {expr}, &{target});"),
-        TypeRef::U64 => format!("napi_create_int64({env}, (int64_t)({expr}), &{target});"),
-        TypeRef::F32 => format!("napi_create_double({env}, {expr}, &{target});"),
-        TypeRef::Bool => format!("napi_get_boolean({env}, {expr}, &{target});"),
-        TypeRef::Enum(_) => format!("napi_create_int32({env}, (int32_t)({expr}), &{target});"),
-        TypeRef::Handle | TypeRef::TypedHandle(_) => {
+        Ty::I32 => format!("napi_create_int32({env}, {expr}, &{target});"),
+        Ty::U32 => format!("napi_create_uint32({env}, {expr}, &{target});"),
+        Ty::I64 => format!("napi_create_int64({env}, {expr}, &{target});"),
+        Ty::F64 => format!("napi_create_double({env}, {expr}, &{target});"),
+        Ty::I8 | Ty::I16 => format!("napi_create_int32({env}, {expr}, &{target});"),
+        Ty::U8 | Ty::U16 => format!("napi_create_uint32({env}, {expr}, &{target});"),
+        Ty::U64 => format!("napi_create_int64({env}, (int64_t)({expr}), &{target});"),
+        Ty::F32 => format!("napi_create_double({env}, {expr}, &{target});"),
+        Ty::Bool => format!("napi_get_boolean({env}, {expr}, &{target});"),
+        Ty::Enum(_) => format!("napi_create_int32({env}, (int32_t)({expr}), &{target});"),
+        Ty::Handle | Ty::TypedHandle(_) => {
             format!("napi_create_int64({env}, (int64_t)(intptr_t)({expr}), &{target});")
         }
         _ => format!("napi_get_null({env}, &{target});"),
@@ -1345,9 +1343,9 @@ fn napi_create_leaf(env: &str, ty: &TypeRef, expr: &str, target: &str) -> String
 /// receiving plan. A buffered return is copied into a JS `Buffer` and
 /// released with `weaveffi_free_bytes`; the JS loader decodes it into the
 /// idiomatic value.
-fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, prefix: &str, f: &FnBinding) {
+fn emit_ret_to_napi(out: &mut String, ty: &Ty, module: &str, prefix: &str, f: &FnBinding) {
     out.push_str("  napi_value ret;\n");
-    if matches!(ty, TypeRef::Iterator(_)) {
+    if matches!(ty, Ty::Iterator(_)) {
         // Lazy: the launcher's owned iterator handle is boxed into a
         // heap-allocated state cell and wrapped in a JS external. The
         // JS wrapper drives the per-iterator `next`/`destroy` entry
@@ -1393,22 +1391,20 @@ fn emit_ret_to_napi(out: &mut String, ty: &TypeRef, module: &str, prefix: &str, 
             }
         }
         RetPass::Direct => match ty {
-            TypeRef::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
-            TypeRef::U32 => out.push_str("  napi_create_uint32(env, result, &ret);\n"),
-            TypeRef::I64 => out.push_str("  napi_create_int64(env, result, &ret);\n"),
-            TypeRef::F64 => out.push_str("  napi_create_double(env, result, &ret);\n"),
-            TypeRef::I8 | TypeRef::I16 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
-            TypeRef::U8 | TypeRef::U16 => {
-                out.push_str("  napi_create_uint32(env, result, &ret);\n")
-            }
-            TypeRef::U64 => out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n"),
-            TypeRef::F32 => out.push_str("  napi_create_double(env, result, &ret);\n"),
-            TypeRef::Bool => out.push_str("  napi_get_boolean(env, result, &ret);\n"),
-            TypeRef::Enum(_) => {
+            Ty::I32 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
+            Ty::U32 => out.push_str("  napi_create_uint32(env, result, &ret);\n"),
+            Ty::I64 => out.push_str("  napi_create_int64(env, result, &ret);\n"),
+            Ty::F64 => out.push_str("  napi_create_double(env, result, &ret);\n"),
+            Ty::I8 | Ty::I16 => out.push_str("  napi_create_int32(env, result, &ret);\n"),
+            Ty::U8 | Ty::U16 => out.push_str("  napi_create_uint32(env, result, &ret);\n"),
+            Ty::U64 => out.push_str("  napi_create_int64(env, (int64_t)result, &ret);\n"),
+            Ty::F32 => out.push_str("  napi_create_double(env, result, &ret);\n"),
+            Ty::Bool => out.push_str("  napi_get_boolean(env, result, &ret);\n"),
+            Ty::Enum(_) => {
                 out.push_str("  napi_create_int32(env, (int32_t)result, &ret);\n");
             }
             // Handles are opaque tokens surfaced as int64.
-            TypeRef::Handle | TypeRef::TypedHandle(_) => {
+            Ty::Handle | Ty::TypedHandle(_) => {
                 out.push_str("  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);\n");
             }
             other => unreachable!("direct return with non-direct type {other:?}"),

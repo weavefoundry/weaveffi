@@ -183,6 +183,7 @@ pub(crate) fn render_wasm_readme(
     out.push_str("16 bytes on wasm32: `{ i32 code, char* message, uint8_t* payload_ptr,\n");
     out.push_str("size_t payload_len }`. Your Wasm module must export the following\n");
     out.push_str("functions:\n\n");
+    out.push_str("- `weaveffi_abi_version() -> i32`: the ABI revision the module implements; the loader refuses a mismatch\n");
     out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
     out.push_str("- `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");

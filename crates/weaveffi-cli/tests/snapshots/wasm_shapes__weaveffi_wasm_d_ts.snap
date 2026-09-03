@@ -43,6 +43,7 @@ export declare const Channel: Readonly<{
   Green: 1;
   Blue: 2;
 }>;
+export type Channel = (typeof Channel)[keyof typeof Channel];
 
 export interface WeaveffiWasmModule {
   _raw: WebAssembly.Exports;

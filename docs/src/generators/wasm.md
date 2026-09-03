@@ -416,16 +416,8 @@ exports as `Module['_name']` rather than `instance.exports.name`. Set
 
 ```toml
 # weaveffi.toml
-[wasm]
+[generators.wasm]
 emscripten = true
-```
-
-or inline in the IDL:
-
-```yaml
-generators:
-  wasm:
-    emscripten: true
 ```
 
 Instead of a URL, the loader accepts the initialized Emscripten module,

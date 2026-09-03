@@ -49,6 +49,7 @@ pointer as the last argument to each Wasm function. The error struct is
 size_t payload_len }`. Your Wasm module must export the following
 functions:
 
+- `weaveffi_abi_version() -> i32`: the ABI revision the module implements; the loader refuses a mismatch
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources

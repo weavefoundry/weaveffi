@@ -111,12 +111,12 @@ impl CType {
     /// uses, with `prefix` for every WeaveFFI-owned symbol.
     ///
     /// This is the Rust counterpart of [`render_c`](Self::render_c): it is the
-    /// single source of truth for the `weaveffi generate --scaffold` producer
-    /// stubs, so a scaffolded signature matches the generated C header by
-    /// construction. Notable lowerings:
+    /// single source of truth for the `extern "C"` signatures the
+    /// `#[weaveffi::module]` macro emits, so a macro-generated signature
+    /// matches the generated C header by construction. Notable lowerings:
     ///
-    /// * [`Char`](Self::Char) renders bare as `c_char` (the scaffold imports
-    ///   `std::os::raw::c_char`), and [`Void`](Self::Void) as
+    /// * [`Char`](Self::Char) renders bare as `c_char` (the emitted code
+    ///   imports `std::os::raw::c_char`), and [`Void`](Self::Void) as
     ///   `std::ffi::c_void` (only meaningful as a pointee; a bare `void`
     ///   *return* is the absence of a `-> T`, handled by the caller).
     /// * A C-style [`Enum`](Self::Enum) crosses the ABI as its `int`-sized

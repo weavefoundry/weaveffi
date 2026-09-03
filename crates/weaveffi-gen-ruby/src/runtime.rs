@@ -1,7 +1,9 @@
 //! The fixed Ruby runtime the generated module carries: the library loader,
 //! the error surface, the value-buffer reader/writer pair, and the runtime
 //! ABI attachments (`error_clear`, `error_free`, `free_string`,
-//! `free_bytes`).
+//! `free_bytes`), guarded by the load-time ABI-revision check.
+
+use weaveffi_core::cabi::ABI_VERSION;
 
 /// The exact `ffi_lib` loader block [`render_preamble`] emits in `generate`
 /// mode, so the packager can swap it for a bundled-first variant.
@@ -60,6 +62,22 @@ module {module_name}
   extend FFI::Library
 
 {RUBY_LOADER_ORIGINAL}
+
+  # The ABI revision these bindings were generated against. Checked before any
+  # other symbol is attached so a mismatched producer fails at require time
+  # instead of misreading the error struct or a value buffer later.
+  ABI_VERSION = {ABI_VERSION}
+  begin
+    attach_function :weaveffi_abi_version, [], :uint32
+  rescue FFI::NotFoundError
+    raise LoadError, 'the loaded WeaveFFI library predates ABI versioning ' \\
+                     \"(these bindings expect ABI revision #{{ABI_VERSION}})\"
+  end
+  _wv_abi = weaveffi_abi_version
+  unless _wv_abi == ABI_VERSION
+    raise LoadError, \"WeaveFFI ABI mismatch: these bindings expect revision #{{ABI_VERSION}} \" \\
+                     \"but the loaded library reports revision #{{_wv_abi}}\"
+  end
 
   class ErrorStruct < FFI::Struct
     layout :code, :int32,

@@ -5,8 +5,8 @@
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::abi::{CType, ConstPos};
 use weaveffi_core::lang;
+use weaveffi_core::model::Ty;
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
-use weaveffi_ir::ir::TypeRef;
 
 /// The local Go type name (PascalCase) of a user-defined type reference,
 /// stripping any qualifying module path.
@@ -31,30 +31,30 @@ pub(crate) fn go_param_ident(name: &str) -> String {
 }
 
 /// The Go type spelling of an IR type reference.
-pub(crate) fn go_type(ty: &TypeRef) -> String {
+pub(crate) fn go_type(ty: &Ty) -> String {
     match ty {
-        TypeRef::I8 => "int8".into(),
-        TypeRef::I16 => "int16".into(),
-        TypeRef::I32 => "int32".into(),
-        TypeRef::U8 => "uint8".into(),
-        TypeRef::U16 => "uint16".into(),
-        TypeRef::U32 => "uint32".into(),
-        TypeRef::U64 => "uint64".into(),
-        TypeRef::I64 | TypeRef::Handle => "int64".into(),
-        TypeRef::F32 => "float32".into(),
-        TypeRef::F64 => "float64".into(),
-        TypeRef::Bool => "bool".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "string".into(),
-        TypeRef::Bytes | TypeRef::BorrowedBytes => "[]byte".into(),
+        Ty::I8 => "int8".into(),
+        Ty::I16 => "int16".into(),
+        Ty::I32 => "int32".into(),
+        Ty::U8 => "uint8".into(),
+        Ty::U16 => "uint16".into(),
+        Ty::U32 => "uint32".into(),
+        Ty::U64 => "uint64".into(),
+        Ty::I64 | Ty::Handle => "int64".into(),
+        Ty::F32 => "float32".into(),
+        Ty::F64 => "float64".into(),
+        Ty::Bool => "bool".into(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
+        Ty::Bytes | Ty::BorrowedBytes => "[]byte".into(),
         // Records are plain value structs; rich enums are sealed interfaces
         // (nil-able), so neither takes a pointer at the type site. A
         // cross-module reference (resolved to e.g. `kv.Entry`) must name the
         // local `Entry` type rather than the qualified `KvEntry`.
-        TypeRef::Record(n) | TypeRef::RichEnum(n) => go_local(n),
-        TypeRef::Interface(n) => format!("*{}", go_local(n)),
-        TypeRef::TypedHandle(n) => format!("*{}", handle_wrapper(n)),
-        TypeRef::Enum(n) => go_local(n),
-        TypeRef::Optional(inner) => {
+        Ty::Record(n) | Ty::RichEnum(n) => go_local(n),
+        Ty::Interface(n) => format!("*{}", go_local(n)),
+        Ty::TypedHandle(n) => format!("*{}", handle_wrapper(n)),
+        Ty::Enum(n) => go_local(n),
+        Ty::Optional(inner) => {
             if optional_derefs(inner) {
                 format!("*{}", go_type(inner))
             } else {
@@ -63,12 +63,11 @@ pub(crate) fn go_type(ty: &TypeRef) -> String {
                 go_type(inner)
             }
         }
-        TypeRef::List(inner) => format!("[]{}", go_type(inner)),
+        Ty::List(inner) => format!("[]{}", go_type(inner)),
         // The bare (non-throwing) sequence type; a throwing iterator wrapper
         // spells `iter.Seq2[T, error]` at its signature site instead.
-        TypeRef::Iterator(inner) => format!("iter.Seq[{}]", go_type(inner)),
-        TypeRef::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        Ty::Iterator(inner) => format!("iter.Seq[{}]", go_type(inner)),
+        Ty::Map(k, v) => format!("map[{}]{}", go_type(k), go_type(v)),
     }
 }
 
@@ -76,39 +75,39 @@ pub(crate) fn go_type(ty: &TypeRef) -> String {
 /// when present). Types that are already nil-able (rich enums, slices, maps,
 /// byte slices, typed handles, interfaces) use nil directly as the none
 /// marker instead.
-pub(crate) fn optional_derefs(inner: &TypeRef) -> bool {
+pub(crate) fn optional_derefs(inner: &Ty) -> bool {
     !matches!(
         inner,
-        TypeRef::RichEnum(_)
-            | TypeRef::List(_)
-            | TypeRef::Map(_, _)
-            | TypeRef::Bytes
-            | TypeRef::BorrowedBytes
-            | TypeRef::TypedHandle(_)
-            | TypeRef::Interface(_)
+        Ty::RichEnum(_)
+            | Ty::List(_)
+            | Ty::Map(_, _)
+            | Ty::Bytes
+            | Ty::BorrowedBytes
+            | Ty::TypedHandle(_)
+            | Ty::Interface(_)
     )
 }
 
 /// The Go zero-value expression of a type, returned on the error path of a
 /// throwing wrapper.
-pub(crate) fn go_zero(ty: &TypeRef) -> String {
+pub(crate) fn go_zero(ty: &Ty) -> String {
     match ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::I64
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::U64
-        | TypeRef::Handle
-        | TypeRef::F32
-        | TypeRef::F64 => "0".into(),
-        TypeRef::Bool => "false".into(),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => "\"\"".into(),
-        TypeRef::Enum(_) => "0".into(),
+        Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::I64
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::U64
+        | Ty::Handle
+        | Ty::F32
+        | Ty::F64 => "0".into(),
+        Ty::Bool => "false".into(),
+        Ty::StringUtf8 | Ty::BorrowedStr => "\"\"".into(),
+        Ty::Enum(_) => "0".into(),
         // A record is a value struct: its zero is the empty literal.
-        TypeRef::Record(n) => format!("{}{{}}", go_local(n)),
+        Ty::Record(n) => format!("{}{{}}", go_local(n)),
         _ => "nil".into(),
     }
 }
@@ -116,29 +115,29 @@ pub(crate) fn go_zero(ty: &TypeRef) -> String {
 /// The cgo spelling of a scalar type's C slot (`C.int32_t`, `C._Bool`,
 /// `C.{prefix}_{module}_{Enum}`), or `None` when the type isn't passed as a
 /// single scalar slot.
-pub(crate) fn c_scalar_type(ty: &TypeRef, prefix: &str, module: &str) -> Option<String> {
+pub(crate) fn c_scalar_type(ty: &Ty, prefix: &str, module: &str) -> Option<String> {
     match ty {
-        TypeRef::I8 => Some("C.int8_t".into()),
-        TypeRef::I16 => Some("C.int16_t".into()),
-        TypeRef::I32 => Some("C.int32_t".into()),
-        TypeRef::U8 => Some("C.uint8_t".into()),
-        TypeRef::U16 => Some("C.uint16_t".into()),
-        TypeRef::U32 => Some("C.uint32_t".into()),
-        TypeRef::U64 => Some("C.uint64_t".into()),
-        TypeRef::I64 | TypeRef::Handle => Some("C.int64_t".into()),
-        TypeRef::F32 => Some("C.float".into()),
-        TypeRef::F64 => Some("C.double".into()),
-        TypeRef::Bool => Some("C._Bool".into()),
-        TypeRef::Enum(n) => Some(format!("C.{}", c_abi_struct_name(n, module, prefix))),
+        Ty::I8 => Some("C.int8_t".into()),
+        Ty::I16 => Some("C.int16_t".into()),
+        Ty::I32 => Some("C.int32_t".into()),
+        Ty::U8 => Some("C.uint8_t".into()),
+        Ty::U16 => Some("C.uint16_t".into()),
+        Ty::U32 => Some("C.uint32_t".into()),
+        Ty::U64 => Some("C.uint64_t".into()),
+        Ty::I64 | Ty::Handle => Some("C.int64_t".into()),
+        Ty::F32 => Some("C.float".into()),
+        Ty::F64 => Some("C.double".into()),
+        Ty::Bool => Some("C._Bool".into()),
+        Ty::Enum(n) => Some(format!("C.{}", c_abi_struct_name(n, module, prefix))),
         _ => None,
     }
 }
 
 /// The Go expression converting a Go scalar `expr` into its C slot value.
 /// Non-scalar types pass through unchanged.
-pub(crate) fn c_scalar_conv(expr: &str, ty: &TypeRef, prefix: &str, module: &str) -> String {
+pub(crate) fn c_scalar_conv(expr: &str, ty: &Ty, prefix: &str, module: &str) -> String {
     match ty {
-        TypeRef::Bool => format!("boolToC({expr})"),
+        Ty::Bool => format!("boolToC({expr})"),
         _ => {
             if let Some(ct) = c_scalar_type(ty, prefix, module) {
                 format!("{ct}({expr})")
@@ -151,30 +150,30 @@ pub(crate) fn c_scalar_conv(expr: &str, ty: &TypeRef, prefix: &str, module: &str
 
 /// The Go expression converting a C scalar `expr` back into its Go value.
 /// Non-scalar types pass through unchanged.
-pub(crate) fn go_scalar_conv(expr: &str, ty: &TypeRef) -> String {
+pub(crate) fn go_scalar_conv(expr: &str, ty: &Ty) -> String {
     match ty {
-        TypeRef::I8 => format!("int8({expr})"),
-        TypeRef::I16 => format!("int16({expr})"),
-        TypeRef::I32 => format!("int32({expr})"),
-        TypeRef::U8 => format!("uint8({expr})"),
-        TypeRef::U16 => format!("uint16({expr})"),
-        TypeRef::U32 => format!("uint32({expr})"),
-        TypeRef::U64 => format!("uint64({expr})"),
-        TypeRef::I64 | TypeRef::Handle => format!("int64({expr})"),
-        TypeRef::F32 => format!("float32({expr})"),
-        TypeRef::F64 => format!("float64({expr})"),
-        TypeRef::Bool => format!("cToBool({expr})"),
-        TypeRef::Enum(n) => format!("{}({expr})", go_local(n)),
+        Ty::I8 => format!("int8({expr})"),
+        Ty::I16 => format!("int16({expr})"),
+        Ty::I32 => format!("int32({expr})"),
+        Ty::U8 => format!("uint8({expr})"),
+        Ty::U16 => format!("uint16({expr})"),
+        Ty::U32 => format!("uint32({expr})"),
+        Ty::U64 => format!("uint64({expr})"),
+        Ty::I64 | Ty::Handle => format!("int64({expr})"),
+        Ty::F32 => format!("float32({expr})"),
+        Ty::F64 => format!("float64({expr})"),
+        Ty::Bool => format!("cToBool({expr})"),
+        Ty::Enum(n) => format!("{}({expr})", go_local(n)),
         _ => expr.to_string(),
     }
 }
 
 /// The Go expression wrapping an opaque C pointer (`ptr_expr`) into the
 /// wrapper type for an interface or typed-handle reference.
-pub(crate) fn go_wrap_expr(ty: &TypeRef, ptr_expr: &str) -> String {
+pub(crate) fn go_wrap_expr(ty: &Ty, ptr_expr: &str) -> String {
     match ty {
-        TypeRef::Interface(n) => format!("&{}{{ptr: {ptr_expr}}}", go_local(n)),
-        TypeRef::TypedHandle(n) => format!("&{}{{ptr: {ptr_expr}}}", handle_wrapper(n)),
+        Ty::Interface(n) => format!("&{}{{ptr: {ptr_expr}}}", go_local(n)),
+        Ty::TypedHandle(n) => format!("&{}{{ptr: {ptr_expr}}}", handle_wrapper(n)),
         _ => unreachable!("only interfaces and typed handles wrap C pointers"),
     }
 }

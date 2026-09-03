@@ -6,13 +6,13 @@ use heck::{ToSnakeCase, ToUpperCamelCase};
 use weaveffi_core::abi;
 use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     AbiFn, AsyncBinding, CallShape, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding,
     ParamBinding,
 };
 use weaveffi_core::plan::{elem_free, ret_pass, ArgPass, ElemFree, ErrorStrategy, RetPass};
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{emit_read_decl, emit_read_into, emit_write_value};
 use crate::types::{
@@ -51,10 +51,10 @@ fn make_error_call(f: &FnBinding, module: &ModuleBinding) -> String {
 
 /// The local interface name behind an object-passed type: the interface
 /// itself, or the interface inside `Interface?`.
-fn object_iface_name(ty: &TypeRef) -> &str {
+fn object_iface_name(ty: &Ty) -> &str {
     match ty {
-        TypeRef::Interface(n) => n,
-        TypeRef::Optional(inner) => object_iface_name(inner),
+        Ty::Interface(n) => n,
+        Ty::Optional(inner) => object_iface_name(inner),
         _ => unreachable!("object passing only applies to interfaces"),
     }
 }
@@ -78,6 +78,9 @@ fn emit_param_setup(
             emit_write_value(w, &p.ty, &name, &buf, 0);
             vec![format!("{buf}.data()"), format!("{buf}.size()")]
         }
+        // `std::string::data()` is the non-const overload on a mutable
+        // parameter (C++17), yielding the `char*` the write-back slot wants.
+        ArgPass::String { .. } if p.mutable => vec![format!("{name}.data()")],
         ArgPass::String { .. } => vec![format!("{name}.c_str()")],
         ArgPass::Bytes { .. } => {
             vec![format!("{name}.data()"), format!("{name}.size()")]
@@ -96,10 +99,10 @@ fn emit_param_setup(
             }
         }
         ArgPass::Direct { .. } => match &p.ty {
-            TypeRef::Handle => vec![format!(
+            Ty::Handle => vec![format!(
                 "static_cast<{prefix}_handle_t>(reinterpret_cast<uintptr_t>({name}))"
             )],
-            TypeRef::Enum(e) => vec![format!(
+            Ty::Enum(e) => vec![format!(
                 "static_cast<{}>(static_cast<int32_t>({name}))",
                 c_abi_struct_name(e, module, prefix)
             )],
@@ -115,7 +118,7 @@ fn emit_param_setup(
 /// [`RetPass`] plan. A buffered return decodes the producer's buffer and
 /// releases it with `{prefix}_free_bytes` via a scope guard, so the release
 /// happens even when decoding throws.
-fn emit_sync_return(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: &str) {
+fn emit_sync_return(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str) {
     match ret_pass(Some(ty), module, prefix) {
         RetPass::Buffer => {
             w.line("detail::BufferGuard result_guard{result, out_len};");
@@ -149,10 +152,10 @@ fn emit_sync_return(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: &str
             ));
         }
         RetPass::Direct => match ty {
-            TypeRef::Handle => {
+            Ty::Handle => {
                 w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(result));");
             }
-            TypeRef::Enum(n) => {
+            Ty::Enum(n) => {
                 w.line(format!(
                     "return static_cast<{}>(result);",
                     local_type_name(n)
@@ -277,7 +280,7 @@ fn render_sync_callable(
     let decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
         .collect();
 
     let is_ctor = matches!(kind, FnKind::Ctor);
@@ -504,7 +507,7 @@ fn render_iterator_callable(
     let decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
         .collect();
     w.line(format!(
         "{}{class_name} {cpp_name}({}){} {{",
@@ -596,7 +599,7 @@ fn render_iterator_next_method(
             w.line("return std::nullopt;");
         });
         w.line("}");
-        if abi::is_buffered(&it.elem) {
+        if it.elem.is_buffered() {
             // A buffered element is producer-allocated: decode into an owned
             // value, then release with free_bytes via the scope guard.
             w.line("detail::BufferGuard item_guard{item, item_len};");
@@ -607,7 +610,7 @@ fn render_iterator_next_method(
         } else {
             match (&it.elem, &ef) {
                 // Byte-buffer elements copy then release the producer buffer.
-                (TypeRef::Bytes | TypeRef::BorrowedBytes, _) => {
+                (Ty::Bytes | Ty::BorrowedBytes, _) => {
                     w.line("std::vector<uint8_t> value(item, item + item_len);");
                     w.line(format!(
                         "{prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);"
@@ -619,11 +622,11 @@ fn render_iterator_next_method(
                     w.line(format!("{prefix}_free_string(item);"));
                     w.line("return value;");
                 }
-                (TypeRef::Enum(n), _) => {
+                (Ty::Enum(n), _) => {
                     let n = local_type_name(n);
                     w.line(format!("return static_cast<{n}>(item);"));
                 }
-                (TypeRef::Handle, _) => {
+                (Ty::Handle, _) => {
                     w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(item));");
                 }
                 _ => {
@@ -663,7 +666,7 @@ fn render_async_callable(
     let mut decls: Vec<String> = f
         .params
         .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), &module.path, prefix))
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
         .collect();
     if f.cancellable {
         decls.push(format!("{prefix}_cancel_token* cancel_token = nullptr"));
@@ -740,7 +743,7 @@ fn render_async_callable(
 /// values) are *owned by the consumer*: the wrapper copies or decodes them,
 /// then releases the producer allocation through the runtime free symbols.
 /// An owned interface result is instead adopted into the RAII wrapper.
-fn emit_async_set_value(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: &str) {
+fn emit_async_set_value(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str) {
     match ret_pass(Some(ty), module, prefix) {
         RetPass::Buffer => {
             // Owned `(result_ptr, result_len)` buffer: decode, then free.
@@ -784,10 +787,10 @@ fn emit_async_set_value(w: &mut CodeWriter, ty: &TypeRef, module: &str, prefix: 
             }
         }
         RetPass::Direct => match ty {
-            TypeRef::Handle => {
+            Ty::Handle => {
                 w.line("p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));");
             }
-            TypeRef::Enum(n) => {
+            Ty::Enum(n) => {
                 w.line(format!(
                     "p->set_value(static_cast<{}>(result));",
                     local_type_name(n)
@@ -828,10 +831,10 @@ pub(crate) fn render_cpp_module_ns(out: &mut String, module: &ModuleBinding, pre
 /// value types. Interface and typed-handle parameters stay raw borrowed
 /// pointers: wrapping a borrowed handle in the owning RAII class would
 /// `_destroy` it on destruction.
-fn cpp_cb_param_type(ty: &TypeRef, module: &str, prefix: &str) -> String {
+fn cpp_cb_param_type(ty: &Ty, module: &str, prefix: &str) -> String {
     match ty {
-        TypeRef::Interface(n) => format!("const {}*", c_abi_struct_name(n, module, prefix)),
-        TypeRef::Optional(inner) if matches!(inner.as_ref(), TypeRef::Interface(_)) => {
+        Ty::Interface(n) => format!("const {}*", c_abi_struct_name(n, module, prefix)),
+        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
             cpp_cb_param_type(inner, module, prefix)
         }
         other => cpp_type(other, module, prefix),
@@ -875,11 +878,11 @@ fn emit_cb_arg(w: &mut CodeWriter, p: &ParamBinding, module: &str, prefix: &str)
         ArgPass::Direct { slot } => {
             let n0 = &slot.name;
             match &p.ty {
-                TypeRef::Enum(e) => format!(
+                Ty::Enum(e) => format!(
                     "static_cast<{}>(static_cast<int32_t>({n0}))",
                     local_type_name(e)
                 ),
-                TypeRef::Handle => {
+                Ty::Handle => {
                     format!("reinterpret_cast<void*>(static_cast<uintptr_t>({n0}))")
                 }
                 // Typed handles stay the raw borrowed tag pointer.

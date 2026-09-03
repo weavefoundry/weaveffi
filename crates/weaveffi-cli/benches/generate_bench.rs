@@ -2,7 +2,7 @@ use std::path::Path;
 
 use camino::Utf8Path;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use weaveffi_core::codegen::{ConfiguredGenerator, DynGenerator, Generator, Orchestrator};
+use weaveffi_core::codegen::{ConfiguredBackend, Orchestrator, Target};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
 use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
@@ -21,6 +21,32 @@ use weaveffi_ir::ir::{
 };
 use weaveffi_ir::parse::parse_api_str;
 
+fn field(name: &str, ty: TypeRef) -> StructField {
+    StructField {
+        name: name.into(),
+        ty,
+        doc: None,
+    }
+}
+
+fn param(name: &str, ty: TypeRef) -> Param {
+    Param {
+        name: name.into(),
+        ty,
+        mutable: false,
+        doc: None,
+    }
+}
+
+fn variant(name: &str, value: i32) -> EnumVariant {
+    EnumVariant {
+        name: name.into(),
+        value,
+        doc: None,
+        fields: vec![],
+    }
+}
+
 /// 10 modules x (50 functions + 5 structs + 3 enums) each. Type names are
 /// namespaced per module (`M0Struct0`, ...) because bare type names must be
 /// unique across the whole API.
@@ -31,22 +57,11 @@ fn build_large_api() -> ResolvedApi {
                 .map(|s| StructDef {
                     name: format!("M{m}Struct{s}"),
                     doc: None,
+                    deprecated: None,
                     fields: vec![
-                        StructField {
-                            name: "id".into(),
-                            ty: TypeRef::I32,
-                            doc: None,
-                        },
-                        StructField {
-                            name: "name".into(),
-                            ty: TypeRef::StringUtf8,
-                            doc: None,
-                        },
-                        StructField {
-                            name: "active".into(),
-                            ty: TypeRef::Bool,
-                            doc: None,
-                        },
+                        field("id", TypeRef::I32),
+                        field("name", TypeRef::StringUtf8),
+                        field("active", TypeRef::Bool),
                     ],
                 })
                 .collect();
@@ -55,26 +70,8 @@ fn build_large_api() -> ResolvedApi {
                 .map(|e| EnumDef {
                     name: format!("M{m}Enum{e}"),
                     doc: None,
-                    variants: vec![
-                        EnumVariant {
-                            name: "Alpha".into(),
-                            value: 0,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Beta".into(),
-                            value: 1,
-                            doc: None,
-                            fields: vec![],
-                        },
-                        EnumVariant {
-                            name: "Gamma".into(),
-                            value: 2,
-                            doc: None,
-                            fields: vec![],
-                        },
-                    ],
+                    deprecated: None,
+                    variants: vec![variant("Alpha", 0), variant("Beta", 1), variant("Gamma", 2)],
                 })
                 .collect();
 
@@ -83,29 +80,11 @@ fn build_large_api() -> ResolvedApi {
                     name: format!("func{f}"),
                     doc: Some(format!("Function {f} in module {m}")),
                     params: vec![
-                        Param {
-                            name: "a".into(),
-                            ty: TypeRef::I32,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "b".into(),
-                            ty: TypeRef::StringUtf8,
-                            mutable: false,
-                            doc: None,
-                        },
-                        Param {
-                            name: "c".into(),
-                            // The synthetic API skips the resolve pass, so
-                            // user-type references use the resolved `Record`
-                            // form the generators require.
-                            ty: TypeRef::Record(format!("M{m}Struct0")),
-                            mutable: false,
-                            doc: None,
-                        },
+                        param("a", TypeRef::I32),
+                        param("b", TypeRef::StringUtf8),
+                        param("c", TypeRef::Named(format!("M{m}Struct0"))),
                     ],
-                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Record(format!(
+                    returns: Some(TypeRef::Optional(Box::new(TypeRef::Named(format!(
                         "M{m}Struct1"
                     ))))),
                     throws: false,
@@ -118,6 +97,7 @@ fn build_large_api() -> ResolvedApi {
 
             Module {
                 name: format!("mod{m}"),
+                doc: None,
                 functions,
                 interfaces: vec![],
                 structs,
@@ -130,136 +110,50 @@ fn build_large_api() -> ResolvedApi {
         })
         .collect();
 
-    // The synthetic API already uses resolved type references (see the
-    // `Record` comment above), so it skips the validate/resolve pass.
-    ResolvedApi::assume_resolved(Api {
-        version: "0.7.0".into(),
-        modules,
-        generators: None,
-        package: None,
-    })
+    validate_api(
+        Api {
+            version: "0.8.0".into(),
+            modules,
+        },
+        None,
+    )
+    .expect("synthetic API validates")
 }
 
-/// Construct the same fan-out of generators used by the CLI, each with its
-/// default per-target config.
-fn all_default_generators() -> Vec<Box<dyn DynGenerator>> {
+/// The same fan-out of targets the CLI drives, each with its default config.
+fn all_default_targets() -> Vec<Box<dyn Target>> {
     vec![
-        Box::new(ConfiguredGenerator::new(CGenerator, CConfig::default())),
-        Box::new(ConfiguredGenerator::new(CppGenerator, CppConfig::default())),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(CGenerator, CConfig::default())),
+        Box::new(ConfiguredBackend::new(CppGenerator, CppConfig::default())),
+        Box::new(ConfiguredBackend::new(
             SwiftGenerator,
             SwiftConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(
             AndroidGenerator,
             AndroidConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
-            NodeGenerator,
-            NodeConfig::default(),
-        )),
-        Box::new(ConfiguredGenerator::new(
-            WasmGenerator,
-            WasmConfig::default(),
-        )),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(NodeGenerator, NodeConfig::default())),
+        Box::new(ConfiguredBackend::new(WasmGenerator, WasmConfig::default())),
+        Box::new(ConfiguredBackend::new(
             PythonGenerator,
             PythonConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
+        Box::new(ConfiguredBackend::new(
             DotnetGenerator,
             DotnetConfig::default(),
         )),
-        Box::new(ConfiguredGenerator::new(
-            DartGenerator,
-            DartConfig::default(),
-        )),
-        Box::new(ConfiguredGenerator::new(GoGenerator, GoConfig::default())),
-        Box::new(ConfiguredGenerator::new(
-            RubyGenerator,
-            RubyConfig::default(),
-        )),
+        Box::new(ConfiguredBackend::new(DartGenerator, DartConfig::default())),
+        Box::new(ConfiguredBackend::new(GoGenerator, GoConfig::default())),
+        Box::new(ConfiguredBackend::new(RubyGenerator, RubyConfig::default())),
     ]
 }
 
-fn bench_generate_c_large_api(c: &mut Criterion) {
-    let api = build_large_api();
-    let gen = CGenerator;
-    let cfg = CConfig::default();
-
-    c.bench_function("generate_c_large_api", |b| {
-        b.iter(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let out = Utf8Path::from_path(dir.path()).unwrap();
-            gen.generate(black_box(&api), out, &cfg).unwrap();
-        });
-    });
-}
-
-fn bench_generate_swift_large_api(c: &mut Criterion) {
-    let api = build_large_api();
-    let gen = SwiftGenerator;
-    let cfg = SwiftConfig::default();
-
-    c.bench_function("generate_swift_large_api", |b| {
-        b.iter(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let out = Utf8Path::from_path(dir.path()).unwrap();
-            gen.generate(black_box(&api), out, &cfg).unwrap();
-        });
-    });
-}
-
-fn bench_generate_all_large_api(c: &mut Criterion) {
-    let api = build_large_api();
-    let generators = all_default_generators();
-
+fn run_all(targets: &[Box<dyn Target>], api: &ResolvedApi) {
     let mut orchestrator = Orchestrator::new();
-    for g in &generators {
-        orchestrator = orchestrator.with_generator(g.as_ref());
+    for t in targets {
+        orchestrator = orchestrator.with_target(t.as_ref());
     }
-
-    c.bench_function("generate_all_large_api", |b| {
-        b.iter(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let out = Utf8Path::from_path(dir.path()).unwrap();
-            orchestrator
-                .run(black_box(&api), out, &Default::default(), true)
-                .unwrap();
-        });
-    });
-}
-
-/// Parse and validate the canonical kitchen-sink IDL fixture so the
-/// parallel-vs-serial benchmark exercises every generator against a
-/// realistic, full-featured API.
-fn load_kitchen_sink_api() -> ResolvedApi {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/06_kitchen_sink.yml");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
-    let api = parse_api_str(&contents, "yaml")
-        .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
-    validate_api(api, None).unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
-}
-
-/// Parse and validate the calculator sample IDL.
-fn load_calculator_api() -> ResolvedApi {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/calculator/calculator.yml");
-    let contents = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read sample {}: {e}", path.display()));
-    let api = parse_api_str(&contents, "yaml")
-        .unwrap_or_else(|e| panic!("parse sample {}: {e}", path.display()));
-    validate_api(api, None).unwrap_or_else(|e| panic!("validate sample {}: {e}", path.display()))
-}
-
-fn run_all_generators(api: &ResolvedApi) {
-    let generators = all_default_generators();
-    let mut orchestrator = Orchestrator::new();
-    for g in &generators {
-        orchestrator = orchestrator.with_generator(g.as_ref());
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let out = Utf8Path::from_path(dir.path()).unwrap();
     orchestrator
@@ -267,47 +161,92 @@ fn run_all_generators(api: &ResolvedApi) {
         .unwrap();
 }
 
+fn bench_generate_c_large_api(c: &mut Criterion) {
+    let api = build_large_api();
+    let cfg = CConfig::default();
+    c.bench_function("generate_c_large_api", |b| {
+        b.iter(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = Utf8Path::from_path(dir.path()).unwrap();
+            weaveffi_core::backend::run(&CGenerator, black_box(&api), out, &cfg).unwrap();
+        });
+    });
+}
+
+fn bench_generate_swift_large_api(c: &mut Criterion) {
+    let api = build_large_api();
+    let cfg = SwiftConfig::default();
+    c.bench_function("generate_swift_large_api", |b| {
+        b.iter(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let out = Utf8Path::from_path(dir.path()).unwrap();
+            weaveffi_core::backend::run(&SwiftGenerator, black_box(&api), out, &cfg).unwrap();
+        });
+    });
+}
+
+fn bench_generate_all_large_api(c: &mut Criterion) {
+    let api = build_large_api();
+    let targets = all_default_targets();
+    c.bench_function("generate_all_large_api", |b| {
+        b.iter(|| run_all(&targets, &api));
+    });
+}
+
+/// Parse and validate the canonical kitchen-sink IDL fixture so the
+/// parallel-vs-serial benchmark exercises every generator against a
+/// realistic, full-featured API.
+fn load_kitchen_sink_api() -> ResolvedApi {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kitchen_sink.yml");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let api = parse_api_str(&contents, "yaml")
+        .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()));
+    validate_api(api, None).unwrap_or_else(|e| panic!("validate fixture {}: {e}", path.display()))
+}
+
+/// Extract and validate the calculator sample from its annotated Rust source.
+fn load_calculator_api() -> ResolvedApi {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/calculator/src/lib.rs");
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read sample {}: {e}", path.display()));
+    let api = weaveffi_bridge::api_from_src_stringly(&contents)
+        .unwrap_or_else(|e| panic!("extract sample {}: {e}", path.display()));
+    validate_api(api, None).unwrap_or_else(|e| panic!("validate sample {}: {e}", path.display()))
+}
+
 /// Target: full codegen (all 11 generators) < 500ms for the calculator sample.
 fn bench_full_codegen_calculator(c: &mut Criterion) {
     let api = load_calculator_api();
+    let targets = all_default_targets();
     c.bench_function("full_codegen_calculator", |b| {
-        b.iter(|| run_all_generators(&api));
+        b.iter(|| run_all(&targets, &api));
     });
 }
 
 /// Target: full codegen (all 11 generators) < 2000ms for the kitchen-sink fixture.
 fn bench_full_codegen_kitchen_sink(c: &mut Criterion) {
     let api = load_kitchen_sink_api();
+    let targets = all_default_targets();
     c.bench_function("full_codegen_kitchen_sink", |b| {
-        b.iter(|| run_all_generators(&api));
+        b.iter(|| run_all(&targets, &api));
     });
 }
 
 fn bench_generate_all_parallel_vs_serial(c: &mut Criterion) {
     let api = load_kitchen_sink_api();
-    let generators = all_default_generators();
-
-    let mut orchestrator = Orchestrator::new();
-    for g in &generators {
-        orchestrator = orchestrator.with_generator(g.as_ref());
-    }
+    let targets = all_default_targets();
 
     let mut group = c.benchmark_group("generate_all_kitchen_sink");
     group.bench_function("parallel", |b| {
-        b.iter(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let out = Utf8Path::from_path(dir.path()).unwrap();
-            orchestrator
-                .run(black_box(&api), out, &Default::default(), true)
-                .unwrap();
-        });
+        b.iter(|| run_all(&targets, &api));
     });
     group.bench_function("serial", |b| {
         b.iter(|| {
             let dir = tempfile::tempdir().unwrap();
             let out = Utf8Path::from_path(dir.path()).unwrap();
-            for g in &generators {
-                g.generate(black_box(&api), out).unwrap();
+            for t in &targets {
+                t.generate(black_box(&api), out).unwrap();
             }
         });
     });

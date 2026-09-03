@@ -25,6 +25,15 @@ import (
 	"unsafe"
 )
 
+// The ABI revision these bindings were generated against.
+const wvABIVersion uint32 = 1
+
+func init() {
+	if found := uint32(C.weaveffi_abi_version()); found != wvABIVersion {
+		panic(fmt.Sprintf("WeaveFFI ABI mismatch: these bindings expect revision %d but the loaded library reports revision %d", wvABIVersion, found))
+	}
+}
+
 func boolToC(b bool) C._Bool {
 	return C._Bool(b)
 }

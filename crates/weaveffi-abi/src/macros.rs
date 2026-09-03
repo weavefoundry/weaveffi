@@ -19,6 +19,7 @@
 /// The macro expands to a fixed set of functions named with the
 /// `weaveffi_` prefix:
 ///
+/// - `weaveffi_abi_version`
 /// - `weaveffi_free_string`
 /// - `weaveffi_free_bytes`
 /// - `weaveffi_error_clear`
@@ -53,6 +54,14 @@
 #[macro_export]
 macro_rules! export_runtime {
     () => {
+        // Consumers compare this against the revision they were generated
+        // for before touching any other symbol, so it must stay a plain
+        // constant with no side effects.
+        #[no_mangle]
+        pub extern "C" fn weaveffi_abi_version() -> u32 {
+            $crate::abi_version()
+        }
+
         #[no_mangle]
         pub extern "C" fn weaveffi_free_string(ptr: *const ::std::os::raw::c_char) {
             $crate::free_string(ptr)

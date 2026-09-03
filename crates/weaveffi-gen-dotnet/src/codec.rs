@@ -5,14 +5,14 @@
 //! Every dispatch here goes through [`wire::classify`], so this module never
 //! re-derives the wire folds (handles as `u64` tokens, borrowed views as
 //! their owned forms, records and rich enums as one user-codec shape). The
-//! only peek back at the [`TypeRef`] is for `handle<T>`, whose C# surface is
+//! only peek back at the [`Ty`] is for `handle<T>`, whose C# surface is
 //! a `{T}Handle` wrapper struct even though the wire shape is one `u64`
 //! token.
 
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
+use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
-use weaveffi_core::wire::{self, WireType};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::types::{cs_type, is_cs_value_type, typed_handle_cs};
 
@@ -22,49 +22,49 @@ use crate::types::{cs_type, is_cs_value_type, typed_handle_cs};
 /// `depth` uniquifies loop locals so nested lists and maps never collide.
 pub(crate) fn emit_buffer_write(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     expr: &str,
     writer_var: &str,
     depth: usize,
 ) {
-    match wire::classify(ty) {
-        WireType::I8 => {
+    match ty.wire() {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("{writer_var}.WriteI8({expr});"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("{writer_var}.WriteI16({expr});"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("{writer_var}.WriteI32({expr});"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("{writer_var}.WriteU8({expr});"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("{writer_var}.WriteU16({expr});"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("{writer_var}.WriteU32({expr});"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("{writer_var}.WriteI64({expr});"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("{writer_var}.WriteU64({expr});"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("{writer_var}.WriteF32({expr});"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("{writer_var}.WriteF64({expr});"));
         }
-        WireType::Bool => {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("{writer_var}.WriteBool({expr});"));
         }
         // Both handle flavors encode as one u64 token; only the C# surface
         // differs (a bare ulong versus the `{T}Handle` wrapper struct).
-        WireType::Handle => {
-            if matches!(ty, TypeRef::TypedHandle(_)) {
+        WireType::Handle(_) => {
+            if matches!(ty, Ty::TypedHandle(_)) {
                 w.line(format!("{writer_var}.WriteU64((ulong)(long){expr}.Raw);"));
             } else {
                 w.line(format!("{writer_var}.WriteU64({expr});"));
@@ -73,10 +73,10 @@ pub(crate) fn emit_buffer_write(
         WireType::Enum(_) => {
             w.line(format!("{writer_var}.WriteI32((int){expr});"));
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("{writer_var}.WriteString({expr});"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("{writer_var}.WriteBytes({expr});"));
         }
         WireType::User(_) => {
@@ -123,49 +123,49 @@ pub(crate) fn emit_buffer_write(
 /// [`emit_buffer_write`]. `depth` uniquifies loop counters across nesting.
 pub(crate) fn emit_buffer_read(
     w: &mut CodeWriter,
-    ty: &TypeRef,
+    ty: &Ty,
     var: &str,
     reader_var: &str,
     depth: usize,
 ) {
-    match wire::classify(ty) {
-        WireType::I8 => {
+    match ty.wire() {
+        WireType::Prim(Prim::I8) => {
             w.line(format!("var {var} = {reader_var}.ReadI8();"));
         }
-        WireType::I16 => {
+        WireType::Prim(Prim::I16) => {
             w.line(format!("var {var} = {reader_var}.ReadI16();"));
         }
-        WireType::I32 => {
+        WireType::Prim(Prim::I32) => {
             w.line(format!("var {var} = {reader_var}.ReadI32();"));
         }
-        WireType::U8 => {
+        WireType::Prim(Prim::U8) => {
             w.line(format!("var {var} = {reader_var}.ReadU8();"));
         }
-        WireType::U16 => {
+        WireType::Prim(Prim::U16) => {
             w.line(format!("var {var} = {reader_var}.ReadU16();"));
         }
-        WireType::U32 => {
+        WireType::Prim(Prim::U32) => {
             w.line(format!("var {var} = {reader_var}.ReadU32();"));
         }
-        WireType::I64 => {
+        WireType::Prim(Prim::I64) => {
             w.line(format!("var {var} = {reader_var}.ReadI64();"));
         }
-        WireType::U64 => {
+        WireType::Prim(Prim::U64) => {
             w.line(format!("var {var} = {reader_var}.ReadU64();"));
         }
-        WireType::F32 => {
+        WireType::Prim(Prim::F32) => {
             w.line(format!("var {var} = {reader_var}.ReadF32();"));
         }
-        WireType::F64 => {
+        WireType::Prim(Prim::F64) => {
             w.line(format!("var {var} = {reader_var}.ReadF64();"));
         }
-        WireType::Bool => {
+        WireType::Prim(Prim::Bool) => {
             w.line(format!("var {var} = {reader_var}.ReadBool();"));
         }
         // The u64 token decodes back into the C# surface: a bare ulong for
         // `handle`, the `{T}Handle` wrapper for `handle<T>`.
-        WireType::Handle => {
-            if let TypeRef::TypedHandle(name) = ty {
+        WireType::Handle(_) => {
+            if let Ty::TypedHandle(name) = ty {
                 let cn = typed_handle_cs(name);
                 w.line(format!(
                     "var {var} = new {cn}((IntPtr)(long){reader_var}.ReadU64());"
@@ -178,10 +178,10 @@ pub(crate) fn emit_buffer_read(
             let cn = local_type_name(name);
             w.line(format!("var {var} = ({cn}){reader_var}.ReadI32();"));
         }
-        WireType::String => {
+        WireType::Prim(Prim::String) => {
             w.line(format!("var {var} = {reader_var}.ReadString();"));
         }
-        WireType::Bytes => {
+        WireType::Prim(Prim::Bytes) => {
             w.line(format!("var {var} = {reader_var}.ReadBytes();"));
         }
         WireType::User(name) => {
@@ -199,9 +199,11 @@ pub(crate) fn emit_buffer_read(
         }
         WireType::List(inner) => {
             let i = format!("i{depth}");
-            let elem = cs_type(inner);
             w.line(format!("var {var}Count = {reader_var}.ReadLen();"));
-            w.line(format!("var {var} = new {elem}[{var}Count];"));
+            w.line(format!(
+                "var {var} = {};",
+                cs_new_array(&cs_type(inner), &format!("{var}Count"))
+            ));
             w.line(format!("for (int {i} = 0; {i} < {var}Count; {i}++)"));
             w.block("{", "}", |w| {
                 emit_buffer_read(w, inner, &format!("{var}Item"), reader_var, depth + 1);
@@ -229,7 +231,18 @@ pub(crate) fn emit_buffer_read(
 /// Emit the statements decoding a consumer-side copy of a value buffer
 /// (`byte[]` local named `buf`) into a local named `var` of type `ty`,
 /// validating that the buffer is fully consumed.
-pub(crate) fn emit_buffer_decode(w: &mut CodeWriter, ty: &TypeRef, var: &str, buf: &str) {
+/// `new T[len]` for an array whose element type is `elem`.
+///
+/// C# puts the outermost rank first, so an array of `int[]` elements is
+/// spelled `new int[len][]`, not `new int[][len]`: any trailing `[]` ranks on
+/// the element type move after the length.
+fn cs_new_array(elem: &str, len: &str) -> String {
+    let base = elem.trim_end_matches("[]");
+    let ranks = &elem[base.len()..];
+    format!("new {base}[{len}]{ranks}")
+}
+
+pub(crate) fn emit_buffer_decode(w: &mut CodeWriter, ty: &Ty, var: &str, buf: &str) {
     w.line(format!(
         "var {var}Reader = new WeaveFFIBufferReader({buf});"
     ));

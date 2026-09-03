@@ -6,13 +6,13 @@
 use heck::ToUpperCamelCase;
 use weaveffi_core::abi;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     CallShape, ErrorBinding, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding,
     ParamBinding,
 };
 use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
-use weaveffi_ir::ir::TypeRef;
 
 use crate::codec::{emit_buffer_decode, emit_buffer_write};
 use crate::docs::{writer_doc, writer_fn_doc};
@@ -180,10 +180,10 @@ pub(crate) fn build_call_args(params: &[ParamBinding]) -> String {
                 // Direct slots pass by value; only the C# spelling of the
                 // value expression depends on the surface type.
                 ArgPass::Direct { .. } => match &p.ty {
-                    TypeRef::Bool => vec![format!("(byte)({name} ? 1 : 0)")],
-                    TypeRef::Enum(_) => vec![format!("(int){name}")],
+                    Ty::Bool => vec![format!("(byte)({name} ? 1 : 0)")],
+                    Ty::Enum(_) => vec![format!("(int){name}")],
                     // A typed handle passes its raw pointer token by value.
-                    TypeRef::TypedHandle(_) => vec![format!("{name}.Raw")],
+                    Ty::TypedHandle(_) => vec![format!("{name}.Raw")],
                     _ => vec![name],
                 },
             }
@@ -217,9 +217,10 @@ pub(crate) fn render_pinvoke_call_and_return(
 
     // Bytes and buffered returns deliver their length through the trailing
     // `size_t* out_len` slot.
-    let has_out_len = f.ret.as_ref().is_some_and(|r| {
-        matches!(r, TypeRef::Bytes | TypeRef::BorrowedBytes) || abi::is_buffered(r)
-    });
+    let has_out_len = f
+        .ret
+        .as_ref()
+        .is_some_and(|r| matches!(r, Ty::Bytes | Ty::BorrowedBytes) || r.is_buffered());
 
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     if f.ret.is_some() {
@@ -252,45 +253,46 @@ pub(crate) fn render_pinvoke_call_and_return(
 /// Emit the statements converting the raw `result` slot (plus `outLen` for
 /// bytes and buffered returns) into the returned C# value, releasing
 /// producer-owned memory along the way.
-pub(crate) fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &str) {
+pub(crate) fn render_return_conversion(out: &mut String, ty: &Ty, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     // A buffered return is a producer-allocated value buffer: copy the bytes,
     // release them with `weaveffi_free_bytes`, then decode the copy.
-    if abi::is_buffered(ty) {
+    if ty.is_buffered() {
         w.line("var resultBuf = new byte[(int)outLen];");
         w.line(
             "if (result != IntPtr.Zero && (int)outLen > 0) Marshal.Copy(result, resultBuf, 0, (int)outLen);",
         );
         w.line("NativeMethods.weaveffi_free_bytes(result, outLen);");
-        emit_buffer_decode(&mut w, ty, "value", "resultBuf");
-        w.line("return value;");
+        // Named so it cannot shadow a user parameter (`value` is a common one).
+        emit_buffer_decode(&mut w, ty, "decoded", "resultBuf");
+        w.line("return decoded;");
         out.push_str(&w.finish());
         return;
     }
     match ty {
-        TypeRef::Bool => {
+        Ty::Bool => {
             w.line("return result != 0;");
         }
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             w.line("var str = Marshal.PtrToStringUTF8(result);");
             w.line("NativeMethods.weaveffi_free_string(result);");
             w.line("return str ?? \"\";");
         }
-        TypeRef::Enum(name) => {
+        Ty::Enum(name) => {
             let cn = local_type_name(name);
             w.line(format!("return ({cn})result;"));
         }
-        TypeRef::TypedHandle(name) => {
+        Ty::TypedHandle(name) => {
             let cn = typed_handle_cs(name);
             w.line(format!("return new {cn}(result);"));
         }
         // An interface return transfers ownership (`ReturnFree::OwnedObject`):
         // wrap the pointer in a new instance whose Dispose() releases it.
-        TypeRef::Interface(name) => {
+        Ty::Interface(name) => {
             let cn = local_type_name(name);
             w.line(format!("return new {cn}(result);"));
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::Bytes | Ty::BorrowedBytes => {
             w.line("if (result == IntPtr.Zero) return Array.Empty<byte>();");
             w.line("var arr = new byte[(int)outLen];");
             w.line("Marshal.Copy(result, arr, 0, (int)outLen);");
@@ -298,8 +300,8 @@ pub(crate) fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &
             w.line("return arr;");
         }
         // Only `Interface?` reaches here: a nullable owned object pointer.
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Interface(name) => {
+        Ty::Optional(inner) => match inner.as_ref() {
+            Ty::Interface(name) => {
                 let cn = local_type_name(name);
                 w.line(format!(
                     "return result == IntPtr.Zero ? null : new {cn}(result);"
@@ -307,8 +309,8 @@ pub(crate) fn render_return_conversion(out: &mut String, ty: &TypeRef, indent: &
             }
             _ => unreachable!("non-interface optionals are buffered"),
         },
-        TypeRef::Iterator(_) => unreachable!("iterator functions render via CallShape::Iterator"),
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        Ty::Iterator(_) => unreachable!("iterator functions render via CallShape::Iterator"),
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered return handled above")
         }
         _ => {
@@ -401,9 +403,9 @@ pub(crate) fn render_wrapper_method(
 /// classification (`ElemFree::String` via `weaveffi_free_string`,
 /// `ElemFree::Bytes` via `weaveffi_free_bytes` for both bytes and buffered
 /// elements). Returns the expression to `yield return`.
-pub(crate) fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent: &str) -> String {
+pub(crate) fn iterator_item_conversion(out: &mut String, elem: &Ty, indent: &str) -> String {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    if abi::is_buffered(elem) {
+    if elem.is_buffered() {
         w.line("var itemBuf = new byte[(int)out_len];");
         w.line("if (out_item != IntPtr.Zero && (int)out_len > 0) Marshal.Copy(out_item, itemBuf, 0, (int)out_len);");
         w.line("NativeMethods.weaveffi_free_bytes(out_item, out_len);");
@@ -426,25 +428,25 @@ pub(crate) fn iterator_item_conversion(out: &mut String, elem: &TypeRef, indent:
             "item".into()
         }
         ElemFree::None => match elem {
-            TypeRef::I8
-            | TypeRef::I16
-            | TypeRef::I32
-            | TypeRef::U8
-            | TypeRef::U16
-            | TypeRef::U32
-            | TypeRef::I64
-            | TypeRef::U64
-            | TypeRef::F32
-            | TypeRef::F64
-            | TypeRef::Handle => "out_item".into(),
-            TypeRef::Bool => "out_item != 0".into(),
-            TypeRef::Enum(name) => format!("({})out_item", local_type_name(name)),
-            TypeRef::TypedHandle(name) => {
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::I64
+            | Ty::U64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Handle => "out_item".into(),
+            Ty::Bool => "out_item != 0".into(),
+            Ty::Enum(name) => format!("({})out_item", local_type_name(name)),
+            Ty::TypedHandle(name) => {
                 format!("new {}(out_item)", typed_handle_cs(name))
             }
             // The consumer owns each yielded wrapper; Dispose() destroys it
             // (owned-object elements are adopted rather than freed eagerly).
-            TypeRef::Interface(name) => {
+            Ty::Interface(name) => {
                 format!("new {}(out_item)", local_type_name(name))
             }
             other => unreachable!("unsupported iterator element type {other:?}"),
@@ -608,13 +610,13 @@ pub(crate) fn render_iterator_wrapper_method(
 /// True when an async result crosses the completion callback as an owned
 /// `ptr` + `len` pair: bytes and every buffered type (records, rich enums,
 /// lists, maps, and non-interface optionals).
-pub(crate) fn async_result_is_ptr_len(ty: &TypeRef) -> bool {
-    matches!(ty, TypeRef::Bytes | TypeRef::BorrowedBytes) || abi::is_buffered(ty)
+pub(crate) fn async_result_is_ptr_len(ty: &Ty) -> bool {
+    matches!(ty, Ty::Bytes | Ty::BorrowedBytes) || ty.is_buffered()
 }
 
 /// The completion lambda's formal parameter list for one async return type,
 /// matching the delegate declared by the P/Invoke layer.
-pub(crate) fn async_cb_lambda_params(ret: &Option<TypeRef>) -> &'static str {
+pub(crate) fn async_cb_lambda_params(ret: &Option<Ty>) -> &'static str {
     match ret {
         None => "(context, err)",
         Some(ty) if async_result_is_ptr_len(ty) => "(context, err, result, resultLen)",
@@ -798,10 +800,10 @@ pub(crate) fn render_async_wrapper_method(
 /// here and then released through the runtime free symbols. Owned-object
 /// results (interfaces, typed handles) transfer ownership instead: the
 /// wrapper adopts the pointer.
-pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, indent: &str) {
+pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<Ty>, indent: &str) {
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
     if let Some(ty) = ret {
-        if abi::is_buffered(ty) {
+        if ty.is_buffered() {
             w.line("var resultBuf = new byte[(int)resultLen];");
             w.line(
                 "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, resultBuf, 0, (int)resultLen);",
@@ -809,8 +811,8 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line(
                 "if (result != IntPtr.Zero) NativeMethods.weaveffi_free_bytes(result, resultLen);",
             );
-            emit_buffer_decode(&mut w, ty, "value", "resultBuf");
-            w.line("tcs.SetResult(value);");
+            emit_buffer_decode(&mut w, ty, "decoded", "resultBuf");
+            w.line("tcs.SetResult(decoded);");
             out.push_str(&w.finish());
             return;
         }
@@ -819,27 +821,27 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
         None => {
             w.line("tcs.SetResult(true);");
         }
-        Some(TypeRef::Bool) => {
+        Some(Ty::Bool) => {
             w.line("tcs.SetResult(result != 0);");
         }
-        Some(TypeRef::StringUtf8 | TypeRef::BorrowedStr) => {
+        Some(Ty::StringUtf8 | Ty::BorrowedStr) => {
             w.line("var str = Marshal.PtrToStringUTF8(result) ?? \"\";");
             w.line("if (result != IntPtr.Zero) NativeMethods.weaveffi_free_string(result);");
             w.line("tcs.SetResult(str);");
         }
-        Some(TypeRef::Enum(name)) => {
+        Some(Ty::Enum(name)) => {
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(({cn})result);"));
         }
-        Some(TypeRef::TypedHandle(name)) => {
+        Some(Ty::TypedHandle(name)) => {
             let cn = typed_handle_cs(name);
             w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
-        Some(TypeRef::Interface(name)) => {
+        Some(Ty::Interface(name)) => {
             let cn = local_type_name(name);
             w.line(format!("tcs.SetResult(new {cn}(result));"));
         }
-        Some(TypeRef::Bytes | TypeRef::BorrowedBytes) => {
+        Some(Ty::Bytes | Ty::BorrowedBytes) => {
             w.line("var arr = new byte[(int)resultLen];");
             w.line(
                 "if (result != IntPtr.Zero && (int)resultLen > 0) Marshal.Copy(result, arr, 0, (int)resultLen);",
@@ -850,8 +852,8 @@ pub(crate) fn render_async_set_result(out: &mut String, ret: &Option<TypeRef>, i
             w.line("tcs.SetResult(arr);");
         }
         // Only `Interface?` reaches here: a nullable owned object pointer.
-        Some(TypeRef::Optional(inner)) => match inner.as_ref() {
-            TypeRef::Interface(name) => {
+        Some(Ty::Optional(inner)) => match inner.as_ref() {
+            Ty::Interface(name) => {
                 let cn = local_type_name(name);
                 w.line(format!(
                     "tcs.SetResult(result == IntPtr.Zero ? null : new {cn}(result));"
@@ -881,7 +883,7 @@ pub(crate) fn render_cb_arg(
     let slots = abi::lower_param(&p.name, &p.ty, "", false);
     let n0 = safe_cs_name(&slots[0].name);
     let mut w = CodeWriter::four_space().with_depth(indent.len() / 4);
-    if abi::is_buffered(&p.ty) {
+    if p.ty.is_buffered() {
         let len = safe_cs_name(&slots[1].name);
         let arg = format!("arg{idx}");
         w.line(format!("var {arg}Buf = new byte[(int){len}];"));
@@ -893,23 +895,23 @@ pub(crate) fn render_cb_arg(
         return arg;
     }
     let expr = match &p.ty {
-        TypeRef::I8
-        | TypeRef::I16
-        | TypeRef::I32
-        | TypeRef::U8
-        | TypeRef::U16
-        | TypeRef::U32
-        | TypeRef::I64
-        | TypeRef::U64
-        | TypeRef::F32
-        | TypeRef::F64 => n0,
-        TypeRef::Handle => n0,
-        TypeRef::Bool => format!("{n0} != 0"),
-        TypeRef::Enum(name) => format!("({}){n0}", local_type_name(name)),
-        TypeRef::StringUtf8 | TypeRef::BorrowedStr => {
+        Ty::I8
+        | Ty::I16
+        | Ty::I32
+        | Ty::U8
+        | Ty::U16
+        | Ty::U32
+        | Ty::I64
+        | Ty::U64
+        | Ty::F32
+        | Ty::F64 => n0,
+        Ty::Handle => n0,
+        Ty::Bool => format!("{n0} != 0"),
+        Ty::Enum(name) => format!("({}){n0}", local_type_name(name)),
+        Ty::StringUtf8 | Ty::BorrowedStr => {
             format!("Marshal.PtrToStringUTF8({n0}) ?? \"\"")
         }
-        TypeRef::Bytes | TypeRef::BorrowedBytes => {
+        Ty::Bytes | Ty::BorrowedBytes => {
             let len = safe_cs_name(&slots[1].name);
             let arg = format!("arg{idx}");
             w.line(format!("var {arg} = new byte[(int){len}];"));
@@ -918,27 +920,26 @@ pub(crate) fn render_cb_arg(
             ));
             arg
         }
-        TypeRef::TypedHandle(name) => {
+        Ty::TypedHandle(name) => {
             format!("new {}({n0})", typed_handle_cs(name))
         }
         // Borrowed for the duration of the callback; the consumer must not
         // Dispose() the wrapper.
-        TypeRef::Interface(name) => {
+        Ty::Interface(name) => {
             format!("new {}({n0})", local_type_name(name))
         }
         // Only `Interface?` reaches here: every other optional is buffered.
-        TypeRef::Optional(inner) => match inner.as_ref() {
-            TypeRef::Interface(name) => {
+        Ty::Optional(inner) => match inner.as_ref() {
+            Ty::Interface(name) => {
                 let cn = local_type_name(name);
                 format!("{n0} == IntPtr.Zero ? null : new {cn}({n0})")
             }
             _ => unreachable!("non-interface optionals are buffered"),
         },
-        TypeRef::Record(_) | TypeRef::RichEnum(_) | TypeRef::List(_) | TypeRef::Map(_, _) => {
+        Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered callback parameter handled above")
         }
-        TypeRef::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
-        TypeRef::Named(_) => unreachable!("unresolved type reference"),
+        Ty::Iterator(_) => unreachable!("iterator not valid as callback parameter"),
     };
     out.push_str(&w.finish());
     expr

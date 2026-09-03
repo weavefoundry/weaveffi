@@ -2,16 +2,13 @@
 //! runtime, module-scope enum and error surfaces, loader-scoped interface
 //! classes, and the nested API object the loader returns.
 
-use std::collections::HashMap;
-
 use heck::ToUpperCamelCase;
-use weaveffi_core::abi::is_buffered;
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
     BindingModel, CallShape, CallbackBinding, InterfaceBinding, ModuleBinding,
 };
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
-use weaveffi_ir::ir::{Api, Module, TypeRef};
 
 use crate::calls::{
     async_cb_wasm_params, collect_listener_callbacks, emit_js_callable, emit_js_listener_api,
@@ -19,11 +16,11 @@ use crate::calls::{
 };
 use crate::codec::{emit_js_buffer_codecs, emit_js_buffer_runtime};
 use crate::runtime::{
-    emit_bytes_helpers, emit_check_err_ref, emit_error_slot_helpers, emit_iterator_class,
-    emit_js_error_checkers, emit_js_error_classes, emit_string_helpers, emit_trampoline_helper,
+    emit_abi_version_check, emit_bytes_helpers, emit_check_err_ref, emit_error_slot_helpers,
+    emit_iterator_class, emit_js_error_checkers, emit_js_error_classes, emit_string_helpers,
+    emit_trampoline_helper,
 };
-use crate::types::{api_deep_any, is_string_type, js_checker_name, js_param_name, JsDecl};
-use weaveffi_core::codegen::common::walk_modules_with_path;
+use crate::types::{is_string_type, js_checker_name, js_param_name, JsDecl};
 
 /// Every producer entry-point symbol the generated glue calls by name:
 /// sync and iterator launchers, iterator `next`/destroy pairs, and interface
@@ -62,7 +59,6 @@ pub(crate) fn collect_called_symbols(model: &BindingModel) -> Vec<String> {
 /// Emscripten mode, adopts) the wasm module and returns the nested API
 /// object.
 pub(crate) fn render_wasm_js_stub(
-    api: &Api,
     model: &BindingModel,
     module_name: &str,
     prefix: &str,
@@ -73,8 +69,6 @@ pub(crate) fn render_wasm_js_stub(
     let pascal_name = module_name.to_upper_camel_case();
     let load_fn = format!("load{pascal_name}");
     let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-    let by_path: HashMap<&str, &ModuleBinding> =
-        model.modules.iter().map(|m| (m.path.as_str(), m)).collect();
 
     // Interface members marshal like free functions, so every callable counts.
     let has_functions = model.modules.iter().any(|m| m.callables().next().is_some());
@@ -106,19 +100,16 @@ pub(crate) fn render_wasm_js_stub(
             .as_ref()
             .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
     });
-    let needs_buf = has_codecs || has_error_payloads || api_deep_any(api, &is_buffered);
+    let needs_buf = has_codecs || has_error_payloads || model.any_type(&|t| t.is_buffered());
     // The buffer reader (and the codecs) reject malformed input by throwing
     // the brand error, so the error surface is needed whenever buffers are.
     let needs_err = has_functions || needs_buf;
     // Error messages always cross as C strings, so anything needing the error
     // helpers also needs the string-read helpers regardless of declared types.
-    let needs_strings = needs_err || api_deep_any(api, &is_string_type);
+    let needs_strings = needs_err || model.any_type(&is_string_type);
     // Buffered values are staged and released exactly like bytes, so the byte
     // helpers cover both.
-    let needs_bytes = needs_buf
-        || api_deep_any(api, &|t| {
-            matches!(t, TypeRef::Bytes | TypeRef::BorrowedBytes)
-        });
+    let needs_bytes = needs_buf || model.any_type(&|t| matches!(t, Ty::Bytes | Ty::BorrowedBytes));
     // Any iterator-returning callable pulls in the shared lazy-iterator
     // wrapper class.
     let has_iterators = model
@@ -143,6 +134,10 @@ pub(crate) fn render_wasm_js_stub(
     out.push_str("//   Buffered  -> records, rich enums, optionals, lists, and maps cross\n");
     out.push_str("//                as one value buffer: i32 pointer + i32 length\n");
     out.push('\n');
+
+    if !model.modules.is_empty() {
+        emit_abi_version_check(&mut out);
+    }
 
     if needs_err {
         emit_js_error_classes(&mut out, model);
@@ -180,7 +175,7 @@ pub(crate) fn render_wasm_js_stub(
         emit_trampoline_helper(&mut out);
     }
 
-    for (module, _path) in walk_modules_with_path(&api.modules) {
+    for module in &model.modules {
         for e in &module.enums {
             // Rich (algebraic) enums are tagged plain-object unions handled by
             // the buffer codecs; only C-style enums surface as a by-value
@@ -202,7 +197,7 @@ pub(crate) fn render_wasm_js_stub(
         out.push_str(" *\n");
         out.push_str(" * @param {Object|Promise<Object>} module - The initialized Emscripten\n");
         out.push_str(" *   module, or the promise returned by its `MODULARIZE` factory.\n");
-        if api.modules.is_empty() {
+        if model.modules.is_empty() {
             out.push_str(" * @returns {Promise<Object>} The Emscripten module.\n");
         } else {
             out.push_str(" * @returns {Promise<Object>} The API bindings.\n");
@@ -211,7 +206,7 @@ pub(crate) fn render_wasm_js_stub(
         out.push_str(" * Load a WeaveFFI Wasm module from the given URL.\n");
         out.push_str(" *\n");
         out.push_str(" * @param {string} url - URL to the `.wasm` file.\n");
-        if api.modules.is_empty() {
+        if model.modules.is_empty() {
             out.push_str(
                 " * @returns {Promise<WebAssembly.Exports>} The exported Wasm functions.\n",
             );
@@ -259,7 +254,7 @@ pub(crate) fn render_wasm_js_stub(
         out.push_str("  const { instance } = await WebAssembly.instantiate(bytes, {});\n");
     }
 
-    if api.modules.is_empty() {
+    if model.modules.is_empty() {
         if emscripten {
             out.push_str("  return m;\n");
         } else {
@@ -273,6 +268,10 @@ pub(crate) fn render_wasm_js_stub(
             // renaming cannot break it, while the rest of the glue keeps
             // consistent dot access on this locally-constructed object.
             let mut bindings: Vec<(String, String)> = vec![
+                (
+                    "weaveffi_abi_version".to_string(),
+                    format!("{prefix}_abi_version"),
+                ),
                 ("weaveffi_alloc".to_string(), format!("{prefix}_alloc")),
                 ("weaveffi_dealloc".to_string(), format!("{prefix}_dealloc")),
             ];
@@ -312,6 +311,7 @@ pub(crate) fn render_wasm_js_stub(
         } else {
             out.push_str("  const wasm = instance.exports;\n\n");
         }
+        out.push_str("  _checkAbiVersion(wasm);\n\n");
 
         if has_async || has_listeners {
             out.push_str("  const _table = wasm.__indirect_function_table;\n\n");
@@ -377,16 +377,8 @@ pub(crate) fn render_wasm_js_stub(
 
         out.push_str("  return {\n");
         out.push_str("    _raw: wasm,\n");
-        for module in &api.modules {
-            render_js_module_object(
-                &mut out,
-                module,
-                &module.name,
-                &by_path,
-                "    ",
-                prefix,
-                emscripten,
-            );
+        for module in model.roots() {
+            render_js_module_object(&mut out, model, module, "    ", prefix, emscripten);
         }
         out.push_str("  };\n");
     }
@@ -400,18 +392,13 @@ pub(crate) fn render_wasm_js_stub(
 /// classes, or listeners), so empty namespace objects are not emitted.
 /// Records and rich enums contribute nothing here: they are plain value
 /// shapes with no runtime members.
-fn module_tree_has_content(
-    m: &Module,
-    path: &str,
-    by_path: &HashMap<&str, &ModuleBinding>,
-) -> bool {
-    let here = by_path.get(path).is_some_and(|mb| {
-        !mb.functions.is_empty() || !mb.interfaces.is_empty() || !mb.listeners.is_empty()
-    });
-    here || m
-        .modules
-        .iter()
-        .any(|sub| module_tree_has_content(sub, &format!("{path}_{}", sub.name), by_path))
+fn module_tree_has_content(model: &BindingModel, mb: &ModuleBinding) -> bool {
+    !mb.functions.is_empty()
+        || !mb.interfaces.is_empty()
+        || !mb.listeners.is_empty()
+        || model
+            .children(mb)
+            .any(|sub| module_tree_has_content(model, sub))
 }
 
 /// Emit one module's namespace object (`math: { ... },`) inside the returned
@@ -419,22 +406,19 @@ fn module_tree_has_content(
 /// (or their Emscripten stubs), the interface classes themselves (so
 /// factories, statics, and `instanceof` checks reach them), and nested
 /// submodule objects, skipping subtrees with no runtime content.
-#[allow(clippy::too_many_arguments)]
 fn render_js_module_object(
     out: &mut String,
-    m: &Module,
-    module_path: &str,
-    by_path: &HashMap<&str, &ModuleBinding>,
+    model: &BindingModel,
+    mb: &ModuleBinding,
     indent: &str,
     prefix: &str,
     emscripten: bool,
 ) {
-    if !module_tree_has_content(m, module_path, by_path) {
+    if !module_tree_has_content(model, mb) {
         return;
     }
-    let mb = by_path[module_path];
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    w.block(format!("{}: {{", m.name), "},", |w| {
+    w.block(format!("{}: {{", mb.name), "},", |w| {
         let inner = w.indent_str();
         for f in &mb.functions {
             let mut tmp = String::new();
@@ -464,12 +448,9 @@ fn render_js_module_object(
         for i in &mb.interfaces {
             w.line(format!("{}: {},", i.name, i.name));
         }
-        for sub in &m.modules {
-            let sub_path = format!("{module_path}_{}", sub.name);
+        for sub in model.children(mb) {
             let mut tmp = String::new();
-            render_js_module_object(
-                &mut tmp, sub, &sub_path, by_path, &inner, prefix, emscripten,
-            );
+            render_js_module_object(&mut tmp, model, sub, &inner, prefix, emscripten);
             w.raw(tmp);
         }
     });

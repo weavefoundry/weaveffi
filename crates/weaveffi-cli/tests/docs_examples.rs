@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: contacts
     enums:
@@ -327,7 +327,7 @@ fn summary_md_all_links_resolve() {
 /// The README quickstart IDL, kept in sync with the `kvstore.yml` snippet in
 /// `README.md` step 2 (trimmed `Store` interface plus `KvError` domain).
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: kv
     errors:
@@ -436,7 +436,7 @@ fn readme_quickstart_generates_c_header() {
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.7.0"
+version: "0.8.0"
 modules:
   - name: math
     structs:
@@ -483,7 +483,6 @@ fn getting_started_yaml_generates_all_targets() {
             yml_path.to_str().unwrap(),
             "-o",
             out_path.join("generated").to_str().unwrap(),
-            "--scaffold",
         ])
         .assert()
         .success();
@@ -498,7 +497,6 @@ fn getting_started_yaml_generates_all_targets() {
         gen.join("node/types.d.ts").exists(),
         "missing node/types.d.ts"
     );
-    assert!(gen.join("scaffold.rs").exists(), "missing scaffold.rs");
 
     let header = std::fs::read_to_string(gen.join("c/weaveffi.h")).unwrap();
     assert!(
@@ -519,16 +517,6 @@ fn getting_started_yaml_generates_all_targets() {
     assert!(
         dts.contains("function add(a: number, b: number): number"),
         "types.d.ts should contain the prefix-stripped add function"
-    );
-
-    let scaffold = std::fs::read_to_string(gen.join("scaffold.rs")).unwrap();
-    assert!(
-        scaffold.contains("weaveffi_math_add"),
-        "scaffold should contain weaveffi_math_add"
-    );
-    assert!(
-        !scaffold.contains("weaveffi_math_Point"),
-        "scaffold should not emit record stubs"
     );
 }
 
@@ -582,13 +570,17 @@ fn readme_states_value_proposition() {
 #[test]
 fn readme_uses_only_current_schema_version() {
     let readme = read_workspace_file("README.md");
+    // Only the IDL `version:` key is a schema version; the `weaveffi.toml`
+    // example's `version = "0.1.0"` is the package version and is fine.
     assert!(
-        readme.contains("\"0.7.0\""),
-        "README should reference schema version 0.7.0"
+        readme.contains("version: \"0.8.0\""),
+        "README should reference schema version 0.8.0"
     );
-    for old in ["\"0.1.0\"", "\"0.2.0\"", "\"0.3.0\"", "\"0.4.0\""] {
+    for old in [
+        "0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.7.0",
+    ] {
         assert!(
-            !readme.contains(old),
+            !readme.contains(&format!("version: \"{old}\"")),
             "README should not reference older schema version {old}"
         );
     }
@@ -621,23 +613,43 @@ fn readme_lists_all_eleven_targets_in_table() {
 fn readme_cli_reference_lists_every_subcommand() {
     let readme = read_workspace_file("README.md");
     for cmd in [
-        "weaveffi new",
         "weaveffi generate",
         "weaveffi package",
         "weaveffi validate",
-        "weaveffi lint",
         "weaveffi diff",
         "weaveffi extract",
-        "weaveffi format",
-        "weaveffi watch",
         "weaveffi schema ",
         "weaveffi schema-version",
-        "weaveffi doctor",
         "weaveffi completions",
     ] {
         assert!(
             readme.contains(cmd),
             "README CLI reference table missing `{cmd}`"
+        );
+    }
+    for removed in [
+        "weaveffi new",
+        "weaveffi lint",
+        "weaveffi format",
+        "weaveffi watch",
+        "weaveffi doctor",
+        "weaveffi man",
+        "--scaffold",
+    ] {
+        assert!(
+            !readme.contains(removed),
+            "README still documents the removed `{removed}`"
+        );
+    }
+}
+
+#[test]
+fn readme_documents_project_config_file() {
+    let readme = read_workspace_file("README.md");
+    for needle in ["weaveffi.toml", "[package]", "[global]", "[generators."] {
+        assert!(
+            readme.contains(needle),
+            "README project-config section missing `{needle}`"
         );
     }
 }
