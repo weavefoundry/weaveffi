@@ -1753,10 +1753,7 @@ version = "0.21.0"
 dependencies = [
  "camino",
  "serde",
- "tempfile",
  "weaveffi-core",
- "weaveffi-gen-c",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1777,7 +1774,6 @@ dependencies = [
  "heck",
  "serde",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1788,7 +1784,6 @@ dependencies = [
  "heck",
  "serde",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1798,9 +1793,7 @@ dependencies = [
  "camino",
  "heck",
  "serde",
- "tempfile",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1811,7 +1804,6 @@ dependencies = [
  "heck",
  "serde",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1821,9 +1813,7 @@ dependencies = [
  "camino",
  "heck",
  "serde",
- "tempfile",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1833,9 +1823,7 @@ dependencies = [
  "camino",
  "heck",
  "serde",
- "tempfile",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]
@@ -1845,9 +1833,7 @@ dependencies = [
  "camino",
  "heck",
  "serde",
- "tempfile",
  "weaveffi-core",
- "weaveffi-ir",
 ]
 
 [[package]]

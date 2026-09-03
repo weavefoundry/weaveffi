@@ -57,15 +57,15 @@ Unknown tables and keys are rejected, so a typo like `[generator.swift]` or
 
 ## `[package]`
 
-| Key           | Type     | Description                                                        |
-|---------------|----------|--------------------------------------------------------------------|
-| `name`        | string   | Distribution name; normalized per ecosystem (see below)            |
-| `version`     | string   | Published version (default `0.1.0`)                                |
-| `description` | string   | One-line description for manifests that carry one                  |
-| `license`     | string   | SPDX license expression                                            |
-| `authors`     | [string] | Author strings, `Name <email>`                                     |
-| `homepage`    | string   | Project home page URL                                              |
-| `repository`  | string   | Source repository URL                                              |
+| Key           | Type       | Description                                                      |
+|---------------|------------|------------------------------------------------------------------|
+| `name`        | string     | Distribution name; normalized per ecosystem (see below)          |
+| `version`     | string     | Published version (default `0.1.0`)                              |
+| `description` | string     | One-line description for manifests that carry one                |
+| `license`     | string     | SPDX license expression                                          |
+| `authors`     | `[string]` | Author strings, `Name <email>`                                   |
+| `homepage`    | string     | Project home page URL                                            |
+| `repository`  | string     | Source repository URL                                            |
 
 ### Package identity
 
