@@ -122,7 +122,12 @@ fn layout_is_a_kotlin_gradle_module() {
     let api = api();
     let model = BindingModel::build(&api, "weaveffi");
     let files = KotlinGenerator.files(&api, &model, Utf8Path::new("out"), &KotlinConfig::default());
-    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    // `files()` joins with the host separator; the orchestrator's
+    // `output_files` normalizes to `/` later, so do the same here for Windows.
+    let paths: Vec<String> = files
+        .iter()
+        .map(|f| f.path.as_str().replace('\\', "/"))
+        .collect();
     assert_eq!(
         paths,
         [
