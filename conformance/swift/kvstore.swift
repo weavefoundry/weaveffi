@@ -127,7 +127,7 @@ do {
 
     // --- EvictionListener callback interface ---------------------------------
     var listener: Listener? = Listener()
-    weak let weakListener = listener
+    weak var weakListener = listener
     store.setEvictionListener(listener: listener!)
     expect(try store.delete(key: "beta"), "delete beta")
     expect(listener!.evicted.count == 1, "one eviction observed")
@@ -158,7 +158,7 @@ do {
     listener = nil
     expect(weakListener != nil, "store retains the listener")
     var second: Listener? = Listener(keepAfter: 2)
-    weak let weakSecond = second
+    weak var weakSecond = second
     store.setEvictionListener(listener: second!)
     expect(weakListener == nil, "replaced listener is freed")
 
@@ -213,7 +213,7 @@ do {
     // share(): a second wrapper to the SAME object; mutation through one is
     // visible through the other, and dropping one leaves the other usable.
     var shared: Store? = store.share()
-    weak let weakShared = shared
+    weak var weakShared = shared
     _ = try shared!.put(key: "via-share", value: payload, kind: .volatile, ttlSeconds: nil)
     expect(store.count() == 2, "put through share() visible through the original")
     expect(Array(try shared!.listKeys(prefix: nil)) == ["alpha", "via-share"], "share() reads the same entries")
