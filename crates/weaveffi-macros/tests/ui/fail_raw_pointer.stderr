@@ -1,0 +1,5 @@
+error: weaveffi: raw pointers cannot cross the FFI boundary; declare the pointee as a #[weaveffi::interface] and pass it as `&T` or `Arc<T>`
+ --> tests/ui/fail_raw_pointer.rs:6:22
+  |
+6 |     pub fn open() -> *mut Token {
+  |                      ^

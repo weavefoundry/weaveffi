@@ -20,7 +20,7 @@ script.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: greeter
     errors:
@@ -47,7 +47,18 @@ modules:
 
 `hello` can't fail, so it stays non-throwing. `greeting` declares
 `throws: true` and reports codes from the module's `GreeterError`
-domain when the language is unknown.
+domain when the language is unknown. Check it with
+`weaveffi validate greeter.yml`; you should see `Validation passed`.
+
+Put a `weaveffi.toml` beside it so the Python distribution and import
+package get a stable name (otherwise both default to the IDL's file stem,
+`greeter`):
+
+```toml
+[package]
+name = "mygreeter"
+version = "0.1.0"
+```
 
 ### 2. Generate bindings
 
@@ -60,21 +71,21 @@ Among other targets, you should see:
 ```text
 generated/
 ├── c/
+│   ├── weaveffi.c
 │   └── weaveffi.h
 └── python/
     ├── pyproject.toml
     ├── setup.py
     ├── README.md
-    └── greeter/
+    └── mygreeter/
         ├── __init__.py
         ├── weaveffi.py
         └── weaveffi.pyi
 ```
 
 The package directory and distribution name follow the `[package]` name
-from `weaveffi.toml`, falling back to the IDL file stem (here `greeter`).
-The Python target uses ctypes: no native extension to compile on the Python
-side.
+from `weaveffi.toml`. The Python target uses ctypes: no native extension to
+compile on the Python side.
 
 ### 3. Implement the Rust library
 
@@ -94,41 +105,57 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.14" }
+weaveffi = "0.22"
 ```
 
-`mygreeter/src/lib.rs`:
+`mygreeter/src/lib.rs` is plain safe Rust. The macro reads the annotated
+items and emits the `extern "C"` thunks the ctypes loader binds to, so the
+module needs no `unsafe` and no hand-written signatures:
 
 ```rust
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#[weaveffi::module]
+pub mod greeter {
+    /// Codes the greeter reports from its throwing functions.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum GreeterError {
+        /// unknown language
+        UnknownLang = 1,
+    }
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use weaveffi_abi::{self as abi, weaveffi_error};
+    /// A greeting and the language it was rendered in.
+    #[weaveffi::record]
+    pub struct Greeting {
+        pub message: String,
+        pub lang: String,
+    }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_greeter_hello(
-    name: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *const c_char {
-    abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
-    let msg = format!("Hello, {name}!");
-    CString::new(msg).unwrap().into_raw() as *const c_char
+    /// Greet someone in English.
+    #[weaveffi::export]
+    pub fn hello(name: String) -> String {
+        format!("Hello, {name}!")
+    }
+
+    /// Greet someone in the given language, failing on an unknown one.
+    #[weaveffi::export]
+    pub fn greeting(name: String, lang: String) -> Result<Greeting, GreeterError> {
+        let message = match lang.as_str() {
+            "en" => format!("Hello, {name}!"),
+            "es" => format!("Hola, {name}!"),
+            "fr" => format!("Bonjour, {name}!"),
+            _ => return Err(GreeterError::UnknownLang),
+        };
+        Ok(Greeting { message, lang })
+    }
 }
 
-// Emit the WeaveFFI C ABI runtime symbols (abi_version, free_string,
-// free_bytes, error_clear, cancel_token_*), one line per cdylib.
-abi::export_runtime!();
+weaveffi::export_runtime!();
 ```
 
-The generated `generated/c/weaveffi.h` lists every remaining symbol the
-bindings expect, with exact signatures; implement `weaveffi_greeter_greeting`
-the same way (it returns the `Greeting` record as a serialized value
-buffer). Alternatively, annotate the module with `#[weaveffi::module]` and
-let the macro emit the whole C ABI; see
-[The Rust Producer Macro](../guides/producer-macro.md).
+`weaveffi extract mygreeter/src/lib.rs` produces the same IDL as
+`greeter.yml` (plus the doc comments), so the two stay in step; you can
+generate from either. The [Producer Macro](../guides/producer-macro.md)
+guide covers every attribute.
 
 ### 4. Build the cdylib
 
@@ -171,14 +198,14 @@ the loader path.
 macOS:
 
 ```bash
-cp target/release/libmygreeter.dylib target/release/libweaveffi.dylib
+ln -sf libmygreeter.dylib target/release/libweaveffi.dylib
 DYLD_LIBRARY_PATH=target/release python demo.py
 ```
 
 Linux:
 
 ```bash
-cp target/release/libmygreeter.so target/release/libweaveffi.so
+ln -sf libmygreeter.so target/release/libweaveffi.so
 LD_LIBRARY_PATH=target/release python demo.py
 ```
 
@@ -190,16 +217,18 @@ directory to `PATH`.
 Save as `demo.py`. Function names are snake_case with the module
 prefix stripped, and the throwing `greeting` raises the typed
 exception hierarchy (`GreeterError` extends `WeaveFFIError`, with an
-`UnknownLang` subclass per code):
+`UnknownLang` subclass per code, also reachable as
+`GreeterError.UnknownLang`):
 
 ```python
-from greeter import hello, greeting, GreeterError
+from mygreeter import hello, greeting, GreeterError
 
 print(hello("Python"))
 
 try:
     g = greeting("Python", "en")
     print(f"{g.message} ({g.lang})")
+    greeting("Python", "tlh")
 except GreeterError as e:
     print(f"Error {e.code}: {e.message}")
 ```
@@ -209,25 +238,34 @@ the C ABI returns; there's no native allocation to manage.
 
 ## Verification
 
-- `pip show greeter` lists the package.
-- Running `demo.py` prints `Hello, Python!` and `Hi (en)` (or whatever
-  `Greeting` you constructed).
-- `mypy demo.py` reports no errors thanks to the generated
-  `weaveffi.pyi` stub.
+- `pip show mygreeter` lists the package.
+- Running `demo.py` prints:
+
+  ```text
+  Hello, Python!
+  Hello, Python! (en)
+  Error 1: unknown language
+  ```
+
+- `mypy demo.py` reports no errors thanks to the generated `weaveffi.pyi`
+  stub, which the package ships alongside a PEP 561 `py.typed` marker so the
+  installed wheel is typed too.
 - Common error mappings:
 
   | Symptom                                                   | Likely cause                                                                  |
   |-----------------------------------------------------------|-------------------------------------------------------------------------------|
   | `OSError: dlopen ... not found`                           | Cdylib not on the loader path; set `WEAVEFFI_LIBRARY` or the loader path.      |
-  | `GreeterError: ...` at runtime                             | Rust reported a domain error code; inspect `e.code` and `e.message`.          |
-  | `ModuleNotFoundError: No module named 'greeter'`           | Package not installed; rerun `pip install .` from `generated/python/`.        |
-  | mypy complains about `greeter`                            | Make sure `weaveffi.pyi` ships next to `weaveffi.py` in the package.          |
+  | `mygreeter.weaveffi.UnknownLang: (1) unknown language`     | Rust reported a domain error code; inspect `e.code` and `e.message`.          |
+  | `WeaveFFIError` with a negative code                       | A producer panic (-2) or marshalling failure (-3); see [Error Handling](../guides/errors.md). |
+  | `ModuleNotFoundError: No module named 'mygreeter'`         | Package not installed; rerun `pip install .` from `generated/python/`.        |
+  | mypy says the module is untyped                           | Reinstall from a fresh `generated/python/` so `py.typed` and `weaveffi.pyi` ship. |
 
 ## Cleanup
 
 ```bash
-pip uninstall greeter
+pip uninstall mygreeter
 rm -rf generated/
+rm -f target/release/libweaveffi.dylib   # the link alias from step 6
 cargo clean -p mygreeter
 ```
 

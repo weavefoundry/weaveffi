@@ -1,0 +1,5 @@
+error: weaveffi: `Box` cannot cross the FFI boundary; objects and callback interfaces are shared, so spell them as `Arc<T>` / `Arc<dyn Trait>`
+ --> tests/ui/fail_box_param.rs:7:20
+  |
+7 |     pub fn take(w: Box<Widget>) {
+  |                    ^^^

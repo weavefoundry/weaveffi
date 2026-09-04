@@ -1,4 +1,4 @@
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: docs
     enums:
@@ -22,16 +22,18 @@ modules:
           - { name: title, type: string, doc: Human-readable title shown in lists }
           - { name: status, type: Status, doc: Current lifecycle status }
           - { name: tags, type: "[string]", doc: Free-form tags for grouping }
-    callbacks:
-      - name: OnSaved
-        doc: Fires after a document has been persisted successfully
-        params:
-          - { name: doc_id, type: i64, doc: Identifier of the saved document }
-          - { name: revision, type: i32, doc: Monotonically increasing revision }
-    listeners:
-      - name: saved_listener
-        event_callback: OnSaved
-        doc: Subscribe to document-saved notifications
+    callback_interfaces:
+      - name: SavedListener
+        doc: |
+          Consumer-implemented observer of document-saved notifications.
+
+          Implementations must be safe to call from any thread.
+        methods:
+          - name: on_saved
+            doc: Fires after a document has been persisted successfully
+            params:
+              - { name: doc_id, type: i64, doc: Identifier of the saved document }
+              - { name: revision, type: i32, doc: Monotonically increasing revision }
     errors:
       name: DocsErrors
       codes:
@@ -90,3 +92,7 @@ modules:
           - { name: id, type: i64, doc: Identifier of the document to publish }
         return: bool
         async: true
+      - name: watch
+        doc: Register a listener for saved notifications
+        params:
+          - { name: listener, type: SavedListener, doc: Receiver of saved notifications }

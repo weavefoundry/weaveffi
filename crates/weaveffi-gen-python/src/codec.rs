@@ -2,9 +2,9 @@
 //! statements for any wire shape, plus the per-record and per-rich-enum
 //! codec functions (`_write_X`, `_read_X`, `_pack_X`, `_unpack_X`).
 //!
-//! Every dispatch here goes through [`wire::classify`], so this module never
-//! re-derives the wire folds (handles as `u64` tokens, borrowed views as
-//! their owned forms, records and rich enums as one user-codec shape).
+//! Every dispatch here goes through [`Ty::wire`], so this module never
+//! re-derives the wire folds (interfaces as `u64` object tokens carrying one
+//! strong reference, records and rich enums as one user-codec shape).
 
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
@@ -59,8 +59,13 @@ pub(crate) fn py_read_expr(ty: &Ty, depth: usize) -> String {
         WireType::Prim(Prim::U64) => "_r.read_u64()".into(),
         WireType::Prim(Prim::F32) => "_r.read_f32()".into(),
         WireType::Prim(Prim::F64) => "_r.read_f64()".into(),
-        // Handles serialize as u64 tokens inside buffers.
-        WireType::Handle(_) => "_r.read_u64()".into(),
+        // An object token carries one strong reference: adopt it into a new
+        // wrapper, whose disposal owes the interface's destroy symbol. A
+        // decode that fails later in the buffer drops the wrapper, and its
+        // finalizer releases the adopted reference.
+        WireType::Object(name) => {
+            format!("{}._from_ptr(_r.read_object())", local_type_name(name))
+        }
         WireType::Prim(Prim::String) => "_r.read_string()".into(),
         WireType::Prim(Prim::Bytes) => "_r.read_bytes()".into(),
         WireType::Enum(name) => format!("{}(_r.read_i32())", local_type_name(name)),
@@ -119,8 +124,12 @@ pub(crate) fn py_write_stmts(w: &mut CodeWriter, writer: &str, expr: &str, ty: &
         WireType::Prim(Prim::F64) => {
             w.line(format!("{writer}.write_f64({expr})"));
         }
-        WireType::Handle(_) => {
-            w.line(format!("{writer}.write_u64({expr})"));
+        // The token written must be a reference the reader can own: the
+        // writer clones the wrapper's pointer (a new strong reference to the
+        // same object) when the buffer is finished, never writing the
+        // pointer the wrapper still holds.
+        WireType::Object(_) => {
+            w.line(format!("{writer}.write_object({expr})"));
         }
         WireType::Prim(Prim::String) => {
             w.line(format!("{writer}.write_string({expr})"));
@@ -164,9 +173,11 @@ pub(crate) fn py_write_stmts(w: &mut CodeWriter, writer: &str, expr: &str, ty: &
     }
 }
 
-/// The expression decoding a borrowed `(ptr, len)` buffer pair (a callback
-/// or listener argument) into its idiomatic value. The producer owns the
-/// buffer for the dispatch, so the bytes are copied before decoding.
+/// The expression decoding a borrowed `(ptr, len)` buffer pair (a
+/// callback-interface method argument) into its idiomatic value. The producer
+/// owns the buffer for the dispatch, so the bytes are copied before decoding;
+/// any object tokens inside still transfer one strong reference, which the
+/// decoded wrappers adopt.
 pub(crate) fn py_decode_borrowed_expr(ptr: &str, len: &str, ty: &Ty) -> String {
     let data = format!("ctypes.string_at({ptr}, {len}) if {ptr} else b\"\"");
     match ty.wire() {

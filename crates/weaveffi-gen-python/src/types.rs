@@ -28,14 +28,18 @@ pub(crate) fn py_ctypes_scalar(ty: &Ty) -> &'static str {
         Ty::F32 => "ctypes.c_float",
         Ty::F64 => "ctypes.c_double",
         Ty::Bool => "ctypes.c_int32",
-        Ty::StringUtf8 | Ty::BorrowedStr => "ctypes.c_char_p",
-        Ty::Handle => "ctypes.c_uint64",
-        // Typed handles, interfaces, and iterators cross as opaque pointers.
-        Ty::TypedHandle(_) | Ty::Interface(_) | Ty::Iterator(_) => "ctypes.c_void_p",
-        Ty::Bytes | Ty::BorrowedBytes => "ctypes.c_uint8",
+        Ty::StringUtf8 => "ctypes.c_char_p",
+        // Interfaces and iterators cross as opaque pointers; `Interface?` is
+        // the same slot with null meaning none.
+        Ty::Interface(_) | Ty::Iterator(_) => "ctypes.c_void_p",
+        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => "ctypes.c_void_p",
+        Ty::Bytes => "ctypes.c_uint8",
         Ty::Enum(_) => "ctypes.c_int32",
         Ty::Record(_) | Ty::RichEnum(_) | Ty::Optional(_) | Ty::List(_) | Ty::Map(_, _) => {
             unreachable!("buffered types have no scalar ctypes slot")
+        }
+        Ty::CallbackInterface(_) => {
+            unreachable!("callback interfaces occupy a ctx + vtable slot pair")
         }
     }
 }
@@ -43,30 +47,21 @@ pub(crate) fn py_ctypes_scalar(ty: &Ty) -> &'static str {
 /// The Python typing hint for `ty` as it appears in signatures and stubs.
 pub(crate) fn py_type_hint(ty: &Ty) -> String {
     match ty {
-        Ty::I8
-        | Ty::I16
-        | Ty::I32
-        | Ty::U8
-        | Ty::U16
-        | Ty::U32
-        | Ty::I64
-        | Ty::U64
-        | Ty::Handle => "int".into(),
-        // A typed handle is an opaque pointer-sized token; Python surfaces it
-        // as a plain integer address, exactly like an untyped handle.
-        Ty::TypedHandle(_) => "int".into(),
+        Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::I64 | Ty::U64 => "int".into(),
         Ty::F32 | Ty::F64 => "float".into(),
         Ty::Bool => "bool".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "str".into(),
-        Ty::Bytes | Ty::BorrowedBytes => "bytes".into(),
-        // Records, rich enums, plain enums, and interfaces surface as bare
-        // local class names in the generated module. A cross-module reference
-        // (e.g. `types.Contact`) must still annotate the *local* `Contact`,
-        // not the qualified IR name, which is not a symbol in this module.
+        Ty::StringUtf8 => "str".into(),
+        Ty::Bytes => "bytes".into(),
+        // Records, rich enums, plain enums, interfaces, and callback
+        // interfaces surface as bare local class names in the generated
+        // module. A cross-module reference (e.g. `types.Contact`) must still
+        // annotate the *local* `Contact`, not the qualified IR name, which is
+        // not a symbol in this module.
         Ty::Enum(name) => format!("\"{}\"", local_type_name(name)),
         Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
             format!("\"{}\"", local_type_name(name))
         }
+        Ty::CallbackInterface(name) => format!("\"{}\"", local_type_name(name)),
         Ty::Optional(inner) => format!("Optional[{}]", py_type_hint(inner)),
         Ty::List(inner) => format!("List[{}]", py_type_hint(inner)),
         Ty::Map(k, v) => format!("Dict[{}, {}]", py_type_hint(k), py_type_hint(v)),
@@ -77,8 +72,9 @@ pub(crate) fn py_type_hint(ty: &Ty) -> String {
 /// Maps a shared ABI [`CType`] onto its `ctypes` spelling. The structural
 /// lowering (which slots exist, in what order) comes from
 /// [`weaveffi_core::abi`]; this is the Python-specific vocabulary applied to
-/// each slot. Opaque handles and structs collapse to `c_void_p`; `char*`
-/// becomes the `c_char_p` convenience type.
+/// each slot. Opaque object and vtable pointers collapse to `c_void_p`;
+/// `char*` becomes the `c_char_p` convenience type; the error struct is the
+/// emitted `_WeaveFFIErrorStruct` so `error*` slots are typed pointers.
 pub(crate) fn py_ctype(ty: &CType) -> String {
     match ty {
         CType::Int8 => "ctypes.c_int8".into(),
@@ -92,22 +88,39 @@ pub(crate) fn py_ctype(ty: &CType) -> String {
         CType::Double => "ctypes.c_double".into(),
         CType::Bool => "ctypes.c_int32".into(),
         CType::Size => "ctypes.c_size_t".into(),
-        CType::Handle => "ctypes.c_uint64".into(),
         CType::Char => "ctypes.c_char".into(),
         CType::Uint8 => "ctypes.c_uint8".into(),
         CType::Void => "None".into(),
         CType::Enum { .. } => "ctypes.c_int32".into(),
-        CType::CancelToken | CType::Error | CType::StructTag { .. } | CType::Named(_) => {
-            "ctypes.c_void_p".into()
-        }
+        CType::Error => "_WeaveFFIErrorStruct".into(),
+        CType::CancelToken
+        | CType::StructTag { .. }
+        | CType::VtableTag { .. }
+        | CType::Named(_) => "ctypes.c_void_p".into(),
         CType::Ptr { pointee, .. } => match pointee.as_ref() {
             CType::Char => "ctypes.c_char_p".into(),
-            CType::StructTag { .. } | CType::CancelToken | CType::Void | CType::Named(_) => {
-                "ctypes.c_void_p".into()
-            }
+            CType::StructTag { .. }
+            | CType::VtableTag { .. }
+            | CType::CancelToken
+            | CType::Void
+            | CType::Named(_) => "ctypes.c_void_p".into(),
             other => format!("ctypes.POINTER({})", py_ctype(other)),
         },
     }
+}
+
+/// The module-level `ctypes.Structure` subclass describing one callback
+/// interface's vtable. `name` may be a qualified IR reference; the emitted
+/// class uses the bare local name.
+pub(crate) fn py_vtable_class_name(name: &str) -> String {
+    format!("_{}Vtable", local_type_name(name))
+}
+
+/// The module-level static vtable instance for one callback interface: the
+/// single process-wide value whose address every call passing that
+/// interface hands to the producer.
+pub(crate) fn py_vtable_instance_name(name: &str) -> String {
+    format!("_{}_vtable", local_type_name(name))
 }
 
 /// The `ctypes` argtypes one parameter contributes, in slot order, driven by
@@ -121,6 +134,18 @@ pub(crate) fn py_param_argtypes(p: &ParamBinding) -> Vec<String> {
         ArgPass::Bytes { ptr, len } => vec![py_ctype(&ptr.ty), py_ctype(&len.ty)],
         ArgPass::Direct { slot } | ArgPass::String { slot } | ArgPass::Object { slot, .. } => {
             vec![py_ctype(&slot.ty)]
+        }
+        // The context slot carries the handle-table key; the vtable slot is
+        // typed against the interface's own Structure so `byref` of the
+        // static instance is accepted.
+        ArgPass::Callback { ctx, .. } => {
+            let cb =
+                p.ty.callback_interface_name()
+                    .expect("callback family names a callback interface");
+            vec![
+                py_ctype(&ctx.ty),
+                format!("ctypes.POINTER({})", py_vtable_class_name(cb)),
+            ]
         }
     }
 }
@@ -183,9 +208,9 @@ pub(crate) fn py_member_name(name: &str) -> String {
     lang::escape_ident(&name.to_snake_case(), lang::PYTHON_KEYWORDS)
 }
 
-/// The Python spelling of a module-level wrapper (free function or listener
-/// register/unregister pair): the module-path prefix applied per config, then
-/// snake_case, then keyword escaping.
+/// The Python spelling of a module-level wrapper (free function): the
+/// module-path prefix applied per config, then snake_case, then keyword
+/// escaping.
 pub(crate) fn py_wrapper_fn_name(
     module_path: &str,
     name: &str,
@@ -195,12 +220,6 @@ pub(crate) fn py_wrapper_fn_name(
         &wrapper_name(module_path, name, strip_module_prefix).to_snake_case(),
         lang::PYTHON_KEYWORDS,
     )
-}
-
-/// `Callable[[<param hints>], None]` for a callback's idiomatic signature.
-pub(crate) fn py_callable_hint(params: &[ParamBinding]) -> String {
-    let hints: Vec<String> = params.iter().map(|p| py_type_hint(&p.ty)).collect();
-    format!("Callable[[{}], None]", hints.join(", "))
 }
 
 /// Escape a string for embedding in a double-quoted Python literal.

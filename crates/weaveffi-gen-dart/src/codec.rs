@@ -2,9 +2,15 @@
 //! statements for any wire shape, naming the per-record and per-rich-enum
 //! `_pack{Name}`/`_unpack{Name}` helpers.
 //!
-//! Every dispatch here goes through [`wire::classify`], so this module never
-//! re-derives the wire folds (handles as `u64` tokens, borrowed views as
-//! their owned forms, records and rich enums as one user-codec shape).
+//! Every dispatch here goes through [`Ty::wire`], so this module never
+//! re-derives the wire folds (interfaces as `u64` object tokens, records and
+//! rich enums as one user-codec shape).
+//!
+//! An object token carries one strong reference. Writing one calls the
+//! wrapper's private `_cloneRef()` (the interface's `_clone` symbol) so the
+//! encoding owns a fresh reference and the wrapper keeps its own; reading one
+//! adopts the pointer into a new wrapper whose `dispose()` (or finalizer)
+//! owes the matching `_destroy`.
 
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
@@ -49,18 +55,12 @@ pub(crate) fn read_expr(r: &str, ty: &Ty) -> String {
         WireType::Prim(Prim::U64) => format!("{r}.readUint64()"),
         WireType::Prim(Prim::F32) => format!("{r}.readFloat32()"),
         WireType::Prim(Prim::F64) => format!("{r}.readFloat64()"),
-        // Both handle kinds decode from one u64 token; only the Dart surface
-        // differs (a bare int versus a wrapper class adopting the address).
-        WireType::Handle(_) => {
-            if let Ty::TypedHandle(n) = ty {
-                format!(
-                    "{}._(Pointer<Void>.fromAddress({r}.readUint64()))",
-                    dart_class(n)
-                )
-            } else {
-                format!("{r}.readUint64()")
-            }
-        }
+        // A token is one adopted strong reference: wrap it, never destroy it
+        // here.
+        WireType::Object(n) => format!(
+            "{}._(Pointer<Void>.fromAddress({r}.readUint64()))",
+            dart_class(n)
+        ),
         WireType::Enum(n) => format!("{}.fromValue({r}.readInt32())", dart_class(n)),
         WireType::Prim(Prim::String) => format!("{r}.readString()"),
         WireType::Prim(Prim::Bytes) => format!("{r}.readBytes()"),
@@ -122,14 +122,10 @@ pub(crate) fn write_stmts(w: &mut CodeWriter, wr: &str, expr: &str, ty: &Ty, tmp
         WireType::Prim(Prim::F64) => {
             w.line(format!("{wr}.writeFloat64({expr});"));
         }
-        // Both handle kinds encode as one u64 token; a typed handle
-        // contributes its wrapped pointer's address.
-        WireType::Handle(_) => {
-            if matches!(ty, Ty::TypedHandle(_)) {
-                w.line(format!("{wr}.writeUint64({expr}._handle.address);"));
-            } else {
-                w.line(format!("{wr}.writeUint64({expr});"));
-            }
+        // The token must own its reference, so write a freshly cloned pointer
+        // rather than the one the wrapper still holds.
+        WireType::Object(_) => {
+            w.line(format!("{wr}.writeUint64({expr}._cloneRef().address);"));
         }
         WireType::Enum(_) => {
             w.line(format!("{wr}.writeInt32({expr}.value);"));

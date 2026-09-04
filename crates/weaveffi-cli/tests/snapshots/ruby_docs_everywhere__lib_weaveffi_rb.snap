@@ -32,7 +32,7 @@ module WeaveFFI
   # The ABI revision these bindings were generated against. Checked before any
   # other symbol is attached so a mismatched producer fails at require time
   # instead of misreading the error struct or a value buffer later.
-  ABI_VERSION = 1
+  ABI_VERSION = 2
   begin
     attach_function :weaveffi_abi_version, [], :uint32
   rescue FFI::NotFoundError
@@ -51,6 +51,16 @@ module WeaveFFI
            :payload_ptr, :pointer,
            :payload_len, :size_t
   end
+
+  # The runtime-reserved error codes. Positive codes belong to a module's
+  # declared error domain; these negative codes are programming errors the
+  # wrappers raise as a plain Error regardless of the function's `throws`.
+  GENERIC_ERROR_CODE = -1
+  PANIC_ERROR_CODE = -2
+  MARSHAL_ERROR_CODE = -3
+  # A callback-interface implementation raised; the message carries the
+  # exception text.
+  FOREIGN_ERROR_CODE = -4
 
   class Error < StandardError
     attr_reader :code
@@ -225,12 +235,21 @@ module WeaveFFI
       take(read_len, 'byte buffer')
     end
 
+    # An object token: a non-zero u64 carrying one strong reference the
+    # caller adopts into a wrapper.
+    def read_object_token
+      addr = read_u64
+      raise Error.new(-1, 'malformed value buffer: null object token') if addr.zero?
+      FFI::Pointer.new(addr)
+    end
+
     def expect_end!
       return if @pos == @data.bytesize
       raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
+  attach_function :weaveffi_error_set, [:pointer, :int32, :string], :void
   attach_function :weaveffi_error_clear, [:pointer], :void
   attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
@@ -240,15 +259,51 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_error_clear(err.to_ptr)
     raise Error.new(code, msg)
   end
 
-  # Registered listener trampolines, keyed by subscription id. Holding the
-  # FFI::Function objects here keeps them alive until unregistered; without
-  # this the GC could collect a trampoline the producer still calls.
-  @listener_refs = {}
+  # Live callback-interface implementations keyed by the Integer the producer
+  # holds as `ctx`. Keys start at 1 so a context pointer is never NULL.
+  @wv_cb_registry = {}
+  @wv_cb_next_key = 0
+  @wv_cb_mutex = Mutex.new
+
+  # @api private
+  # Registers `impl` and returns the `ctx` pointer to hand the producer.
+  def self._wv_cb_register(impl)
+    @wv_cb_mutex.synchronize do
+      @wv_cb_next_key += 1
+      @wv_cb_registry[@wv_cb_next_key] = impl
+      FFI::Pointer.new(@wv_cb_next_key)
+    end
+  end
+
+  # @api private
+  # Resolves a trampoline's `ctx` back to the registered implementation.
+  def self._wv_cb_lookup(ctx)
+    impl = @wv_cb_mutex.synchronize { @wv_cb_registry[ctx.address] }
+    raise Error.new(FOREIGN_ERROR_CODE, 'callback context is not registered') if impl.nil?
+    impl
+  end
+
+  # @api private
+  # Drops the registry entry when the producer releases its last reference.
+  def self._wv_cb_free(ctx)
+    @wv_cb_mutex.synchronize { @wv_cb_registry.delete(ctx.address) }
+    nil
+  end
+
+  # @api private
+  # Reports a callback implementation's exception through `out_err`. The
+  # producer copies the message, so the Ruby String need not outlive the call.
+  def self._wv_cb_fail(out_err, exception)
+    message = exception.message.to_s
+    message = exception.class.name if message.empty?
+    weaveffi_error_set(out_err, FOREIGN_ERROR_CODE, message)
+    nil
+  end
 
   # === Module: docs ===
 
@@ -281,7 +336,7 @@ module WeaveFFI
 
   # Builds the DocsErrorsError subclass matching `code`, decoding any payload
   # fields the code declares, or a generic Error for codes outside
-  # the domain (panics, marshalling).
+  # the domain (panics, marshalling, callback failures).
   def self.docs_errors_error_from(code, message, payload = nil)
     cls = DOCS_ERRORS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
@@ -293,7 +348,7 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     payload_ptr = err[:payload_ptr]
     payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)
@@ -371,6 +426,7 @@ module WeaveFFI
     Document.new(id: _wv_id, title: _wv_title, status: _wv_status, tags: _wv_tags)
   end
 
+  attach_function :weaveffi_docs_Notebook_clone, [:pointer], :pointer
   attach_function :weaveffi_docs_Notebook_destroy, [:pointer], :void
   # Create an empty notebook
   attach_function :weaveffi_docs_Notebook_new, [:pointer], :pointer
@@ -382,10 +438,6 @@ module WeaveFFI
   attach_function :weaveffi_docs_Notebook_size, [:pointer, :pointer], :int32
   # The largest number of documents one notebook will hold
   attach_function :weaveffi_docs_Notebook_max_documents, [:pointer], :int32
-  # Fires after a document has been persisted successfully
-  callback :weaveffi_docs_OnSaved_fn, [:int64, :int32, :pointer], :void
-  attach_function :weaveffi_docs_register_saved_listener, [:weaveffi_docs_OnSaved_fn, :pointer], :uint64
-  attach_function :weaveffi_docs_unregister_saved_listener, [:uint64], :void
   # Create a brand new document.
   #
   # The document starts in `Draft` status; callers must publish
@@ -396,7 +448,63 @@ module WeaveFFI
   # Publish a document in the background
   callback :weaveffi_docs_publish_async_callback, [:pointer, :pointer, :int32], :void
   attach_function :weaveffi_docs_publish_async_async, [:int64, :weaveffi_docs_publish_async_callback, :pointer], :void
+  # Register a listener for saved notifications
+  attach_function :weaveffi_docs_watch, [:pointer, :pointer, :pointer], :void
 
+  # Consumer-implemented observer of document-saved notifications.
+  #
+  # Implementations must be safe to call from any thread.
+  # Consumer-implemented callback interface. Any object responding to the
+  # methods below is accepted wherever a SavedListener parameter is expected;
+  # include this module to inherit NotImplementedError defaults. The
+  # producer may call the methods from any thread until it releases the
+  # implementation.
+  module SavedListener
+    # Fires after a document has been persisted successfully
+    # @param doc_id [Object] Identifier of the saved document
+    # @param revision [Object] Monotonically increasing revision
+    def on_saved(doc_id, revision)
+      raise NotImplementedError, "#{self.class}#on_saved is not implemented"
+    end
+  end
+
+  # @api private
+  # The C vtable layout the producer calls a SavedListener through.
+  class WvSavedListenerVtable < FFI::Struct
+    layout :on_saved, :pointer,
+           :free, :pointer
+  end
+
+  # @api private
+  # Trampoline for SavedListener#on_saved.
+  WV_SAVED_LISTENER_ON_SAVED = FFI::Function.new(:void, [:pointer, :int64, :int32, :pointer]) do |ctx, doc_id, revision, out_err|
+    begin
+      impl = _wv_cb_lookup(ctx)
+      doc_id_v = doc_id
+      revision_v = revision
+      impl.on_saved(doc_id_v, revision_v)
+      nil
+    rescue Exception => e
+      _wv_cb_fail(out_err, e)
+      nil
+    end
+  end
+
+  # @api private
+  # Releases a SavedListener implementation when the producer drops its last
+  # reference.
+  WV_SAVED_LISTENER_FREE = FFI::Function.new(:void, [:pointer]) do |ctx|
+    _wv_cb_free(ctx)
+  end
+
+  # The one process-wide SavedListener vtable every registration hands the
+  # producer; its entries live for the process lifetime.
+  WV_SAVED_LISTENER_VTABLE = WvSavedListenerVtable.new
+  WV_SAVED_LISTENER_VTABLE[:on_saved] = WV_SAVED_LISTENER_ON_SAVED
+  WV_SAVED_LISTENER_VTABLE[:free] = WV_SAVED_LISTENER_FREE
+
+  # @api private
+  # Owns one strong reference to a Notebook; releases it exactly once.
   class NotebookPtr < FFI::AutoPointer
     def self.release(ptr)
       WeaveFFI.weaveffi_docs_Notebook_destroy(ptr)
@@ -407,9 +515,8 @@ module WeaveFFI
   #
   # Notebooks own their documents and release them when destroyed.
   class Notebook
-    attr_reader :handle
-
-    # Wraps an owned pointer the producer handed over, without
+    # @api private
+    # Adopts one strong reference the producer handed over, without
     # re-running initialize.
     def self._from_ptr(ptr)
       obj = allocate
@@ -417,10 +524,37 @@ module WeaveFFI
       obj
     end
 
-    def destroy
+    # The borrowed object pointer passed to producer calls.
+    def handle
+      raise Error.new(-1, 'Notebook used after close') if @handle.nil?
+      @handle
+    end
+
+    # Whether close has released this wrapper's reference.
+    def closed?
+      @handle.nil?
+    end
+
+    # Releases this wrapper's reference now rather than at GC time.
+    # Idempotent; the object itself is dropped when the last reference
+    # anywhere (another wrapper, a record field, the producer) goes.
+    def close
       return if @handle.nil?
       @handle.free
       @handle = nil
+    end
+
+    # @api private
+    # Mints a new strong reference the caller owns (used when this
+    # object is written into a value buffer).
+    def _wv_clone_ptr
+      WeaveFFI.weaveffi_docs_Notebook_clone(handle)
+    end
+
+    # dup and clone produce an independent wrapper with its own reference.
+    def initialize_copy(other)
+      super
+      @handle = NotebookPtr.new(WeaveFFI.weaveffi_docs_Notebook_clone(other.handle))
     end
 
     # Create an empty notebook
@@ -441,7 +575,7 @@ module WeaveFFI
       document_data = document_w.data
       document_buf = FFI::MemoryPointer.new(:uint8, document_data.bytesize)
       document_buf.put_bytes(0, document_data)
-      result = WeaveFFI.weaveffi_docs_Notebook_insert(@handle, document_buf, document_data.bytesize, err)
+      result = WeaveFFI.weaveffi_docs_Notebook_insert(handle, document_buf, document_data.bytesize, err)
       WeaveFFI.check_error!(err)
       result
     end
@@ -451,7 +585,7 @@ module WeaveFFI
     def find(id)
       err = ErrorStruct.new
       out_len = FFI::MemoryPointer.new(:size_t)
-      result = WeaveFFI.weaveffi_docs_Notebook_find(@handle, id, out_len, err)
+      result = WeaveFFI.weaveffi_docs_Notebook_find(handle, id, out_len, err)
       WeaveFFI.check_docs_errors_error!(err)
       len = out_len.read(:size_t)
       data = result.null? ? ''.b : result.read_string(len)
@@ -465,7 +599,7 @@ module WeaveFFI
     # The number of documents currently held
     def size()
       err = ErrorStruct.new
-      result = WeaveFFI.weaveffi_docs_Notebook_size(@handle, err)
+      result = WeaveFFI.weaveffi_docs_Notebook_size(handle, err)
       WeaveFFI.check_error!(err)
       result
     end
@@ -477,25 +611,6 @@ module WeaveFFI
       WeaveFFI.check_error!(err)
       result
     end
-  end
-
-  # Subscribe to document-saved notifications
-  # Registers a OnSaved listener block. Returns a subscription id for
-  # unregister_saved_listener.
-  def self.register_saved_listener(&block)
-    trampoline = FFI::Function.new(:void, [:int64, :int32, :pointer]) do |doc_id, revision, _context|
-      block.call(doc_id, revision)
-    end
-    listener_id = weaveffi_docs_register_saved_listener(trampoline, FFI::Pointer::NULL)
-    @listener_refs[listener_id] = trampoline
-    listener_id
-  end
-
-  # Unregisters a listener previously registered with register_saved_listener.
-  def self.unregister_saved_listener(listener_id)
-    weaveffi_docs_unregister_saved_listener(listener_id)
-    @listener_refs.delete(listener_id)
-    nil
   end
 
   # Create a brand new document.
@@ -555,7 +670,7 @@ module WeaveFFI
       err = err_ptr.null? ? nil : ErrorStruct.new(err_ptr)
       if err && err[:code] != 0
         code = err[:code]
-        msg = err[:message].null? ? '' : err[:message].read_string
+        msg = err[:message].null? ? '' : err[:message].read_string.force_encoding(Encoding::UTF_8)
         weaveffi_error_free(err_ptr)
         queue << Error.new(code, msg)
       else
@@ -566,6 +681,15 @@ module WeaveFFI
     value = queue.pop
     raise value if value.is_a?(Error)
     value
+  end
+
+  # Register a listener for saved notifications
+  # @param listener [Object] Receiver of saved notifications
+  def self.watch(listener)
+    err = ErrorStruct.new
+    listener_ctx = _wv_cb_register(listener)
+    weaveffi_docs_watch(listener_ctx, WV_SAVED_LISTENER_VTABLE.to_ptr, err)
+    check_error!(err)
   end
 end
 

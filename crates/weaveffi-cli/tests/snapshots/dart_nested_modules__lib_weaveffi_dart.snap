@@ -26,7 +26,7 @@ DynamicLibrary _openLibrary() {
 }
 
 // The ABI revision these bindings were generated against.
-const int _abiVersion = 1;
+const int _abiVersion = 2;
 
 DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {
   final int Function() abiVersion;
@@ -59,6 +59,11 @@ final class _WeaveFFIError extends Struct {
   external int payloadLen;
 }
 
+typedef _NativeWeaveffiErrorSet = Void Function(Pointer<_WeaveFFIError>, Int32, Pointer<Utf8>);
+typedef _DartWeaveffiErrorSet = void Function(Pointer<_WeaveFFIError>, int, Pointer<Utf8>);
+final _weaveffiErrorSet = _lib.lookupFunction<
+    _NativeWeaveffiErrorSet, _DartWeaveffiErrorSet>('weaveffi_error_set');
+
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
@@ -79,8 +84,19 @@ typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
 final _weaveffiFreeBytes = _lib.lookupFunction<
     _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
 
-/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
+/// Generic WeaveFFI failure: a producer panic ([panicCode]), a marshalling
+/// error ([marshalCode]), a callback-interface implementation that threw
+/// ([foreignCode], carrying the Dart exception's text), or an unknown code.
 class WeaveFFIException implements Exception {
+  /// The producer reported an untyped error.
+  static const int genericCode = -1;
+  /// The producer panicked; [message] carries the panic text.
+  static const int panicCode = -2;
+  /// An argument could not be lifted by the producer.
+  static const int marshalCode = -3;
+  /// A Dart callback-interface implementation threw; [message] carries the
+  /// exception's text.
+  static const int foreignCode = -4;
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);

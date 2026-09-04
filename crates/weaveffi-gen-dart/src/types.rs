@@ -16,9 +16,8 @@ pub(crate) fn dart_ident(name: &str) -> String {
     lang::escape_ident(&name.to_lower_camel_case(), lang::DART_KEYWORDS)
 }
 
-/// The Dart spelling of a module-level wrapper (free function or listener
-/// register/unregister pair): the module-path prefix applied per config,
-/// then lowerCamelCase, then keyword escaping.
+/// The Dart spelling of a module-level free function: the module-path prefix
+/// applied per config, then lowerCamelCase, then keyword escaping.
 pub(crate) fn dart_wrapper_fn_name(
     module_path: &str,
     name: &str,
@@ -33,26 +32,20 @@ pub(crate) fn dart_wrapper_fn_name(
 /// The idiomatic Dart type a [`Ty`] surfaces as.
 pub(crate) fn dart_type(ty: &Ty) -> String {
     match ty {
-        Ty::I8
-        | Ty::I16
-        | Ty::I32
-        | Ty::I64
-        | Ty::U8
-        | Ty::U16
-        | Ty::U32
-        | Ty::U64
-        | Ty::Handle => "int".into(),
+        Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => "int".into(),
         Ty::F32 | Ty::F64 => "double".into(),
         Ty::Bool => "bool".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "String".into(),
-        Ty::Bytes | Ty::BorrowedBytes => "List<int>".into(),
-        // Records, rich enums, C-style enums, typed handles, and interfaces
-        // all surface as bare local Dart classes. A cross-module reference
-        // (resolved to e.g. `kv.Store`) must still name the local `Store`
-        // class, not the qualified IR name.
-        Ty::TypedHandle(n) | Ty::Enum(n) | Ty::Record(n) | Ty::RichEnum(n) | Ty::Interface(n) => {
-            local_type_name(n).to_upper_camel_case()
-        }
+        Ty::StringUtf8 => "String".into(),
+        Ty::Bytes => "List<int>".into(),
+        // Records, rich enums, C-style enums, interfaces, and callback
+        // interfaces all surface as bare local Dart classes. A cross-module
+        // reference (resolved to e.g. `kv.Store`) must still name the local
+        // `Store` class, not the qualified IR name.
+        Ty::Enum(n)
+        | Ty::Record(n)
+        | Ty::RichEnum(n)
+        | Ty::Interface(n)
+        | Ty::CallbackInterface(n) => local_type_name(n).to_upper_camel_case(),
         Ty::Optional(inner) => format!("{}?", dart_type(inner)),
         Ty::List(inner) => format!("List<{}>", dart_type(inner)),
         Ty::Iterator(inner) => format!("Iterable<{}>", dart_type(inner)),
@@ -63,6 +56,26 @@ pub(crate) fn dart_type(ty: &Ty) -> String {
 /// The bare local Dart class name of a (possibly dot-qualified) user type.
 pub(crate) fn dart_class(name: &str) -> String {
     local_type_name(name).to_upper_camel_case()
+}
+
+/// The Dart wrapper class of a direct or nullable interface reference.
+///
+/// # Panics
+///
+/// Panics when `ty` is not an interface or an optional interface; callers
+/// dispatch on [`RetPass::Object`] or [`ArgPass::Object`] first.
+pub(crate) fn object_class(ty: &Ty) -> String {
+    match ty {
+        Ty::Interface(name) => dart_class(name),
+        Ty::Optional(inner) => object_class(inner),
+        _ => unreachable!("object positions are (optional) interfaces"),
+    }
+}
+
+/// The private Dart global holding a callback interface's one static vtable
+/// pointer: `_{Class}Vtable`.
+pub(crate) fn vtable_var(name: &str) -> String {
+    format!("_{}Vtable", dart_class(name))
 }
 
 /// dart:ffi (native, dart) types of a leaf scalar passed by value. `Bool` is
@@ -77,10 +90,20 @@ pub(crate) fn scalar_ffi(ty: &Ty) -> (&'static str, &'static str) {
         Ty::U64 => ("Uint64", "int"),
         Ty::I32 | Ty::Enum(_) => ("Int32", "int"),
         Ty::Bool => ("Bool", "bool"),
-        Ty::I64 | Ty::Handle => ("Int64", "int"),
+        Ty::I64 => ("Int64", "int"),
         Ty::F32 => ("Float", "double"),
         Ty::F64 => ("Double", "double"),
         _ => ("Int64", "int"),
+    }
+}
+
+/// The Dart literal a trampoline returns when the implementation raised: the
+/// zero value of the method's direct return type (`0`, `0.0`, or `false`).
+pub(crate) fn default_literal(ty: &Ty) -> &'static str {
+    match ty {
+        Ty::Bool => "false",
+        Ty::F32 | Ty::F64 => "0.0",
+        _ => "0",
     }
 }
 
@@ -89,8 +112,9 @@ pub(crate) fn scalar_ffi(ty: &Ty) -> (&'static str, &'static str) {
 /// The (native, dart) FFI typedef slot pairs a single input parameter expands
 /// into, mirroring the C ABI and driven by the parameter's [`ArgPass`]
 /// contract: a buffered value is one borrowed `(const uint8_t*, size_t)`
-/// pair; bytes fan out to `(ptr, len)`; strings, interfaces, and typed
-/// handles stay one pointer slot; everything else is a by-value scalar.
+/// pair; bytes fan out to `(ptr, len)`; strings and interfaces stay one
+/// pointer slot; a callback interface is a `(ctx, vtable)` pointer pair;
+/// everything else is a by-value scalar.
 pub(crate) fn input_slots(p: &ParamBinding) -> Vec<(String, String)> {
     let ptr = |s: &str| (s.to_string(), s.to_string());
     match p.arg_pass() {
@@ -101,37 +125,31 @@ pub(crate) fn input_slots(p: &ParamBinding) -> Vec<(String, String)> {
         // Interfaces and nullable interfaces are one (possibly null) object
         // pointer.
         ArgPass::Object { .. } => vec![ptr("Pointer<Void>")],
-        ArgPass::Direct { .. } => match &p.ty {
-            // A typed handle's direct slot is an opaque pointer.
-            Ty::TypedHandle(_) => vec![ptr("Pointer<Void>")],
-            ty => {
-                let (n, d) = scalar_ffi(ty);
-                vec![(n.into(), d.into())]
-            }
-        },
+        // The consumer's handle-table key and its static vtable.
+        ArgPass::Callback { .. } => vec![ptr("Pointer<Void>"), ptr("Pointer<Void>")],
+        ArgPass::Direct { .. } => {
+            let (n, d) = scalar_ffi(&p.ty);
+            vec![(n.into(), d.into())]
+        }
     }
 }
 
 /// The FFI return type (native, dart) of a call symbol, driven by the
 /// return's [`RetPass`] contract. Buffered and bytes returns come back as a
 /// producer-allocated `Pointer<Uint8>`; strings as `Pointer<Utf8>`;
-/// interfaces and typed handles as opaque pointers.
+/// interfaces as opaque pointers.
 pub(crate) fn return_ffi(ty: &Ty) -> (String, String) {
     let ptr = |s: &str| (s.to_string(), s.to_string());
-    // Module and prefix only shape an object return's destroy symbol, which
-    // the FFI typedef never names; empty context is fine here.
+    // Module and prefix only shape an object return's clone and destroy
+    // symbols, which the FFI typedef never names; empty context is fine here.
     match plan::ret_pass(Some(ty), "", "") {
         RetPass::Buffer | RetPass::Bytes => ptr("Pointer<Uint8>"),
         RetPass::String => ptr("Pointer<Utf8>"),
         RetPass::Object { .. } => ptr("Pointer<Void>"),
-        RetPass::Void | RetPass::Direct => match ty {
-            // A typed handle's direct slot is an opaque pointer.
-            Ty::TypedHandle(_) => ptr("Pointer<Void>"),
-            ty => {
-                let (n, d) = scalar_ffi(ty);
-                (n.into(), d.into())
-            }
-        },
+        RetPass::Void | RetPass::Direct => {
+            let (n, d) = scalar_ffi(ty);
+            (n.into(), d.into())
+        }
     }
 }
 

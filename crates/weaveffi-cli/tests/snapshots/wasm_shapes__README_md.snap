@@ -15,7 +15,7 @@ Build (example):
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
+Then serve the `.wasm` and use `weaveffi_wasm.js` to load it: the loader accepts a URL to fetch, the module's bytes (for Node, where `fetch` cannot read files), or an already compiled `WebAssembly.Module`.
 
 ## Complex Type Handling
 
@@ -29,9 +29,17 @@ Records are **plain JavaScript objects**. A record crosses the boundary serializ
 
 C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. Rich (algebraic) enums are plain objects tagged by variant name (`{ tag: "Circle", radius: 2 }`) and cross the boundary serialized in a value buffer, exactly like records.
 
+### Objects
+
+Interfaces are **wrapper classes** holding one reference to a producer object (an `i32` pointer into linear memory). A wrapper you receive is yours: release it with `close()` (or bind it with `using`, which calls `Symbol.dispose`); a wrapper collected unclosed is released by a `FinalizationRegistry` backstop where the runtime provides one, and destroy runs exactly once either way. Passing a wrapper to a function lends its reference for the duration of the call. Inside a value buffer an object crosses as a `u64` token carrying one reference: the writer clones the wrapper's reference and the reader adopts the token into a new wrapper.
+
+### 64-bit Integers
+
+`i64` and `u64` are JavaScript **`bigint`** values everywhere: as arguments, returns, record fields, and callback parameters. Map keys of these types become string property names on the decoded object. A `number` is accepted where a `bigint` is expected (it's widened with `BigInt(v)`, so a fractional value throws a `RangeError`). Values crossing by value follow the wasm calling convention: an out-of-range `bigint` wraps modulo 2^64 rather than throwing, and unsigned results are read back as unsigned (`u64` via `BigInt.asUintN`, `u32` via `>>> 0`).
+
 ### Optionals
 
-Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent).
+Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent) and maps to `Wrapper | null`.
 
 ### Lists and Maps
 
@@ -53,15 +61,25 @@ functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
+- `weaveffi_error_set(err_ptr: i32, code: i32, msg: i32)`: fill an error slot (used to report callback exceptions)
 - `weaveffi_free_string(ptr: i32)`: free a producer-returned C string
 - `weaveffi_free_bytes(ptr: i32, len: i32)`: free a producer-returned buffer
 
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
-for producer panics and marshalling failures. When the matched error code
-declares payload fields, the wrapper decodes them from the error's value
-buffer and attaches them as properties on the thrown error.
+for producer panics, marshalling failures, and callback exceptions
+(code `-4`). When the matched error code declares payload fields, the
+wrapper decodes them from the error's value buffer and attaches them as
+properties on the thrown error.
+
+#### Callback failures without unwinding
+
+`wasm32-unknown-unknown` builds with `panic = "abort"`, so when a callback interface method throws, the producer can't unwind out of the call the way native targets do. Instead the runtime records the failure, the producer's code runs to completion on the method's default return value (`0`, `0n`, or `false`), and the thunk then reports code `-4` with the exception's message in place of the result, so the wrapper throws (or the Promise rejects with) the same `WeaveFFIError` a native build would produce. While that producer call is still on the stack, the glue refuses every further callback invocation with the same error rather than calling your implementation again, so your code observes the failure exactly as it would under unwinding. Producers must tolerate a callback returning its default once (a well-behaved producer already does, because a consumer could return that value on purpose).
+
+#### Traps
+
+A producer panic can't be caught on the Rust side either: it executes `unreachable`, and the engine throws a `WebAssembly.RuntimeError` out of the call. The glue translates that trap for you: the wrapper throws (or the Promise rejects with) a `WeaveFFIError` with code `-2` (`producer panicked`), or code `-4` if a callback method had already failed during the call. The error slot and every staged argument are released either way. The producer frames between the trap and the call are *not* unwound, so their cleanup does not run: a lock held across the panic stays locked, and allocations those frames owned leak.
 
 ## API Reference
 

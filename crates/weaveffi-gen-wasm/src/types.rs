@@ -15,19 +15,20 @@ use weaveffi_core::utils::local_type_name;
 
 /// The wasm value-type spelling of one IDL type at the boundary, for the
 /// README's signature tables. Buffered types occupy two `i32` slots (pointer
-/// plus length); everything else keeps its scalar or pointer slot.
+/// plus length); a callback interface occupies two `i32` slots (context plus
+/// vtable pointer); everything else keeps its scalar or pointer slot.
 pub(crate) fn wasm_type(ty: &Ty) -> &'static str {
     if ty.is_buffered() {
         return "i32, i32";
     }
     match ty {
         Ty::I8 | Ty::I16 | Ty::I32 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::Bool | Ty::Enum(_) => "i32",
-        Ty::I64 | Ty::U64 | Ty::Handle => "i64",
+        Ty::I64 | Ty::U64 => "i64",
         Ty::F32 => "f32",
         Ty::F64 => "f64",
-        Ty::StringUtf8 | Ty::BorrowedStr => "i32",
-        Ty::Bytes | Ty::BorrowedBytes => "i32, i32",
-        Ty::TypedHandle(_) | Ty::Interface(_) | Ty::Iterator(_) => "i32",
+        Ty::StringUtf8 => "i32",
+        Ty::Bytes | Ty::CallbackInterface(_) => "i32, i32",
+        Ty::Interface(_) | Ty::Iterator(_) => "i32",
         // Only `Interface?` reaches here: a nullable object pointer.
         Ty::Optional(_) => "i32",
         Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => {
@@ -54,11 +55,10 @@ pub(crate) fn wasm_type_note(ty: &Ty) -> &'static str {
         Ty::F32 => "native Wasm f32",
         Ty::F64 => "native Wasm f64",
         Ty::Bool => "0 = false, 1 = true",
-        Ty::StringUtf8 | Ty::BorrowedStr => "NUL-terminated C string pointer",
-        Ty::Bytes | Ty::BorrowedBytes => "ptr + len in linear memory",
-        Ty::TypedHandle(_) => "opaque pointer",
-        Ty::Handle => "opaque 64-bit handle",
-        Ty::Interface(_) => "opaque object pointer",
+        Ty::StringUtf8 => "NUL-terminated C string pointer",
+        Ty::Bytes => "ptr + len in linear memory",
+        Ty::Interface(_) => "borrowed object pointer",
+        Ty::CallbackInterface(_) => "context key + static vtable pointer",
         Ty::Enum(_) => "variant discriminant",
         Ty::Iterator(_) => "opaque iterator handle",
         Ty::Optional(_) => "nullable object pointer, 0 = absent",
@@ -83,16 +83,16 @@ pub(crate) fn type_display(ty: &Ty) -> String {
         Ty::F32 => "f32".into(),
         Ty::F64 => "f64".into(),
         Ty::Bool => "bool".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
-        Ty::Bytes | Ty::BorrowedBytes => "bytes".into(),
-        Ty::TypedHandle(_) | Ty::Handle => "handle".into(),
-        Ty::Record(n) | Ty::RichEnum(n) => local_type_name(n).to_string(),
+        Ty::StringUtf8 => "string".into(),
+        Ty::Bytes => "bytes".into(),
+        Ty::Record(n) | Ty::RichEnum(n) | Ty::Interface(n) | Ty::CallbackInterface(n) => {
+            local_type_name(n).to_string()
+        }
         Ty::Enum(n) => n.clone(),
         Ty::Optional(inner) => format!("{}?", type_display(inner)),
         Ty::List(inner) => format!("[{}]", type_display(inner)),
         Ty::Iterator(inner) => format!("iter<{}>", type_display(inner)),
         Ty::Map(k, v) => format!("{{{}:{}}}", type_display(k), type_display(v)),
-        Ty::Interface(n) => local_type_name(n).to_string(),
     }
 }
 
@@ -103,23 +103,22 @@ pub(crate) fn ts_type_for(ty: &Ty) -> String {
             "number".into()
         }
         Ty::Bool => "boolean".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
+        Ty::StringUtf8 => "string".into(),
         // Bytes cross the boundary as plain `Uint8Array` copies; the Node-only
         // `Buffer` type does not exist in browsers and is never returned here.
-        Ty::Bytes | Ty::BorrowedBytes => "Uint8Array".into(),
+        Ty::Bytes => "Uint8Array".into(),
         // Every 64-bit integer crosses the JS boundary as a BigInt: wasm i64
         // results arrive as BigInt and i64 arguments are BigInt-coerced.
-        Ty::I64 | Ty::U64 | Ty::Handle => "bigint".into(),
-        // A typed handle is an opaque i32 pointer at the ABI, surfaced as a
-        // plain number.
-        Ty::TypedHandle(_) => "number".into(),
-        // Records, rich enums, plain enums, and interfaces surface as bare
-        // local TS names; a cross-module reference (resolved to e.g.
-        // `kv.Store`) must name the local `Store`, not the qualified IR name
-        // which is undeclared here.
-        Ty::Enum(name) | Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
-            local_type_name(name).to_string()
-        }
+        Ty::I64 | Ty::U64 => "bigint".into(),
+        // Records, rich enums, plain enums, interfaces, and callback
+        // interfaces surface as bare local TS names; a cross-module reference
+        // (resolved to e.g. `kv.Store`) must name the local `Store`, not the
+        // qualified IR name which is undeclared here.
+        Ty::Enum(name)
+        | Ty::Record(name)
+        | Ty::RichEnum(name)
+        | Ty::Interface(name)
+        | Ty::CallbackInterface(name) => local_type_name(name).to_string(),
         Ty::Optional(inner) => format!("{} | null", ts_type_for(inner)),
         Ty::List(inner) => {
             let inner_ts = ts_type_for(inner);
@@ -140,7 +139,7 @@ pub(crate) fn ts_type_for(ty: &Ty) -> String {
         // constraint, so 64-bit keys are typed as the strings they become.
         Ty::Map(k, v) => {
             let key = match k.as_ref() {
-                Ty::I64 | Ty::U64 | Ty::Handle => "string".to_string(),
+                Ty::I64 | Ty::U64 => "string".to_string(),
                 other => ts_type_for(other),
             };
             format!("Record<{key}, {}>", ts_type_for(v))
@@ -148,9 +147,9 @@ pub(crate) fn ts_type_for(ty: &Ty) -> String {
     }
 }
 
-/// True if `ty` is one of the UTF-8 string spellings.
+/// True if `ty` is the UTF-8 string type.
 pub(crate) fn is_string_type(ty: &Ty) -> bool {
-    matches!(ty, Ty::StringUtf8 | Ty::BorrowedStr)
+    matches!(ty, Ty::StringUtf8)
 }
 
 // ── Naming and error-surface policy ──
@@ -160,6 +159,13 @@ pub(crate) fn is_string_type(ty: &Ty) -> bool {
 /// never carry a module prefix in the first place.
 pub(crate) fn js_fn_name(f: &FnBinding) -> String {
     f.name.to_lower_camel_case()
+}
+
+/// The lowerCamelCase JS name of a callback-interface method (`on_message`
+/// becomes `onMessage`): the property the trampoline invokes on the consumer's
+/// implementation object and the member the TS `interface` declares.
+pub(crate) fn js_cb_method_name(name: &str) -> String {
+    name.to_lower_camel_case()
 }
 
 /// The camelCase JS spelling of one parameter (`ttl_seconds` becomes
@@ -193,7 +199,8 @@ pub(crate) fn js_error_checker_name(eb: &ErrorBinding) -> String {
 /// The error-check helper a callable's out-err slot routes through, per its
 /// [`ErrorStrategy`]: the module domain's typed checker for
 /// [`ErrorStrategy::Throws`], the generic `_checkErr` (plain `WeaveFFIError`;
-/// panics and marshalling failures only) for [`ErrorStrategy::Trap`].
+/// panics, marshalling failures, and foreign callback failures only) for
+/// [`ErrorStrategy::Trap`].
 pub(crate) fn js_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> String {
     match (f.error_strategy(), error) {
         (ErrorStrategy::Throws, Some(eb)) => js_error_checker_name(eb),
@@ -210,6 +217,28 @@ pub(crate) fn js_err_factory(f: &FnBinding, error: Option<&ErrorBinding>) -> Opt
         (ErrorStrategy::Throws, Some(eb)) => Some(js_error_factory_name(eb)),
         _ => None,
     }
+}
+
+/// The loader-scoped JS constant holding the linear-memory address of the
+/// static vtable for the (possibly dot-qualified) callback interface `name`.
+/// Callback interface names are unique across the API, so the local name is
+/// collision-free.
+pub(crate) fn js_vtable_name(name: &str) -> String {
+    format!("_vtable_{}", local_type_name(name))
+}
+
+/// True when `f` takes at least one callback-interface parameter, which the
+/// Emscripten loader cannot support (see [`crate::calls`]).
+pub(crate) fn takes_callback(f: &FnBinding) -> bool {
+    f.params
+        .iter()
+        .any(|p| matches!(p.ty, Ty::CallbackInterface(_)))
+}
+
+/// True when `f` is unsupported in Emscripten mode and rendered as a throwing
+/// stub there: an async function or one taking a callback interface.
+pub(crate) fn emscripten_stub(f: &FnBinding) -> bool {
+    f.is_async || takes_callback(f)
 }
 
 /// Escape a string for embedding in a double-quoted JS literal.

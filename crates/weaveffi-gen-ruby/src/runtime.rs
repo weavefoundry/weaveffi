@@ -1,7 +1,9 @@
 //! The fixed Ruby runtime the generated module carries: the library loader,
-//! the error surface, the value-buffer reader/writer pair, and the runtime
-//! ABI attachments (`error_clear`, `error_free`, `free_string`,
-//! `free_bytes`), guarded by the load-time ABI-revision check.
+//! the error surface, the value-buffer reader/writer pair, the runtime ABI
+//! attachments (`error_set`, `error_clear`, `error_free`, `free_string`,
+//! `free_bytes`), guarded by the load-time ABI-revision check, and (when
+//! the API declares callback interfaces) the implementation registry the
+//! vtable trampolines resolve their `ctx` keys against.
 
 use weaveffi_core::cabi::ABI_VERSION;
 
@@ -49,9 +51,9 @@ pub(crate) fn ruby_loader_packaged(lib: &str) -> String {
 
 /// Emit the fixed module preamble: the loader, the error struct and generic
 /// `Error` class, the buffer runtime, the runtime ABI attachments, the
-/// generic `check_error!` trap helper, and (when the API declares listeners)
-/// the trampoline pin table.
-pub(crate) fn render_preamble(out: &mut String, module_name: &str, has_listeners: bool) {
+/// generic `check_error!` trap helper, and (when the API declares callback
+/// interfaces) the implementation registry.
+pub(crate) fn render_preamble(out: &mut String, module_name: &str, has_callback_interfaces: bool) {
     out.push_str(&format!(
         "# frozen_string_literal: true
 # {module_name} Ruby FFI bindings (auto-generated)
@@ -86,6 +88,16 @@ module {module_name}
            :payload_len, :size_t
   end
 
+  # The runtime-reserved error codes. Positive codes belong to a module's
+  # declared error domain; these negative codes are programming errors the
+  # wrappers raise as a plain Error regardless of the function's `throws`.
+  GENERIC_ERROR_CODE = -1
+  PANIC_ERROR_CODE = -2
+  MARSHAL_ERROR_CODE = -3
+  # A callback-interface implementation raised; the message carries the
+  # exception text.
+  FOREIGN_ERROR_CODE = -4
+
   class Error < StandardError
     attr_reader :code
 
@@ -99,6 +111,7 @@ module {module_name}
     out.push_str(RUBY_BUFFER_RUNTIME);
     out.push_str(
         "
+  attach_function :weaveffi_error_set, [:pointer, :int32, :string], :void
   attach_function :weaveffi_error_clear, [:pointer], :void
   attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
@@ -108,28 +121,71 @@ module {module_name}
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_error_clear(err.to_ptr)
     raise Error.new(code, msg)
   end
 ",
     );
-    if has_listeners {
-        out.push_str(
-            "
-  # Registered listener trampolines, keyed by subscription id. Holding the
-  # FFI::Function objects here keeps them alive until unregistered; without
-  # this the GC could collect a trampoline the producer still calls.
-  @listener_refs = {}
-",
-        );
+    if has_callback_interfaces {
+        out.push_str(RUBY_CALLBACK_REGISTRY);
     }
 }
+
+/// The handle table behind every callback-interface parameter: the Ruby
+/// implementation object is stored under an incrementing Integer key, and
+/// that key (widened to a pointer) is what the producer receives as `ctx`.
+/// The producer never sees a Ruby object address, so the GC is free to move
+/// or keep the implementation as it likes; the entry is deleted when the
+/// producer calls the vtable's `free`.
+const RUBY_CALLBACK_REGISTRY: &str = "
+  # Live callback-interface implementations keyed by the Integer the producer
+  # holds as `ctx`. Keys start at 1 so a context pointer is never NULL.
+  @wv_cb_registry = {}
+  @wv_cb_next_key = 0
+  @wv_cb_mutex = Mutex.new
+
+  # @api private
+  # Registers `impl` and returns the `ctx` pointer to hand the producer.
+  def self._wv_cb_register(impl)
+    @wv_cb_mutex.synchronize do
+      @wv_cb_next_key += 1
+      @wv_cb_registry[@wv_cb_next_key] = impl
+      FFI::Pointer.new(@wv_cb_next_key)
+    end
+  end
+
+  # @api private
+  # Resolves a trampoline's `ctx` back to the registered implementation.
+  def self._wv_cb_lookup(ctx)
+    impl = @wv_cb_mutex.synchronize { @wv_cb_registry[ctx.address] }
+    raise Error.new(FOREIGN_ERROR_CODE, 'callback context is not registered') if impl.nil?
+    impl
+  end
+
+  # @api private
+  # Drops the registry entry when the producer releases its last reference.
+  def self._wv_cb_free(ctx)
+    @wv_cb_mutex.synchronize { @wv_cb_registry.delete(ctx.address) }
+    nil
+  end
+
+  # @api private
+  # Reports a callback implementation's exception through `out_err`. The
+  # producer copies the message, so the Ruby String need not outlive the call.
+  def self._wv_cb_fail(out_err, exception)
+    message = exception.message.to_s
+    message = exception.class.name if message.empty?
+    weaveffi_error_set(out_err, FOREIGN_ERROR_CODE, message)
+    nil
+  end
+";
 
 /// The private Ruby runtime implementing the value-buffer wire format
 /// (little-endian, packed, no alignment): a writer building a binary String
 /// and a reader that raises `Error` on any malformed buffer (truncation, bad
-/// flag bytes, invalid UTF-8, length prefixes past the end, trailing bytes).
+/// flag bytes, invalid UTF-8, length prefixes past the end, zero object
+/// tokens, trailing bytes).
 const RUBY_BUFFER_RUNTIME: &str = r#"
   # @api private
   # Appends values in the WeaveFFI value-buffer wire format: little-endian,
@@ -293,6 +349,14 @@ const RUBY_BUFFER_RUNTIME: &str = r#"
 
     def read_bytes
       take(read_len, 'byte buffer')
+    end
+
+    # An object token: a non-zero u64 carrying one strong reference the
+    # caller adopts into a wrapper.
+    def read_object_token
+      addr = read_u64
+      raise Error.new(-1, 'malformed value buffer: null object token') if addr.zero?
+      FFI::Pointer.new(addr)
     end
 
     def expect_end!

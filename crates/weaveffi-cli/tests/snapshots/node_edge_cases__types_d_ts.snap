@@ -8,8 +8,10 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // Generated types for WeaveFFI functions
 /**
  * Base class of every error thrown by these bindings. Non-throwing
- * functions reject or throw it directly for panics and marshalling
- * failures; throwing functions surface a module domain subclass.
+ * functions reject or throw it directly for runtime traps (code -2 a
+ * producer panic, -3 a marshalling failure, -4 a callback interface
+ * implementation that threw); throwing functions surface a module
+ * domain subclass for their declared codes.
  */
 export class WeaveFFIError extends Error {
   /** The numeric ABI error code. */
@@ -40,10 +42,10 @@ export interface Outer {
   by_name: Record<string, Inner>;
   modes: Mode[];
   matrix: number[][];
-  sparse: (number | null)[];
+  sparse: (bigint | null)[];
   blob: Buffer | null;
   note: string | null;
-  by_id: Record<number, string>;
+  by_id: Record<string, string>;
   _hidden: boolean;
   v2: number;
 }
@@ -111,7 +113,14 @@ export interface Keywords {
 }
 /** Deprecated struct */
 export interface Retired {
-  id: number;
+  id: bigint;
+}
+/** Record carrying objects in every buffered position */
+export interface WidgetHolder {
+  primary: Widget;
+  fallback: Widget | null;
+  extras: Widget[];
+  by_name: Record<string, Widget>;
 }
 /** Deprecated enum with non-contiguous values and keyword-like variants */
 export enum Legacy {
@@ -124,6 +133,31 @@ export enum Mode {
   Safe = 2,
 }
 // module edge_cases
+/** Callback interface carrying composite payloads and objects */
+export interface BatchListener {
+  /**
+   * Composite payloads cross as value buffers
+   */
+  onBatch(items: Outer[], raw: Buffer, first: Outer | null, mode: Mode): void;
+  /**
+   * Objects cross as strong references the consumer must release
+   */
+  onWidget(widget: Widget, fallback: Widget | null, children: Widget[]): void;
+  onTick(): void;
+  /**
+   * Scalar return travels back through the vtable
+   */
+  shouldContinue(class_: number): boolean;
+  /**
+   * Enum return travels back as its integer discriminant
+   */
+  pickMode(): Mode;
+}
+/** Callback interface whose name and methods are keywords */
+export interface Keyword {
+  delete(self: number): void;
+  import(): number;
+}
 /** Interface with no constructor; instances come from make_widget */
 export class Widget {
   /**
@@ -141,14 +175,20 @@ export class Widget {
    * Maps to C function: weaveffi_edge_cases_Widget_fetch
    * @throws {EdgeErrorsError}
    */
-  fetch(id: number): Promise<Outer>;
+  fetch(id: bigint): Promise<Outer>;
   /**
    * Maps to C function: weaveffi_edge_cases_Widget_old_name
    * @deprecated Use rename instead
    */
   oldName(): string;
-  /** Free the underlying native object. */
-  destroy(): void;
+  /**
+   * Release this wrapper's reference to the native object. Safe to call
+   * more than once; a wrapper that is never closed is released when it is
+   * garbage collected. Using the wrapper after `close()` throws.
+   */
+  close(): void;
+  /** Alias of `close()` for `using` declarations. */
+  [Symbol.dispose](): void;
 }
 /** Deprecated interface with a throwing constructor */
 export class Vault {
@@ -168,13 +208,15 @@ export class Vault {
    * @throws {EdgeErrorsError}
    */
   static probe(): boolean;
-  /** Free the underlying native object. */
-  destroy(): void;
+  /**
+   * Release this wrapper's reference to the native object. Safe to call
+   * more than once; a wrapper that is never closed is released when it is
+   * garbage collected. Using the wrapper after `close()` throws.
+   */
+  close(): void;
+  /** Alias of `close()` for `using` declarations. */
+  [Symbol.dispose](): void;
 }
-export function registerBatchListener(callback: (items: Outer[], raw: Buffer, first: Outer | null, mode: Mode) => void): number
-export function unregisterBatchListener(id: number): void
-export function registerTickListener(callback: () => void): number
-export function unregisterTickListener(id: number): void
 /**
  * No parameters and no result
  * Maps to C function: weaveffi_edge_cases_noop
@@ -195,10 +237,26 @@ export function nestedOptional(items: (Outer | null)[] | null): (Outer | null)[]
  */
 export function optionalParams(text: string | null, count: number | null, outer: Outer | null, tags: string[] | null, blob: Buffer | null, mode: Mode | null): Mode | null
 /**
- * Write-back parameters
- * Maps to C function: weaveffi_edge_cases_mutable_params
+ * Two callback interface parameters on one function
+ * Maps to C function: weaveffi_edge_cases_register_batch
  */
-export function mutableParams(text: string, blob: Buffer): void
+export function registerBatch(listener: BatchListener, keyword: Keyword): void
+/**
+ * Objects in every buffered position
+ * Maps to C function: weaveffi_edge_cases_widgets_everywhere
+ */
+export function widgetsEverywhere(list: Widget[], byName: Record<string, Widget>, sparse: (Widget | null)[], holder: WidgetHolder): WidgetHolder
+/**
+ * Iterator of objects
+ * Maps to C function: weaveffi_edge_cases_widget_stream
+ */
+export function widgetStream(): IterableIterator<Widget>
+/**
+ * Async returning an object
+ * Maps to C function: weaveffi_edge_cases_async_widget
+ * @throws {EdgeErrorsError}
+ */
+export function asyncWidget(): Promise<Widget>
 /**
  * Factory for an interface with no constructor
  * Maps to C function: weaveffi_edge_cases_make_widget
@@ -209,16 +267,12 @@ export function makeWidget(label: string): Widget
  * Maps to C function: weaveffi_edge_cases_find_widget
  * @throws {EdgeErrorsError}
  */
-export function findWidget(id: number): Widget | null
+export function findWidget(id: bigint): Widget | null
 /**
  * Interface parameter, including an optional one
  * Maps to C function: weaveffi_edge_cases_inspect_widget
  */
 export function inspectWidget(widget: Widget, fallback: Widget | null): string
-/**
- * Maps to C function: weaveffi_edge_cases_typed_handle_param
- */
-export function typedHandleParam(token: Leaf, raw: bigint): Leaf
 /**
  * Iterator of strings
  * Maps to C function: weaveffi_edge_cases_string_stream
@@ -256,7 +310,7 @@ export function asyncList(): Promise<Outer[]>
 /**
  * Maps to C function: weaveffi_edge_cases_async_optional
  */
-export function asyncOptional(): Promise<number | null>
+export function asyncOptional(): Promise<bigint | null>
 /**
  * Maps to C function: weaveffi_edge_cases_async_enum
  */

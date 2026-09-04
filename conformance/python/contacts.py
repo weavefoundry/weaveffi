@@ -1,7 +1,8 @@
 """Conformance consumer: contacts sample, Python target.
 
-Exercises the generated ctypes wrapper end to end: the `ContactBook`
-interface (its `__init__` calls the C constructor and `__del__` the destroy
+Exercises the generated ctypes wrapper end to end: the reference-counted
+`ContactBook` interface (its `__init__` calls the C constructor; `close()`,
+the `with` statement, or `__del__` release the reference through the destroy
 symbol), enum marshalling, the `Contact` record decoded from a value buffer
 into a plain dataclass with value equality, optional strings (a buffered
 `string?` parameter and field), list-of-record returns, boolean returns, and
@@ -74,8 +75,19 @@ def main() -> None:
     assert wv.NotFound is wv.ContactsError.NotFound
 
     # A second book is independent state: contacts don't leak across objects.
-    other = wv.ContactBook()
-    assert other.count() == 0
+    # Objects are context managers with an idempotent close(); a closed
+    # wrapper rejects further use.
+    with wv.ContactBook() as other:
+        assert other.count() == 0
+        other.close()
+    other.close()
+    try:
+        other.count()
+        raise AssertionError("expected use-after-close error")
+    except wv.WeaveFFIError as exc:
+        assert "after close" in exc.message, exc.message
+    assert book.count() == 1
+    book.close()
 
     print("python/contacts: OK")
 

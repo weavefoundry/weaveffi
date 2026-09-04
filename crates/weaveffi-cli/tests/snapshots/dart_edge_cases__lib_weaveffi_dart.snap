@@ -27,7 +27,7 @@ DynamicLibrary _openLibrary() {
 }
 
 // The ABI revision these bindings were generated against.
-const int _abiVersion = 1;
+const int _abiVersion = 2;
 
 DynamicLibrary _checkAbiVersion(DynamicLibrary lib) {
   final int Function() abiVersion;
@@ -60,6 +60,11 @@ final class _WeaveFFIError extends Struct {
   external int payloadLen;
 }
 
+typedef _NativeWeaveffiErrorSet = Void Function(Pointer<_WeaveFFIError>, Int32, Pointer<Utf8>);
+typedef _DartWeaveffiErrorSet = void Function(Pointer<_WeaveFFIError>, int, Pointer<Utf8>);
+final _weaveffiErrorSet = _lib.lookupFunction<
+    _NativeWeaveffiErrorSet, _DartWeaveffiErrorSet>('weaveffi_error_set');
+
 typedef _NativeWeaveffiErrorClear = Void Function(Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiErrorClear = void Function(Pointer<_WeaveFFIError>);
 final _weaveffiErrorClear = _lib.lookupFunction<
@@ -80,8 +85,19 @@ typedef _DartWeaveffiFreeBytes = void Function(Pointer<Uint8>, int);
 final _weaveffiFreeBytes = _lib.lookupFunction<
     _NativeWeaveffiFreeBytes, _DartWeaveffiFreeBytes>('weaveffi_free_bytes');
 
-/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.
+/// Generic WeaveFFI failure: a producer panic ([panicCode]), a marshalling
+/// error ([marshalCode]), a callback-interface implementation that threw
+/// ([foreignCode], carrying the Dart exception's text), or an unknown code.
 class WeaveFFIException implements Exception {
+  /// The producer reported an untyped error.
+  static const int genericCode = -1;
+  /// The producer panicked; [message] carries the panic text.
+  static const int panicCode = -2;
+  /// An argument could not be lifted by the producer.
+  static const int marshalCode = -3;
+  /// A Dart callback-interface implementation threw; [message] carries the
+  /// exception's text.
+  static const int foreignCode = -4;
   final int code;
   final String message;
   WeaveFFIException(this.code, this.message);
@@ -341,9 +357,57 @@ final class _BufferReader {
   }
 }
 
-// Live listener trampolines by subscription id. Holding the
-// NativeCallable here keeps its native thunk alive until unregistered.
-final Map<int, NativeCallable> _listenerCallables = {};
+// ── WeaveFFI callback-interface runtime ──
+// A Dart implementation passed to the producer is stored here under an
+// integer key; the key (widened to a pointer) is what crosses as `ctx`, so the
+// producer never holds a Dart object and the GC never sees a raw pointer. The
+// entry lives until the producer calls the vtable's `free(ctx)`.
+final Map<int, Object> _callbackTable = {};
+int _nextCallbackKey = 1;
+
+Pointer<Void> _registerCallback(Object impl) {
+  final key = _nextCallbackKey++;
+  _callbackTable[key] = impl;
+  return Pointer<Void>.fromAddress(key);
+}
+
+Object _callbackFor(Pointer<Void> ctx) {
+  final impl = _callbackTable[ctx.address];
+  if (impl == null) {
+    throw StateError('callback interface context ${ctx.address} is not registered');
+  }
+  return impl;
+}
+
+// Vtable trampolines are process-wide: their NativeCallables are never closed,
+// so they are anchored here to keep the native thunks alive. `keepIsolateAlive`
+// is cleared on each so an idle isolate can still exit.
+final List<NativeCallable<Function>> _callbackCallables = [];
+
+Pointer<NativeFunction<T>> _pinCallable<T extends Function>(
+    NativeCallable<T> callable) {
+  callable.keepIsolateAlive = false;
+  _callbackCallables.add(callable);
+  return callable.nativeFunction;
+}
+
+// Reports a Dart exception thrown by a callback-interface implementation
+// through `weaveffi_error_set` with the reserved foreign error code (-4).
+// The producer copies the message, so the temporary is freed right away. This
+// must never throw: it runs in the catch path of a trampoline whose C frame
+// an exception must not unwind through.
+void _foreignError(Pointer<_WeaveFFIError> outErr, Object error) {
+  if (outErr == nullptr) return;
+  Pointer<Utf8> message = nullptr;
+  try {
+    message = error.toString().toNativeUtf8();
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, message);
+  } catch (_) {
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, nullptr);
+  } finally {
+    if (message != nullptr) calloc.free(message);
+  }
+}
 
 // Anchors one live native iteration for its GC-finalizer backstop.
 // A suspended `sync*` frame keeps the anchor reachable; abandoning the
@@ -749,10 +813,270 @@ Retired _unpackRetired(_BufferReader r) {
   );
 }
 
+/// Record carrying objects in every buffered position
+class WidgetHolder {
+  final Widget primary;
+  final Widget? fallback;
+  final List<Widget> extras;
+  final Map<String, Widget> byName;
+
+  WidgetHolder({required this.primary, this.fallback, required this.extras, required this.byName});
+}
+
+void _packWidgetHolder(_BufferWriter w, WidgetHolder v) {
+  w.writeUint64(v.primary._cloneRef().address);
+  final t0 = v.fallback;
+  if (t0 == null) {
+    w.writeOptionFlag(false);
+  } else {
+    w.writeOptionFlag(true);
+    w.writeUint64(t0._cloneRef().address);
+  }
+  final t1 = v.extras;
+  w.writeLength(t1.length);
+  for (final t2 in t1) {
+    w.writeUint64(t2._cloneRef().address);
+  }
+  final t3 = v.byName;
+  w.writeLength(t3.length);
+  for (final t4 in t3.entries) {
+    w.writeString(t4.key);
+    w.writeUint64(t4.value._cloneRef().address);
+  }
+}
+
+WidgetHolder _unpackWidgetHolder(_BufferReader r) {
+  return WidgetHolder(
+    primary: Widget._(Pointer<Void>.fromAddress(r.readUint64())),
+    fallback: (r.readOptionFlag() ? Widget._(Pointer<Void>.fromAddress(r.readUint64())) : null),
+    extras: List<Widget>.generate(r.readLength(), (_) => Widget._(Pointer<Void>.fromAddress(r.readUint64()))),
+    byName: <String, Widget>{ for (var i = r.readLength(); i > 0; i--) r.readString(): Widget._(Pointer<Void>.fromAddress(r.readUint64())) },
+  );
+}
+
+/// Callback interface carrying composite payloads and objects
+///
+/// A callback interface: implement this class and pass an instance to any
+/// function taking a [BatchListener]. The producer keeps the instance alive
+/// (through a private handle table) until it releases the callback, so no
+/// other reference needs to be held.
+///
+/// Object arguments are owned by the implementation: call `dispose()` on
+/// them (or let the finalizer run) when done. A thrown exception is reported
+/// to the producer, which aborts the call it was making; the original Dart
+/// caller then observes a [WeaveFFIException] with [WeaveFFIException.foreignCode]
+/// carrying the exception's text.
+///
+/// Dart limitation: methods are bound with `NativeCallable.isolateLocal`, so
+/// the producer may only invoke them on the thread of the isolate that
+/// passed the callback. That holds when the producer calls them
+/// synchronously during a call from Dart. A producer that invokes a method
+/// from another thread (an async task, a background worker) is unsupported:
+/// a `NativeCallable.listener` cannot return a value or read borrowed
+/// arguments after the native frame returns.
+abstract class BatchListener {
+  /// Composite payloads cross as value buffers
+  void onBatch(List<Outer> items, List<int> raw, Outer? first, Mode mode);
+  /// Objects cross as strong references the consumer must release
+  void onWidget(Widget widget, Widget? fallback, List<Widget> children);
+  void onTick();
+  /// Scalar return travels back through the vtable
+  bool shouldContinue(int class_);
+  /// Enum return travels back as its integer discriminant
+  Mode pickMode();
+}
+
+typedef _NativeBatchListenerVtOnBatch = Void Function(Pointer<Void>, Pointer<Uint8>, Size, Pointer<Uint8>, Size, Pointer<Uint8>, Size, Int32, Pointer<_WeaveFFIError>);
+typedef _NativeBatchListenerVtOnWidget = Void Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Uint8>, Size, Pointer<_WeaveFFIError>);
+typedef _NativeBatchListenerVtOnTick = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _NativeBatchListenerVtShouldContinue = Bool Function(Pointer<Void>, Int32, Pointer<_WeaveFFIError>);
+typedef _NativeBatchListenerVtPickMode = Int32 Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _NativeBatchListenerVtFree = Void Function(Pointer<Void>);
+
+// The C `weaveffi_edge_cases_BatchListener_vtable` layout.
+final class _BatchListenerVtableStruct extends Struct {
+  external Pointer<NativeFunction<_NativeBatchListenerVtOnBatch>> onBatch;
+  external Pointer<NativeFunction<_NativeBatchListenerVtOnWidget>> onWidget;
+  external Pointer<NativeFunction<_NativeBatchListenerVtOnTick>> onTick;
+  external Pointer<NativeFunction<_NativeBatchListenerVtShouldContinue>> shouldContinue;
+  external Pointer<NativeFunction<_NativeBatchListenerVtPickMode>> pickMode;
+  external Pointer<NativeFunction<_NativeBatchListenerVtFree>> free;
+}
+
+// Vtable entry `weaveffi_edge_cases_BatchListener_vtable.on_batch`.
+void _batchListenerVtOnBatch(Pointer<Void> ctx, Pointer<Uint8> itemsPtr, int itemsLen, Pointer<Uint8> rawPtr, int rawLen, Pointer<Uint8> firstPtr, int firstLen, int mode, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final itemsData = _copyNativeBytes(itemsPtr, itemsLen);
+    final itemsReader = _BufferReader(itemsData);
+    final itemsValue = List<Outer>.generate(itemsReader.readLength(), (_) => _unpackOuter(itemsReader));
+    itemsReader.expectEnd();
+    final firstData = _copyNativeBytes(firstPtr, firstLen);
+    final firstReader = _BufferReader(firstData);
+    final firstValue = (firstReader.readOptionFlag() ? _unpackOuter(firstReader) : null);
+    firstReader.expectEnd();
+    final impl = _callbackFor(ctx) as BatchListener;
+    impl.onBatch(itemsValue, rawPtr == nullptr ? <int>[] : rawPtr.asTypedList(rawLen).toList(), firstValue, Mode.fromValue(mode));
+  } catch (e) {
+    _foreignError(outErr, e);
+  }
+}
+
+// Vtable entry `weaveffi_edge_cases_BatchListener_vtable.on_widget`.
+void _batchListenerVtOnWidget(Pointer<Void> ctx, Pointer<Void> widget, Pointer<Void> fallback, Pointer<Uint8> childrenPtr, int childrenLen, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final widgetValue = Widget._(widget);
+    final fallbackValue = fallback == nullptr ? null : Widget._(fallback);
+    final childrenData = _copyNativeBytes(childrenPtr, childrenLen);
+    final childrenReader = _BufferReader(childrenData);
+    final childrenValue = List<Widget>.generate(childrenReader.readLength(), (_) => Widget._(Pointer<Void>.fromAddress(childrenReader.readUint64())));
+    childrenReader.expectEnd();
+    final impl = _callbackFor(ctx) as BatchListener;
+    impl.onWidget(widgetValue, fallbackValue, childrenValue);
+  } catch (e) {
+    _foreignError(outErr, e);
+  }
+}
+
+// Vtable entry `weaveffi_edge_cases_BatchListener_vtable.on_tick`.
+void _batchListenerVtOnTick(Pointer<Void> ctx, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as BatchListener;
+    impl.onTick();
+  } catch (e) {
+    _foreignError(outErr, e);
+  }
+}
+
+// Vtable entry `weaveffi_edge_cases_BatchListener_vtable.should_continue`.
+bool _batchListenerVtShouldContinue(Pointer<Void> ctx, int class_, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as BatchListener;
+    return impl.shouldContinue(class_);
+  } catch (e) {
+    _foreignError(outErr, e);
+    return false;
+  }
+}
+
+// Vtable entry `weaveffi_edge_cases_BatchListener_vtable.pick_mode`.
+int _batchListenerVtPickMode(Pointer<Void> ctx, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as BatchListener;
+    return impl.pickMode().value;
+  } catch (e) {
+    _foreignError(outErr, e);
+    return 0;
+  }
+}
+
+void _batchListenerVtFree(Pointer<Void> ctx) {
+  _callbackTable.remove(ctx.address);
+}
+
+// The process-wide static `weaveffi_edge_cases_BatchListener_vtable` every BatchListener passed to the producer
+// shares; the per-instance state travels in `ctx`.
+final Pointer<_BatchListenerVtableStruct> _BatchListenerVtable = () {
+  final vt = calloc<_BatchListenerVtableStruct>();
+  vt.ref.onBatch = _pinCallable(NativeCallable<_NativeBatchListenerVtOnBatch>.isolateLocal(
+      _batchListenerVtOnBatch));
+  vt.ref.onWidget = _pinCallable(NativeCallable<_NativeBatchListenerVtOnWidget>.isolateLocal(
+      _batchListenerVtOnWidget));
+  vt.ref.onTick = _pinCallable(NativeCallable<_NativeBatchListenerVtOnTick>.isolateLocal(
+      _batchListenerVtOnTick));
+  vt.ref.shouldContinue = _pinCallable(NativeCallable<_NativeBatchListenerVtShouldContinue>.isolateLocal(
+      _batchListenerVtShouldContinue, exceptionalReturn: false));
+  vt.ref.pickMode = _pinCallable(NativeCallable<_NativeBatchListenerVtPickMode>.isolateLocal(
+      _batchListenerVtPickMode, exceptionalReturn: 0));
+  vt.ref.free = _pinCallable(NativeCallable<_NativeBatchListenerVtFree>.listener(
+      _batchListenerVtFree));
+  return vt;
+}();
+
+/// Callback interface whose name and methods are keywords
+///
+/// A callback interface: implement this class and pass an instance to any
+/// function taking a [Keyword]. The producer keeps the instance alive
+/// (through a private handle table) until it releases the callback, so no
+/// other reference needs to be held.
+///
+/// Object arguments are owned by the implementation: call `dispose()` on
+/// them (or let the finalizer run) when done. A thrown exception is reported
+/// to the producer, which aborts the call it was making; the original Dart
+/// caller then observes a [WeaveFFIException] with [WeaveFFIException.foreignCode]
+/// carrying the exception's text.
+///
+/// Dart limitation: methods are bound with `NativeCallable.isolateLocal`, so
+/// the producer may only invoke them on the thread of the isolate that
+/// passed the callback. That holds when the producer calls them
+/// synchronously during a call from Dart. A producer that invokes a method
+/// from another thread (an async task, a background worker) is unsupported:
+/// a `NativeCallable.listener` cannot return a value or read borrowed
+/// arguments after the native frame returns.
+abstract class Keyword {
+  void delete(int self);
+  int import();
+}
+
+typedef _NativeKeywordVtDelete = Void Function(Pointer<Void>, Int32, Pointer<_WeaveFFIError>);
+typedef _NativeKeywordVtImport = Int32 Function(Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _NativeKeywordVtFree = Void Function(Pointer<Void>);
+
+// The C `weaveffi_edge_cases_Keyword_vtable` layout.
+final class _KeywordVtableStruct extends Struct {
+  external Pointer<NativeFunction<_NativeKeywordVtDelete>> delete;
+  external Pointer<NativeFunction<_NativeKeywordVtImport>> import;
+  external Pointer<NativeFunction<_NativeKeywordVtFree>> free;
+}
+
+// Vtable entry `weaveffi_edge_cases_Keyword_vtable.delete`.
+void _keywordVtDelete(Pointer<Void> ctx, int self, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as Keyword;
+    impl.delete(self);
+  } catch (e) {
+    _foreignError(outErr, e);
+  }
+}
+
+// Vtable entry `weaveffi_edge_cases_Keyword_vtable.import`.
+int _keywordVtImport(Pointer<Void> ctx, Pointer<_WeaveFFIError> outErr) {
+  try {
+    final impl = _callbackFor(ctx) as Keyword;
+    return impl.import();
+  } catch (e) {
+    _foreignError(outErr, e);
+    return 0;
+  }
+}
+
+void _keywordVtFree(Pointer<Void> ctx) {
+  _callbackTable.remove(ctx.address);
+}
+
+// The process-wide static `weaveffi_edge_cases_Keyword_vtable` every Keyword passed to the producer
+// shares; the per-instance state travels in `ctx`.
+final Pointer<_KeywordVtableStruct> _KeywordVtable = () {
+  final vt = calloc<_KeywordVtableStruct>();
+  vt.ref.delete = _pinCallable(NativeCallable<_NativeKeywordVtDelete>.isolateLocal(
+      _keywordVtDelete));
+  vt.ref.import = _pinCallable(NativeCallable<_NativeKeywordVtImport>.isolateLocal(
+      _keywordVtImport, exceptionalReturn: 0));
+  vt.ref.free = _pinCallable(NativeCallable<_NativeKeywordVtFree>.listener(
+      _keywordVtFree));
+  return vt;
+}();
+
+typedef _NativeWeaveffiEdgeCasesWidgetClone = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiEdgeCasesWidgetClone = Pointer<Void> Function(Pointer<Void>);
+final _weaveffiEdgeCasesWidgetClone = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesWidgetClone, _DartWeaveffiEdgeCasesWidgetClone>('weaveffi_edge_cases_Widget_clone');
+
 typedef _NativeWeaveffiEdgeCasesWidgetDestroy = Void Function(Pointer<Void>);
 typedef _DartWeaveffiEdgeCasesWidgetDestroy = void Function(Pointer<Void>);
 final _weaveffiEdgeCasesWidgetDestroy = _lib.lookupFunction<
     _NativeWeaveffiEdgeCasesWidgetDestroy, _DartWeaveffiEdgeCasesWidgetDestroy>('weaveffi_edge_cases_Widget_destroy');
+final _weaveffiEdgeCasesWidgetDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_edge_cases_Widget_destroy'));
 
 typedef _NativeWeaveffiEdgeCasesWidgetRefresh = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiEdgeCasesWidgetRefresh = void Function(Pointer<Void>, Pointer<_WeaveFFIError>);
@@ -777,13 +1101,39 @@ final _weaveffiEdgeCasesWidgetOldName = _lib.lookupFunction<
     _NativeWeaveffiEdgeCasesWidgetOldName, _DartWeaveffiEdgeCasesWidgetOldName>('weaveffi_edge_cases_Widget_old_name');
 
 /// Interface with no constructor; instances come from make_widget
-class Widget {
-  final Pointer<Void> _handle;
-  Widget._(this._handle);
+///
+/// A reference-counted native object. Each instance holds one strong
+/// reference, released by [dispose] or, if the instance is collected
+/// without being disposed, by a GC finalizer. Instances stay valid for as
+/// long as the Dart object is reachable; the producer keeps its own
+/// references to any object it retains.
+class Widget implements Finalizable {
+  final Pointer<Void> _ptr;
+  bool _disposed = false;
 
-  /// Releases the native object reference.
+  /// Adopts one strong reference to the native object.
+  Widget._(this._ptr) {
+    _weaveffiEdgeCasesWidgetDestroyFinalizer.attach(this, _ptr, detach: this);
+  }
+
+  /// The borrowed native pointer for the duration of a call.
+  Pointer<Void> get _handle {
+    if (_disposed) throw StateError('Widget used after dispose()');
+    return _ptr;
+  }
+
+  /// Mints a second strong reference (the interface's `_clone` symbol) for
+  /// an object token written into a value buffer.
+  Pointer<Void> _cloneRef() => _weaveffiEdgeCasesWidgetClone(_handle);
+
+  /// Releases this instance's native reference. Safe to call more than
+  /// once; the native object is dropped when its last reference (this
+  /// one, any other wrapper's, or the producer's) is released.
   void dispose() {
-    _weaveffiEdgeCasesWidgetDestroy(_handle);
+    if (_disposed) return;
+    _disposed = true;
+    _weaveffiEdgeCasesWidgetDestroyFinalizer.detach(this);
+    _weaveffiEdgeCasesWidgetDestroy(_ptr);
   }
 
   /// Void method that can fail
@@ -877,10 +1227,17 @@ class Widget {
   }
 }
 
+typedef _NativeWeaveffiEdgeCasesVaultClone = Pointer<Void> Function(Pointer<Void>);
+typedef _DartWeaveffiEdgeCasesVaultClone = Pointer<Void> Function(Pointer<Void>);
+final _weaveffiEdgeCasesVaultClone = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesVaultClone, _DartWeaveffiEdgeCasesVaultClone>('weaveffi_edge_cases_Vault_clone');
+
 typedef _NativeWeaveffiEdgeCasesVaultDestroy = Void Function(Pointer<Void>);
 typedef _DartWeaveffiEdgeCasesVaultDestroy = void Function(Pointer<Void>);
 final _weaveffiEdgeCasesVaultDestroy = _lib.lookupFunction<
     _NativeWeaveffiEdgeCasesVaultDestroy, _DartWeaveffiEdgeCasesVaultDestroy>('weaveffi_edge_cases_Vault_destroy');
+final _weaveffiEdgeCasesVaultDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_edge_cases_Vault_destroy'));
 
 typedef _NativeWeaveffiEdgeCasesVaultOpen = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
 typedef _DartWeaveffiEdgeCasesVaultOpen = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
@@ -898,16 +1255,46 @@ final _weaveffiEdgeCasesVaultProbe = _lib.lookupFunction<
     _NativeWeaveffiEdgeCasesVaultProbe, _DartWeaveffiEdgeCasesVaultProbe>('weaveffi_edge_cases_Vault_probe');
 
 /// Deprecated interface with a throwing constructor
-class Vault {
-  final Pointer<Void> _handle;
-  Vault._(this._handle);
+///
+/// A reference-counted native object. Each instance holds one strong
+/// reference, released by [dispose] or, if the instance is collected
+/// without being disposed, by a GC finalizer. Instances stay valid for as
+/// long as the Dart object is reachable; the producer keeps its own
+/// references to any object it retains.
+@Deprecated('Use Widget instead')
+class Vault implements Finalizable {
+  final Pointer<Void> _ptr;
+  bool _disposed = false;
 
-  /// Releases the native object reference.
+  /// Adopts one strong reference to the native object.
+  Vault._(this._ptr) {
+    _weaveffiEdgeCasesVaultDestroyFinalizer.attach(this, _ptr, detach: this);
+  }
+
+  /// The borrowed native pointer for the duration of a call.
+  Pointer<Void> get _handle {
+    if (_disposed) throw StateError('Vault used after dispose()');
+    return _ptr;
+  }
+
+  /// Mints a second strong reference (the interface's `_clone` symbol) for
+  /// an object token written into a value buffer.
+  Pointer<Void> _cloneRef() => _weaveffiEdgeCasesVaultClone(_handle);
+
+  /// Releases this instance's native reference. Safe to call more than
+  /// once; the native object is dropped when its last reference (this
+  /// one, any other wrapper's, or the producer's) is released.
   void dispose() {
-    _weaveffiEdgeCasesVaultDestroy(_handle);
+    if (_disposed) return;
+    _disposed = true;
+    _weaveffiEdgeCasesVaultDestroyFinalizer.detach(this);
+    _weaveffiEdgeCasesVaultDestroy(_ptr);
   }
 
   /// Fails when the vault is busy
+  ///
+  /// The returned object is owned by the caller: call its `dispose()` when
+  /// you are done with it.
   ///
   /// Throws [EdgeErrorsException] on domain errors.
   factory Vault.open(String path) {
@@ -923,13 +1310,14 @@ class Vault {
     }
   }
 
+  /// Returns `null` when the producer reports no object. A non-null result
+  /// is owned by the caller: call its `dispose()` when you are done with it.
   Widget? peek() {
     final err = calloc<_WeaveFFIError>();
     try {
       final result = _weaveffiEdgeCasesVaultPeek(_handle, err);
       _checkError(err);
-      if (result == nullptr) return null;
-      return Widget._(result);
+      return result == nullptr ? null : Widget._(result);
     } finally {
       calloc.free(err);
     }
@@ -948,70 +1336,6 @@ class Vault {
       calloc.free(err);
     }
   }
-}
-
-typedef _NativeCb_weaveffi_edge_cases_OnBatch_fn = Void Function(Pointer<Uint8>, Size, Pointer<Uint8>, Size, Pointer<Uint8>, Size, Int32, Pointer<Void>);
-
-typedef _NativeCb_weaveffi_edge_cases_OnTick_fn = Void Function(Pointer<Void>);
-
-typedef _NativeWeaveffiEdgeCasesRegisterBatchListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_edge_cases_OnBatch_fn>>, Pointer<Void>);
-typedef _DartWeaveffiEdgeCasesRegisterBatchListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_edge_cases_OnBatch_fn>>, Pointer<Void>);
-final _weaveffiEdgeCasesRegisterBatchListener = _lib.lookupFunction<
-    _NativeWeaveffiEdgeCasesRegisterBatchListener, _DartWeaveffiEdgeCasesRegisterBatchListener>('weaveffi_edge_cases_register_batch_listener');
-
-typedef _NativeWeaveffiEdgeCasesUnregisterBatchListener = Void Function(Uint64);
-typedef _DartWeaveffiEdgeCasesUnregisterBatchListener = void Function(int);
-final _weaveffiEdgeCasesUnregisterBatchListener = _lib.lookupFunction<
-    _NativeWeaveffiEdgeCasesUnregisterBatchListener, _DartWeaveffiEdgeCasesUnregisterBatchListener>('weaveffi_edge_cases_unregister_batch_listener');
-
-/// Registers a OnBatch listener. Returns a subscription id for unregisterBatchListener().
-int registerBatchListener(void Function(List<Outer> items, List<int> raw, Outer? first, Mode mode) callback) {
-  final callable = NativeCallable<_NativeCb_weaveffi_edge_cases_OnBatch_fn>.isolateLocal((Pointer<Uint8> itemsPtr, int itemsLen, Pointer<Uint8> rawPtr, int rawLen, Pointer<Uint8> firstPtr, int firstLen, int mode, Pointer<Void> context) {
-    final itemsData = _copyNativeBytes(itemsPtr, itemsLen);
-    final itemsReader = _BufferReader(itemsData);
-    final itemsValue = List<Outer>.generate(itemsReader.readLength(), (_) => _unpackOuter(itemsReader));
-    itemsReader.expectEnd();
-    final firstData = _copyNativeBytes(firstPtr, firstLen);
-    final firstReader = _BufferReader(firstData);
-    final firstValue = (firstReader.readOptionFlag() ? _unpackOuter(firstReader) : null);
-    firstReader.expectEnd();
-    callback(itemsValue, rawPtr == nullptr ? <int>[] : rawPtr.asTypedList(rawLen).toList(), firstValue, Mode.fromValue(mode));
-  });
-  final id = _weaveffiEdgeCasesRegisterBatchListener(callable.nativeFunction, nullptr);
-  _listenerCallables[id] = callable;
-  return id;
-}
-
-/// Unregisters a listener previously registered with registerBatchListener().
-void unregisterBatchListener(int id) {
-  _weaveffiEdgeCasesUnregisterBatchListener(id);
-  _listenerCallables.remove(id)?.close();
-}
-
-typedef _NativeWeaveffiEdgeCasesRegisterTickListener = Uint64 Function(Pointer<NativeFunction<_NativeCb_weaveffi_edge_cases_OnTick_fn>>, Pointer<Void>);
-typedef _DartWeaveffiEdgeCasesRegisterTickListener = int Function(Pointer<NativeFunction<_NativeCb_weaveffi_edge_cases_OnTick_fn>>, Pointer<Void>);
-final _weaveffiEdgeCasesRegisterTickListener = _lib.lookupFunction<
-    _NativeWeaveffiEdgeCasesRegisterTickListener, _DartWeaveffiEdgeCasesRegisterTickListener>('weaveffi_edge_cases_register_tick_listener');
-
-typedef _NativeWeaveffiEdgeCasesUnregisterTickListener = Void Function(Uint64);
-typedef _DartWeaveffiEdgeCasesUnregisterTickListener = void Function(int);
-final _weaveffiEdgeCasesUnregisterTickListener = _lib.lookupFunction<
-    _NativeWeaveffiEdgeCasesUnregisterTickListener, _DartWeaveffiEdgeCasesUnregisterTickListener>('weaveffi_edge_cases_unregister_tick_listener');
-
-/// Registers a OnTick listener. Returns a subscription id for unregisterTickListener().
-int registerTickListener(void Function() callback) {
-  final callable = NativeCallable<_NativeCb_weaveffi_edge_cases_OnTick_fn>.isolateLocal((Pointer<Void> context) {
-    callback();
-  });
-  final id = _weaveffiEdgeCasesRegisterTickListener(callable.nativeFunction, nullptr);
-  _listenerCallables[id] = callable;
-  return id;
-}
-
-/// Unregisters a listener previously registered with registerTickListener().
-void unregisterTickListener(int id) {
-  _weaveffiEdgeCasesUnregisterTickListener(id);
-  _listenerCallables.remove(id)?.close();
 }
 
 typedef _NativeWeaveffiEdgeCasesNoop = Void Function(Pointer<_WeaveFFIError>);
@@ -1209,25 +1533,181 @@ Mode? optionalParams(String? text, int? count, Outer? outer, List<String>? tags,
   }
 }
 
-typedef _NativeWeaveffiEdgeCasesMutableParams = Void Function(Pointer<Utf8>, Pointer<Uint8>, Size, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiEdgeCasesMutableParams = void Function(Pointer<Utf8>, Pointer<Uint8>, int, Pointer<_WeaveFFIError>);
-final _weaveffiEdgeCasesMutableParams = _lib.lookupFunction<
-    _NativeWeaveffiEdgeCasesMutableParams, _DartWeaveffiEdgeCasesMutableParams>('weaveffi_edge_cases_mutable_params');
+typedef _NativeWeaveffiEdgeCasesRegisterBatch = Void Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEdgeCasesRegisterBatch = void Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<_WeaveFFIError>);
+final _weaveffiEdgeCasesRegisterBatch = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesRegisterBatch, _DartWeaveffiEdgeCasesRegisterBatch>('weaveffi_edge_cases_register_batch');
 
-/// Write-back parameters
-void mutableParams(String text, List<int> blob) {
-  final textPtr = text.toNativeUtf8();
-  final blobPtr = blob.isEmpty ? nullptr : calloc<Uint8>(blob.length);
-  for (var i = 0; i < blob.length; i++) { blobPtr[i] = blob[i]; }
+/// Two callback interface parameters on one function
+void registerBatch(BatchListener listener, Keyword keyword) {
   final err = calloc<_WeaveFFIError>();
   try {
-    _weaveffiEdgeCasesMutableParams(textPtr, blobPtr, blob.length, err);
+    _weaveffiEdgeCasesRegisterBatch(_registerCallback(listener), _BatchListenerVtable.cast<Void>(), _registerCallback(keyword), _KeywordVtable.cast<Void>(), err);
     _checkError(err);
   } finally {
-    calloc.free(textPtr);
-    if (blobPtr != nullptr) calloc.free(blobPtr);
     calloc.free(err);
   }
+}
+
+typedef _NativeWeaveffiEdgeCasesWidgetsEverywhere = Pointer<Uint8> Function(Pointer<Uint8>, Size, Pointer<Uint8>, Size, Pointer<Uint8>, Size, Pointer<Uint8>, Size, Pointer<Size>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEdgeCasesWidgetsEverywhere = Pointer<Uint8> Function(Pointer<Uint8>, int, Pointer<Uint8>, int, Pointer<Uint8>, int, Pointer<Uint8>, int, Pointer<Size>, Pointer<_WeaveFFIError>);
+final _weaveffiEdgeCasesWidgetsEverywhere = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesWidgetsEverywhere, _DartWeaveffiEdgeCasesWidgetsEverywhere>('weaveffi_edge_cases_widgets_everywhere');
+
+/// Objects in every buffered position
+WidgetHolder widgetsEverywhere(List<Widget> list, Map<String, Widget> byName, List<Widget?> sparse, WidgetHolder holder) {
+  final listWriter = _BufferWriter();
+  final t0 = list;
+  listWriter.writeLength(t0.length);
+  for (final t1 in t0) {
+    listWriter.writeUint64(t1._cloneRef().address);
+  }
+  final listBuf = listWriter.takeBytes();
+  final listPtr = _stageBytes(listBuf);
+  final byNameWriter = _BufferWriter();
+  final t2 = byName;
+  byNameWriter.writeLength(t2.length);
+  for (final t3 in t2.entries) {
+    byNameWriter.writeString(t3.key);
+    byNameWriter.writeUint64(t3.value._cloneRef().address);
+  }
+  final byNameBuf = byNameWriter.takeBytes();
+  final byNamePtr = _stageBytes(byNameBuf);
+  final sparseWriter = _BufferWriter();
+  final t4 = sparse;
+  sparseWriter.writeLength(t4.length);
+  for (final t5 in t4) {
+    final t6 = t5;
+    if (t6 == null) {
+      sparseWriter.writeOptionFlag(false);
+    } else {
+      sparseWriter.writeOptionFlag(true);
+      sparseWriter.writeUint64(t6._cloneRef().address);
+    }
+  }
+  final sparseBuf = sparseWriter.takeBytes();
+  final sparsePtr = _stageBytes(sparseBuf);
+  final holderWriter = _BufferWriter();
+  _packWidgetHolder(holderWriter, holder);
+  final holderBuf = holderWriter.takeBytes();
+  final holderPtr = _stageBytes(holderBuf);
+  final outLen = calloc<Size>();
+  final err = calloc<_WeaveFFIError>();
+  try {
+    final result = _weaveffiEdgeCasesWidgetsEverywhere(listPtr, listBuf.length, byNamePtr, byNameBuf.length, sparsePtr, sparseBuf.length, holderPtr, holderBuf.length, outLen, err);
+    _checkError(err);
+    final n = outLen.value;
+    final data = _copyNativeBytes(result, n);
+    if (result != nullptr) _weaveffiFreeBytes(result, n);
+    final reader = _BufferReader(data);
+    final decoded = _unpackWidgetHolder(reader);
+    reader.expectEnd();
+    return decoded;
+  } finally {
+    calloc.free(listPtr);
+    calloc.free(byNamePtr);
+    calloc.free(sparsePtr);
+    calloc.free(holderPtr);
+    calloc.free(outLen);
+    calloc.free(err);
+  }
+}
+
+typedef _NativeWeaveffiEdgeCasesWidgetStream = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEdgeCasesWidgetStream = Pointer<Void> Function(Pointer<_WeaveFFIError>);
+final _weaveffiEdgeCasesWidgetStream = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesWidgetStream, _DartWeaveffiEdgeCasesWidgetStream>('weaveffi_edge_cases_widget_stream');
+
+typedef _NativeWeaveffiEdgeCasesWidgetStreamIteratorNext = Int32 Function(Pointer<Void>, Pointer<Pointer<Void>>, Pointer<_WeaveFFIError>);
+typedef _DartWeaveffiEdgeCasesWidgetStreamIteratorNext = int Function(Pointer<Void>, Pointer<Pointer<Void>>, Pointer<_WeaveFFIError>);
+final _weaveffiEdgeCasesWidgetStreamIteratorNext = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesWidgetStreamIteratorNext, _DartWeaveffiEdgeCasesWidgetStreamIteratorNext>('weaveffi_edge_cases_WidgetStreamIterator_next');
+
+typedef _NativeWeaveffiEdgeCasesWidgetStreamIteratorDestroy = Void Function(Pointer<Void>);
+typedef _DartWeaveffiEdgeCasesWidgetStreamIteratorDestroy = void Function(Pointer<Void>);
+final _weaveffiEdgeCasesWidgetStreamIteratorDestroy = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesWidgetStreamIteratorDestroy, _DartWeaveffiEdgeCasesWidgetStreamIteratorDestroy>('weaveffi_edge_cases_WidgetStreamIterator_destroy');
+final _weaveffiEdgeCasesWidgetStreamIteratorDestroyFinalizer = NativeFinalizer(
+    _lib.lookup<NativeFunction<Void Function(Pointer<Void>)>>('weaveffi_edge_cases_WidgetStreamIterator_destroy'));
+
+/// Iterator of objects
+///
+/// Returns a lazy [Iterable]: elements are pulled from the native
+/// iterator one at a time (one native `next` call per element), and
+/// iterating the result again launches a fresh native iterator.
+///
+/// The native iterator handle is destroyed exactly once: eagerly when
+/// the iteration completes or fails, or by a GC finalizer if the
+/// iteration is abandoned before it is exhausted.
+///
+/// Each yielded element is owned by the caller: call its `dispose()`
+/// when you are done with it.
+Iterable<Widget> widgetStream() sync* {
+  final err = calloc<_WeaveFFIError>();
+  final outItem = calloc<Pointer<Void>>();
+  Pointer<Void> iter = nullptr;
+  final anchor = _IteratorLifetime();
+  try {
+    iter = _weaveffiEdgeCasesWidgetStream(err);
+    _checkError(err);
+    _weaveffiEdgeCasesWidgetStreamIteratorDestroyFinalizer.attach(anchor, iter, detach: anchor);
+    while (_weaveffiEdgeCasesWidgetStreamIteratorNext(iter, outItem, err) != 0) {
+      _checkError(err);
+      final itemPtr = outItem.value;
+      yield Widget._(itemPtr);
+    }
+    _checkError(err);
+  } finally {
+    if (iter != nullptr) {
+      _weaveffiEdgeCasesWidgetStreamIteratorDestroyFinalizer.detach(anchor);
+      _weaveffiEdgeCasesWidgetStreamIteratorDestroy(iter);
+      iter = nullptr;
+    }
+    calloc.free(outItem);
+    calloc.free(err);
+  }
+}
+
+typedef _NativeAsyncCb_weaveffi_edge_cases_async_widget = Void Function(Pointer<Void>, Pointer<_WeaveFFIError>, Pointer<Void>);
+
+typedef _NativeWeaveffiEdgeCasesAsyncWidgetAsync = Void Function(Pointer<NativeFunction<_NativeAsyncCb_weaveffi_edge_cases_async_widget>>, Pointer<Void>);
+typedef _DartWeaveffiEdgeCasesAsyncWidgetAsync = void Function(Pointer<NativeFunction<_NativeAsyncCb_weaveffi_edge_cases_async_widget>>, Pointer<Void>);
+final _weaveffiEdgeCasesAsyncWidgetAsync = _lib.lookupFunction<
+    _NativeWeaveffiEdgeCasesAsyncWidgetAsync, _DartWeaveffiEdgeCasesAsyncWidgetAsync>('weaveffi_edge_cases_async_widget_async');
+
+/// Async returning an object
+///
+/// The returned object is owned by the caller: call its `dispose()` when
+/// you are done with it.
+///
+/// Throws [EdgeErrorsException] on domain errors.
+Future<Widget> asyncWidget() {
+  final completer = Completer<Widget>();
+  late NativeCallable<_NativeAsyncCb_weaveffi_edge_cases_async_widget> callable;
+  callable = NativeCallable<_NativeAsyncCb_weaveffi_edge_cases_async_widget>.listener((Pointer<Void> context, Pointer<_WeaveFFIError> err, Pointer<Void> result) {
+    try {
+      if (err.address != 0 && err.ref.code != 0) {
+        final code = err.ref.code;
+        final msg = err.ref.message.toDartString();
+        final payload = _copyNativeBytes(err.ref.payloadPtr, err.ref.payloadLen);
+        _weaveffiErrorFree(err);
+        completer.completeError(_mapEdgeErrorsException(code, msg, payload));
+        return;
+      }
+      completer.complete(Widget._(result));
+    } catch (e) {
+      completer.completeError(e);
+    } finally {
+      callable.close();
+    }
+  });
+  try {
+    _weaveffiEdgeCasesAsyncWidgetAsync(callable.nativeFunction, nullptr);
+  } catch (e) {
+    callable.close();
+    rethrow;
+  }
+  return completer.future;
 }
 
 typedef _NativeWeaveffiEdgeCasesMakeWidget = Pointer<Void> Function(Pointer<Utf8>, Pointer<_WeaveFFIError>);
@@ -1236,6 +1716,9 @@ final _weaveffiEdgeCasesMakeWidget = _lib.lookupFunction<
     _NativeWeaveffiEdgeCasesMakeWidget, _DartWeaveffiEdgeCasesMakeWidget>('weaveffi_edge_cases_make_widget');
 
 /// Factory for an interface with no constructor
+///
+/// The returned object is owned by the caller: call its `dispose()` when
+/// you are done with it.
 Widget makeWidget(String label) {
   final labelPtr = label.toNativeUtf8();
   final err = calloc<_WeaveFFIError>();
@@ -1256,14 +1739,16 @@ final _weaveffiEdgeCasesFindWidget = _lib.lookupFunction<
 
 /// Optional interface return
 ///
+/// Returns `null` when the producer reports no object. A non-null result
+/// is owned by the caller: call its `dispose()` when you are done with it.
+///
 /// Throws [EdgeErrorsException] on domain errors.
 Widget? findWidget(int id) {
   final err = calloc<_WeaveFFIError>();
   try {
     final result = _weaveffiEdgeCasesFindWidget(id, err);
     _checkEdgeErrorsException(err);
-    if (result == nullptr) return null;
-    return Widget._(result);
+    return result == nullptr ? null : Widget._(result);
   } finally {
     calloc.free(err);
   }
@@ -1283,22 +1768,6 @@ String inspectWidget(Widget widget, Widget? fallback) {
     final decoded = result.toDartString();
     _weaveffiFreeString(result);
     return decoded;
-  } finally {
-    calloc.free(err);
-  }
-}
-
-typedef _NativeWeaveffiEdgeCasesTypedHandleParam = Pointer<Void> Function(Pointer<Void>, Int64, Pointer<_WeaveFFIError>);
-typedef _DartWeaveffiEdgeCasesTypedHandleParam = Pointer<Void> Function(Pointer<Void>, int, Pointer<_WeaveFFIError>);
-final _weaveffiEdgeCasesTypedHandleParam = _lib.lookupFunction<
-    _NativeWeaveffiEdgeCasesTypedHandleParam, _DartWeaveffiEdgeCasesTypedHandleParam>('weaveffi_edge_cases_typed_handle_param');
-
-Leaf typedHandleParam(Leaf token, int raw) {
-  final err = calloc<_WeaveFFIError>();
-  try {
-    final result = _weaveffiEdgeCasesTypedHandleParam(token._handle, raw, err);
-    _checkError(err);
-    return Leaf._(result);
   } finally {
     calloc.free(err);
   }

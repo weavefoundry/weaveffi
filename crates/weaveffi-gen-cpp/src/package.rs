@@ -58,7 +58,8 @@ target_compile_features(weaveffi_cpp INTERFACE cxx_std_@STD@)
     format!("{prelude}{body}\n{trailer}")
 }
 
-/// README for a packaged C++ artifact bundling the header and per-platform libs.
+/// README for a packaged C++ artifact bundling the header and the desktop
+/// per-platform libraries the packaged CMake can select among.
 pub(crate) fn render_packaged_readme(
     lib: &str,
     header_name: &str,
@@ -69,6 +70,7 @@ pub(crate) fn render_packaged_readme(
     let platforms: Vec<String> = ctx
         .binaries
         .platforms()
+        .filter(|p| p.is_desktop())
         .map(|p| format!("- `lib/{}/`", p.id()))
         .collect();
     let platform_list = platforms.join("\n");

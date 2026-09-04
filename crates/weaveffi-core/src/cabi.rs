@@ -3,21 +3,21 @@
 //!
 //! Both the C generator (which emits the canonical `{prefix}.h`) and the C++
 //! generator (whose idiomatic wrapper opens an `extern "C"` block re-declaring
-//! the same symbols) render their C declarations through this module. Before it
-//! existed the two re-derived the ABI independently and drifted. Most visibly,
-//! the C++ `extern "C"` block lowered `iter<T>` as a list and omitted callbacks
-//! and listeners entirely. Routing both through one model-driven renderer makes
-//! that class of drift impossible.
+//! the same symbols) render their C declarations through this module, so the
+//! two can't drift.
+//!
+//! The normative description of what is rendered here is
+//! `docs/src/reference/abi.md`.
 
-use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use crate::abi::{AbiParam, CType};
+use crate::abi::AbiParam;
 use crate::codegen::common::{emit_doc as common_emit_doc, DocCommentStyle};
 use crate::codegen::CodeWriter;
 use crate::lang::{is_reserved, CPP_KEYWORDS, C_KEYWORDS};
 use crate::model::{
-    AbiFn, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
+    AbiFn, CallShape, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, ModuleBinding,
 };
 
 /// The revision of the WeaveFFI C ABI the generators emit bindings for.
@@ -27,7 +27,7 @@ use crate::model::{
 /// embed this value and, where a load-time check is cheap, compare it against
 /// the producer's exported `{prefix}_abi_version()` before making any other
 /// call.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Emit a `/** ... */` doc comment at `indent`.
 pub fn emit_doc(out: &mut String, doc: &Option<String>, indent: &str) {
@@ -152,9 +152,9 @@ pub fn fn_decl(out: &mut String, f: &AbiFn, prefix: &str) {
     );
 }
 
-/// Render the runtime typedefs and helper prototypes (`handle_t`, `error`,
-/// `free_*`, `alloc`/`dealloc`, `cancel_token`) that every WeaveFFI C surface
-/// depends on.
+/// Render the runtime typedefs and helper prototypes (`error`, `free_*`,
+/// `alloc`/`dealloc`, `cancel_token`) that every WeaveFFI C surface depends
+/// on.
 ///
 /// `alloc`/`dealloc` back the Wasm JavaScript glue, which stages strings,
 /// bytes, and arrays into linear memory before each call. Native consumers
@@ -172,17 +172,23 @@ pub fn render_runtime_decls(out: &mut String, prefix: &str) {
            error struct or value buffers. */\n\
          #define {upper}_ABI_VERSION {ABI_VERSION}u\n\
          {api} uint32_t {prefix}_abi_version(void);\n\n\
-         typedef uint64_t {prefix}_handle_t;\n\n\
          /* Error slot written by every fallible call. `payload_ptr`/`payload_len`\n   \
            hold the matched error code's fields serialized in the WeaveFFI value\n   \
            buffer format (null when the code declares no fields); both the message\n   \
-           and the payload are released by {prefix}_error_clear. */\n\
+           and the payload are released by {prefix}_error_clear. Positive codes are\n   \
+           the module's declared error codes; negative codes are runtime traps:\n   \
+           -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback\n   \
+           interface implementation raised. */\n\
          typedef struct {prefix}_error {{\n    \
            int32_t code;\n    \
            const char* message;\n    \
            const uint8_t* payload_ptr;\n    \
            size_t payload_len;\n\
          }} {prefix}_error;\n\n\
+         /* Fill `err` with `code` and a producer-owned copy of `message`. Callback\n   \
+           interface trampolines call this to report a failure in the consumer's\n   \
+           implementation (code -4) without allocating with a foreign allocator. */\n\
+         {api} void {prefix}_error_set({prefix}_error* err, int32_t code, const char* message);\n\
          {api} void {prefix}_error_clear({prefix}_error* err);\n\n\
          /* Async completion callbacks receive a heap-boxed error the consumer\n   \
            owns; {prefix}_error_free releases the message, the payload, and the\n   \
@@ -316,67 +322,52 @@ pub fn render_module_type_tags(out: &mut String, module: &ModuleBinding) {
     }
 }
 
-/// Record `ty`'s struct tag (if any) into `tags`, recursing through pointers.
-fn walk_struct_tags(ty: &CType, prefix: &str, tags: &mut BTreeSet<String>) {
-    match ty {
-        CType::StructTag { .. } => {
-            tags.insert(ty.render_c(prefix));
-        }
-        CType::Ptr { pointee, .. } => walk_struct_tags(pointee, prefix, tags),
-        _ => {}
-    }
+/// Render one callback interface's vtable struct: one function pointer per
+/// method in declaration order, then the trailing `free`.
+fn render_vtable_decl(out: &mut String, cb: &CallbackInterfaceBinding, prefix: &str) {
+    let mut w = CodeWriter::four_space();
+    w.doc(
+        &Some(match &cb.doc {
+            Some(doc) => format!(
+                "{doc}\n\nConsumer-implemented callback interface. The consumer passes a \
+                 context pointer plus a pointer to a static instance of this vtable; the \
+                 producer may call any entry from any thread until it calls `free(ctx)` \
+                 exactly once."
+            ),
+            None => "Consumer-implemented callback interface. The consumer passes a \
+                     context pointer plus a pointer to a static instance of this vtable; the \
+                     producer may call any entry from any thread until it calls `free(ctx)` \
+                     exactly once."
+                .to_string(),
+        }),
+        DocCommentStyle::Javadoc,
+    );
+    w.block(
+        format!("typedef struct {} {{", cb.vtable_tag),
+        format!("}} {};", cb.vtable_tag),
+        |w| {
+            for m in &cb.methods {
+                w.doc(&m.doc, DocCommentStyle::Javadoc);
+                w.line(format!(
+                    "{} (*{})({});",
+                    m.abi_ret.render_c(prefix),
+                    c_param_name(&m.name),
+                    params_str(&m.abi_params, prefix)
+                ));
+            }
+            w.line("void (*free)(void* ctx);");
+        },
+    );
+    out.push_str(&w.finish());
 }
 
-/// Collect every struct tag reachable from one module's lowered ABI
-/// signatures. With records and rich enums crossing by value, the struct tags
-/// left in signatures are interface receivers and typed-handle targets; the
-/// latter have no other declaration site, so [`render_decls`] forward-declares
-/// any tag phase 1b did not already emit.
-fn collect_signature_struct_tags(
-    module: &ModuleBinding,
-    prefix: &str,
-    tags: &mut BTreeSet<String>,
-) {
-    let walk_fn = |f: &AbiFn, tags: &mut BTreeSet<String>| {
-        for p in &f.params {
-            walk_struct_tags(&p.ty, prefix, tags);
-        }
-        walk_struct_tags(&f.ret, prefix, tags);
-    };
-    for f in module.callables() {
-        match &f.shape {
-            CallShape::Sync(abi) => walk_fn(abi, tags),
-            CallShape::Async(a) => {
-                walk_fn(&a.launch, tags);
-                for p in &a.callback_params {
-                    walk_struct_tags(&p.ty, prefix, tags);
-                }
-            }
-            CallShape::Iterator(it) => {
-                walk_fn(&it.launch, tags);
-                walk_fn(&it.next, tags);
-            }
-        }
-    }
-    for cb in &module.callbacks {
-        for p in &cb.abi_params {
-            walk_struct_tags(&p.ty, prefix, tags);
-        }
-    }
-}
-
-/// Phase 1c: callback / async-callback function-pointer typedefs for one
-/// module. These may reference enums (by value) and structs (by pointer), so
-/// they are emitted after every module's enums and type tags.
+/// Phase 1c: callback-interface vtables and async completion-callback
+/// function-pointer typedefs for one module. These may reference enums (by
+/// value) and interfaces (by pointer), so they are emitted after every
+/// module's enums and type tags.
 pub fn render_module_callback_types(out: &mut String, module: &ModuleBinding, prefix: &str) {
-    for cb in &module.callbacks {
-        emit_doc(out, &cb.doc, "");
-        let _ = writeln!(
-            out,
-            "typedef void (*{})({});",
-            cb.c_fn_type,
-            params_str(&cb.abi_params, prefix)
-        );
+    for cb in &module.callback_interfaces {
+        render_vtable_decl(out, cb, prefix);
     }
     for f in module.callables() {
         if let CallShape::Async(a) = &f.shape {
@@ -417,7 +408,7 @@ fn render_callable_decl(out: &mut String, f: &FnBinding, prefix: &str) {
 }
 
 /// Render the function surface of one interface: constructors, statics,
-/// methods, then the destructor. Assumes the opaque tag is already
+/// methods, then the reference-count pair. Assumes the opaque tag is already
 /// forward-declared (phase 1b).
 fn render_interface_fn_decls(out: &mut String, i: &InterfaceBinding, prefix: &str) {
     let api = export_macro(prefix);
@@ -432,29 +423,36 @@ fn render_interface_fn_decls(out: &mut String, i: &InterfaceBinding, prefix: &st
     for m in &i.methods {
         render_callable_decl(out, m, prefix);
     }
+    emit_doc(
+        out,
+        &Some(
+            "Returns a new strong reference to the same object (the pointer value is \
+             unchanged). Null is a no-op returning null."
+                .to_string(),
+        ),
+        "",
+    );
+    let _ = writeln!(out, "{api} {tag}* {}(const {tag}* self);", i.clone_symbol);
+    emit_doc(
+        out,
+        &Some(
+            "Releases one strong reference; the object is dropped when the last reference \
+             is released. Null is a no-op."
+                .to_string(),
+        ),
+        "",
+    );
     let _ = writeln!(out, "{api} void {}({tag}* self);", i.destroy_symbol);
     out.push('\n');
 }
 
-/// Phase 2: every function prototype for one module: struct create/destroy/
-/// getters and builders, interface members, listeners, then sync/async/
-/// iterator functions. All type tags and callback typedefs are assumed already
-/// emitted (phases 1a–1c). Caller controls the leading `// Module:` comment
-/// and any framing.
+/// Phase 2: every function prototype for one module: interface members, then
+/// sync/async/iterator functions. All type tags, vtables, and callback
+/// typedefs are assumed already emitted (phases 1a-1c). Caller controls the
+/// leading `// Module:` comment and any framing.
 pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: &str) {
-    let api = export_macro(prefix);
     for i in &module.interfaces {
         render_interface_fn_decls(out, i, prefix);
-    }
-    for l in &module.listeners {
-        emit_doc(out, &l.doc, "");
-        let _ = writeln!(
-            out,
-            "{api} uint64_t {}({} callback, void* context);",
-            l.register_symbol, l.callback_c_fn_type
-        );
-        emit_doc(out, &l.doc, "");
-        let _ = writeln!(out, "{api} void {}(uint64_t id);", l.unregister_symbol);
     }
     for f in &module.functions {
         render_callable_decl(out, f, prefix);
@@ -463,14 +461,14 @@ pub fn render_module_fn_decls(out: &mut String, module: &ModuleBinding, prefix: 
 
 /// Render the complete C ABI declaration surface for `modules` in
 /// dependency-safe order: all enum definitions, then all opaque type tags, then
-/// all callback typedefs, then per-module function prototypes. Emitting every
-/// type tag before any function lets a parent module's function reference a
-/// child module's struct: cross-module forward references the previous
+/// all vtables and callback typedefs, then per-module function prototypes.
+/// Emitting every type tag before any function lets a parent module's function
+/// reference a child module's interface: cross-module forward references a
 /// per-module interleaving could not express.
 ///
-/// The runtime decls (`handle_t`, `error`, `free_*`, cancel token) are *not*
-/// emitted here; callers render those first (the C generator inserts its map
-/// convention comment in between).
+/// The runtime decls (`error`, `free_*`, cancel token) are *not* emitted here;
+/// callers render those first (the C generator inserts its map convention
+/// comment in between).
 pub fn render_decls(
     out: &mut String,
     modules: &[ModuleBinding],
@@ -480,27 +478,8 @@ pub fn render_decls(
     for m in modules {
         render_module_enum_defs(out, m);
     }
-    let mut declared: BTreeSet<String> = BTreeSet::new();
     for m in modules {
         render_module_type_tags(out, m);
-        for i in &m.interfaces {
-            declared.insert(i.c_tag.clone());
-        }
-        for f in m.callables() {
-            if let CallShape::Iterator(it) = &f.shape {
-                declared.insert(it.iter_tag.clone());
-            }
-        }
-    }
-    // Typed-handle targets are the one struct tag left in signatures with no
-    // declaration of their own (records are value types now), so forward-
-    // declare any tag phase 1b did not cover, e.g. `handle<other.Type>`.
-    let mut used: BTreeSet<String> = BTreeSet::new();
-    for m in modules {
-        collect_signature_struct_tags(m, prefix, &mut used);
-    }
-    for t in used.difference(&declared) {
-        let _ = writeln!(out, "typedef struct {t} {t};");
     }
     for m in modules {
         render_module_callback_types(out, m, prefix);

@@ -3,8 +3,8 @@
 //!
 //! Every Rust cdylib that hosts generated WeaveFFI bindings must expose
 //! a small set of `#[no_mangle] extern "C"` functions that the language
-//! wrappers call into: string/byte deallocation, error clearing, and
-//! the cancel-token lifecycle. The wrappers themselves live in
+//! wrappers call into: string/byte deallocation, error setting and
+//! clearing, and the cancel-token lifecycle. The wrappers themselves live in
 //! `weaveffi-abi` as ordinary `pub fn`s; the `extern "C"` thunks must
 //! be emitted in the *consumer's* crate because `#[no_mangle]` symbols
 //! in a transitive `rlib` are not guaranteed to be re-exported from a
@@ -22,15 +22,13 @@
 /// - `weaveffi_abi_version`
 /// - `weaveffi_free_string`
 /// - `weaveffi_free_bytes`
+/// - `weaveffi_error_set`
 /// - `weaveffi_error_clear`
 /// - `weaveffi_error_free`
 /// - `weaveffi_cancel_token_create`
 /// - `weaveffi_cancel_token_cancel`
 /// - `weaveffi_cancel_token_is_cancelled`
 /// - `weaveffi_cancel_token_destroy`
-/// - `weaveffi_arena_create`
-/// - `weaveffi_arena_register`
-/// - `weaveffi_arena_destroy`
 ///
 /// On `wasm32` targets it additionally emits a linear-memory allocator that the
 /// generated JS bindings call to stage inputs and return slots:
@@ -88,6 +86,18 @@ macro_rules! export_runtime {
             $crate::wasm_dealloc(ptr, size as usize)
         }
 
+        // Callback-interface implementations report a failure through this
+        // thunk so the message is copied with the producer's allocator (the
+        // one `weaveffi_error_clear` frees with).
+        #[no_mangle]
+        pub extern "C" fn weaveffi_error_set(
+            err: *mut $crate::weaveffi_error,
+            code: i32,
+            message: *const ::std::os::raw::c_char,
+        ) {
+            $crate::error_set_c(err, code, message)
+        }
+
         #[no_mangle]
         pub extern "C" fn weaveffi_error_clear(err: *mut $crate::weaveffi_error) {
             $crate::error_clear(err)
@@ -118,28 +128,6 @@ macro_rules! export_runtime {
         #[no_mangle]
         pub extern "C" fn weaveffi_cancel_token_destroy(token: *mut $crate::weaveffi_cancel_token) {
             $crate::cancel_token_destroy(token)
-        }
-
-        // The batch-free arena is part of the documented stable runtime ABI, so
-        // its thunks are re-exported here for the same reason as the rest: an
-        // rlib-local `#[no_mangle]` is not guaranteed to survive into the cdylib.
-        #[no_mangle]
-        pub extern "C" fn weaveffi_arena_create() -> *mut $crate::arena::HandleArena {
-            $crate::arena::arena_create()
-        }
-
-        #[no_mangle]
-        pub extern "C" fn weaveffi_arena_register(
-            arena: *mut $crate::arena::HandleArena,
-            ptr: *mut ::std::ffi::c_void,
-            dtor: unsafe extern "C" fn(*mut ::std::ffi::c_void),
-        ) {
-            $crate::arena::arena_register(arena, ptr, dtor)
-        }
-
-        #[no_mangle]
-        pub extern "C" fn weaveffi_arena_destroy(arena: *mut $crate::arena::HandleArena) {
-            $crate::arena::arena_destroy(arena)
         }
     };
 }

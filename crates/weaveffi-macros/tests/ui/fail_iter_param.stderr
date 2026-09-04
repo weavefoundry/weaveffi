@@ -1,0 +1,5 @@
+error: weaveffi: `Iter<T>` is a pull handle the consumer drives and is only valid as a function's outermost return type, not as a parameter
+ --> tests/ui/fail_iter_param.rs:4:25
+  |
+4 |     pub fn drain(items: weaveffi::Iter<i32>) -> i64 {
+  |                         ^^^^^^^^

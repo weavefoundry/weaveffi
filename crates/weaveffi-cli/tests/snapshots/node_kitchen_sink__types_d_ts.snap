@@ -8,8 +8,10 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // Generated types for WeaveFFI functions
 /**
  * Base class of every error thrown by these bindings. Non-throwing
- * functions reject or throw it directly for panics and marshalling
- * failures; throwing functions surface a module domain subclass.
+ * functions reject or throw it directly for runtime traps (code -2 a
+ * producer panic, -3 a marshalling failure, -4 a callback interface
+ * implementation that threw); throwing functions surface a module
+ * domain subclass for their declared codes.
  */
 export class WeaveFFIError extends Error {
   /** The numeric ABI error code. */
@@ -20,7 +22,7 @@ export class WeaveFFIError extends Error {
 }
 /** A reusable token referenced across modules */
 export interface Token {
-  id: number;
+  id: bigint;
   label: string;
 }
 // module shared
@@ -44,7 +46,7 @@ export class InvalidInputError extends KitchenErrorsError {
 /** Kitchen sink struct exercising every field feature */
 export interface Item {
   /** Stable identifier */
-  id: number;
+  id: bigint;
   /** Display name */
   name: string;
   /** Initial count */
@@ -57,10 +59,12 @@ export interface Item {
   payload: Buffer;
   tags: string[];
   attrs: Record<string, string>;
-  parent: number | null;
+  parent: bigint | null;
   /** Cross-module struct reference */
   token: Token;
   priority: Priority;
+  /** An optional object inside a record */
+  gadget: Gadget | null;
 }
 /** Task priority levels */
 export enum Priority {
@@ -72,13 +76,24 @@ export enum Priority {
   High = 2,
 }
 // module kitchen
+/** Consumer-implemented observer of ready items */
+export interface ReadyListener {
+  /**
+   * Fires when an item is ready
+   */
+  onReady(code: number, msg: string): void;
+  /**
+   * Receives the item itself and says whether to keep listening
+   */
+  onItem(item: Item, gadget: Gadget): boolean;
+}
 /** A pocket-sized interface exercising the object surface */
 export class Gadget {
   /**
    * Create a gadget with the given id
    * Maps to C function: weaveffi_kitchen_Gadget_new
    */
-  constructor(id: number);
+  constructor(id: bigint);
   /**
    * Render the gadget as a human-readable string
    * Maps to C function: weaveffi_kitchen_Gadget_describe
@@ -95,12 +110,15 @@ export class Gadget {
    * Maps to C function: weaveffi_kitchen_Gadget_version
    */
   static version(): string;
-  /** Free the underlying native object. */
-  destroy(): void;
+  /**
+   * Release this wrapper's reference to the native object. Safe to call
+   * more than once; a wrapper that is never closed is released when it is
+   * garbage collected. Using the wrapper after `close()` throws.
+   */
+  close(): void;
+  /** Alias of `close()` for `using` declarations. */
+  [Symbol.dispose](): void;
 }
-/** Subscribe to OnReady events */
-export function registerReadyListener(callback: (code: number, msg: string) => void): number
-export function unregisterReadyListener(id: number): void
 /**
  * Identity for bool
  * Maps to C function: weaveffi_kitchen_bool_id
@@ -117,7 +135,7 @@ export function u32Id(x: number): number
 /**
  * Maps to C function: weaveffi_kitchen_i64_id
  */
-export function i64Id(x: number): number
+export function i64Id(x: bigint): bigint
 /**
  * Maps to C function: weaveffi_kitchen_f64_id
  */
@@ -131,31 +149,31 @@ export function echoString(s: string): string
  */
 export function echoBytes(b: Buffer): Buffer
 /**
- * Borrowed string parameter
- * Maps to C function: weaveffi_kitchen_echo_borrowed_str
+ * Register a listener, returning how many are attached
+ * Maps to C function: weaveffi_kitchen_subscribe
  */
-export function echoBorrowedStr(s: string): string
+export function subscribe(listener: ReadyListener): number
 /**
- * Borrowed bytes parameter
- * Maps to C function: weaveffi_kitchen_echo_borrowed_bytes
+ * Optional object in both directions
+ * Maps to C function: weaveffi_kitchen_maybe_gadget
  */
-export function echoBorrowedBytes(b: Buffer): Buffer
+export function maybeGadget(fallback: Gadget | null): Gadget | null
 /**
- * Returns an opaque handle
- * Maps to C function: weaveffi_kitchen_open_handle
+ * A list of objects
+ * Maps to C function: weaveffi_kitchen_gadgets
  */
-export function openHandle(): bigint
+export function gadgets(): Gadget[]
 /**
- * Returns a typed handle
- * Maps to C function: weaveffi_kitchen_open_typed_handle
+ * An iterator over objects
+ * Maps to C function: weaveffi_kitchen_stream_gadgets
  */
-export function openTypedHandle(): Token
+export function streamGadgets(): IterableIterator<Gadget>
 /**
  * Optional struct return
  * Maps to C function: weaveffi_kitchen_maybe_item
  * @throws {KitchenErrorsError}
  */
-export function maybeItem(id: number): Item | null
+export function maybeItem(id: bigint): Item | null
 /**
  * List of structs
  * Maps to C function: weaveffi_kitchen_list_items

@@ -1,7 +1,9 @@
 //! The emitted Python runtime prelude: error base classes, library loading,
-//! the ABI-revision check, the owned-pointer helpers, and the
-//! `_BufferWriter`/`_BufferReader` pair implementing the value-buffer wire
-//! format.
+//! the ABI-revision check, the runtime symbol bindings (`error_set`,
+//! `error_clear`, `error_free`, `free_string`, `free_bytes`), the
+//! owned-pointer helpers, the `_BufferWriter`/`_BufferReader` pair
+//! implementing the value-buffer wire format (including object tokens), and
+//! the feature-gated async and callback-interface registries.
 
 use weaveffi_core::cabi::ABI_VERSION;
 
@@ -58,6 +60,19 @@ from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
+    """An error reported through the C ABI.
+
+    Positive codes are a module's declared error codes (raised as the
+    module's typed subclasses); negative codes are runtime traps: a generic
+    producer error (-1), a producer panic (-2), a marshalling failure (-3),
+    or an exception raised by a callback-interface implementation (-4).
+    """
+
+    GENERIC_ERROR_CODE = -1
+    PANIC_ERROR_CODE = -2
+    MARSHAL_ERROR_CODE = -3
+    FOREIGN_ERROR_CODE = -4
+
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
@@ -94,7 +109,15 @@ _lib = _load_library()
     );
     render_abi_version_check(out);
     out.push_str(
-        r#"_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
+        r#"# Callback-interface trampolines report a failed implementation through
+# weaveffi_error_set, which copies the message with the producer's allocator.
+_lib.weaveffi_error_set.argtypes = [
+    ctypes.POINTER(_WeaveFFIErrorStruct),
+    ctypes.c_int32,
+    ctypes.c_char_p,
+]
+_lib.weaveffi_error_set.restype = None
+_lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 # Async completion callbacks receive a heap-boxed error the consumer owns;
 # weaveffi_error_free releases the message, the payload, and the box.
@@ -149,14 +172,30 @@ def _take_string(ptr) -> Optional[str]:
     return _s
 
 
+def _borrow(obj):
+    """The raw pointer of a live object wrapper, lent to the producer for the
+    duration of one call. Raises if the wrapper was already closed."""
+    _p = obj._ptr
+    if _p is None:
+        raise WeaveFFIError(-1, f"{type(obj).__name__} used after close()")
+    return _p
+
+
 class _BufferWriter:
     """Encodes values into the WeaveFFI value-buffer wire format:
     little-endian, packed, no alignment."""
 
     def __init__(self) -> None:
         self._buf = bytearray()
+        self._objects = []
 
     def finish(self) -> bytes:
+        # Mint the object tokens last: an encoding that raised part-way
+        # (a closed wrapper, a field of the wrong type) never reaches here,
+        # so it leaks no strong references.
+        for _pos, _obj in self._objects:
+            struct.pack_into("<Q", self._buf, _pos, _obj._clone_ptr())
+        self._objects = []
         return bytes(self._buf)
 
     def write_bool(self, v) -> None:
@@ -206,6 +245,14 @@ class _BufferWriter:
     def write_bytes(self, v: bytes) -> None:
         self.write_len(len(v))
         self._buf += bytes(v)
+
+    def write_object(self, obj) -> None:
+        """Write an object token: one strong reference to `obj` the reader
+        will adopt. The wrapper is checked to be live now (a closed one
+        raises), but the reference itself is cloned in finish()."""
+        _borrow(obj)
+        self._objects.append((len(self._buf), obj))
+        self._buf += bytes(8)
 
 
 class _BufferReader:
@@ -287,6 +334,14 @@ class _BufferReader:
         _n = self.read_len()
         return bytes(self._take(_n, "bytes data"))
 
+    def read_object(self) -> int:
+        """Read an object token: one strong reference the caller adopts into
+        a wrapper. Zero never appears in a non-optional position."""
+        _p = struct.unpack("<Q", self._take(8, "object token"))[0]
+        if _p == 0:
+            raise WeaveFFIError(-1, "malformed value buffer: null object token")
+        return _p
+
     def expect_end(self) -> None:
         if self._pos != len(self._data):
             raise WeaveFFIError(-1, "malformed value buffer: trailing bytes")
@@ -310,6 +365,72 @@ def _take_buffer(ptr, length) -> bytes:
     return _data
 "#,
     );
+}
+
+/// Append the feature-gated runtime pieces after the fixed preamble: the
+/// `asyncio` completion registry when the API has async callables, and the
+/// callback-interface handle table (plus the `abc` import the abstract base
+/// classes need) when it declares callback interfaces. Both registries share
+/// one `threading` import.
+pub(crate) fn render_feature_runtime(out: &mut String, has_async: bool, has_callbacks: bool) {
+    if !has_async && !has_callbacks {
+        return;
+    }
+    out.push('\n');
+    if has_callbacks {
+        out.push_str("import abc\n");
+    }
+    if has_async {
+        out.push_str("import asyncio\n");
+    }
+    out.push_str("import threading\n");
+    if has_async {
+        out.push_str(
+            r#"
+
+# Pending async completion trampolines, keyed by an integer token.
+# Holding the ctypes function objects here keeps them alive until the
+# producer fires the completion callback, even when the awaiting
+# coroutine has been cancelled; each entry is removed on completion.
+_async_pending: Dict[int, object] = {}
+_async_lock = threading.Lock()
+_async_next_token = 0
+
+
+def _async_register(cb) -> int:
+    global _async_next_token
+    with _async_lock:
+        _async_next_token += 1
+        _token = _async_next_token
+        _async_pending[_token] = cb
+    return _token
+"#,
+        );
+    }
+    if has_callbacks {
+        out.push_str(
+            r#"
+
+# Live callback-interface implementations, keyed by the integer the producer
+# receives as `ctx`. An entry is added when an implementation is passed to a
+# call and removed when the producer invokes the vtable's `free(ctx)`, so the
+# implementation stays alive exactly as long as the producer may call it and
+# the producer never holds a raw reference to a Python object.
+_cb_impls: Dict[int, object] = {}
+_cb_lock = threading.Lock()
+_cb_next_ctx = 0
+
+
+def _cb_register(impl) -> int:
+    global _cb_next_ctx
+    with _cb_lock:
+        _cb_next_ctx += 1
+        _ctx = _cb_next_ctx
+        _cb_impls[_ctx] = impl
+    return _ctx
+"#,
+        );
+    }
 }
 
 /// The exact `_load_library` block [`render_preamble`] emits in `generate`

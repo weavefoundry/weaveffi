@@ -83,6 +83,9 @@ struct WvWriter {
         bytes.append(contentsOf: v)
     }
     mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
+    /// Writes an object token. `p` must be a strong reference the buffer now
+    /// owns (a freshly cloned pointer), never one a wrapper still holds.
+    mutating func writeObject(_ p: OpaquePointer) { writeUInt64(UInt64(UInt(bitPattern: p))) }
 }
 
 /// Traps on a malformed value buffer. Per the wire-format spec, consumers
@@ -160,6 +163,14 @@ struct WvReader {
         default: wvDecodeFailure("option flag byte out of range")
         }
     }
+    /// Reads an object token: one strong reference the caller must adopt
+    /// into a wrapper whose deinit releases it.
+    mutating func readObject() -> OpaquePointer {
+        guard let p = OpaquePointer(bitPattern: UInt(readUInt64())) else {
+            wvDecodeFailure("null object token")
+        }
+        return p
+    }
     func finish() {
         if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
     }
@@ -170,13 +181,12 @@ private final class ContinuationRef<T, E: Error> {
     init(_ value: CheckedContinuation<T, E>) { self.value = value }
 }
 
-final class WvCallbackBox<T> {
-    let value: T
-    init(_ value: T) { self.value = value }
+/// Reports a thrown Swift error to the producer as a foreign callback failure
+/// (code -4); the producer aborts its current call with that code and message.
+func wvForeignError(_ outErr: UnsafeMutablePointer<weaveffi_error>?, _ error: Error) {
+    let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    message.withCString { weaveffi_error_set(outErr, -4, $0) }
 }
-
-var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
-let wvListenerLock = NSLock()
 
 /// Typed errors reported by the `edge_cases` module.
 public enum EdgeErrorsError: Error, LocalizedError {
@@ -707,6 +717,232 @@ func wvReadRetired(_ r: inout WvReader) -> Retired {
     return Retired(id: v0)
 }
 
+/// Record carrying objects in every buffered position
+public struct WidgetHolder {
+    public var primary: Widget
+    public var fallback: Widget?
+    public var extras: [Widget]
+    public var byName: [String: Widget]
+
+    /// Creates a `WidgetHolder` value.
+    public init(primary: Widget, fallback: Widget?, extras: [Widget], byName: [String: Widget]) {
+        self.primary = primary
+        self.fallback = fallback
+        self.extras = extras
+        self.byName = byName
+    }
+}
+
+/// Serializes a `WidgetHolder` into the value-buffer wire format.
+func wvWriteWidgetHolder(_ value: WidgetHolder, into w: inout WvWriter) {
+    w.writeObject(value.primary.clonePtr())
+    if let v0 = value.fallback {
+        w.writeOptionFlag(true)
+        w.writeObject(v0.clonePtr())
+    } else {
+        w.writeOptionFlag(false)
+    }
+    w.writeLen(value.extras.count)
+    for v1 in value.extras {
+        w.writeObject(v1.clonePtr())
+    }
+    w.writeLen(value.byName.count)
+    for (v2, v3) in value.byName {
+        w.writeString(v2)
+        w.writeObject(v3.clonePtr())
+    }
+}
+
+/// Deserializes a `WidgetHolder` from the value-buffer wire format.
+func wvReadWidgetHolder(_ r: inout WvReader) -> WidgetHolder {
+    let v4 = Widget(ptr: r.readObject())
+    var v5: Widget? = nil
+    if r.readOptionFlag() {
+        let v6 = Widget(ptr: r.readObject())
+        v5 = v6
+    }
+    let n8 = r.readLen()
+    var v7: [Widget] = []
+    v7.reserveCapacity(n8)
+    for _ in 0..<n8 {
+        let v9 = Widget(ptr: r.readObject())
+        v7.append(v9)
+    }
+    let n11 = r.readLen()
+    var v10: [String: Widget] = [:]
+    v10.reserveCapacity(n11)
+    for _ in 0..<n11 {
+        let v12 = r.readString()
+        let v13 = Widget(ptr: r.readObject())
+        v10[v12] = v13
+    }
+    return WidgetHolder(primary: v4, fallback: v5, extras: v7, byName: v10)
+}
+
+/// Callback interface carrying composite payloads and objects
+///
+/// Implement this protocol and pass the value where the API expects it; the
+/// producer keeps it alive for as long as it holds the callback and may call
+/// any method from any thread. A thrown error aborts the producer's call and
+/// surfaces to the original caller as a foreign error (code -4).
+public protocol BatchListener {
+    /// Composite payloads cross as value buffers
+    func onBatch(items: [Outer], raw: Data, first: Outer?, mode: Mode) throws
+    /// Objects cross as strong references the consumer must release
+    func onWidget(widget: Widget, fallback: Widget?, children: [Widget]) throws
+    func onTick() throws
+    /// Scalar return travels back through the vtable
+    func shouldContinue(class_: Int32) throws -> Bool
+    /// Enum return travels back as its integer discriminant
+    func pickMode() throws -> Mode
+}
+
+/// Retains one `BatchListener` implementation across the C boundary; the producer's
+/// `free` entry releases it.
+final class WvBatchListenerBox {
+    let impl: any BatchListener
+    init(_ impl: any BatchListener) { self.impl = impl }
+}
+
+/// The process-wide `weaveffi_edge_cases_BatchListener_vtable` the producer calls `BatchListener`
+/// implementations through. Every entry recovers the box from `ctx`, copies
+/// or adopts its arguments, and reports a thrown error through `out_err`
+/// instead of unwinding.
+enum WvBatchListenerVtable {
+    static let value = weaveffi_edge_cases_BatchListener_vtable(
+        on_batch: { ctx, items_ptr, items_len, raw_ptr, raw_len, first_ptr, first_len, mode, out_err in
+            let wvBox = Unmanaged<WvBatchListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            let b0 = [UInt8](UnsafeBufferPointer(start: items_ptr, count: items_len))
+            var r1 = WvReader(bytes: b0)
+            let n3 = r1.readLen()
+            var v2: [Outer] = []
+            v2.reserveCapacity(n3)
+            for _ in 0..<n3 {
+                let v4 = wvReadOuter(&r1)
+                v2.append(v4)
+            }
+            r1.finish()
+            let b5 = [UInt8](UnsafeBufferPointer(start: first_ptr, count: first_len))
+            var r6 = WvReader(bytes: b5)
+            var v7: Outer? = nil
+            if r6.readOptionFlag() {
+                let v8 = wvReadOuter(&r6)
+                v7 = v8
+            }
+            r6.finish()
+            do {
+                try wvBox.impl.onBatch(items: v2, raw: raw_ptr.map { Data(bytes: $0, count: raw_len) } ?? Data(), first: v7, mode: Mode(rawValue: mode.rawValue)!)
+            } catch {
+                wvForeignError(out_err, error)
+            }
+        },
+        on_widget: { ctx, widget, fallback, children_ptr, children_len, out_err in
+            let wvBox = Unmanaged<WvBatchListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            let b0 = [UInt8](UnsafeBufferPointer(start: children_ptr, count: children_len))
+            var r1 = WvReader(bytes: b0)
+            let n3 = r1.readLen()
+            var v2: [Widget] = []
+            v2.reserveCapacity(n3)
+            for _ in 0..<n3 {
+                let v4 = Widget(ptr: r1.readObject())
+                v2.append(v4)
+            }
+            r1.finish()
+            do {
+                try wvBox.impl.onWidget(widget: Widget(ptr: widget!), fallback: fallback.map { Widget(ptr: $0) }, children: v2)
+            } catch {
+                wvForeignError(out_err, error)
+            }
+        },
+        on_tick: { ctx, out_err in
+            let wvBox = Unmanaged<WvBatchListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                try wvBox.impl.onTick()
+            } catch {
+                wvForeignError(out_err, error)
+            }
+        },
+        should_continue: { ctx, class_, out_err in
+            let wvBox = Unmanaged<WvBatchListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                return try wvBox.impl.shouldContinue(class_: class_)
+            } catch {
+                wvForeignError(out_err, error)
+                return false
+            }
+        },
+        pick_mode: { ctx, out_err in
+            let wvBox = Unmanaged<WvBatchListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                return weaveffi_edge_cases_Mode(try wvBox.impl.pickMode().rawValue)
+            } catch {
+                wvForeignError(out_err, error)
+                return weaveffi_edge_cases_Mode(0)
+            }
+        },
+        free: { ctx in
+            Unmanaged<WvBatchListenerBox>.fromOpaque(ctx!).release()
+        }
+    )
+    static let pointer: UnsafePointer<weaveffi_edge_cases_BatchListener_vtable> = {
+        let cell = UnsafeMutablePointer<weaveffi_edge_cases_BatchListener_vtable>.allocate(capacity: 1)
+        cell.initialize(to: value)
+        return UnsafePointer(cell)
+    }()
+}
+
+/// Callback interface whose name and methods are keywords
+///
+/// Implement this protocol and pass the value where the API expects it; the
+/// producer keeps it alive for as long as it holds the callback and may call
+/// any method from any thread. A thrown error aborts the producer's call and
+/// surfaces to the original caller as a foreign error (code -4).
+public protocol Keyword {
+    func delete(self_: Int32) throws
+    func import_() throws -> Int32
+}
+
+/// Retains one `Keyword` implementation across the C boundary; the producer's
+/// `free` entry releases it.
+final class WvKeywordBox {
+    let impl: any Keyword
+    init(_ impl: any Keyword) { self.impl = impl }
+}
+
+/// The process-wide `weaveffi_edge_cases_Keyword_vtable` the producer calls `Keyword`
+/// implementations through. Every entry recovers the box from `ctx`, copies
+/// or adopts its arguments, and reports a thrown error through `out_err`
+/// instead of unwinding.
+enum WvKeywordVtable {
+    static let value = weaveffi_edge_cases_Keyword_vtable(
+        delete_: { ctx, self_, out_err in
+            let wvBox = Unmanaged<WvKeywordBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                try wvBox.impl.delete(self_: self_)
+            } catch {
+                wvForeignError(out_err, error)
+            }
+        },
+        import: { ctx, out_err in
+            let wvBox = Unmanaged<WvKeywordBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                return try wvBox.impl.import_()
+            } catch {
+                wvForeignError(out_err, error)
+                return 0
+            }
+        },
+        free: { ctx in
+            Unmanaged<WvKeywordBox>.fromOpaque(ctx!).release()
+        }
+    )
+    static let pointer: UnsafePointer<weaveffi_edge_cases_Keyword_vtable> = {
+        let cell = UnsafeMutablePointer<weaveffi_edge_cases_Keyword_vtable>.allocate(capacity: 1)
+        cell.initialize(to: value)
+        return UnsafePointer(cell)
+    }()
+}
+
 /// Interface with no constructor; instances come from make_widget
 public final class Widget {
     let ptr: OpaquePointer
@@ -717,6 +953,12 @@ public final class Widget {
 
     deinit {
         weaveffi_edge_cases_Widget_destroy(ptr)
+    }
+
+    /// Returns a new strong reference to the same object, for a position that
+    /// takes ownership of it (an object token inside a value buffer).
+    func clonePtr() -> OpaquePointer {
+        weaveffi_edge_cases_Widget_clone(ptr)!
     }
     /// Void method that can fail
     public func refresh() throws -> Void {
@@ -794,6 +1036,12 @@ public final class Vault {
     deinit {
         weaveffi_edge_cases_Vault_destroy(ptr)
     }
+
+    /// Returns a new strong reference to the same object, for a position that
+    /// takes ownership of it (an object token inside a value buffer).
+    func clonePtr() -> OpaquePointer {
+        weaveffi_edge_cases_Vault_clone(ptr)!
+    }
     /// Fails when the vault is busy
     public static func open(path: String) throws -> Vault {
         var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
@@ -816,6 +1064,48 @@ public final class Vault {
         let rv = weaveffi_edge_cases_Vault_probe(&err)
         try checkEdgeCases(&err)
         return rv
+    }
+}
+
+/// A lazy sequence over the `Widget` elements streamed by `weaveffi_edge_cases_widget_stream`.
+///
+/// Each `next()` call pulls exactly one element from the producer. The
+/// underlying C iterator is destroyed eagerly on exhaustion and from
+/// `deinit` when iteration is abandoned early.
+public final class EdgeCasesWidgetStreamIterator: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+
+    init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        destroyHandle()
+    }
+
+    private func destroyHandle() {
+        guard let handle = handle else { return }
+        weaveffi_edge_cases_WidgetStreamIterator_destroy(handle)
+        self.handle = nil
+    }
+
+    /// Pulls the next element from the producer, or returns `nil` once the
+    /// stream is exhausted (destroying the underlying iterator).
+    public func next() -> Widget? {
+        guard let handle = handle else { return nil }
+        var item: OpaquePointer? = nil
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        if weaveffi_edge_cases_WidgetStreamIterator_next(handle, &item, &err) == 0 {
+            if err.code != 0 {
+                let code = err.code
+                let message = err.message.flatMap { String(cString: $0) } ?? ""
+                weaveffi_error_clear(&err)
+                fatalError("\(code): \(message)")
+            }
+            destroyHandle()
+            return nil
+        }
+        return Widget(ptr: item!)
     }
 }
 
@@ -901,8 +1191,7 @@ public final class EdgeCasesScalarStreamIterator: Sequence, IteratorProtocol {
             destroyHandle()
             return nil
         }
-        let element = item
-        return element
+        return item
     }
 }
 
@@ -944,76 +1233,11 @@ public final class EdgeCasesModeStreamIterator: Sequence, IteratorProtocol {
             destroyHandle()
             return nil
         }
-        let element = Mode(rawValue: item.rawValue)!
-        return element
+        return Mode(rawValue: item.rawValue)!
     }
 }
 
 public enum EdgeCases {
-    /// - Returns: A subscription id for ``unregisterBatchListener(_:)``.
-    public static func registerBatchListener(_ callback: @escaping ([Outer], Data, Outer?, Mode) -> Void) -> UInt64 {
-        let box = WvCallbackBox(callback)
-        let ctx = Unmanaged.passRetained(box).toOpaque()
-        let id = weaveffi_edge_cases_register_batch_listener({ items_ptr, items_len, raw_ptr, raw_len, first_ptr, first_len, mode, context in
-            let cb = Unmanaged<WvCallbackBox<([Outer], Data, Outer?, Mode) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
-            let itemsBuf = [UInt8](UnsafeBufferPointer(start: items_ptr, count: items_len))
-            var itemsReader = WvReader(bytes: itemsBuf)
-            let n1 = itemsReader.readLen()
-            var v0: [Outer] = []
-            v0.reserveCapacity(n1)
-            for _ in 0..<n1 {
-                let v2 = wvReadOuter(&itemsReader)
-                v0.append(v2)
-            }
-            itemsReader.finish()
-            let firstBuf = [UInt8](UnsafeBufferPointer(start: first_ptr, count: first_len))
-            var firstReader = WvReader(bytes: firstBuf)
-            var v3: Outer? = nil
-            if firstReader.readOptionFlag() {
-                let v4 = wvReadOuter(&firstReader)
-                v3 = v4
-            }
-            firstReader.finish()
-            cb(v0, raw_ptr.map { Data(bytes: $0, count: raw_len) } ?? Data(), v3, Mode(rawValue: mode.rawValue)!)
-        }, ctx)
-        wvListenerLock.lock()
-        wvListenerContexts[id] = ctx
-        wvListenerLock.unlock()
-        return id
-    }
-    /// Unregisters a listener previously registered with ``registerBatchListener(_:)``.
-    public static func unregisterBatchListener(_ id: UInt64) {
-        weaveffi_edge_cases_unregister_batch_listener(id)
-        wvListenerLock.lock()
-        let ctx = wvListenerContexts.removeValue(forKey: id)
-        wvListenerLock.unlock()
-        if let ctx = ctx {
-            Unmanaged<WvCallbackBox<([Outer], Data, Outer?, Mode) -> Void>>.fromOpaque(ctx).release()
-        }
-    }
-    /// - Returns: A subscription id for ``unregisterTickListener(_:)``.
-    public static func registerTickListener(_ callback: @escaping () -> Void) -> UInt64 {
-        let box = WvCallbackBox(callback)
-        let ctx = Unmanaged.passRetained(box).toOpaque()
-        let id = weaveffi_edge_cases_register_tick_listener({ context in
-            let cb = Unmanaged<WvCallbackBox<() -> Void>>.fromOpaque(context!).takeUnretainedValue().value
-            cb()
-        }, ctx)
-        wvListenerLock.lock()
-        wvListenerContexts[id] = ctx
-        wvListenerLock.unlock()
-        return id
-    }
-    /// Unregisters a listener previously registered with ``registerTickListener(_:)``.
-    public static func unregisterTickListener(_ id: UInt64) {
-        weaveffi_edge_cases_unregister_tick_listener(id)
-        wvListenerLock.lock()
-        let ctx = wvListenerContexts.removeValue(forKey: id)
-        wvListenerLock.unlock()
-        if let ctx = ctx {
-            Unmanaged<WvCallbackBox<() -> Void>>.fromOpaque(ctx).release()
-        }
-    }
     /// No parameters and no result
     public static func noop() -> Void {
         var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
@@ -1182,18 +1406,99 @@ public enum EdgeCases {
         rvReader.finish()
         return v7
     }
-    /// Write-back parameters
-    public static func mutableParams(text: String, blob: Data) -> Void {
+    /// Two callback interface parameters on one function
+    public static func registerBatch(listener: BatchListener, keyword: Keyword) -> Void {
         var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
-        let blobBytes = Array(blob)
-        text.withCString { text_ptr in
-            blobBytes.withUnsafeBufferPointer { blob_buf in
-                let blob_ptr = blob_buf.baseAddress
-                let blob_len = blob_buf.count
-                weaveffi_edge_cases_mutable_params(text_ptr, blob_ptr, blob_len, &err)
+        let listener_ctx = Unmanaged.passRetained(WvBatchListenerBox(listener)).toOpaque()
+        let keyword_ctx = Unmanaged.passRetained(WvKeywordBox(keyword)).toOpaque()
+        weaveffi_edge_cases_register_batch(listener_ctx, WvBatchListenerVtable.pointer, keyword_ctx, WvKeywordVtable.pointer, &err)
+        trap(&err)
+    }
+    /// Objects in every buffered position
+    public static func widgetsEverywhere(list: [Widget], byName: [String: Widget], sparse: [Widget?], holder: WidgetHolder) -> WidgetHolder {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var listWriter = WvWriter()
+        listWriter.writeLen(list.count)
+        for v0 in list {
+            listWriter.writeObject(v0.clonePtr())
+        }
+        var byNameWriter = WvWriter()
+        byNameWriter.writeLen(byName.count)
+        for (v1, v2) in byName {
+            byNameWriter.writeString(v1)
+            byNameWriter.writeObject(v2.clonePtr())
+        }
+        var sparseWriter = WvWriter()
+        sparseWriter.writeLen(sparse.count)
+        for v3 in sparse {
+            if let v4 = v3 {
+                sparseWriter.writeOptionFlag(true)
+                sparseWriter.writeObject(v4.clonePtr())
+            } else {
+                sparseWriter.writeOptionFlag(false)
+            }
+        }
+        var holderWriter = WvWriter()
+        wvWriteWidgetHolder(holder, into: &holderWriter)
+        var outLen: Int = 0
+        let rv: UnsafePointer<UInt8>? = listWriter.bytes.withUnsafeBufferPointer { list_buf in
+            let list_ptr = list_buf.baseAddress
+            let list_len = list_buf.count
+            return byNameWriter.bytes.withUnsafeBufferPointer { byName_buf in
+                let byName_ptr = byName_buf.baseAddress
+                let byName_len = byName_buf.count
+                return sparseWriter.bytes.withUnsafeBufferPointer { sparse_buf in
+                    let sparse_ptr = sparse_buf.baseAddress
+                    let sparse_len = sparse_buf.count
+                    return holderWriter.bytes.withUnsafeBufferPointer { holder_buf in
+                        let holder_ptr = holder_buf.baseAddress
+                        let holder_len = holder_buf.count
+                        return weaveffi_edge_cases_widgets_everywhere(list_ptr, list_len, byName_ptr, byName_len, sparse_ptr, sparse_len, holder_ptr, holder_len, &outLen, &err)
+                    }
+                }
             }
         }
         trap(&err)
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let v5 = wvReadWidgetHolder(&rvReader)
+        rvReader.finish()
+        return v5
+    }
+    /// Iterator of objects
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   producer; the underlying iterator is destroyed when the sequence is
+    ///   exhausted or deinitialized.
+    public static func widgetStream() -> EdgeCasesWidgetStreamIterator {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let rv = weaveffi_edge_cases_widget_stream(&err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null iterator") }
+        return EdgeCasesWidgetStreamIterator(handle: rv)
+    }
+    /// Async returning an object
+    public static func asyncWidget() async throws -> Widget {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Widget, Error>) in
+            let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()
+            weaveffi_edge_cases_async_widget_async({ context, err, result in
+                let contRef = Unmanaged<ContinuationRef<Widget, Error>>.fromOpaque(context!).takeRetainedValue()
+                if let err = err, err.pointee.code != 0 {
+                    let code = err.pointee.code
+                    let msg = err.pointee.message.flatMap { String(cString: $0) } ?? ""
+                    let payload: [UInt8]? = err.pointee.payload_ptr.map { [UInt8](UnsafeBufferPointer(start: $0, count: err.pointee.payload_len)) }
+                    weaveffi_error_free(err)
+                    contRef.value.resume(throwing: mapEdgeCases(code: code, message: msg, payload: payload))
+                } else {
+                    guard let result = result else {
+                        contRef.value.resume(throwing: WeaveFFIError.error(code: -1, message: "null pointer"))
+                        return
+                    }
+                    contRef.value.resume(returning: Widget(ptr: result))
+                }
+            }, ctx)
+        }
     }
     /// Factory for an interface with no constructor
     public static func makeWidget(label: String) -> Widget {
@@ -1220,12 +1525,6 @@ public enum EdgeCases {
         guard let rv = rv else { fatalError("-1: null string") }
         defer { weaveffi_free_string(rv) }
         return String(cString: rv)
-    }
-    public static func typedHandleParam(token: UInt64, raw: UInt64) -> UInt64 {
-        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
-        let rv = weaveffi_edge_cases_typed_handle_param(OpaquePointer(bitPattern: UInt(token)), raw, &err)
-        trap(&err)
-        return UInt64(UInt(bitPattern: rv))
     }
     /// Iterator of strings
     /// - Returns: A lazy sequence that pulls one element per step from the

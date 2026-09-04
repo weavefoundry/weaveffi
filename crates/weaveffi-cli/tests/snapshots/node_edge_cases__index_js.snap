@@ -56,6 +56,18 @@ function __invokeAsync(fn, args, map) {
   });
 }
 
+// Borrow a live object wrapper's native handle for one call. The wrapper
+// keeps its own reference; the producer clones if it retains the object.
+function __borrow(o, cls) {
+  if (!(o instanceof cls)) {
+    throw new WeaveFFIError(-3, 'expected an instance of ' + cls.name);
+  }
+  if (!o._handle) {
+    throw new WeaveFFIError(-3, cls.name + ' used after close()');
+  }
+  return o._handle;
+}
+
 // --- Private value-buffer runtime (WeaveFFI wire format) --------------------
 // Little-endian, packed, no alignment. Decoders reject truncated buffers,
 // invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
@@ -215,10 +227,10 @@ function __unpackOuter(r) {
     by_name: __rMap(r, (r) => r.str(), __unpackInner),
     modes: __rList(r, (r) => r.i32()),
     matrix: __rList(r, (r) => __rList(r, (r) => r.i32())),
-    sparse: __rList(r, (r) => __rOpt(r, (r) => Number(r.i64()))),
+    sparse: __rList(r, (r) => __rOpt(r, (r) => r.i64())),
     blob: __rOpt(r, (r) => r.bytes()),
     note: __rOpt(r, (r) => r.str()),
-    by_id: __rMap(r, (r) => Number(r.i64()), (r) => r.str()),
+    by_id: __rMap(r, (r) => r.i64(), (r) => r.str()),
     _hidden: r.bool(),
     v2: r.u8(),
   };
@@ -352,7 +364,21 @@ function __packRetired(w, v) {
 }
 function __unpackRetired(r) {
   return {
-    id: Number(r.i64()),
+    id: r.i64(),
+  };
+}
+function __packWidgetHolder(w, v) {
+  w.u64(v.primary._cloneHandle());
+  __wOpt(w, v.fallback, (w, v) => w.u64(v._cloneHandle()));
+  __wList(w, v.extras, (w, v) => w.u64(v._cloneHandle()));
+  __wMap(w, v.by_name, (w, k) => w.str(k), (w, v) => w.u64(v._cloneHandle()));
+}
+function __unpackWidgetHolder(r) {
+  return {
+    primary: Widget._adopt(r.u64()),
+    fallback: __rOpt(r, (r) => Widget._adopt(r.u64())),
+    extras: __rList(r, (r) => Widget._adopt(r.u64())),
+    by_name: __rMap(r, (r) => r.str(), (r) => Widget._adopt(r.u64())),
   };
 }
 
@@ -413,74 +439,132 @@ function __edgeCasesErrorFrom(code, message, payload) {
   return _err;
 }
 
+wv.Legacy = Object.freeze({
+  None: 0,
+  Default: 5,
+  Class: 10,
+  0: 'None',
+  5: 'Default',
+  10: 'Class',
+});
+wv.Mode = Object.freeze({
+  Fast: 1,
+  Safe: 2,
+  1: 'Fast',
+  2: 'Safe',
+});
+function __adaptBatchListener(impl) {
+  if (impl === null || impl === undefined) {
+    throw new WeaveFFIError(-3, 'BatchListener implementation must be an object');
+  }
+  return {
+    on_batch(items, raw, first, mode) {
+      return impl.onBatch(__decode((r) => __rList(r, __unpackOuter), items), raw, __decode((r) => __rOpt(r, __unpackOuter), first), mode);
+    },
+    on_widget(widget, fallback, children) {
+      return impl.onWidget(Widget._adopt(widget), (fallback == null ? null : Widget._adopt(fallback)), __decode((r) => __rList(r, (r) => Widget._adopt(r.u64())), children));
+    },
+    on_tick() {
+      return impl.onTick();
+    },
+    should_continue(class_) {
+      return impl.shouldContinue(class_);
+    },
+    pick_mode() {
+      return impl.pickMode();
+    },
+  };
+}
+
+function __adaptKeyword(impl) {
+  if (impl === null || impl === undefined) {
+    throw new WeaveFFIError(-3, 'Keyword implementation must be an object');
+  }
+  return {
+    delete(self) {
+      return impl.delete(self);
+    },
+    import() {
+      return impl.import();
+    },
+  };
+}
+
 class Widget {
   refresh() {
-    return __invoke(addon.Widget_refresh, [this._handle], __edgeCasesErrorFrom);
+    return __invoke(addon.Widget_refresh, [__borrow(this, Widget)], __edgeCasesErrorFrom);
   }
   rename(class_, import_) {
-    return __invoke(addon.Widget_rename, [this._handle, class_, __encode((w, v) => __wOpt(w, v, (w, v) => w.str(v)), import_)], __generic);
+    return __invoke(addon.Widget_rename, [__borrow(this, Widget), class_, __encode((w, v) => __wOpt(w, v, (w, v) => w.str(v)), import_)], __generic);
   }
   fetch(id) {
-    return __invokeAsync(addon.Widget_fetch, [this._handle, id], __edgeCasesErrorFrom).then((_r) => __decode(__unpackOuter, _r));
+    return __invokeAsync(addon.Widget_fetch, [__borrow(this, Widget), id], __edgeCasesErrorFrom).then((_r) => __decode(__unpackOuter, _r));
   }
   oldName() {
-    return __invoke(addon.Widget_old_name, [this._handle], __generic);
+    return __invoke(addon.Widget_old_name, [__borrow(this, Widget)], __generic);
   }
-  destroy() {
+  close() {
     if (this._handle) {
       Widget._cleanup.unregister(this);
-      addon.Widget_destroy(this._handle);
-      this._handle = 0;
+      addon.Widget__destroy(this._handle);
+      this._handle = 0n;
     }
   }
+  _cloneHandle() {
+    return addon.Widget__clone(__borrow(this, Widget));
+  }
 }
-Widget._fromHandle = function (handle) {
+Widget._adopt = function (handle) {
   const _o = Object.create(Widget.prototype);
   _o._handle = handle;
   Widget._cleanup.register(_o, handle, _o);
   return _o;
 };
 Widget._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.Widget_destroy(handle); }
+  if (handle) { addon.Widget__destroy(handle); }
 });
+if (typeof Symbol.dispose === 'symbol') {
+  Widget.prototype[Symbol.dispose] = Widget.prototype.close;
+}
 wv.Widget = Widget;
 
 class Vault {
   static open(path) {
     const _r = __invoke(addon.Vault_open, [path], __edgeCasesErrorFrom);
-    return Vault._fromHandle(_r);
+    return Vault._adopt(_r);
   }
   peek() {
-    const _r = __invoke(addon.Vault_peek, [this._handle], __generic);
-    return _r == null ? null : Widget._fromHandle(_r);
+    const _r = __invoke(addon.Vault_peek, [__borrow(this, Vault)], __generic);
+    return (_r == null ? null : Widget._adopt(_r));
   }
   static probe() {
     return __invoke(addon.Vault_probe, [], __edgeCasesErrorFrom);
   }
-  destroy() {
+  close() {
     if (this._handle) {
       Vault._cleanup.unregister(this);
-      addon.Vault_destroy(this._handle);
-      this._handle = 0;
+      addon.Vault__destroy(this._handle);
+      this._handle = 0n;
     }
   }
+  _cloneHandle() {
+    return addon.Vault__clone(__borrow(this, Vault));
+  }
 }
-Vault._fromHandle = function (handle) {
+Vault._adopt = function (handle) {
   const _o = Object.create(Vault.prototype);
   _o._handle = handle;
   Vault._cleanup.register(_o, handle, _o);
   return _o;
 };
 Vault._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.Vault_destroy(handle); }
+  if (handle) { addon.Vault__destroy(handle); }
 });
+if (typeof Symbol.dispose === 'symbol') {
+  Vault.prototype[Symbol.dispose] = Vault.prototype.close;
+}
 wv.Vault = Vault;
 
-wv.registerBatchListener = function (callback) {
-  return addon.registerBatchListener(function (items, raw, first, mode) {
-    callback(__decode((r) => __rList(r, __unpackOuter), items), raw, __decode((r) => __rOpt(r, __unpackOuter), first), mode);
-  });
-};
 wv.noop = function () {
   return __invoke(addon.noop, [], __generic);
 };
@@ -495,22 +579,30 @@ wv.optionalParams = function (text, count, outer, tags, blob, mode) {
   const _r = __invoke(addon.optionalParams, [__encode((w, v) => __wOpt(w, v, (w, v) => w.str(v)), text), __encode((w, v) => __wOpt(w, v, (w, v) => w.i32(v)), count), __encode((w, v) => __wOpt(w, v, __packOuter), outer), __encode((w, v) => __wOpt(w, v, (w, v) => __wList(w, v, (w, v) => w.str(v))), tags), __encode((w, v) => __wOpt(w, v, (w, v) => w.bytes(v)), blob), __encode((w, v) => __wOpt(w, v, (w, v) => w.i32(v)), mode)], __generic);
   return __decode((r) => __rOpt(r, (r) => r.i32()), _r);
 };
-wv.mutableParams = function (text, blob) {
-  return __invoke(addon.mutableParams, [text, blob], __generic);
+wv.registerBatch = function (listener, keyword) {
+  return __invoke(addon.registerBatch, [__adaptBatchListener(listener), __adaptKeyword(keyword)], __generic);
+};
+wv.widgetsEverywhere = function (list, byName, sparse, holder) {
+  const _r = __invoke(addon.widgetsEverywhere, [__encode((w, v) => __wList(w, v, (w, v) => w.u64(v._cloneHandle())), list), __encode((w, v) => __wMap(w, v, (w, k) => w.str(k), (w, v) => w.u64(v._cloneHandle())), byName), __encode((w, v) => __wList(w, v, (w, v) => __wOpt(w, v, (w, v) => w.u64(v._cloneHandle()))), sparse), __encode(__packWidgetHolder, holder)], __generic);
+  return __decode(__unpackWidgetHolder, _r);
+};
+wv.widgetStream = function () {
+  const _it = __invoke(addon.widgetStream, [], __generic);
+  return new WeaveFFIIterator(_it, addon.widgetStream_iterNext, addon.widgetStream_iterDestroy, __generic, (_e) => Widget._adopt(_e));
+};
+wv.asyncWidget = function () {
+  return __invokeAsync(addon.asyncWidget, [], __edgeCasesErrorFrom).then((_r) => Widget._adopt(_r));
 };
 wv.makeWidget = function (label) {
   const _r = __invoke(addon.makeWidget, [label], __generic);
-  return Widget._fromHandle(_r);
+  return Widget._adopt(_r);
 };
 wv.findWidget = function (id) {
   const _r = __invoke(addon.findWidget, [id], __edgeCasesErrorFrom);
-  return _r == null ? null : Widget._fromHandle(_r);
+  return (_r == null ? null : Widget._adopt(_r));
 };
 wv.inspectWidget = function (widget, fallback) {
-  return __invoke(addon.inspectWidget, [widget instanceof Widget ? widget._handle : widget, fallback instanceof Widget ? fallback._handle : fallback], __generic);
-};
-wv.typedHandleParam = function (token, raw) {
-  return __invoke(addon.typedHandleParam, [token, raw], __generic);
+  return __invoke(addon.inspectWidget, [__borrow(widget, Widget), (fallback == null ? null : __borrow(fallback, Widget))], __generic);
 };
 wv.stringStream = function () {
   const _it = __invoke(addon.stringStream, [], __generic);
@@ -537,7 +629,7 @@ wv.asyncList = function () {
   return __invokeAsync(addon.asyncList, [], __edgeCasesErrorFrom).then((_r) => __decode((r) => __rList(r, __unpackOuter), _r));
 };
 wv.asyncOptional = function () {
-  return __invokeAsync(addon.asyncOptional, [], __generic).then((_r) => __decode((r) => __rOpt(r, (r) => Number(r.i64())), _r));
+  return __invokeAsync(addon.asyncOptional, [], __generic).then((_r) => __decode((r) => __rOpt(r, (r) => r.i64()), _r));
 };
 wv.asyncEnum = function () {
   return __invokeAsync(addon.asyncEnum, [], __generic);

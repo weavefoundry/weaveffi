@@ -1,6 +1,5 @@
-//! Callable rendering: sync and async wrapper functions, listener
-//! register/unregister pairs, and the lazy sequence classes backing
-//! `iter<T>` returns.
+//! Callable rendering: sync and async wrapper functions and the lazy
+//! sequence classes backing `iter<T>` returns.
 //!
 //! Parameter marshalling dispatches on the shared [`ArgPass`] plan and
 //! return handling on [`RetPass`], so how a value crosses the ABI is decided
@@ -8,23 +7,19 @@
 
 use std::fmt::Write;
 
-use heck::ToLowerCamelCase;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
-use weaveffi_core::lang;
 use weaveffi_core::model::Ty;
-use weaveffi_core::model::{
-    CallShape, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding, ParamBinding,
-};
-use weaveffi_core::plan::{ret_pass, ArgPass, ElemFree, ErrorStrategy, RetPass};
-use weaveffi_core::utils::{local_type_name, wrapper_name};
+use weaveffi_core::model::{CallShape, FnBinding, IteratorBinding, ModuleBinding, ParamBinding};
+use weaveffi_core::plan::{ret_pass, ArgPass, ErrorStrategy, Free, RetPass};
+use weaveffi_core::utils::local_type_name;
 
 use crate::codec::{fresh, read_value_stmts, write_value_stmts};
 use crate::docs::emit_fn_doc;
 use crate::entities::domain_stem;
 use crate::types::{
-    c_enum_type, iterator_class_name, swift_ident, swift_scalar_default, swift_type_ctx,
-    swift_type_for, SwiftCtx,
+    c_enum_type, callback_box_name, callback_vtable_name, iterator_class_name, swift_ident,
+    swift_scalar_default, swift_type_ctx, swift_type_for, SwiftCtx,
 };
 
 /// How a wrapper body reports a non-zero `weaveffi_error` slot.
@@ -290,22 +285,93 @@ fn build_c_call_args(params: &[ParamBinding], c_prefix: &str, module_name: &str)
                     args.push(format!("{}.ptr", p.name));
                 }
             }
+            // A callback interface passes the retained box (staged as
+            // `{name}_ctx`) plus the interface's process-wide vtable.
+            ArgPass::Callback { .. } => {
+                let cb =
+                    p.ty.callback_interface_name()
+                        .expect("callback family names a callback interface");
+                args.push(format!("{}_ctx", p.name));
+                args.push(format!("{}.pointer", callback_vtable_name(cb)));
+            }
             ArgPass::Direct { .. } => match &p.ty {
                 Ty::Enum(enum_name) => args.push(format!(
                     "{}({}.rawValue)",
                     c_enum_type(enum_name, c_prefix, module_name),
                     p.name
                 )),
-                // A typed handle is a `UInt64` token in Swift; the C slot is
-                // an opaque typed pointer, so reinterpret the bits.
-                Ty::TypedHandle(_) => {
-                    args.push(format!("OpaquePointer(bitPattern: UInt({}))", p.name));
-                }
                 _ => args.push(p.name.clone()),
             },
         }
     }
     args.join(", ")
+}
+
+/// Emit the pre-call staging statements for `params`: byte params are copied
+/// into `[UInt8]`, buffered params are packed into a writer (both handed to
+/// the C call via `withUnsafeBufferPointer` later), and callback interfaces
+/// are boxed with a +1 retain the producer's `free` entry releases.
+fn render_arg_staging(
+    w: &mut CodeWriter,
+    params: &[ParamBinding],
+    ctx: SwiftCtx,
+    counter: &mut usize,
+) {
+    for p in params {
+        match p.arg_pass() {
+            ArgPass::Bytes { .. } => {
+                w.line(format!("let {n}Bytes = Array({n})", n = p.name));
+            }
+            ArgPass::Buffer { .. } => {
+                w.line(format!("var {n}Writer = WvWriter()", n = p.name));
+                let writer = format!("{}Writer", p.name);
+                write_value_stmts(w, &p.ty, &p.name, &writer, ctx, counter);
+            }
+            ArgPass::Callback { .. } => {
+                let cb =
+                    p.ty.callback_interface_name()
+                        .expect("callback family names a callback interface");
+                w.line(format!(
+                    "let {n}_ctx = Unmanaged.passRetained({}({n})).toOpaque()",
+                    callback_box_name(cb),
+                    n = p.name
+                ));
+            }
+            ArgPass::Direct { .. } | ArgPass::String { .. } | ArgPass::Object { .. } => {}
+        }
+    }
+}
+
+/// Open one pointer-staging closure for `p` (a string, bytes, or buffered
+/// parameter), binding its `_ptr`/`_len` locals; `bind` is the prefix of the
+/// opening line (`let rv: T = `, `return `, or nothing).
+fn open_staging_closure(w: &mut CodeWriter, p: &ParamBinding, bind: &str) {
+    let n = &p.name;
+    match p.arg_pass() {
+        ArgPass::String { .. } => {
+            w.line(format!("{bind}{n}.withCString {{ {n}_ptr in"));
+            w.indent();
+        }
+        ArgPass::Bytes { .. } => {
+            w.line(format!(
+                "{bind}{n}Bytes.withUnsafeBufferPointer {{ {n}_buf in"
+            ));
+            w.indent();
+            w.line(format!("let {n}_ptr = {n}_buf.baseAddress"));
+            w.line(format!("let {n}_len = {n}_buf.count"));
+        }
+        ArgPass::Buffer { .. } => {
+            w.line(format!(
+                "{bind}{n}Writer.bytes.withUnsafeBufferPointer {{ {n}_buf in"
+            ));
+            w.indent();
+            w.line(format!("let {n}_ptr = {n}_buf.baseAddress"));
+            w.line(format!("let {n}_len = {n}_buf.count"));
+        }
+        ArgPass::Direct { .. } | ArgPass::Object { .. } | ArgPass::Callback { .. } => {
+            unreachable!("only string, bytes, and buffered parameters are staged")
+        }
+    }
 }
 
 /// The Swift spelling of the raw C return value of `f`, used to annotate the
@@ -327,7 +393,6 @@ fn raw_return_swift(
         RetPass::String => "UnsafePointer<CChar>?".to_string(),
         RetPass::Object { .. } => "OpaquePointer?".to_string(),
         RetPass::Direct => match f.ret.as_ref() {
-            Some(Ty::TypedHandle(_)) => "OpaquePointer?".to_string(),
             Some(Ty::Enum(name)) => c_enum_type(name, c_prefix, module_name),
             Some(other) => swift_type_for(other),
             None => unreachable!("a direct return carries a type"),
@@ -366,23 +431,7 @@ fn render_call_body(
 ) {
     let mut counter = 0usize;
     w.line("var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)");
-
-    // Staging: byte params are copied into `[UInt8]`, buffered params are
-    // packed into a writer; both are handed to the C call via
-    // `withUnsafeBufferPointer` below.
-    for p in &f.params {
-        match p.arg_pass() {
-            ArgPass::Bytes { .. } => {
-                w.line(format!("let {n}Bytes = Array({n})", n = p.name));
-            }
-            ArgPass::Buffer { .. } => {
-                w.line(format!("var {n}Writer = WvWriter()", n = p.name));
-                let writer = format!("{}Writer", p.name);
-                write_value_stmts(w, &p.ty, &p.name, &writer, ctx, &mut counter);
-            }
-            _ => {}
-        }
-    }
+    render_arg_staging(w, &f.params, ctx, &mut counter);
 
     // An iterator launch returns the handle, not a value; its return plan is
     // the iterator protocol rather than a `RetPass`.
@@ -436,30 +485,7 @@ fn render_call_body(
             } else {
                 "return ".to_string()
             };
-            let n = &p.name;
-            match p.arg_pass() {
-                ArgPass::String { .. } => {
-                    w.line(format!("{bind}{n}.withCString {{ {n}_ptr in"));
-                    w.indent();
-                }
-                ArgPass::Bytes { .. } => {
-                    w.line(format!(
-                        "{bind}{n}Bytes.withUnsafeBufferPointer {{ {n}_buf in"
-                    ));
-                    w.indent();
-                    w.line(format!("let {n}_ptr = {n}_buf.baseAddress"));
-                    w.line(format!("let {n}_len = {n}_buf.count"));
-                }
-                ArgPass::Buffer { .. } => {
-                    w.line(format!(
-                        "{bind}{n}Writer.bytes.withUnsafeBufferPointer {{ {n}_buf in"
-                    ));
-                    w.indent();
-                    w.line(format!("let {n}_ptr = {n}_buf.baseAddress"));
-                    w.line(format!("let {n}_len = {n}_buf.count"));
-                }
-                ArgPass::Direct { .. } | ArgPass::Object { .. } => unreachable!(),
-            }
+            open_staging_closure(w, p, &bind);
         }
         if has_ret {
             w.line(format!("return {call}"));
@@ -547,178 +573,11 @@ fn render_return_tail(
                 let ty_name = ctx.ty_name(local_type_name(name));
                 w.line(format!("return {ty_name}(rawValue: rv.rawValue)!"));
             }
-            Some(Ty::TypedHandle(_)) => {
-                w.line("return UInt64(UInt(bitPattern: rv))");
-            }
             _ => {
                 w.line("return rv");
             }
         },
     }
-}
-
-/// The Swift type one callback parameter surfaces as in the user closure.
-/// Interface parameters stay raw (`OpaquePointer?`): wrapping them in the
-/// owning Swift class would `*_destroy` a borrowed handle on ARC release.
-/// Buffered parameters are decoded to their idiomatic value types before the
-/// closure is invoked.
-fn swift_cb_param_type(ty: &Ty, ctx: SwiftCtx) -> String {
-    match ty {
-        Ty::Interface(_) => "OpaquePointer?".into(),
-        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
-            "OpaquePointer?".into()
-        }
-        other => swift_type_ctx(other, ctx),
-    }
-}
-
-/// The Swift spelling of one trampoline closure formal: the ABI slot name,
-/// keyword-escaped (a param named `in` yields a slot named `in`, which can't
-/// bind as a closure formal unescaped).
-fn cb_slot_ident(name: &str) -> String {
-    lang::escape_ident(name, lang::SWIFT_KEYWORDS)
-}
-
-/// The expression converting one *direct* callback parameter's C slots into
-/// the value handed to the user closure. Slot names follow the parameter's
-/// precomputed ABI slots. Buffered parameters are decoded via statements
-/// instead (see [`render_swift_listener`]).
-fn swift_cb_direct_arg(p: &ParamBinding, ctx: SwiftCtx) -> String {
-    let n0 = cb_slot_ident(&p.abi[0].name);
-    match &p.ty {
-        Ty::Enum(_) => {
-            let local = swift_type_ctx(&p.ty, ctx);
-            format!("{local}(rawValue: {n0}.rawValue)!")
-        }
-        Ty::StringUtf8 | Ty::BorrowedStr => format!("String(cString: {n0}!)"),
-        Ty::Bytes | Ty::BorrowedBytes => {
-            let n1 = cb_slot_ident(&p.abi[1].name);
-            format!("{n0}.map {{ Data(bytes: $0, count: {n1}) }} ?? Data()")
-        }
-        Ty::TypedHandle(_) => format!("UInt64(UInt(bitPattern: {n0}))"),
-        // Interfaces (and nullable interfaces) stay raw borrowed pointers.
-        _ => n0,
-    }
-}
-
-/// The register/unregister pair for one listener. The user closure is boxed
-/// (`WvCallbackBox`) and retained through the C `context` pointer; the
-/// capture-free trampoline closure decodes any buffered arguments, unboxes
-/// the user closure, and invokes it.
-pub(crate) fn render_swift_listener(
-    out: &mut String,
-    module_path: &str,
-    mb: &ModuleBinding,
-    l: &ListenerBinding,
-    strip_module_prefix: bool,
-    ctx: SwiftCtx,
-) {
-    let Some(cb) = mb.callback(&l.event_callback) else {
-        unreachable!("validation guarantees the listener's callback exists");
-    };
-    let register_fn = swift_ident(&wrapper_name(
-        module_path,
-        &format!("register_{}", l.name),
-        strip_module_prefix,
-    ));
-    let unregister_fn = swift_ident(&wrapper_name(
-        module_path,
-        &format!("unregister_{}", l.name),
-        strip_module_prefix,
-    ));
-
-    let closure_type = format!(
-        "({}) -> Void",
-        cb.params
-            .iter()
-            .map(|p| swift_cb_param_type(&p.ty, ctx))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // Trampoline closure formals: every ABI slot, context last.
-    let slot_names: Vec<String> = cb
-        .abi_params
-        .iter()
-        .map(|s| cb_slot_ident(&s.name))
-        .collect();
-
-    let mut w = CodeWriter::four_space().with_depth(1);
-    {
-        let mut tmp = String::new();
-        emit_fn_doc(&mut tmp, &l.doc, &[], "    ");
-        w.raw(tmp);
-    }
-    w.line(format!(
-        "/// - Returns: A subscription id for ``{unregister_fn}(_:)``."
-    ));
-    w.line(format!(
-        "public static func {register_fn}(_ callback: @escaping {closure_type}) -> UInt64 {{"
-    ));
-    w.indent();
-    w.line("let box = WvCallbackBox(callback)");
-    w.line("let ctx = Unmanaged.passRetained(box).toOpaque()");
-    w.line(format!(
-        "let id = {}({{ {} in",
-        l.register_symbol,
-        slot_names.join(", ")
-    ));
-    w.indent();
-    w.line(format!(
-        "let cb = Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(context!).takeUnretainedValue().value"
-    ));
-    // Buffered arguments are borrowed (ptr, len) pairs, valid only for the
-    // dispatch: decode them before invoking the user closure.
-    let mut counter = 0usize;
-    let mut args: Vec<String> = Vec::new();
-    for p in &cb.params {
-        if let ArgPass::Buffer { ptr, len } = p.arg_pass() {
-            let base = p.name.to_lower_camel_case();
-            w.line(format!(
-                "let {base}Buf = [UInt8](UnsafeBufferPointer(start: {}, count: {}))",
-                ptr.name, len.name
-            ));
-            w.line(format!("var {base}Reader = WvReader(bytes: {base}Buf)"));
-            let v = fresh(&mut counter, "v");
-            let reader = format!("{base}Reader");
-            read_value_stmts(&mut w, &p.ty, &v, &reader, ctx, &mut counter);
-            w.line(format!("{base}Reader.finish()"));
-            args.push(v);
-        } else {
-            args.push(swift_cb_direct_arg(p, ctx));
-        }
-    }
-    w.line(format!("cb({})", args.join(", ")));
-    w.dedent();
-    w.line("}, ctx)");
-    w.line("wvListenerLock.lock()");
-    w.line("wvListenerContexts[id] = ctx");
-    w.line("wvListenerLock.unlock()");
-    w.line("return id");
-    w.dedent();
-    w.line("}");
-
-    w.line(format!(
-        "/// Unregisters a listener previously registered with ``{register_fn}(_:)``."
-    ));
-    w.line(format!(
-        "public static func {unregister_fn}(_ id: UInt64) {{"
-    ));
-    w.indent();
-    w.line(format!("{}(id)", l.unregister_symbol));
-    w.line("wvListenerLock.lock()");
-    w.line("let ctx = wvListenerContexts.removeValue(forKey: id)");
-    w.line("wvListenerLock.unlock()");
-    w.line("if let ctx = ctx {");
-    w.scope(|w| {
-        w.line(format!(
-            "Unmanaged<WvCallbackBox<{closure_type}>>.fromOpaque(ctx).release()"
-        ));
-    });
-    w.line("}");
-    w.dedent();
-    w.line("}");
-    out.push_str(&w.finish());
 }
 
 /// Render one async callable as a continuation-backed `async` wrapper. A
@@ -779,22 +638,11 @@ pub(crate) fn render_swift_async_function(
     w.line("let ctx = Unmanaged.passRetained(ContinuationRef(continuation)).toOpaque()");
 
     // Staging: identical to the sync path. The producer copies every input
-    // synchronously during the launch, so pointer validity for the launch
-    // call's duration is sufficient.
+    // synchronously during the launch (and retains the callback pair for as
+    // long as it needs it), so pointer validity for the launch call's
+    // duration is sufficient.
     let mut counter = 0usize;
-    for p in &f.params {
-        match p.arg_pass() {
-            ArgPass::Bytes { .. } => {
-                w.line(format!("let {n}Bytes = Array({n})", n = p.name));
-            }
-            ArgPass::Buffer { .. } => {
-                w.line(format!("var {n}Writer = WvWriter()", n = p.name));
-                let writer = format!("{}Writer", p.name);
-                write_value_stmts(&mut w, &p.ty, &p.name, &writer, ctx, &mut counter);
-            }
-            _ => {}
-        }
-    }
+    render_arg_staging(&mut w, &f.params, ctx, &mut counter);
 
     // The launch returns void, so the staging closures carry no binding.
     let closure_params: Vec<&ParamBinding> = f
@@ -803,28 +651,7 @@ pub(crate) fn render_swift_async_function(
         .filter(|p| needs_staging_closure(p))
         .collect();
     for p in &closure_params {
-        let n = &p.name;
-        match p.arg_pass() {
-            ArgPass::String { .. } => {
-                w.line(format!("{n}.withCString {{ {n}_ptr in"));
-                w.indent();
-            }
-            ArgPass::Bytes { .. } => {
-                w.line(format!("{n}Bytes.withUnsafeBufferPointer {{ {n}_buf in"));
-                w.indent();
-                w.line(format!("let {n}_ptr = {n}_buf.baseAddress"));
-                w.line(format!("let {n}_len = {n}_buf.count"));
-            }
-            ArgPass::Buffer { .. } => {
-                w.line(format!(
-                    "{n}Writer.bytes.withUnsafeBufferPointer {{ {n}_buf in"
-                ));
-                w.indent();
-                w.line(format!("let {n}_ptr = {n}_buf.baseAddress"));
-                w.line(format!("let {n}_len = {n}_buf.count"));
-            }
-            ArgPass::Direct { .. } | ArgPass::Object { .. } => unreachable!(),
-        }
+        open_staging_closure(&mut w, p, "");
     }
 
     let c_sym = format!("{}_async", f.c_base);
@@ -989,9 +816,6 @@ fn render_async_resume_result(
                     "contRef.value.resume(returning: {ty_name}(rawValue: result.rawValue)!)"
                 ));
             }
-            Some(Ty::TypedHandle(_)) => {
-                w.line("contRef.value.resume(returning: UInt64(UInt(bitPattern: result)))");
-            }
             _ => {
                 w.line("contRef.value.resume(returning: result)");
             }
@@ -1023,7 +847,7 @@ pub(crate) fn render_swift_iterator_class(
     it: &IteratorBinding,
     ctx: SwiftCtx,
 ) {
-    let protocol = it.protocol(f);
+    let protocol = it.protocol(f, &mb.path, ctx.c_prefix);
     let class_name = iterator_class_name(it, ctx.c_prefix);
     let next_fn = &it.next.symbol;
     let destroy_fn = &it.destroy_symbol;
@@ -1031,11 +855,7 @@ pub(crate) fn render_swift_iterator_class(
     let elem_swift = swift_type_ctx(inner, ctx);
     let stem = domain_stem(mb);
     let throws = protocol.error == ErrorStrategy::Throws;
-    let has_len_slot = protocol.elem_free == ElemFree::Bytes;
-    let is_bytes_elem = matches!(inner, Ty::Bytes | Ty::BorrowedBytes);
-    // A `(ptr, len)` element that isn't raw bytes is a buffered value the
-    // wrapper decodes.
-    let is_buffered_elem = has_len_slot && !is_bytes_elem;
+    let has_len_slot = protocol.elem_free == Free::Bytes;
 
     // `out_item` is the slot after the iterator handle; render its pointee as
     // the element C type so enum slots get the imported C enum
@@ -1053,16 +873,17 @@ pub(crate) fn render_swift_iterator_class(
         .unwrap_or_default();
 
     // The `out_item` slot declaration.
-    let (c_var, default): (String, String) = match inner {
-        _ if has_len_slot => ("UnsafePointer<UInt8>?".to_string(), "nil".to_string()),
-        Ty::StringUtf8 | Ty::BorrowedStr => {
-            ("UnsafePointer<CChar>?".to_string(), "nil".to_string())
+    let (c_var, default): (String, String) = match &protocol.elem {
+        RetPass::Bytes | RetPass::Buffer => {
+            ("UnsafePointer<UInt8>?".to_string(), "nil".to_string())
         }
-        Ty::Interface(_) | Ty::TypedHandle(_) | Ty::Optional(_) => {
-            ("OpaquePointer?".to_string(), "nil".to_string())
-        }
-        Ty::Enum(_) => (elem_c_type.clone(), format!("{elem_c_type}(0)")),
-        _ => (swift_type_for(inner), swift_scalar_default(inner)),
+        RetPass::String => ("UnsafePointer<CChar>?".to_string(), "nil".to_string()),
+        RetPass::Object { .. } => ("OpaquePointer?".to_string(), "nil".to_string()),
+        RetPass::Direct => match inner {
+            Ty::Enum(_) => (elem_c_type.clone(), format!("{elem_c_type}(0)")),
+            _ => (swift_type_for(inner), swift_scalar_default(inner)),
+        },
+        RetPass::Void => unreachable!("an iterator element is never void"),
     };
 
     let mut w = CodeWriter::four_space();
@@ -1158,40 +979,54 @@ pub(crate) fn render_swift_iterator_class(
     w.dedent();
     w.line("}");
 
-    if is_buffered_elem {
-        // Decode the element buffer, then release it (ElemFree::Bytes).
-        w.line("let itemBytes = [UInt8](UnsafeBufferPointer(start: item, count: itemLen))");
-        w.line("weaveffi_free_bytes(UnsafeMutablePointer(mutating: item), itemLen)");
-        w.line("var itemReader = WvReader(bytes: itemBytes)");
-        let mut counter = 0usize;
-        let v = fresh(&mut counter, "v");
-        read_value_stmts(&mut w, inner, &v, "itemReader", ctx, &mut counter);
-        w.line("itemReader.finish()");
-        w.line(format!("return {v}"));
-    } else if is_bytes_elem {
-        w.line("let element = Data(bytes: item!, count: itemLen)");
-        w.line("weaveffi_free_bytes(UnsafeMutablePointer(mutating: item), itemLen)");
-        w.line("return element");
-    } else {
-        let convert = match inner {
-            Ty::StringUtf8 | Ty::BorrowedStr => "String(cString: item!)".to_string(),
-            // An owned interface element is adopted by the wrapper class,
-            // whose deinit owes the `_destroy`.
-            Ty::Interface(name) => {
-                format!("{}(ptr: item!)", ctx.ty_name(local_type_name(name)))
-            }
-            Ty::TypedHandle(_) => "UInt64(UInt(bitPattern: item))".to_string(),
-            Ty::Enum(name) => format!(
-                "{}(rawValue: item.rawValue)!",
-                ctx.ty_name(local_type_name(name))
-            ),
-            _ => "item".to_string(),
-        };
-        w.line(format!("let element = {convert}"));
-        if protocol.elem_free == ElemFree::String {
-            w.line("weaveffi_free_string(item)");
+    match &protocol.elem {
+        RetPass::Buffer => {
+            // Decode the element buffer, then release it (`Free::Bytes`).
+            w.line("let itemBytes = [UInt8](UnsafeBufferPointer(start: item, count: itemLen))");
+            w.line("weaveffi_free_bytes(UnsafeMutablePointer(mutating: item), itemLen)");
+            w.line("var itemReader = WvReader(bytes: itemBytes)");
+            let mut counter = 0usize;
+            let v = fresh(&mut counter, "v");
+            read_value_stmts(&mut w, inner, &v, "itemReader", ctx, &mut counter);
+            w.line("itemReader.finish()");
+            w.line(format!("return {v}"));
         }
-        w.line("return element");
+        RetPass::Bytes => {
+            w.line("let element = Data(bytes: item!, count: itemLen)");
+            w.line("weaveffi_free_bytes(UnsafeMutablePointer(mutating: item), itemLen)");
+            w.line("return element");
+        }
+        RetPass::String => {
+            w.line("let element = String(cString: item!)");
+            w.line("weaveffi_free_string(item)");
+            w.line("return element");
+        }
+        // An owned interface element is adopted by the wrapper class, whose
+        // deinit owes the `_destroy`; a nullable one adopts when non-null.
+        RetPass::Object { nullable, .. } => {
+            let wrapper = ctx.ty_name(local_type_name(
+                inner
+                    .interface_name()
+                    .expect("object element names an interface"),
+            ));
+            if *nullable {
+                w.line(format!("return item.map {{ {wrapper}(ptr: $0) }}"));
+            } else {
+                w.line(format!("return {wrapper}(ptr: item!)"));
+            }
+        }
+        RetPass::Direct => match inner {
+            Ty::Enum(name) => {
+                w.line(format!(
+                    "return {}(rawValue: item.rawValue)!",
+                    ctx.ty_name(local_type_name(name))
+                ));
+            }
+            _ => {
+                w.line("return item");
+            }
+        },
+        RetPass::Void => unreachable!("an iterator element is never void"),
     }
     w.dedent();
     w.line("}");

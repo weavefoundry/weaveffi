@@ -118,9 +118,11 @@ pub(crate) fn render_packaged_readme(
 ) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, "README.md");
+    // Match the slices `package()` actually bundles: desktop only.
     let platforms: Vec<String> = ctx
         .binaries
         .platforms()
+        .filter(|p| p.is_desktop())
         .map(|p| format!("- `lib/{}/`", p.id()))
         .collect();
     let platform_list = platforms.join("\n");

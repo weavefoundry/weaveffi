@@ -5,12 +5,12 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use weaveffi_core::codegen::{ConfiguredBackend, Orchestrator, Target};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
-use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
 use weaveffi_gen_c::{CConfig, CGenerator};
 use weaveffi_gen_cpp::{CppConfig, CppGenerator};
 use weaveffi_gen_dart::{DartConfig, DartGenerator};
 use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
 use weaveffi_gen_go::{GoConfig, GoGenerator};
+use weaveffi_gen_kotlin::{KotlinConfig, KotlinGenerator};
 use weaveffi_gen_node::{NodeConfig, NodeGenerator};
 use weaveffi_gen_python::{PythonConfig, PythonGenerator};
 use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
@@ -33,7 +33,6 @@ fn param(name: &str, ty: TypeRef) -> Param {
     Param {
         name: name.into(),
         ty,
-        mutable: false,
         doc: None,
     }
 }
@@ -91,7 +90,6 @@ fn build_large_api() -> ResolvedApi {
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
-                    since: None,
                 })
                 .collect();
 
@@ -102,8 +100,7 @@ fn build_large_api() -> ResolvedApi {
                 interfaces: vec![],
                 structs,
                 enums,
-                callbacks: vec![],
-                listeners: vec![],
+                callback_interfaces: vec![],
                 errors: None,
                 modules: vec![],
             }
@@ -112,7 +109,7 @@ fn build_large_api() -> ResolvedApi {
 
     validate_api(
         Api {
-            version: "0.8.0".into(),
+            version: "0.9.0".into(),
             modules,
         },
         None,
@@ -130,8 +127,8 @@ fn all_default_targets() -> Vec<Box<dyn Target>> {
             SwiftConfig::default(),
         )),
         Box::new(ConfiguredBackend::new(
-            AndroidGenerator,
-            AndroidConfig::default(),
+            KotlinGenerator,
+            KotlinConfig::default(),
         )),
         Box::new(ConfiguredBackend::new(NodeGenerator, NodeConfig::default())),
         Box::new(ConfiguredBackend::new(WasmGenerator, WasmConfig::default())),

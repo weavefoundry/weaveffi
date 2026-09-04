@@ -4,8 +4,9 @@
 // interface class (canonical `new` constructor, instance methods, per-object
 // state), struct returns materialized as real JS objects, optional strings
 // (null email), enum-as-int params, list-of-struct returns, the bool return,
-// and the typed error surface (NotFoundError / InvalidNameError extending
-// ContactsError extending WeaveFFIError, each carrying its stable code). The
+// the typed error surface (NotFoundError / InvalidNameError extending
+// ContactsError extending WeaveFFIError, each carrying its stable code), and
+// the idempotent `close()` of the reference-counted wrapper. The
 // harness passes the built addon via WV_ADDON; the generated loader honors
 // WEAVEFFI_ADDON, and the generated index.js lives in the sibling
 // conformance-gen tree.
@@ -29,7 +30,11 @@ function expect(cond, msg) {
   }
 }
 
-const ContactType = { Personal: 0, Work: 1, Other: 2 };
+// The C-style enum is exported as a frozen object (forward and reverse
+// mappings), the runtime value `types.d.ts` declares as `export enum`.
+const ContactType = wv.ContactType;
+expect(ContactType.Personal === 0 && ContactType.Work === 1 && ContactType.Other === 2, 'ContactType values');
+expect(ContactType[1] === 'Work', 'ContactType reverse mapping');
 
 const book = new wv.ContactBook();
 expect(book instanceof wv.ContactBook, 'book is a ContactBook instance');
@@ -93,7 +98,15 @@ try {
   expect(e.code === 1, 'InvalidName code == 1 (got ' + e.code + ')');
 }
 
-other.destroy();
-book.destroy();
+// Explicit release; close() is idempotent and a closed wrapper rejects use.
+other.close();
+other.close();
+book.close();
+try {
+  book.count();
+  expect(false, 'expected throw for use after close');
+} catch (e) {
+  expect(e instanceof wv.WeaveFFIError && e.code === -3, 'use after close is a marshalling error (got ' + e.code + ')');
+}
 
 console.log('node/contacts: OK');

@@ -36,11 +36,18 @@ go build ./...
 
 ## How It Works
 
-The generated `weaveffi.go` file uses a CGo preamble to `#include "weaveffi.h"`
+The generated `weaveffi.go` file uses a cgo preamble to `#include "weaveffi.h"`
 and link against `-lweaveffi`. Each API function is exposed as an idiomatic Go
 function that marshals arguments to C types, calls the C ABI function, and
 converts the result back to Go types. Records, rich enums, optionals, lists,
 and maps cross the boundary serialized in the WeaveFFI value-buffer format.
 Errors are returned as Go `error` values.
+
+Interfaces are reference-counted objects: each wrapper holds one strong
+reference that `Close()` releases (a finalizer releases it if you forget), and
+a nullable interface is a nil wrapper pointer. Callback interfaces are Go
+`interface` types: implement one and pass the value to any function that
+accepts it; the native library may call it from any thread, and a panic in
+your implementation is reported to the native caller instead of crashing.
 
 <!-- END README.md -->

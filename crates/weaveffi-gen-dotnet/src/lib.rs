@@ -1,20 +1,32 @@
 //! .NET (P/Invoke) binding generator for WeaveFFI.
 //!
 //! Emits a C# project (`.csproj` + `.nuspec`) with P/Invoke declarations
-//! and idiomatic wrappers over the C ABI. Async functions surface as
-//! `Task<T>`-returning methods. Implements [`LanguageBackend`]; the shared
-//! driver bridges it into the generator pipeline.
+//! and idiomatic wrappers over the C ABI, revision 2. Implements
+//! [`LanguageBackend`]; the shared driver bridges it into the generator
+//! pipeline.
 //!
-//! Records, rich enums, optionals, lists, and maps are value types that
-//! cross the C ABI serialized in the WeaveFFI value-buffer format (one
-//! `const uint8_t*` + `size_t` pair). The generated file carries a small
-//! internal writer/reader implementing the wire format, plus one
-//! `WriteTo`/`ReadFrom` pair per record and rich enum.
+//! * Records, rich enums, optionals, lists, and maps are value types that
+//!   cross the C ABI serialized in the WeaveFFI value-buffer format (one
+//!   `const uint8_t*` + `size_t` pair). The generated file carries a small
+//!   internal writer/reader implementing the wire format, plus one
+//!   `WriteTo`/`ReadFrom` pair per record and rich enum.
+//! * Interfaces are reference-counted objects wrapped in `IDisposable`
+//!   classes with a finalizer backstop; a returned, async, iterated, or
+//!   buffered object is adopted into a fresh wrapper, and a top-level object
+//!   parameter is borrowed for the call. Objects inside value buffers are
+//!   `u64` tokens minted through the interface's `_clone` symbol.
+//! * Callback interfaces surface as C# `interface`s the consumer implements;
+//!   passing one registers it in a `GCHandle` and hands the producer a
+//!   pointer to one process-wide static vtable of `[UnmanagedCallersOnly]`
+//!   trampolines.
+//! * Async functions surface as `Task<T>`-returning methods and `iter<T>`
+//!   returns as lazily streamed `IEnumerable<T>`.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
+mod callbacks;
 mod calls;
 mod codec;
 mod docs;
@@ -28,15 +40,15 @@ use camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::model::{BindingModel, CallShape, ErrorBinding};
+use weaveffi_core::model::{BindingModel, ErrorBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
+use crate::callbacks::render_callback_interface;
 use crate::calls::render_wrapper_class;
 use crate::entities::{
-    collect_typed_handles, render_enum, render_interface_class, render_rich_enum_class,
-    render_struct_class, render_typed_handle_struct,
+    render_enum, render_interface_class, render_rich_enum_class, render_struct_class,
 };
 use crate::package::{
     render_csproj, render_csproj_with_assets, render_nuspec, render_packaged_readme, render_readme,
@@ -50,7 +62,7 @@ use crate::runtime::{
 
 /// Per-target configuration for [`DotnetGenerator`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DotnetConfig {
     /// C# namespace (and on-disk basename used for `.cs`/`.csproj`/`.nuspec`).
     /// Defaults to `"WeaveFFI"`.
@@ -109,7 +121,7 @@ impl LanguageBackend for DotnetGenerator {
         "dotnet"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 
@@ -217,11 +229,15 @@ impl LanguageBackend for DotnetGenerator {
         ];
 
         // Bundle each prebuilt library under the NuGet `runtimes/<rid>/native/`
-        // layout NuGet auto-resolves at restore time.
+        // layout NuGet auto-resolves at restore time. Platforms NuGet has no
+        // RID for (Android, wasm32) have no slot in the package and are skipped.
         for nb in &ctx.binaries.binaries {
+            let Some(rid) = nb.platform.nuget_rid() else {
+                continue;
+            };
             let dest = dir
                 .join("runtimes")
-                .join(nb.platform.nuget_rid())
+                .join(rid)
                 .join("native")
                 .join(ctx.binaries.bundled_filename(nb.platform));
             files.push(PackagedFile::copy(dest, nb.source.clone()));
@@ -232,8 +248,9 @@ impl LanguageBackend for DotnetGenerator {
 }
 
 /// Render the complete generated C# source file: the prelude, usings, the
-/// shared runtime types, every module's entities, the `NativeMethods` extern
-/// class, and the per-module static wrapper classes.
+/// shared runtime types, every module's entities (enums, records, callback
+/// interfaces with their vtables, interface wrappers), the `NativeMethods`
+/// extern class, and the per-module static wrapper classes.
 pub(crate) fn render_csharp(
     model: &BindingModel,
     namespace: &str,
@@ -249,12 +266,11 @@ pub(crate) fn render_csharp(
     out.push_str(
         "using System;\nusing System.Collections.Generic;\nusing System.Runtime.InteropServices;\n",
     );
-    if model
-        .modules
-        .iter()
-        .flat_map(|m| m.callables())
-        .any(|f| f.is_async)
-    {
+    if model.has_callback_interfaces() {
+        // `CallConvCdecl` for the `[UnmanagedCallersOnly]` trampolines.
+        out.push_str("using System.Runtime.CompilerServices;\n");
+    }
+    if model.has_async() {
         out.push_str("using System.Threading.Tasks;\n");
     }
     out.push('\n');
@@ -276,15 +292,7 @@ pub(crate) fn render_csharp(
     render_error_struct(&mut out, &domains);
     render_helpers_class(&mut out);
     render_buffer_classes(&mut out);
-    for referent in collect_typed_handles(model) {
-        render_typed_handle_struct(&mut out, &referent);
-    }
-    if model
-        .modules
-        .iter()
-        .flat_map(|m| m.callables())
-        .any(|f| matches!(f.shape, CallShape::Iterator(_)))
-    {
+    if model.has_iterators() {
         render_once_enumerable_class(&mut out);
     }
 
@@ -302,6 +310,9 @@ pub(crate) fn render_csharp(
         for s in &m.structs {
             render_struct_class(&mut out, s);
         }
+        for cb in &m.callback_interfaces {
+            render_callback_interface(&mut out, m, cb);
+        }
         for i in &m.interfaces {
             render_interface_class(&mut out, i, m.error.as_ref());
         }
@@ -317,3 +328,6 @@ pub(crate) fn render_csharp(
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
     out
 }
+
+#[cfg(test)]
+mod tests;

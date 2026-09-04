@@ -82,10 +82,25 @@ expect(empty2.tag === 'Empty', "empty2.tag === 'Empty'");
 let tagErr = null;
 try { api.shapes.describe({ tag: 'Pentagon' }); } catch (e) { tagErr = e; }
 expect(tagErr instanceof mod.WeaveFFIError, 'unknown tag -> WeaveFFIError');
+expect(tagErr && tagErr.code === -3, `unknown tag -> marshalling code -3 (got ${tagErr && tagErr.code})`);
+expect(tagErr && tagErr.message.includes('Pentagon'), 'unknown tag error names the tag');
+expect(api.shapes.describe({ tag: 'Empty' }) === 'empty', 'module usable after the rejected tag');
+
+// Floating-point edge values inside the rich enum payloads survive the round
+// trip: NaN, infinities, and -0 in the f64 and f32 slots.
+const nanCircle = api.shapes.scale({ tag: 'Circle', radius: NaN }, 1.0);
+expect(Number.isNaN(nanCircle.radius), 'NaN radius survives');
+const negZero = api.shapes.scale({ tag: 'Circle', radius: -0 }, 1.0);
+expect(Object.is(negZero.radius, -0), '-0 radius keeps its sign');
+const inf = api.shapes.scale({ tag: 'Rectangle', width: Infinity, height: -Infinity }, 1.0);
+expect(inf.width === Infinity && inf.height === -Infinity, 'infinities survive in f32 slots');
 
 // numerics: [u8] in (canonicalized to bytes), u64 out (BigInt);
 // lowerCamelCase wrapper name.
 expect(api.shapes.sumBytes([250, 250, 250, 250]) === 1000n, 'sumBytes == 1000n');
+expect(typeof api.shapes.sumBytes([1]) === 'bigint', 'sumBytes returns a BigInt');
+expect(api.shapes.sumBytes(new Uint8Array([255, 255])) === 510n, 'sumBytes accepts a Uint8Array');
+expect(api.shapes.sumBytes([]) === 0n, 'sumBytes of nothing is 0n');
 
 if (failures === 0) {
   console.log('wasm/shapes: OK');

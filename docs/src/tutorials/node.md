@@ -22,7 +22,7 @@ package shape ready to publish.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: greeter
     errors:
@@ -49,7 +49,17 @@ modules:
 
 `hello` can't fail, so it stays non-throwing. `greeting` declares
 `throws: true` and reports codes from the module's `GreeterError`
-domain when the language is unknown.
+domain when the language is unknown. Check it with
+`weaveffi validate greeter.yml`; you should see `Validation passed`.
+
+Put a `weaveffi.toml` beside it so the npm package gets a stable name
+(otherwise it defaults to the IDL's file stem, `greeter`):
+
+```toml
+[package]
+name = "mygreeter"
+version = "0.1.0"
+```
 
 ### 2. Generate bindings
 
@@ -62,6 +72,7 @@ Among other targets you should see:
 ```text
 generated/
 ├── c/
+│   ├── weaveffi.c
 │   └── weaveffi.h
 └── node/
     ├── binding.gyp
@@ -73,7 +84,9 @@ generated/
 
 `weaveffi_addon.c` is a complete N-API addon that bridges Node's
 runtime to the C ABI, and `binding.gyp` builds it with `node-gyp`; you
-don't write any addon code yourself.
+don't write any addon code yourself. `package.json` carries the name and
+version from `weaveffi.toml` plus an `install` script that runs
+`node-gyp rebuild`.
 
 ### 3. Implement the Rust library
 
@@ -93,41 +106,57 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.14" }
+weaveffi = "0.22"
 ```
 
-`mygreeter/src/lib.rs`:
+`mygreeter/src/lib.rs` is plain safe Rust. The macro reads the annotated
+items and emits the `extern "C"` thunks the addon calls, so the module
+needs no `unsafe` and no hand-written signatures:
 
 ```rust
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#[weaveffi::module]
+pub mod greeter {
+    /// Codes the greeter reports from its throwing functions.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum GreeterError {
+        /// unknown language
+        UnknownLang = 1,
+    }
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use weaveffi_abi::{self as abi, weaveffi_error};
+    /// A greeting and the language it was rendered in.
+    #[weaveffi::record]
+    pub struct Greeting {
+        pub message: String,
+        pub lang: String,
+    }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_greeter_hello(
-    name: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *const c_char {
-    abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
-    let msg = format!("Hello, {name}!");
-    CString::new(msg).unwrap().into_raw() as *const c_char
+    /// Greet someone in English.
+    #[weaveffi::export]
+    pub fn hello(name: String) -> String {
+        format!("Hello, {name}!")
+    }
+
+    /// Greet someone in the given language, failing on an unknown one.
+    #[weaveffi::export]
+    pub fn greeting(name: String, lang: String) -> Result<Greeting, GreeterError> {
+        let message = match lang.as_str() {
+            "en" => format!("Hello, {name}!"),
+            "es" => format!("Hola, {name}!"),
+            "fr" => format!("Bonjour, {name}!"),
+            _ => return Err(GreeterError::UnknownLang),
+        };
+        Ok(Greeting { message, lang })
+    }
 }
 
-// Emit the WeaveFFI C ABI runtime symbols (abi_version, free_string,
-// free_bytes, error_clear, cancel_token_*), one line per cdylib.
-abi::export_runtime!();
+weaveffi::export_runtime!();
 ```
 
-The generated `generated/c/weaveffi.h` lists every remaining symbol the
-addon expects, with exact signatures; implement `weaveffi_greeter_greeting`
-the same way (it returns the `Greeting` record as a serialized value
-buffer). Alternatively, annotate the module with `#[weaveffi::module]` and
-let the macro emit the whole C ABI; see
-[The Rust Producer Macro](../guides/producer-macro.md).
+`weaveffi extract mygreeter/src/lib.rs` produces the same IDL as
+`greeter.yml` (plus the doc comments), so the two stay in step; you can
+generate from either. The [Producer Macro](../guides/producer-macro.md)
+guide covers every attribute.
 
 ### 4. Build the cdylib and the N-API addon
 
@@ -157,7 +186,9 @@ variable, or ship a prebuilt binary as `index.node` next to
 Save as `generated/node/demo.js`. Function names are camelCase with
 the module prefix stripped, and the throwing `greeting` raises typed
 error classes (`GreeterError` extends `WeaveFFIError`, with an
-`UnknownLangError` subclass per code):
+`UnknownLangError` subclass per code). Every error carries `code`, the
+bare producer message in `errorMessage`, and `(code) message` in the
+standard `message`:
 
 ```javascript
 const greeter = require("./index");
@@ -167,6 +198,7 @@ console.log(greeter.hello("Node"));
 try {
   const g = greeter.greeting("Node", "en");
   console.log(`${g.message} (${g.lang})`);
+  greeter.greeting("Node", "tlh");
 } catch (e) {
   if (e instanceof greeter.GreeterError) {
     console.log(`${e.name}: ${e.errorMessage}`);
@@ -193,6 +225,14 @@ cd generated/node
 LD_LIBRARY_PATH=../../target/release node demo.js
 ```
 
+Expected output:
+
+```text
+Hello, Node!
+Hello, Node! (en)
+UnknownLangError: unknown language
+```
+
 For TypeScript consumers, the generated `types.d.ts` is enough:
 
 ```typescript
@@ -212,7 +252,9 @@ consumers don't need node-gyp:
 cp build/Release/weaveffi.node index.node
 ```
 
-Then edit `generated/node/package.json`:
+Then edit `generated/node/package.json`. The generated file sets
+`"gypfile": true` and an `install` script that rebuilds the addon; drop
+both so consumers use the prebuilt `index.node`, and add a `files` list:
 
 ```json
 {
@@ -230,10 +272,12 @@ Then edit `generated/node/package.json`:
 }
 ```
 
-`files` must include `index.node`. For multi-platform packages,
-publish per-platform optional dependencies (e.g.
-`@myorg/greeter-darwin-arm64`) and use an install script to pick the
-right binary.
+`files` must include `index.node`. For multi-platform packages, publish
+per-platform optional dependencies instead. `weaveffi package` automates
+that shape: pass it prebuilt cdylibs per platform and it emits the main
+package plus one `npm/mygreeter-<os>-<cpu>/` package per platform, each
+gated by npm `os`/`cpu` so only the matching one installs; see
+[Packaging](../guides/packaging.md).
 
 ### 7. Publish
 
@@ -256,7 +300,7 @@ console.log(hello("npm"));
 
 ## Verification
 
-- `node demo.js` prints `Hello, Node!` and exits with code `0`.
+- `node demo.js` prints the three lines above and exits with code `0`.
 - `npm pack` produces a `.tgz` containing `index.node`,
   `types.d.ts`, and `index.js`.
 - TypeScript consumers see the `Greeting` interface and `hello`
@@ -268,12 +312,14 @@ console.log(hello("npm"));
   | `Error: Cannot find module './index.node'`               | The addon isn't built; run `npm install` or set `WEAVEFFI_ADDON`.              |
   | `Error: dlopen ... not found`                            | Cdylib not on the loader path; set `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH`.    |
   | `TypeError: greeter.hello is not a function`             | The addon is stale; rerun `npm install` after IDL edits.                       |
+  | `WeaveFFIError` with a negative code                     | A producer panic (-2) or marshalling failure (-3); see [Error Handling](../guides/errors.md). |
   | Crashes on `require()`                                   | Addon built for the wrong Node.js version or architecture; rebuild.            |
 
 ## Cleanup
 
 ```bash
 rm -rf generated/
+rm -f target/release/libweaveffi.dylib   # the link alias from step 4
 cargo clean -p mygreeter
 ```
 

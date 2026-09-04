@@ -2,16 +2,17 @@
 //! IDL corpus.
 //!
 //! Five fixtures cover the whole IDL surface between them: `kitchen_sink`
-//! (every scalar and composite type, borrowed params, handles, an interface,
-//! callbacks and a listener, an error domain, iterators, async and
-//! cancellable functions, deprecation, and a nested submodule), `shapes`
-//! (rich enums and the full numeric primitive set), `nested_modules` (a
-//! three-deep module tree with cross-module references), `docs_everywhere`
-//! (doc comments on every declaration kind), and `edge_cases` (identifiers
-//! that are reserved words in some target, deeply nested composites,
-//! optional and mutable parameters, interfaces in every legal position,
-//! async functions with non-string results, type-level deprecation, and
-//! scalar and string iterators). One test per generator runs it over all
+//! (every scalar and composite type, an interface with objects in optional,
+//! list, iterator, and record positions, a callback interface, an error
+//! domain, iterators, async and cancellable functions, deprecation, and a
+//! nested submodule), `shapes` (rich enums and the full numeric primitive
+//! set), `nested_modules` (a three-deep module tree with cross-module
+//! references), `docs_everywhere` (doc comments on every declaration kind),
+//! and `edge_cases` (identifiers that are reserved words in some target,
+//! deeply nested composites, optional parameters, interfaces and callback
+//! interfaces in every legal position, async functions with non-string
+//! results, type-level deprecation, and scalar and string iterators). One
+//! test per generator runs it over all
 //! five fixtures into a fresh tempdir, walks the
 //! resulting files in sorted order, and snapshots each file under
 //! `tests/snapshots/`. Regressions in any generator's output fail the
@@ -25,12 +26,12 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::{ConfiguredBackend, Target};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
-use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
 use weaveffi_gen_c::{CConfig, CGenerator};
 use weaveffi_gen_cpp::{CppConfig, CppGenerator};
 use weaveffi_gen_dart::{DartConfig, DartGenerator};
 use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
 use weaveffi_gen_go::{GoConfig, GoGenerator};
+use weaveffi_gen_kotlin::{KotlinConfig, KotlinGenerator};
 use weaveffi_gen_node::{NodeConfig, NodeGenerator};
 use weaveffi_gen_python::{PythonConfig, PythonGenerator};
 use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
@@ -162,7 +163,7 @@ snapshot_tests! {
     snapshot_c => CGenerator, CConfig;
     snapshot_cpp => CppGenerator, CppConfig;
     snapshot_swift => SwiftGenerator, SwiftConfig;
-    snapshot_android => AndroidGenerator, AndroidConfig;
+    snapshot_kotlin => KotlinGenerator, KotlinConfig;
     snapshot_node => NodeGenerator, NodeConfig;
     snapshot_wasm => WasmGenerator, WasmConfig;
     snapshot_python => PythonGenerator, PythonConfig;

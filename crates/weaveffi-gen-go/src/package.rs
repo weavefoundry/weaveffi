@@ -5,22 +5,35 @@ use camino::Utf8Path;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
-use weaveffi_core::platform::Platform;
+use weaveffi_core::platform::{NativeBinary, Platform};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::{render_go, GoConfig};
 
 /// The `(GOOS, GOARCH)` build-constraint tokens for a [`Platform`], used on
-/// `#cgo` directive lines.
-fn go_build_tags(p: Platform) -> (&'static str, &'static str) {
+/// `#cgo` directive lines, or `None` for a platform the cgo package has no
+/// slot for (Android and wasm32 binaries are skipped when packaging).
+fn go_build_tags(p: Platform) -> Option<(&'static str, &'static str)> {
     match p {
-        Platform::MacosArm64 => ("darwin", "arm64"),
-        Platform::MacosX64 => ("darwin", "amd64"),
-        Platform::LinuxX64 => ("linux", "amd64"),
-        Platform::LinuxArm64 => ("linux", "arm64"),
-        Platform::WindowsX64 => ("windows", "amd64"),
+        Platform::MacosArm64 => Some(("darwin", "arm64")),
+        Platform::MacosX64 => Some(("darwin", "amd64")),
+        Platform::LinuxX64 => Some(("linux", "amd64")),
+        Platform::LinuxArm64 => Some(("linux", "arm64")),
+        Platform::WindowsX64 => Some(("windows", "amd64")),
+        Platform::AndroidArm64 | Platform::AndroidX64 | Platform::Wasm32 => None,
     }
+}
+
+/// The bundled binaries this package has a `#cgo` slot for, in the binary
+/// set's order.
+fn bundled<'a>(
+    ctx: &'a PackageContext<'a>,
+) -> impl Iterator<Item = (&'a NativeBinary, &'static str, &'static str)> {
+    ctx.binaries
+        .binaries
+        .iter()
+        .filter_map(|nb| go_build_tags(nb.platform).map(|(goos, goarch)| (nb, goos, goarch)))
 }
 
 /// The generated `go.mod` for the emitted package.
@@ -68,12 +81,19 @@ go build ./...
 
 ## How It Works
 
-The generated `weaveffi.go` file uses a CGo preamble to `#include "weaveffi.h"`
+The generated `weaveffi.go` file uses a cgo preamble to `#include "weaveffi.h"`
 and link against `-lweaveffi`. Each API function is exposed as an idiomatic Go
 function that marshals arguments to C types, calls the C ABI function, and
 converts the result back to Go types. Records, rich enums, optionals, lists,
 and maps cross the boundary serialized in the WeaveFFI value-buffer format.
 Errors are returned as Go `error` values.
+
+Interfaces are reference-counted objects: each wrapper holds one strong
+reference that `Close()` releases (a finalizer releases it if you forget), and
+a nullable interface is a nil wrapper pointer. Callback interfaces are Go
+`interface` types: implement one and pass the value to any function that
+accepts it; the native library may call it from any thread, and a panic in
+your implementation is reported to the native caller instead of crashing.
 
 {trailer}"#
     )
@@ -83,10 +103,8 @@ Errors are returned as Go `error` values.
 fn render_packaged_readme(ctx: &PackageContext, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, "README.md");
-    let platforms: Vec<String> = ctx
-        .binaries
-        .platforms()
-        .map(|p| format!("- `lib/{}/`", p.id()))
+    let platforms: Vec<String> = bundled(ctx)
+        .map(|(nb, _, _)| format!("- `lib/{}/`", nb.platform.id()))
         .collect();
     let platform_list = platforms.join("\n");
     format!(
@@ -110,7 +128,8 @@ alongside Go, for example `weaveffi package --target c,go`).
 
 /// The full packaged file set: the Go source with a self-contained cgo
 /// preamble, `go.mod`, the packaged README, and one bundled shared library
-/// per platform.
+/// per desktop platform. Binaries for platforms without a `GOOS,GOARCH` cgo
+/// slot (Android, wasm32) are skipped.
 pub(crate) fn package_files(
     api: &ResolvedApi,
     model: &BindingModel,
@@ -120,7 +139,6 @@ pub(crate) fn package_files(
 ) -> Vec<PackagedFile> {
     let dir = out_dir.join("go");
     let input_basename = config.input_basename();
-    let prefix = config.prefix();
     let link_name = pkg::resolve(api, None, Some(input_basename)).ident_name();
     let module_path = pkg::resolve(
         api,
@@ -135,8 +153,7 @@ pub(crate) fn package_files(
     // relative). cgo selects the matching line at build time.
     let original = format!("#cgo LDFLAGS: -l{link_name}\n");
     let mut cgo = String::from("#cgo CFLAGS: -I${SRCDIR}/../c/include\n");
-    for nb in &ctx.binaries.binaries {
-        let (goos, goarch) = go_build_tags(nb.platform);
+    for (nb, goos, goarch) in bundled(ctx) {
         let id = nb.platform.id();
         if nb.platform == Platform::WindowsX64 {
             cgo.push_str(&format!(
@@ -149,14 +166,7 @@ pub(crate) fn package_files(
         }
     }
     cgo.push_str(&format!("#cgo LDFLAGS: -l{link_name}\n"));
-    let go_src = render_go(
-        api,
-        model,
-        prefix,
-        config.strip_module_prefix,
-        input_basename,
-    )
-    .replace(&original, &cgo);
+    let go_src = render_go(api, model, config).replace(&original, &cgo);
 
     let mut files = vec![
         PackagedFile::text(dir.join("weaveffi.go"), go_src),
@@ -169,7 +179,7 @@ pub(crate) fn package_files(
             render_packaged_readme(ctx, input_basename),
         ),
     ];
-    for nb in &ctx.binaries.binaries {
+    for (nb, _, _) in bundled(ctx) {
         let dest = dir
             .join("lib")
             .join(nb.platform.id())

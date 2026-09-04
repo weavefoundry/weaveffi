@@ -1,0 +1,5 @@
+error: weaveffi: interface methods must take `&self` or `self: Arc<Self>`; use interior mutability (Mutex, RwLock, atomics) for mutable state, because the object is shared across the FFI boundary
+ --> tests/ui/fail_interface_self_by_value.rs:7:24
+  |
+7 |         pub fn consume(self) {}
+  |                        ^^^^

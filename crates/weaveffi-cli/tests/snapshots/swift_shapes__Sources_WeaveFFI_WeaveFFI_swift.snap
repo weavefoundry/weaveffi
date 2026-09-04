@@ -83,6 +83,9 @@ struct WvWriter {
         bytes.append(contentsOf: v)
     }
     mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
+    /// Writes an object token. `p` must be a strong reference the buffer now
+    /// owns (a freshly cloned pointer), never one a wrapper still holds.
+    mutating func writeObject(_ p: OpaquePointer) { writeUInt64(UInt64(UInt(bitPattern: p))) }
 }
 
 /// Traps on a malformed value buffer. Per the wire-format spec, consumers
@@ -159,6 +162,14 @@ struct WvReader {
         case 1: return true
         default: wvDecodeFailure("option flag byte out of range")
         }
+    }
+    /// Reads an object token: one strong reference the caller must adopt
+    /// into a wrapper whose deinit releases it.
+    mutating func readObject() -> OpaquePointer {
+        guard let p = OpaquePointer(bitPattern: UInt(readUInt64())) else {
+            wvDecodeFailure("null object token")
+        }
+        return p
     }
     func finish() {
         if remaining != 0 { wvDecodeFailure("trailing bytes after value") }

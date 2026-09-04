@@ -214,15 +214,29 @@ mod tests {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
         let tx_ptr = Box::into_raw(Box::new(tx));
 
-        // A null string lifts leniently to "" on the async path (the launcher
-        // has no out_err slot), so the producer's empty-name check rejects it
-        // with the TaskError::InvalidName domain code.
-        weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
+        let empty = CString::new("").unwrap();
+        weaveffi_tasks_run_task_async(empty.as_ptr(), task_callback, tx_ptr as *mut c_void);
 
         let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         leak_ctx(tx_ptr);
         assert_eq!(code, 1, "TaskError::InvalidName's declared code");
         assert!(result.is_none(), "error path passes a null result buffer");
+    }
+
+    #[test]
+    fn run_task_null_name_reports_marshal_error_through_the_callback() {
+        let (tx, rx) = mpsc::channel::<TaskCbMsg>();
+        let tx_ptr = Box::into_raw(Box::new(tx));
+
+        // The launcher has no out_err slot, so an argument that fails to lift
+        // is reported through the completion callback with the reserved
+        // marshalling code, exactly like the sync path would report it.
+        weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
+
+        let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        leak_ctx(tx_ptr);
+        assert_eq!(code, abi::MARSHAL_ERROR_CODE);
+        assert!(result.is_none());
     }
 
     #[test]

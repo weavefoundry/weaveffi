@@ -1,5 +1,5 @@
-//! Call rendering: sync, async, and iterator wrappers, callback and listener
-//! trampolines, and the argument/return marshalling they share.
+//! Call rendering: sync, async, and iterator wrappers, callback-interface
+//! types and trampolines, and the argument/return marshalling they share.
 //!
 //! Marshalling dispatch follows the shared plan layer: each parameter's
 //! passing contract comes from [`ParamBinding::arg_pass`], each result's
@@ -7,21 +7,22 @@
 //! those contracts in Go rather than re-deriving them from `Ty`.
 
 use heck::ToUpperCamelCase;
-use weaveffi_core::abi::AbiParam;
+use weaveffi_core::abi::{AbiParam, CType};
 use weaveffi_core::codegen::CodeWriter;
+use weaveffi_core::lang;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    AsyncBinding, BindingModel, CallShape, CallbackBinding, FnBinding, IteratorBinding,
-    ListenerBinding, ModuleBinding, ParamBinding,
+    AsyncBinding, BindingModel, CallShape, CallbackInterfaceBinding, CallbackMethodBinding,
+    FnBinding, IteratorBinding, ModuleBinding, ParamBinding,
 };
-use weaveffi_core::plan::{self, elem_free, ArgPass, ElemFree, ErrorStrategy, RetPass};
-use weaveffi_core::utils::{c_abi_struct_name, wrapper_name};
+use weaveffi_core::plan::{self, ArgPass, ErrorStrategy, RetPass};
+use weaveffi_core::utils::c_abi_struct_name;
 
 use crate::codec::{emit_buffer_read, emit_buffer_write};
 use crate::docs::{emit_doc, emit_fn_doc};
 use crate::types::{
-    c_scalar_conv, c_scalar_type, cgo_slot_type, go_local, go_param_ident, go_scalar_conv, go_type,
-    go_wrap_expr, go_zero, strip_const,
+    c_scalar_conv, cgo_slot_type, go_adopt_expr, go_param_ident, go_scalar_conv, go_type, go_zero,
+    strip_const, vtable_accessor, vtable_var,
 };
 
 // ── Errors ──
@@ -33,7 +34,8 @@ use crate::types::{
 /// the generic [`ERROR_BRAND`](weaveffi_core::errors::ERROR_BRAND) struct
 /// when no domain is in scope. A callable with `throws == false` has a plain
 /// signature and panics via `wvTrap` instead, since a reported error can only
-/// be a producer panic or an argument-marshalling failure.
+/// be a producer panic, an argument-marshalling failure, or a callback
+/// implementation that panicked.
 #[derive(Clone, Copy)]
 pub(crate) struct ErrCtx<'a> {
     /// `true` when the wrapper returns `(T, error)` and surfaces typed errors.
@@ -103,75 +105,172 @@ impl<'a> ErrCtx<'a> {
     }
 }
 
-// ── Callbacks, listeners, and async support ──
+// ── Trampolines and the cgo preamble ──
 
-/// The C name of the exported Go trampoline for a callback/async typedef.
+/// The Go spelling of one C ABI slot name inside an exported trampoline's
+/// formal list: a slot named after a Go keyword (an IDL parameter called
+/// `type`, `func`, `range`) gains the trailing-underscore escape. The same
+/// spelling is used in the preamble `extern` so the two prototypes agree.
+fn go_slot_ident(name: &str) -> String {
+    lang::escape_ident(name, lang::GO_KEYWORDS)
+}
+
+/// The C name of the exported Go trampoline for an async completion typedef.
 pub(crate) fn trampoline_name(c_type_name: &str) -> String {
     format!("goWv_{c_type_name}")
 }
 
-/// The preamble `extern` declaration for one exported trampoline.
-fn extern_decl(c_type_name: &str, params: &[AbiParam], prefix: &str) -> String {
+/// The C name of the exported Go trampoline behind one callback-interface
+/// vtable entry (`goWv_{c_tag}_{method}`); `free` names the trailing entry.
+fn cb_trampoline_name(c_tag: &str, method: &str) -> String {
+    format!("goWv_{c_tag}_{method}")
+}
+
+/// The preamble `extern` declaration for one exported trampoline. Pointer
+/// types are rendered const-free to match the prototypes cgo writes into
+/// `_cgo_export.h` from the Go signature.
+fn extern_decl(name: &str, ret: &CType, params: &[AbiParam], prefix: &str) -> String {
     let args: Vec<String> = params
         .iter()
-        .map(|p| format!("{} {}", strip_const(&p.ty).render_c(prefix), p.name))
+        .map(|p| {
+            format!(
+                "{} {}",
+                strip_const(&p.ty).render_c(prefix),
+                go_slot_ident(&p.name)
+            )
+        })
         .collect();
     format!(
-        "extern void {}({});",
-        trampoline_name(c_type_name),
+        "extern {} {name}({});",
+        ret.render_c(prefix),
         args.join(", ")
     )
 }
 
-/// Every `extern` declaration the preamble needs: one per module callback
-/// (shared by all listeners firing it) and one per async completion callback,
-/// including async interface members.
-pub(crate) fn collect_trampoline_externs(model: &BindingModel, prefix: &str) -> Vec<String> {
+/// The preamble definition of the one process-wide static vtable for `cb`:
+/// one trampoline per method in declaration order, then `free`. An entry
+/// whose C signature carries `const` pointers is cast back to the vtable's
+/// exact field type, since the exported Go function is declared const-free.
+fn vtable_def(cb: &CallbackInterfaceBinding, prefix: &str) -> String {
+    let mut s = format!(
+        "static const {} {} = {{\n",
+        cb.vtable_tag,
+        vtable_var(&cb.c_tag)
+    );
+    for m in &cb.methods {
+        let tramp = cb_trampoline_name(&cb.c_tag, &m.name);
+        let needs_cast = m.abi_params.iter().any(|p| strip_const(&p.ty) != p.ty);
+        if needs_cast {
+            let types: Vec<String> = m.abi_params.iter().map(|p| p.ty.render_c(prefix)).collect();
+            s.push_str(&format!(
+                "    ({} (*)({})){tramp},\n",
+                m.abi_ret.render_c(prefix),
+                types.join(", ")
+            ));
+        } else {
+            s.push_str(&format!("    {tramp},\n"));
+        }
+    }
+    s.push_str(&format!(
+        "    {},\n}};\n",
+        cb_trampoline_name(&cb.c_tag, "free")
+    ));
+    // cgo reaches a C variable through `//go:cgo_import_static`, which needs
+    // external linkage, so a `static const` table can't be named as
+    // `&C.wvVtable_...` from Go. A static accessor function is callable
+    // through the ordinary cgo stub in the same translation unit.
+    s.push_str(&format!(
+        "static const {}* {}(void) {{ return &{}; }}",
+        cb.vtable_tag,
+        vtable_accessor(&cb.c_tag),
+        vtable_var(&cb.c_tag)
+    ));
+    s
+}
+
+/// Every declaration the cgo preamble needs beyond the header include: for
+/// each callback interface, the `extern` prototypes of its method and `free`
+/// trampolines followed by its static vtable and accessor; then one `extern`
+/// per async completion callback, including async interface members.
+///
+/// A file that uses `//export` may only put declarations in its preamble
+/// (the preamble is compiled into two C translation units); the vtable is a
+/// `static const` so each unit gets a private copy and no symbol is
+/// duplicated. Go takes the address of the copy in its own unit through the
+/// static accessor, so the producer always sees one vtable whose entries
+/// live for the process.
+pub(crate) fn collect_preamble_decls(model: &BindingModel, prefix: &str) -> Vec<String> {
     let mut decls = Vec::new();
     for m in &model.modules {
-        for cb in &m.callbacks {
-            decls.push(extern_decl(&cb.c_fn_type, &cb.abi_params, prefix));
+        for cb in &m.callback_interfaces {
+            for meth in &cb.methods {
+                decls.push(extern_decl(
+                    &cb_trampoline_name(&cb.c_tag, &meth.name),
+                    &meth.abi_ret,
+                    &meth.abi_params,
+                    prefix,
+                ));
+            }
+            decls.push(extern_decl(
+                &cb_trampoline_name(&cb.c_tag, "free"),
+                &CType::Void,
+                &[AbiParam::new("ctx", CType::ptr(CType::Void))],
+                prefix,
+            ));
+            decls.push(vtable_def(cb, prefix));
         }
         for f in m.callables() {
             if let CallShape::Async(ab) = &f.shape {
-                decls.push(extern_decl(&ab.callback_type, &ab.callback_params, prefix));
+                decls.push(extern_decl(
+                    &trampoline_name(&ab.callback_type),
+                    &CType::Void,
+                    &ab.callback_params,
+                    prefix,
+                ));
             }
         }
     }
     decls
 }
 
-/// The Go signature of the user-facing callback for a module callback decl,
-/// e.g. `func(key string)`.
-fn go_callback_sig(cb: &CallbackBinding) -> String {
-    let params: Vec<String> = cb
+// ── Callback interfaces ──
+
+/// The Go method signature of one callback-interface method, as it appears
+/// in the consumer-implemented interface type: `OnMessage(text string,
+/// weight int32) int64`.
+fn cb_method_sig(m: &CallbackMethodBinding) -> String {
+    let params: Vec<String> = m
         .params
         .iter()
         .map(|p| format!("{} {}", go_param_ident(&p.name), go_type(&p.ty)))
         .collect();
-    format!("func({})", params.join(", "))
+    let ret = match &m.ret {
+        Some(ty) => format!(" {}", go_type(ty)),
+        None => String::new(),
+    };
+    format!(
+        "{}({}){ret}",
+        m.name.to_upper_camel_case(),
+        params.join(", ")
+    )
 }
 
-/// Emit statements converting one callback parameter's C slots into a Go
-/// value bound to `arg{idx}`, returning that local's name.
+/// Emit statements converting one callback-method parameter's C slots into
+/// a Go value bound to `arg{idx}`, returning that local's name.
 ///
-/// Every callback argument is borrowed for the dispatch: buffered values are
-/// decoded from the borrowed `(ptr, len)` pair, strings and bytes are copied,
-/// and object pointers are wrapped without adopting ownership.
-fn emit_cb_param_arg(
-    out: &mut String,
-    idx: usize,
-    p: &ParamBinding,
-    prefix: &str,
-    module: &str,
-) -> String {
+/// Strings, bytes, and buffers arriving in a trampoline are borrowed for the
+/// dispatch: they are copied or decoded and nothing is freed. An object
+/// argument transfers one strong reference, which is adopted into a wrapper
+/// (a null `Interface?` adopts to nil).
+fn emit_cb_param_arg(out: &mut String, idx: usize, p: &ParamBinding) -> String {
     let arg = format!("arg{idx}");
     let mut w = CodeWriter::tabs().with_depth(1);
     match p.arg_pass() {
         ArgPass::Buffer { ptr, len } => {
             w.line(format!(
                 "rArg{idx} := &wvReader{{buf: wvBorrowBuffer({}, {})}}",
-                ptr.name, len.name
+                go_slot_ident(&ptr.name),
+                go_slot_ident(&len.name)
             ));
             w.line(format!("var {arg} {}", go_type(&p.ty)));
             emit_buffer_read(
@@ -181,172 +280,184 @@ fn emit_cb_param_arg(
                 &p.ty,
                 &format!("Arg{idx}"),
                 0,
-                prefix,
-                module,
             );
             w.line(format!("rArg{idx}.expectEnd()"));
         }
         ArgPass::String { slot } => {
-            let n = &slot.name;
+            let n = go_slot_ident(&slot.name);
             w.line(format!("{arg} := \"\""));
             w.block(format!("if {n} != nil {{"), "}", |w| {
                 w.line(format!("{arg} = C.GoString({n})"));
             });
         }
         ArgPass::Bytes { ptr, len } => {
+            let pn = go_slot_ident(&ptr.name);
+            let ln = go_slot_ident(&len.name);
             w.line(format!("var {arg} []byte"));
-            w.block(format!("if {} != nil {{", ptr.name), "}", |w| {
+            w.block(format!("if {pn} != nil {{"), "}", |w| {
                 w.line(format!(
-                    "{arg} = C.GoBytes(unsafe.Pointer({}), C.int({}))",
-                    ptr.name, len.name
+                    "{arg} = C.GoBytes(unsafe.Pointer({pn}), C.int({ln}))"
                 ));
             });
         }
-        // Object pointers are borrowed for the duration of the callback; the
-        // wrapper must not be Closed by the consumer.
-        ArgPass::Object { slot, nullable } => {
-            let n = &slot.name;
-            if nullable {
-                let Ty::Optional(inner) = &p.ty else {
-                    unreachable!("nullable object params are optional interfaces")
-                };
-                let Ty::Interface(name) = inner.as_ref() else {
-                    unreachable!("every other optional is buffered")
-                };
-                let g = go_local(name);
-                w.line(format!("var {arg} *{g}"));
-                w.block(format!("if {n} != nil {{"), "}", |w| {
-                    w.line(format!("{arg} = &{g}{{ptr: {n}}}"));
-                });
-            } else {
-                w.line(format!("{arg} := {}", go_wrap_expr(&p.ty, n)));
-            }
+        ArgPass::Object { slot, .. } => {
+            w.line(format!(
+                "{arg} := {}",
+                go_adopt_expr(&p.ty, &go_slot_ident(&slot.name))
+            ));
         }
         ArgPass::Direct { slot } => {
-            let n = &slot.name;
-            match &p.ty {
-                Ty::Bool => {
-                    w.line(format!("{arg} := cToBool({n})"));
-                }
-                // A typed handle is a borrowed opaque pointer wrapped
-                // without ownership, like an interface.
-                Ty::TypedHandle(_) => {
-                    w.line(format!("{arg} := {}", go_wrap_expr(&p.ty, n)));
-                }
-                _ => {
-                    w.line(format!("{arg} := {}", go_scalar_conv(n, &p.ty)));
-                }
-            }
+            let n = go_slot_ident(&slot.name);
+            w.line(format!("{arg} := {}", go_scalar_conv(&n, &p.ty)));
+        }
+        ArgPass::Callback { .. } => {
+            unreachable!("validation rejects callback interfaces as callback-method parameters")
         }
     }
     out.push_str(&w.finish());
     arg
 }
 
-/// One exported trampoline per module callback declaration; every listener
-/// firing this callback shares it, with the registry id in `context` selecting
-/// the Go callback.
-pub(crate) fn render_callback_trampoline(
-    out: &mut String,
+/// Emit the exported trampoline behind one vtable entry. It recovers the
+/// implementation from the `cgo.Handle` passed as `ctx`, converts the
+/// borrowed arguments, calls the Go method, and writes a direct-family
+/// result into the C return. A panic in the implementation is recovered,
+/// reported through `weaveffi_error_set(out_err, -4, message)`, and the
+/// zero value is returned; nothing ever unwinds through the C frame.
+fn render_cb_trampoline(
+    w: &mut CodeWriter,
     prefix: &str,
     module: &str,
-    cb: &CallbackBinding,
+    cb: &CallbackInterfaceBinding,
+    m: &CallbackMethodBinding,
+    iface_name: &str,
 ) {
-    let tramp = trampoline_name(&cb.c_fn_type);
-    let formals: Vec<String> = cb
+    let tramp = cb_trampoline_name(&cb.c_tag, &m.name);
+    let formals: Vec<String> = m
         .abi_params
         .iter()
-        .map(|s| format!("{} {}", s.name, cgo_slot_type(&s.ty, prefix)))
+        .map(|s| {
+            format!(
+                "{} {}",
+                go_slot_ident(&s.name),
+                cgo_slot_type(&s.ty, prefix)
+            )
+        })
         .collect();
-
-    let mut w = CodeWriter::tabs();
+    let ret_sig = match &m.ret {
+        Some(_) => format!(" (ret {})", cgo_slot_type(&m.abi_ret, prefix)),
+        None => String::new(),
+    };
     w.line(format!("//export {tramp}"));
     w.block(
-        format!("func {tramp}({}) {{", formals.join(", ")),
+        format!("func {tramp}({}){ret_sig} {{", formals.join(", ")),
         "}",
         |w| {
-            w.line("v := wvCallbackLoad(uint64(uintptr(context)))");
-            w.block("if v == nil {", "}", |w| {
-                w.line("return");
+            w.block("defer func() {", "}()", |w| {
+                w.block("if r := recover(); r != nil {", "}", |w| {
+                    w.line("wvForeignError(out_err, r)");
+                });
             });
-            w.line(format!("cb := v.({})", go_callback_sig(cb)));
+            w.line(format!(
+                "impl := cgo.Handle(uintptr(ctx)).Value().({iface_name})"
+            ));
             let mut args = Vec::new();
-            for (idx, p) in cb.params.iter().enumerate() {
+            for (idx, p) in m.params.iter().enumerate() {
                 let mut body = String::new();
-                args.push(emit_cb_param_arg(&mut body, idx, p, prefix, module));
+                args.push(emit_cb_param_arg(&mut body, idx, p));
                 w.raw(body);
             }
-            w.line(format!("cb({})", args.join(", ")));
+            let call = format!("impl.{}({})", m.name.to_upper_camel_case(), args.join(", "));
+            match &m.ret {
+                Some(ty) => {
+                    w.line(format!(
+                        "ret = {}",
+                        c_scalar_conv(&call, ty, prefix, module)
+                    ));
+                    w.line("return");
+                }
+                None => {
+                    w.line(call);
+                }
+            }
         },
     );
     w.blank();
-    out.push_str(&w.finish());
 }
 
-/// The register/unregister wrapper pair for one listener. The wrapper names
-/// follow the module-prefix-stripping default like free functions
-/// (`RegisterEvictionListener` rather than `KvRegisterEvictionListener`).
-pub(crate) fn render_listener_api(
+/// Render one callback interface: the Go `interface` type the consumer
+/// implements (one method per IDL method, PascalCase, direct-family or void
+/// returns), the exported trampoline behind each vtable entry, and the
+/// `free` trampoline that deletes the `cgo.Handle` once the producer drops
+/// its last reference to the callback.
+///
+/// Passing an implementation to a producer function stores it in a
+/// `cgo.Handle` (the `void* ctx` slot) and passes the address of the
+/// interface's static vtable from the cgo preamble (see
+/// [`collect_preamble_decls`]). The producer may invoke any trampoline from
+/// any thread; cgo attaches the calling thread to the Go runtime.
+pub(crate) fn render_callback_interface(
     out: &mut String,
-    m: &ModuleBinding,
-    l: &ListenerBinding,
-    strip_module_prefix: bool,
+    prefix: &str,
+    module: &ModuleBinding,
+    cb: &CallbackInterfaceBinding,
 ) {
-    let Some(cb) = m.callback(&l.event_callback) else {
-        unreachable!("validation guarantees the listener's callback exists");
-    };
-    let register_go = wrapper_name(
-        &m.path,
-        &format!("register_{}", l.name),
-        strip_module_prefix,
-    )
-    .to_upper_camel_case();
-    let unregister_go = wrapper_name(
-        &m.path,
-        &format!("unregister_{}", l.name),
-        strip_module_prefix,
-    )
-    .to_upper_camel_case();
-    let tramp = trampoline_name(&cb.c_fn_type);
-
+    let name = cb.name.to_upper_camel_case();
     let mut w = CodeWriter::tabs();
     let mut d = String::new();
-    emit_doc(&mut d, &l.doc, "", Some(&register_go));
-    w.raw(d);
-    w.line(format!("// Returns a subscription id for {unregister_go}."));
-    w.block(
-        format!("func {register_go}(callback {}) uint64 {{", go_callback_sig(cb)),
-        "}",
-        |w| {
-            w.line("ctxID := wvCallbackStore(callback)");
-            w.line(format!(
-                "id := uint64(C.{}(C.{}(unsafe.Pointer(C.{tramp})), unsafe.Pointer(uintptr(ctxID))))",
-                l.register_symbol, cb.c_fn_type
-            ));
-            w.line("wvCallbackMu.Lock()");
-            w.line("wvListenerCtx[id] = ctxID");
-            w.line("wvCallbackMu.Unlock()");
-            w.line("return id");
-        },
-    );
+    emit_doc(&mut d, &cb.doc, "", Some(&name));
+    if d.is_empty() {
+        w.line(format!(
+            "// {name} is a callback interface: implement it in Go and pass the value to"
+        ));
+        w.line("// native functions that accept it.");
+    } else {
+        w.raw(d);
+        w.line("//");
+        w.line("// Implement this interface in Go and pass the value to native functions");
+        w.line("// that accept it.");
+    }
+    w.line("//");
+    w.line("// The native library may call any method from any thread until it releases");
+    w.line("// the implementation. A panic in a method is reported to the native caller");
+    w.line("// as a foreign error (code -4) instead of crashing the process.");
+    if let Some(msg) = &cb.deprecated {
+        w.line("//");
+        w.line(format!("// Deprecated: {msg}"));
+    }
+    w.block(format!("type {name} interface {{"), "}", |w| {
+        for m in &cb.methods {
+            let mut md = String::new();
+            emit_fn_doc(
+                &mut md,
+                &m.doc,
+                &m.params,
+                "\t",
+                &m.name.to_upper_camel_case(),
+            );
+            w.raw(md);
+            if let Some(msg) = &m.deprecated {
+                w.line(format!("// Deprecated: {msg}"));
+            }
+            w.line(cb_method_sig(m));
+        }
+    });
     w.blank();
 
-    w.line(format!(
-        "// {unregister_go} unregisters a listener previously registered with {register_go}."
-    ));
-    w.block(format!("func {unregister_go}(id uint64) {{"), "}", |w| {
-        w.line(format!("C.{}(C.uint64_t(id))", l.unregister_symbol));
-        w.line("wvCallbackMu.Lock()");
-        w.line("ctxID, ok := wvListenerCtx[id]");
-        w.line("delete(wvListenerCtx, id)");
-        w.line("wvCallbackMu.Unlock()");
-        w.block("if ok {", "}", |w| {
-            w.line("wvCallbackDelete(ctxID)");
-        });
+    for m in &cb.methods {
+        render_cb_trampoline(&mut w, prefix, &module.path, cb, m, &name);
+    }
+
+    let free = cb_trampoline_name(&cb.c_tag, "free");
+    w.line(format!("//export {free}"));
+    w.block(format!("func {free}(ctx unsafe.Pointer) {{"), "}", |w| {
+        w.line("cgo.Handle(uintptr(ctx)).Delete()");
     });
     w.blank();
     out.push_str(&w.finish());
 }
+
+// ── Async ──
 
 /// The per-async-function outcome payload type name, derived from the
 /// (unique) base C symbol with the ABI prefix dropped: free function
@@ -365,8 +476,8 @@ fn async_outcome_type(prefix: &str, f: &FnBinding) -> String {
 ///
 /// Result buffers (strings, bytes, value buffers) are owned by the consumer
 /// per the shared async protocol: they are copied or decoded here and then
-/// released through the runtime free symbols. Owned interface results are
-/// adopted by the wrapper instead (its `Close` calls the destroy symbol).
+/// released through the runtime free symbols. An owned object result
+/// transfers one strong reference, adopted into a wrapper.
 fn emit_async_result_send(
     out: &mut String,
     ret: &Option<Ty>,
@@ -386,7 +497,7 @@ fn emit_async_result_send(
             // Owned by the consumer: wvCopyBuffer copies, then frees.
             w.line("rRes := &wvReader{buf: wvCopyBuffer(result_ptr, result_len)}");
             w.line(format!("var val {}", go_type(ty)));
-            emit_buffer_read(&mut w, "rRes", "val", ty, "Res", 0, prefix, module);
+            emit_buffer_read(&mut w, "rRes", "val", ty, "Res", 0);
             w.line("rRes.expectEnd()");
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
@@ -408,54 +519,27 @@ fn emit_async_result_send(
             });
             w.line(format!("ch <- {outcome}{{val: val}}"));
         }
-        // An owned interface result is adopted by the wrapper (its Close
-        // calls the destroy symbol).
-        RetPass::Object { nullable, .. } => {
-            if nullable {
-                let Ty::Optional(inner) = ty else {
-                    unreachable!("nullable object results are optional interfaces")
-                };
-                let Ty::Interface(name) = inner.as_ref() else {
-                    unreachable!("every other optional is buffered")
-                };
-                let g = go_local(name);
-                w.line(format!("var val *{g}"));
-                w.block("if result != nil {", "}", |w| {
-                    w.line(format!("val = &{g}{{ptr: result}}"));
-                });
-                w.line(format!("ch <- {outcome}{{val: val}}"));
-            } else {
-                w.line(format!(
-                    "ch <- {outcome}{{val: {}}}",
-                    go_wrap_expr(ty, "result")
-                ));
-            }
+        RetPass::Object { .. } => {
+            w.line(format!(
+                "ch <- {outcome}{{val: {}}}",
+                go_adopt_expr(ty, "result")
+            ));
         }
-        RetPass::Direct => match ty {
-            Ty::Bool => {
-                w.line(format!("ch <- {outcome}{{val: cToBool(result)}}"));
-            }
-            // A typed handle is a borrowed id wrapped without ownership.
-            Ty::TypedHandle(_) => {
-                w.line(format!(
-                    "ch <- {outcome}{{val: {}}}",
-                    go_wrap_expr(ty, "result")
-                ));
-            }
-            _ => {
-                w.line(format!(
-                    "ch <- {outcome}{{val: {}}}",
-                    go_scalar_conv("result", ty)
-                ));
-            }
-        },
+        RetPass::Direct => {
+            w.line(format!(
+                "ch <- {outcome}{{val: {}}}",
+                go_scalar_conv("result", ty)
+            ));
+        }
     }
     out.push_str(&w.finish());
 }
 
 /// An async callable: a blocking Go wrapper that launches the C call with a
 /// completion trampoline and waits on a buffered channel, plus the outcome
-/// type and the exported trampoline itself.
+/// type and the exported trampoline itself. The channel travels to the
+/// producer as a `cgo.Handle` in the `context` slot; the trampoline resolves
+/// and deletes it, so the completion is delivered exactly once.
 ///
 /// The error split follows the shared plan's [`ErrorStrategy`]. A throwing
 /// wrapper returns `(T, error)` and the trampoline maps a reported error
@@ -465,7 +549,7 @@ fn emit_async_result_send(
 /// with it on the calling goroutine (the trampoline itself must never panic:
 /// it runs on a producer thread entered from C). With `receiver` set, the
 /// wrapper is a method on that wrapper type passing `s.ptr` as the leading
-/// launch argument.
+/// launch argument and keeping the receiver alive until completion.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_async_function(
     out: &mut String,
@@ -497,7 +581,13 @@ pub(crate) fn render_async_function(
     let formals: Vec<String> = ab
         .callback_params
         .iter()
-        .map(|s| format!("{} {}", s.name, cgo_slot_type(&s.ty, prefix)))
+        .map(|s| {
+            format!(
+                "{} {}",
+                go_slot_ident(&s.name),
+                cgo_slot_type(&s.ty, prefix)
+            )
+        })
         .collect();
     let mut tramp_body = String::new();
     emit_async_result_send(&mut tramp_body, &f.ret, &outcome, prefix, module);
@@ -513,11 +603,9 @@ pub(crate) fn render_async_function(
         format!("func {tramp}({}) {{", formals.join(", ")),
         "}",
         |w| {
-            w.line("v := wvCallbackTake(uint64(uintptr(context)))");
-            w.block("if v == nil {", "}", |w| {
-                w.line("return");
-            });
-            w.line(format!("ch := v.(chan {outcome})"));
+            w.line("h := cgo.Handle(uintptr(context))");
+            w.line(format!("ch := h.Value().(chan {outcome})"));
+            w.line("h.Delete()");
             w.block("if err != nil && err.code != 0 {", "}", |w| {
                 w.line(format!("ch <- {outcome}{{err: {map_err}}}"));
                 w.line("return");
@@ -554,7 +642,7 @@ pub(crate) fn render_async_function(
         c_args.push("nil".into());
     }
     c_args.push(format!("C.{}(unsafe.Pointer(C.{tramp}))", ab.callback_type));
-    c_args.push("unsafe.Pointer(uintptr(ctxID))".into());
+    c_args.push("C.wvHandlePtr(C.uintptr_t(h))".into());
     let launch_args = c_args.join(", ");
 
     let header = match receiver {
@@ -565,8 +653,11 @@ pub(crate) fn render_async_function(
         None => format!("func {go_name}({}){ret_sig} {{", go_params.join(", ")),
     };
     w.block(header, "}", |w| {
+        if let Some(ty) = receiver {
+            w.raw(receiver_guard(ty, "\t"));
+        }
         w.line(format!("ch := make(chan {outcome}, 1)"));
-        w.line("ctxID := wvCallbackStore(ch)");
+        w.line("h := cgo.NewHandle(ch)");
         w.raw(pre.as_str());
         w.line(format!("C.{}({})", ab.launch.symbol, launch_args));
         w.line("outcome := <-ch");
@@ -600,7 +691,7 @@ pub(crate) fn render_async_function(
 /// result out. An iterator-returning callable renders through
 /// [`render_iterator_fn`] as a lazy sequence instead. With `receiver` set,
 /// the wrapper is a method on that wrapper type passing `s.ptr` as the
-/// leading C argument.
+/// leading C argument and keeping the receiver alive across the call.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_function(
     out: &mut String,
@@ -643,7 +734,8 @@ pub(crate) fn render_function(
 
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
-    if receiver.is_some() {
+    if let Some(ty) = receiver {
+        pre.push_str(&receiver_guard(ty, "\t"));
         c_args.push("s.ptr".into());
     }
 
@@ -684,19 +776,15 @@ pub(crate) fn render_function(
 }
 
 /// Go type of the `out_item` local whose address is passed to an iterator's
-/// `next` (the C slot is `T*`, so the local is one indirection less).
-/// Buffered and bytes elements arrive as a `const uint8_t*` buffer pointer.
-fn iter_out_item_type(inner: &Ty, prefix: &str, module: &str) -> String {
-    match elem_free(inner) {
-        ElemFree::String => "*C.char".into(),
-        ElemFree::Bytes => "*C.uint8_t".into(),
-        ElemFree::None => match inner {
-            Ty::TypedHandle(n) | Ty::Interface(n) => {
-                format!("*C.{}", c_abi_struct_name(n, module, prefix))
-            }
-            _ => c_scalar_type(inner, prefix, module).unwrap_or_else(|| "C.int64_t".into()),
-        },
-    }
+/// `next`: the pointee of the `T* out_item` slot, so one indirection less
+/// than the C slot. Strings arrive as `*C.char`, bytes and buffered elements
+/// as a `*C.uint8_t` buffer pointer, objects as `*C.{tag}`, and direct
+/// values as their scalar C type.
+fn iter_out_item_type(ib: &IteratorBinding, prefix: &str) -> String {
+    let CType::Ptr { pointee, .. } = &ib.next.params[1].ty else {
+        unreachable!("an iterator's out_item slot is always a pointer")
+    };
+    cgo_slot_type(pointee, prefix)
 }
 
 /// Re-indent `block` by one tab per non-empty line, used to move depth-1
@@ -717,40 +805,32 @@ fn indent_block(block: &str) -> String {
 
 /// Emit the statements converting one freshly-pulled `next` slot (`outItem`,
 /// plus `outLen` for bytes/buffered elements) into a Go value bound to
-/// `item`, releasing the slot per the protocol's [`ElemFree`] plan: strings
-/// are freed after copying, bytes and buffered elements are copied/decoded
-/// and released with `weaveffi_free_bytes` (via `wvCopyBuffer`), and by-value
-/// elements owe nothing.
-fn emit_iter_elem_bind(w: &mut CodeWriter, inner: &Ty, ef: &ElemFree, prefix: &str, module: &str) {
-    match ef {
-        ElemFree::String => {
+/// `item`, receiving it per the protocol's [`RetPass`] plan: strings are
+/// copied then freed, bytes and buffered elements are copied/decoded and
+/// released with `weaveffi_free_bytes` (via `wvCopyBuffer`), objects are
+/// adopted into a wrapper, and by-value elements owe nothing.
+fn emit_iter_elem_bind(w: &mut CodeWriter, inner: &Ty, elem: &RetPass) {
+    match elem {
+        RetPass::Void => unreachable!("an iterator element is never void"),
+        RetPass::String => {
             w.line("item := C.GoString(outItem)");
             w.line("C.weaveffi_free_string(outItem)");
         }
-        ElemFree::Bytes => {
-            if matches!(inner, Ty::Bytes | Ty::BorrowedBytes) {
-                w.line("item := wvCopyBuffer(outItem, outLen)");
-            } else {
-                w.line("rItem := &wvReader{buf: wvCopyBuffer(outItem, outLen)}");
-                w.line(format!("var item {}", go_type(inner)));
-                emit_buffer_read(w, "rItem", "item", inner, "Item", 0, prefix, module);
-                w.line("rItem.expectEnd()");
-            }
+        RetPass::Bytes => {
+            w.line("item := wvCopyBuffer(outItem, outLen)");
         }
-        ElemFree::None => match inner {
-            Ty::Bool => {
-                w.line("item := cToBool(outItem)");
-            }
-            // Typed handles and interfaces are opaque pointers the consumer
-            // adopts, even though `elem_free` owes no runtime call for them.
-            Ty::TypedHandle(_) | Ty::Interface(_) => {
-                w.line(format!("item := {}", go_wrap_expr(inner, "outItem")));
-            }
-            _ => {
-                let conv = go_scalar_conv("outItem", inner);
-                w.line(format!("item := {conv}"));
-            }
-        },
+        RetPass::Buffer => {
+            w.line("rItem := &wvReader{buf: wvCopyBuffer(outItem, outLen)}");
+            w.line(format!("var item {}", go_type(inner)));
+            emit_buffer_read(w, "rItem", "item", inner, "Item", 0);
+            w.line("rItem.expectEnd()");
+        }
+        RetPass::Object { .. } => {
+            w.line(format!("item := {}", go_adopt_expr(inner, "outItem")));
+        }
+        RetPass::Direct => {
+            w.line(format!("item := {}", go_scalar_conv("outItem", inner)));
+        }
     }
 }
 
@@ -767,8 +847,8 @@ fn emit_iter_elem_bind(w: &mut CodeWriter, inner: &Ty, ef: &ElemFree, prefix: &s
 ///
 /// The producer iterator is launched lazily inside the returned closure, so
 /// an unused sequence allocates nothing on the producer side. One C `next`
-/// call runs per consumer step, each yielded element is released per the
-/// protocol's [`ElemFree`] plan after conversion, and the destroy runs
+/// call runs per consumer step, each yielded element is received per the
+/// protocol's element [`RetPass`] after conversion, and the destroy runs
 /// exactly once through a `defer` inside the closure, whether the sequence
 /// is exhausted, stops on an error, or is abandoned by an early `break`.
 #[allow(clippy::too_many_arguments)]
@@ -782,12 +862,12 @@ fn render_iterator_fn(
     receiver: Option<&str>,
     err: ErrCtx,
 ) {
-    let proto = ib.protocol(f);
+    let proto = ib.protocol(f, module, prefix);
     let throws = matches!(proto.error, ErrorStrategy::Throws);
     let elem = &ib.elem;
     let elem_go = go_type(elem);
-    let item_ty = iter_out_item_type(elem, prefix, module);
-    let has_len = matches!(proto.elem_free, ElemFree::Bytes);
+    let item_ty = iter_out_item_type(ib, prefix);
+    let has_len = matches!(proto.elem, RetPass::Bytes | RetPass::Buffer);
     let zero = go_zero(elem);
 
     let go_params: Vec<String> = f
@@ -837,7 +917,8 @@ fn render_iterator_fn(
     // live at launch time and each range restages them.
     let mut pre = String::new();
     let mut c_args: Vec<String> = Vec::new();
-    if receiver.is_some() {
+    if let Some(ty) = receiver {
+        pre.push_str(&receiver_guard(ty, "\t"));
         c_args.push("s.ptr".into());
     }
     for p in &f.params {
@@ -887,7 +968,7 @@ fn render_iterator_fn(
                 w.block("if !ok {", "}", |w| {
                     w.line("return");
                 });
-                emit_iter_elem_bind(w, elem, &proto.elem_free, prefix, module);
+                emit_iter_elem_bind(w, elem, &proto.elem);
                 let yield_call = if throws {
                     "if !yield(item, nil) {"
                 } else {
@@ -905,11 +986,27 @@ fn render_iterator_fn(
 
 // ── Parameter and return marshalling ──
 
+/// The statements every method opens with: reject a wrapper whose reference
+/// was already released by `Close` (the ABI never accepts a null object
+/// there, so a Go panic beats a producer-side abort), then pin the wrapper
+/// so its finalizer cannot release the object while the call is in flight.
+fn receiver_guard(ty: &str, indent: &str) -> String {
+    format!(
+        "{indent}if s.ptr == nil {{\n{indent}\tpanic(\"weaveffi: {ty} used after Close\")\n{indent}}}\n{indent}defer runtime.KeepAlive(s)\n"
+    )
+}
+
 /// Emit the staging statements and C argument expressions for one Go
-/// parameter, dispatching on the shared [`ArgPass`] contract. A buffered
-/// parameter is packed into a `wvWriter` and passed as a borrowed
-/// `(ptr, len)` pair; the C-owned encoding lives in Go memory kept alive for
-/// the duration of the call by cgo's argument-pinning rules.
+/// parameter, dispatching on the shared [`ArgPass`] contract.
+///
+/// A buffered parameter is packed into a `wvWriter` and passed as a borrowed
+/// `(ptr, len)` pair; the encoding lives in Go memory kept alive for the
+/// duration of the call by cgo's argument-pinning rules. An object parameter
+/// passes the wrapper's own pointer (borrowed; the wrapper keeps its
+/// reference) and pins the wrapper with `runtime.KeepAlive` so its finalizer
+/// cannot release the object mid-call; a nil `Interface?` stages a NULL
+/// slot. A callback interface stores the implementation in a `cgo.Handle`
+/// passed as `ctx` alongside the address of the interface's static vtable.
 fn emit_param(
     pre: &mut String,
     args: &mut Vec<String>,
@@ -950,8 +1047,8 @@ fn emit_param(
             args.push(pv);
             args.push(lv);
         }
-        // A borrowed object pointer; when nullable, nil stages a NULL slot.
         ArgPass::Object { slot, nullable } => {
+            w.line(format!("defer runtime.KeepAlive({name})"));
             if nullable {
                 let cv = format!("c{}", name.to_upper_camel_case());
                 w.line(format!("var {cv} {}", cgo_slot_type(&slot.ty, prefix)));
@@ -963,12 +1060,19 @@ fn emit_param(
                 args.push(format!("{name}.ptr"));
             }
         }
-        ArgPass::Direct { .. } => match &p.ty {
-            Ty::Handle => args.push(format!("C.weaveffi_handle_t({name})")),
-            // A typed handle passes its wrapped opaque pointer by value.
-            Ty::TypedHandle(_) => args.push(format!("{name}.ptr")),
-            _ => args.push(c_scalar_conv(&name, &p.ty, prefix, module)),
-        },
+        ArgPass::Callback { .. } => {
+            let Ty::CallbackInterface(cb) = &p.ty else {
+                unreachable!("callback family names a callback interface")
+            };
+            let hv = format!("h{}", name.to_upper_camel_case());
+            w.line(format!("{hv} := cgo.NewHandle({name})"));
+            args.push(format!("C.wvHandlePtr(C.uintptr_t({hv}))"));
+            args.push(format!(
+                "C.{}()",
+                vtable_accessor(&c_abi_struct_name(cb, module, prefix))
+            ));
+        }
+        ArgPass::Direct { .. } => args.push(c_scalar_conv(&name, &p.ty, prefix, module)),
     }
     pre.push_str(&w.finish());
 }
@@ -1000,7 +1104,8 @@ fn emit_return_out_params(
 ///
 /// A buffered return is copied out of the producer-allocated buffer (which
 /// `wvCopyBuffer` releases with `weaveffi_free_bytes`), decoded, and checked
-/// for trailing bytes.
+/// for trailing bytes. An object return transfers one strong reference that
+/// the wrapper adopts; a null `Interface?` adopts to nil.
 fn emit_return(out: &mut String, ty: &Ty, prefix: &str, module: &str, tail: &str) {
     let mut w = CodeWriter::tabs().with_depth(1);
     match plan::ret_pass(Some(ty), module, prefix) {
@@ -1008,7 +1113,7 @@ fn emit_return(out: &mut String, ty: &Ty, prefix: &str, module: &str, tail: &str
         RetPass::Buffer => {
             w.line("rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}");
             w.line(format!("var goResult {}", go_type(ty)));
-            emit_buffer_read(&mut w, "rRes", "goResult", ty, "Res", 0, prefix, module);
+            emit_buffer_read(&mut w, "rRes", "goResult", ty, "Res", 0);
             w.line("rRes.expectEnd()");
             w.line(format!("return goResult{tail}"));
         }
@@ -1025,38 +1130,13 @@ fn emit_return(out: &mut String, ty: &Ty, prefix: &str, module: &str, tail: &str
             w.line("C.weaveffi_free_bytes(result, cOutLen)");
             w.line(format!("return goResult{tail}"));
         }
-        // An owned object pointer the wrapper adopts; when nullable, a NULL
-        // return means none.
-        RetPass::Object { nullable, .. } => {
-            if nullable {
-                let Ty::Optional(inner) = ty else {
-                    unreachable!("nullable object returns are optional interfaces")
-                };
-                let Ty::Interface(n) = inner.as_ref() else {
-                    unreachable!("every other optional is buffered")
-                };
-                let g = go_local(n);
-                w.block("if result == nil {", "}", |w| {
-                    w.line(format!("return nil{tail}"));
-                });
-                w.line(format!("return &{g}{{ptr: result}}{tail}"));
-            } else {
-                w.line(format!("return {}{tail}", go_wrap_expr(ty, "result")));
-            }
+        RetPass::Object { .. } => {
+            w.line(format!("return {}{tail}", go_adopt_expr(ty, "result")));
         }
-        RetPass::Direct => match ty {
-            Ty::Bool => {
-                w.line(format!("return cToBool(result){tail}"));
-            }
-            // A typed handle is a borrowed id wrapped without ownership.
-            Ty::TypedHandle(_) => {
-                w.line(format!("return {}{tail}", go_wrap_expr(ty, "result")));
-            }
-            _ => {
-                let conv = go_scalar_conv("result", ty);
-                w.line(format!("return {conv}{tail}"));
-            }
-        },
+        RetPass::Direct => {
+            let conv = go_scalar_conv("result", ty);
+            w.line(format!("return {conv}{tail}"));
+        }
     }
     out.push_str(&w.finish());
 }

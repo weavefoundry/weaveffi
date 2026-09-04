@@ -1,5 +1,6 @@
-//! Packaging output: the `package.json` manifest and the README with its
-//! boundary-convention notes and generated API reference.
+//! Packaging output: the `package.json` manifest, the generated-source README
+//! with its boundary-convention notes and API reference, and the packaged
+//! README describing the bundled artifact.
 //!
 //! The manifest is built with [`manifest::JsonObject`]
 //! (`weaveffi_core::manifest`) so quoting and escaping are centralized; user
@@ -8,19 +9,30 @@
 
 use std::collections::HashMap;
 
+use camino::Utf8PathBuf;
 use weaveffi_core::cache::CLI_VERSION;
-use weaveffi_core::codegen::common::walk_modules;
 use weaveffi_core::errors::ERROR_BRAND;
-use weaveffi_core::manifest::JsonObject;
+use weaveffi_core::manifest::{JsonObject, JsonValue};
 use weaveffi_core::model::{
-    BindingModel, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding, ModuleBinding,
-    StructBinding,
+    BindingModel, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    ModuleBinding, StructBinding,
 };
 use weaveffi_core::pkg::ResolvedPackage;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 use weaveffi_ir::ir::Api;
 
-use crate::types::{js_code_class_name, type_display, wasm_type, wasm_type_note};
+use crate::types::{
+    js_cb_method_name, js_code_class_name, ts_type_for, type_display, wasm_type, wasm_type_note,
+};
+
+/// The prebuilt `wasm32-unknown-unknown` binary a package bundles: the
+/// filename it's shipped under (next to the loader) and where to copy it from.
+pub(crate) struct PackagedBinary {
+    /// The bundled filename, `<lib_name>.wasm`.
+    pub(crate) filename: String,
+    /// The on-disk source the binary is copied from.
+    pub(crate) source: Utf8PathBuf,
+}
 
 /// Prepend the generated-file prelude entries (`//`, `//warning`,
 /// `//regenerate`) npm tolerates at the top of `package.json`. Mirrors
@@ -42,12 +54,15 @@ fn json_prelude_entries(obj: JsonObject, input_basename: &str) -> JsonObject {
 }
 
 /// Render the `package.json` manifest: prelude comment entries, npm metadata
-/// from the resolved package (optional fields only when present), and the
-/// fixed ES-module entry points for the loader and its declarations.
+/// from the resolved package (optional fields only when present), the fixed
+/// ES-module entry points for the loader and its declarations, and, when a
+/// binary is bundled, an explicit `files` list so npm publishes exactly the
+/// loader, declarations, and `.wasm` (the README is always included by npm).
 pub(crate) fn render_wasm_package_json(
     package: &ResolvedPackage,
     js_filename: &str,
     dts_filename: &str,
+    wasm_filename: Option<&str>,
     input_basename: &str,
 ) -> String {
     let mut obj = json_prelude_entries(JsonObject::new(), input_basename)
@@ -58,11 +73,110 @@ pub(crate) fn render_wasm_package_json(
     if let Some(author) = package.authors.first() {
         obj = obj.str_entry("author", author);
     }
-    obj.opt_str_entry("homepage", package.homepage.as_deref())
+    obj = obj
+        .opt_str_entry("homepage", package.homepage.as_deref())
         .str_entry("type", "module")
         .str_entry("main", js_filename)
-        .str_entry("types", dts_filename)
-        .render()
+        .str_entry("types", dts_filename);
+    if let Some(wasm) = wasm_filename {
+        obj = obj.entry(
+            "files",
+            JsonValue::Array(
+                [js_filename, dts_filename, wasm]
+                    .into_iter()
+                    .map(JsonValue::str)
+                    .collect(),
+            ),
+        );
+    }
+    obj.render()
+}
+
+/// README for a packaged Wasm artifact: what the package contains, how to
+/// load it from the bundled `.wasm` (or, without one, where the binary has to
+/// come from), and the lifetime rules a consumer must follow.
+pub(crate) fn render_packaged_readme(
+    package: &ResolvedPackage,
+    module_name: &str,
+    js_filename: &str,
+    binary: Option<&PackagedBinary>,
+    input_basename: &str,
+    emscripten: bool,
+) -> String {
+    use heck::ToUpperCamelCase;
+    let load_fn = format!("load{}", module_name.to_upper_camel_case());
+    let name = &package.name;
+    let mut out = render_prelude(CommentStyle::Xml, input_basename);
+    out.push_str(&format!("# {name} (WebAssembly)\n\n"));
+    if emscripten {
+        out.push_str(
+            "Auto-generated JavaScript glue and TypeScript declarations for an Emscripten \
+             build of this library. The package carries no binary: build the Emscripten \
+             module yourself (so you control options like `locateFile`) and hand it to \
+             the loader.\n\n",
+        );
+        out.push_str("```js\n");
+        out.push_str("import Module from './your_library.js';\n");
+        out.push_str(&format!("import {{ {load_fn} }} from '{name}';\n\n"));
+        out.push_str(&format!("const api = await {load_fn}(Module());\n"));
+        out.push_str("```\n\n");
+        out.push_str(
+            "Async functions and callback interfaces are not supported in Emscripten \
+             mode: each affected entry point throws at call time and is omitted from the \
+             TypeScript declarations.\n\n",
+        );
+    } else if let Some(b) = binary {
+        out.push_str(&format!(
+            "Auto-generated JavaScript loader and TypeScript declarations with the \
+             prebuilt `wasm32-unknown-unknown` module bundled as `{}`. No toolchain is \
+             needed: fetch the bundled file (or read it in Node) and hand it to the \
+             loader.\n\n",
+            b.filename
+        ));
+        out.push_str("```js\n");
+        out.push_str(&format!("import {{ {load_fn} }} from '{name}';\n\n"));
+        out.push_str("// Browsers and bundlers: resolve the bundled file's URL.\n");
+        out.push_str(&format!(
+            "const api = await {load_fn}(new URL('./{}', import.meta.url));\n\n",
+            b.filename
+        ));
+        out.push_str("// Node: pass the bytes instead of fetching.\n");
+        out.push_str("import { readFile } from 'node:fs/promises';\n");
+        out.push_str(&format!(
+            "const api2 = await {load_fn}(await readFile(new URL('./{}', import.meta.url)));\n",
+            b.filename
+        ));
+        out.push_str("```\n\n");
+    } else {
+        out.push_str(
+            "Auto-generated JavaScript loader and TypeScript declarations for a \
+             `wasm32-unknown-unknown` build of this library. No `wasm32` binary was \
+             supplied when this package was assembled, so it ships without one: build \
+             the library with `cargo build --target wasm32-unknown-unknown --release` \
+             and pass the resulting `.wasm` (a URL, its bytes, or a compiled \
+             `WebAssembly.Module`) to the loader.\n\n",
+        );
+        out.push_str("```js\n");
+        out.push_str(&format!("import {{ {load_fn} }} from '{name}';\n\n"));
+        out.push_str(&format!(
+            "const api = await {load_fn}('your_library.wasm');\n"
+        ));
+        out.push_str("```\n\n");
+    }
+    out.push_str(&format!(
+        "`{js_filename}` is an ES module; the package is `\"type\": \"module\"`.\n\n"
+    ));
+    out.push_str("## Object lifetimes\n\n");
+    out.push_str(
+        "Interface values are wrapper classes holding one reference to a producer \
+         object. Call `close()` (or bind the wrapper with `using`, which calls \
+         `Symbol.dispose`) when you're done; a wrapper that is garbage collected \
+         unclosed is released by a `FinalizationRegistry` backstop where the runtime \
+         provides one. Passing a wrapper to a function lends its reference for the \
+         duration of the call; a wrapper returned to you is yours to close.\n\n",
+    );
+    out.push_str(&render_trailer(CommentStyle::Xml, "README.md"));
+    out
 }
 
 /// Render the `README.md`: build and load instructions for the configured
@@ -98,7 +212,7 @@ pub(crate) fn render_wasm_readme(
         out.push_str("import { loadWeaveffiWasm } from './weaveffi_wasm.js';\n\n");
         out.push_str("const api = await loadWeaveffiWasm(Module());\n");
         out.push_str("```\n\n");
-        if walk_modules(&api.modules).any(|m| m.functions.iter().any(|f| f.r#async)) {
+        if model.has_async() {
             out.push_str("## Async Functions\n\n");
             out.push_str(
                 "Async functions are not supported in Emscripten mode. Each one is \
@@ -108,16 +222,17 @@ pub(crate) fn render_wasm_readme(
                  them.\n\n",
             );
         }
-        if walk_modules(&api.modules).any(|m| !m.listeners.is_empty()) {
-            out.push_str("## Callbacks and Listeners\n\n");
+        if model.has_callback_interfaces() {
+            out.push_str("## Callback Interfaces\n\n");
             out.push_str(
-                "Callbacks and listeners are not supported in Emscripten mode: their \
+                "Callback interfaces are not supported in Emscripten mode: their \
                  trampolines rely on `WebAssembly.Function` and a growable \
                  `__indirect_function_table`, neither of which an Emscripten module \
-                 exposes portably. Each register/unregister entry point is generated \
-                 as an explicit stub that throws at call time and is omitted from the \
-                 TypeScript declarations. Use the standard `wasm32-unknown-unknown` \
-                 loader or a native target when you need them.\n\n",
+                 exposes portably. Each function taking a callback interface is \
+                 generated as an explicit stub that throws at call time and is omitted \
+                 from the TypeScript declarations, along with the interface shapes \
+                 themselves. Use the standard `wasm32-unknown-unknown` loader or a \
+                 native target when you need them.\n\n",
             );
         }
     } else {
@@ -126,7 +241,11 @@ pub(crate) fn render_wasm_readme(
         out.push_str("```bash\n");
         out.push_str("cargo build --target wasm32-unknown-unknown --release\n");
         out.push_str("```\n\n");
-        out.push_str("Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.\n\n");
+        out.push_str(
+            "Then serve the `.wasm` and use `weaveffi_wasm.js` to load it: the loader \
+             accepts a URL to fetch, the module's bytes (for Node, where `fetch` cannot \
+             read files), or an already compiled `WebAssembly.Module`.\n\n",
+        );
     }
     out.push_str("## Complex Type Handling\n\n");
     out.push_str("Wasm only supports numeric types natively (`i32`, `i64`, `f32`, `f64`). ");
@@ -141,11 +260,32 @@ pub(crate) fn render_wasm_readme(
     out.push_str("Rich (algebraic) enums are plain objects tagged by variant name ");
     out.push_str("(`{ tag: \"Circle\", radius: 2 }`) and cross the boundary serialized in a ");
     out.push_str("value buffer, exactly like records.\n\n");
+    out.push_str("### Objects\n\n");
+    out.push_str("Interfaces are **wrapper classes** holding one reference to a producer ");
+    out.push_str("object (an `i32` pointer into linear memory). A wrapper you receive is ");
+    out.push_str("yours: release it with `close()` (or bind it with `using`, which calls ");
+    out.push_str("`Symbol.dispose`); a wrapper collected unclosed is released by a ");
+    out.push_str("`FinalizationRegistry` backstop where the runtime provides one, and ");
+    out.push_str("destroy runs exactly once either way. Passing a wrapper to a function lends ");
+    out.push_str("its reference for the duration of the call. Inside a value buffer an object ");
+    out.push_str("crosses as a `u64` token carrying one reference: the writer clones the ");
+    out.push_str("wrapper's reference and the reader adopts the token into a new wrapper.\n\n");
+    out.push_str("### 64-bit Integers\n\n");
+    out.push_str("`i64` and `u64` are JavaScript **`bigint`** values everywhere: as arguments, ");
+    out.push_str("returns, record fields, and callback parameters. Map keys of these types ");
+    out.push_str("become string property names on the decoded object. A `number` is accepted ");
+    out.push_str("where a `bigint` is expected (it's widened with `BigInt(v)`, so a fractional ");
+    out.push_str("value throws a `RangeError`). Values crossing by value follow the wasm ");
+    out.push_str("calling convention: an out-of-range `bigint` wraps modulo 2^64 rather than ");
+    out.push_str("throwing, and unsigned results are read back as unsigned (`u64` via ");
+    out.push_str("`BigInt.asUintN`, `u32` via `>>> 0`).\n\n");
     out.push_str("### Optionals\n\n");
     out.push_str("Optional values map to **`null`** for the absent case. An optional crosses ");
     out.push_str("the boundary inside a value buffer as a one-byte presence flag followed by ");
     out.push_str("the value when present. The one exception is an optional interface, which ");
-    out.push_str("stays a nullable object pointer (`0` = absent).\n\n");
+    out.push_str(
+        "stays a nullable object pointer (`0` = absent) and maps to `Wrapper | null`.\n\n",
+    );
     out.push_str("### Lists and Maps\n\n");
     out.push_str("Lists are JS arrays; maps are plain objects (a `Map` instance is also ");
     out.push_str("accepted on input). Both cross the boundary serialized in a value buffer ");
@@ -157,24 +297,44 @@ pub(crate) fn render_wasm_readme(
     out.push_str("exactly once, on exhaustion or via `return()` when iteration stops early ");
     out.push_str("(a `for...of` loop calls `return()` automatically on `break` or `throw`). ");
     out.push_str("Abandoning an iterator without exhausting or closing it leaks the handle.\n");
-    if !emscripten && walk_modules(&api.modules).any(|m| !m.listeners.is_empty()) {
-        out.push_str("\n### Callbacks and Listeners\n\n");
+    if !emscripten && model.has_async() {
+        out.push_str("\n### Async Functions\n\n");
         out.push_str(
-            "Each listener surfaces as a `register.../unregister...` pair. `register` \
-             takes a plain JS function and returns a numeric subscription id; \
-             `unregister` takes that id and stops delivery. Delivery is **synchronous \
-             and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events \
-             fire only while a call into the module is on the stack (for example, a \
-             producer function that emits during its own execution). A producer that \
-             emits from a spawned thread cannot run on this target at all.\n\n",
+            "`async` functions return a **`Promise`**. `wasm32-unknown-unknown` has no \
+             threads, so the producer's default spawner drives each future to completion \
+             inline, inside the launch call: the completion callback fires (through a \
+             function-table trampoline) before the wrapper returns, and the Promise is \
+             already settled when you `await` it. There is nothing to pump or poll from \
+             JS. A future that returns `Pending` can't be woken on this target with the \
+             default spawner; a producer whose futures wait on external events needs its \
+             own spawner (`weaveffi::set_spawner`), and driving that executor is then the \
+             producer's responsibility, not the glue's. A typed error rejects the Promise \
+             with the same class the synchronous wrapper would throw.\n",
+        );
+    }
+    if !emscripten && model.has_callback_interfaces() {
+        out.push_str("\n### Callback Interfaces\n\n");
+        out.push_str(
+            "A callback interface is a TypeScript `interface`; pass any object with the \
+             matching methods where a parameter of that type is expected. The loader \
+             keeps one **static vtable per interface** in linear memory, filled with \
+             function-table indices of long-lived trampolines, and passes a small \
+             integer context key with it; the producer calls `free(ctx)` when it drops \
+             the callback, which releases your object. Delivery is **synchronous and \
+             same-thread**: `wasm32-unknown-unknown` is single-threaded, so a method \
+             runs only while a call into the module is on the stack. A producer that \
+             calls back from a spawned thread cannot run on this target at all.\n\n",
         );
         out.push_str(
-            "Callback arguments are **borrowed for the duration of the callback**: \
-             strings, byte buffers, and buffered values (records, rich enums, \
-             optionals, lists, maps) are copied or decoded into JS values before your \
-             function runs, and interface arguments wrap producer-owned objects. Read \
-             what you need inside the callback and do not retain an interface wrapper \
-             or call `free()` on it.\n",
+            "Method arguments that are strings, bytes, or buffered values are \
+             **borrowed for the duration of the call**: they're copied or decoded into \
+             JS values before your method runs. Object arguments transfer one reference \
+             to you: `close()` the wrapper when you're done with it. An exception thrown \
+             from a method is reported to the producer as error code `-4` (with the \
+             exception's message) and the method's default value is returned in its \
+             place; the producer then aborts the call it was making, and the original \
+             caller sees a `WeaveFFIError` with code `-4` carrying your message (see \
+             *Traps* below for how that abort reaches the caller on this target).\n",
         );
     }
     out.push_str("\n### Error Handling\n\n");
@@ -187,14 +347,46 @@ pub(crate) fn render_wasm_readme(
     out.push_str("- `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory\n");
     out.push_str("- `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block\n");
     out.push_str("- `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources\n");
+    out.push_str("- `weaveffi_error_set(err_ptr: i32, code: i32, msg: i32)`: fill an error slot (used to report callback exceptions)\n");
     out.push_str("- `weaveffi_free_string(ptr: i32)`: free a producer-returned C string\n");
     out.push_str("- `weaveffi_free_bytes(ptr: i32, len: i32)`: free a producer-returned buffer\n");
     out.push_str("\nWrappers of functions declared `throws` raise the declaring module's typed\n");
     out.push_str("error class (a `WeaveFFIError` subclass with a per-code subclass, such as\n");
     out.push_str("`KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only\n");
-    out.push_str("for producer panics and marshalling failures. When the matched error code\n");
-    out.push_str("declares payload fields, the wrapper decodes them from the error's value\n");
-    out.push_str("buffer and attaches them as properties on the thrown error.\n");
+    out.push_str("for producer panics, marshalling failures, and callback exceptions\n");
+    out.push_str("(code `-4`). When the matched error code declares payload fields, the\n");
+    out.push_str("wrapper decodes them from the error's value buffer and attaches them as\n");
+    out.push_str("properties on the thrown error.\n");
+    if !emscripten {
+        out.push_str("\n#### Callback failures without unwinding\n\n");
+        out.push_str(
+            "`wasm32-unknown-unknown` builds with `panic = \"abort\"`, so when a callback \
+             interface method throws, the producer can't unwind out of the call the way \
+             native targets do. Instead the runtime records the failure, the producer's \
+             code runs to completion on the method's default return value (`0`, `0n`, \
+             or `false`), and the thunk then reports code `-4` with the exception's \
+             message in place of the result, so the wrapper throws (or the Promise \
+             rejects with) the same `WeaveFFIError` a native build would produce. While \
+             that producer call is still on the stack, the glue refuses every further \
+             callback invocation with the same error rather than calling your \
+             implementation again, so your code observes the failure exactly as it would \
+             under unwinding. Producers must tolerate a callback returning its default \
+             once (a well-behaved producer already does, because a consumer could return \
+             that value on purpose).\n",
+        );
+        out.push_str("\n#### Traps\n\n");
+        out.push_str(
+            "A producer panic can't be caught on the Rust side either: it executes \
+             `unreachable`, and the engine throws a `WebAssembly.RuntimeError` out of \
+             the call. The glue translates that trap for you: the wrapper throws (or the \
+             Promise rejects with) a `WeaveFFIError` with code `-2` (`producer \
+             panicked`), or code `-4` if a callback method had already failed during \
+             the call. The error slot and every staged argument are released either \
+             way. The producer frames between the trap and the call are *not* unwound, \
+             so their cleanup does not run: a lock held across the panic stays locked, \
+             and allocations those frames owned leak.\n",
+        );
+    }
 
     if !api.modules.is_empty() {
         render_api_reference(&mut out, api, model);
@@ -231,6 +423,13 @@ fn render_api_reference(out: &mut String, api: &Api, model: &BindingModel) {
             out.push_str("\n#### Interfaces\n");
             for i in &mb.interfaces {
                 render_interface_ref(out, i);
+            }
+        }
+
+        if !mb.callback_interfaces.is_empty() {
+            out.push_str("\n#### Callback Interfaces\n");
+            for cb in &mb.callback_interfaces {
+                render_callback_interface_ref(out, cb);
             }
         }
 
@@ -284,7 +483,7 @@ fn render_error_ref(out: &mut String, eb: &ErrorBinding) {
     }
 }
 
-/// Document one interface: an opaque handle wrapped by a JS class, with the
+/// Document one interface: an object pointer wrapped by a JS class, with the
 /// member entry points listed at the ABI level like free functions.
 fn render_interface_ref(out: &mut String, i: &InterfaceBinding) {
     out.push_str(&format!("\n##### `{}`\n\n", i.name));
@@ -293,9 +492,10 @@ fn render_interface_ref(out: &mut String, i: &InterfaceBinding) {
         out.push_str("\n\n");
     }
     out.push_str(
-        "Passed as an **opaque object pointer** (`i32`), wrapped by a JS class. \
-         Constructors return an owned handle; methods pass the handle as the implicit \
-         leading `self` argument; `free()` releases the handle via the destroy symbol.\n",
+        "Passed as an **object pointer** (`i32`), wrapped by a JS class holding one \
+         reference. Constructors return an owned reference; methods lend the pointer \
+         as the implicit leading `self` argument; `close()` (or `Symbol.dispose`) \
+         releases the reference via the destroy symbol exactly once.\n",
     );
     for f in i
         .constructors
@@ -306,9 +506,55 @@ fn render_interface_ref(out: &mut String, i: &InterfaceBinding) {
         render_function_ref(out, f);
     }
     out.push_str(&format!(
-        "\n##### `{}`\n\nReleases the object reference. Called by the wrapper's `free()`.\n",
+        "\n##### `{}`\n\nReturns a second reference to the same object. Used when the \
+         wrapper is encoded as an object token inside a value buffer.\n",
+        i.clone_symbol
+    ));
+    out.push_str(&format!(
+        "\n##### `{}`\n\nReleases one object reference. Called by the wrapper's `close()` \
+         (and by the finalizer backstop).\n",
         i.destroy_symbol
     ));
+}
+
+/// Document one callback interface: the TS shape a consumer implements, its
+/// vtable layout, and each method's parameters at the API level.
+fn render_callback_interface_ref(out: &mut String, cb: &CallbackInterfaceBinding) {
+    out.push_str(&format!("\n##### `{}`\n\n", cb.name));
+    if let Some(doc) = &cb.doc {
+        out.push_str(doc);
+        out.push_str("\n\n");
+    }
+    if let Some(msg) = &cb.deprecated {
+        out.push_str(&format!("**Deprecated:** {msg}\n\n"));
+    }
+    out.push_str(&format!(
+        "Implemented in JS as an object with the methods below. Passed as an `i32` \
+         context key plus an `i32` pointer to the static `{}` vtable; the vtable's \
+         trailing `free(ctx)` entry releases the JS object.\n\n",
+        cb.vtable_tag
+    ));
+    out.push_str("| Method | Parameters | Returns |\n");
+    out.push_str("|--------|------------|---------|\n");
+    for m in &cb.methods {
+        let params = if m.params.is_empty() {
+            "(none)".to_string()
+        } else {
+            m.params
+                .iter()
+                .map(|p| format!("`{}: {}`", p.name, ts_type_for(&p.ty)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ret = m
+            .ret
+            .as_ref()
+            .map_or_else(|| "`void`".to_string(), |t| format!("`{}`", ts_type_for(t)));
+        out.push_str(&format!(
+            "| `{}` | {params} | {ret} |\n",
+            js_cb_method_name(&m.name)
+        ));
+    }
 }
 
 /// Document one callable at the ABI level: its C signature in wasm value

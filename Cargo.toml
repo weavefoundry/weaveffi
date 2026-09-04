@@ -8,7 +8,7 @@ members = [
     "crates/weaveffi-core",
     "crates/weaveffi-gen-c",
     "crates/weaveffi-gen-swift",
-    "crates/weaveffi-gen-android",
+    "crates/weaveffi-gen-kotlin",
     "crates/weaveffi-gen-node",
     "crates/weaveffi-gen-wasm",
     "crates/weaveffi-gen-python",
@@ -19,13 +19,13 @@ members = [
     "crates/weaveffi-gen-ruby",
     "crates/weaveffi-cli",
     "samples/calculator",
-    "samples/node-addon",
     "samples/contacts",
     "samples/inventory",
     "samples/async-demo",
     "samples/events",
     "samples/kvstore",
     "samples/shapes",
+    "samples/codec",
     "crates/weaveffi-fuzz",
 ]
 resolver = "2"

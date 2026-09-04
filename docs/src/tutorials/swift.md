@@ -4,7 +4,8 @@
 
 Build a small Rust greeter library, generate Swift bindings with
 WeaveFFI, and call them from a SwiftUI iOS app running in the
-simulator.
+simulator. A macOS command-line smoke test along the way proves the
+Rust and the bindings agree before Xcode enters the picture.
 
 ## Prerequisites
 
@@ -24,7 +25,7 @@ simulator.
 Save as `greeter.yml`:
 
 ```yaml
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: greeter
     errors:
@@ -51,7 +52,17 @@ modules:
 
 `hello` can't fail, so it stays non-throwing. `greeting` declares
 `throws: true` and reports codes from the module's `GreeterError`
-domain when the language is unknown.
+domain when the language is unknown. Check it with
+`weaveffi validate greeter.yml`; you should see `Validation passed`.
+
+Put a `weaveffi.toml` beside it so the Swift package gets a stable name
+(otherwise it defaults to the IDL's file stem, `greeter`):
+
+```toml
+[package]
+name = "mygreeter"
+version = "0.1.0"
+```
 
 ### 2. Generate bindings
 
@@ -64,15 +75,22 @@ You should see, among other targets:
 ```text
 generated/
 ├── c/
+│   ├── weaveffi.c
 │   └── weaveffi.h
 └── swift/
     ├── Package.swift
     └── Sources/
-        ├── CWeaveFFI/
+        ├── CMygreeter/
         │   └── module.modulemap
-        └── WeaveFFI/
-            └── WeaveFFI.swift
+        └── Mygreeter/
+            └── Mygreeter.swift
 ```
+
+The package name and both target names are the capitalized `[package]`
+name: `CMygreeter` is the SwiftPM system library that wraps
+`generated/c/weaveffi.h`, and `Mygreeter` is the Swift wrapper you
+`import`. `Package.swift` declares iOS 13, macOS 10.15, tvOS 13, and
+watchOS 6 as the minimum platforms.
 
 ### 3. Implement the Rust library
 
@@ -92,41 +110,59 @@ edition = "2021"
 crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
-weaveffi-abi = { version = "0.14" }
+weaveffi = "0.22"
 ```
 
-`mygreeter/src/lib.rs`:
+The `staticlib` is what the iOS app links; the `cdylib` is for the macOS
+smoke test in step 5. `mygreeter/src/lib.rs` is plain safe Rust. The macro
+reads the annotated items and emits the `extern "C"` thunks the Swift
+wrapper calls, so the module needs no `unsafe` and no hand-written
+signatures:
 
 ```rust
-#![allow(unsafe_code)]
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#[weaveffi::module]
+pub mod greeter {
+    /// Codes the greeter reports from its throwing functions.
+    #[weaveffi::error]
+    #[derive(Debug)]
+    pub enum GreeterError {
+        /// unknown language
+        UnknownLang = 1,
+    }
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use weaveffi_abi::{self as abi, weaveffi_error};
+    /// A greeting and the language it was rendered in.
+    #[weaveffi::record]
+    pub struct Greeting {
+        pub message: String,
+        pub lang: String,
+    }
 
-#[no_mangle]
-pub extern "C" fn weaveffi_greeter_hello(
-    name: *const c_char,
-    out_err: *mut weaveffi_error,
-) -> *const c_char {
-    abi::error_set_ok(out_err);
-    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("world");
-    let msg = format!("Hello, {name}!");
-    CString::new(msg).unwrap().into_raw() as *const c_char
+    /// Greet someone in English.
+    #[weaveffi::export]
+    pub fn hello(name: String) -> String {
+        format!("Hello, {name}!")
+    }
+
+    /// Greet someone in the given language, failing on an unknown one.
+    #[weaveffi::export]
+    pub fn greeting(name: String, lang: String) -> Result<Greeting, GreeterError> {
+        let message = match lang.as_str() {
+            "en" => format!("Hello, {name}!"),
+            "es" => format!("Hola, {name}!"),
+            "fr" => format!("Bonjour, {name}!"),
+            _ => return Err(GreeterError::UnknownLang),
+        };
+        Ok(Greeting { message, lang })
+    }
 }
 
-// Emit the WeaveFFI C ABI runtime symbols (abi_version, free_string,
-// free_bytes, error_clear, cancel_token_*), one line per cdylib.
-abi::export_runtime!();
+weaveffi::export_runtime!();
 ```
 
-The generated `generated/c/weaveffi.h` lists every remaining symbol with
-its exact signature; implement `weaveffi_greeter_greeting` the same way
-(it returns the `Greeting` record as a serialized value buffer).
-Alternatively, annotate the module with `#[weaveffi::module]` and let the
-macro emit the whole C ABI; see
-[The Rust Producer Macro](../guides/producer-macro.md).
+`weaveffi extract mygreeter/src/lib.rs` produces the same IDL as
+`greeter.yml` (plus the doc comments), so the two stay in step; you can
+generate from either. The [Producer Macro](../guides/producer-macro.md)
+guide covers every attribute.
 
 ### 4. Build for iOS targets
 
@@ -136,45 +172,88 @@ cargo build -p mygreeter --target aarch64-apple-ios-sim --release
 cargo build -p mygreeter --target x86_64-apple-ios --release
 ```
 
-Combine the simulator architectures with `lipo` and bundle everything
-in an `XCFramework` so Xcode can pick the right slice automatically:
+The generated module map autolinks a library called `weaveffi`
+(`link "weaveffi"`), so name the archives you hand to Xcode
+`libweaveffi.a`. Combine the simulator architectures with `lipo` and
+bundle everything in an `XCFramework` so Xcode can pick the right slice
+automatically:
 
 ```bash
 mkdir -p target/universal-ios-sim/release
 lipo -create \
   target/aarch64-apple-ios-sim/release/libmygreeter.a \
   target/x86_64-apple-ios/release/libmygreeter.a \
-  -output target/universal-ios-sim/release/libmygreeter.a
+  -output target/universal-ios-sim/release/libweaveffi.a
+cp target/aarch64-apple-ios/release/libmygreeter.a \
+  target/aarch64-apple-ios/release/libweaveffi.a
 
 xcodebuild -create-xcframework \
-  -library target/aarch64-apple-ios/release/libmygreeter.a \
+  -library target/aarch64-apple-ios/release/libweaveffi.a \
   -headers generated/c/ \
-  -library target/universal-ios-sim/release/libmygreeter.a \
+  -library target/universal-ios-sim/release/libweaveffi.a \
   -headers generated/c/ \
   -output MyGreeter.xcframework
 ```
 
-### 5. Wire it into Xcode
+### 5. Optional: smoke-test on macOS
+
+Before opening Xcode, compile the generated wrapper together with a
+`main.swift` against the host cdylib. Build it, give it the `libweaveffi`
+name the module map links, and run:
+
+```bash
+cargo build -p mygreeter --release
+ln -sf libmygreeter.dylib target/release/libweaveffi.dylib
+```
+
+`main.swift`:
+
+```swift
+print(Greeter.hello(name: "Swift"))
+do {
+    let g = try Greeter.greeting(name: "Ada", lang: "fr")
+    print("\(g.message) (\(g.lang))")
+    _ = try Greeter.greeting(name: "Ada", lang: "tlh")
+} catch let e as GreeterError {
+    print("greeting failed: \(e.localizedDescription) (code \(e.errorCode))")
+}
+```
+
+```bash
+swiftc \
+  -I generated/swift/Sources/CMygreeter \
+  -L target/release \
+  -Xlinker -rpath -Xlinker target/release \
+  generated/swift/Sources/Mygreeter/Mygreeter.swift main.swift -o greet
+./greet
+```
+
+Expected output:
+
+```text
+Hello, Swift!
+Bonjour, Ada! (fr)
+greeting failed: unknown language (code 1)
+```
+
+### 6. Wire it into Xcode
 
 1. Create a new iOS App in Xcode (SwiftUI or UIKit).
 2. Drag `MyGreeter.xcframework` into the project navigator. Confirm it
    appears under **Build Phases > Link Binary With Libraries**.
 3. **File > Add Package Dependencies > Add Local…** and pick
-   `generated/swift/`. The package contributes the `CWeaveFFI` and
-   `WeaveFFI` targets.
+   `generated/swift/`. The package contributes the `CMygreeter` and
+   `Mygreeter` targets; add the `Mygreeter` library product to your app.
 4. **Build Settings > Header Search Paths**: add the path to
-   `generated/c/` (e.g. `$(SRCROOT)/../generated/c`).
-5. **Build Settings > Library Search Paths**: add the path to the
-   matching Rust static library
-   (`$(SRCROOT)/../target/aarch64-apple-ios/release` for device
-   builds).
-6. **Build Phases > Dependencies**: ensure `WeaveFFI` is listed.
+   `generated/c/` (e.g. `$(SRCROOT)/../generated/c`), which the module
+   map's relative `header` path resolves against.
+5. **Build Phases > Dependencies**: ensure `Mygreeter` is listed.
 
-### 6. Call from Swift
+### 7. Call from Swift
 
 ```swift
 import SwiftUI
-import WeaveFFI
+import Mygreeter
 
 struct ContentView: View {
     @State private var greeting = ""
@@ -185,49 +264,59 @@ struct ContentView: View {
             Button("Greet") {
                 greeting = Greeter.hello(name: "Swift")
             }
+            Button("Greet in French") {
+                do {
+                    greeting = try Greeter.greeting(name: "Swift", lang: "fr").message
+                } catch {
+                    greeting = error.localizedDescription
+                }
+            }
         }
         .padding()
     }
 }
 ```
 
-The generated `WeaveFFI` module exposes:
+The generated `Mygreeter` module exposes:
 
 - `Greeter.hello(name:)`: non-throwing, returns `String`.
 - `Greeter.greeting(name:lang:)`: declared `throws` in the IDL, so
   the Swift wrapper is `throws` and surfaces `GreeterError`; returns
   a `Greeting` value with `.message` and `.lang` properties.
 - `GreeterError`: the module's error domain as a Swift `enum`
-  conforming to `Error` and `LocalizedError`.
+  conforming to `Error` and `LocalizedError`, one case per code
+  (`.unknownLang(message:)`) plus an `errorCode` accessor. Runtime traps
+  (a producer panic or a marshalling failure) arrive as the generic
+  `WeaveFFIError.error(code:message:)` instead.
 - `Greeting`: a plain Swift struct decoded from the value buffer the
-  C ABI returns.
+  C ABI returns, with a public memberwise initializer.
 
 ## Verification
 
 - Select an iOS Simulator target and press **Cmd+R**.
 - Tap **Greet** in the running app; the label changes to
-  `Hello, Swift!`.
+  `Hello, Swift!`. **Greet in French** changes it to `Bonjour, Swift!`.
 - Re-run on a physical device after building for `aarch64-apple-ios`
   to confirm the device path also works.
 - Common error mappings:
 
   | Symptom                                           | Likely cause                                                                 |
   |---------------------------------------------------|------------------------------------------------------------------------------|
-  | `Undefined symbols for architecture arm64`        | Static library not linked or the search path is wrong.                       |
-  | `Module 'CWeaveFFI' not found`                    | Header search path does not point at `generated/c/`.                         |
-  | `No such module 'WeaveFFI'`                       | Local Swift package not added under **Add Package Dependencies > Add Local…**.|
+  | `Undefined symbols for architecture arm64`        | Static library not linked, or it isn't named `libweaveffi.a`.                |
+  | `Module 'CMygreeter' not found`                   | Header search path does not point at `generated/c/`.                         |
+  | `No such module 'Mygreeter'`                      | Local Swift package not added under **Add Package Dependencies > Add Local…**.|
   | Crash when running on Intel simulator              | Build for `x86_64-apple-ios` and combine with `lipo`.                        |
 
 ## Cleanup
 
 ```bash
-rm -rf generated/ MyGreeter.xcframework
+rm -rf generated/ MyGreeter.xcframework main.swift greet
+rm -f target/release/libweaveffi.dylib   # the link alias from step 5
 cargo clean -p mygreeter
 ```
 
 Remove the `MyGreeter.xcframework` reference from the Xcode project
-and undo the **Header Search Paths** / **Library Search Paths**
-edits.
+and undo the **Header Search Paths** edit.
 
 ## Next steps
 
@@ -236,4 +325,4 @@ edits.
 - Read the [Memory Ownership](../guides/memory.md) guide to understand
   buffered value and interface lifetime rules.
 - Try the [Calculator tutorial](calculator.md) for a simpler
-  end-to-end walkthrough or [Android](android.md) for a JVM target.
+  end-to-end walkthrough or [Kotlin](kotlin.md) for a JVM target.

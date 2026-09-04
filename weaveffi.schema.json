@@ -9,7 +9,7 @@
   ],
   "properties": {
     "version": {
-      "description": "IR schema version this document targets (for example `0.8.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
+      "description": "IR schema version this document targets (for example `0.9.0`). Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].",
       "type": "string"
     },
     "modules": {
@@ -23,7 +23,7 @@
   "additionalProperties": false,
   "definitions": {
     "Module": {
-      "description": "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors.",
+      "description": "A WeaveFFI module: a named group of functions, types, callback interfaces, and errors.",
       "type": "object",
       "required": [
         "name"
@@ -54,6 +54,13 @@
             "$ref": "#/definitions/InterfaceDef"
           }
         },
+        "callback_interfaces": {
+          "description": "Callback interfaces declared in this module: method sets the consumer implements and the producer calls.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CallbackInterfaceDef"
+          }
+        },
         "structs": {
           "description": "Record (struct) types declared in this module.",
           "type": "array",
@@ -66,20 +73,6 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/EnumDef"
-          }
-        },
-        "callbacks": {
-          "description": "Callback signatures this module's functions and listeners can invoke.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/CallbackDef"
-          }
-        },
-        "listeners": {
-          "description": "Event listeners (subscribe and unsubscribe endpoints) this module exposes.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/ListenerDef"
           }
         },
         "errors": {
@@ -100,10 +93,11 @@
             "$ref": "#/definitions/Module"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Function": {
-      "description": "A function exported across the FFI boundary.\n\nEach function becomes a C ABI entry point plus an idiomatic wrapper in every target language. The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without altering the parameter and return shape declared here. The same shape also describes an interface's constructors, methods, and statics (see [`InterfaceDef`]).",
+      "description": "A function exported across the FFI boundary.\n\nEach function becomes a C ABI entry point plus an idiomatic wrapper in every target language. The `async` and `cancellable` flags change how the symbol is lowered (a completion callback, an extra cancel-token parameter) without altering the parameter and return shape declared here. The same shape also describes an interface's constructors, methods, and statics (see [`InterfaceDef`]) and a callback interface's methods (see [`CallbackInterfaceDef`]).",
       "type": "object",
       "required": [
         "name"
@@ -156,18 +150,12 @@
             "string",
             "null"
           ]
-        },
-        "since": {
-          "description": "Version in which the function was introduced (for example `0.2.0`), surfaced as a \"since\" annotation where the target language supports one.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "Param": {
-      "description": "A single parameter of a [`Function`] or [`CallbackDef`].",
+      "description": "A single parameter of a [`Function`].",
       "type": "object",
       "required": [
         "name",
@@ -186,10 +174,6 @@
             }
           ]
         },
-        "mutable": {
-          "description": "Whether the callee may write back through this parameter (for example a buffer filled in place). Defaults to `false`.",
-          "type": "boolean"
-        },
         "doc": {
           "description": "Human-readable documentation for the parameter, propagated to the generated bindings. `None` when undocumented.",
           "type": [
@@ -197,11 +181,12 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TypeRef": {
       "title": "TypeRef",
-      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct/enum/interface name.",
+      "description": "Reference to a type. Encoded as a string with custom syntax: primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any user-defined struct, enum, interface, or callback interface name.",
       "type": "string"
     },
     "InterfaceDef": {
@@ -250,7 +235,44 @@
             "$ref": "#/definitions/Function"
           }
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "CallbackInterfaceDef": {
+      "description": "A callback interface: a set of methods the consumer implements and the producer calls.",
+      "type": "object",
+      "required": [
+        "methods",
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Callback interface type name (for example `MessageListener`).",
+          "type": "string"
+        },
+        "doc": {
+          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deprecated": {
+          "description": "Deprecation notice for the whole type; when set, generators annotate the emitted type. `None` means the callback interface is current.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "methods": {
+          "description": "Methods the consumer implements, in vtable order. Must be non-empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Function"
+          }
+        }
+      },
+      "additionalProperties": false
     },
     "StructDef": {
       "description": "A struct (record) type with named fields.",
@@ -285,7 +307,8 @@
             "$ref": "#/definitions/StructField"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "StructField": {
       "description": "A named field of a [`StructDef`], or the payload of an algebraic [`EnumVariant`].",
@@ -314,7 +337,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "EnumDef": {
       "description": "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields.",
@@ -349,7 +373,8 @@
             "$ref": "#/definitions/EnumVariant"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "EnumVariant": {
       "description": "A single variant of an [`EnumDef`].",
@@ -382,60 +407,8 @@
             "$ref": "#/definitions/StructField"
           }
         }
-      }
-    },
-    "CallbackDef": {
-      "description": "A callback signature: a function shape the host implements and native code invokes.\n\nCallbacks are declared at module scope rather than as a [`TypeRef`] so the C ABI can represent them uniformly as a function pointer plus a context pointer. A [`ListenerDef`] references one by name to model an event stream.",
-      "type": "object",
-      "required": [
-        "name",
-        "params"
-      ],
-      "properties": {
-        "name": {
-          "description": "Callback name, used to name the generated function-pointer type and referenced by [`ListenerDef::event_callback`] (for example `on_message`).",
-          "type": "string"
-        },
-        "params": {
-          "description": "Parameters passed to the callback each time it fires.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Param"
-          }
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    "ListenerDef": {
-      "description": "An event listener: a subscribe and unsubscribe endpoint that delivers events through a [`CallbackDef`].\n\nGenerators expand a listener into register and unregister functions; the register call takes the named callback and returns a subscription id the caller later hands to unregister.",
-      "type": "object",
-      "required": [
-        "event_callback",
-        "name"
-      ],
-      "properties": {
-        "name": {
-          "description": "Listener name, lowered into the generated `register_*` and `unregister_*` function names (for example `messages`).",
-          "type": "string"
-        },
-        "event_callback": {
-          "description": "Name of the [`CallbackDef`] invoked for each event. Must match a callback declared on the same [`Module`].",
-          "type": "string"
-        },
-        "doc": {
-          "description": "Human-readable documentation, propagated to the generated bindings. `None` when undocumented.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
+      },
+      "additionalProperties": false
     },
     "ErrorDomain": {
       "description": "A module's error domain: the named set of error codes its fallible functions can report.",
@@ -456,7 +429,8 @@
             "$ref": "#/definitions/ErrorCode"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "ErrorCode": {
       "description": "A single named error within an [`ErrorDomain`].",
@@ -472,7 +446,7 @@
           "type": "string"
         },
         "code": {
-          "description": "Stable numeric value carried across the C ABI to identify this error.",
+          "description": "Stable numeric value carried across the C ABI to identify this error. Must be positive; non-positive codes are reserved for the runtime.",
           "type": "integer",
           "format": "int32"
         },
@@ -494,7 +468,8 @@
             "$ref": "#/definitions/StructField"
           }
         }
-      }
+      },
+      "additionalProperties": false
     }
   }
 }

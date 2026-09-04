@@ -6,50 +6,111 @@
 //! from an arbitrary producer thread, and everything it delivers is *owned by
 //! the consumer*. A non-null `err` is heap-boxed and released with
 //! `weaveffi_error_free`; a string result is released with
-//! `weaveffi_free_string`; a buffered result is released with
-//! `weaveffi_free_bytes`; an owned-object result transfers ownership. This
-//! ownership transfer (unlike the borrow-and-copy contract of synchronous
+//! `weaveffi_free_string`; a buffered or bytes result is released with
+//! `weaveffi_free_bytes`; an object result transfers one strong reference.
+//! This ownership transfer (unlike the borrow-and-copy contract of synchronous
 //! `out_err` slots) is what lets consumers defer decoding past the callback's
 //! return, which runtimes such as Dart's `NativeCallable.listener` require.
 //! The callback's `err` slot follows the owning function's
 //! [`ErrorStrategy`](weaveffi_core::plan::ErrorStrategy).
+//!
+//! The future runs on the process-wide [`weaveffi_abi::spawn`] executor (the
+//! default thread-per-future spawner, or whatever the producer installed with
+//! [`weaveffi_abi::set_spawner`]), wrapped in [`weaveffi_abi::CatchUnwind`]
+//! so a panic is delivered through the callback rather than into the executor.
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use weaveffi_core::model::Ty;
-use weaveffi_core::model::{AsyncBinding, FnBinding, ParamBinding};
+use weaveffi_core::model::{AsyncBinding, FnBinding, ParamBinding, Ty};
 
 use super::helpers::{
-    ctype_to_rust, fn_slots, ident, is_copy, sentinel, user_param_type, CallTarget,
+    ctype_to_rust, fn_slots, ident, is_copy, rust_type_ident, sentinel, CallTarget, UserSig,
 };
 use super::sync::throws;
 use super::unsupported;
 
+/// The two "fire the callback with an error and stop" tails an async launcher
+/// needs: one for the caller's thread (before the spawn, where `context` is
+/// still a raw pointer and `return` leaves the launcher) and one for inside
+/// the spawned future (where `__wv_ctx` is a `usize` and `return` leaves the
+/// async block). Both replay the result slots as their zero/null sentinels.
+struct Fail {
+    sentinels: Vec<TokenStream>,
+}
+
+impl Fail {
+    fn with(&self, ctx: TokenStream, build_err: TokenStream) -> TokenStream {
+        let sentinels = &self.sentinels;
+        quote! {{
+            let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
+            #build_err
+            callback(
+                #ctx,
+                ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
+                #(, #sentinels)*
+            );
+            return;
+        }}
+    }
+
+    fn marshal(msg: &str) -> TokenStream {
+        quote! {
+            ::weaveffi::abi::error_set(
+                &mut __wv_e,
+                ::weaveffi::abi::MARSHAL_ERROR_CODE,
+                #msg,
+            );
+        }
+    }
+
+    /// Reject on the caller's thread with a marshalling error.
+    fn pre(&self, msg: &str) -> TokenStream {
+        self.with(quote!(context), Self::marshal(msg))
+    }
+
+    /// Reject inside the future with a marshalling error.
+    fn inner(&self, msg: &str) -> TokenStream {
+        self.with(
+            quote!(__wv_ctx as *mut ::std::ffi::c_void),
+            Self::marshal(msg),
+        )
+    }
+}
+
 /// Lift one async-launcher input slot into an *owned* Rust value and give the
-/// call argument the user's `async fn` receives.
+/// call argument the user's `async fn` receives, as `(pre_spawn, in_future,
+/// arg)`.
 ///
-/// Async inputs must own their data before the worker thread runs: the foreign
+/// Async inputs must own their data before the future is spawned: the foreign
 /// caller may free or reuse the argument buffers as soon as the launcher
-/// returns. So borrowed slots (`&str`, `&[u8]`, `[&str]`) are copied here, just
-/// like the hand-written async sample does. There is no `out_err` slot on a
-/// launcher, so an invalid input is lifted leniently (an unreadable string
-/// becomes empty) rather than reported - the completion callback is the only
-/// error channel, and it fires with the result the future produces.
+/// returns. So strings and bytes are copied and objects retained (a new strong
+/// reference) on the caller's thread; a borrowed spelling (`&str`, `&T`) is
+/// then satisfied by lending the owned value. There is no `out_err` slot on a
+/// launcher, so an invalid input fires the completion callback with a
+/// marshalling error, which keeps the "exactly once" promise.
 fn lift_async_input(
     pb: &ParamBinding,
-    sig: &syn::Signature,
+    user: &UserSig<'_>,
+    fail: &Fail,
 ) -> syn::Result<(TokenStream, TokenStream, TokenStream)> {
     let name = ident(&pb.name);
     let none = TokenStream::new();
+    let is_ref = user.param_is_ref(&pb.name);
+    let arg = if is_ref {
+        quote!(&#name)
+    } else {
+        quote!(#name)
+    };
+    let invalid = fail.pre(&format!("{} is null or invalid", pb.name));
+
     // A buffered parameter arrives as a borrowed value buffer the caller may
-    // free as soon as the launcher returns: copy the raw bytes on the
-    // caller's thread, decode on the worker thread (inside its catch_unwind,
-    // so a malformed buffer is delivered through the callback's `err` with
-    // the panic code rather than unwinding across the C boundary).
+    // free as soon as the launcher returns: copy the raw bytes on the caller's
+    // thread and decode inside the future (a malformed buffer is delivered
+    // through the callback's `err` with the marshalling code).
     if pb.ty.is_buffered() {
         let ptr = ident(&format!("{}_ptr", pb.name));
         let len = ident(&format!("{}_len", pb.name));
-        let panic_msg = format!("{}: malformed WeaveFFI value buffer", pb.name);
+        let decode_fail = fail.inner(&format!("{}: malformed value buffer", pb.name));
         return Ok((
             quote! {
                 let #name: ::std::vec::Vec<u8> = if #ptr.is_null() {
@@ -59,36 +120,40 @@ fn lift_async_input(
                 };
             },
             quote! {
-                let #name = ::weaveffi::abi::decode_value(&#name).expect(#panic_msg);
+                let #name = match ::weaveffi::abi::decode_value(&#name) {
+                    ::std::result::Result::Ok(__v) => __v,
+                    ::std::result::Result::Err(_) => #decode_fail
+                };
             },
-            quote!(#name),
+            arg,
         ));
     }
     Ok(match &pb.ty {
-        ty if is_copy(ty) && !matches!(ty, Ty::Enum(_)) => (none.clone(), none, quote!(#name)),
-        // A typed handle is an opaque pointer, which is not `Send`. Carry it
-        // across the worker-thread boundary as a `usize` and rebuild it inside
-        // the closure with the producer's own pointer type (so a `super::T`
-        // path stays in scope), mirroring the hand-written async sample.
-        Ty::TypedHandle(_) => {
-            let addr = ident(&format!("__wv_addr_{}", pb.name));
-            let uty = user_param_type(sig, &pb.name)
-                .ok_or_else(|| unsupported(&pb.name, "async typed-handle parameter"))?;
+        Ty::Enum(enum_name) => {
+            let et = user
+                .param_object(&pb.name)
+                .unwrap_or_else(|| quote::ToTokens::into_token_stream(rust_type_ident(enum_name)));
             (
-                quote!(let #addr = #name as usize;),
-                quote!(let #name = #addr as #uty;),
-                quote!(#name),
+                quote! {
+                    let #name = match <#et>::__weaveffi_from_i32(#name) {
+                        ::std::option::Option::Some(__v) => __v,
+                        ::std::option::Option::None => #invalid
+                    };
+                },
+                none,
+                arg,
             )
         }
+        ty if is_copy(ty) => (none.clone(), none, arg),
         Ty::StringUtf8 => (
-            quote!(let #name = ::weaveffi::abi::c_ptr_to_string(#name).unwrap_or_default();),
+            quote! {
+                let #name = match ::weaveffi::abi::c_ptr_to_string(#name) {
+                    ::std::option::Option::Some(__s) => __s,
+                    ::std::option::Option::None => #invalid
+                };
+            },
             none,
-            quote!(#name),
-        ),
-        Ty::BorrowedStr => (
-            quote!(let #name = ::weaveffi::abi::c_ptr_to_string(#name).unwrap_or_default();),
-            none,
-            quote!(&#name),
+            arg,
         ),
         Ty::Bytes => {
             let ptr = ident(&format!("{}_ptr", pb.name));
@@ -96,16 +161,57 @@ fn lift_async_input(
             (
                 quote!(let #name = unsafe { ::weaveffi::abi::lift_bytes(#ptr, #len) };),
                 none,
-                quote!(#name),
+                arg,
             )
         }
-        Ty::BorrowedBytes => {
-            let ptr = ident(&format!("{}_ptr", pb.name));
-            let len = ident(&format!("{}_len", pb.name));
+        // An object is always retained across the spawn (the consumer may
+        // release its own reference the moment the launcher returns). A `&T`
+        // spelling is satisfied by lending the `Arc`, which derefs to `&T`.
+        Ty::Interface(_) => {
+            let arg = if user.param_wants_arc(&pb.name) {
+                arg
+            } else {
+                quote!(&#name)
+            };
             (
-                quote!(let #name = unsafe { ::weaveffi::abi::lift_bytes(#ptr, #len) };),
+                quote! {
+                    let #name = match unsafe { ::weaveffi::abi::object_arc(#name) } {
+                        ::std::option::Option::Some(__wv_o) => __wv_o,
+                        ::std::option::Option::None => #invalid
+                    };
+                },
                 none,
-                quote!(&#name),
+                arg,
+            )
+        }
+        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
+            let arg = if user.param_wants_arc(&pb.name) {
+                arg
+            } else {
+                quote!(#name.as_deref())
+            };
+            (
+                quote!(let #name = unsafe { ::weaveffi::abi::object_arc(#name) };),
+                none,
+                arg,
+            )
+        }
+        Ty::CallbackInterface(_) => {
+            let dyn_ty = user.param_callback(&pb.name)?;
+            let ctx = ident(&format!("{}_ctx", pb.name));
+            let vtable = ident(&format!("{}_vtable", pb.name));
+            let null_fail = fail.pre(&format!("{}: null callback vtable", pb.name));
+            (
+                quote! {
+                    let #name = match unsafe {
+                        ::weaveffi::abi::lift_callback::<#dyn_ty>(#ctx, #vtable)
+                    } {
+                        ::std::option::Option::Some(__wv_cb) => __wv_cb,
+                        ::std::option::Option::None => #null_fail
+                    };
+                },
+                none,
+                arg,
             )
         }
         _ => return Err(unsupported(&pb.name, "async parameter type")),
@@ -117,37 +223,49 @@ fn lift_async_input(
 ///
 /// Every result transfers ownership to the consumer, per the plan's async
 /// contract ([`weaveffi_core::plan::AsyncProtocol`]): a string is released
-/// with `weaveffi_free_string`, a value buffer with `weaveffi_free_bytes`,
-/// and an owned interface result is adopted (the consumer eventually calls
-/// `_destroy`). Ownership transfer is what lets consumers defer decoding past
-/// the callback's return. `bytes` results are not yet supported.
-fn async_result_args(ty: &Ty, value: TokenStream) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
+/// with `weaveffi_free_string`, a value or byte buffer with
+/// `weaveffi_free_bytes`, and an object result is one strong reference the
+/// consumer eventually releases with `_destroy`.
+fn async_result_args(
+    ty: &Ty,
+    value: TokenStream,
+    object: Option<&TokenStream>,
+) -> syn::Result<(TokenStream, Vec<TokenStream>)> {
     let none = TokenStream::new();
-    // A buffered result crosses as an owned `(ptr, len)` pair the consumer
-    // decodes at its leisure and releases with `weaveffi_free_bytes`.
-    if ty.is_buffered() {
-        return Ok((
+    let owned_bytes = |bytes: TokenStream| {
+        (
             quote! {
-                let __wv_res_buf = ::weaveffi::abi::encode_value(&(#value)).into_boxed_slice();
+                let __wv_res_buf = (#bytes).into_boxed_slice();
                 let __wv_res_len = __wv_res_buf.len();
                 let __wv_res_ptr = ::std::boxed::Box::into_raw(__wv_res_buf) as *const u8;
             },
             vec![quote!(__wv_res_ptr), quote!(__wv_res_len)],
+        )
+    };
+    if ty.is_buffered() {
+        return Ok(owned_bytes(
+            quote!(::weaveffi::abi::encode_value(&(#value))),
         ));
     }
+    let typed = |call: TokenStream| match object {
+        Some(obj) => quote!(let __wv_res: *mut #obj = #call;),
+        None => quote!(let __wv_res = #call;),
+    };
     Ok(match ty {
-        t if is_copy(t) && !matches!(t, Ty::Enum(_)) => (none.clone(), vec![value]),
-        Ty::Enum(_) => (none.clone(), vec![quote!((#value) as i32)]),
-        // An owned string the consumer releases with `weaveffi_free_string`.
-        Ty::StringUtf8 | Ty::BorrowedStr => (
+        Ty::Enum(_) => (none, vec![quote!((#value).__weaveffi_to_i32())]),
+        t if is_copy(t) => (none, vec![value]),
+        Ty::StringUtf8 => (
             quote!(let __wv_res = ::weaveffi::abi::string_to_c_ptr(&(#value));),
             vec![quote!(__wv_res)],
         ),
-        // An owned-object result: the callback adopts the pointer (the plan's
-        // `result_adopt`) and the consumer eventually calls `_destroy`.
+        Ty::Bytes => owned_bytes(value),
         Ty::Interface(_) => (
-            none.clone(),
-            vec![quote!(::std::boxed::Box::into_raw(::std::boxed::Box::new(#value)))],
+            typed(quote!(::weaveffi::abi::lower_object(#value))),
+            vec![quote!(__wv_res)],
+        ),
+        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => (
+            typed(quote!(::weaveffi::abi::lower_object_opt(#value))),
+            vec![quote!(__wv_res)],
         ),
         _ => return Err(unsupported("async return", "result type")),
     })
@@ -156,24 +274,33 @@ fn async_result_args(ty: &Ty, value: TokenStream) -> syn::Result<(TokenStream, V
 /// Generate the completion-callback typedef and the `_async` launcher for an
 /// `async fn`.
 ///
-/// The launcher lifts inputs into owned values, spawns a worker thread, drives
-/// the future to completion with `weaveffi::abi::block_on`, then invokes the
-/// host's callback with `(context, err, result…)`. A `Result`
-/// return routes its `Err` through a transient `weaveffi_error`; success passes
-/// a null `err`. The foreign caller's `context` is moved across the thread
-/// boundary as a `usize` (so the closure is `Send`); the callback pointer is
-/// `Send` on its own.
+/// The launcher lifts inputs into owned values on the caller's thread, then
+/// hands a `Send + 'static` future to [`weaveffi_abi::spawn`]. The future
+/// awaits the producer's `async fn` under [`weaveffi_abi::CatchUnwind`] and
+/// invokes the host's callback with `(context, err, result…)` exactly once: a
+/// `Result` return routes its `Err` through a boxed `weaveffi_error`, a panic
+/// (or a consumer callback's failure) is reported with the reserved code, and
+/// success passes a null `err`. The foreign caller's `context` is carried as a
+/// `usize` so the future is `Send`; the callback pointer is `Send` on its own.
 pub(crate) fn gen_async_function(
     f: &FnBinding,
     a: &AsyncBinding,
-    sig: &syn::Signature,
+    user: &UserSig<'_>,
     target: &CallTarget,
 ) -> syn::Result<TokenStream> {
     let cb_ty = ident(&a.callback_type);
     let cb_slots: Vec<TokenStream> = a
         .callback_params
         .iter()
-        .map(|p| ctype_to_rust(&p.ty))
+        .map(|p| {
+            // The result slot of an object return is spelled with the
+            // producer's pointee so `super::T` stays in scope.
+            let is_object_ret = f.ret.as_ref().is_some_and(|t| t.interface_name().is_some());
+            match (p.name.as_str(), user.ret_object()) {
+                ("result", Some(obj)) if is_object_ret => quote!(*mut #obj),
+                _ => ctype_to_rust(&p.ty),
+            }
+        })
         .collect();
     let callback_typedef = quote! {
         #[doc(hidden)]
@@ -182,56 +309,43 @@ pub(crate) fn gen_async_function(
     };
 
     let launch_sym = ident(&a.launch.symbol);
-    let launch_params: Vec<TokenStream> = fn_slots(&a.launch.params, f, sig);
+    let launch_params = fn_slots(&a.launch.params, &f.params, user)?;
 
-    // The error path replays the result slots as their zero/null sentinels.
-    let sentinels: Vec<TokenStream> = a
-        .callback_params
-        .iter()
-        .skip(2)
-        .map(|p| sentinel(&p.ty))
-        .collect();
+    let fail = Fail {
+        sentinels: a
+            .callback_params
+            .iter()
+            .skip(2)
+            .map(|p| sentinel(&p.ty))
+            .collect(),
+    };
 
     // Lift each logical input into three parts: a pre-spawn statement that runs
-    // on the caller's thread (owning borrowed data, bouncing a non-`Send`
-    // handle through a `usize`), an in-closure statement that reconstitutes the
-    // value on the worker thread, and the argument forwarded to the producer.
+    // on the caller's thread (owning borrowed data, retaining objects), an
+    // in-future statement that finishes the lift (decoding a value buffer),
+    // and the argument forwarded to the producer.
     let mut pre_spawn = TokenStream::new();
-    let mut in_closure = TokenStream::new();
+    let mut in_future = TokenStream::new();
     let mut call_args: Vec<TokenStream> = Vec::new();
 
-    // An async method's receiver crosses the worker-thread boundary the same
-    // way a typed handle does: as a `usize`, rebuilt into `&T` inside the
-    // closure. The object outlives the call by the ABI contract (the consumer
-    // must not destroy it while a call is in flight). A null receiver still
-    // fires the callback (with an error), so the continuation never hangs.
+    // An async method retains its receiver for the life of the call: the
+    // consumer may release its own reference the moment the launcher returns.
+    // A null receiver still fires the callback (with an error), so the
+    // continuation never hangs.
     if let CallTarget::Method(ty) = target {
+        let null_self = fail.pre("self is null");
         pre_spawn.extend(quote! {
-            if __wv_self.is_null() {
-                let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
-                ::weaveffi::abi::error_set(
-                    &mut __wv_e,
-                    ::weaveffi::abi::MARSHAL_ERROR_CODE,
-                    "self is null",
-                );
-                callback(
-                    context,
-                    ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
-                    #(, #sentinels)*
-                );
-                return;
-            }
-            let __wv_self_addr = __wv_self as usize;
-        });
-        in_closure.extend(quote! {
-            let __wv_obj: &#ty = unsafe { &*(__wv_self_addr as *const #ty) };
+            let __wv_obj = match unsafe { ::weaveffi::abi::object_arc::<#ty>(__wv_self) } {
+                ::std::option::Option::Some(__wv_o) => __wv_o,
+                ::std::option::Option::None => #null_self
+            };
         });
     }
 
     for pb in &f.params {
-        let (pre, inc, arg) = lift_async_input(pb, sig)?;
+        let (pre, inc, arg) = lift_async_input(pb, user, &fail)?;
         pre_spawn.extend(pre);
-        in_closure.extend(inc);
+        in_future.extend(inc);
         call_args.push(arg);
     }
 
@@ -247,27 +361,16 @@ pub(crate) fn gen_async_function(
     }
 
     let is_throws = throws(f);
+    let object = user.ret_object();
     let (result_pre, success_args) = match &f.ret {
-        Some(ty) => async_result_args(ty, quote!(__wv_val))?,
+        Some(ty) => async_result_args(ty, quote!(__wv_val), object.as_ref())?,
         None => (TokenStream::new(), Vec::new()),
     };
-    // Result buffers and strings transfer ownership to the consumer, which
-    // releases them with the runtime free symbols, per the async plan
-    // contract.
     let success_call = quote! {
         #result_pre
         callback(__wv_ctx as *mut ::std::ffi::c_void, ::std::ptr::null_mut() #(, #success_args)*);
     };
-
-    // A non-null `err` is heap-boxed: the consumer copies what it needs and
-    // releases it with `weaveffi_error_free`.
-    let fail_call = quote! {
-        callback(
-            __wv_ctx as *mut ::std::ffi::c_void,
-            ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
-            #(, #sentinels)*
-        );
-    };
+    let sentinels = &fail.sentinels;
 
     let dispatch = if is_throws {
         let bind = if f.ret.is_some() {
@@ -286,7 +389,11 @@ pub(crate) fn gen_async_function(
                         &::weaveffi::abi::ErrorReport::message(&__wv_err),
                         ::weaveffi::abi::ErrorReport::payload(&__wv_err),
                     );
-                    #fail_call
+                    callback(
+                        __wv_ctx as *mut ::std::ffi::c_void,
+                        ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
+                        #(, #sentinels)*
+                    );
                 }
             }
         }
@@ -301,7 +408,6 @@ pub(crate) fn gen_async_function(
             #success_call
         }
     };
-
     let call = target.call(&f.name, &call_args);
 
     Ok(quote! {
@@ -312,33 +418,48 @@ pub(crate) fn gen_async_function(
         pub extern "C" fn #launch_sym(#(#launch_params),*) {
             #pre_spawn
             let __wv_ctx = context as usize;
-            // Drive the future to completion, then fire the host callback. On a
-            // threaded target this happens on a worker thread so the launcher
-            // returns immediately; `wasm32` has no threads, so run inline (the
-            // sample futures are ready without awaiting real I/O). A panic in
-            // the producer's future is caught and delivered through the
-            // callback's `err` argument with the reserved panic code, so the
-            // consumer's continuation always fires exactly once.
-            let __wv_body = move || {
-                let __wv_run = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    #in_closure
-                    let __wv_out = ::weaveffi::abi::block_on(#call);
-                    #dispatch
-                }));
+            ::weaveffi::abi::spawn(async move {
+                // The inner future finishes lifting, awaits the producer, and
+                // fires the callback. A panic anywhere inside (including a
+                // consumer callback-interface failure surfacing as a
+                // `ForeignError`) is caught and delivered through `err`, so
+                // the continuation fires exactly once. A failure the producer
+                // recorded instead of unwinding (`panic = "abort"` builds) is
+                // taken before the success callback can fire, for the same
+                // reason.
+                let __wv_run = ::weaveffi::abi::CatchUnwind::new(async move {
+                    #in_future
+                    let __wv_out = #call.await;
+                    match ::weaveffi::abi::take_foreign_error() {
+                        ::std::option::Option::Some(__wv_foreign) => {
+                            let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
+                            ::weaveffi::abi::error_set(
+                                &mut __wv_e,
+                                __wv_foreign.code,
+                                &__wv_foreign.message,
+                            );
+                            callback(
+                                __wv_ctx as *mut ::std::ffi::c_void,
+                                ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
+                                #(, #sentinels)*
+                            );
+                        }
+                        ::std::option::Option::None => {
+                            #dispatch
+                        }
+                    }
+                })
+                .await;
                 if let ::std::result::Result::Err(__wv_panic) = __wv_run {
                     let mut __wv_e = ::weaveffi::abi::weaveffi_error::default();
                     ::weaveffi::abi::error_set_panic(&mut __wv_e, &*__wv_panic);
-                    #fail_call
+                    callback(
+                        __wv_ctx as *mut ::std::ffi::c_void,
+                        ::std::boxed::Box::into_raw(::std::boxed::Box::new(__wv_e))
+                        #(, #sentinels)*
+                    );
                 }
-            };
-            #[cfg(target_arch = "wasm32")]
-            {
-                __wv_body();
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                ::std::thread::spawn(__wv_body);
-            }
+            });
         }
     })
 }

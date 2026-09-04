@@ -57,10 +57,13 @@ build (`--release`, `lto = false`), no other heavy processes running.
 
 ## Latest measurements
 
-These numbers were captured on the most recent baseline run after the
-hot-path optimizations described below. Each row is the criterion
-median; the parentheses show the headroom relative to the documented
-target.
+These numbers were captured on the baseline run that followed the hot-path
+optimizations described below, before the ABI revision 2 generators landed.
+Each row is the criterion median; the last column shows the headroom
+relative to the documented target. ABI 2 added `_clone` symbols, callback
+vtables, and object-token codec paths to every generator's output, so expect
+the absolute medians to move slightly on the next baseline; the targets are
+unchanged and CI's `bench-results` artifact (below) has the current figures.
 
 | Benchmark                        | Median   | Headroom vs target |
 | -------------------------------- | -------- | ------------------ |
@@ -88,8 +91,9 @@ table above.
    `render_swift_wrapper` started from `String::new()` and let the
    buffer grow by doubling, copying the entire string on each
    re-allocation. They now estimate the final output size from the
-   number of modules, functions, structs, and callbacks in the API and
-   pre-allocate accordingly via `String::with_capacity`.
+   number of modules, functions, records, interfaces, and callback
+   interfaces in the API and pre-allocate accordingly via
+   `String::with_capacity`.
 
 2. **`write!` instead of `push_str(&format!(...))`** in the per-function
    hot loop of `render_module_header` (C generator) and the function
@@ -116,6 +120,28 @@ in the original performance plan, in order of impact.
   and `serde_yaml` does not expose a streaming API that is materially
   faster for our schemas. We accept it as the dominant CLI startup
   cost and document it here.
+
+## Runtime cost of the ABI 2 object model
+
+The benchmarks above measure code generation. At run time, the constructs
+ABI revision 2 introduced are deliberately cheap:
+
+- **Object references.** `{tag}_clone` is one atomic increment on the
+  producer's `Arc<T>` and `{tag}_destroy` is one atomic decrement (plus the
+  drop when it reaches zero). Passing an object as a parameter is a single
+  pointer with no count traffic; the producer clones only if it retains the
+  object.
+- **Objects inside value buffers.** An object token is eight bytes in the
+  buffer and one `_clone` at encode time; decoding adopts the reference with
+  no further call into the producer.
+- **Callback interfaces.** A method call is one indirect call through a
+  static vtable plus the usual marshalling of its arguments. Registering an
+  implementation allocates one context per registration on the consumer side
+  and one `Arc` on the producer side; there is no per-call allocation for
+  scalar arguments.
+- **Async spawner.** The default spawner costs one thread per in-flight
+  future. Producers with many concurrent async calls should install a pooled
+  runtime with `weaveffi::set_spawner`.
 
 ## CI artifacts
 

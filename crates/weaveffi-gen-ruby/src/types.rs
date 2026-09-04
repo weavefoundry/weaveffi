@@ -39,7 +39,6 @@ pub(crate) fn rb_ffi_type(ty: &CType, string_as_pointer: bool) -> &'static str {
         CType::Uint64 => ":uint64",
         CType::Float => ":float",
         CType::Double => ":double",
-        CType::Handle => ":uint64",
         CType::Size => ":size_t",
         CType::Void => ":void",
         CType::Ptr { pointee, .. } if matches!(**pointee, CType::Char) && !string_as_pointer => {
@@ -60,9 +59,9 @@ pub(crate) fn rb_abi_types(params: &[AbiParam], string_as_pointer: bool) -> Vec<
 }
 
 /// The `FFI::MemoryPointer` read method for one iterator element out-slot.
-/// This is ABI-slot vocabulary, not wire vocabulary: a typed handle crosses
-/// a `next` slot as an opaque pointer, so anything non-scalar reads a
-/// pointer.
+/// This is ABI-slot vocabulary, not wire vocabulary: strings, bytes,
+/// buffers, and objects all cross a `next` slot as a pointer, so anything
+/// non-scalar reads a pointer.
 pub(crate) fn rb_read_method(ty: &Ty) -> &'static str {
     match ty {
         Ty::I8 => "read_int8",
@@ -75,7 +74,6 @@ pub(crate) fn rb_read_method(ty: &Ty) -> &'static str {
         Ty::U64 => "read_uint64",
         Ty::F32 => "read_float",
         Ty::F64 => "read_double",
-        Ty::Handle => "read_uint64",
         _ => "read_pointer",
     }
 }
@@ -94,8 +92,30 @@ pub(crate) fn rb_mem_type(ty: &Ty) -> &'static str {
         Ty::U64 => ":uint64",
         Ty::F32 => ":float",
         Ty::F64 => ":double",
-        Ty::Handle => ":uint64",
         _ => ":pointer",
+    }
+}
+
+/// The Ruby expression converting one direct-family (`Direct`) C value
+/// received from the producer (a return, an out-slot read, or a trampoline
+/// argument) into its idiomatic Ruby value: a `bool` crosses as an `int32`
+/// and becomes `true`/`false`; scalars and C-style enum discriminants pass
+/// through.
+pub(crate) fn rb_direct_from_c(ty: &Ty, expr: &str) -> String {
+    match ty {
+        Ty::Bool => format!("({expr} != 0)"),
+        _ => expr.to_string(),
+    }
+}
+
+/// The Ruby literal a callback-interface trampoline returns to the producer
+/// after its implementation raised: the zero value of the method's direct
+/// return type, or `nil` for a void method.
+pub(crate) fn rb_direct_default(ty: Option<&Ty>) -> &'static str {
+    match ty {
+        None => "nil",
+        Some(Ty::F32 | Ty::F64) => "0.0",
+        Some(_) => "0",
     }
 }
 

@@ -46,15 +46,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -62,6 +63,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -108,10 +113,20 @@ typedef enum {
 /** Error codes reported by throwing functions in the `kitchen` module tree. */
 typedef enum { weaveffi_kitchen_KitchenErrors_NotFound = 1, weaveffi_kitchen_KitchenErrors_InvalidInput = 2 } weaveffi_kitchen_KitchenErrors;
 typedef struct weaveffi_kitchen_Gadget weaveffi_kitchen_Gadget;
+typedef struct weaveffi_kitchen_StreamGadgetsIterator weaveffi_kitchen_StreamGadgetsIterator;
 typedef struct weaveffi_kitchen_StreamItemsIterator weaveffi_kitchen_StreamItemsIterator;
-typedef struct weaveffi_shared_Token weaveffi_shared_Token;
-/** Fires when an item is ready */
-typedef void (*weaveffi_kitchen_OnReady_fn)(int32_t code, const char* msg, void* context);
+/**
+ * Consumer-implemented observer of ready items
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_kitchen_ReadyListener_vtable {
+    /** Fires when an item is ready */
+    void (*on_ready)(void* ctx, int32_t code, const char* msg, weaveffi_error* out_err);
+    /** Receives the item itself and says whether to keep listening */
+    bool (*on_item)(void* ctx, const uint8_t* item_ptr, size_t item_len, weaveffi_kitchen_Gadget* gadget, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_kitchen_ReadyListener_vtable;
 typedef void (*weaveffi_kitchen_do_async_callback)(void* context, weaveffi_error* err, const char* result);
 typedef void (*weaveffi_kitchen_do_cancellable_callback)(void* context, weaveffi_error* err, const char* result);
 
@@ -129,12 +144,11 @@ WEAVEFFI_API const char* weaveffi_kitchen_Gadget_version(weaveffi_error* out_err
 WEAVEFFI_API const char* weaveffi_kitchen_Gadget_describe(const weaveffi_kitchen_Gadget* self, weaveffi_error* out_err);
 /** Poke the gadget a number of times, failing on a negative count */
 WEAVEFFI_API int32_t weaveffi_kitchen_Gadget_poke(const weaveffi_kitchen_Gadget* self, int32_t times, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_Gadget_clone(const weaveffi_kitchen_Gadget* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_kitchen_Gadget_destroy(weaveffi_kitchen_Gadget* self);
 
-/** Subscribe to OnReady events */
-WEAVEFFI_API uint64_t weaveffi_kitchen_register_ready_listener(weaveffi_kitchen_OnReady_fn callback, void* context);
-/** Subscribe to OnReady events */
-WEAVEFFI_API void weaveffi_kitchen_unregister_ready_listener(uint64_t id);
 /** Identity for bool */
 WEAVEFFI_API bool weaveffi_kitchen_bool_id(bool x, weaveffi_error* out_err);
 WEAVEFFI_API int32_t weaveffi_kitchen_i32_id(int32_t x, weaveffi_error* out_err);
@@ -143,14 +157,16 @@ WEAVEFFI_API int64_t weaveffi_kitchen_i64_id(int64_t x, weaveffi_error* out_err)
 WEAVEFFI_API double weaveffi_kitchen_f64_id(double x, weaveffi_error* out_err);
 WEAVEFFI_API const char* weaveffi_kitchen_echo_string(const char* s, weaveffi_error* out_err);
 WEAVEFFI_API const uint8_t* weaveffi_kitchen_echo_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
-/** Borrowed string parameter */
-WEAVEFFI_API const char* weaveffi_kitchen_echo_borrowed_str(const char* s, weaveffi_error* out_err);
-/** Borrowed bytes parameter */
-WEAVEFFI_API const uint8_t* weaveffi_kitchen_echo_borrowed_bytes(const uint8_t* b_ptr, size_t b_len, size_t* out_len, weaveffi_error* out_err);
-/** Returns an opaque handle */
-WEAVEFFI_API weaveffi_handle_t weaveffi_kitchen_open_handle(weaveffi_error* out_err);
-/** Returns a typed handle */
-WEAVEFFI_API weaveffi_shared_Token* weaveffi_kitchen_open_typed_handle(weaveffi_error* out_err);
+/** Register a listener, returning how many are attached */
+WEAVEFFI_API int32_t weaveffi_kitchen_subscribe(void* listener_ctx, const weaveffi_kitchen_ReadyListener_vtable* listener_vtable, weaveffi_error* out_err);
+/** Optional object in both directions */
+WEAVEFFI_API weaveffi_kitchen_Gadget* weaveffi_kitchen_maybe_gadget(const weaveffi_kitchen_Gadget* fallback, weaveffi_error* out_err);
+/** A list of objects */
+WEAVEFFI_API const uint8_t* weaveffi_kitchen_gadgets(size_t* out_len, weaveffi_error* out_err);
+/** An iterator over objects */
+WEAVEFFI_API weaveffi_kitchen_StreamGadgetsIterator* weaveffi_kitchen_stream_gadgets(weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_kitchen_StreamGadgetsIterator_next(weaveffi_kitchen_StreamGadgetsIterator* iter, weaveffi_kitchen_Gadget** out_item, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_kitchen_StreamGadgetsIterator_destroy(weaveffi_kitchen_StreamGadgetsIterator* iter);
 /** Optional struct return */
 WEAVEFFI_API const uint8_t* weaveffi_kitchen_maybe_item(int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** List of structs */

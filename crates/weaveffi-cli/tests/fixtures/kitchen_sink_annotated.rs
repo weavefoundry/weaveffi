@@ -8,10 +8,6 @@
 //! syntactic markers here match the same names the proc-macro re-emits.
 //!
 //! Round-trip gaps documented in `docs/src/guides/extract.md`:
-//!   * The original `stream_items` IDL function (an `iter<T>` return) is
-//!     omitted from this fixture.
-//!   * Standalone `since:` without `#[deprecated]`: dropped, so `new_op`
-//!     loses its `since: "0.3.0"`.
 //!   * An error code's yml `doc:` cannot be expressed separately from its
 //!     `message:` in Rust (the message is the first doc line), so the
 //!     round-trip test compares codes by name/code/message only.
@@ -19,6 +15,8 @@
 #![allow(dead_code)]
 #![allow(unused_attributes)]
 #![allow(unused_variables)]
+
+use std::sync::Arc;
 
 #[weaveffi::module]
 mod shared {
@@ -71,15 +69,18 @@ mod kitchen {
         /// Cross-module struct reference
         token: Token,
         priority: Priority,
+        /// An optional object inside a record
+        gadget: Option<Arc<Gadget>>,
     }
 
-    /// Fires when an item is ready
-    #[weaveffi::callback]
-    fn OnReady(code: i32, msg: String) {}
-
-    /// Subscribe to OnReady events
-    #[weaveffi::listener(event = "OnReady")]
-    fn ready_listener() {}
+    /// Consumer-implemented observer of ready items
+    #[weaveffi::callback_interface]
+    trait ReadyListener: Send + Sync {
+        /// Fires when an item is ready
+        fn on_ready(&self, code: i32, msg: String);
+        /// Receives the item itself and says whether to keep listening
+        fn on_item(&self, item: &Item, gadget: Arc<Gadget>) -> bool;
+    }
 
     #[weaveffi::error]
     enum KitchenErrors {
@@ -156,28 +157,34 @@ mod kitchen {
         b
     }
 
-    /// Borrowed string parameter
+    /// Register a listener, returning how many are attached
     #[weaveffi::export]
-    fn echo_borrowed_str(s: &str) -> String {
-        s.to_string()
+    fn subscribe(listener: Arc<dyn ReadyListener>) -> i32 {
+        1
     }
 
-    /// Borrowed bytes parameter
+    /// Optional object in both directions
     #[weaveffi::export]
-    fn echo_borrowed_bytes(b: &[u8]) -> Vec<u8> {
-        b.to_vec()
+    fn maybe_gadget(fallback: Option<Arc<Gadget>>) -> Option<Arc<Gadget>> {
+        fallback
     }
 
-    /// Returns an opaque handle
+    /// A list of objects
     #[weaveffi::export]
-    fn open_handle() -> weaveffi::Handle {
-        0
+    fn gadgets() -> Vec<Arc<Gadget>> {
+        Vec::new()
     }
 
-    /// Returns a typed handle
+    /// An iterator over objects
     #[weaveffi::export]
-    fn open_typed_handle() -> *mut Token {
-        std::ptr::null_mut()
+    fn stream_gadgets() -> weaveffi::Iter<Arc<Gadget>> {
+        weaveffi::Iter::new(Vec::new())
+    }
+
+    /// Iterator return type
+    #[weaveffi::export]
+    fn stream_items() -> weaveffi::Iter<Item> {
+        weaveffi::Iter::new(Vec::new())
     }
 
     /// Optional struct return

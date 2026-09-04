@@ -8,8 +8,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
- * thrown directly for unknown codes, marshalling failures, and producer
- * panics. Carries the stable ABI `code`. */
+ * thrown directly for unknown codes, marshalling failures, producer
+ * panics, and callback-interface implementations that raised (code -4).
+ * Carries the stable ABI `code`. */
 export declare class WeaveFFIError extends Error {
   constructor(code: number, message?: string);
   code: number;
@@ -65,13 +66,32 @@ export declare const Status: Readonly<{
 export type Status = (typeof Status)[keyof typeof Status];
 
 /**
+ * Consumer-implemented observer of document-saved notifications.
+ *
+ * Implementations must be safe to call from any thread.
+ *
+ * Implemented by the consumer; the producer calls these methods synchronously. An exception thrown from a method is reported to the producer as an error (code -4).
+ */
+export interface SavedListener {
+  /**
+   * Fires after a document has been persisted successfully
+   * @param docId Identifier of the saved document
+   * @param revision Monotonically increasing revision
+   */
+  onSaved(docId: bigint, revision: number): void;
+}
+
+/**
  * An ordered collection of documents.
  *
  * Notebooks own their documents and release them when destroyed.
+ *
+ * Wraps one reference to a producer object; release it with `close()`.
  */
 export declare class Notebook {
   /**
    * Create an empty notebook
+   * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
    * @throws {WeaveFFIError} if the native call fails
    */
   constructor();
@@ -97,8 +117,11 @@ export declare class Notebook {
    * @throws {WeaveFFIError} if the native call fails
    */
   static maxDocuments(): number;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  /** Releases this wrapper's reference exactly once; later calls are
+   * no-ops. Also reachable as `[Symbol.dispose]()` for `using`
+   * declarations. A wrapper collected unclosed is released by a
+   * finalizer where the runtime provides one. */
+  close(): void;
 }
 
 export interface WeaveffiWasmModule {
@@ -127,17 +150,15 @@ export interface WeaveffiWasmModule {
      */
     publishAsync(id: bigint): Promise<boolean>;
     /**
-     * Subscribe to document-saved notifications
-     *
-     * @returns A subscription id for `unregisterSavedListener()`.
+     * Register a listener for saved notifications
+     * @param listener Receiver of saved notifications
+     * @throws {WeaveFFIError} if the native call fails
      */
-    registerSavedListener(callback: (docId: bigint, revision: number) => void): number;
-    /** Unregister a listener previously registered with `registerSavedListener()`. */
-    unregisterSavedListener(id: number): void;
+    watch(listener: SavedListener): void;
     Notebook: typeof Notebook;
   };
 }
 
-export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
+export function loadWeaveffiWasm(source: string | URL | BufferSource | WebAssembly.Module): Promise<WeaveffiWasmModule>;
 
 // END weaveffi_wasm.d.ts

@@ -56,6 +56,18 @@ function __invokeAsync(fn, args, map) {
   });
 }
 
+// Borrow a live object wrapper's native handle for one call. The wrapper
+// keeps its own reference; the producer clones if it retains the object.
+function __borrow(o, cls) {
+  if (!(o instanceof cls)) {
+    throw new WeaveFFIError(-3, 'expected an instance of ' + cls.name);
+  }
+  if (!o._handle) {
+    throw new WeaveFFIError(-3, cls.name + ' used after close()');
+  }
+  return o._handle;
+}
+
 // --- Private value-buffer runtime (WeaveFFI wire format) --------------------
 // Little-endian, packed, no alignment. Decoders reject truncated buffers,
 // invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
@@ -183,7 +195,7 @@ function __packToken(w, v) {
 }
 function __unpackToken(r) {
   return {
-    id: Number(r.i64()),
+    id: r.i64(),
     label: r.str(),
   };
 }
@@ -201,10 +213,11 @@ function __packItem(w, v) {
   __wOpt(w, v.parent, (w, v) => w.i64(v));
   __packToken(w, v.token);
   w.i32(v.priority);
+  __wOpt(w, v.gadget, (w, v) => w.u64(v._cloneHandle()));
 }
 function __unpackItem(r) {
   return {
-    id: Number(r.i64()),
+    id: r.i64(),
     name: r.str(),
     count: r.i32(),
     enabled: r.bool(),
@@ -213,9 +226,10 @@ function __unpackItem(r) {
     payload: r.bytes(),
     tags: __rList(r, (r) => r.str()),
     attrs: __rMap(r, (r) => r.str(), (r) => r.str()),
-    parent: __rOpt(r, (r) => Number(r.i64())),
+    parent: __rOpt(r, (r) => r.i64()),
     token: __unpackToken(r),
     priority: r.i32(),
+    gadget: __rOpt(r, (r) => Gadget._adopt(r.u64())),
   };
 }
 
@@ -284,37 +298,65 @@ function __kitchenErrorFrom(code, message, payload) {
   return _err;
 }
 
+wv.Priority = Object.freeze({
+  Low: 0,
+  Normal: 1,
+  High: 2,
+  0: 'Low',
+  1: 'Normal',
+  2: 'High',
+});
+function __adaptReadyListener(impl) {
+  if (impl === null || impl === undefined) {
+    throw new WeaveFFIError(-3, 'ReadyListener implementation must be an object');
+  }
+  return {
+    on_ready(code, msg) {
+      return impl.onReady(code, msg);
+    },
+    on_item(item, gadget) {
+      return impl.onItem(__decode(__unpackItem, item), Gadget._adopt(gadget));
+    },
+  };
+}
+
 class Gadget {
   constructor(id) {
     this._handle = __invoke(addon.Gadget_new, [id], __generic);
     Gadget._cleanup.register(this, this._handle, this);
   }
   describe() {
-    return __invoke(addon.Gadget_describe, [this._handle], __generic);
+    return __invoke(addon.Gadget_describe, [__borrow(this, Gadget)], __generic);
   }
   poke(times) {
-    return __invoke(addon.Gadget_poke, [this._handle, times], __kitchenErrorFrom);
+    return __invoke(addon.Gadget_poke, [__borrow(this, Gadget), times], __kitchenErrorFrom);
   }
   static version() {
     return __invoke(addon.Gadget_version, [], __generic);
   }
-  destroy() {
+  close() {
     if (this._handle) {
       Gadget._cleanup.unregister(this);
-      addon.Gadget_destroy(this._handle);
-      this._handle = 0;
+      addon.Gadget__destroy(this._handle);
+      this._handle = 0n;
     }
   }
+  _cloneHandle() {
+    return addon.Gadget__clone(__borrow(this, Gadget));
+  }
 }
-Gadget._fromHandle = function (handle) {
+Gadget._adopt = function (handle) {
   const _o = Object.create(Gadget.prototype);
   _o._handle = handle;
   Gadget._cleanup.register(_o, handle, _o);
   return _o;
 };
 Gadget._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.Gadget_destroy(handle); }
+  if (handle) { addon.Gadget__destroy(handle); }
 });
+if (typeof Symbol.dispose === 'symbol') {
+  Gadget.prototype[Symbol.dispose] = Gadget.prototype.close;
+}
 wv.Gadget = Gadget;
 
 wv.ping = function () {
@@ -341,17 +383,20 @@ wv.echoString = function (s) {
 wv.echoBytes = function (b) {
   return __invoke(addon.echoBytes, [b], __generic);
 };
-wv.echoBorrowedStr = function (s) {
-  return __invoke(addon.echoBorrowedStr, [s], __generic);
+wv.subscribe = function (listener) {
+  return __invoke(addon.subscribe, [__adaptReadyListener(listener)], __generic);
 };
-wv.echoBorrowedBytes = function (b) {
-  return __invoke(addon.echoBorrowedBytes, [b], __generic);
+wv.maybeGadget = function (fallback) {
+  const _r = __invoke(addon.maybeGadget, [(fallback == null ? null : __borrow(fallback, Gadget))], __generic);
+  return (_r == null ? null : Gadget._adopt(_r));
 };
-wv.openHandle = function () {
-  return __invoke(addon.openHandle, [], __generic);
+wv.gadgets = function () {
+  const _r = __invoke(addon.gadgets, [], __generic);
+  return __decode((r) => __rList(r, (r) => Gadget._adopt(r.u64())), _r);
 };
-wv.openTypedHandle = function () {
-  return __invoke(addon.openTypedHandle, [], __generic);
+wv.streamGadgets = function () {
+  const _it = __invoke(addon.streamGadgets, [], __generic);
+  return new WeaveFFIIterator(_it, addon.streamGadgets_iterNext, addon.streamGadgets_iterDestroy, __generic, (_e) => Gadget._adopt(_e));
 };
 wv.maybeItem = function (id) {
   const _r = __invoke(addon.maybeItem, [id], __kitchenErrorFrom);

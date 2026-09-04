@@ -184,13 +184,11 @@ mod tests {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                     ],
@@ -200,13 +198,11 @@ mod tests {
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
-                    since: None,
                 }],
                 interfaces: vec![],
+                callback_interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -216,7 +212,7 @@ mod tests {
     #[test]
     fn every_format_parses_the_same_document() {
         let yaml = r#"
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: math
     functions:
@@ -230,7 +226,7 @@ modules:
         doc: "Adds two numbers"
 "#;
         let json = r#"{
-            "version": "0.8.0",
+            "version": "0.9.0",
             "modules": [{
                 "name": "math",
                 "functions": [{
@@ -245,7 +241,7 @@ modules:
             }]
         }"#;
         let toml_str = r#"
-version = "0.8.0"
+version = "0.9.0"
 
 [[modules]]
 name = "math"
@@ -289,7 +285,7 @@ type = "i32"
 
     #[test]
     fn parse_errors_carry_spans() {
-        let yaml = "version: \"0.8.0\"\nmodules:\n  - name: [oops\n";
+        let yaml = "version: \"0.9.0\"\nmodules:\n  - name: [oops\n";
         match parse_api_str(yaml, "yaml").unwrap_err() {
             ParseError::Yaml { line, span, .. } => {
                 assert!(line > 0);
@@ -309,7 +305,7 @@ type = "i32"
 
     #[test]
     fn unknown_type_syntax_is_a_parse_error() {
-        let yaml = "version: \"0.8.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
+        let yaml = "version: \"0.9.0\"\nmodules:\n  - name: m\n    functions:\n      - name: f\n        params: [{ name: x, type: \"{string}\" }]\n";
         let err = parse_api_str(yaml, "yaml").unwrap_err();
         assert!(err.to_string().contains("map type missing"), "{err}");
     }

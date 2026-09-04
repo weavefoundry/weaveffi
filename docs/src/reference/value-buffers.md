@@ -21,8 +21,10 @@ pass by value; strings pass as C strings; `bytes` as a raw pointer plus
 length; interfaces and iterators as opaque object pointers; `Interface?` as a
 nullable object pointer; C-style enums as `int32_t`.
 
-Interfaces, iterators, and borrowed views (`str`, `bytes_view`) never appear
-*inside* a buffered type; validation rejects them in buffered positions.
+Interfaces *may* appear inside a buffered type (a record field, a list
+element, a map value, an optional) and encode as an object token; see
+[Objects](#objects). Iterators and callback interfaces never appear inside a
+buffered type; validation rejects them in buffered positions.
 
 ## Encoding
 
@@ -41,7 +43,7 @@ alignment; values are packed back to back. Lengths and element counts are
 | `f32`                 | 4 bytes (IEEE 754 bits)                              |
 | `f64`                 | 8 bytes (IEEE 754 bits)                              |
 | enum (C-style)        | `i32` discriminant                                   |
-| `handle` / `handle<T>`| `u64`                                                |
+| interface             | `u64` object token (one strong reference)            |
 | `string`              | `u32` byte length, then UTF-8 bytes (no terminator)  |
 | `bytes`               | `u32` length, then raw bytes                         |
 | `T?`                  | 1 flag byte (`0` absent, `1` present), then the value when present |
@@ -66,6 +68,31 @@ length prefix larger than the bytes remaining, or leaves trailing bytes after
 the complete value. A malformed buffer is a producer/consumer contract
 violation (both sides are generated from one IDL), so consumers surface it
 through the same channel as a producer panic, not as a typed domain error.
+
+## Objects
+
+An interface value inside a buffer is an **object token**: the object's
+pointer widened to `u64` (zero-extended on 32-bit targets). A token carries
+exactly one strong reference, in either direction.
+
+- **Writing.** The side that encodes a token must own the reference it
+  writes. A consumer that holds an object wrapper calls `{tag}_clone` and
+  writes the returned pointer, keeping its own reference for the wrapper; a
+  producer writes `Arc::into_raw(arc.clone())`.
+- **Reading.** The side that decodes a token adopts the reference: a consumer
+  wraps the pointer in a new object wrapper whose finalizer will call
+  `{tag}_destroy`; a producer calls `Arc::from_raw`.
+- **Failure.** If decoding fails partway through a buffer, the reader is
+  responsible for releasing every token it already adopted. The writer keeps
+  no responsibility once the buffer is handed over.
+- **Single use.** Because each token is one reference, an encoding that
+  contains objects is consumed exactly once: decode it twice and the second
+  reader adopts references that no longer exist. Generated bindings encode a
+  fresh buffer per call and never reuse one.
+
+A zero token is invalid in a non-optional position; `Interface?` inside a
+buffer uses the ordinary optional flag byte followed by the token when
+present.
 
 ## ABI slots and ownership
 
@@ -99,8 +126,10 @@ frees it with `weaveffi_free_bytes` per element.
 Owned interface results transfer ownership the same way: the callback adopts
 the object pointer.
 
-**Callback and listener arguments.** Buffered callback arguments are borrowed
-`(ptr, len)` pairs valid only for the duration of the dispatch.
+**Callback-interface method arguments.** Buffered arguments to a
+callback-interface method are borrowed `(ptr, len)` pairs valid only for the
+duration of the dispatch; the consumer decodes before returning. Object tokens
+inside such a buffer still transfer one strong reference to the consumer.
 
 ## Structured errors
 
