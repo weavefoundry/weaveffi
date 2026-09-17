@@ -474,6 +474,19 @@ mod tests {
         weaveffi_error::default()
     }
 
+    /// Box a clone of the test's sender as the `context` for one async
+    /// launch. The completion callback adopts it with [`adopt_ctx`], so the
+    /// channel is released by whichever side lets go last; a borrowed sender
+    /// freed after `recv` would race the producer thread's in-flight `send`.
+    fn ctx_for<T>(tx: &mpsc::Sender<T>) -> *mut c_void {
+        Box::into_raw(Box::new(tx.clone())).cast()
+    }
+
+    /// Take ownership of the sender [`ctx_for`] boxed for this callback.
+    unsafe fn adopt_ctx<T>(ctx: *mut c_void) -> Box<mpsc::Sender<T>> {
+        unsafe { Box::from_raw(ctx.cast()) }
+    }
+
     fn open() -> *mut Store {
         let mut err = new_err();
         let path = CString::new("/tmp/kvstore-test").unwrap();
@@ -774,9 +787,8 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::channel::<(i32, i64)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
         extern "C" fn cb(context: *mut c_void, err: *mut weaveffi_error, result: i64) {
-            let tx = unsafe { &*(context as *const mpsc::Sender<(i32, i64)>) };
+            let tx = unsafe { adopt_ctx::<(i32, i64)>(context) };
             let code = if err.is_null() {
                 0
             } else {
@@ -785,10 +797,9 @@ mod tests {
             tx.send((code, result)).unwrap();
         }
         let token = abi::cancel_token_create();
-        weaveffi_kv_Store_compact_async(s, token, cb, tx_ptr as *mut c_void);
+        weaveffi_kv_Store_compact_async(s, token, cb, ctx_for(&tx));
 
         let (code, reclaimed) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert_eq!(code, 0);
         assert_eq!(reclaimed, 5);
         abi::cancel_token_destroy(token);
@@ -801,9 +812,8 @@ mod tests {
         let s = open();
 
         let (tx, rx) = mpsc::channel::<(i32, i64)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
         extern "C" fn cb(context: *mut c_void, err: *mut weaveffi_error, result: i64) {
-            let tx = unsafe { &*(context as *const mpsc::Sender<(i32, i64)>) };
+            let tx = unsafe { adopt_ctx::<(i32, i64)>(context) };
             let code = if err.is_null() {
                 0
             } else {
@@ -813,10 +823,9 @@ mod tests {
         }
         let token = abi::cancel_token_create();
         abi::cancel_token_cancel(token);
-        weaveffi_kv_Store_compact_async(s, token, cb, tx_ptr as *mut c_void);
+        weaveffi_kv_Store_compact_async(s, token, cb, ctx_for(&tx));
 
         let (code, reclaimed) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        unsafe { drop(Box::from_raw(tx_ptr)) };
         assert_eq!(code, 1004, "a cancelled compact reports KvError::IoError");
         assert_eq!(reclaimed, 0);
         abi::cancel_token_destroy(token);

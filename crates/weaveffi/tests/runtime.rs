@@ -451,6 +451,28 @@ fn decode_ret<T: abi::BufferValue>(ptr: *const u8, len: usize) -> T {
     value
 }
 
+/// Build the `context` for one async launch: a heap-boxed clone of the
+/// test's channel sender that the completion callback adopts with
+/// [`adopt_ctx`].
+///
+/// The callback fires on a detached producer thread, and the test's `recv`
+/// unblocks as soon as the message is queued, before that thread has finished
+/// `send`. Handing the callback a *borrowed* sender and freeing it after
+/// `recv` would therefore free the channel out from under an in-flight
+/// `send`. Giving every launch its own owned sender, released by the callback
+/// itself, means the channel is torn down by whichever side lets go last, the
+/// way the ABI's "consumer owns `context`" rule is meant to be used.
+fn ctx_for<T>(tx: &std::sync::mpsc::Sender<T>) -> *mut std::os::raw::c_void {
+    Box::into_raw(Box::new(tx.clone())).cast()
+}
+
+/// Take ownership of the sender [`ctx_for`] boxed for this callback. Must be
+/// called exactly once per launch, which the "callback fires exactly once"
+/// contract guarantees.
+unsafe fn adopt_ctx<T>(ctx: *mut std::os::raw::c_void) -> Box<std::sync::mpsc::Sender<T>> {
+    unsafe { Box::from_raw(ctx.cast()) }
+}
+
 #[test]
 fn scalar_call_sets_ok() {
     let mut err = ok_err();
@@ -932,7 +954,7 @@ fn callback_interface_from_async_method() {
 
     type Msg = (i32, String, i64);
     extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
+        let tx = unsafe { adopt_ctx::<Msg>(ctx) };
         let (code, msg) = if err.is_null() {
             (0, String::new())
         } else {
@@ -950,16 +972,15 @@ fn callback_interface_from_async_method() {
     bus::weaveffi_bus_Bus_subscribe(b, new_ctx(4, &freed), &VTABLE, &mut err);
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
     let text = string_to_c_ptr("async");
 
-    bus::weaveffi_bus_Bus_publish_later_async(b, text, 2, cb, tx_ptr as *mut c_void);
+    bus::weaveffi_bus_Bus_publish_later_async(b, text, 2, cb, ctx_for(&tx));
     let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(code, 0);
     assert_eq!(result, 2);
 
     // A foreign failure inside the future is delivered through the callback.
-    bus::weaveffi_bus_Bus_publish_later_async(b, text, 4, cb, tx_ptr as *mut c_void);
+    bus::weaveffi_bus_Bus_publish_later_async(b, text, 4, cb, ctx_for(&tx));
     let (code, msg, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(code, abi::FOREIGN_ERROR_CODE);
     assert_eq!(msg, "subscriber rejected async");
@@ -967,14 +988,13 @@ fn callback_interface_from_async_method() {
 
     // The receiver was retained across the spawn: releasing the consumer's
     // reference while a call is in flight is safe.
-    bus::weaveffi_bus_Bus_publish_later_async(b, text, 1, cb, tx_ptr as *mut c_void);
+    bus::weaveffi_bus_Bus_publish_later_async(b, text, 1, cb, ctx_for(&tx));
     bus::weaveffi_bus_Bus_destroy(b);
     let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(code, 0);
     assert_eq!(result, 3);
 
     free_string(text);
-    unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
 #[test]
@@ -992,7 +1012,7 @@ fn async_struct_result_completes_via_callback() {
         result_ptr: *const u8,
         result_len: usize,
     ) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
+        let tx = unsafe { adopt_ctx::<Msg>(ctx) };
         let had_err = !err.is_null() && unsafe { (*err).code } != 0;
         if had_err {
             abi::error_free(err);
@@ -1009,12 +1029,10 @@ fn async_struct_result_completes_via_callback() {
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
     let name = string_to_c_ptr("alpha");
-    tasks::weaveffi_tasks_run_task_async(name, cb, tx_ptr as *mut c_void);
+    tasks::weaveffi_tasks_run_task_async(name, cb, ctx_for(&tx));
     let (had_err, id, value) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     free_string(name);
-    unsafe { drop(Box::from_raw(tx_ptr)) };
 
     assert!(!had_err);
     assert_eq!(id, 7);
@@ -1029,7 +1047,7 @@ fn async_result_ok_and_err_paths() {
 
     type Msg = (bool, i32);
     extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i32) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
+        let tx = unsafe { adopt_ctx::<Msg>(ctx) };
         let had_err = !err.is_null() && unsafe { (*err).code } != 0;
         if had_err {
             // The reported error is heap-boxed and owned by the consumer.
@@ -1039,19 +1057,16 @@ fn async_result_ok_and_err_paths() {
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
 
-    tasks::weaveffi_tasks_checked_add_async(2, 3, cb, tx_ptr as *mut c_void);
+    tasks::weaveffi_tasks_checked_add_async(2, 3, cb, ctx_for(&tx));
     let (had_err, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(!had_err);
     assert_eq!(result, 5);
 
-    tasks::weaveffi_tasks_checked_add_async(i32::MAX, 1, cb, tx_ptr as *mut c_void);
+    tasks::weaveffi_tasks_checked_add_async(i32::MAX, 1, cb, ctx_for(&tx));
     let (had_err, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(had_err);
     assert_eq!(result, 0);
-
-    unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
 #[test]
@@ -1088,7 +1103,7 @@ fn deferred_foreign_error_fires_the_async_callback_once() {
 
     type Msg = (i32, String, i32);
     extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i32) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
+        let tx = unsafe { adopt_ctx::<Msg>(ctx) };
         let (code, message) = if err.is_null() {
             (0, String::new())
         } else {
@@ -1101,13 +1116,12 @@ fn deferred_foreign_error_fires_the_async_callback_once() {
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
 
-    deferred::weaveffi_deferred_later_then_fail_async(false, cb, tx_ptr as *mut c_void);
+    deferred::weaveffi_deferred_later_then_fail_async(false, cb, ctx_for(&tx));
     let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!((code, result), (0, 88));
 
-    deferred::weaveffi_deferred_later_then_fail_async(true, cb, tx_ptr as *mut c_void);
+    deferred::weaveffi_deferred_later_then_fail_async(true, cb, ctx_for(&tx));
     let (code, message, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(code, abi::FOREIGN_ERROR_CODE);
     assert_eq!(message, "consumer said no, later");
@@ -1116,8 +1130,6 @@ fn deferred_foreign_error_fires_the_async_callback_once() {
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
         "the completion callback fires exactly once"
     );
-
-    unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
 /// Exercises nested-module codegen: the inner module's symbols must carry the
@@ -1644,7 +1656,7 @@ fn async_methods_retain_the_receiver() {
     use std::time::Duration;
 
     extern "C" fn on_value(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
+        let tx = unsafe { adopt_ctx::<i64>(ctx) };
         assert!(err.is_null());
         tx.send(result).unwrap();
     }
@@ -1653,7 +1665,7 @@ fn async_methods_retain_the_receiver() {
         err: *mut weaveffi_error,
         result: *mut counters::Counter,
     ) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
+        let tx = unsafe { adopt_ctx::<i64>(ctx) };
         assert!(err.is_null());
         let mut e = weaveffi_error::default();
         let v = counters::weaveffi_counters_Counter_value(result, &mut e);
@@ -1663,11 +1675,10 @@ fn async_methods_retain_the_receiver() {
 
     let mut err = ok_err();
     let (tx, rx) = mpsc::channel::<i64>();
-    let tx_ptr = Box::into_raw(Box::new(tx));
 
     let c = counters::weaveffi_counters_Counter_new(8, &mut err);
-    counters::weaveffi_counters_Counter_value_later_async(c, on_value, tx_ptr as *mut c_void);
-    counters::weaveffi_counters_Counter_snapshot_later_async(c, on_obj, tx_ptr as *mut c_void);
+    counters::weaveffi_counters_Counter_value_later_async(c, on_value, ctx_for(&tx));
+    counters::weaveffi_counters_Counter_snapshot_later_async(c, on_obj, ctx_for(&tx));
     // Releasing the consumer's reference while calls are in flight is safe:
     // each launcher retained its own.
     counters::weaveffi_counters_Counter_destroy(c);
@@ -1680,19 +1691,14 @@ fn async_methods_retain_the_receiver() {
 
     // A null receiver still completes (with a marshalling error).
     extern "C" fn on_null(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
-        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
+        let tx = unsafe { adopt_ctx::<i64>(ctx) };
         assert!(!err.is_null());
         assert_eq!(unsafe { (*err).code }, abi::MARSHAL_ERROR_CODE);
         abi::error_free(err);
         tx.send(result).unwrap();
     }
-    counters::weaveffi_counters_Counter_value_later_async(
-        std::ptr::null(),
-        on_null,
-        tx_ptr as *mut c_void,
-    );
+    counters::weaveffi_counters_Counter_value_later_async(std::ptr::null(), on_null, ctx_for(&tx));
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
-    unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
 #[test]
