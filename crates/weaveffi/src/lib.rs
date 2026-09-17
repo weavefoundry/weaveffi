@@ -40,9 +40,16 @@
 //! * [`macro@export`] - export a function (`async fn` is asynchronous; a
 //!   `Result`-returning fn is fallible).
 //! * [`macro@record`] - a by-value struct serialized across the ABI.
-//! * [`macro@enumeration`] - a `#[repr(i32)]` C-style enum.
-//! * [`macro@callback`] / [`macro@listener`] - a callback and an event listener.
+//! * [`macro@enumeration`] - a `#[repr(i32)]` C-style enum, or a rich enum
+//!   with data-carrying variants.
+//! * [`macro@interface`] - an opaque, reference-counted object type; pass one
+//!   as `&T` or `Arc<T>`, return one as `Self`, `T`, or `Arc<T>`.
+//! * [`macro@error`] - the module's error domain.
+//! * [`macro@callback_interface`] - a trait the consumer implements; accept
+//!   one as `Arc<dyn Trait>`.
 //! * [`macro@cancellable`] - mark an `async fn` as accepting a cancel token.
+//! * [`set_spawner`] - install the executor async exports run on (Tokio, for
+//!   example); the default drives each future on its own thread.
 //! * [`abi`] - the C ABI runtime: the error struct, memory helpers, the
 //!   marshalling converters the expansion calls, and [`export_runtime!`].
 
@@ -78,12 +85,19 @@ pub use weaveffi_abi::CancelToken;
 /// domain.
 pub use weaveffi_abi::ErrorReport;
 
-/// The opaque `handle` type: a `u64` token whose value round-trips through
-/// consumers unchanged. Spell producer parameters and returns as
-/// `weaveffi::Handle` to extract them as the IDL `handle` type; a bare `u64`
-/// extracts as the `u64` scalar.
-pub use weaveffi_abi::Handle;
+/// Install the process-wide executor that exported `async fn`s run on. Call it
+/// once at startup (before the first async export is launched) to hand futures
+/// to a runtime such as Tokio; until then, and if never called, each future is
+/// driven to completion on its own thread.
+pub use weaveffi_abi::set_spawner;
+
+/// The executor hook [`set_spawner`] accepts: anything callable as
+/// `Fn(BoxFuture)` that is `Send + Sync + 'static`.
+pub use weaveffi_abi::Spawner;
+
+/// The type-erased `Send + 'static` future a [`Spawner`] receives.
+pub use weaveffi_abi::BoxFuture;
 
 pub use weaveffi_macros::{
-    callback, cancellable, enumeration, error, export, interface, listener, module, record,
+    callback_interface, cancellable, enumeration, error, export, interface, module, record,
 };

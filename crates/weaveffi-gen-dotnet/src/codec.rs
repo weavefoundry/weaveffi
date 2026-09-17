@@ -2,19 +2,20 @@
 //! `WeaveFFIBufferWriter` and decoding one back from a
 //! `WeaveFFIBufferReader`.
 //!
-//! Every dispatch here goes through [`wire::classify`], so this module never
-//! re-derives the wire folds (handles as `u64` tokens, borrowed views as
-//! their owned forms, records and rich enums as one user-codec shape). The
-//! only peek back at the [`Ty`] is for `handle<T>`, whose C# surface is
-//! a `{T}Handle` wrapper struct even though the wire shape is one `u64`
-//! token.
+//! Every dispatch here goes through [`Ty::wire`], so this module never
+//! re-derives the wire shapes (records and rich enums as one user-codec
+//! shape, interfaces as `u64` object tokens). An object token carries one
+//! strong reference: writing one clones the wrapper's handle through the
+//! interface's `_clone` symbol, and reading one adopts the pointer into a
+//! new wrapper whose `Dispose` (or finalizer) releases it.
 
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
 
-use crate::types::{cs_type, is_cs_value_type, typed_handle_cs};
+use crate::calls::adopt_object;
+use crate::types::{cs_type, is_cs_value_type};
 
 /// Emit statements serializing `expr` (a C# expression of the C# type mapped
 /// from `ty`) into the buffer writer named `writer_var`, following the wire
@@ -61,14 +62,10 @@ pub(crate) fn emit_buffer_write(
         WireType::Prim(Prim::Bool) => {
             w.line(format!("{writer_var}.WriteBool({expr});"));
         }
-        // Both handle flavors encode as one u64 token; only the C# surface
-        // differs (a bare ulong versus the `{T}Handle` wrapper struct).
-        WireType::Handle(_) => {
-            if matches!(ty, Ty::TypedHandle(_)) {
-                w.line(format!("{writer_var}.WriteU64((ulong)(long){expr}.Raw);"));
-            } else {
-                w.line(format!("{writer_var}.WriteU64({expr});"));
-            }
+        // The token must carry its own strong reference, so clone the
+        // wrapper's handle rather than writing the pointer it still owns.
+        WireType::Object(_) => {
+            w.line(format!("{writer_var}.WriteObject({expr}.CloneHandle());"));
         }
         WireType::Enum(_) => {
             w.line(format!("{writer_var}.WriteI32((int){expr});"));
@@ -162,17 +159,11 @@ pub(crate) fn emit_buffer_read(
         WireType::Prim(Prim::Bool) => {
             w.line(format!("var {var} = {reader_var}.ReadBool();"));
         }
-        // The u64 token decodes back into the C# surface: a bare ulong for
-        // `handle`, the `{T}Handle` wrapper for `handle<T>`.
-        WireType::Handle(_) => {
-            if let Ty::TypedHandle(name) = ty {
-                let cn = typed_handle_cs(name);
-                w.line(format!(
-                    "var {var} = new {cn}((IntPtr)(long){reader_var}.ReadU64());"
-                ));
-            } else {
-                w.line(format!("var {var} = {reader_var}.ReadU64();"));
-            }
+        // Adopt the token's strong reference into a fresh wrapper; its
+        // Dispose (or finalizer) owes the interface's `_destroy`.
+        WireType::Object(name) => {
+            let adopt = adopt_object(local_type_name(name), &format!("{reader_var}.ReadObject()"));
+            w.line(format!("var {var} = {adopt};"));
         }
         WireType::Enum(name) => {
             let cn = local_type_name(name);
@@ -228,9 +219,6 @@ pub(crate) fn emit_buffer_read(
     }
 }
 
-/// Emit the statements decoding a consumer-side copy of a value buffer
-/// (`byte[]` local named `buf`) into a local named `var` of type `ty`,
-/// validating that the buffer is fully consumed.
 /// `new T[len]` for an array whose element type is `elem`.
 ///
 /// C# puts the outermost rank first, so an array of `int[]` elements is
@@ -242,6 +230,9 @@ fn cs_new_array(elem: &str, len: &str) -> String {
     format!("new {base}[{len}]{ranks}")
 }
 
+/// Emit the statements decoding a consumer-side copy of a value buffer
+/// (`byte[]` local named `buf`) into a local named `var` of type `ty`,
+/// validating that the buffer is fully consumed.
 pub(crate) fn emit_buffer_decode(w: &mut CodeWriter, ty: &Ty, var: &str, buf: &str) {
     w.line(format!(
         "var {var}Reader = new WeaveFFIBufferReader({buf});"

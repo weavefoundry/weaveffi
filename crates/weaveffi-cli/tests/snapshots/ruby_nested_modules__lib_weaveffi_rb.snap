@@ -32,7 +32,7 @@ module WeaveFFI
   # The ABI revision these bindings were generated against. Checked before any
   # other symbol is attached so a mismatched producer fails at require time
   # instead of misreading the error struct or a value buffer later.
-  ABI_VERSION = 1
+  ABI_VERSION = 2
   begin
     attach_function :weaveffi_abi_version, [], :uint32
   rescue FFI::NotFoundError
@@ -51,6 +51,16 @@ module WeaveFFI
            :payload_ptr, :pointer,
            :payload_len, :size_t
   end
+
+  # The runtime-reserved error codes. Positive codes belong to a module's
+  # declared error domain; these negative codes are programming errors the
+  # wrappers raise as a plain Error regardless of the function's `throws`.
+  GENERIC_ERROR_CODE = -1
+  PANIC_ERROR_CODE = -2
+  MARSHAL_ERROR_CODE = -3
+  # A callback-interface implementation raised; the message carries the
+  # exception text.
+  FOREIGN_ERROR_CODE = -4
 
   class Error < StandardError
     attr_reader :code
@@ -225,12 +235,21 @@ module WeaveFFI
       take(read_len, 'byte buffer')
     end
 
+    # An object token: a non-zero u64 carrying one strong reference the
+    # caller adopts into a wrapper.
+    def read_object_token
+      addr = read_u64
+      raise Error.new(-1, 'malformed value buffer: null object token') if addr.zero?
+      FFI::Pointer.new(addr)
+    end
+
     def expect_end!
       return if @pos == @data.bytesize
       raise Error.new(-1, 'malformed value buffer: trailing bytes after value')
     end
   end
 
+  attach_function :weaveffi_error_set, [:pointer, :int32, :string], :void
   attach_function :weaveffi_error_clear, [:pointer], :void
   attach_function :weaveffi_error_free, [:pointer], :void
   attach_function :weaveffi_free_string, [:pointer], :void
@@ -240,7 +259,7 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     weaveffi_error_clear(err.to_ptr)
     raise Error.new(code, msg)
   end
@@ -266,7 +285,7 @@ module WeaveFFI
 
   # Builds the GraphicsError subclass matching `code`, decoding any payload
   # fields the code declares, or a generic Error for codes outside
-  # the domain (panics, marshalling).
+  # the domain (panics, marshalling, callback failures).
   def self.graphics_error_from(code, message, payload = nil)
     cls = GRAPHICS_ERROR_CODES[code]
     return Error.new(code, message) if cls.nil?
@@ -278,7 +297,7 @@ module WeaveFFI
     return if err[:code].zero?
     code = err[:code]
     msg_ptr = err[:message]
-    msg = msg_ptr.null? ? '' : msg_ptr.read_string
+    msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)
     payload_ptr = err[:payload_ptr]
     payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])
     weaveffi_error_clear(err.to_ptr)

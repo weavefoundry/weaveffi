@@ -76,7 +76,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.8.0\"\n",
+            "version: \"0.9.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -102,7 +102,7 @@ fn diff_check_fails_when_idl_changed() {
     write_file(
         &idl,
         concat!(
-            "version: \"0.8.0\"\n",
+            "version: \"0.9.0\"\n",
             "modules:\n",
             "  - name: calc\n",
             "    functions:\n",
@@ -189,7 +189,7 @@ fn validate_warn_json_format_outputs_warnings_array() {
     write_file(
         &path,
         concat!(
-            "version: \"0.8.0\"\n",
+            "version: \"0.9.0\"\n",
             "modules:\n",
             "  - name: nodocs\n",
             "    functions:\n",

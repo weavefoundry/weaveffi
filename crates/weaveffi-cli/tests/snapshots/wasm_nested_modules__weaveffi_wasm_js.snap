@@ -9,16 +9,18 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Objects   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent); one
+//                strong reference per wrapper, released by close()
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Buffered  -> records, rich enums, optionals, lists, and maps cross
 //                as one value buffer: i32 pointer + i32 length
+//   Callbacks -> i32 context key + i32 pointer to a static vtable
 
 // The ABI revision this glue was generated against.
-const _ABI_VERSION = 1;
+const _ABI_VERSION = 2;
 
 function _checkAbiVersion(wasm) {
   if (typeof wasm.weaveffi_abi_version !== 'function') {
@@ -31,8 +33,9 @@ function _checkAbiVersion(wasm) {
 }
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
- * thrown directly for unknown codes, marshalling failures, and producer
- * panics. Carries the stable ABI `code`. */
+ * thrown directly for unknown codes, marshalling failures, producer
+ * panics, and callback-interface implementations that raised (code -4).
+ * Carries the stable ABI `code`. */
 export class WeaveFFIError extends Error {
   constructor(code, message) {
     super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
@@ -56,14 +59,6 @@ GraphicsError.OutOfBounds = OutOfBounds;
 const _GRAPHICS_ERROR_CODES = Object.freeze({
   1: OutOfBounds,
 });
-
-// Build the GraphicsError subclass matching `code`, or a generic
-// WeaveFFIError for codes outside the domain (panics, marshalling).
-function _graphicsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
-  const _cls = _GRAPHICS_ERROR_CODES[code];
-  const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
-  return _e;
-}
 
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
@@ -144,6 +139,8 @@ class _BufWriter {
   f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }
   len(n) { this.u32(n); }
   flag(present) { this.u8(present ? 1 : 0); }
+  // An object token: the pointer (a wasm32 i32, read unsigned) widened to u64.
+  obj(ptr) { this.u64(BigInt(ptr >>> 0)); }
   str(v) {
     const b = _enc.encode(v);
     this.len(b.length);
@@ -208,6 +205,13 @@ class _BufReader {
     if (b > 1) this._bad('option flag byte out of range');
     return b === 1;
   }
+  // An object token narrowed back to a wasm32 pointer; zero is never a
+  // valid token (an absent `Interface?` uses the option flag instead).
+  obj() {
+    const t = this.u64();
+    if (t === 0n || t > 0xffffffffn) this._bad('object token out of range');
+    return Number(t);
+  }
   str() {
     const n = this.len();
     const at = this._take(n, 'string bytes');
@@ -237,9 +241,11 @@ function _allocErr(wasm) {
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
 // Non-throwing wrappers route here: a non-zero code can only be a
-// producer panic or a marshalling failure, surfaced as the generic
+// producer panic (-2), a marshalling failure (-3), or a callback
+// interface implementation that raised (-4), surfaced as the generic
 // WeaveFFIError.
 function _checkErr(wasm, errPtr) {
+  _pendingForeign = null;
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
@@ -253,63 +259,36 @@ function _checkErr(wasm, errPtr) {
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
+  _pendingForeign = null;
   wasm.weaveffi_dealloc(errPtr, 16);
 }
 
-// Throw the `GraphicsError` domain error (and free the slot) if the error slot
-// carries a non-zero code.
-function _checkGraphicsError(wasm, errPtr) {
-  const dv = new DataView(wasm.memory.buffer);
-  const code = dv.getInt32(errPtr, true);
-  if (code !== 0) {
-    const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
-    const _e = _graphicsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
-    wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 16);
-    throw _e;
-  }
+// The message of a callback-interface failure a trampoline reported through
+// out_err, held until the producer call on the stack returns (every error
+// checker and _freeErr clear it) so later callbacks in that call are refused.
+let _pendingForeign = null;
+
+// Translate an exception raised while a producer call was on the stack.
+// wasm32-unknown-unknown has no unwinding runtime: a producer panic executes
+// `unreachable`, so the engine throws a WebAssembly.RuntimeError instead of
+// the producer writing out_err. A trap that follows a callback-interface
+// failure is labelled with that failure (-4); any other trap is a producer
+// panic (-2). Non-trap exceptions pass through unchanged. The producer
+// frames between the trap and the call are not unwound, so a lock held
+// across a callback stays locked; a producer that snapshots its state
+// before calling out stays usable.
+function _trapError(e) {
+  const foreign = _pendingForeign;
+  _pendingForeign = null;
+  if (!(e instanceof WebAssembly.RuntimeError)) return e;
+  if (foreign !== null) return new WeaveFFIError(-4, foreign);
+  return new WeaveFFIError(-2, 'producer panicked: ' + e.message);
 }
 
-// Serialize a `graphics.Canvas` record into the value-buffer wire format.
-function _write_graphics_Canvas(w, v) {
-  w.i32(v.width);
-  _write_graphics_shapes_Shape(w, v.root);
-}
-
-// Decode a `graphics.Canvas` record from the value-buffer wire format.
-function _read_graphics_Canvas(r) {
-  const v = {};
-  v.width = r.i32();
-  v.root = _read_graphics_shapes_Shape(r);
-  return v;
-}
-
-// Serialize a `graphics_shapes.Shape` record into the value-buffer wire format.
-function _write_graphics_shapes_Shape(w, v) {
-  w.i32(v.sides);
-  w.i32(v.unit);
-  _write_graphics_shapes_geometry_Detail(w, v.detail);
-}
-
-// Decode a `graphics_shapes.Shape` record from the value-buffer wire format.
-function _read_graphics_shapes_Shape(r) {
-  const v = {};
-  v.sides = r.i32();
-  v.unit = r.i32();
-  v.detail = _read_graphics_shapes_geometry_Detail(r);
-  return v;
-}
-
-// Serialize a `graphics_shapes_geometry.Detail` record into the value-buffer wire format.
-function _write_graphics_shapes_geometry_Detail(w, v) {
-  w.f64(v.area);
-}
-
-// Decode a `graphics_shapes_geometry.Detail` record from the value-buffer wire format.
-function _read_graphics_shapes_geometry_Detail(r) {
-  const v = {};
-  v.area = r.f64();
-  return v;
+// Release the error slot a failed call never filled, then translate.
+function _trap(wasm, errPtr, e) {
+  _freeErr(wasm, errPtr);
+  return _trapError(e);
 }
 
 export const Unit = Object.freeze({
@@ -318,9 +297,11 @@ export const Unit = Object.freeze({
 });
 
 /**
- * Load a WeaveFFI Wasm module from the given URL.
+ * Load a WeaveFFI Wasm module.
  *
- * @param {string} url - URL to the `.wasm` file.
+ * @param {string|URL|BufferSource|WebAssembly.Module} source - A URL to
+ *   fetch the `.wasm` from, its bytes, or an already compiled module
+ *   (use the bytes form where `fetch` cannot read files, e.g. Node).
  * @returns {Promise<Object>} The API bindings.
  *
  * Exported functions follow the C ABI naming convention:
@@ -335,6 +316,12 @@ export const Unit = Object.freeze({
  * // Record: plain objects in and out (serialized automatically).
  * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
+ * // Object: a class wrapping one producer reference; close() releases it
+ * // (or let `using` do it). Passing it lends the reference for the call.
+ * const store = new api.kv.Store();
+ * api.kv.inspect(store);
+ * store.close();
+ *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
@@ -345,13 +332,86 @@ export const Unit = Object.freeze({
  * // List/Map: pass arrays/objects; receive arrays/objects.
  * const names = api.data.all_names();
  */
-export async function loadWeaveffiWasm(url) {
-  const response = await fetch(url);
-  const bytes = await response.arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+export async function loadWeaveffiWasm(source) {
+  let module;
+  if (source instanceof WebAssembly.Module) {
+    module = source;
+  } else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
+    module = await WebAssembly.compile(source);
+  } else {
+    const response = await fetch(source);
+    module = await WebAssembly.compile(await response.arrayBuffer());
+  }
+  const instance = await WebAssembly.instantiate(module, {});
   const wasm = instance.exports;
 
   _checkAbiVersion(wasm);
+
+  // Build the GraphicsError subclass matching `code`, or a generic
+  // WeaveFFIError for codes outside the domain (panics, marshalling,
+  // foreign callback failures).
+  function _graphicsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
+    const _cls = _GRAPHICS_ERROR_CODES[code];
+    const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
+    return _e;
+  }
+
+  // Throw the `GraphicsError` domain error (and free the slot) if the error slot
+  // carries a non-zero code.
+  function _checkGraphicsError(wasm, errPtr) {
+    _pendingForeign = null;
+    const dv = new DataView(wasm.memory.buffer);
+    const code = dv.getInt32(errPtr, true);
+    if (code !== 0) {
+      const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+      const _e = _graphicsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
+      wasm.weaveffi_error_clear(errPtr);
+      wasm.weaveffi_dealloc(errPtr, 16);
+      throw _e;
+    }
+  }
+
+  // Serialize a `graphics.Canvas` record into the value-buffer wire format.
+  function _write_graphics_Canvas(w, v) {
+    w.i32(v.width);
+    _write_graphics_shapes_Shape(w, v.root);
+  }
+
+  // Decode a `graphics.Canvas` record from the value-buffer wire format.
+  function _read_graphics_Canvas(r) {
+    const v = {};
+    v.width = r.i32();
+    v.root = _read_graphics_shapes_Shape(r);
+    return v;
+  }
+
+  // Serialize a `graphics_shapes.Shape` record into the value-buffer wire format.
+  function _write_graphics_shapes_Shape(w, v) {
+    w.i32(v.sides);
+    w.i32(v.unit);
+    _write_graphics_shapes_geometry_Detail(w, v.detail);
+  }
+
+  // Decode a `graphics_shapes.Shape` record from the value-buffer wire format.
+  function _read_graphics_shapes_Shape(r) {
+    const v = {};
+    v.sides = r.i32();
+    v.unit = r.i32();
+    v.detail = _read_graphics_shapes_geometry_Detail(r);
+    return v;
+  }
+
+  // Serialize a `graphics_shapes_geometry.Detail` record into the value-buffer wire format.
+  function _write_graphics_shapes_geometry_Detail(w, v) {
+    w.f64(v.area);
+  }
+
+  // Decode a `graphics_shapes_geometry.Detail` record from the value-buffer wire format.
+  function _read_graphics_shapes_geometry_Detail(r) {
+    const v = {};
+    v.area = r.f64();
+    return v;
+  }
 
   return {
     _raw: wasm,
@@ -359,7 +419,13 @@ export async function loadWeaveffiWasm(url) {
       newCanvas(width) {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_graphics_new_canvas(width, _lp, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_graphics_new_canvas(width, _lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -373,7 +439,13 @@ export async function loadWeaveffiWasm(url) {
         makeShape(sides) {
           const _lp = wasm.weaveffi_alloc(4);
           const _err = _allocErr(wasm);
-          const _r = wasm.weaveffi_graphics_shapes_make_shape(sides, _lp, _err);
+          let _r;
+          try {
+            _r = wasm.weaveffi_graphics_shapes_make_shape(sides, _lp, _err);
+          } catch (e) {
+            wasm.weaveffi_dealloc(_lp, 4);
+            throw _trap(wasm, _err, e);
+          }
           _checkErr(wasm, _err);
           _freeErr(wasm, _err);
           const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -386,7 +458,13 @@ export async function loadWeaveffiWasm(url) {
         describe() {
           const _lp = wasm.weaveffi_alloc(4);
           const _err = _allocErr(wasm);
-          const _r = wasm.weaveffi_graphics_shapes_describe(_lp, _err);
+          let _r;
+          try {
+            _r = wasm.weaveffi_graphics_shapes_describe(_lp, _err);
+          } catch (e) {
+            wasm.weaveffi_dealloc(_lp, 4);
+            throw _trap(wasm, _err, e);
+          }
           _checkErr(wasm, _err);
           _freeErr(wasm, _err);
           const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -403,8 +481,15 @@ export async function loadWeaveffiWasm(url) {
             const [a0_p, a0_l] = _bytes(wasm, a0_w.finish());
             const _lp = wasm.weaveffi_alloc(4);
             const _err = _allocErr(wasm);
-            const _r = wasm.weaveffi_graphics_shapes_geometry_compute(a0_p, a0_l, _lp, _err);
-            wasm.weaveffi_dealloc(a0_p, a0_l);
+            let _r;
+            try {
+              _r = wasm.weaveffi_graphics_shapes_geometry_compute(a0_p, a0_l, _lp, _err);
+            } catch (e) {
+              wasm.weaveffi_dealloc(_lp, 4);
+              throw _trap(wasm, _err, e);
+            } finally {
+              wasm.weaveffi_dealloc(a0_p, a0_l);
+            }
             _checkGraphicsError(wasm, _err);
             _freeErr(wasm, _err);
             const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);

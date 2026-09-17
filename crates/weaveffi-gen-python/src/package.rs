@@ -49,8 +49,18 @@ requires-python = ">=3.8"
 [tool.setuptools]
 packages = ["{import_name}"]
 
+[tool.setuptools.package-data]
+"{import_name}" = ["py.typed", "*.pyi", "*.so", "*.dylib", "*.dll"]
+
 {trailer}"#,
     )
+}
+
+/// Render the PEP 561 `py.typed` marker. Type checkers only look for the
+/// file's presence (its content is ignored unless it says `partial`), so it
+/// carries the standard prelude like every other generated file.
+pub(crate) fn render_py_typed(input_basename: &str) -> String {
+    render_prelude(CommentStyle::Hash, input_basename)
 }
 
 /// Render the plain `setup.py` for a generated (non-packaged) tree.
@@ -141,7 +151,7 @@ setup(
     name="{name}",
     version="{version}",
     packages=["{import_name}"],
-    package_data={{"{import_name}": ["*.so", "*.dylib", "*.dll"]}},
+    package_data={{"{import_name}": ["py.typed", "*.pyi", "*.so", "*.dylib", "*.dll"]}},
     include_package_data=True,
     distclass=_BinaryDistribution,
 )
@@ -150,17 +160,19 @@ setup(
     )
 }
 
-/// README for a packaged per-platform Python wheel tree.
+/// README for a packaged per-platform Python wheel tree. `tag` is the
+/// platform's wheel tag (`platform.python_platform_tag()`), which the caller
+/// has already established exists.
 pub(crate) fn render_packaged_readme(
     package: &ResolvedPackage,
     import_name: &str,
     platform: weaveffi_core::platform::Platform,
+    tag: &str,
     input_basename: &str,
 ) -> String {
     let prelude = render_prelude(CommentStyle::Xml, input_basename);
     let trailer = render_trailer(CommentStyle::Xml, "README.md");
     let name = &package.name;
-    let tag = platform.python_platform_tag();
     format!(
         r#"{prelude}# {name} (Python, {plat})
 

@@ -5,10 +5,15 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 # DO NOT EDIT. Your changes will be overwritten.
 # To regenerate: weaveffi generate weaveffi.yml -o <out>
 
+from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import Callable, Dict, Iterator, List, Optional, Type
 
 class WeaveFFIError(Exception):
+    GENERIC_ERROR_CODE: int
+    PANIC_ERROR_CODE: int
+    MARSHAL_ERROR_CODE: int
+    FOREIGN_ERROR_CODE: int
     code: int
     message: str
     def __init__(self, code: int, message: str) -> None: ...

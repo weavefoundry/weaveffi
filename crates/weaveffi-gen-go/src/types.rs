@@ -14,12 +14,6 @@ pub(crate) fn go_local(n: &str) -> String {
     local_type_name(n).to_upper_camel_case()
 }
 
-/// The Go wrapper type name for a typed-handle referent: `{Name}Handle`.
-/// The suffix keeps the wrapper distinct from the referent's value struct.
-pub(crate) fn handle_wrapper(n: &str) -> String {
-    format!("{}Handle", go_local(n))
-}
-
 /// The Go spelling of a user-chosen parameter name: lowerCamelCase, with a
 /// trailing `_` appended when the conversion lands on a Go keyword (a param
 /// named `type` surfaces as `type_`).
@@ -40,26 +34,29 @@ pub(crate) fn go_type(ty: &Ty) -> String {
         Ty::U16 => "uint16".into(),
         Ty::U32 => "uint32".into(),
         Ty::U64 => "uint64".into(),
-        Ty::I64 | Ty::Handle => "int64".into(),
+        Ty::I64 => "int64".into(),
         Ty::F32 => "float32".into(),
         Ty::F64 => "float64".into(),
         Ty::Bool => "bool".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
-        Ty::Bytes | Ty::BorrowedBytes => "[]byte".into(),
+        Ty::StringUtf8 => "string".into(),
+        Ty::Bytes => "[]byte".into(),
         // Records are plain value structs; rich enums are sealed interfaces
         // (nil-able), so neither takes a pointer at the type site. A
         // cross-module reference (resolved to e.g. `kv.Entry`) must name the
         // local `Entry` type rather than the qualified `KvEntry`.
         Ty::Record(n) | Ty::RichEnum(n) => go_local(n),
+        // An object wrapper is always handled through a pointer so one Go
+        // value owns the strong reference; a callback interface is the Go
+        // interface type the consumer implements.
         Ty::Interface(n) => format!("*{}", go_local(n)),
-        Ty::TypedHandle(n) => format!("*{}", handle_wrapper(n)),
+        Ty::CallbackInterface(n) => go_local(n),
         Ty::Enum(n) => go_local(n),
         Ty::Optional(inner) => {
             if optional_derefs(inner) {
                 format!("*{}", go_type(inner))
             } else {
                 // Already nil-able in Go (interface, slice, map, byte slice,
-                // handle wrapper): nil is the none marker.
+                // object wrapper pointer): nil is the none marker.
                 go_type(inner)
             }
         }
@@ -73,18 +70,12 @@ pub(crate) fn go_type(ty: &Ty) -> String {
 
 /// `true` when `T?` surfaces as `*T` in Go (the value must be dereferenced
 /// when present). Types that are already nil-able (rich enums, slices, maps,
-/// byte slices, typed handles, interfaces) use nil directly as the none
-/// marker instead.
+/// byte slices, object wrapper pointers) use nil directly as the none marker
+/// instead.
 pub(crate) fn optional_derefs(inner: &Ty) -> bool {
     !matches!(
         inner,
-        Ty::RichEnum(_)
-            | Ty::List(_)
-            | Ty::Map(_, _)
-            | Ty::Bytes
-            | Ty::BorrowedBytes
-            | Ty::TypedHandle(_)
-            | Ty::Interface(_)
+        Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) | Ty::Bytes | Ty::Interface(_)
     )
 }
 
@@ -100,11 +91,10 @@ pub(crate) fn go_zero(ty: &Ty) -> String {
         | Ty::U16
         | Ty::U32
         | Ty::U64
-        | Ty::Handle
         | Ty::F32
         | Ty::F64 => "0".into(),
         Ty::Bool => "false".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "\"\"".into(),
+        Ty::StringUtf8 => "\"\"".into(),
         Ty::Enum(_) => "0".into(),
         // A record is a value struct: its zero is the empty literal.
         Ty::Record(n) => format!("{}{{}}", go_local(n)),
@@ -124,7 +114,7 @@ pub(crate) fn c_scalar_type(ty: &Ty, prefix: &str, module: &str) -> Option<Strin
         Ty::U16 => Some("C.uint16_t".into()),
         Ty::U32 => Some("C.uint32_t".into()),
         Ty::U64 => Some("C.uint64_t".into()),
-        Ty::I64 | Ty::Handle => Some("C.int64_t".into()),
+        Ty::I64 => Some("C.int64_t".into()),
         Ty::F32 => Some("C.float".into()),
         Ty::F64 => Some("C.double".into()),
         Ty::Bool => Some("C._Bool".into()),
@@ -159,7 +149,7 @@ pub(crate) fn go_scalar_conv(expr: &str, ty: &Ty) -> String {
         Ty::U16 => format!("uint16({expr})"),
         Ty::U32 => format!("uint32({expr})"),
         Ty::U64 => format!("uint64({expr})"),
-        Ty::I64 | Ty::Handle => format!("int64({expr})"),
+        Ty::I64 => format!("int64({expr})"),
         Ty::F32 => format!("float32({expr})"),
         Ty::F64 => format!("float64({expr})"),
         Ty::Bool => format!("cToBool({expr})"),
@@ -168,14 +158,47 @@ pub(crate) fn go_scalar_conv(expr: &str, ty: &Ty) -> String {
     }
 }
 
-/// The Go expression wrapping an opaque C pointer (`ptr_expr`) into the
-/// wrapper type for an interface or typed-handle reference.
-pub(crate) fn go_wrap_expr(ty: &Ty, ptr_expr: &str) -> String {
-    match ty {
-        Ty::Interface(n) => format!("&{}{{ptr: {ptr_expr}}}", go_local(n)),
-        Ty::TypedHandle(n) => format!("&{}{{ptr: {ptr_expr}}}", handle_wrapper(n)),
-        _ => unreachable!("only interfaces and typed handles wrap C pointers"),
-    }
+/// The name of the per-interface adopt helper (`wvAdoptStore`) that wraps one
+/// owned strong reference in a new wrapper (or returns nil for a null
+/// pointer). `n` may be dot-qualified.
+pub(crate) fn adopt_fn(n: &str) -> String {
+    format!("wvAdopt{}", go_local(n))
+}
+
+/// The name of the per-interface token writer (`wvTokenStore`) that clones a
+/// wrapper's reference into a value-buffer object token.
+pub(crate) fn token_fn(n: &str) -> String {
+    format!("wvToken{}", go_local(n))
+}
+
+/// The name of the per-interface token reader (`wvUntokenStore`) that adopts
+/// the reference carried by a value-buffer object token.
+pub(crate) fn untoken_fn(n: &str) -> String {
+    format!("wvUntoken{}", go_local(n))
+}
+
+/// The Go expression adopting the owned object pointer `ptr_expr` into a
+/// wrapper for the interface named by `ty` (a bare or optional interface).
+/// A null pointer adopts to nil, so the same expression serves `Interface`
+/// and `Interface?`.
+pub(crate) fn go_adopt_expr(ty: &Ty, ptr_expr: &str) -> String {
+    let n = ty
+        .interface_name()
+        .expect("only interfaces and optional interfaces adopt C pointers");
+    format!("{}({ptr_expr})", adopt_fn(n))
+}
+
+/// The C identifier of the process-wide static vtable emitted in the cgo
+/// preamble for the callback interface whose C tag is `c_tag`.
+pub(crate) fn vtable_var(c_tag: &str) -> String {
+    format!("wvVtable_{c_tag}")
+}
+
+/// The C identifier of the static preamble function returning the address
+/// of [`vtable_var`]'s table; Go can't take a `static` variable's address
+/// through cgo directly, so wrappers call this instead.
+pub(crate) fn vtable_accessor(c_tag: &str) -> String {
+    format!("wvVtablePtr_{c_tag}")
 }
 
 /// Quote `s` as a Go string literal, escaping backslashes, quotes, and
@@ -212,12 +235,12 @@ pub(crate) fn cgo_slot_type(ct: &CType, prefix: &str) -> String {
         CType::Bool => "C._Bool".into(),
         CType::Size => "C.size_t".into(),
         CType::Char => "C.char".into(),
-        CType::Handle => format!("C.{prefix}_handle_t"),
         CType::CancelToken => format!("C.{prefix}_cancel_token"),
         CType::Error => format!("C.{prefix}_error"),
         CType::Enum { module, name } | CType::StructTag { module, name } => {
             format!("C.{prefix}_{module}_{name}")
         }
+        CType::VtableTag { module, name } => format!("C.{prefix}_{module}_{name}_vtable"),
         CType::Named(core) => format!("C.{prefix}_{core}"),
         CType::Ptr { pointee, .. } => {
             if **pointee == CType::Void {

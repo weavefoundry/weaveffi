@@ -1,10 +1,14 @@
 //! The emitted Go runtime prelude: bool conversion helpers, the shared
-//! error plumbing, the value-buffer reader/writer pair, and the callback
-//! registry.
+//! error plumbing, the value-buffer reader/writer pair, and the foreign-error
+//! reporter callback-interface trampolines use.
 
 use weaveffi_core::cabi::ABI_VERSION;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
+
+/// The runtime error code a callback-interface trampoline reports when the
+/// Go implementation panicked (`FOREIGN_ERROR_CODE` in the ABI contract).
+pub(crate) const FOREIGN_ERROR_CODE: i32 = -4;
 
 /// Emit the package `init` that compares the producer's exported
 /// `weaveffi_abi_version()` against the revision these bindings were
@@ -43,17 +47,25 @@ pub(crate) fn render_bool_helpers(out: &mut String) {
 }
 
 /// The shared error plumbing: the generic [`ERROR_BRAND`] struct implementing
-/// `error` (unknown codes, marshalling failures), plus the `wvTakeError` slot
-/// reader (returning code, message, and a copy of the structured payload
-/// buffer), the `wvBrandError` constructor, and the `wvTrap` panic helper
-/// non-throwing wrappers check their slot with.
+/// `error` (unknown codes, marshalling failures, producer panics, and foreign
+/// callback failures), plus the `wvTakeError` slot reader (returning code,
+/// message, and a copy of the structured payload buffer), the `wvBrandError`
+/// constructor, and the `wvTrap` panic helper non-throwing wrappers check
+/// their slot with (it panics with a `*WeaveFFIError` value rather than a
+/// bare string so a `recover()` site can still read the code).
+///
+/// The runtime's negative codes (`-1` generic, `-2` producer panic, `-3`
+/// marshalling failure, `-4` a Go callback-interface implementation
+/// panicked) all surface through the brand error: the code is preserved on
+/// the value so a caller can still tell them apart.
 pub(crate) fn render_error_infra(out: &mut String) {
     let mut w = CodeWriter::tabs();
     w.line(format!(
         "// {ERROR_BRAND} reports a failure crossing the C boundary that no typed"
     ));
-    w.line("// error domain claims: an unknown code, a marshalling failure, or a");
-    w.line("// producer panic.");
+    w.line("// error domain claims: an unknown code, a marshalling failure, a");
+    w.line("// producer panic (code -2), or a Go callback-interface implementation");
+    w.line("// that panicked (code -4).");
     w.block(format!("type {ERROR_BRAND} struct {{"), "}", |w| {
         w.line("// Code is the numeric ABI error code.");
         w.line("Code int32");
@@ -130,11 +142,14 @@ pub(crate) fn render_error_infra(out: &mut String) {
 
     w.line("// wvTrap panics when the C error slot reports a failure. Non-throwing");
     w.line("// wrappers check their slot with it: a non-zero code there can only be");
-    w.line("// a producer panic or a marshalling failure.");
+    w.line("// a producer panic, a marshalling failure, or a callback-interface");
+    w.line(format!(
+        "// implementation that panicked. The panic value is a *{ERROR_BRAND}, so a"
+    ));
+    w.line("// recover() site can still inspect the code.");
     w.block("func wvTrap(cErr *C.weaveffi_error) {", "}", |w| {
         w.block("if cErr.code != 0 {", "}", |w| {
-            w.line("code, msg, _ := wvTakeError(cErr)");
-            w.line("panic(fmt.Sprintf(\"weaveffi: %s (code %d)\", msg, code))");
+            w.line("panic(wvBrandError(wvTakeError(cErr)))");
         });
     });
     w.blank();
@@ -393,53 +408,29 @@ pub(crate) fn render_buffer_runtime(out: &mut String) {
     out.push_str(&w.finish());
 }
 
-/// The registry mapping opaque context ids to Go callbacks/channels. Only the
-/// integer id (never a Go pointer) crosses the C boundary as `void*`, so the
-/// GC stays unaware of C-held references and trampolines recover the Go value
-/// from the map.
-pub(crate) fn render_callback_registry(out: &mut String, has_listeners: bool) {
+/// The `wvForeignError` reporter every callback-interface trampoline calls
+/// from its `recover` path: it formats the recovered panic value and hands a
+/// borrowed C string to `weaveffi_error_set` with [`FOREIGN_ERROR_CODE`].
+/// The producer copies the message, so the C string is freed before
+/// returning, and the trampoline itself returns its zero value; the panic
+/// never unwinds through the C frame. Like every other runtime symbol the
+/// bindings call, the helper keeps its canonical `weaveffi_` spelling.
+pub(crate) fn render_foreign_error(out: &mut String) {
     let mut w = CodeWriter::tabs();
-    w.block("var (", ")", |w| {
-        w.line("wvCallbackMu  sync.Mutex");
-        w.line("wvCallbackSeq uint64");
-        w.line("wvCallbacks   = map[uint64]interface{}{}");
-        if has_listeners {
-            w.line("// Subscription id -> registry id, so unregister can release the Go callback.");
-            w.line("wvListenerCtx = map[uint64]uint64{}");
-        }
-    });
-    w.blank();
-
-    w.block("func wvCallbackStore(v interface{}) uint64 {", "}", |w| {
-        w.line("wvCallbackMu.Lock()");
-        w.line("defer wvCallbackMu.Unlock()");
-        w.line("wvCallbackSeq++");
-        w.line("wvCallbacks[wvCallbackSeq] = v");
-        w.line("return wvCallbackSeq");
-    });
-    w.blank();
-
-    w.block("func wvCallbackLoad(id uint64) interface{} {", "}", |w| {
-        w.line("wvCallbackMu.Lock()");
-        w.line("defer wvCallbackMu.Unlock()");
-        w.line("return wvCallbacks[id]");
-    });
-    w.blank();
-
-    w.block("func wvCallbackTake(id uint64) interface{} {", "}", |w| {
-        w.line("wvCallbackMu.Lock()");
-        w.line("defer wvCallbackMu.Unlock()");
-        w.line("v := wvCallbacks[id]");
-        w.line("delete(wvCallbacks, id)");
-        w.line("return v");
-    });
-    w.blank();
-
-    w.block("func wvCallbackDelete(id uint64) {", "}", |w| {
-        w.line("wvCallbackMu.Lock()");
-        w.line("defer wvCallbackMu.Unlock()");
-        w.line("delete(wvCallbacks, id)");
-    });
+    w.line("// wvForeignError reports a panic recovered inside a callback-interface");
+    w.line("// trampoline through the producer's error slot (code -4). The message is");
+    w.line("// borrowed for the call: the producer copies it with its own allocator.");
+    w.block(
+        "func wvForeignError(outErr *C.weaveffi_error, recovered any) {",
+        "}",
+        |w| {
+            w.line("msg := C.CString(fmt.Sprint(recovered))");
+            w.line("defer C.free(unsafe.Pointer(msg))");
+            w.line(format!(
+                "C.weaveffi_error_set(outErr, {FOREIGN_ERROR_CODE}, msg)"
+            ));
+        },
+    );
     w.blank();
     out.push_str(&w.finish());
 }

@@ -1,6 +1,6 @@
 //! The validation rules: per-module name/uniqueness checks, type-reference
-//! existence, ABI-representability of element shapes, callback parameter
-//! marshalability, interface shape rules, and error-domain consistency.
+//! existence, ABI-representability of element shapes, callback-interface
+//! shape rules, interface positions, and error-domain consistency.
 //!
 //! Every rule pushes into a shared `Vec<ValidationError>` sink instead of
 //! returning early, so one validation pass reports every violation in the
@@ -8,7 +8,9 @@
 
 use super::ValidationError;
 use std::collections::{BTreeMap, BTreeSet};
-use weaveffi_ir::ir::{ErrorDomain, Function, InterfaceDef, Module, Param, StructField, TypeRef};
+use weaveffi_ir::ir::{
+    CallbackInterfaceDef, ErrorDomain, Function, InterfaceDef, Module, Param, StructField, TypeRef,
+};
 
 const RESERVED: &[&str] = &[
     "if", "else", "for", "while", "loop", "match", "type", "return", "async", "await", "break",
@@ -45,10 +47,13 @@ fn check_identifier(name: &str, errors: &mut Vec<ValidationError>) -> bool {
 /// positional rules consult this index to learn what a name is.
 #[derive(Default)]
 pub(super) struct TypeIndex {
-    /// Bare names of every struct, enum, and interface anywhere in the API.
+    /// Bare names of every struct, enum, interface, and callback interface
+    /// anywhere in the API.
     pub all: BTreeSet<String>,
     /// Bare names of every interface anywhere in the API.
     pub interfaces: BTreeSet<String>,
+    /// Bare names of every callback interface anywhere in the API.
+    pub callback_interfaces: BTreeSet<String>,
     /// Bare names of every C-style (payload-free) enum anywhere in the API.
     pub plain_enums: BTreeSet<String>,
 }
@@ -75,6 +80,10 @@ impl TypeIndex {
                 self.all.insert(i.name.clone());
                 self.interfaces.insert(i.name.clone());
             }
+            for cb in &m.callback_interfaces {
+                self.all.insert(cb.name.clone());
+                self.callback_interfaces.insert(cb.name.clone());
+            }
             self.walk(&m.modules);
         }
     }
@@ -84,15 +93,20 @@ impl TypeIndex {
         self.interfaces.contains(bare(name))
     }
 
-    /// Does a struct, enum, or interface with this (bare or dot-qualified)
-    /// name exist anywhere in the API?
+    /// Is `name` (bare or dot-qualified) a callback interface?
+    fn is_callback_interface(&self, name: &str) -> bool {
+        self.callback_interfaces.contains(bare(name))
+    }
+
+    /// Does a declaration with this (bare or dot-qualified) name exist
+    /// anywhere in the API?
     fn exists(&self, name: &str) -> bool {
         self.all.contains(bare(name))
     }
 
     /// May `ty` be a map key? Every target must be able to use the key in
     /// its native dictionary idiom, so only scalars, bools, strings, and
-    /// C-style enums qualify; composites, optionals, bytes, and handles are
+    /// C-style enums qualify; composites, optionals, bytes, and objects are
     /// rejected.
     fn is_map_key(&self, ty: &TypeRef) -> bool {
         match ty {
@@ -107,8 +121,27 @@ impl TypeIndex {
             | TypeRef::F32
             | TypeRef::F64
             | TypeRef::Bool
-            | TypeRef::StringUtf8
-            | TypeRef::BorrowedStr => true,
+            | TypeRef::StringUtf8 => true,
+            TypeRef::Named(name) => self.plain_enums.contains(bare(name)),
+            _ => false,
+        }
+    }
+
+    /// May `ty` be returned from a callback-interface method? Only `void`
+    /// and the direct family: scalars, bool, and C-style enums.
+    fn is_direct(&self, ty: &TypeRef) -> bool {
+        match ty {
+            TypeRef::I8
+            | TypeRef::I16
+            | TypeRef::I32
+            | TypeRef::U8
+            | TypeRef::U16
+            | TypeRef::U32
+            | TypeRef::I64
+            | TypeRef::U64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Bool => true,
             TypeRef::Named(name) => self.plain_enums.contains(bare(name)),
             _ => false,
         }
@@ -121,8 +154,8 @@ fn bare(name: &str) -> &str {
 }
 
 /// Enforce global bare-name uniqueness for the type namespace: structs,
-/// enums, interfaces, and error domains across every module (including
-/// nested submodules).
+/// enums, interfaces, callback interfaces, and error domains across every
+/// module (including nested submodules).
 ///
 /// Generators emit flat per-language type names, and unqualified cross-module
 /// references resolve by bare name, so two types sharing a name would collide
@@ -146,6 +179,7 @@ pub(super) fn check_global_type_names(modules: &[Module], errors: &mut Vec<Valid
                 .map(|s| s.name.as_str())
                 .chain(m.enums.iter().map(|e| e.name.as_str()))
                 .chain(m.interfaces.iter().map(|i| i.name.as_str()))
+                .chain(m.callback_interfaces.iter().map(|c| c.name.as_str()))
                 .chain(m.errors.iter().map(|d| d.name.as_str()));
             for name in names {
                 if let Some(first) = seen.get(name) {
@@ -229,8 +263,8 @@ pub(super) fn validate_module(
     let has_domain = ancestor_has_domain || module.errors.is_some();
 
     // Every C symbol suffix a module-level callable claims: free functions,
-    // interface members, and implicit destructors. Two entries with the same
-    // suffix would produce two identical C symbols.
+    // interface members, and the implicit clone/destroy pair. Two entries
+    // with the same suffix would produce two identical C symbols.
     let mut symbol_suffixes: BTreeSet<String> = BTreeSet::new();
     let mut claim_symbol = |suffix: String, errors: &mut Vec<ValidationError>| {
         if !symbol_suffixes.insert(suffix.clone()) {
@@ -334,28 +368,36 @@ pub(super) fn validate_module(
                 name: i.name.clone(),
             });
         }
+        claim_symbol(format!("{}_clone", i.name), errors);
         claim_symbol(format!("{}_destroy", i.name), errors);
         validate_interface(module, i, has_domain, &mut claim_symbol, errors);
     }
 
-    // A field of a record, a rich-enum variant, or an error payload is
-    // serialized inside a value buffer, so it obeys the buffered positional
-    // rules: no borrowed views, no iterators, no interfaces, and every
-    // reference must resolve.
-    let mut check_buffered_field = |f: &StructField, location: &dyn Fn() -> String| {
-        if let Some(ty) = contains_borrowed(&f.ty) {
-            errors.push(ValidationError::BorrowedTypeInInvalidPosition {
-                ty: ty.to_string(),
-                location: location(),
+    let mut callback_names = BTreeSet::new();
+    for cb in &module.callback_interfaces {
+        check_identifier(&cb.name, errors);
+        if !callback_names.insert(cb.name.clone()) {
+            errors.push(ValidationError::DuplicateCallbackInterfaceName {
+                module: module.name.clone(),
+                name: cb.name.clone(),
             });
         }
+        validate_callback_interface(module, cb, types, errors);
+    }
+
+    // A field of a record, a rich-enum variant, or an error payload is
+    // serialized inside a value buffer, so it obeys the buffered positional
+    // rules: no iterators, no callback interfaces, no interface map keys, and
+    // every reference must resolve.
+    let mut check_buffered_field = |f: &StructField, location: &dyn Fn() -> String| {
         if contains_iterator(&f.ty) {
             errors.push(ValidationError::IteratorInInvalidPosition {
                 location: location(),
             });
         }
         validate_type_ref(&f.ty, types, errors);
-        check_interface_positions(&f.ty, types, false, location, errors);
+        check_interface_positions(&f.ty, types, location, errors);
+        check_no_callback_interface(&f.ty, types, location, errors);
     };
     for s in &module.structs {
         for f in &s.fields {
@@ -391,52 +433,6 @@ pub(super) fn validate_module(
         for f in i.constructors.iter().chain(&i.methods).chain(&i.statics) {
             let display = format!("{}.{}", i.name, f.name);
             validate_callable_types(&module.name, &display, f, types, errors);
-        }
-    }
-
-    let mut callback_names = BTreeSet::new();
-    for cb in &module.callbacks {
-        check_identifier(&cb.name, errors);
-        if !callback_names.insert(cb.name.clone()) {
-            errors.push(ValidationError::DuplicateCallbackName {
-                module: module.name.clone(),
-                name: cb.name.clone(),
-            });
-        }
-        for p in &cb.params {
-            validate_param(p, errors);
-            validate_type_ref(&p.ty, types, errors);
-            if references_interface(&p.ty, types) {
-                errors.push(ValidationError::InterfaceInInvalidPosition {
-                    name: user_name_in(&p.ty),
-                    location: format!("param '{}' of callback '{}'", p.name, cb.name),
-                });
-            } else if !callback_param_type_supported(&p.ty) {
-                errors.push(ValidationError::UnsupportedCallbackParamType {
-                    module: module.name.clone(),
-                    callback: cb.name.clone(),
-                    param: p.name.clone(),
-                    ty: p.ty.to_string(),
-                });
-            }
-        }
-    }
-
-    let mut listener_names = BTreeSet::new();
-    for l in &module.listeners {
-        check_identifier(&l.name, errors);
-        if !listener_names.insert(l.name.clone()) {
-            errors.push(ValidationError::DuplicateListenerName {
-                module: module.name.clone(),
-                name: l.name.clone(),
-            });
-        }
-        if !callback_names.contains(&l.event_callback) {
-            errors.push(ValidationError::ListenerCallbackNotFound {
-                module: module.name.clone(),
-                listener: l.name.clone(),
-                callback: l.event_callback.clone(),
-            });
         }
     }
 
@@ -504,6 +500,85 @@ fn validate_interface(
     }
 }
 
+/// Validate a callback interface: at least one method, unique method names,
+/// and per-method restrictions. A callback method is implemented by the
+/// consumer, so it is synchronous, never throws, never takes a cancel token,
+/// returns nothing or a direct value, and takes no callback interface or
+/// iterator as a parameter.
+fn validate_callback_interface(
+    module: &Module,
+    cb: &CallbackInterfaceDef,
+    types: &TypeIndex,
+    errors: &mut Vec<ValidationError>,
+) {
+    if cb.methods.is_empty() {
+        errors.push(ValidationError::EmptyCallbackInterface {
+            module: module.name.clone(),
+            name: cb.name.clone(),
+        });
+    }
+    let mut method_names = BTreeSet::new();
+    for m in &cb.methods {
+        check_identifier(&m.name, errors);
+        if !method_names.insert(m.name.clone()) {
+            errors.push(ValidationError::DuplicateCallbackMethod {
+                interface: cb.name.clone(),
+                name: m.name.clone(),
+            });
+        }
+        let reject = |reason: &'static str, errors: &mut Vec<ValidationError>| {
+            errors.push(ValidationError::InvalidCallbackMethod {
+                interface: cb.name.clone(),
+                method: m.name.clone(),
+                reason,
+            });
+        };
+        if m.r#async {
+            reject("cannot be async", errors);
+        }
+        if m.throws {
+            reject("cannot declare throws", errors);
+        }
+        if m.cancellable {
+            reject("cannot be cancellable", errors);
+        }
+        if let Some(ret) = &m.returns {
+            validate_type_ref(ret, types, errors);
+            if !types.is_direct(ret) {
+                reject(
+                    "must return nothing or a direct value (scalar, bool, or C-style enum)",
+                    errors,
+                );
+            }
+        }
+        let mut param_names = BTreeSet::new();
+        for p in &m.params {
+            validate_param(p, errors);
+            if !param_names.insert(p.name.clone()) {
+                errors.push(ValidationError::DuplicateParamName {
+                    module: module.name.clone(),
+                    function: format!("{}.{}", cb.name, m.name),
+                    param: p.name.clone(),
+                });
+            }
+            let location = || {
+                format!(
+                    "param '{}' of callback interface method '{}.{}'",
+                    p.name, cb.name, m.name
+                )
+            };
+            if contains_iterator(&p.ty) {
+                errors.push(ValidationError::IteratorInInvalidPosition {
+                    location: location(),
+                });
+            }
+            validate_type_ref(&p.ty, types, errors);
+            check_interface_positions(&p.ty, types, location, errors);
+            check_no_callback_interface(&p.ty, types, location, errors);
+        }
+    }
+}
+
 /// Name-level checks for one callable: a valid identifier, unique parameter
 /// names, and an error domain in scope when the callable declares `throws`.
 fn validate_function(
@@ -535,9 +610,9 @@ fn validate_function(
     }
 }
 
-/// Type-level checks for one callable's parameters and return: iterator and
-/// borrowed positions, async-iterator exclusion, reference existence, element
-/// shapes, and interface positions.
+/// Type-level checks for one callable's parameters and return: iterator
+/// positions, async-iterator exclusion, reference existence, element shapes,
+/// interface map keys, and callback-interface positions.
 fn validate_callable_types(
     module_name: &str,
     display_name: &str,
@@ -557,46 +632,17 @@ fn validate_callable_types(
                 location: location(),
             });
         }
-        // A borrowed view is valid only as the parameter's own type; inside a
-        // composite it would end up serialized in a value buffer, which
-        // cannot hold a borrow.
-        if !matches!(p.ty, TypeRef::BorrowedStr | TypeRef::BorrowedBytes) {
-            if let Some(ty) = contains_borrowed(&p.ty) {
-                errors.push(ValidationError::BorrowedTypeInInvalidPosition {
-                    ty: ty.to_string(),
-                    location: location(),
-                });
-            }
-        }
-        // `mutable: true` needs a write-back lowering, which only the string
-        // and bytes pointer shapes have. Buffered types are borrowed
-        // serialized copies; mutating the copy could never reach the caller.
-        if p.mutable
-            && !matches!(
-                p.ty,
-                TypeRef::StringUtf8
-                    | TypeRef::Bytes
-                    | TypeRef::BorrowedStr
-                    | TypeRef::BorrowedBytes
-            )
-        {
-            errors.push(ValidationError::MutableParamUnsupported {
-                function: format!("{module_name}::{display_name}"),
-                param: p.name.clone(),
-                ty: p.ty.to_string(),
-            });
-        }
         validate_type_ref(&p.ty, types, errors);
-        check_interface_positions(&p.ty, types, true, location, errors);
+        check_interface_positions(&p.ty, types, location, errors);
+        // A bare callback interface is the one legal callback position;
+        // anything nested (`Listener?`, `[Listener]`) is not.
+        match &p.ty {
+            TypeRef::Named(name) if types.is_callback_interface(name) => {}
+            other => check_no_callback_interface(other, types, location, errors),
+        }
     }
     if let Some(ret) = &f.returns {
         let location = || format!("return type of {module_name}::{display_name}");
-        if let Some(ty) = contains_borrowed(ret) {
-            errors.push(ValidationError::BorrowedTypeInInvalidPosition {
-                ty: ty.to_string(),
-                location: location(),
-            });
-        }
         // An async function completes through a one-shot callback; an
         // iterator needs a pull-based handle. The two shapes cannot
         // compose on the C ABI, so reject the combination up front
@@ -607,8 +653,21 @@ fn validate_callable_types(
                 function: display_name.to_string(),
             });
         }
+        // An iterator is a pull handle, valid only as the outermost return
+        // shape: `[iter<T>]`, `iter<T>?`, `iter<iter<T>>`, and iterators
+        // inside a map have no lowering.
+        let nested_iterator = match ret {
+            TypeRef::Iterator(elem) => contains_iterator(elem),
+            other => contains_iterator(other),
+        };
+        if nested_iterator {
+            errors.push(ValidationError::IteratorInInvalidPosition {
+                location: format!("nested inside the {}", location()),
+            });
+        }
         validate_type_ref(ret, types, errors);
-        check_interface_positions(ret, types, true, location, errors);
+        check_interface_positions(ret, types, location, errors);
+        check_no_callback_interface(ret, types, location, errors);
     }
 }
 
@@ -616,118 +675,63 @@ fn validate_param(p: &Param, errors: &mut Vec<ValidationError>) {
     check_identifier(&p.name, errors);
 }
 
-/// Whether a type may appear as a callback parameter. Callback arguments
-/// cross the boundary *into* the foreign language, either as a direct slot
-/// (scalars, strings, bytes, handles) or as a borrowed serialized buffer
-/// (records, rich enums, optionals, lists, maps), so nearly everything is
-/// marshalable. The exceptions: iterators have no callback protocol, and a
-/// borrowed view can appear only as the parameter's own type (a buffer
-/// cannot hold a borrow). Interfaces are rejected separately.
-fn callback_param_type_supported(ty: &TypeRef) -> bool {
-    if contains_iterator(ty) {
-        return false;
-    }
-    match ty {
-        TypeRef::BorrowedStr | TypeRef::BorrowedBytes => true,
-        _ => contains_borrowed(ty).is_none(),
-    }
-}
-
-/// Does `ty` reference an interface anywhere in its structure? Used for
-/// positions where interfaces are wholly disallowed (callback parameters).
-fn references_interface(ty: &TypeRef, types: &TypeIndex) -> bool {
-    match ty {
-        TypeRef::Named(name) => types.is_interface(name),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            references_interface(inner, types)
-        }
-        TypeRef::Map(k, v) => references_interface(k, types) || references_interface(v, types),
-        _ => false,
-    }
-}
-
-/// The innermost user-type name inside `ty` for an error message, falling
-/// back to the IDL spelling for shapes without one.
-fn user_name_in(ty: &TypeRef) -> String {
-    match ty {
-        TypeRef::Named(name) => name.clone(),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            user_name_in(inner)
-        }
-        other => other.to_string(),
-    }
-}
-
-/// Enforce where an interface reference may appear. With `top` true (a
-/// function parameter or return), a bare interface or an optional interface
-/// is allowed; anywhere deeper (collection elements, map keys/values,
-/// iterator elements, struct fields via `top` false) is rejected: an
-/// interface is a live object reference, and element positions imply deep
-/// copies the object cannot provide.
+/// Enforce the one place an interface reference may not appear: as a map
+/// key. Objects are reference-counted tokens, so they compose with every
+/// other buffered shape (fields, elements, map values, optionals), but no
+/// target can hash an object by identity in a way that survives the ABI.
 fn check_interface_positions(
     ty: &TypeRef,
     types: &TypeIndex,
-    top: bool,
     location: impl Fn() -> String + Copy,
     errors: &mut Vec<ValidationError>,
 ) {
-    match ty {
-        TypeRef::Named(name) => {
-            if types.is_interface(name) && !top {
-                errors.push(ValidationError::InterfaceInInvalidPosition {
+    ty.walk(&mut |t| {
+        if let TypeRef::Map(k, _) = t {
+            if let TypeRef::Named(name) = &**k {
+                if types.is_interface(name) {
+                    errors.push(ValidationError::InterfaceInInvalidPosition {
+                        name: name.clone(),
+                        location: format!("map key of {}", location()),
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// Reject any callback-interface reference reachable from `ty`. Callers that
+/// permit a bare top-level callback interface unwrap it before calling.
+fn check_no_callback_interface(
+    ty: &TypeRef,
+    types: &TypeIndex,
+    location: impl Fn() -> String + Copy,
+    errors: &mut Vec<ValidationError>,
+) {
+    ty.walk(&mut |t| {
+        if let TypeRef::Named(name) = t {
+            if types.is_callback_interface(name) {
+                errors.push(ValidationError::CallbackInterfaceInInvalidPosition {
                     name: name.clone(),
                     location: location(),
                 });
             }
         }
-        // A typed handle names a token *type tag*, not an object; pointing
-        // one at an interface would conflate u64 tokens with object pointers.
-        TypeRef::TypedHandle(name) => {
-            if types.is_interface(name) {
-                errors.push(ValidationError::InterfaceInInvalidPosition {
-                    name: name.clone(),
-                    location: format!("typed handle in {}", location()),
-                });
-            }
-        }
-        // Optionality does not change the position: `Store?` is still a
-        // top-level object reference.
-        TypeRef::Optional(inner) => check_interface_positions(inner, types, top, location, errors),
-        TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            check_interface_positions(inner, types, false, location, errors);
-        }
-        TypeRef::Map(k, v) => {
-            check_interface_positions(k, types, false, location, errors);
-            check_interface_positions(v, types, false, location, errors);
-        }
-        _ => {}
-    }
-}
-
-fn contains_borrowed(ty: &TypeRef) -> Option<&'static str> {
-    match ty {
-        TypeRef::BorrowedStr => Some("&str"),
-        TypeRef::BorrowedBytes => Some("&[u8]"),
-        TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
-            contains_borrowed(inner)
-        }
-        TypeRef::Map(k, v) => contains_borrowed(k).or_else(|| contains_borrowed(v)),
-        _ => None,
-    }
+    });
 }
 
 fn contains_iterator(ty: &TypeRef) -> bool {
-    match ty {
-        TypeRef::Iterator(_) => true,
-        TypeRef::Optional(inner) | TypeRef::List(inner) => contains_iterator(inner),
-        TypeRef::Map(k, v) => contains_iterator(k) || contains_iterator(v),
-        _ => false,
-    }
+    let mut found = false;
+    ty.walk(&mut |t| {
+        if matches!(t, TypeRef::Iterator(_)) {
+            found = true;
+        }
+    });
+    found
 }
 
 fn validate_type_ref(ty: &TypeRef, types: &TypeIndex, errors: &mut Vec<ValidationError>) {
     match ty {
-        TypeRef::Named(name) | TypeRef::TypedHandle(name) => {
+        TypeRef::Named(name) => {
             if !types.exists(name) {
                 errors.push(ValidationError::UnknownTypeRef { name: name.clone() });
             }
@@ -758,6 +762,7 @@ fn validate_error_domain(
         errors.push(ValidationError::ErrorDomainMissingName(module.name.clone()));
         return;
     }
+    check_identifier(&domain.name, errors);
     if function_names.contains(&domain.name) {
         errors.push(ValidationError::NameCollisionWithErrorDomain {
             module: module.name.clone(),
@@ -768,9 +773,11 @@ fn validate_error_domain(
     let mut by_name: BTreeSet<String> = BTreeSet::new();
     let mut by_code: BTreeMap<i32, String> = BTreeMap::new();
     for c in &domain.codes {
+        check_identifier(&c.name, errors);
         // 0 means success and the whole negative range is reserved for the
-        // runtime (-1 generic error, -2 panic, -3 marshalling failure, and
-        // room to grow), so domain codes must be positive.
+        // runtime (-1 generic error, -2 panic, -3 marshalling failure, -4
+        // foreign callback error, and room to grow), so domain codes must be
+        // positive.
         if c.code <= 0 {
             errors.push(ValidationError::InvalidErrorCode {
                 module: module.name.clone(),

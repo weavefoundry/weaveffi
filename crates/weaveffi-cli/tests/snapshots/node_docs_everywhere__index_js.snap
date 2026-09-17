@@ -56,6 +56,18 @@ function __invokeAsync(fn, args, map) {
   });
 }
 
+// Borrow a live object wrapper's native handle for one call. The wrapper
+// keeps its own reference; the producer clones if it retains the object.
+function __borrow(o, cls) {
+  if (!(o instanceof cls)) {
+    throw new WeaveFFIError(-3, 'expected an instance of ' + cls.name);
+  }
+  if (!o._handle) {
+    throw new WeaveFFIError(-3, cls.name + ' used after close()');
+  }
+  return o._handle;
+}
+
 // --- Private value-buffer runtime (WeaveFFI wire format) --------------------
 // Little-endian, packed, no alignment. Decoders reject truncated buffers,
 // invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
@@ -185,7 +197,7 @@ function __packDocument(w, v) {
 }
 function __unpackDocument(r) {
   return {
-    id: Number(r.i64()),
+    id: r.i64(),
     title: r.str(),
     status: r.i32(),
     tags: __rList(r, (r) => r.str()),
@@ -222,41 +234,66 @@ function __docsErrorFrom(code, message, payload) {
   return _err;
 }
 
+wv.Status = Object.freeze({
+  Draft: 0,
+  Published: 1,
+  Archived: 2,
+  0: 'Draft',
+  1: 'Published',
+  2: 'Archived',
+});
+function __adaptSavedListener(impl) {
+  if (impl === null || impl === undefined) {
+    throw new WeaveFFIError(-3, 'SavedListener implementation must be an object');
+  }
+  return {
+    on_saved(docId, revision) {
+      return impl.onSaved(docId, revision);
+    },
+  };
+}
+
 class Notebook {
   constructor() {
     this._handle = __invoke(addon.Notebook_new, [], __generic);
     Notebook._cleanup.register(this, this._handle, this);
   }
   insert(document) {
-    return __invoke(addon.Notebook_insert, [this._handle, __encode(__packDocument, document)], __generic);
+    return __invoke(addon.Notebook_insert, [__borrow(this, Notebook), __encode(__packDocument, document)], __generic);
   }
   find(id) {
-    const _r = __invoke(addon.Notebook_find, [this._handle, id], __docsErrorFrom);
+    const _r = __invoke(addon.Notebook_find, [__borrow(this, Notebook), id], __docsErrorFrom);
     return __decode(__unpackDocument, _r);
   }
   size() {
-    return __invoke(addon.Notebook_size, [this._handle], __generic);
+    return __invoke(addon.Notebook_size, [__borrow(this, Notebook)], __generic);
   }
   static maxDocuments() {
     return __invoke(addon.Notebook_max_documents, [], __generic);
   }
-  destroy() {
+  close() {
     if (this._handle) {
       Notebook._cleanup.unregister(this);
-      addon.Notebook_destroy(this._handle);
-      this._handle = 0;
+      addon.Notebook__destroy(this._handle);
+      this._handle = 0n;
     }
   }
+  _cloneHandle() {
+    return addon.Notebook__clone(__borrow(this, Notebook));
+  }
 }
-Notebook._fromHandle = function (handle) {
+Notebook._adopt = function (handle) {
   const _o = Object.create(Notebook.prototype);
   _o._handle = handle;
   Notebook._cleanup.register(_o, handle, _o);
   return _o;
 };
 Notebook._cleanup = new FinalizationRegistry((handle) => {
-  if (handle) { addon.Notebook_destroy(handle); }
+  if (handle) { addon.Notebook__destroy(handle); }
 });
+if (typeof Symbol.dispose === 'symbol') {
+  Notebook.prototype[Symbol.dispose] = Notebook.prototype.close;
+}
 wv.Notebook = Notebook;
 
 wv.createDocument = function (title, tags) {
@@ -269,6 +306,9 @@ wv.getDocument = function (id) {
 };
 wv.publishAsync = function (id) {
   return __invokeAsync(addon.publishAsync, [id], __generic);
+};
+wv.watch = function (listener) {
+  return __invoke(addon.watch, [__adaptSavedListener(listener)], __generic);
 };
 
 module.exports = wv;

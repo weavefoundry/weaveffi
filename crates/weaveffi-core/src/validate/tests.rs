@@ -70,21 +70,29 @@ modules:
         - { name: Bad, code: 2, message: "bad", fields: [{ name: why, type: string }] }
     interfaces:
       - name: Store
-        constructors: [{ name: open, params: [{ name: path, type: "&str" }] }]
+        constructors: [{ name: open, params: [{ name: path, type: string }] }]
         methods:
           - { name: get, params: [{ name: k, type: string }], return: "Point?", throws: true }
           - { name: scan, params: [], return: "iter<Point>" }
+          - { name: stores, params: [], return: "iter<Store>" }
           - { name: sibling, params: [{ name: other, type: "Store?" }], return: Store }
+          - { name: children, params: [], return: "[Store]" }
+          - { name: by_name, params: [], return: "{string:Store}" }
+          - { name: watch, params: [{ name: listener, type: PointListener }] }
         statics: [{ name: version, params: [], return: string }]
-    callbacks:
-      - name: on_point
-        params: [{ name: p, type: Point }, { name: raw, type: "&[u8]" }]
-    listeners:
-      - { name: points, event_callback: on_point }
+    structs:
+      - name: Owner
+        fields: [{ name: store, type: "Store?" }, { name: all, type: "[Store]" }]
+    callback_interfaces:
+      - name: PointListener
+        methods:
+          - name: on_point
+            params: [{ name: p, type: Point }, { name: raw, type: bytes }, { name: from, type: Store }]
+          - { name: wants_more, params: [{ name: seen, type: u32 }], return: bool }
+          - { name: status, params: [], return: Status }
     functions:
       - { name: fetch, params: [{ name: id, type: i64 }], return: "[Point]", async: true, cancellable: true }
-      - { name: token, params: [], return: "handle<Point>" }
-      - { name: rename, params: [{ name: s, type: string, mutable: true }] }
+      - { name: subscribe, params: [{ name: l, type: PointListener }, { name: s, type: Store }] }
     modules:
       - name: inner
         functions:
@@ -220,6 +228,17 @@ modules:
 modules:
   - name: m
     functions: [{ name: Store_destroy, params: [] }]
+    interfaces:
+      - name: Store
+        methods: [{ name: get, params: [] }]
+"#,
+        ),
+        (
+            "AbiSymbolCollision",
+            r#"
+modules:
+  - name: m
+    functions: [{ name: Store_clone, params: [] }]
     interfaces:
       - name: Store
         methods: [{ name: get, params: [] }]
@@ -375,7 +394,7 @@ modules:
 modules:
   - name: m
     interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    structs: [{ name: S, fields: [{ name: i, type: I }] }]
+    functions: [{ name: f, params: [{ name: xs, type: "{I:i32}" }] }]
 "#,
         ),
         (
@@ -384,25 +403,7 @@ modules:
 modules:
   - name: m
     interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [{ name: xs, type: "[I]" }] }]
-"#,
-        ),
-        (
-            "InterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    functions: [{ name: f, params: [], return: "handle<I>" }]
-"#,
-        ),
-        (
-            "InterfaceInInvalidPosition",
-            r#"
-modules:
-  - name: m
-    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
-    callbacks: [{ name: cb, params: [{ name: i, type: I }] }]
+    structs: [{ name: S, fields: [{ name: m, type: "{I:i32}" }] }]
 "#,
         ),
         (
@@ -411,7 +412,7 @@ modules:
         ),
         (
             "UnknownTypeRef",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: 'handle<Nope>' }] }]",
+            "modules: [{ name: m, functions: [{ name: f, params: [], return: '[Nope?]' }] }]",
         ),
         (
             "InvalidMapKey",
@@ -438,45 +439,92 @@ modules:
             "modules: [{ name: m, functions: [{ name: f, params: [], return: '{bytes:i32}' }] }]",
         ),
         (
-            "BorrowedTypeInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [], return: '&str' }] }]",
-        ),
-        (
-            "BorrowedTypeInInvalidPosition",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: x, type: '[&str]' }] }] }]",
-        ),
-        (
-            "BorrowedTypeInInvalidPosition",
-            "modules: [{ name: m, structs: [{ name: S, fields: [{ name: x, type: '&[u8]' }] }] }]",
-        ),
-        (
-            "DuplicateCallbackName",
+            "DuplicateCallbackInterfaceName",
             r#"
 modules:
   - name: m
-    callbacks: [{ name: cb, params: [] }, { name: cb, params: [] }]
+    callback_interfaces:
+      - { name: L, methods: [{ name: a, params: [] }] }
+      - { name: L, methods: [{ name: b, params: [] }] }
 "#,
         ),
         (
-            "ListenerCallbackNotFound",
-            "modules: [{ name: m, listeners: [{ name: l, event_callback: nope }] }]",
+            "EmptyCallbackInterface",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [] }] }]",
         ),
         (
-            "DuplicateListenerName",
+            "DuplicateCallbackMethod",
             r#"
 modules:
   - name: m
-    callbacks: [{ name: cb, params: [] }]
-    listeners: [{ name: l, event_callback: cb }, { name: l, event_callback: cb }]
+    callback_interfaces:
+      - { name: L, methods: [{ name: a, params: [] }, { name: a, params: [] }] }
 "#,
         ),
         (
-            "UnsupportedCallbackParamType",
-            "modules: [{ name: m, callbacks: [{ name: cb, params: [{ name: x, type: 'iter<i32>' }] }] }]",
+            "InvalidCallbackMethod",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], async: true }] }] }]",
         ),
         (
-            "UnsupportedCallbackParamType",
-            "modules: [{ name: m, callbacks: [{ name: cb, params: [{ name: x, type: '[&str]' }] }] }]",
+            "InvalidCallbackMethod",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], throws: true }] }] }]",
+        ),
+        (
+            "InvalidCallbackMethod",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], cancellable: true }] }] }]",
+        ),
+        (
+            "InvalidCallbackMethod",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: string }] }] }]",
+        ),
+        (
+            "InvalidCallbackMethod",
+            r#"
+modules:
+  - name: m
+    interfaces: [{ name: I, methods: [{ name: a, params: [] }] }]
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [], return: I }] }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    functions: [{ name: f, params: [], return: L }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    functions: [{ name: f, params: [{ name: l, type: "L?" }] }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces: [{ name: L, methods: [{ name: a, params: [] }] }]
+    structs: [{ name: S, fields: [{ name: l, type: L }] }]
+"#,
+        ),
+        (
+            "CallbackInterfaceInInvalidPosition",
+            r#"
+modules:
+  - name: m
+    callback_interfaces:
+      - { name: L, methods: [{ name: a, params: [{ name: other, type: L }] }] }
+"#,
+        ),
+        (
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, callback_interfaces: [{ name: L, methods: [{ name: a, params: [{ name: x, type: 'iter<i32>' }] }] }] }]",
         ),
         (
             "IteratorInInvalidPosition",
@@ -487,16 +535,28 @@ modules:
             "modules: [{ name: m, structs: [{ name: S, fields: [{ name: x, type: 'iter<i32>' }] }] }]",
         ),
         (
-            "MutableParamUnsupported",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: x, type: i32, mutable: true }] }] }]",
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, functions: [{ name: f, params: [], return: '[iter<i32>]' }] }]",
         ),
         (
-            "MutableParamUnsupported",
-            "modules: [{ name: m, functions: [{ name: f, params: [{ name: x, type: '[i32]', mutable: true }] }] }]",
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, functions: [{ name: f, params: [], return: 'iter<i32>?' }] }]",
+        ),
+        (
+            "IteratorInInvalidPosition",
+            "modules: [{ name: m, functions: [{ name: f, params: [], return: 'iter<iter<i32>>' }] }]",
         ),
         (
             "AsyncIteratorReturn",
             "modules: [{ name: m, functions: [{ name: f, params: [], return: 'iter<i32>', async: true }] }]",
+        ),
+        (
+            "ReservedKeyword",
+            "modules: [{ name: m, errors: { name: 'if', codes: [{ name: A, code: 1, message: a }] } }]",
+        ),
+        (
+            "InvalidIdentifier",
+            "modules: [{ name: m, errors: { name: E, codes: [{ name: '1bad', code: 1, message: a }] } }]",
         ),
     ];
     for (expected, doc) in cases {
@@ -562,7 +622,7 @@ fn diagnostics_render_every_message_and_related() {
 
 #[test]
 fn source_spans_underline_the_offending_identifier() {
-    let src = "version: \"0.8.0\"\nmodules:\n  - name: \"dup\"\n  - name: \"dup\"\n";
+    let src = "version: \"0.9.0\"\nmodules:\n  - name: \"dup\"\n  - name: \"dup\"\n";
     let api = parse_api_str(src, "yaml").unwrap();
     let err = validate_api(api, Some(("api.yml", src))).unwrap_err();
     let d = err.first();
@@ -581,10 +641,11 @@ modules:
     enums: [{ name: Status, variants: [{ name: Ok, value: 0 }] }]
     structs: [{ name: Point, fields: [{ name: x, type: f64 }] }]
     interfaces: [{ name: Store, methods: [{ name: get, params: [] }] }]
+    callback_interfaces: [{ name: Watcher, methods: [{ name: on, params: [] }] }]
   - name: orders
     functions:
       - name: f
-        params: [{ name: s, type: Store }, { name: st, type: Status }]
+        params: [{ name: s, type: Store }, { name: st, type: Status }, { name: w, type: Watcher }]
         return: "[Point]"
 "#,
     )
@@ -599,6 +660,10 @@ modules:
     assert_eq!(
         api.resolve(&f.params[1].ty, "orders"),
         Ty::Enum("shared.Status".into())
+    );
+    assert_eq!(
+        api.resolve(&f.params[2].ty, "orders"),
+        Ty::CallbackInterface("shared.Watcher".into())
     );
     assert_eq!(
         api.resolve(f.returns.as_ref().unwrap(), "orders"),

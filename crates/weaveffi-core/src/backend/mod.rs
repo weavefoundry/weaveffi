@@ -1,8 +1,8 @@
 //! The language-backend framework.
 //!
 //! Every idiomatic WeaveFFI generator does the same three things: it walks the
-//! [`BindingModel`] in a fixed order (errors, enums, structs, interfaces,
-//! callbacks, listeners, functions), dispatches each function on its
+//! [`BindingModel`] in a fixed order (errors, enums, structs, callback
+//! interfaces, interfaces, functions), dispatches each function on its
 //! [`CallShape`], and writes a primary source file plus a handful of package
 //! manifests.
 //!
@@ -25,8 +25,8 @@ use serde::Serialize;
 
 use crate::capabilities::TargetCapabilities;
 use crate::model::{
-    BindingModel, CallbackBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
-    ListenerBinding, ModuleBinding, StructBinding,
+    BindingModel, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    ModuleBinding, StructBinding,
 };
 use crate::package::{PackageContext, PackagedFile};
 use crate::resolved::ResolvedApi;
@@ -64,14 +64,14 @@ impl OutputFile {
 ///
 /// Backends whose primary file is a straightforward per-module walk (Python,
 /// Ruby, Go, Dart, .NET) override the per-entity hooks (`render_enum`,
-/// `render_struct`, `render_function`, and optionally
-/// `render_callback`/`render_listener`) and call the provided
+/// `render_struct`, `render_callback_interface`, `render_interface`,
+/// `render_function`) and call the provided
 /// [`emit_members`](Self::emit_members) from inside their module scoping; that
 /// is what removes the hand-rolled walk + call-shape dispatch each generator
 /// used to carry. Backends whose output is not one linear pass leave the hooks
 /// at their no-op defaults and build their layout directly in
 /// [`files`](Self::files): C and C++ order declarations by dependency, Swift
-/// splits types from the namespaced module body, and Android, Node, and Wasm
+/// splits types from the namespaced module body, and Kotlin, Node, and Wasm
 /// each render parallel files (Kotlin + JNI C, addon C + JS, JS + `.d.ts`)
 /// that would each need their own walk anyway.
 ///
@@ -90,10 +90,12 @@ pub trait LanguageBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// The gated IDL features this backend implements (async functions,
-    /// callbacks, listeners, iterators). Required: declaring capabilities
-    /// explicitly is what lets the orchestrator fail loudly instead of a
-    /// backend silently skipping a feature it never implemented.
-    fn capabilities(&self) -> TargetCapabilities;
+    /// callback interfaces, iterators) under `config`. Required: declaring
+    /// capabilities explicitly is what lets the orchestrator fail loudly
+    /// instead of a backend silently skipping a feature it never implemented.
+    /// The config is passed because some backends have modes with different
+    /// ceilings (the Wasm backend's Emscripten mode, for example).
+    fn capabilities(&self, config: &Self::Config) -> TargetCapabilities;
 
     /// Whether the user explicitly opted in to generating this target even
     /// though the API uses features the target does not support (via an
@@ -153,8 +155,22 @@ pub trait LanguageBackend: Send + Sync {
         let _ = (out, module, e, config);
     }
 
+    /// Render one callback interface: the protocol, abstract class, or
+    /// interface type the consumer implements, plus the vtable trampolines
+    /// that adapt an implementation to the C ABI. Override when using
+    /// [`emit_members`](Self::emit_members).
+    fn render_callback_interface(
+        &self,
+        out: &mut String,
+        module: &ModuleBinding,
+        cb: &CallbackInterfaceBinding,
+        config: &Self::Config,
+    ) {
+        let _ = (out, module, cb, config);
+    }
+
     /// Render one interface: the wrapper class with its constructors, methods,
-    /// statics, and destructor wiring. Override when using
+    /// statics, and reference-count wiring. Override when using
     /// [`emit_members`](Self::emit_members).
     fn render_interface(
         &self,
@@ -164,29 +180,6 @@ pub trait LanguageBackend: Send + Sync {
         config: &Self::Config,
     ) {
         let _ = (out, module, i, config);
-    }
-
-    /// Render a module-scope callback typedef. Default: no output (most idiomatic
-    /// backends express callbacks inline at the async/listener call site).
-    fn render_callback(
-        &self,
-        out: &mut String,
-        module: &ModuleBinding,
-        c: &CallbackBinding,
-        config: &Self::Config,
-    ) {
-        let _ = (out, module, c, config);
-    }
-
-    /// Render a listener's register/unregister surface. Default: no output.
-    fn render_listener(
-        &self,
-        out: &mut String,
-        module: &ModuleBinding,
-        l: &ListenerBinding,
-        config: &Self::Config,
-    ) {
-        let _ = (out, module, l, config);
     }
 
     /// Render one function. Implementations match on `f.shape` (sync / async /
@@ -202,11 +195,12 @@ pub trait LanguageBackend: Send + Sync {
         let _ = (out, module, f, config);
     }
 
-    /// Emit every member of `module` in canonical order (error domain → enums
-    /// → structs → interfaces → callbacks → listeners → functions). Backends
-    /// call this from within their own module scoping; overriding the
-    /// per-entity hooks is what guarantees a single-pass backend cannot
-    /// silently skip an entity kind.
+    /// Emit every member of `module` in canonical order (error domain, enums,
+    /// structs, callback interfaces, interfaces, functions). Callback
+    /// interfaces precede interfaces because interface members take them as
+    /// parameters. Backends call this from within their own module scoping;
+    /// overriding the per-entity hooks is what guarantees a single-pass
+    /// backend cannot silently skip an entity kind.
     fn emit_members(&self, out: &mut String, module: &ModuleBinding, config: &Self::Config) {
         if let Some(e) = module.error.as_ref().filter(|e| e.declared_here) {
             self.render_error(out, module, e, config);
@@ -217,14 +211,11 @@ pub trait LanguageBackend: Send + Sync {
         for s in &module.structs {
             self.render_struct(out, module, s, config);
         }
+        for cb in &module.callback_interfaces {
+            self.render_callback_interface(out, module, cb, config);
+        }
         for i in &module.interfaces {
             self.render_interface(out, module, i, config);
-        }
-        for c in &module.callbacks {
-            self.render_callback(out, module, c, config);
-        }
-        for l in &module.listeners {
-            self.render_listener(out, module, l, config);
         }
         for f in &module.functions {
             self.render_function(out, module, f, config);
@@ -367,7 +358,7 @@ mod tests {
             "fake"
         }
 
-        fn capabilities(&self) -> TargetCapabilities {
+        fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
             TargetCapabilities::full()
         }
 
@@ -412,7 +403,6 @@ mod tests {
             params: vec![Param {
                 name: "x".into(),
                 ty: TypeRef::I32,
-                mutable: false,
                 doc: None,
             }],
             returns,
@@ -421,7 +411,6 @@ mod tests {
             r#async: is_async,
             cancellable: false,
             deprecated: None,
-            since: None,
         }
     }
 
@@ -443,8 +432,7 @@ mod tests {
                 interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
+                callback_interfaces: vec![],
                 errors: None,
                 modules: vec![],
             }],

@@ -1,10 +1,10 @@
 //! Value-buffer codec emitters: the Swift statements serializing and
 //! decoding one value in the wire format.
 //!
-//! Both emitters dispatch on the shared [`wire::classify`] classification,
-//! so the non-obvious folds (handles as `u64` tokens, borrowed views like
-//! their owned forms, records and rich enums through one user codec) are
-//! decided centrally rather than re-derived from `Ty` here.
+//! Both emitters dispatch on the shared [`Ty::wire`] classification, so the
+//! non-obvious folds (interfaces as `u64` object tokens carrying one strong
+//! reference, records and rich enums through one user codec) are decided
+//! centrally rather than re-derived from `Ty` here.
 
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
@@ -72,10 +72,10 @@ pub(crate) fn write_value_stmts(
         WireType::Prim(Prim::Bytes) => {
             w.line(format!("{writer}.writeBytes({expr})"));
         }
-        // Both handle flavors surface as `UInt64` in Swift, so one write
-        // covers them.
-        WireType::Handle(_) => {
-            w.line(format!("{writer}.writeUInt64({expr})"));
+        // An object token carries one strong reference, so the wrapper
+        // writes a freshly cloned pointer and keeps its own.
+        WireType::Object(_) => {
+            w.line(format!("{writer}.writeObject({expr}.clonePtr())"));
         }
         WireType::Enum(name) => {
             // C-style enums cross as `i32` on the wire; a `UInt32`-raw Swift
@@ -180,8 +180,13 @@ pub(crate) fn read_value_stmts(
         WireType::Prim(Prim::Bytes) => {
             w.line(format!("let {out} = {reader}.readBytes()"));
         }
-        WireType::Handle(_) => {
-            w.line(format!("let {out} = {reader}.readUInt64()"));
+        // The token's reference is adopted by a new wrapper, whose deinit
+        // owes the `_destroy`.
+        WireType::Object(name) => {
+            w.line(format!(
+                "let {out} = {}(ptr: {reader}.readObject())",
+                ctx.ty_name(local_type_name(name))
+            ));
         }
         WireType::Enum(name) => {
             let local = local_type_name(name);

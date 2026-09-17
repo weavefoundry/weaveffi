@@ -2,9 +2,10 @@
 //
 // Drives the generated ESM bindings (loadWeaveffiWasm) against the real
 // producer compiled to wasm. Exercises the original struct/enum/optional
-// surface: the `ContactBook` interface class (canonical `new` constructor,
-// instance methods passing the handle as the implicit self argument, and
-// `free()` through the destroy symbol), records decoded from value buffers
+// surface: the reference-counted `ContactBook` interface class (canonical
+// `new` constructor, instance methods passing the handle as the implicit self
+// argument, idempotent `close()` and `Symbol.dispose` releasing the wrapper's
+// reference, use after close as a -3 error), records decoded from value buffers
 // into plain objects (`Contact` with its i64 id as BigInt, optional email,
 // and enum-as-int contact_type), NUL-terminated string args, the buffered
 // `string?` parameter (null email), list-of-record returns, the bool return,
@@ -112,11 +113,35 @@ expect(addErr instanceof ContactsError, 'empty name -> instanceof ContactsError'
 expect(addErr && addErr.code === 1, 'empty name -> code 1');
 expect(book.count() === 1, 'failed add leaves count == 1');
 
-// Disposal: free() releases the handle via the destroy symbol exactly once.
-other.free();
-book.free();
-expect(book._handle === 0, 'free() zeroes the handle');
-book.free(); // second call is a no-op
+// A number id widens to the i64 BigInt the ABI expects.
+expect(book.get(bob.id).first_name === 'Bob', 'get by BigInt id');
+expect(book.get(Number(bob.id)).first_name === 'Bob', 'get by number id widens to i64');
+
+// Disposal: close() releases this wrapper's reference exactly once; later
+// calls are no-ops, and any use of the closed wrapper is a -3 error.
+other.close();
+expect(other._handle === 0, 'close() zeroes the handle');
+other.close();
+book.close();
+book.close();
+let closedErr = null;
+try { book.count(); } catch (e) { closedErr = e; }
+expect(closedErr instanceof WeaveFFIError && closedErr.code === -3, `use after close is code -3 (got ${closedErr && closedErr.code})`);
+expect(!(closedErr instanceof ContactsError), 'use after close is not a domain error');
+
+// Symbol.dispose is the same release path (for `using` declarations).
+const disposeSym = typeof Symbol.dispose === 'symbol' ? Symbol.dispose : Symbol.for('Symbol.dispose');
+const disposable = new ContactBook();
+disposable.add('Carol', 'King', null, ContactType.Other);
+expect(typeof disposable[disposeSym] === 'function', 'wrapper implements Symbol.dispose');
+disposable[disposeSym]();
+expect(disposable._handle === 0, 'Symbol.dispose zeroes the handle');
+disposable[disposeSym]();
+
+// The module keeps working after use-after-close errors.
+const again = new ContactBook();
+expect(again.count() === 0 && again.add('Dan', 'Lee', 'dan@example.com', ContactType.Work).id > 0n, 'fresh book after closes');
+again.close();
 
 if (failures === 0) {
   console.log('wasm/contacts: OK');

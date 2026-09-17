@@ -11,8 +11,32 @@ package weaveffi
 #cgo LDFLAGS: -lweaveffi
 #include "weaveffi.h"
 #include <stdlib.h>
-extern void goWv_weaveffi_edge_cases_OnBatch_fn(uint8_t* items_ptr, size_t items_len, uint8_t* raw_ptr, size_t raw_len, uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, void* context);
-extern void goWv_weaveffi_edge_cases_OnTick_fn(void* context);
+static void* wvHandlePtr(uintptr_t h) { return (void*)h; }
+extern void goWv_weaveffi_edge_cases_BatchListener_on_batch(void* ctx, uint8_t* items_ptr, size_t items_len, uint8_t* raw_ptr, size_t raw_len, uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, weaveffi_error* out_err);
+extern void goWv_weaveffi_edge_cases_BatchListener_on_widget(void* ctx, weaveffi_edge_cases_Widget* widget, weaveffi_edge_cases_Widget* fallback, uint8_t* children_ptr, size_t children_len, weaveffi_error* out_err);
+extern void goWv_weaveffi_edge_cases_BatchListener_on_tick(void* ctx, weaveffi_error* out_err);
+extern bool goWv_weaveffi_edge_cases_BatchListener_should_continue(void* ctx, int32_t class, weaveffi_error* out_err);
+extern weaveffi_edge_cases_Mode goWv_weaveffi_edge_cases_BatchListener_pick_mode(void* ctx, weaveffi_error* out_err);
+extern void goWv_weaveffi_edge_cases_BatchListener_free(void* ctx);
+static const weaveffi_edge_cases_BatchListener_vtable wvVtable_weaveffi_edge_cases_BatchListener = {
+    (void (*)(void*, const uint8_t*, size_t, const uint8_t*, size_t, const uint8_t*, size_t, weaveffi_edge_cases_Mode, weaveffi_error*))goWv_weaveffi_edge_cases_BatchListener_on_batch,
+    (void (*)(void*, weaveffi_edge_cases_Widget*, weaveffi_edge_cases_Widget*, const uint8_t*, size_t, weaveffi_error*))goWv_weaveffi_edge_cases_BatchListener_on_widget,
+    goWv_weaveffi_edge_cases_BatchListener_on_tick,
+    goWv_weaveffi_edge_cases_BatchListener_should_continue,
+    goWv_weaveffi_edge_cases_BatchListener_pick_mode,
+    goWv_weaveffi_edge_cases_BatchListener_free,
+};
+static const weaveffi_edge_cases_BatchListener_vtable* wvVtablePtr_weaveffi_edge_cases_BatchListener(void) { return &wvVtable_weaveffi_edge_cases_BatchListener; }
+extern void goWv_weaveffi_edge_cases_Keyword_delete(void* ctx, int32_t self, weaveffi_error* out_err);
+extern int32_t goWv_weaveffi_edge_cases_Keyword_import(void* ctx, weaveffi_error* out_err);
+extern void goWv_weaveffi_edge_cases_Keyword_free(void* ctx);
+static const weaveffi_edge_cases_Keyword_vtable wvVtable_weaveffi_edge_cases_Keyword = {
+    goWv_weaveffi_edge_cases_Keyword_delete,
+    goWv_weaveffi_edge_cases_Keyword_import,
+    goWv_weaveffi_edge_cases_Keyword_free,
+};
+static const weaveffi_edge_cases_Keyword_vtable* wvVtablePtr_weaveffi_edge_cases_Keyword(void) { return &wvVtable_weaveffi_edge_cases_Keyword; }
+extern void goWv_weaveffi_edge_cases_async_widget_callback(void* context, weaveffi_error* err, weaveffi_edge_cases_Widget* result);
 extern void goWv_weaveffi_edge_cases_async_void_callback(void* context, weaveffi_error* err);
 extern void goWv_weaveffi_edge_cases_async_bytes_callback(void* context, weaveffi_error* err, uint8_t* result, size_t result_len);
 extern void goWv_weaveffi_edge_cases_async_struct_callback(void* context, weaveffi_error* err, uint8_t* result_ptr, size_t result_len);
@@ -29,13 +53,14 @@ import (
 	"fmt"
 	"iter"
 	"math"
-	"sync"
+	"runtime"
+	"runtime/cgo"
 	"unicode/utf8"
 	"unsafe"
 )
 
 // The ABI revision these bindings were generated against.
-const wvABIVersion uint32 = 1
+const wvABIVersion uint32 = 2
 
 func init() {
 	if found := uint32(C.weaveffi_abi_version()); found != wvABIVersion {
@@ -52,8 +77,9 @@ func cToBool(b C._Bool) bool {
 }
 
 // WeaveFFIError reports a failure crossing the C boundary that no typed
-// error domain claims: an unknown code, a marshalling failure, or a
-// producer panic.
+// error domain claims: an unknown code, a marshalling failure, a
+// producer panic (code -2), or a Go callback-interface implementation
+// that panicked (code -4).
 type WeaveFFIError struct {
 	// Code is the numeric ABI error code.
 	Code int32
@@ -104,11 +130,12 @@ func wvBrandError(code int32, message string, _ []byte) error {
 
 // wvTrap panics when the C error slot reports a failure. Non-throwing
 // wrappers check their slot with it: a non-zero code there can only be
-// a producer panic or a marshalling failure.
+// a producer panic, a marshalling failure, or a callback-interface
+// implementation that panicked. The panic value is a *WeaveFFIError, so a
+// recover() site can still inspect the code.
 func wvTrap(cErr *C.weaveffi_error) {
 	if cErr.code != 0 {
-		code, msg, _ := wvTakeError(cErr)
-		panic(fmt.Sprintf("weaveffi: %s (code %d)", msg, code))
+		panic(wvBrandError(wvTakeError(cErr)))
 	}
 }
 
@@ -320,46 +347,13 @@ func wvBorrowBuffer(ptr *C.uint8_t, length C.size_t) []byte {
 	return C.GoBytes(unsafe.Pointer(ptr), C.int(length))
 }
 
-var (
-	wvCallbackMu  sync.Mutex
-	wvCallbackSeq uint64
-	wvCallbacks   = map[uint64]interface{}{}
-	// Subscription id -> registry id, so unregister can release the Go callback.
-	wvListenerCtx = map[uint64]uint64{}
-)
-
-func wvCallbackStore(v interface{}) uint64 {
-	wvCallbackMu.Lock()
-	defer wvCallbackMu.Unlock()
-	wvCallbackSeq++
-	wvCallbacks[wvCallbackSeq] = v
-	return wvCallbackSeq
-}
-
-func wvCallbackLoad(id uint64) interface{} {
-	wvCallbackMu.Lock()
-	defer wvCallbackMu.Unlock()
-	return wvCallbacks[id]
-}
-
-func wvCallbackTake(id uint64) interface{} {
-	wvCallbackMu.Lock()
-	defer wvCallbackMu.Unlock()
-	v := wvCallbacks[id]
-	delete(wvCallbacks, id)
-	return v
-}
-
-func wvCallbackDelete(id uint64) {
-	wvCallbackMu.Lock()
-	defer wvCallbackMu.Unlock()
-	delete(wvCallbacks, id)
-}
-
-// LeafHandle is a typed handle naming a producer-owned resource. It wraps
-// the opaque C pointer and owes no release call.
-type LeafHandle struct {
-	ptr *C.weaveffi_edge_cases_Leaf
+// wvForeignError reports a panic recovered inside a callback-interface
+// trampoline through the producer's error slot (code -4). The message is
+// borrowed for the call: the producer copies it with its own allocator.
+func wvForeignError(outErr *C.weaveffi_error, recovered any) {
+	msg := C.CString(fmt.Sprint(recovered))
+	defer C.free(unsafe.Pointer(msg))
+	C.weaveffi_error_set(outErr, -4, msg)
 }
 
 // EdgeErrorsError is a typed error reported by the `edge_cases` module.
@@ -398,9 +392,9 @@ func wvMapEdgeCases(code int32, message string, payload []byte) error {
 type Legacy int32
 
 const (
-	LegacyNone Legacy = 0
+	LegacyNone    Legacy = 0
 	LegacyDefault Legacy = 5
-	LegacyClass Legacy = 10
+	LegacyClass   Legacy = 10
 )
 
 type Mode int32
@@ -428,7 +422,7 @@ func wvUnpackLeaf(r *wvReader) Leaf {
 
 // Inner: Middle layer of a three-deep struct nesting
 type Inner struct {
-	Leaf Leaf
+	Leaf   Leaf
 	Leaves []Leaf
 }
 
@@ -454,17 +448,17 @@ func wvUnpackInner(r *wvReader) Inner {
 }
 
 type Outer struct {
-	Inner Inner
+	Inner      Inner
 	MaybeInner *Inner
-	ByName map[string]Inner
-	Modes []Mode
-	Matrix [][]int32
-	Sparse []*int64
-	Blob []byte
-	Note *string
-	ById map[int64]string
-	Hidden bool
-	V2 uint8
+	ByName     map[string]Inner
+	Modes      []Mode
+	Matrix     [][]int32
+	Sparse     []*int64
+	Blob       []byte
+	Note       *string
+	ById       map[int64]string
+	Hidden     bool
+	V2         uint8
 }
 
 // wvPackOuter appends v to w in the value-buffer wire format.
@@ -589,65 +583,65 @@ func wvUnpackOuter(r *wvReader) Outer {
 
 // Keywords: Every field is a reserved word somewhere
 type Keywords struct {
-	Class int32
-	Def int32
-	Import int32
-	From int32
-	Func int32
-	Range int32
-	Register int32
-	Volatile int32
-	New int32
-	Default int32
-	End int32
-	In int32
-	Is int32
-	Int int32
-	Var int32
-	Val int32
-	Self int32
-	This int32
-	Object int32
-	String int32
-	Case int32
-	Select int32
-	Switch int32
-	Void int32
-	Union int32
+	Class     int32
+	Def       int32
+	Import    int32
+	From      int32
+	Func      int32
+	Range     int32
+	Register  int32
+	Volatile  int32
+	New       int32
+	Default   int32
+	End       int32
+	In        int32
+	Is        int32
+	Int       int32
+	Var       int32
+	Val       int32
+	Self      int32
+	This      int32
+	Object    int32
+	String    int32
+	Case      int32
+	Select    int32
+	Switch    int32
+	Void      int32
+	Union     int32
 	Namespace int32
-	Operator int32
-	Template int32
-	Package int32
-	Protocol int32
-	Guard int32
-	Defer int32
-	Inout int32
-	Internal int32
-	When int32
-	Fun int32
-	Data int32
-	Late int32
-	Part int32
-	Out int32
-	Ref int32
-	Event int32
-	Base int32
-	Lambda int32
-	Yield int32
-	Nil int32
-	Null int32
-	Begin int32
-	Rescue int32
-	Module int32
-	Chan int32
-	Go int32
-	Let int32
-	Export int32
-	Delete int32
-	Typedef int32
-	Sizeof int32
-	Static int32
-	Super int32
+	Operator  int32
+	Template  int32
+	Package   int32
+	Protocol  int32
+	Guard     int32
+	Defer     int32
+	Inout     int32
+	Internal  int32
+	When      int32
+	Fun       int32
+	Data      int32
+	Late      int32
+	Part      int32
+	Out       int32
+	Ref       int32
+	Event     int32
+	Base      int32
+	Lambda    int32
+	Yield     int32
+	Nil       int32
+	Null      int32
+	Begin     int32
+	Rescue    int32
+	Module    int32
+	Chan      int32
+	Go        int32
+	Let       int32
+	Export    int32
+	Delete    int32
+	Typedef   int32
+	Sizeof    int32
+	Static    int32
+	Super     int32
 }
 
 // wvPackKeywords appends v to w in the value-buffer wire format.
@@ -795,13 +789,259 @@ func wvUnpackRetired(r *wvReader) Retired {
 	return v
 }
 
+// WidgetHolder: Record carrying objects in every buffered position
+type WidgetHolder struct {
+	Primary  *Widget
+	Fallback *Widget
+	Extras   []*Widget
+	ByName   map[string]*Widget
+}
+
+// wvPackWidgetHolder appends v to w in the value-buffer wire format.
+func wvPackWidgetHolder(w *wvWriter, v WidgetHolder) {
+	w.writeU64(wvTokenWidget(v.Primary))
+	if v.Fallback == nil {
+		w.writeOptionFlag(false)
+	} else {
+		w.writeOptionFlag(true)
+		w.writeU64(wvTokenWidget(v.Fallback))
+	}
+	w.writeLen(len(v.Extras))
+	for _, eExtras0 := range v.Extras {
+		w.writeU64(wvTokenWidget(eExtras0))
+	}
+	w.writeLen(len(v.ByName))
+	for kByName0, vByName0 := range v.ByName {
+		w.writeString(kByName0)
+		w.writeU64(wvTokenWidget(vByName0))
+	}
+}
+
+// wvUnpackWidgetHolder decodes one WidgetHolder from r.
+func wvUnpackWidgetHolder(r *wvReader) WidgetHolder {
+	var v WidgetHolder
+	v.Primary = wvUntokenWidget(r.readU64())
+	if r.readOptionFlag() {
+		var oFallback0 *Widget
+		oFallback0 = wvUntokenWidget(r.readU64())
+		v.Fallback = oFallback0
+	}
+	nExtras0 := r.readLen()
+	v.Extras = make([]*Widget, nExtras0)
+	for iExtras0 := range v.Extras {
+		v.Extras[iExtras0] = wvUntokenWidget(r.readU64())
+	}
+	nByName0 := r.readLen()
+	v.ByName = make(map[string]*Widget, nByName0)
+	for iByName0 := 0; iByName0 < nByName0; iByName0++ {
+		var kByName0 string
+		kByName0 = r.readString()
+		var vByName0 *Widget
+		vByName0 = wvUntokenWidget(r.readU64())
+		v.ByName[kByName0] = vByName0
+	}
+	return v
+}
+
+// BatchListener: Callback interface carrying composite payloads and objects
+//
+// Implement this interface in Go and pass the value to native functions
+// that accept it.
+//
+// The native library may call any method from any thread until it releases
+// the implementation. A panic in a method is reported to the native caller
+// as a foreign error (code -4) instead of crashing the process.
+type BatchListener interface {
+	// OnBatch: Composite payloads cross as value buffers
+	OnBatch(items []Outer, raw []byte, first *Outer, mode Mode)
+	// OnWidget: Objects cross as strong references the consumer must release
+	OnWidget(widget *Widget, fallback *Widget, children []*Widget)
+	OnTick()
+	// ShouldContinue: Scalar return travels back through the vtable
+	ShouldContinue(class int32) bool
+	// PickMode: Enum return travels back as its integer discriminant
+	PickMode() Mode
+}
+
+//export goWv_weaveffi_edge_cases_BatchListener_on_batch
+func goWv_weaveffi_edge_cases_BatchListener_on_batch(ctx unsafe.Pointer, items_ptr *C.uint8_t, items_len C.size_t, raw_ptr *C.uint8_t, raw_len C.size_t, first_ptr *C.uint8_t, first_len C.size_t, mode C.weaveffi_edge_cases_Mode, out_err *C.weaveffi_error) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(BatchListener)
+	rArg0 := &wvReader{buf: wvBorrowBuffer(items_ptr, items_len)}
+	var arg0 []Outer
+	nArg00 := rArg0.readLen()
+	arg0 = make([]Outer, nArg00)
+	for iArg00 := range arg0 {
+		arg0[iArg00] = wvUnpackOuter(rArg0)
+	}
+	rArg0.expectEnd()
+	var arg1 []byte
+	if raw_ptr != nil {
+		arg1 = C.GoBytes(unsafe.Pointer(raw_ptr), C.int(raw_len))
+	}
+	rArg2 := &wvReader{buf: wvBorrowBuffer(first_ptr, first_len)}
+	var arg2 *Outer
+	if rArg2.readOptionFlag() {
+		var oArg20 Outer
+		oArg20 = wvUnpackOuter(rArg2)
+		arg2 = &oArg20
+	}
+	rArg2.expectEnd()
+	arg3 := Mode(mode)
+	impl.OnBatch(arg0, arg1, arg2, arg3)
+}
+
+//export goWv_weaveffi_edge_cases_BatchListener_on_widget
+func goWv_weaveffi_edge_cases_BatchListener_on_widget(ctx unsafe.Pointer, widget *C.weaveffi_edge_cases_Widget, fallback *C.weaveffi_edge_cases_Widget, children_ptr *C.uint8_t, children_len C.size_t, out_err *C.weaveffi_error) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(BatchListener)
+	arg0 := wvAdoptWidget(widget)
+	arg1 := wvAdoptWidget(fallback)
+	rArg2 := &wvReader{buf: wvBorrowBuffer(children_ptr, children_len)}
+	var arg2 []*Widget
+	nArg20 := rArg2.readLen()
+	arg2 = make([]*Widget, nArg20)
+	for iArg20 := range arg2 {
+		arg2[iArg20] = wvUntokenWidget(rArg2.readU64())
+	}
+	rArg2.expectEnd()
+	impl.OnWidget(arg0, arg1, arg2)
+}
+
+//export goWv_weaveffi_edge_cases_BatchListener_on_tick
+func goWv_weaveffi_edge_cases_BatchListener_on_tick(ctx unsafe.Pointer, out_err *C.weaveffi_error) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(BatchListener)
+	impl.OnTick()
+}
+
+//export goWv_weaveffi_edge_cases_BatchListener_should_continue
+func goWv_weaveffi_edge_cases_BatchListener_should_continue(ctx unsafe.Pointer, class C.int32_t, out_err *C.weaveffi_error) (ret C._Bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(BatchListener)
+	arg0 := int32(class)
+	ret = boolToC(impl.ShouldContinue(arg0))
+	return
+}
+
+//export goWv_weaveffi_edge_cases_BatchListener_pick_mode
+func goWv_weaveffi_edge_cases_BatchListener_pick_mode(ctx unsafe.Pointer, out_err *C.weaveffi_error) (ret C.weaveffi_edge_cases_Mode) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(BatchListener)
+	ret = C.weaveffi_edge_cases_Mode(impl.PickMode())
+	return
+}
+
+//export goWv_weaveffi_edge_cases_BatchListener_free
+func goWv_weaveffi_edge_cases_BatchListener_free(ctx unsafe.Pointer) {
+	cgo.Handle(uintptr(ctx)).Delete()
+}
+
+// Keyword: Callback interface whose name and methods are keywords
+//
+// Implement this interface in Go and pass the value to native functions
+// that accept it.
+//
+// The native library may call any method from any thread until it releases
+// the implementation. A panic in a method is reported to the native caller
+// as a foreign error (code -4) instead of crashing the process.
+type Keyword interface {
+	Delete(self int32)
+	Import() int32
+}
+
+//export goWv_weaveffi_edge_cases_Keyword_delete
+func goWv_weaveffi_edge_cases_Keyword_delete(ctx unsafe.Pointer, self C.int32_t, out_err *C.weaveffi_error) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(Keyword)
+	arg0 := int32(self)
+	impl.Delete(arg0)
+}
+
+//export goWv_weaveffi_edge_cases_Keyword_import
+func goWv_weaveffi_edge_cases_Keyword_import(ctx unsafe.Pointer, out_err *C.weaveffi_error) (ret C.int32_t) {
+	defer func() {
+		if r := recover(); r != nil {
+			wvForeignError(out_err, r)
+		}
+	}()
+	impl := cgo.Handle(uintptr(ctx)).Value().(Keyword)
+	ret = C.int32_t(impl.Import())
+	return
+}
+
+//export goWv_weaveffi_edge_cases_Keyword_free
+func goWv_weaveffi_edge_cases_Keyword_free(ctx unsafe.Pointer) {
+	cgo.Handle(uintptr(ctx)).Delete()
+}
+
 // Widget: Interface with no constructor; instances come from make_widget
+//
+// Each wrapper holds one strong reference; Close releases it, and a
+// finalizer releases it if the wrapper is garbage collected first.
 type Widget struct {
 	ptr *C.weaveffi_edge_cases_Widget
 }
 
+// wvAdoptWidget adopts one owned strong reference into a new wrapper. A null
+// pointer adopts to nil.
+func wvAdoptWidget(ptr *C.weaveffi_edge_cases_Widget) *Widget {
+	if ptr == nil {
+		return nil
+	}
+	s := &Widget{ptr: ptr}
+	runtime.SetFinalizer(s, (*Widget).Close)
+	return s
+}
+
+// wvTokenWidget clones o's reference into a value-buffer object token. The
+// wrapper keeps its own reference; the token carries the new one.
+func wvTokenWidget(o *Widget) uint64 {
+	if o == nil || o.ptr == nil {
+		panic("weaveffi: nil or closed Widget cannot be encoded in a non-optional position")
+	}
+	return uint64(uintptr(unsafe.Pointer(C.weaveffi_edge_cases_Widget_clone(o.ptr))))
+}
+
+// wvUntokenWidget adopts the strong reference carried by a value-buffer object
+// token.
+func wvUntokenWidget(token uint64) *Widget {
+	if token == 0 {
+		panic("weaveffi: malformed value buffer: null object token")
+	}
+	return wvAdoptWidget((*C.weaveffi_edge_cases_Widget)(C.wvHandlePtr(C.uintptr_t(token))))
+}
+
 // Refresh: Void method that can fail
 func (s *Widget) Refresh() error {
+	if s.ptr == nil {
+		panic("weaveffi: Widget used after Close")
+	}
+	defer runtime.KeepAlive(s)
 	var cErr C.weaveffi_error
 	C.weaveffi_edge_cases_Widget_refresh(s.ptr, &cErr)
 	if cErr.code != 0 {
@@ -811,6 +1051,10 @@ func (s *Widget) Refresh() error {
 }
 
 func (s *Widget) Rename(class string, import_ *string) string {
+	if s.ptr == nil {
+		panic("weaveffi: Widget used after Close")
+	}
+	defer runtime.KeepAlive(s)
 	cClass := C.CString(class)
 	defer C.free(unsafe.Pointer(cClass))
 	wImport := &wvWriter{}
@@ -839,11 +1083,9 @@ type wvOutcomeEdgeCasesWidgetFetch struct {
 
 //export goWv_weaveffi_edge_cases_Widget_fetch_callback
 func goWv_weaveffi_edge_cases_Widget_fetch_callback(context unsafe.Pointer, err *C.weaveffi_error, result_ptr *C.uint8_t, result_len C.size_t) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesWidgetFetch)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesWidgetFetch)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesWidgetFetch{err: wvMapEdgeCases(wvTakeBoxedError(err))}
 		return
@@ -858,9 +1100,13 @@ func goWv_weaveffi_edge_cases_Widget_fetch_callback(context unsafe.Pointer, err 
 // Fetch: Async method with a struct result
 // Blocks the calling goroutine until the async producer completes.
 func (s *Widget) Fetch(id int64) (Outer, error) {
+	if s.ptr == nil {
+		panic("weaveffi: Widget used after Close")
+	}
+	defer runtime.KeepAlive(s)
 	ch := make(chan wvOutcomeEdgeCasesWidgetFetch, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_Widget_fetch_async(s.ptr, C.int64_t(id), C.weaveffi_edge_cases_Widget_fetch_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_Widget_fetch_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_Widget_fetch_async(s.ptr, C.int64_t(id), C.weaveffi_edge_cases_Widget_fetch_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_Widget_fetch_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		return Outer{}, outcome.err
@@ -870,6 +1116,10 @@ func (s *Widget) Fetch(id int64) (Outer, error) {
 
 // Deprecated: Use rename instead
 func (s *Widget) OldName() string {
+	if s.ptr == nil {
+		panic("weaveffi: Widget used after Close")
+	}
+	defer runtime.KeepAlive(s)
 	var cErr C.weaveffi_error
 	result := C.weaveffi_edge_cases_Widget_old_name(s.ptr, &cErr)
 	wvTrap(&cErr)
@@ -878,16 +1128,54 @@ func (s *Widget) OldName() string {
 	return goResult
 }
 
+// Close releases the wrapper's strong reference. Calling it more than once
+// is harmless; the object itself is dropped by the native library when its
+// last reference (from any wrapper, record, or producer) is released.
 func (s *Widget) Close() {
 	if s.ptr != nil {
 		C.weaveffi_edge_cases_Widget_destroy(s.ptr)
 		s.ptr = nil
+		runtime.SetFinalizer(s, nil)
 	}
 }
 
 // Vault: Deprecated interface with a throwing constructor
+//
+// Each wrapper holds one strong reference; Close releases it, and a
+// finalizer releases it if the wrapper is garbage collected first.
+//
+// Deprecated: Use Widget instead
 type Vault struct {
 	ptr *C.weaveffi_edge_cases_Vault
+}
+
+// wvAdoptVault adopts one owned strong reference into a new wrapper. A null
+// pointer adopts to nil.
+func wvAdoptVault(ptr *C.weaveffi_edge_cases_Vault) *Vault {
+	if ptr == nil {
+		return nil
+	}
+	s := &Vault{ptr: ptr}
+	runtime.SetFinalizer(s, (*Vault).Close)
+	return s
+}
+
+// wvTokenVault clones o's reference into a value-buffer object token. The
+// wrapper keeps its own reference; the token carries the new one.
+func wvTokenVault(o *Vault) uint64 {
+	if o == nil || o.ptr == nil {
+		panic("weaveffi: nil or closed Vault cannot be encoded in a non-optional position")
+	}
+	return uint64(uintptr(unsafe.Pointer(C.weaveffi_edge_cases_Vault_clone(o.ptr))))
+}
+
+// wvUntokenVault adopts the strong reference carried by a value-buffer object
+// token.
+func wvUntokenVault(token uint64) *Vault {
+	if token == 0 {
+		panic("weaveffi: malformed value buffer: null object token")
+	}
+	return wvAdoptVault((*C.weaveffi_edge_cases_Vault)(C.wvHandlePtr(C.uintptr_t(token))))
 }
 
 // OpenVault: Fails when the vault is busy
@@ -899,17 +1187,18 @@ func OpenVault(path string) (*Vault, error) {
 	if cErr.code != 0 {
 		return nil, wvMapEdgeCases(wvTakeError(&cErr))
 	}
-	return &Vault{ptr: result}, nil
+	return wvAdoptVault(result), nil
 }
 
 func (s *Vault) Peek() *Widget {
+	if s.ptr == nil {
+		panic("weaveffi: Vault used after Close")
+	}
+	defer runtime.KeepAlive(s)
 	var cErr C.weaveffi_error
 	result := C.weaveffi_edge_cases_Vault_peek(s.ptr, &cErr)
 	wvTrap(&cErr)
-	if result == nil {
-		return nil
-	}
-	return &Widget{ptr: result}
+	return wvAdoptWidget(result)
 }
 
 // VaultProbe: Throwing static
@@ -922,95 +1211,14 @@ func VaultProbe() (bool, error) {
 	return cToBool(result), nil
 }
 
+// Close releases the wrapper's strong reference. Calling it more than once
+// is harmless; the object itself is dropped by the native library when its
+// last reference (from any wrapper, record, or producer) is released.
 func (s *Vault) Close() {
 	if s.ptr != nil {
 		C.weaveffi_edge_cases_Vault_destroy(s.ptr)
 		s.ptr = nil
-	}
-}
-
-//export goWv_weaveffi_edge_cases_OnBatch_fn
-func goWv_weaveffi_edge_cases_OnBatch_fn(items_ptr *C.uint8_t, items_len C.size_t, raw_ptr *C.uint8_t, raw_len C.size_t, first_ptr *C.uint8_t, first_len C.size_t, mode C.weaveffi_edge_cases_Mode, context unsafe.Pointer) {
-	v := wvCallbackLoad(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	cb := v.(func(items []Outer, raw []byte, first *Outer, mode Mode))
-	rArg0 := &wvReader{buf: wvBorrowBuffer(items_ptr, items_len)}
-	var arg0 []Outer
-	nArg00 := rArg0.readLen()
-	arg0 = make([]Outer, nArg00)
-	for iArg00 := range arg0 {
-		arg0[iArg00] = wvUnpackOuter(rArg0)
-	}
-	rArg0.expectEnd()
-	var arg1 []byte
-	if raw_ptr != nil {
-		arg1 = C.GoBytes(unsafe.Pointer(raw_ptr), C.int(raw_len))
-	}
-	rArg2 := &wvReader{buf: wvBorrowBuffer(first_ptr, first_len)}
-	var arg2 *Outer
-	if rArg2.readOptionFlag() {
-		var oArg20 Outer
-		oArg20 = wvUnpackOuter(rArg2)
-		arg2 = &oArg20
-	}
-	rArg2.expectEnd()
-	arg3 := Mode(mode)
-	cb(arg0, arg1, arg2, arg3)
-}
-
-//export goWv_weaveffi_edge_cases_OnTick_fn
-func goWv_weaveffi_edge_cases_OnTick_fn(context unsafe.Pointer) {
-	v := wvCallbackLoad(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	cb := v.(func())
-	cb()
-}
-
-// Returns a subscription id for UnregisterBatchListener.
-func RegisterBatchListener(callback func(items []Outer, raw []byte, first *Outer, mode Mode)) uint64 {
-	ctxID := wvCallbackStore(callback)
-	id := uint64(C.weaveffi_edge_cases_register_batch_listener(C.weaveffi_edge_cases_OnBatch_fn(unsafe.Pointer(C.goWv_weaveffi_edge_cases_OnBatch_fn)), unsafe.Pointer(uintptr(ctxID))))
-	wvCallbackMu.Lock()
-	wvListenerCtx[id] = ctxID
-	wvCallbackMu.Unlock()
-	return id
-}
-
-// UnregisterBatchListener unregisters a listener previously registered with RegisterBatchListener.
-func UnregisterBatchListener(id uint64) {
-	C.weaveffi_edge_cases_unregister_batch_listener(C.uint64_t(id))
-	wvCallbackMu.Lock()
-	ctxID, ok := wvListenerCtx[id]
-	delete(wvListenerCtx, id)
-	wvCallbackMu.Unlock()
-	if ok {
-		wvCallbackDelete(ctxID)
-	}
-}
-
-// Returns a subscription id for UnregisterTickListener.
-func RegisterTickListener(callback func()) uint64 {
-	ctxID := wvCallbackStore(callback)
-	id := uint64(C.weaveffi_edge_cases_register_tick_listener(C.weaveffi_edge_cases_OnTick_fn(unsafe.Pointer(C.goWv_weaveffi_edge_cases_OnTick_fn)), unsafe.Pointer(uintptr(ctxID))))
-	wvCallbackMu.Lock()
-	wvListenerCtx[id] = ctxID
-	wvCallbackMu.Unlock()
-	return id
-}
-
-// UnregisterTickListener unregisters a listener previously registered with RegisterTickListener.
-func UnregisterTickListener(id uint64) {
-	C.weaveffi_edge_cases_unregister_tick_listener(C.uint64_t(id))
-	wvCallbackMu.Lock()
-	ctxID, ok := wvListenerCtx[id]
-	delete(wvListenerCtx, id)
-	wvCallbackMu.Unlock()
-	if ok {
-		wvCallbackDelete(ctxID)
+		runtime.SetFinalizer(s, nil)
 	}
 }
 
@@ -1180,18 +1388,124 @@ func OptionalParams(text *string, count *int32, outer *Outer, tags []string, blo
 	return goResult
 }
 
-// MutableParams: Write-back parameters
-func MutableParams(text string, blob []byte) {
-	cText := C.CString(text)
-	defer C.free(unsafe.Pointer(cText))
-	var cBlobPtr *C.uint8_t
-	cBlobLen := C.size_t(len(blob))
-	if len(blob) > 0 {
-		cBlobPtr = (*C.uint8_t)(unsafe.Pointer(&blob[0]))
-	}
+// RegisterBatch: Two callback interface parameters on one function
+func RegisterBatch(listener BatchListener, keyword Keyword) {
+	hListener := cgo.NewHandle(listener)
+	hKeyword := cgo.NewHandle(keyword)
 	var cErr C.weaveffi_error
-	C.weaveffi_edge_cases_mutable_params(cText, cBlobPtr, cBlobLen, &cErr)
+	C.weaveffi_edge_cases_register_batch(C.wvHandlePtr(C.uintptr_t(hListener)), C.wvVtablePtr_weaveffi_edge_cases_BatchListener(), C.wvHandlePtr(C.uintptr_t(hKeyword)), C.wvVtablePtr_weaveffi_edge_cases_Keyword(), &cErr)
 	wvTrap(&cErr)
+}
+
+// WidgetsEverywhere: Objects in every buffered position
+func WidgetsEverywhere(list []*Widget, byName map[string]*Widget, sparse []*Widget, holder WidgetHolder) WidgetHolder {
+	wList := &wvWriter{}
+	wList.writeLen(len(list))
+	for _, eList0 := range list {
+		wList.writeU64(wvTokenWidget(eList0))
+	}
+	var cListPtr *C.uint8_t
+	if len(wList.buf) > 0 {
+		cListPtr = (*C.uint8_t)(unsafe.Pointer(&wList.buf[0]))
+	}
+	wByName := &wvWriter{}
+	wByName.writeLen(len(byName))
+	for kByName0, vByName0 := range byName {
+		wByName.writeString(kByName0)
+		wByName.writeU64(wvTokenWidget(vByName0))
+	}
+	var cByNamePtr *C.uint8_t
+	if len(wByName.buf) > 0 {
+		cByNamePtr = (*C.uint8_t)(unsafe.Pointer(&wByName.buf[0]))
+	}
+	wSparse := &wvWriter{}
+	wSparse.writeLen(len(sparse))
+	for _, eSparse0 := range sparse {
+		if eSparse0 == nil {
+			wSparse.writeOptionFlag(false)
+		} else {
+			wSparse.writeOptionFlag(true)
+			wSparse.writeU64(wvTokenWidget(eSparse0))
+		}
+	}
+	var cSparsePtr *C.uint8_t
+	if len(wSparse.buf) > 0 {
+		cSparsePtr = (*C.uint8_t)(unsafe.Pointer(&wSparse.buf[0]))
+	}
+	wHolder := &wvWriter{}
+	wvPackWidgetHolder(wHolder, holder)
+	var cHolderPtr *C.uint8_t
+	if len(wHolder.buf) > 0 {
+		cHolderPtr = (*C.uint8_t)(unsafe.Pointer(&wHolder.buf[0]))
+	}
+	var cOutLen C.size_t
+	var cErr C.weaveffi_error
+	result := C.weaveffi_edge_cases_widgets_everywhere(cListPtr, C.size_t(len(wList.buf)), cByNamePtr, C.size_t(len(wByName.buf)), cSparsePtr, C.size_t(len(wSparse.buf)), cHolderPtr, C.size_t(len(wHolder.buf)), &cOutLen, &cErr)
+	wvTrap(&cErr)
+	rRes := &wvReader{buf: wvCopyBuffer(result, cOutLen)}
+	var goResult WidgetHolder
+	goResult = wvUnpackWidgetHolder(rRes)
+	rRes.expectEnd()
+	return goResult
+}
+
+// WidgetStream: Iterator of objects
+// Returns a lazy sequence: the producer iterator is launched on first
+// iteration and one producer next call runs per element. The iterator is
+// destroyed exactly once, whether the sequence is exhausted or abandoned
+// early; each range over the sequence launches a fresh producer iterator.
+// A reported error can only be a producer bug and panics with the
+// weaveffi message.
+func WidgetStream() iter.Seq[*Widget] {
+	return func(yield func(*Widget) bool) {
+		var cErr C.weaveffi_error
+		it := C.weaveffi_edge_cases_widget_stream(&cErr)
+		wvTrap(&cErr)
+		defer C.weaveffi_edge_cases_WidgetStreamIterator_destroy(it)
+		for {
+			var outItem *C.weaveffi_edge_cases_Widget
+			var iterErr C.weaveffi_error
+			ok := C.weaveffi_edge_cases_WidgetStreamIterator_next(it, &outItem, &iterErr) != 0
+			wvTrap(&iterErr)
+			if !ok {
+				return
+			}
+			item := wvAdoptWidget(outItem)
+			if !yield(item) {
+				return
+			}
+		}
+	}
+}
+
+type wvOutcomeEdgeCasesAsyncWidget struct {
+	val *Widget
+	err error
+}
+
+//export goWv_weaveffi_edge_cases_async_widget_callback
+func goWv_weaveffi_edge_cases_async_widget_callback(context unsafe.Pointer, err *C.weaveffi_error, result *C.weaveffi_edge_cases_Widget) {
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncWidget)
+	h.Delete()
+	if err != nil && err.code != 0 {
+		ch <- wvOutcomeEdgeCasesAsyncWidget{err: wvMapEdgeCases(wvTakeBoxedError(err))}
+		return
+	}
+	ch <- wvOutcomeEdgeCasesAsyncWidget{val: wvAdoptWidget(result)}
+}
+
+// AsyncWidget: Async returning an object
+// Blocks the calling goroutine until the async producer completes.
+func AsyncWidget() (*Widget, error) {
+	ch := make(chan wvOutcomeEdgeCasesAsyncWidget, 1)
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_widget_async(C.weaveffi_edge_cases_async_widget_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_widget_callback)), C.wvHandlePtr(C.uintptr_t(h)))
+	outcome := <-ch
+	if outcome.err != nil {
+		return nil, outcome.err
+	}
+	return outcome.val, nil
 }
 
 // MakeWidget: Factory for an interface with no constructor
@@ -1201,7 +1515,7 @@ func MakeWidget(label string) *Widget {
 	var cErr C.weaveffi_error
 	result := C.weaveffi_edge_cases_make_widget(cLabel, &cErr)
 	wvTrap(&cErr)
-	return &Widget{ptr: result}
+	return wvAdoptWidget(result)
 }
 
 // FindWidget: Optional interface return
@@ -1211,14 +1525,13 @@ func FindWidget(id int64) (*Widget, error) {
 	if cErr.code != 0 {
 		return nil, wvMapEdgeCases(wvTakeError(&cErr))
 	}
-	if result == nil {
-		return nil, nil
-	}
-	return &Widget{ptr: result}, nil
+	return wvAdoptWidget(result), nil
 }
 
 // InspectWidget: Interface parameter, including an optional one
 func InspectWidget(widget *Widget, fallback *Widget) string {
+	defer runtime.KeepAlive(widget)
+	defer runtime.KeepAlive(fallback)
 	var cFallback *C.weaveffi_edge_cases_Widget
 	if fallback != nil {
 		cFallback = fallback.ptr
@@ -1229,13 +1542,6 @@ func InspectWidget(widget *Widget, fallback *Widget) string {
 	goResult := C.GoString(result)
 	C.weaveffi_free_string(result)
 	return goResult
-}
-
-func TypedHandleParam(token *LeafHandle, raw int64) *LeafHandle {
-	var cErr C.weaveffi_error
-	result := C.weaveffi_edge_cases_typed_handle_param(token.ptr, C.weaveffi_handle_t(raw), &cErr)
-	wvTrap(&cErr)
-	return &LeafHandle{ptr: result}
 }
 
 // StringStream: Iterator of strings
@@ -1332,11 +1638,9 @@ type wvOutcomeEdgeCasesAsyncVoid struct {
 
 //export goWv_weaveffi_edge_cases_async_void_callback
 func goWv_weaveffi_edge_cases_async_void_callback(context unsafe.Pointer, err *C.weaveffi_error) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncVoid)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncVoid)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncVoid{err: wvBrandError(wvTakeBoxedError(err))}
 		return
@@ -1348,8 +1652,8 @@ func goWv_weaveffi_edge_cases_async_void_callback(context unsafe.Pointer, err *C
 // Blocks the calling goroutine until the async producer completes.
 func AsyncVoid() {
 	ch := make(chan wvOutcomeEdgeCasesAsyncVoid, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_async_void_async(C.weaveffi_edge_cases_async_void_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_void_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_void_async(C.weaveffi_edge_cases_async_void_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_void_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		panic(outcome.err)
@@ -1363,11 +1667,9 @@ type wvOutcomeEdgeCasesAsyncBytes struct {
 
 //export goWv_weaveffi_edge_cases_async_bytes_callback
 func goWv_weaveffi_edge_cases_async_bytes_callback(context unsafe.Pointer, err *C.weaveffi_error, result *C.uint8_t, result_len C.size_t) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncBytes)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncBytes)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncBytes{err: wvBrandError(wvTakeBoxedError(err))}
 		return
@@ -1383,8 +1685,8 @@ func goWv_weaveffi_edge_cases_async_bytes_callback(context unsafe.Pointer, err *
 // Blocks the calling goroutine until the async producer completes.
 func AsyncBytes(size uint32) []byte {
 	ch := make(chan wvOutcomeEdgeCasesAsyncBytes, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_async_bytes_async(C.uint32_t(size), C.weaveffi_edge_cases_async_bytes_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_bytes_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_bytes_async(C.uint32_t(size), C.weaveffi_edge_cases_async_bytes_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_bytes_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		panic(outcome.err)
@@ -1399,11 +1701,9 @@ type wvOutcomeEdgeCasesAsyncStruct struct {
 
 //export goWv_weaveffi_edge_cases_async_struct_callback
 func goWv_weaveffi_edge_cases_async_struct_callback(context unsafe.Pointer, err *C.weaveffi_error, result_ptr *C.uint8_t, result_len C.size_t) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncStruct)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncStruct)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncStruct{err: wvMapEdgeCases(wvTakeBoxedError(err))}
 		return
@@ -1418,8 +1718,8 @@ func goWv_weaveffi_edge_cases_async_struct_callback(context unsafe.Pointer, err 
 // Blocks the calling goroutine until the async producer completes.
 func AsyncStruct() (Outer, error) {
 	ch := make(chan wvOutcomeEdgeCasesAsyncStruct, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_async_struct_async(C.weaveffi_edge_cases_async_struct_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_struct_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_struct_async(C.weaveffi_edge_cases_async_struct_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_struct_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		return Outer{}, outcome.err
@@ -1434,11 +1734,9 @@ type wvOutcomeEdgeCasesAsyncList struct {
 
 //export goWv_weaveffi_edge_cases_async_list_callback
 func goWv_weaveffi_edge_cases_async_list_callback(context unsafe.Pointer, err *C.weaveffi_error, result_ptr *C.uint8_t, result_len C.size_t) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncList)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncList)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncList{err: wvMapEdgeCases(wvTakeBoxedError(err))}
 		return
@@ -1457,8 +1755,8 @@ func goWv_weaveffi_edge_cases_async_list_callback(context unsafe.Pointer, err *C
 // Blocks the calling goroutine until the async producer completes.
 func AsyncList() ([]Outer, error) {
 	ch := make(chan wvOutcomeEdgeCasesAsyncList, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_async_list_async(nil, C.weaveffi_edge_cases_async_list_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_list_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_list_async(nil, C.weaveffi_edge_cases_async_list_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_list_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		return nil, outcome.err
@@ -1473,11 +1771,9 @@ type wvOutcomeEdgeCasesAsyncOptional struct {
 
 //export goWv_weaveffi_edge_cases_async_optional_callback
 func goWv_weaveffi_edge_cases_async_optional_callback(context unsafe.Pointer, err *C.weaveffi_error, result_ptr *C.uint8_t, result_len C.size_t) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncOptional)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncOptional)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncOptional{err: wvBrandError(wvTakeBoxedError(err))}
 		return
@@ -1496,8 +1792,8 @@ func goWv_weaveffi_edge_cases_async_optional_callback(context unsafe.Pointer, er
 // Blocks the calling goroutine until the async producer completes.
 func AsyncOptional() *int64 {
 	ch := make(chan wvOutcomeEdgeCasesAsyncOptional, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_async_optional_async(C.weaveffi_edge_cases_async_optional_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_optional_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_optional_async(C.weaveffi_edge_cases_async_optional_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_optional_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		panic(outcome.err)
@@ -1512,11 +1808,9 @@ type wvOutcomeEdgeCasesAsyncEnum struct {
 
 //export goWv_weaveffi_edge_cases_async_enum_callback
 func goWv_weaveffi_edge_cases_async_enum_callback(context unsafe.Pointer, err *C.weaveffi_error, result C.weaveffi_edge_cases_Mode) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncEnum)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncEnum)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncEnum{err: wvBrandError(wvTakeBoxedError(err))}
 		return
@@ -1527,8 +1821,8 @@ func goWv_weaveffi_edge_cases_async_enum_callback(context unsafe.Pointer, err *C
 // Blocks the calling goroutine until the async producer completes.
 func AsyncEnum() Mode {
 	ch := make(chan wvOutcomeEdgeCasesAsyncEnum, 1)
-	ctxID := wvCallbackStore(ch)
-	C.weaveffi_edge_cases_async_enum_async(C.weaveffi_edge_cases_async_enum_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_enum_callback)), unsafe.Pointer(uintptr(ctxID)))
+	h := cgo.NewHandle(ch)
+	C.weaveffi_edge_cases_async_enum_async(C.weaveffi_edge_cases_async_enum_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_enum_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		panic(outcome.err)
@@ -1543,11 +1837,9 @@ type wvOutcomeEdgeCasesAsyncKeywords struct {
 
 //export goWv_weaveffi_edge_cases_async_keywords_callback
 func goWv_weaveffi_edge_cases_async_keywords_callback(context unsafe.Pointer, err *C.weaveffi_error, result *C.char) {
-	v := wvCallbackTake(uint64(uintptr(context)))
-	if v == nil {
-		return
-	}
-	ch := v.(chan wvOutcomeEdgeCasesAsyncKeywords)
+	h := cgo.Handle(uintptr(context))
+	ch := h.Value().(chan wvOutcomeEdgeCasesAsyncKeywords)
+	h.Delete()
 	if err != nil && err.code != 0 {
 		ch <- wvOutcomeEdgeCasesAsyncKeywords{err: wvBrandError(wvTakeBoxedError(err))}
 		return
@@ -1563,10 +1855,10 @@ func goWv_weaveffi_edge_cases_async_keywords_callback(context unsafe.Pointer, er
 // Blocks the calling goroutine until the async producer completes.
 func AsyncKeywords(class string, import_ int32) string {
 	ch := make(chan wvOutcomeEdgeCasesAsyncKeywords, 1)
-	ctxID := wvCallbackStore(ch)
+	h := cgo.NewHandle(ch)
 	cClass := C.CString(class)
 	defer C.free(unsafe.Pointer(cClass))
-	C.weaveffi_edge_cases_async_keywords_async(cClass, C.int32_t(import_), C.weaveffi_edge_cases_async_keywords_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_keywords_callback)), unsafe.Pointer(uintptr(ctxID)))
+	C.weaveffi_edge_cases_async_keywords_async(cClass, C.int32_t(import_), C.weaveffi_edge_cases_async_keywords_callback(unsafe.Pointer(C.goWv_weaveffi_edge_cases_async_keywords_callback)), C.wvHandlePtr(C.uintptr_t(h)))
 	outcome := <-ch
 	if outcome.err != nil {
 		panic(outcome.err)
@@ -1604,6 +1896,5 @@ func LegacyValue(value Legacy) Retired {
 	rRes.expectEnd()
 	return goResult
 }
-
 
 // END weaveffi.go

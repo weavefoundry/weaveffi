@@ -12,12 +12,12 @@ use camino::Utf8Path;
 use weaveffi_core::codegen::{ConfiguredBackend, Target};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::validate::validate_api;
-use weaveffi_gen_android::{AndroidConfig, AndroidGenerator};
 use weaveffi_gen_c::{CConfig, CGenerator};
 use weaveffi_gen_cpp::{CppConfig, CppGenerator};
 use weaveffi_gen_dart::{DartConfig, DartGenerator};
 use weaveffi_gen_dotnet::{DotnetConfig, DotnetGenerator};
 use weaveffi_gen_go::{GoConfig, GoGenerator};
+use weaveffi_gen_kotlin::{KotlinConfig, KotlinGenerator};
 use weaveffi_gen_node::{NodeConfig, NodeGenerator};
 use weaveffi_gen_python::{PythonConfig, PythonGenerator};
 use weaveffi_gen_ruby::{RubyConfig, RubyGenerator};
@@ -122,8 +122,8 @@ fn generator_output_is_byte_identical_across_runs() {
             SwiftConfig::default(),
         )),
         Box::new(ConfiguredBackend::new(
-            AndroidGenerator,
-            AndroidConfig::default(),
+            KotlinGenerator,
+            KotlinConfig::default(),
         )),
         Box::new(ConfiguredBackend::new(NodeGenerator, NodeConfig::default())),
         Box::new(ConfiguredBackend::new(WasmGenerator, WasmConfig::default())),

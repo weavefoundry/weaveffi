@@ -154,6 +154,24 @@ c_shapes() {
         && "$OUT/c_shapes"
 }
 
+c_inventory() {
+    clang -I "$GENROOT/inventory/c" "$ROOT/conformance/c/inventory.c" \
+        -L "$LIBDIR" -linventory -o "$OUT/c_inventory" \
+        && "$OUT/c_inventory"
+}
+
+c_codec() {
+    clang -I "$GENROOT/codec/c" "$ROOT/conformance/c/codec.c" \
+        -L "$LIBDIR" -lcodec -lm -o "$OUT/c_codec" \
+        && "$OUT/c_codec"
+}
+
+cpp_codec() {
+    clang++ -std=c++17 -I "$GENROOT/codec/cpp" "$ROOT/conformance/cpp/codec.cpp" \
+        -L "$LIBDIR" -lcodec -o "$OUT/cpp_codec" \
+        && "$OUT/cpp_codec"
+}
+
 cpp_shapes() {
     clang++ -std=c++17 -I "$GENROOT/shapes/cpp" "$ROOT/conformance/cpp/shapes.cpp" \
         -L "$LIBDIR" -lshapes -o "$OUT/cpp_shapes" \
@@ -211,6 +229,8 @@ python_events()     { py_consumer events events.py; }
 python_kvstore()    { py_consumer kvstore kvstore.py; }
 python_shapes()     { py_consumer shapes shapes.py; }
 python_async_demo() { py_consumer async-demo async_demo.py; }
+python_codec()      { py_consumer codec codec.py; }
+python_inventory()  { py_consumer inventory inventory.py; }
 
 # Run a Ruby consumer; same library-selection story as Python.
 rb_consumer() {
@@ -225,6 +245,7 @@ ruby_events()     { rb_consumer events events.rb; }
 ruby_kvstore()    { rb_consumer kvstore kvstore.rb; }
 ruby_shapes()     { rb_consumer shapes shapes.rb; }
 ruby_async_demo() { rb_consumer async-demo async_demo.rb; }
+ruby_codec()      { rb_consumer codec codec.rb; }
 
 # Run a Dart consumer from inside the generated package so `package:weaveffi`
 # and the cached `ffi` dependency resolve. The cdylib comes via WEAVEFFI_LIBRARY.
@@ -248,6 +269,7 @@ dart_events()     { dart_consumer events events.dart; }
 dart_kvstore()    { dart_consumer kvstore kvstore.dart; }
 dart_shapes()     { dart_consumer shapes shapes.dart; }
 dart_async_demo() { dart_consumer async-demo async_demo.dart; }
+dart_codec()      { dart_consumer codec codec.dart; }
 
 # A directory containing `libweaveffi.<ext>` symlinked to the sample cdylib, so
 # build-time `-lweaveffi` / `#cgo -lweaveffi` resolve. On Linux the consumer then
@@ -294,6 +316,7 @@ go_events()     { go_consumer events events.go; }
 go_kvstore()    { go_consumer kvstore kvstore.go; }
 go_shapes()     { go_consumer shapes shapes.go; }
 go_async_demo() { go_consumer async-demo async_demo.go; }
+go_codec()      { go_consumer codec codec.go; }
 
 # Swift: assemble a throwaway SwiftPM package that vendors the generated
 # WeaveFFI module plus a C shim whose module map points at the generated header
@@ -344,6 +367,7 @@ swift_events()     { swift_consumer events events.swift; }
 swift_kvstore()    { swift_consumer kvstore kvstore.swift; }
 swift_shapes()     { swift_consumer shapes shapes.swift; }
 swift_async_demo() { swift_consumer async-demo async_demo.swift; }
+swift_codec()      { swift_consumer codec codec.swift; }
 
 # .NET: compile the generated P/Invoke source together with the consumer into
 # one console app. The generated file is named after the resolved identity
@@ -383,6 +407,7 @@ dotnet_events()     { dotnet_consumer events Events.cs; }
 dotnet_kvstore()    { dotnet_consumer kvstore Kvstore.cs; }
 dotnet_shapes()     { dotnet_consumer shapes Shapes.cs; }
 dotnet_async_demo() { dotnet_consumer async-demo AsyncDemo.cs; }
+dotnet_codec()      { dotnet_consumer codec Codec.cs; }
 
 # Node: build the generated N-API addon with node-gyp against the producer
 # cdylib (via the `libweaveffi` link alias + include of the generated C header),
@@ -416,8 +441,9 @@ node_events()     { node_consumer events events.js; }
 node_kvstore()    { node_consumer kvstore kvstore.js; }
 node_shapes()     { node_consumer shapes shapes.js; }
 node_async_demo() { node_consumer async-demo async_demo.js; }
+node_codec()      { node_consumer codec codec.js; }
 
-# Kotlin/Android: compile the generated JNI bridge into `libweaveffi.<ext>` (what
+# Kotlin (JVM): compile the generated JNI bridge into `libweaveffi.<ext>` (what
 # `System.loadLibrary("weaveffi")` expects), linked against the producer cdylib;
 # then compile the generated WeaveFFI.kt together with the consumer in one module
 # (so the `internal` Entry/Stats constructors are reachable) against the
@@ -454,11 +480,11 @@ kotlin_consumer() {
                                 /snap/kotlin/current/lib/kotlinx-coroutines-core-jvm.jar \
                                 "$HOME/.sdkman/candidates/kotlin/current/lib/kotlinx-coroutines-core-jvm.jar" 2>/dev/null | head -1)
     [ -n "$coro" ] || { echo "kotlinx-coroutines-core-jvm.jar not found" >&2; return 1; }
-    cc -shared -fPIC "$GENROOT/$sample/android/src/main/cpp/weaveffi_jni.c" \
+    cc -shared -fPIC "$GENROOT/$sample/kotlin/src/main/cpp/weaveffi_jni.c" \
         -I"$jh/include" -I"$jni_os_inc" -I"$GENROOT/$sample/c" \
         -L"$LIBDIR" -l"${sample//-/_}" -Wl,-rpath,"$LIBDIR" \
         -o "$b/libweaveffi.$EXT" || { echo "JNI bridge compile failed" >&2; return 1; }
-    kotlinc "$GENROOT/$sample/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt" \
+    kotlinc "$GENROOT/$sample/kotlin/src/main/kotlin/com/weaveffi/WeaveFFI.kt" \
         "$ROOT/conformance/kotlin/$src" -cp "$coro" -include-runtime -d "$b/app.jar" \
         >/dev/null 2>&1 || { echo "kotlinc failed" >&2; return 1; }
     DYLD_LIBRARY_PATH="$LIBDIR:${DYLD_LIBRARY_PATH:-}" \
@@ -471,6 +497,7 @@ kotlin_events()     { kotlin_consumer events events.kt; }
 kotlin_kvstore()    { kotlin_consumer kvstore kvstore.kt; }
 kotlin_shapes()     { kotlin_consumer shapes shapes.kt; }
 kotlin_async_demo() { kotlin_consumer async-demo async_demo.kt; }
+kotlin_codec()      { kotlin_consumer codec codec.kt; }
 
 # Wasm: compile the producer to wasm32-unknown-unknown and drive the generated
 # ESM bindings from Node. The generated JS glue expects weaveffi_alloc/dealloc
@@ -500,6 +527,7 @@ wasm_events()     { wasm_consumer events events.mjs; }
 wasm_kvstore()    { wasm_consumer kvstore kvstore.mjs; }
 wasm_shapes()     { wasm_consumer shapes shapes.mjs; }
 wasm_async_demo() { wasm_consumer async-demo async_demo.mjs; }
+wasm_codec()      { wasm_consumer codec codec.mjs; }
 
 # ---------------------------------------------------------------------------
 # Producers + generation
@@ -514,15 +542,24 @@ build_producer shapes
 generate shapes
 build_producer async-demo
 generate async-demo
+build_producer codec
+generate codec
+build_producer inventory
+generate inventory
 # Header-only: the producer-export lane implements this in C, no Rust cdylib.
 generate calculator
 
 # ---------------------------------------------------------------------------
-# Run matrix: every language runs the events lane (callbacks/listeners +
-# iterators), the kvstore lane (handles, structs, builders, async, eviction
-# listener), and the async-demo lane (module-level async functions, typed
-# async errors, buffered async list-of-record returns); contacts covers the
-# original struct/enum/optional surface.
+# Run matrix: every language runs the events lane (a callback interface, a
+# reference-counted object passed back through the callback, iterators), the
+# kvstore lane (objects in records/lists/optionals, builders, async, an
+# eviction callback interface), the async-demo lane (module-level async
+# functions, typed async errors, buffered async list-of-record returns), the
+# codec lane (every value-buffer wire shape round-tripped through the producer,
+# including object tokens inside buffers), and shapes (rich enums); contacts
+# covers the original struct/enum/optional surface. The inventory lanes (C and
+# Python) cover the only multi-module sample: nested modules with cross-module
+# type references and per-module error domains.
 # ---------------------------------------------------------------------------
 check c-contacts c_contacts
 check c-events c_events
@@ -580,6 +617,19 @@ check dotnet-async-demo dotnet_async_demo
 check node-async-demo node_async_demo
 check kotlin-async-demo kotlin_async_demo
 check wasm-async-demo wasm_async_demo
+check c-codec c_codec
+check cpp-codec cpp_codec
+check python-codec python_codec
+check ruby-codec ruby_codec
+check go-codec go_codec
+check dart-codec dart_codec
+check swift-codec swift_codec
+check dotnet-codec dotnet_codec
+check node-codec node_codec
+check kotlin-codec kotlin_codec
+check wasm-codec wasm_codec
+check c-inventory c_inventory
+check python-inventory python_inventory
 
 echo
 echo "conformance: $PASS passed, $FAIL failed"

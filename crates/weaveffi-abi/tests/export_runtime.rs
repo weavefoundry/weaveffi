@@ -27,22 +27,34 @@ export_runtime!();
 fn macro_emits_all_runtime_symbols() {
     // Compile-time guarantee: every symbol the C ABI generators expect
     // must be addressable from this test crate.
+    let _f_version: extern "C" fn() -> u32 = weaveffi_abi_version;
     let _f_string: extern "C" fn(*const std::os::raw::c_char) = weaveffi_free_string;
     let _f_bytes: extern "C" fn(*mut u8, usize) = weaveffi_free_bytes;
+    let _f_err_set: extern "C" fn(*mut weaveffi_error, i32, *const std::os::raw::c_char) =
+        weaveffi_error_set;
     let _f_err_clear: extern "C" fn(*mut weaveffi_error) = weaveffi_error_clear;
+    let _f_err_free: extern "C" fn(*mut weaveffi_error) = weaveffi_error_free;
     let _f_tok_create: extern "C" fn() -> *mut weaveffi_cancel_token = weaveffi_cancel_token_create;
     let _f_tok_cancel: extern "C" fn(*mut weaveffi_cancel_token) = weaveffi_cancel_token_cancel;
     let _f_tok_is_cancelled: extern "C" fn(*const weaveffi_cancel_token) -> bool =
         weaveffi_cancel_token_is_cancelled;
     let _f_tok_destroy: extern "C" fn(*mut weaveffi_cancel_token) = weaveffi_cancel_token_destroy;
+    assert_eq!(weaveffi_abi_version(), abi::ABI_VERSION);
+}
 
-    let _f_arena_create: extern "C" fn() -> *mut abi::arena::HandleArena = weaveffi_arena_create;
-    let _f_arena_register: extern "C" fn(
-        *mut abi::arena::HandleArena,
-        *mut std::ffi::c_void,
-        unsafe extern "C" fn(*mut std::ffi::c_void),
-    ) = weaveffi_arena_register;
-    let _f_arena_destroy: extern "C" fn(*mut abi::arena::HandleArena) = weaveffi_arena_destroy;
+#[test]
+fn macro_error_set_thunk_copies_the_message() {
+    let mut err = weaveffi_error::default();
+    let msg = CString::new("consumer failure").unwrap();
+    weaveffi_error_set(&mut err, abi::FOREIGN_ERROR_CODE, msg.as_ptr());
+    drop(msg);
+    assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(
+        abi::c_ptr_to_string(err.message).as_deref(),
+        Some("consumer failure")
+    );
+    weaveffi_error_clear(&mut err);
+    weaveffi_error_set(ptr::null_mut(), 1, ptr::null());
 }
 
 #[test]
@@ -90,36 +102,6 @@ fn macro_cancel_token_thunks_round_trip() {
     weaveffi_cancel_token_cancel(ptr::null_mut());
     assert!(!weaveffi_cancel_token_is_cancelled(ptr::null()));
     weaveffi_cancel_token_destroy(ptr::null_mut());
-}
-
-#[test]
-fn macro_arena_thunks_round_trip() {
-    use std::ffi::c_void;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    unsafe extern "C" fn counting_dtor(ptr: *mut c_void) {
-        let counter = ptr as *const AtomicUsize;
-        (*counter).fetch_add(1, Ordering::SeqCst);
-    }
-
-    let counter = AtomicUsize::new(0);
-    let counter_ptr = &counter as *const AtomicUsize as *mut c_void;
-
-    let arena = weaveffi_arena_create();
-    assert!(!arena.is_null());
-
-    weaveffi_arena_register(arena, counter_ptr, counting_dtor);
-    weaveffi_arena_register(arena, counter_ptr, counting_dtor);
-
-    weaveffi_arena_destroy(arena);
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
-
-    weaveffi_arena_register(
-        ptr::null_mut(),
-        ptr::dangling_mut::<c_void>(),
-        counting_dtor,
-    );
-    weaveffi_arena_destroy(ptr::null_mut());
 }
 
 #[test]

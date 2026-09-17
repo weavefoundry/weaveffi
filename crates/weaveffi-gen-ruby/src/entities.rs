@@ -51,9 +51,10 @@ pub(crate) fn rb_checker_name(f: &FnBinding, error: Option<&ErrorBinding>) -> St
 ///
 /// Domain codes are validated positive-only; the negative range is reserved
 /// for the runtime (`-1` generic, `-2` producer panic, `-3` marshalling
-/// failure). The factory therefore maps only declared codes onto typed
-/// classes and lets everything else, negative runtime codes included, fall
-/// through to the generic branded `Error`.
+/// failure, `-4` a callback-interface implementation that raised). The
+/// factory therefore maps only declared codes onto typed classes and lets
+/// everything else, negative runtime codes included, fall through to the
+/// generic branded `Error`.
 pub(crate) fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     let domain = &eb.type_name;
     let factory = rb_error_factory_name(eb);
@@ -134,7 +135,7 @@ pub(crate) fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorB
         "# Builds the {domain} subclass matching `code`, decoding any payload"
     ));
     w.line("# fields the code declares, or a generic Error for codes outside");
-    w.line("# the domain (panics, marshalling).");
+    w.line("# the domain (panics, marshalling, callback failures).");
     w.block(
         format!("def self.{factory}(code, message, payload = nil)"),
         "end",
@@ -182,7 +183,7 @@ pub(crate) fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorB
         w.line("return if err[:code].zero?");
         w.line("code = err[:code]");
         w.line("msg_ptr = err[:message]");
-        w.line("msg = msg_ptr.null? ? '' : msg_ptr.read_string");
+        w.line("msg = msg_ptr.null? ? '' : msg_ptr.read_string.force_encoding(Encoding::UTF_8)");
         w.line("payload_ptr = err[:payload_ptr]");
         w.line("payload = payload_ptr.null? ? nil : payload_ptr.read_string(err[:payload_len])");
         w.line("weaveffi_error_clear(err.to_ptr)");
@@ -333,13 +334,18 @@ pub(crate) fn render_rich_enum_class(out: &mut String, e: &EnumBinding) {
     out.push_str(&w.finish());
 }
 
-/// Declare the FFI bindings for one interface: the destroy symbol plus every
-/// constructor, method, and static through the shared attach path. Methods
-/// carry their implicit leading `self` pointer slot in the precomputed ABI
-/// signatures, so no special casing is needed here.
+/// Declare the FFI bindings for one interface: the clone and destroy
+/// lifecycle symbols plus every constructor, method, and static through the
+/// shared attach path. Methods carry their implicit leading `self` pointer
+/// slot in the precomputed ABI signatures, so no special casing is needed
+/// here.
 pub(crate) fn render_interface_ffi(out: &mut String, i: &InterfaceBinding) {
     let mut w = CodeWriter::two_space().with_depth(1);
     w.blank();
+    w.line(format!(
+        "attach_function :{}, [:pointer], :pointer",
+        i.clone_symbol
+    ));
     w.line(format!(
         "attach_function :{}, [:pointer], :void",
         i.destroy_symbol
@@ -355,15 +361,20 @@ pub(crate) fn render_interface_ffi(out: &mut String, i: &InterfaceBinding) {
     }
 }
 
-/// Render one interface as an opaque-object wrapper class, following the
-/// struct wrapper's ownership pattern: a `{Name}Ptr < FFI::AutoPointer`
-/// subclass releases the handle through the interface's C destroy symbol on
-/// GC, and the wrapper class exposes `attr_reader :handle` plus an explicit
-/// `destroy`. A constructor named `new` becomes `initialize`; every other
-/// constructor becomes a class-method factory; methods pass `@handle` as the
-/// leading C argument; statics are class methods. `_from_ptr` wraps an owned
-/// pointer the producer already handed over (a C return value) without
-/// re-running `initialize`.
+/// Render one interface as a reference-counted object wrapper class. A
+/// `{Name}Ptr < FFI::AutoPointer` subclass owns exactly one strong reference
+/// and releases it through the interface's `_destroy` symbol either from
+/// `close` or, as a backstop, from the GC finalizer (`AutoPointer#free`
+/// disables the finalizer, so the two paths never both fire). The wrapper
+/// exposes `handle` (the borrowed pointer passed to producer calls), `close`,
+/// `closed?`, `_wv_clone_ptr` (a fresh strong reference for the value-buffer
+/// codec), and an `initialize_copy` so `dup`/`clone` yield an independent
+/// wrapper holding its own reference. A constructor named `new` becomes
+/// `initialize`; every other constructor becomes a class-method factory;
+/// methods pass `handle` as the leading C argument; statics are class
+/// methods. `_from_ptr` adopts an owned pointer the producer already handed
+/// over (a return, an async result, an iterator element, a buffer token)
+/// without re-running `initialize`.
 pub(crate) fn render_interface_class(
     out: &mut String,
     module: &ModuleBinding,
@@ -373,6 +384,11 @@ pub(crate) fn render_interface_class(
     let ptr_class = format!("{}Ptr", i.name);
     let mut w = CodeWriter::two_space().with_depth(1);
     w.blank();
+    w.line("# @api private");
+    w.line(format!(
+        "# Owns one strong reference to a {}; releases it exactly once.",
+        i.name
+    ));
     w.block(
         format!("class {ptr_class} < FFI::AutoPointer"),
         "end",
@@ -387,11 +403,13 @@ pub(crate) fn render_interface_class(
     let mut d = String::new();
     emit_doc(&mut d, &i.doc, "  ");
     w.raw(d);
+    if let Some(msg) = &i.deprecated {
+        w.line(format!("# @deprecated {msg}"));
+    }
     w.line(format!("class {}", i.name));
     w.scope(|w| {
-        w.line("attr_reader :handle");
-        w.blank();
-        w.line("# Wraps an owned pointer the producer handed over, without");
+        w.line("# @api private");
+        w.line("# Adopts one strong reference the producer handed over, without");
         w.line("# re-running initialize.");
         w.block("def self._from_ptr(ptr)", "end", |w| {
             w.line("obj = allocate");
@@ -401,10 +419,43 @@ pub(crate) fn render_interface_class(
             w.line("obj");
         });
         w.blank();
-        w.block("def destroy", "end", |w| {
+        w.line("# The borrowed object pointer passed to producer calls.");
+        w.block("def handle", "end", |w| {
+            w.line(format!(
+                "raise Error.new(-1, '{} used after close') if @handle.nil?",
+                i.name
+            ));
+            w.line("@handle");
+        });
+        w.blank();
+        w.line("# Whether close has released this wrapper's reference.");
+        w.block("def closed?", "end", |w| {
+            w.line("@handle.nil?");
+        });
+        w.blank();
+        w.line("# Releases this wrapper's reference now rather than at GC time.");
+        w.line("# Idempotent; the object itself is dropped when the last reference");
+        w.line("# anywhere (another wrapper, a record field, the producer) goes.");
+        w.block("def close", "end", |w| {
             w.line("return if @handle.nil?");
             w.line("@handle.free");
             w.line("@handle = nil");
+        });
+        w.blank();
+        w.line("# @api private");
+        w.line("# Mints a new strong reference the caller owns (used when this");
+        w.line("# object is written into a value buffer).");
+        w.block("def _wv_clone_ptr", "end", |w| {
+            w.line(format!("{rb_module_name}.{}(handle)", i.clone_symbol));
+        });
+        w.blank();
+        w.line("# dup and clone produce an independent wrapper with its own reference.");
+        w.block("def initialize_copy(other)", "end", |w| {
+            w.line("super");
+            w.line(format!(
+                "@handle = {ptr_class}.new({rb_module_name}.{}(other.handle))",
+                i.clone_symbol
+            ));
         });
     });
     out.push_str(&w.finish());

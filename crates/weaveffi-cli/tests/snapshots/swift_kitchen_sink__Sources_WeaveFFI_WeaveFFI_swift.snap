@@ -83,6 +83,9 @@ struct WvWriter {
         bytes.append(contentsOf: v)
     }
     mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
+    /// Writes an object token. `p` must be a strong reference the buffer now
+    /// owns (a freshly cloned pointer), never one a wrapper still holds.
+    mutating func writeObject(_ p: OpaquePointer) { writeUInt64(UInt64(UInt(bitPattern: p))) }
 }
 
 /// Traps on a malformed value buffer. Per the wire-format spec, consumers
@@ -160,6 +163,14 @@ struct WvReader {
         default: wvDecodeFailure("option flag byte out of range")
         }
     }
+    /// Reads an object token: one strong reference the caller must adopt
+    /// into a wrapper whose deinit releases it.
+    mutating func readObject() -> OpaquePointer {
+        guard let p = OpaquePointer(bitPattern: UInt(readUInt64())) else {
+            wvDecodeFailure("null object token")
+        }
+        return p
+    }
     func finish() {
         if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
     }
@@ -170,13 +181,12 @@ private final class ContinuationRef<T, E: Error> {
     init(_ value: CheckedContinuation<T, E>) { self.value = value }
 }
 
-final class WvCallbackBox<T> {
-    let value: T
-    init(_ value: T) { self.value = value }
+/// Reports a thrown Swift error to the producer as a foreign callback failure
+/// (code -4); the producer aborts its current call with that code and message.
+func wvForeignError(_ outErr: UnsafeMutablePointer<weaveffi_error>?, _ error: Error) {
+    let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    message.withCString { weaveffi_error_set(outErr, -4, $0) }
 }
-
-var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
-let wvListenerLock = NSLock()
 
 /// A reusable token referenced across modules
 public struct Token {
@@ -284,9 +294,11 @@ public struct Item {
     /// Cross-module struct reference
     public var token: Token
     public var priority: Priority
+    /// An optional object inside a record
+    public var gadget: Gadget?
 
     /// Creates a `Item` value.
-    public init(id: Int64, name: String, count: Int32, enabled: Bool, ratio: Double, nick: UInt32, payload: Data, tags: [String], attrs: [String: String], parent: Int64?, token: Token, priority: Priority) {
+    public init(id: Int64, name: String, count: Int32, enabled: Bool, ratio: Double, nick: UInt32, payload: Data, tags: [String], attrs: [String: String], parent: Int64?, token: Token, priority: Priority, gadget: Gadget?) {
         self.id = id
         self.name = name
         self.count = count
@@ -299,6 +311,7 @@ public struct Item {
         self.parent = parent
         self.token = token
         self.priority = priority
+        self.gadget = gadget
     }
 }
 
@@ -328,40 +341,109 @@ func wvWriteItem(_ value: Item, into w: inout WvWriter) {
     }
     wvWriteToken(value.token, into: &w)
     w.writeInt32(Int32(bitPattern: value.priority.rawValue))
+    if let v4 = value.gadget {
+        w.writeOptionFlag(true)
+        w.writeObject(v4.clonePtr())
+    } else {
+        w.writeOptionFlag(false)
+    }
 }
 
 /// Deserializes a `Item` from the value-buffer wire format.
 func wvReadItem(_ r: inout WvReader) -> Item {
-    let v4 = r.readInt64()
-    let v5 = r.readString()
-    let v6 = r.readInt32()
-    let v7 = r.readBool()
-    let v8 = r.readDouble()
-    let v9 = r.readUInt32()
-    let v10 = r.readBytes()
-    let n12 = r.readLen()
-    var v11: [String] = []
-    v11.reserveCapacity(n12)
-    for _ in 0..<n12 {
-        let v13 = r.readString()
-        v11.append(v13)
+    let v5 = r.readInt64()
+    let v6 = r.readString()
+    let v7 = r.readInt32()
+    let v8 = r.readBool()
+    let v9 = r.readDouble()
+    let v10 = r.readUInt32()
+    let v11 = r.readBytes()
+    let n13 = r.readLen()
+    var v12: [String] = []
+    v12.reserveCapacity(n13)
+    for _ in 0..<n13 {
+        let v14 = r.readString()
+        v12.append(v14)
     }
-    let n15 = r.readLen()
-    var v14: [String: String] = [:]
-    v14.reserveCapacity(n15)
-    for _ in 0..<n15 {
-        let v16 = r.readString()
+    let n16 = r.readLen()
+    var v15: [String: String] = [:]
+    v15.reserveCapacity(n16)
+    for _ in 0..<n16 {
         let v17 = r.readString()
-        v14[v16] = v17
+        let v18 = r.readString()
+        v15[v17] = v18
     }
-    var v18: Int64? = nil
+    var v19: Int64? = nil
     if r.readOptionFlag() {
-        let v19 = r.readInt64()
-        v18 = v19
+        let v20 = r.readInt64()
+        v19 = v20
     }
-    let v20 = wvReadToken(&r)
-    let v21 = Priority(rawValue: UInt32(bitPattern: r.readInt32()))!
-    return Item(id: v4, name: v5, count: v6, enabled: v7, ratio: v8, nick: v9, payload: v10, tags: v11, attrs: v14, parent: v18, token: v20, priority: v21)
+    let v21 = wvReadToken(&r)
+    let v22 = Priority(rawValue: UInt32(bitPattern: r.readInt32()))!
+    var v23: Gadget? = nil
+    if r.readOptionFlag() {
+        let v24 = Gadget(ptr: r.readObject())
+        v23 = v24
+    }
+    return Item(id: v5, name: v6, count: v7, enabled: v8, ratio: v9, nick: v10, payload: v11, tags: v12, attrs: v15, parent: v19, token: v21, priority: v22, gadget: v23)
+}
+
+/// Consumer-implemented observer of ready items
+///
+/// Implement this protocol and pass the value where the API expects it; the
+/// producer keeps it alive for as long as it holds the callback and may call
+/// any method from any thread. A thrown error aborts the producer's call and
+/// surfaces to the original caller as a foreign error (code -4).
+public protocol ReadyListener {
+    /// Fires when an item is ready
+    func onReady(code: Int32, msg: String) throws
+    /// Receives the item itself and says whether to keep listening
+    func onItem(item: Item, gadget: Gadget) throws -> Bool
+}
+
+/// Retains one `ReadyListener` implementation across the C boundary; the producer's
+/// `free` entry releases it.
+final class WvReadyListenerBox {
+    let impl: any ReadyListener
+    init(_ impl: any ReadyListener) { self.impl = impl }
+}
+
+/// The process-wide `weaveffi_kitchen_ReadyListener_vtable` the producer calls `ReadyListener`
+/// implementations through. Every entry recovers the box from `ctx`, copies
+/// or adopts its arguments, and reports a thrown error through `out_err`
+/// instead of unwinding.
+enum WvReadyListenerVtable {
+    static let value = weaveffi_kitchen_ReadyListener_vtable(
+        on_ready: { ctx, code, msg, out_err in
+            let wvBox = Unmanaged<WvReadyListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                try wvBox.impl.onReady(code: code, msg: String(cString: msg!))
+            } catch {
+                wvForeignError(out_err, error)
+            }
+        },
+        on_item: { ctx, item_ptr, item_len, gadget, out_err in
+            let wvBox = Unmanaged<WvReadyListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            let b0 = [UInt8](UnsafeBufferPointer(start: item_ptr, count: item_len))
+            var r1 = WvReader(bytes: b0)
+            let v2 = wvReadItem(&r1)
+            r1.finish()
+            do {
+                return try wvBox.impl.onItem(item: v2, gadget: Gadget(ptr: gadget!))
+            } catch {
+                wvForeignError(out_err, error)
+                return false
+            }
+        },
+        free: { ctx in
+            Unmanaged<WvReadyListenerBox>.fromOpaque(ctx!).release()
+        }
+    )
+    static let pointer: UnsafePointer<weaveffi_kitchen_ReadyListener_vtable> = {
+        let cell = UnsafeMutablePointer<weaveffi_kitchen_ReadyListener_vtable>.allocate(capacity: 1)
+        cell.initialize(to: value)
+        return UnsafePointer(cell)
+    }()
 }
 
 /// A pocket-sized interface exercising the object surface
@@ -374,6 +456,12 @@ public final class Gadget {
 
     deinit {
         weaveffi_kitchen_Gadget_destroy(ptr)
+    }
+
+    /// Returns a new strong reference to the same object, for a position that
+    /// takes ownership of it (an object token inside a value buffer).
+    func clonePtr() -> OpaquePointer {
+        weaveffi_kitchen_Gadget_clone(ptr)!
     }
     /// Create a gadget with the given id
     public init(id: Int64) {
@@ -407,6 +495,48 @@ public final class Gadget {
         guard let rv = rv else { fatalError("-1: null string") }
         defer { weaveffi_free_string(rv) }
         return String(cString: rv)
+    }
+}
+
+/// A lazy sequence over the `Gadget` elements streamed by `weaveffi_kitchen_stream_gadgets`.
+///
+/// Each `next()` call pulls exactly one element from the producer. The
+/// underlying C iterator is destroyed eagerly on exhaustion and from
+/// `deinit` when iteration is abandoned early.
+public final class KitchenStreamGadgetsIterator: Sequence, IteratorProtocol {
+    private var handle: OpaquePointer?
+
+    init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        destroyHandle()
+    }
+
+    private func destroyHandle() {
+        guard let handle = handle else { return }
+        weaveffi_kitchen_StreamGadgetsIterator_destroy(handle)
+        self.handle = nil
+    }
+
+    /// Pulls the next element from the producer, or returns `nil` once the
+    /// stream is exhausted (destroying the underlying iterator).
+    public func next() -> Gadget? {
+        guard let handle = handle else { return nil }
+        var item: OpaquePointer? = nil
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        if weaveffi_kitchen_StreamGadgetsIterator_next(handle, &item, &err) == 0 {
+            if err.code != 0 {
+                let code = err.code
+                let message = err.message.flatMap { String(cString: $0) } ?? ""
+                weaveffi_error_clear(&err)
+                fatalError("\(code): \(message)")
+            }
+            destroyHandle()
+            return nil
+        }
+        return Gadget(ptr: item!)
     }
 }
 
@@ -459,30 +589,6 @@ public final class KitchenStreamItemsIterator: Sequence, IteratorProtocol {
 }
 
 public enum Kitchen {
-    /// Subscribe to OnReady events
-    /// - Returns: A subscription id for ``unregisterReadyListener(_:)``.
-    public static func registerReadyListener(_ callback: @escaping (Int32, String) -> Void) -> UInt64 {
-        let box = WvCallbackBox(callback)
-        let ctx = Unmanaged.passRetained(box).toOpaque()
-        let id = weaveffi_kitchen_register_ready_listener({ code, msg, context in
-            let cb = Unmanaged<WvCallbackBox<(Int32, String) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
-            cb(code, String(cString: msg!))
-        }, ctx)
-        wvListenerLock.lock()
-        wvListenerContexts[id] = ctx
-        wvListenerLock.unlock()
-        return id
-    }
-    /// Unregisters a listener previously registered with ``registerReadyListener(_:)``.
-    public static func unregisterReadyListener(_ id: UInt64) {
-        weaveffi_kitchen_unregister_ready_listener(id)
-        wvListenerLock.lock()
-        let ctx = wvListenerContexts.removeValue(forKey: id)
-        wvListenerLock.unlock()
-        if let ctx = ctx {
-            Unmanaged<WvCallbackBox<(Int32, String) -> Void>>.fromOpaque(ctx).release()
-        }
-    }
     /// Identity for bool
     public static func boolId(x: Bool) -> Bool {
         var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
@@ -538,45 +644,51 @@ public enum Kitchen {
         defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }
         return Data(bytes: rv, count: outLen)
     }
-    /// Borrowed string parameter
-    public static func echoBorrowedStr(s: String) -> String {
+    /// Register a listener, returning how many are attached
+    public static func subscribe(listener: ReadyListener) -> Int32 {
         var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
-        let rv: UnsafePointer<CChar>? = s.withCString { s_ptr in
-            return weaveffi_kitchen_echo_borrowed_str(s_ptr, &err)
-        }
-        trap(&err)
-        guard let rv = rv else { fatalError("-1: null string") }
-        defer { weaveffi_free_string(rv) }
-        return String(cString: rv)
-    }
-    /// Borrowed bytes parameter
-    public static func echoBorrowedBytes(b: Data) -> Data {
-        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
-        let bBytes = Array(b)
-        var outLen: Int = 0
-        let rv: UnsafePointer<UInt8>? = bBytes.withUnsafeBufferPointer { b_buf in
-            let b_ptr = b_buf.baseAddress
-            let b_len = b_buf.count
-            return weaveffi_kitchen_echo_borrowed_bytes(b_ptr, b_len, &outLen, &err)
-        }
-        trap(&err)
-        guard let rv = rv else { return Data() }
-        defer { weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen) }
-        return Data(bytes: rv, count: outLen)
-    }
-    /// Returns an opaque handle
-    public static func openHandle() -> UInt64 {
-        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
-        let rv = weaveffi_kitchen_open_handle(&err)
+        let listener_ctx = Unmanaged.passRetained(WvReadyListenerBox(listener)).toOpaque()
+        let rv = weaveffi_kitchen_subscribe(listener_ctx, WvReadyListenerVtable.pointer, &err)
         trap(&err)
         return rv
     }
-    /// Returns a typed handle
-    public static func openTypedHandle() -> UInt64 {
+    /// Optional object in both directions
+    public static func maybeGadget(fallback: Gadget?) -> Gadget? {
         var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
-        let rv = weaveffi_kitchen_open_typed_handle(&err)
+        let rv = weaveffi_kitchen_maybe_gadget(fallback?.ptr, &err)
         trap(&err)
-        return UInt64(UInt(bitPattern: rv))
+        return rv.map { Gadget(ptr: $0) }
+    }
+    /// A list of objects
+    public static func gadgets() -> [Gadget] {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        var outLen: Int = 0
+        let rv = weaveffi_kitchen_gadgets(&outLen, &err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null buffer") }
+        let rvBytes = [UInt8](UnsafeBufferPointer(start: rv, count: outLen))
+        weaveffi_free_bytes(UnsafeMutablePointer(mutating: rv), outLen)
+        var rvReader = WvReader(bytes: rvBytes)
+        let n1 = rvReader.readLen()
+        var v0: [Gadget] = []
+        v0.reserveCapacity(n1)
+        for _ in 0..<n1 {
+            let v2 = Gadget(ptr: rvReader.readObject())
+            v0.append(v2)
+        }
+        rvReader.finish()
+        return v0
+    }
+    /// An iterator over objects
+    /// - Returns: A lazy sequence that pulls one element per step from the
+    ///   producer; the underlying iterator is destroyed when the sequence is
+    ///   exhausted or deinitialized.
+    public static func streamGadgets() -> KitchenStreamGadgetsIterator {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let rv = weaveffi_kitchen_stream_gadgets(&err)
+        trap(&err)
+        guard let rv = rv else { fatalError("-1: null iterator") }
+        return KitchenStreamGadgetsIterator(handle: rv)
     }
     /// Optional struct return
     public static func maybeItem(id: Int64) throws -> Item? {

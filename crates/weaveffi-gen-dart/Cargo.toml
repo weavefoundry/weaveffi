@@ -15,5 +15,8 @@ camino = { workspace = true }
 heck = { workspace = true }
 serde = { workspace = true }
 
+[dev-dependencies]
+weaveffi-ir = { path = "../weaveffi-ir", version = "0.22.0" }
+
 [lints]
 workspace = true

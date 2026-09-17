@@ -1,9 +1,10 @@
-version: "0.8.0"
+version: "0.9.0"
 # Shapes the mainstream fixtures do not reach: identifiers that are reserved
-# words in one or more target languages, deeply nested composites, optional and
-# mutable parameters, interfaces in every legal position, async functions with
-# non-string results, type-level deprecation, scalar and string iterators, and
-# callbacks carrying composite payloads. Snapshots pin how every generator
+# words in one or more target languages, deeply nested composites, optional
+# parameters, interfaces in every legal position (including inside records,
+# lists, maps, and iterators), async functions with non-string results,
+# type-level deprecation, scalar and string iterators, and callback interfaces
+# carrying composite payloads and objects. Snapshots pin how every generator
 # renders each of these, so a regression in keyword escaping or a codec edge
 # shows up as a diff instead of as a compile error in a downstream project.
 modules:
@@ -109,21 +110,50 @@ modules:
         deprecated: "Use Outer instead"
         fields:
           - { name: id, type: i64 }
-    callbacks:
-      - name: OnBatch
-        doc: Callback carrying composite payloads
-        params:
-          - { name: items, type: "[Outer]" }
-          - { name: raw, type: bytes }
-          - { name: first, type: "Outer?" }
-          - { name: mode, type: Mode }
-      - name: OnTick
-        params: []
-    listeners:
-      - name: batch_listener
-        event_callback: OnBatch
-      - name: tick_listener
-        event_callback: OnTick
+      - name: WidgetHolder
+        doc: Record carrying objects in every buffered position
+        fields:
+          - { name: primary, type: Widget }
+          - { name: fallback, type: "Widget?" }
+          - { name: extras, type: "[Widget]" }
+          - { name: by_name, type: "{string:Widget}" }
+    callback_interfaces:
+      - name: BatchListener
+        doc: Callback interface carrying composite payloads and objects
+        methods:
+          - name: on_batch
+            doc: Composite payloads cross as value buffers
+            params:
+              - { name: items, type: "[Outer]" }
+              - { name: raw, type: bytes }
+              - { name: first, type: "Outer?" }
+              - { name: mode, type: Mode }
+          - name: on_widget
+            doc: Objects cross as strong references the consumer must release
+            params:
+              - { name: widget, type: Widget }
+              - { name: fallback, type: "Widget?" }
+              - { name: children, type: "[Widget]" }
+          - name: on_tick
+            params: []
+          - name: should_continue
+            doc: Scalar return travels back through the vtable
+            params:
+              - { name: class, type: i32 }
+            return: bool
+          - name: pick_mode
+            doc: Enum return travels back as its integer discriminant
+            params: []
+            return: Mode
+      - name: Keyword
+        doc: Callback interface whose name and methods are keywords
+        methods:
+          - name: delete
+            params:
+              - { name: self, type: i32 }
+          - name: import
+            params: []
+            return: i32
     errors:
       name: EdgeErrors
       codes:
@@ -198,11 +228,29 @@ modules:
           - { name: blob, type: "bytes?" }
           - { name: mode, type: "Mode?" }
         return: "Mode?"
-      - name: mutable_params
-        doc: Write-back parameters
+      - name: register_batch
+        doc: Two callback interface parameters on one function
         params:
-          - { name: text, type: string, mutable: true }
-          - { name: blob, type: bytes, mutable: true }
+          - { name: listener, type: BatchListener }
+          - { name: keyword, type: Keyword }
+      - name: widgets_everywhere
+        doc: Objects in every buffered position
+        params:
+          - { name: list, type: "[Widget]" }
+          - { name: by_name, type: "{string:Widget}" }
+          - { name: sparse, type: "[Widget?]" }
+          - { name: holder, type: WidgetHolder }
+        return: WidgetHolder
+      - name: widget_stream
+        doc: Iterator of objects
+        params: []
+        return: "iter<Widget>"
+      - name: async_widget
+        doc: Async returning an object
+        params: []
+        return: Widget
+        async: true
+        throws: true
       - name: make_widget
         doc: Factory for an interface with no constructor
         params:
@@ -220,11 +268,6 @@ modules:
           - { name: widget, type: Widget }
           - { name: fallback, type: "Widget?" }
         return: string
-      - name: typed_handle_param
-        params:
-          - { name: token, type: "handle<Leaf>" }
-          - { name: raw, type: handle }
-        return: "handle<Leaf>"
       - name: string_stream
         doc: Iterator of strings
         params: []

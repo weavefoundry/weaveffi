@@ -8,7 +8,7 @@ use weaveffi_core::model::{AbiFn, CallShape, FnBinding};
 use weaveffi_core::plan::ErrorStrategy;
 
 use super::async_fns::gen_async_function;
-use super::helpers::{fn_slots, ident, ret_arrow_for, sentinel, wrap_unwind, CallTarget};
+use super::helpers::{fn_slots, ident, ret_arrow_for, sentinel, wrap_unwind, CallTarget, UserSig};
 use super::iterators::gen_iterator_function;
 use super::marshal::{build_call_body, lift_param};
 
@@ -27,10 +27,11 @@ pub(crate) fn gen_function(
     sig: &syn::Signature,
     target: &CallTarget,
 ) -> syn::Result<TokenStream> {
+    let user = UserSig::new(sig, target.self_ty());
     match &f.shape {
-        CallShape::Sync(abi) => gen_sync_function(f, abi, sig, target),
-        CallShape::Iterator(it) => gen_iterator_function(f, it, sig, target),
-        CallShape::Async(a) => gen_async_function(f, a, sig, target),
+        CallShape::Sync(abi) => gen_sync_function(f, abi, &user, target),
+        CallShape::Iterator(it) => gen_iterator_function(f, it, &user, target),
+        CallShape::Async(a) => gen_async_function(f, a, &user, target),
     }
 }
 
@@ -38,27 +39,26 @@ pub(crate) fn gen_function(
 fn gen_sync_function(
     f: &FnBinding,
     abi: &AbiFn,
-    sig: &syn::Signature,
+    user: &UserSig<'_>,
     target: &CallTarget,
 ) -> syn::Result<TokenStream> {
     let sym = ident(&abi.symbol);
-    let params: Vec<TokenStream> = fn_slots(&abi.params, f, sig);
-    let arrow = ret_arrow_for(&abi.ret, f, sig);
+    let params = fn_slots(&abi.params, &f.params, user)?;
+    let arrow = ret_arrow_for(&abi.ret, f.ret.as_ref(), user);
     let sentinel = sentinel(&abi.ret);
 
     // Lift each parameter, collecting the preambles and the call arguments.
-    let self_pre = target.self_preamble(&sentinel);
+    let self_pre = target.self_preamble(&sentinel, user.receiver_is_arc());
     let mut preamble = TokenStream::new();
     let mut call_args: Vec<TokenStream> = Vec::new();
     for pb in &f.params {
-        let is_ref = super::helpers::param_is_ref(sig, &pb.name);
-        let (pre, arg) = lift_param(pb, is_ref, &sentinel)?;
+        let (pre, arg) = lift_param(pb, user, &sentinel)?;
         preamble.extend(pre);
         call_args.push(arg);
     }
 
     let call = target.call(&f.name, &call_args);
-    let body = build_call_body(&f.ret, &abi.ret, throws(f), call)?;
+    let body = build_call_body(f.ret.as_ref(), &abi.ret, throws(f), call, user)?;
     let is_void = matches!(abi.ret, CType::Void);
     let wrapped = wrap_unwind(
         quote! { #self_pre #preamble #body },

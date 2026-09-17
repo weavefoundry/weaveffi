@@ -28,6 +28,10 @@ pub enum Os {
     Linux,
     /// Windows; shared libraries are `.dll`.
     Windows,
+    /// Android (Bionic); shared libraries are `.so` bundled under `jniLibs`.
+    Android,
+    /// WebAssembly; the "library" is a standalone `.wasm` module.
+    Wasm,
 }
 
 /// The CPU architecture of a [`Platform`].
@@ -37,15 +41,22 @@ pub enum Arch {
     X64,
     /// 64-bit ARM (`aarch64` / `arm64`).
     Arm64,
+    /// 32-bit WebAssembly (`wasm32`).
+    Wasm32,
 }
 
 /// A single native target platform WeaveFFI can build for and bundle a
 /// prebuilt library into a published package.
 ///
-/// The v1 matrix is macOS (arm64 and x64), Linux glibc (x64 and arm64), and
-/// Windows (x64). Each variant carries a stable [`id`](Self::id) used both as
+/// The desktop matrix is macOS (arm64 and x64), Linux glibc (x64 and arm64),
+/// and Windows (x64); the mobile and web additions are Android (arm64 and x64)
+/// and `wasm32`. Each variant carries a stable [`id`](Self::id) used both as
 /// the `--platforms` token and as the per-platform subdirectory name in the
 /// `--binaries` input layout (`<dir>/<id>/<library>`).
+///
+/// Not every ecosystem publishes for every platform: a NuGet package has no
+/// Android RID, a wheel has no wasm tag. The ecosystem accessors return
+/// `Option` and a packaging backend skips binaries it has no slot for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Platform {
     /// macOS on Apple silicon (`aarch64-apple-darwin`).
@@ -58,11 +69,31 @@ pub enum Platform {
     LinuxArm64,
     /// Windows on x86-64 (`x86_64-pc-windows-msvc`).
     WindowsX64,
+    /// Android on ARM64 (`aarch64-linux-android`, jniLibs `arm64-v8a`).
+    AndroidArm64,
+    /// Android on x86-64 (`x86_64-linux-android`, jniLibs `x86_64`), the
+    /// emulator target.
+    AndroidX64,
+    /// Bare WebAssembly (`wasm32-unknown-unknown`).
+    Wasm32,
 }
 
 impl Platform {
-    /// Every platform in the v1 support matrix, in a stable order.
-    pub const ALL: [Platform; 5] = [
+    /// Every supported platform, in a stable order.
+    pub const ALL: [Platform; 8] = [
+        Platform::MacosArm64,
+        Platform::MacosX64,
+        Platform::LinuxX64,
+        Platform::LinuxArm64,
+        Platform::WindowsX64,
+        Platform::AndroidArm64,
+        Platform::AndroidX64,
+        Platform::Wasm32,
+    ];
+
+    /// The desktop platforms every dynamic-library ecosystem (NuGet, npm,
+    /// wheels, gems, JVM desktop) can bundle, in a stable order.
+    pub const DESKTOP: [Platform; 5] = [
         Platform::MacosArm64,
         Platform::MacosX64,
         Platform::LinuxX64,
@@ -72,7 +103,8 @@ impl Platform {
 
     /// The stable WeaveFFI platform identifier, used as the `--platforms` token
     /// and the `--binaries` subdirectory name (`darwin-arm64`, `darwin-x64`,
-    /// `linux-x64`, `linux-arm64`, `windows-x64`).
+    /// `linux-x64`, `linux-arm64`, `windows-x64`, `android-arm64`,
+    /// `android-x64`, `wasm32`).
     pub fn id(self) -> &'static str {
         match self {
             Platform::MacosArm64 => "darwin-arm64",
@@ -80,7 +112,15 @@ impl Platform {
             Platform::LinuxX64 => "linux-x64",
             Platform::LinuxArm64 => "linux-arm64",
             Platform::WindowsX64 => "windows-x64",
+            Platform::AndroidArm64 => "android-arm64",
+            Platform::AndroidX64 => "android-x64",
+            Platform::Wasm32 => "wasm32",
         }
+    }
+
+    /// Whether this is one of the [`DESKTOP`](Self::DESKTOP) platforms.
+    pub fn is_desktop(self) -> bool {
+        Platform::DESKTOP.contains(&self)
     }
 
     /// Parse a [`Platform`] from its [`id`](Self::id), returning `None` for an
@@ -95,14 +135,20 @@ impl Platform {
             Platform::MacosArm64 | Platform::MacosX64 => Os::MacOs,
             Platform::LinuxX64 | Platform::LinuxArm64 => Os::Linux,
             Platform::WindowsX64 => Os::Windows,
+            Platform::AndroidArm64 | Platform::AndroidX64 => Os::Android,
+            Platform::Wasm32 => Os::Wasm,
         }
     }
 
     /// The CPU architecture.
     pub fn arch(self) -> Arch {
         match self {
-            Platform::MacosArm64 | Platform::LinuxArm64 => Arch::Arm64,
-            Platform::MacosX64 | Platform::LinuxX64 | Platform::WindowsX64 => Arch::X64,
+            Platform::MacosArm64 | Platform::LinuxArm64 | Platform::AndroidArm64 => Arch::Arm64,
+            Platform::MacosX64
+            | Platform::LinuxX64
+            | Platform::WindowsX64
+            | Platform::AndroidX64 => Arch::X64,
+            Platform::Wasm32 => Arch::Wasm32,
         }
     }
 
@@ -115,6 +161,9 @@ impl Platform {
             Platform::LinuxX64 => "x86_64-unknown-linux-gnu",
             Platform::LinuxArm64 => "aarch64-unknown-linux-gnu",
             Platform::WindowsX64 => "x86_64-pc-windows-msvc",
+            Platform::AndroidArm64 => "aarch64-linux-android",
+            Platform::AndroidX64 => "x86_64-linux-android",
+            Platform::Wasm32 => "wasm32-unknown-unknown",
         }
     }
 
@@ -126,21 +175,33 @@ impl Platform {
             .find(|p| p.rust_target() == triple)
     }
 
-    /// The shared-library filename prefix: `"lib"` on Unix, empty on Windows.
+    /// The shared-library filename prefix: `"lib"` on Unix-like targets
+    /// (including Android), empty on Windows and for a `.wasm` module.
     pub fn lib_prefix(self) -> &'static str {
         match self.os() {
-            Os::MacOs | Os::Linux => "lib",
-            Os::Windows => "",
+            Os::MacOs | Os::Linux | Os::Android => "lib",
+            Os::Windows | Os::Wasm => "",
         }
     }
 
     /// The shared-library filename extension (without the dot): `dylib`, `so`,
-    /// or `dll`.
+    /// `dll`, or `wasm`.
     pub fn lib_extension(self) -> &'static str {
         match self.os() {
             Os::MacOs => "dylib",
-            Os::Linux => "so",
+            Os::Linux | Os::Android => "so",
             Os::Windows => "dll",
+            Os::Wasm => "wasm",
+        }
+    }
+
+    /// The Android `jniLibs/<abi>/` directory name (`arm64-v8a`, `x86_64`),
+    /// or `None` off Android.
+    pub fn android_abi(self) -> Option<&'static str> {
+        match self {
+            Platform::AndroidArm64 => Some("arm64-v8a"),
+            Platform::AndroidX64 => Some("x86_64"),
+            _ => None,
         }
     }
 
@@ -153,55 +214,65 @@ impl Platform {
     }
 
     /// The NuGet runtime identifier (RID) for the `runtimes/<rid>/native/`
-    /// layout: `osx-arm64`, `osx-x64`, `linux-x64`, `linux-arm64`, `win-x64`.
-    pub fn nuget_rid(self) -> &'static str {
+    /// layout (`osx-arm64`, `osx-x64`, `linux-x64`, `linux-arm64`, `win-x64`),
+    /// or `None` for a platform NuGet has no RID for.
+    pub fn nuget_rid(self) -> Option<&'static str> {
         match self {
-            Platform::MacosArm64 => "osx-arm64",
-            Platform::MacosX64 => "osx-x64",
-            Platform::LinuxX64 => "linux-x64",
-            Platform::LinuxArm64 => "linux-arm64",
-            Platform::WindowsX64 => "win-x64",
+            Platform::MacosArm64 => Some("osx-arm64"),
+            Platform::MacosX64 => Some("osx-x64"),
+            Platform::LinuxX64 => Some("linux-x64"),
+            Platform::LinuxArm64 => Some("linux-arm64"),
+            Platform::WindowsX64 => Some("win-x64"),
+            Platform::AndroidArm64 | Platform::AndroidX64 | Platform::Wasm32 => None,
         }
     }
 
-    /// The Node.js `process.platform` value (`darwin`, `linux`, `win32`).
-    pub fn node_os(self) -> &'static str {
+    /// The Node.js `process.platform` value (`darwin`, `linux`, `win32`), or
+    /// `None` where Node does not run.
+    pub fn node_os(self) -> Option<&'static str> {
         match self.os() {
-            Os::MacOs => "darwin",
-            Os::Linux => "linux",
-            Os::Windows => "win32",
+            Os::MacOs => Some("darwin"),
+            Os::Linux => Some("linux"),
+            Os::Windows => Some("win32"),
+            Os::Android | Os::Wasm => None,
         }
     }
 
-    /// The Node.js `process.arch` value (`arm64`, `x64`).
-    pub fn node_cpu(self) -> &'static str {
+    /// The Node.js `process.arch` value (`arm64`, `x64`), or `None` for an
+    /// architecture Node has no token for.
+    pub fn node_cpu(self) -> Option<&'static str> {
         match self.arch() {
-            Arch::Arm64 => "arm64",
-            Arch::X64 => "x64",
+            Arch::Arm64 => Some("arm64"),
+            Arch::X64 => Some("x64"),
+            Arch::Wasm32 => None,
         }
     }
 
     /// The Python wheel platform tag (the final segment of a wheel filename),
-    /// for example `macosx_11_0_arm64` or `manylinux2014_x86_64`.
-    pub fn python_platform_tag(self) -> &'static str {
+    /// for example `macosx_11_0_arm64` or `manylinux2014_x86_64`, or `None`
+    /// for a platform wheels do not target.
+    pub fn python_platform_tag(self) -> Option<&'static str> {
         match self {
-            Platform::MacosArm64 => "macosx_11_0_arm64",
-            Platform::MacosX64 => "macosx_10_12_x86_64",
-            Platform::LinuxX64 => "manylinux2014_x86_64",
-            Platform::LinuxArm64 => "manylinux2014_aarch64",
-            Platform::WindowsX64 => "win_amd64",
+            Platform::MacosArm64 => Some("macosx_11_0_arm64"),
+            Platform::MacosX64 => Some("macosx_10_12_x86_64"),
+            Platform::LinuxX64 => Some("manylinux2014_x86_64"),
+            Platform::LinuxArm64 => Some("manylinux2014_aarch64"),
+            Platform::WindowsX64 => Some("win_amd64"),
+            Platform::AndroidArm64 | Platform::AndroidX64 | Platform::Wasm32 => None,
         }
     }
 
     /// The RubyGems platform string used for a precompiled platform gem, for
-    /// example `arm64-darwin` or `x86_64-linux`.
-    pub fn ruby_platform(self) -> &'static str {
+    /// example `arm64-darwin` or `x86_64-linux`, or `None` for a platform gems
+    /// do not target.
+    pub fn ruby_platform(self) -> Option<&'static str> {
         match self {
-            Platform::MacosArm64 => "arm64-darwin",
-            Platform::MacosX64 => "x86_64-darwin",
-            Platform::LinuxX64 => "x86_64-linux",
-            Platform::LinuxArm64 => "aarch64-linux",
-            Platform::WindowsX64 => "x64-mingw-ucrt",
+            Platform::MacosArm64 => Some("arm64-darwin"),
+            Platform::MacosX64 => Some("x86_64-darwin"),
+            Platform::LinuxX64 => Some("x86_64-linux"),
+            Platform::LinuxArm64 => Some("aarch64-linux"),
+            Platform::WindowsX64 => Some("x64-mingw-ucrt"),
+            Platform::AndroidArm64 | Platform::AndroidX64 | Platform::Wasm32 => None,
         }
     }
 
@@ -214,6 +285,9 @@ impl Platform {
             Platform::LinuxX64 => "Linux x64",
             Platform::LinuxArm64 => "Linux arm64",
             Platform::WindowsX64 => "Windows x64",
+            Platform::AndroidArm64 => "Android arm64",
+            Platform::AndroidX64 => "Android x64",
+            Platform::Wasm32 => "WebAssembly (wasm32)",
         }
     }
 }
@@ -319,21 +393,40 @@ mod tests {
             Platform::WindowsX64.lib_filename("contacts"),
             "contacts.dll"
         );
+        assert_eq!(
+            Platform::AndroidArm64.lib_filename("contacts"),
+            "libcontacts.so"
+        );
+        assert_eq!(Platform::Wasm32.lib_filename("contacts"), "contacts.wasm");
     }
 
     #[test]
     fn ecosystem_identifiers() {
-        assert_eq!(Platform::MacosArm64.nuget_rid(), "osx-arm64");
-        assert_eq!(Platform::WindowsX64.nuget_rid(), "win-x64");
-        assert_eq!(Platform::MacosX64.node_os(), "darwin");
-        assert_eq!(Platform::MacosX64.node_cpu(), "x64");
-        assert_eq!(Platform::WindowsX64.node_os(), "win32");
+        assert_eq!(Platform::MacosArm64.nuget_rid(), Some("osx-arm64"));
+        assert_eq!(Platform::WindowsX64.nuget_rid(), Some("win-x64"));
+        assert_eq!(Platform::MacosX64.node_os(), Some("darwin"));
+        assert_eq!(Platform::MacosX64.node_cpu(), Some("x64"));
+        assert_eq!(Platform::WindowsX64.node_os(), Some("win32"));
         assert_eq!(
             Platform::LinuxArm64.python_platform_tag(),
-            "manylinux2014_aarch64"
+            Some("manylinux2014_aarch64")
         );
-        assert_eq!(Platform::MacosArm64.ruby_platform(), "arm64-darwin");
-        assert_eq!(Platform::LinuxX64.ruby_platform(), "x86_64-linux");
+        assert_eq!(Platform::MacosArm64.ruby_platform(), Some("arm64-darwin"));
+        assert_eq!(Platform::LinuxX64.ruby_platform(), Some("x86_64-linux"));
+        assert_eq!(Platform::AndroidArm64.android_abi(), Some("arm64-v8a"));
+        assert_eq!(Platform::AndroidX64.android_abi(), Some("x86_64"));
+        assert_eq!(Platform::MacosArm64.android_abi(), None);
+        for p in [
+            Platform::AndroidArm64,
+            Platform::AndroidX64,
+            Platform::Wasm32,
+        ] {
+            assert!(!p.is_desktop());
+            assert_eq!(p.nuget_rid(), None);
+            assert_eq!(p.python_platform_tag(), None);
+            assert_eq!(p.ruby_platform(), None);
+        }
+        assert!(Platform::DESKTOP.iter().all(|p| p.is_desktop()));
     }
 
     #[test]

@@ -5,11 +5,88 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
+#ifndef NAPI_VERSION
+#define NAPI_VERSION 8
+#endif
 #include <node_api.h>
 #include "weaveffi.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static inline napi_status weaveffi_napi_get_i64(napi_env env, napi_value v, int64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_int64(env, v, out, &lossless);
+    if (s == napi_ok && !lossless) {
+      napi_throw_range_error(env, NULL, "bigint does not fit in a signed 64-bit integer");
+      return napi_generic_failure;
+    }
+    return s;
+  }
+  if (t == napi_number) {
+    return napi_get_value_int64(env, v, out);
+  }
+  napi_throw_type_error(env, NULL, "expected a bigint");
+  return napi_bigint_expected;
+}
+
+static inline napi_status weaveffi_napi_get_u64(napi_env env, napi_value v, uint64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_uint64(env, v, out, &lossless);
+    if (s == napi_ok && !lossless) {
+      napi_throw_range_error(env, NULL, "bigint does not fit in an unsigned 64-bit integer");
+      return napi_generic_failure;
+    }
+    return s;
+  }
+  if (t == napi_number) {
+    double d = 0;
+    napi_status s = napi_get_value_double(env, v, &d);
+    if (s == napi_ok && (d < 0 || d != d)) {
+      napi_throw_range_error(env, NULL, "negative number for an unsigned 64-bit integer");
+      return napi_generic_failure;
+    }
+    *out = (uint64_t)d;
+    return s;
+  }
+  napi_throw_type_error(env, NULL, "expected a bigint");
+  return napi_bigint_expected;
+}
+
+// An object handle is the pointer value carried as a bigint. null and
+// undefined read as NULL (the absent case of a nullable object).
+static inline napi_status weaveffi_napi_get_handle(napi_env env, napi_value v, void** out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_null || t == napi_undefined) {
+    *out = NULL;
+    return napi_ok;
+  }
+  if (t == napi_bigint) {
+    uint64_t raw = 0;
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_uint64(env, v, &raw, &lossless);
+    *out = (void*)(uintptr_t)raw;
+    return s;
+  }
+  napi_throw_type_error(env, NULL, "expected an object handle");
+  return napi_bigint_expected;
+}
+
+static inline napi_status weaveffi_napi_make_handle(napi_env env, const void* p, napi_value* out) {
+  if (p == NULL) {
+    return napi_get_null(env, out);
+  }
+  return napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)p, out);
+}
 
 static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message, const uint8_t* payload_ptr, size_t payload_len) {
     napi_value msg;
@@ -31,10 +108,16 @@ static napi_value Napi_weaveffi_graphics_new_canvas(napi_env env, napi_callback_
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int32_t width;
-  napi_get_value_int32(env, args[0], &width);
+  napi_status arg_status = napi_ok;
+  int32_t width = 0;
+  if (arg_status == napi_ok) {
+    arg_status = napi_get_value_int32(env, args[0], &width);
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_graphics_new_canvas(width, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -51,10 +134,16 @@ static napi_value Napi_weaveffi_graphics_shapes_make_shape(napi_env env, napi_ca
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int32_t sides;
-  napi_get_value_int32(env, args[0], &sides);
+  napi_status arg_status = napi_ok;
+  int32_t sides = 0;
+  if (arg_status == napi_ok) {
+    arg_status = napi_get_value_int32(env, args[0], &sides);
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_graphics_shapes_make_shape(sides, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -71,7 +160,7 @@ static napi_value Napi_weaveffi_graphics_shapes_describe(napi_env env, napi_call
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_graphics_shapes_describe(&out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -88,11 +177,11 @@ static napi_value Napi_weaveffi_graphics_shapes_geometry_compute(napi_env env, n
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  void* shape_raw;
-  size_t shape_len;
+  void* shape_raw = NULL;
+  size_t shape_len = 0;
   napi_get_buffer_info(env, args[0], &shape_raw, &shape_len);
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_graphics_shapes_geometry_compute((const uint8_t*)shape_raw, shape_len, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));

@@ -44,7 +44,17 @@ static inline void wv_put_raw(wv_writer* w, const void* p, size_t n) {
 }
 
 static inline void wv_put_u8(wv_writer* w, uint8_t v) { wv_put_raw(w, &v, 1); }
+static inline void wv_put_i8(wv_writer* w, int8_t v) { wv_put_u8(w, (uint8_t)v); }
 static inline void wv_put_bool(wv_writer* w, int v) { wv_put_u8(w, v ? 1 : 0); }
+
+static inline void wv_put_u16(wv_writer* w, uint16_t v) {
+    uint8_t b[2] = {(uint8_t)v, (uint8_t)(v >> 8)};
+    wv_put_raw(w, b, 2);
+}
+
+static inline void wv_put_i16(wv_writer* w, int16_t v) {
+    wv_put_u16(w, (uint16_t)v);
+}
 
 static inline void wv_put_u32(wv_writer* w, uint32_t v) {
     uint8_t b[4] = {(uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16),
@@ -89,6 +99,14 @@ static inline void wv_put_bytes(wv_writer* w, const uint8_t* p, size_t n) {
     wv_put_raw(w, p, n);
 }
 
+// Object token: the object pointer widened to u64. The token carries one
+// strong reference, so the caller passes a pointer it owns and gives up (in
+// practice the result of `{tag}_clone`), never a pointer it still holds.
+static inline void wv_put_obj(wv_writer* w, const void* owned_ref) {
+    assert(owned_ref != NULL && "zero object token in a required position");
+    wv_put_u64(w, (uint64_t)(uintptr_t)owned_ref);
+}
+
 // ── reader ──────────────────────────────────────────────────────────────────
 
 typedef struct {
@@ -111,12 +129,20 @@ static inline const uint8_t* wv_take(wv_reader* r, size_t n) {
 }
 
 static inline uint8_t wv_get_u8(wv_reader* r) { return *wv_take(r, 1); }
+static inline int8_t wv_get_i8(wv_reader* r) { return (int8_t)wv_get_u8(r); }
 
 static inline int wv_get_bool(wv_reader* r) {
     uint8_t v = wv_get_u8(r);
     assert(v <= 1 && "invalid bool byte");
     return v;
 }
+
+static inline uint16_t wv_get_u16(wv_reader* r) {
+    const uint8_t* b = wv_take(r, 2);
+    return (uint16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8));
+}
+
+static inline int16_t wv_get_i16(wv_reader* r) { return (int16_t)wv_get_u16(r); }
 
 static inline uint32_t wv_get_u32(wv_reader* r) {
     const uint8_t* b = wv_take(r, 4);
@@ -158,6 +184,15 @@ static inline char* wv_get_str(wv_reader* r) {
     memcpy(s, at, n);
     s[n] = '\0';
     return s;
+}
+
+// Object token: the reader adopts the strong reference it carries, so the
+// returned pointer must eventually be released with `{tag}_destroy` (or kept
+// as the consumer's own reference to the object).
+static inline void* wv_get_obj(wv_reader* r) {
+    uint64_t token = wv_get_u64(r);
+    assert(token != 0 && "zero object token in a required position");
+    return (void*)(uintptr_t)token;
 }
 
 static inline void wv_r_expect_end(const wv_reader* r) {

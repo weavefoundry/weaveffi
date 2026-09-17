@@ -5,11 +5,89 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // DO NOT EDIT. Your changes will be overwritten.
 // To regenerate: weaveffi generate weaveffi.yml -o <out>
 
+#ifndef NAPI_VERSION
+#define NAPI_VERSION 8
+#endif
 #include <node_api.h>
 #include "weaveffi.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <uv.h>
+
+static inline napi_status weaveffi_napi_get_i64(napi_env env, napi_value v, int64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_int64(env, v, out, &lossless);
+    if (s == napi_ok && !lossless) {
+      napi_throw_range_error(env, NULL, "bigint does not fit in a signed 64-bit integer");
+      return napi_generic_failure;
+    }
+    return s;
+  }
+  if (t == napi_number) {
+    return napi_get_value_int64(env, v, out);
+  }
+  napi_throw_type_error(env, NULL, "expected a bigint");
+  return napi_bigint_expected;
+}
+
+static inline napi_status weaveffi_napi_get_u64(napi_env env, napi_value v, uint64_t* out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_bigint) {
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_uint64(env, v, out, &lossless);
+    if (s == napi_ok && !lossless) {
+      napi_throw_range_error(env, NULL, "bigint does not fit in an unsigned 64-bit integer");
+      return napi_generic_failure;
+    }
+    return s;
+  }
+  if (t == napi_number) {
+    double d = 0;
+    napi_status s = napi_get_value_double(env, v, &d);
+    if (s == napi_ok && (d < 0 || d != d)) {
+      napi_throw_range_error(env, NULL, "negative number for an unsigned 64-bit integer");
+      return napi_generic_failure;
+    }
+    *out = (uint64_t)d;
+    return s;
+  }
+  napi_throw_type_error(env, NULL, "expected a bigint");
+  return napi_bigint_expected;
+}
+
+// An object handle is the pointer value carried as a bigint. null and
+// undefined read as NULL (the absent case of a nullable object).
+static inline napi_status weaveffi_napi_get_handle(napi_env env, napi_value v, void** out) {
+  napi_valuetype t;
+  napi_typeof(env, v, &t);
+  if (t == napi_null || t == napi_undefined) {
+    *out = NULL;
+    return napi_ok;
+  }
+  if (t == napi_bigint) {
+    uint64_t raw = 0;
+    bool lossless = false;
+    napi_status s = napi_get_value_bigint_uint64(env, v, &raw, &lossless);
+    *out = (void*)(uintptr_t)raw;
+    return s;
+  }
+  napi_throw_type_error(env, NULL, "expected an object handle");
+  return napi_bigint_expected;
+}
+
+static inline napi_status weaveffi_napi_make_handle(napi_env env, const void* p, napi_value* out) {
+  if (p == NULL) {
+    return napi_get_null(env, out);
+  }
+  return napi_create_bigint_uint64(env, (uint64_t)(uintptr_t)p, out);
+}
 
 static napi_value weaveffi_napi_error_value(napi_env env, int32_t code, const char* message, const uint8_t* payload_ptr, size_t payload_len) {
     napi_value msg;
@@ -31,22 +109,528 @@ typedef struct {
     void* iter;
 } weaveffi_napi_iter_state;
 
-typedef struct weaveffi_napi_listener_ctx {
-    napi_threadsafe_function tsfn;
-    uint64_t id;
-    struct weaveffi_napi_listener_ctx* next;
-} weaveffi_napi_listener_ctx;
+static uv_thread_t weaveffi_napi_js_thread;
 
-static weaveffi_napi_listener_ctx* weaveffi_napi_listeners = NULL;
+static inline bool weaveffi_napi_on_js_thread(void) {
+  uv_thread_t self = uv_thread_self();
+  return uv_thread_equal(&self, &weaveffi_napi_js_thread) != 0;
+}
+
+// One handle-table entry per registered callback-interface implementation;
+// its address is the `ctx` the producer passes back to every method.
+typedef struct {
+  napi_env env;
+  napi_ref ref;
+  napi_threadsafe_function tsfn;
+} weaveffi_napi_cb_ctx;
+
+// Every method frame starts with this header so the dispatcher can reach
+// `out_err` without knowing the method.
+typedef struct {
+  weaveffi_error* out_err;
+} weaveffi_napi_cb_frame_hdr;
+
+// A request hopped from a producer thread to the JS thread. `method` is the
+// vtable index to run, or -1 to release the context.
+typedef struct {
+  weaveffi_napi_cb_ctx* ctx;
+  int method;
+  void* frame;
+  uv_mutex_t mu;
+  uv_cond_t cv;
+  bool done;
+} weaveffi_napi_cb_req;
+
+static weaveffi_napi_cb_ctx* weaveffi_napi_cb_register(napi_env env, napi_value target, const char* name, napi_threadsafe_function_call_js dispatch) {
+  weaveffi_napi_cb_ctx* ctx = (weaveffi_napi_cb_ctx*)calloc(1, sizeof(weaveffi_napi_cb_ctx));
+  ctx->env = env;
+  napi_create_reference(env, target, 1, &ctx->ref);
+  napi_value resource_name;
+  napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, dispatch, &ctx->tsfn);
+  // A live implementation must not pin the event loop by itself.
+  napi_unref_threadsafe_function(env, ctx->tsfn);
+  return ctx;
+}
+
+// Release one entry on the JS thread (env is NULL only during teardown, when
+// the reference is already gone).
+static void weaveffi_napi_cb_release(napi_env env, weaveffi_napi_cb_ctx* ctx) {
+  if (env != NULL) {
+    napi_delete_reference(env, ctx->ref);
+  }
+  napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+  free(ctx);
+}
+
+// The vtable's `free` entry: the producer is done with `ctx`.
+static void weaveffi_napi_cb_free(void* ctx_) {
+  weaveffi_napi_cb_ctx* ctx = (weaveffi_napi_cb_ctx*)ctx_;
+  if (ctx == NULL) {
+    return;
+  }
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_napi_cb_release(ctx->env, ctx);
+    return;
+  }
+  weaveffi_napi_cb_req* req = (weaveffi_napi_cb_req*)calloc(1, sizeof(weaveffi_napi_cb_req));
+  req->ctx = ctx;
+  req->method = -1;
+  if (napi_call_threadsafe_function(ctx->tsfn, req, napi_tsfn_nonblocking) != napi_ok) {
+    free(req);
+  }
+}
+
+// Run `req` on the JS thread and block until it has completed.
+static void weaveffi_napi_cb_hop(weaveffi_napi_cb_req* req) {
+  uv_mutex_init(&req->mu);
+  uv_cond_init(&req->cv);
+  req->done = false;
+  if (napi_call_threadsafe_function(req->ctx->tsfn, req, napi_tsfn_blocking) == napi_ok) {
+    uv_mutex_lock(&req->mu);
+    while (!req->done) {
+      uv_cond_wait(&req->cv, &req->mu);
+    }
+    uv_mutex_unlock(&req->mu);
+  } else {
+    weaveffi_error_set(((weaveffi_napi_cb_frame_hdr*)req->frame)->out_err, -4, "callback interface implementation is no longer reachable");
+  }
+  uv_cond_destroy(&req->cv);
+  uv_mutex_destroy(&req->mu);
+}
+
+static void weaveffi_napi_cb_finish(weaveffi_napi_cb_req* req) {
+  uv_mutex_lock(&req->mu);
+  req->done = true;
+  uv_cond_signal(&req->cv);
+  uv_mutex_unlock(&req->mu);
+}
+
+// Report a JS exception raised by a callback implementation (or a return
+// value of the wrong type) through `out_err` as a foreign error, clearing
+// the pending exception so nothing unwinds through the C frame.
+static void weaveffi_napi_cb_report(napi_env env, weaveffi_error* out_err, const char* fallback) {
+  char msg[512];
+  msg[0] = 0;
+  bool pending = false;
+  napi_is_exception_pending(env, &pending);
+  if (pending) {
+    napi_value exc;
+    napi_get_and_clear_last_exception(env, &exc);
+    napi_valuetype t;
+    napi_typeof(env, exc, &t);
+    napi_value text = exc;
+    if (t == napi_object) {
+      napi_get_named_property(env, exc, "message", &text);
+    }
+    napi_value str;
+    if (napi_coerce_to_string(env, text, &str) == napi_ok) {
+      napi_get_value_string_utf8(env, str, msg, sizeof msg, NULL);
+    }
+    napi_is_exception_pending(env, &pending);
+    if (pending) {
+      napi_get_and_clear_last_exception(env, &exc);
+    }
+  }
+  weaveffi_error_set(out_err, -4, msg[0] ? msg : fallback);
+}
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+    const uint8_t* items_ptr;
+    size_t items_len;
+    const uint8_t* raw_ptr;
+    size_t raw_len;
+    const uint8_t* first_ptr;
+    size_t first_len;
+    weaveffi_edge_cases_Mode mode;
+} weaveffi_edge_cases_BatchListener_on_batch_frame;
+
+static void weaveffi_edge_cases_BatchListener_on_batch_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_BatchListener_on_batch_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "on_batch", &fn);
+  napi_value argv[4];
+  napi_create_buffer_copy(env, f->items_len, f->items_ptr ? (const void*)f->items_ptr : (const void*)"", NULL, &argv[0]);
+  napi_create_buffer_copy(env, f->raw_len, f->raw_ptr ? (const void*)f->raw_ptr : (const void*)"", NULL, &argv[1]);
+  napi_create_buffer_copy(env, f->first_len, f->first_ptr ? (const void*)f->first_ptr : (const void*)"", NULL, &argv[2]);
+  napi_create_int32(env, (int32_t)(f->mode), &argv[3]);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener implementation has no on_batch method");
+  } else if (napi_call_function(env, target, fn, 4, argv, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.on_batch threw");
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static void weaveffi_edge_cases_BatchListener_on_batch_tramp(void* ctx, const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, weaveffi_error* out_err) {
+  weaveffi_edge_cases_BatchListener_on_batch_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  f.items_ptr = items_ptr;
+  f.items_len = items_len;
+  f.raw_ptr = raw_ptr;
+  f.raw_len = raw_len;
+  f.first_ptr = first_ptr;
+  f.first_len = first_len;
+  f.mode = mode;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_BatchListener_on_batch_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 0;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+}
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+    weaveffi_edge_cases_Widget* widget;
+    weaveffi_edge_cases_Widget* fallback;
+    const uint8_t* children_ptr;
+    size_t children_len;
+} weaveffi_edge_cases_BatchListener_on_widget_frame;
+
+static void weaveffi_edge_cases_BatchListener_on_widget_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_BatchListener_on_widget_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "on_widget", &fn);
+  napi_value argv[3];
+  weaveffi_napi_make_handle(env, f->widget, &argv[0]);
+  weaveffi_napi_make_handle(env, f->fallback, &argv[1]);
+  napi_create_buffer_copy(env, f->children_len, f->children_ptr ? (const void*)f->children_ptr : (const void*)"", NULL, &argv[2]);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener implementation has no on_widget method");
+  } else if (napi_call_function(env, target, fn, 3, argv, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.on_widget threw");
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static void weaveffi_edge_cases_BatchListener_on_widget_tramp(void* ctx, weaveffi_edge_cases_Widget* widget, weaveffi_edge_cases_Widget* fallback, const uint8_t* children_ptr, size_t children_len, weaveffi_error* out_err) {
+  weaveffi_edge_cases_BatchListener_on_widget_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  f.widget = widget;
+  f.fallback = fallback;
+  f.children_ptr = children_ptr;
+  f.children_len = children_len;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_BatchListener_on_widget_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 1;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+}
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+} weaveffi_edge_cases_BatchListener_on_tick_frame;
+
+static void weaveffi_edge_cases_BatchListener_on_tick_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_BatchListener_on_tick_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "on_tick", &fn);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener implementation has no on_tick method");
+  } else if (napi_call_function(env, target, fn, 0, NULL, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.on_tick threw");
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static void weaveffi_edge_cases_BatchListener_on_tick_tramp(void* ctx, weaveffi_error* out_err) {
+  weaveffi_edge_cases_BatchListener_on_tick_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_BatchListener_on_tick_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 2;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+}
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+    int32_t class;
+    bool result;
+} weaveffi_edge_cases_BatchListener_should_continue_frame;
+
+static void weaveffi_edge_cases_BatchListener_should_continue_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_BatchListener_should_continue_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "should_continue", &fn);
+  napi_value argv[1];
+  napi_create_int32(env, f->class, &argv[0]);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener implementation has no should_continue method");
+  } else if (napi_call_function(env, target, fn, 1, argv, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.should_continue threw");
+  } else {
+    napi_status rs;
+    rs = napi_get_value_bool(env, result, &f->result);
+    if (rs != napi_ok) {
+      weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.should_continue returned a value of the wrong type");
+    }
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static bool weaveffi_edge_cases_BatchListener_should_continue_tramp(void* ctx, int32_t class, weaveffi_error* out_err) {
+  weaveffi_edge_cases_BatchListener_should_continue_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  f.class = class;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_BatchListener_should_continue_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 3;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+  return f.result;
+}
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+    weaveffi_edge_cases_Mode result;
+} weaveffi_edge_cases_BatchListener_pick_mode_frame;
+
+static void weaveffi_edge_cases_BatchListener_pick_mode_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_BatchListener_pick_mode_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "pick_mode", &fn);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener implementation has no pick_mode method");
+  } else if (napi_call_function(env, target, fn, 0, NULL, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.pick_mode threw");
+  } else {
+    napi_status rs;
+    int32_t f__result_tmp = 0;
+    rs = napi_get_value_int32(env, result, &f__result_tmp);
+    f->result = f__result_tmp;
+    if (rs != napi_ok) {
+      weaveffi_napi_cb_report(env, f->hdr.out_err, "BatchListener.pick_mode returned a value of the wrong type");
+    }
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static weaveffi_edge_cases_Mode weaveffi_edge_cases_BatchListener_pick_mode_tramp(void* ctx, weaveffi_error* out_err) {
+  weaveffi_edge_cases_BatchListener_pick_mode_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_BatchListener_pick_mode_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 4;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+  return f.result;
+}
+
+static void weaveffi_edge_cases_BatchListener_napi_dispatch(napi_env env, napi_value js_cb, void* context, void* data) {
+  (void)js_cb;
+  (void)context;
+  weaveffi_napi_cb_req* req = (weaveffi_napi_cb_req*)data;
+  if (req->method < 0) {
+    weaveffi_napi_cb_release(env, req->ctx);
+    free(req);
+    return;
+  }
+  if (env == NULL) {
+    weaveffi_error_set(((weaveffi_napi_cb_frame_hdr*)req->frame)->out_err, -4, "Node environment is shutting down");
+  } else {
+    switch (req->method) {
+      case 0: weaveffi_edge_cases_BatchListener_on_batch_invoke(env, req->ctx, (weaveffi_edge_cases_BatchListener_on_batch_frame*)req->frame); break;
+      case 1: weaveffi_edge_cases_BatchListener_on_widget_invoke(env, req->ctx, (weaveffi_edge_cases_BatchListener_on_widget_frame*)req->frame); break;
+      case 2: weaveffi_edge_cases_BatchListener_on_tick_invoke(env, req->ctx, (weaveffi_edge_cases_BatchListener_on_tick_frame*)req->frame); break;
+      case 3: weaveffi_edge_cases_BatchListener_should_continue_invoke(env, req->ctx, (weaveffi_edge_cases_BatchListener_should_continue_frame*)req->frame); break;
+      case 4: weaveffi_edge_cases_BatchListener_pick_mode_invoke(env, req->ctx, (weaveffi_edge_cases_BatchListener_pick_mode_frame*)req->frame); break;
+      default: break;
+    }
+  }
+  weaveffi_napi_cb_finish(req);
+}
+
+static const weaveffi_edge_cases_BatchListener_vtable weaveffi_edge_cases_BatchListener_napi_vtable = { weaveffi_edge_cases_BatchListener_on_batch_tramp, weaveffi_edge_cases_BatchListener_on_widget_tramp, weaveffi_edge_cases_BatchListener_on_tick_tramp, weaveffi_edge_cases_BatchListener_should_continue_tramp, weaveffi_edge_cases_BatchListener_pick_mode_tramp, weaveffi_napi_cb_free };
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+    int32_t self;
+} weaveffi_edge_cases_Keyword_delete_frame;
+
+static void weaveffi_edge_cases_Keyword_delete_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_Keyword_delete_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "delete", &fn);
+  napi_value argv[1];
+  napi_create_int32(env, f->self, &argv[0]);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "Keyword implementation has no delete method");
+  } else if (napi_call_function(env, target, fn, 1, argv, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "Keyword.delete threw");
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static void weaveffi_edge_cases_Keyword_delete_tramp(void* ctx, int32_t self, weaveffi_error* out_err) {
+  weaveffi_edge_cases_Keyword_delete_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  f.self = self;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_Keyword_delete_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 0;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+}
+
+typedef struct {
+    weaveffi_napi_cb_frame_hdr hdr;
+    int32_t result;
+} weaveffi_edge_cases_Keyword_import_frame;
+
+static void weaveffi_edge_cases_Keyword_import_invoke(napi_env env, weaveffi_napi_cb_ctx* ctx, weaveffi_edge_cases_Keyword_import_frame* f) {
+  napi_handle_scope scope;
+  napi_open_handle_scope(env, &scope);
+  napi_value target;
+  napi_get_reference_value(env, ctx->ref, &target);
+  napi_value fn;
+  napi_get_named_property(env, target, "import", &fn);
+  napi_value result;
+  napi_valuetype fn_type;
+  napi_typeof(env, fn, &fn_type);
+  if (fn_type != napi_function) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "Keyword implementation has no import method");
+  } else if (napi_call_function(env, target, fn, 0, NULL, &result) != napi_ok) {
+    weaveffi_napi_cb_report(env, f->hdr.out_err, "Keyword.import threw");
+  } else {
+    napi_status rs;
+    rs = napi_get_value_int32(env, result, &f->result);
+    if (rs != napi_ok) {
+      weaveffi_napi_cb_report(env, f->hdr.out_err, "Keyword.import returned a value of the wrong type");
+    }
+  }
+  napi_close_handle_scope(env, scope);
+}
+
+static int32_t weaveffi_edge_cases_Keyword_import_tramp(void* ctx, weaveffi_error* out_err) {
+  weaveffi_edge_cases_Keyword_import_frame f;
+  memset(&f, 0, sizeof f);
+  f.hdr.out_err = out_err;
+  weaveffi_napi_cb_ctx* c = (weaveffi_napi_cb_ctx*)ctx;
+  if (weaveffi_napi_on_js_thread()) {
+    weaveffi_edge_cases_Keyword_import_invoke(c->env, c, &f);
+  } else {
+    weaveffi_napi_cb_req req;
+    req.ctx = c;
+    req.method = 1;
+    req.frame = &f;
+    weaveffi_napi_cb_hop(&req);
+  }
+  return f.result;
+}
+
+static void weaveffi_edge_cases_Keyword_napi_dispatch(napi_env env, napi_value js_cb, void* context, void* data) {
+  (void)js_cb;
+  (void)context;
+  weaveffi_napi_cb_req* req = (weaveffi_napi_cb_req*)data;
+  if (req->method < 0) {
+    weaveffi_napi_cb_release(env, req->ctx);
+    free(req);
+    return;
+  }
+  if (env == NULL) {
+    weaveffi_error_set(((weaveffi_napi_cb_frame_hdr*)req->frame)->out_err, -4, "Node environment is shutting down");
+  } else {
+    switch (req->method) {
+      case 0: weaveffi_edge_cases_Keyword_delete_invoke(env, req->ctx, (weaveffi_edge_cases_Keyword_delete_frame*)req->frame); break;
+      case 1: weaveffi_edge_cases_Keyword_import_invoke(env, req->ctx, (weaveffi_edge_cases_Keyword_import_frame*)req->frame); break;
+      default: break;
+    }
+  }
+  weaveffi_napi_cb_finish(req);
+}
+
+static const weaveffi_edge_cases_Keyword_vtable weaveffi_edge_cases_Keyword_napi_vtable = { weaveffi_edge_cases_Keyword_delete_tramp, weaveffi_edge_cases_Keyword_import_tramp, weaveffi_napi_cb_free };
 
 static napi_value Napi_weaveffi_edge_cases_Widget_refresh(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
+  napi_status arg_status = napi_ok;
+  void* self_raw = NULL;
+  arg_status = weaveffi_napi_get_handle(env, args[0], &self_raw);
+  if (arg_status == napi_ok && self_raw == NULL) {
+    napi_throw_type_error(env, NULL, "object used after close()");
+    arg_status = napi_invalid_arg;
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
-  weaveffi_edge_cases_Widget_refresh((const weaveffi_edge_cases_Widget*)(intptr_t)self_raw, &err);
+  weaveffi_edge_cases_Widget_refresh((const weaveffi_edge_cases_Widget*)self_raw, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
@@ -61,17 +645,26 @@ static napi_value Napi_weaveffi_edge_cases_Widget_rename(napi_env env, napi_call
   size_t argc = 3;
   napi_value args[3];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  size_t class_len;
+  napi_status arg_status = napi_ok;
+  void* self_raw = NULL;
+  arg_status = weaveffi_napi_get_handle(env, args[0], &self_raw);
+  if (arg_status == napi_ok && self_raw == NULL) {
+    napi_throw_type_error(env, NULL, "object used after close()");
+    arg_status = napi_invalid_arg;
+  }
+  size_t class_len = 0;
   napi_get_value_string_utf8(env, args[1], NULL, 0, &class_len);
   char* class = (char*)malloc(class_len + 1);
   napi_get_value_string_utf8(env, args[1], class, class_len + 1, &class_len);
-  void* import_raw;
-  size_t import_len;
+  void* import_raw = NULL;
+  size_t import_len = 0;
   napi_get_buffer_info(env, args[2], &import_raw, &import_len);
+  if (arg_status != napi_ok) {
+    free(class);
+    return NULL;
+  }
   weaveffi_error err = {0};
-  const char* result = weaveffi_edge_cases_Widget_rename((const weaveffi_edge_cases_Widget*)(intptr_t)self_raw, class, (const uint8_t*)import_raw, import_len, &err);
+  const char* result = weaveffi_edge_cases_Widget_rename((const weaveffi_edge_cases_Widget*)self_raw, class, (const uint8_t*)import_raw, import_len, &err);
   free(class);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -136,17 +729,27 @@ static napi_value Napi_weaveffi_edge_cases_Widget_fetch(napi_env env, napi_callb
   size_t argc = 2;
   napi_value args[2];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  int64_t id;
-  napi_get_value_int64(env, args[1], &id);
+  napi_status arg_status = napi_ok;
+  void* self_raw = NULL;
+  arg_status = weaveffi_napi_get_handle(env, args[0], &self_raw);
+  if (arg_status == napi_ok && self_raw == NULL) {
+    napi_throw_type_error(env, NULL, "object used after close()");
+    arg_status = napi_invalid_arg;
+  }
+  int64_t id = 0;
+  if (arg_status == napi_ok) {
+    arg_status = weaveffi_napi_get_i64(env, args[1], &id);
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_edge_cases_Widget_fetch_napi_actx* ctx = (weaveffi_edge_cases_Widget_fetch_napi_actx*)calloc(1, sizeof(weaveffi_edge_cases_Widget_fetch_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
   napi_value resource_name;
   napi_create_string_utf8(env, "weaveffi_edge_cases_Widget_fetch", NAPI_AUTO_LENGTH, &resource_name);
   napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_edge_cases_Widget_fetch_napi_settle, &ctx->tsfn);
-  weaveffi_edge_cases_Widget_fetch_async((const weaveffi_edge_cases_Widget*)(intptr_t)self_raw, id, weaveffi_edge_cases_Widget_fetch_napi_cb, ctx);
+  weaveffi_edge_cases_Widget_fetch_async((const weaveffi_edge_cases_Widget*)self_raw, id, weaveffi_edge_cases_Widget_fetch_napi_cb, ctx);
   return promise;
 }
 
@@ -154,10 +757,18 @@ static napi_value Napi_weaveffi_edge_cases_Widget_old_name(napi_env env, napi_ca
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
+  napi_status arg_status = napi_ok;
+  void* self_raw = NULL;
+  arg_status = weaveffi_napi_get_handle(env, args[0], &self_raw);
+  if (arg_status == napi_ok && self_raw == NULL) {
+    napi_throw_type_error(env, NULL, "object used after close()");
+    arg_status = napi_invalid_arg;
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
-  const char* result = weaveffi_edge_cases_Widget_old_name((const weaveffi_edge_cases_Widget*)(intptr_t)self_raw, &err);
+  const char* result = weaveffi_edge_cases_Widget_old_name((const weaveffi_edge_cases_Widget*)self_raw, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
@@ -173,12 +784,29 @@ static napi_value Napi_weaveffi_edge_cases_Widget_destroy(napi_env env, napi_cal
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_edge_cases_Widget* self = (weaveffi_edge_cases_Widget*)(intptr_t)self_raw;
+  void* self_raw = NULL;
+  if (weaveffi_napi_get_handle(env, args[0], &self_raw) != napi_ok || self_raw == NULL) {
+    return NULL;
+  }
+  weaveffi_edge_cases_Widget* self = (weaveffi_edge_cases_Widget*)self_raw;
   weaveffi_edge_cases_Widget_destroy(self);
   napi_value ret;
   napi_get_undefined(env, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_edge_cases_Widget_clone(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* self_raw = NULL;
+  if (weaveffi_napi_get_handle(env, args[0], &self_raw) != napi_ok || self_raw == NULL) {
+    return NULL;
+  }
+  weaveffi_edge_cases_Widget* self = (weaveffi_edge_cases_Widget*)self_raw;
+  weaveffi_edge_cases_Widget* cloned = weaveffi_edge_cases_Widget_clone(self);
+  napi_value ret;
+  weaveffi_napi_make_handle(env, cloned, &ret);
   return ret;
 }
 
@@ -186,7 +814,7 @@ static napi_value Napi_weaveffi_edge_cases_Vault_open(napi_env env, napi_callbac
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  size_t path_len;
+  size_t path_len = 0;
   napi_get_value_string_utf8(env, args[0], NULL, 0, &path_len);
   char* path = (char*)malloc(path_len + 1);
   napi_get_value_string_utf8(env, args[0], path, path_len + 1, &path_len);
@@ -199,7 +827,7 @@ static napi_value Napi_weaveffi_edge_cases_Vault_open(napi_env env, napi_callbac
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  weaveffi_napi_make_handle(env, result, &ret);
   return ret;
 }
 
@@ -222,21 +850,25 @@ static napi_value Napi_weaveffi_edge_cases_Vault_peek(napi_env env, napi_callbac
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
+  napi_status arg_status = napi_ok;
+  void* self_raw = NULL;
+  arg_status = weaveffi_napi_get_handle(env, args[0], &self_raw);
+  if (arg_status == napi_ok && self_raw == NULL) {
+    napi_throw_type_error(env, NULL, "object used after close()");
+    arg_status = napi_invalid_arg;
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
-  weaveffi_edge_cases_Widget* result = weaveffi_edge_cases_Vault_peek((const weaveffi_edge_cases_Vault*)(intptr_t)self_raw, &err);
+  weaveffi_edge_cases_Widget* result = weaveffi_edge_cases_Vault_peek((const weaveffi_edge_cases_Vault*)self_raw, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
     return NULL;
   }
   napi_value ret;
-  if (result == NULL) {
-    napi_get_null(env, &ret);
-  } else {
-    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  }
+  weaveffi_napi_make_handle(env, result, &ret);
   return ret;
 }
 
@@ -244,158 +876,29 @@ static napi_value Napi_weaveffi_edge_cases_Vault_destroy(napi_env env, napi_call
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t self_raw;
-  napi_get_value_int64(env, args[0], &self_raw);
-  weaveffi_edge_cases_Vault* self = (weaveffi_edge_cases_Vault*)(intptr_t)self_raw;
+  void* self_raw = NULL;
+  if (weaveffi_napi_get_handle(env, args[0], &self_raw) != napi_ok || self_raw == NULL) {
+    return NULL;
+  }
+  weaveffi_edge_cases_Vault* self = (weaveffi_edge_cases_Vault*)self_raw;
   weaveffi_edge_cases_Vault_destroy(self);
   napi_value ret;
   napi_get_undefined(env, &ret);
   return ret;
 }
 
-typedef struct {
-    uint8_t* items_ptr;
-    size_t items_len;
-    uint8_t* raw_ptr;
-    size_t raw_len;
-    uint8_t* first_ptr;
-    size_t first_len;
-    weaveffi_edge_cases_Mode mode;
-} weaveffi_edge_cases_OnBatch_fn_payload;
-
-static void weaveffi_edge_cases_OnBatch_fn_napi_tramp(const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, void* context) {
-    weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)context;
-    weaveffi_edge_cases_OnBatch_fn_payload* p = (weaveffi_edge_cases_OnBatch_fn_payload*)calloc(1, sizeof(weaveffi_edge_cases_OnBatch_fn_payload));
-    p->items_len = items_len;
-    if (items_ptr != NULL && items_len > 0) { p->items_ptr = (uint8_t*)malloc(items_len); memcpy(p->items_ptr, items_ptr, items_len); }
-    p->raw_len = raw_len;
-    if (raw_ptr != NULL && raw_len > 0) { p->raw_ptr = (uint8_t*)malloc(raw_len); memcpy(p->raw_ptr, raw_ptr, raw_len); }
-    p->first_len = first_len;
-    if (first_ptr != NULL && first_len > 0) { p->first_ptr = (uint8_t*)malloc(first_len); memcpy(p->first_ptr, first_ptr, first_len); }
-    p->mode = mode;
-    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);
-}
-
-static void weaveffi_edge_cases_OnBatch_fn_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {
-    (void)context;
-    weaveffi_edge_cases_OnBatch_fn_payload* p = (weaveffi_edge_cases_OnBatch_fn_payload*)data;
-    if (env != NULL) {
-        napi_value undefined;
-        napi_get_undefined(env, &undefined);
-        napi_value argv[4];
-        napi_create_buffer_copy(env, p->items_len, p->items_ptr ? (const void*)p->items_ptr : (const void*)"", NULL, &argv[0]);
-        napi_create_buffer_copy(env, p->raw_len, p->raw_ptr ? (const void*)p->raw_ptr : (const void*)"", NULL, &argv[1]);
-        napi_create_buffer_copy(env, p->first_len, p->first_ptr ? (const void*)p->first_ptr : (const void*)"", NULL, &argv[2]);
-        napi_create_int32(env, (int32_t)p->mode, &argv[3]);
-        napi_call_function(env, undefined, js_cb, 4, argv, NULL);
-    }
-    free(p->items_ptr);
-    free(p->raw_ptr);
-    free(p->first_ptr);
-    free(p);
-}
-
-typedef struct {
-} weaveffi_edge_cases_OnTick_fn_payload;
-
-static void weaveffi_edge_cases_OnTick_fn_napi_tramp(void* context) {
-    weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)context;
-    weaveffi_edge_cases_OnTick_fn_payload* p = (weaveffi_edge_cases_OnTick_fn_payload*)calloc(1, sizeof(weaveffi_edge_cases_OnTick_fn_payload));
-    napi_call_threadsafe_function(ctx->tsfn, p, napi_tsfn_nonblocking);
-}
-
-static void weaveffi_edge_cases_OnTick_fn_napi_calljs(napi_env env, napi_value js_cb, void* context, void* data) {
-    (void)context;
-    weaveffi_edge_cases_OnTick_fn_payload* p = (weaveffi_edge_cases_OnTick_fn_payload*)data;
-    if (env != NULL) {
-        napi_value undefined;
-        napi_get_undefined(env, &undefined);
-        napi_call_function(env, undefined, js_cb, 0, NULL, NULL);
-    }
-    free(p);
-}
-
-static napi_value Napi_weaveffi_edge_cases_register_batch_listener(napi_env env, napi_callback_info info) {
+static napi_value Napi_weaveffi_edge_cases_Vault_clone(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)calloc(1, sizeof(weaveffi_napi_listener_ctx));
-  napi_value resource_name;
-  napi_create_string_utf8(env, "weaveffi_edge_cases_register_batch_listener", NAPI_AUTO_LENGTH, &resource_name);
-  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_edge_cases_OnBatch_fn_napi_calljs, &ctx->tsfn);
-  napi_unref_threadsafe_function(env, ctx->tsfn);
-  uint64_t id = weaveffi_edge_cases_register_batch_listener(weaveffi_edge_cases_OnBatch_fn_napi_tramp, ctx);
-  ctx->id = id;
-  ctx->next = weaveffi_napi_listeners;
-  weaveffi_napi_listeners = ctx;
-  napi_value ret;
-  napi_create_double(env, (double)id, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_edge_cases_unregister_batch_listener(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  double id_d = 0;
-  napi_get_value_double(env, args[0], &id_d);
-  uint64_t id = (uint64_t)id_d;
-  weaveffi_edge_cases_unregister_batch_listener(id);
-  weaveffi_napi_listener_ctx** link = &weaveffi_napi_listeners;
-  while (*link != NULL) {
-    if ((*link)->id == id) {
-      weaveffi_napi_listener_ctx* found = *link;
-      *link = found->next;
-      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);
-      free(found);
-      break;
-    }
-    link = &(*link)->next;
+  void* self_raw = NULL;
+  if (weaveffi_napi_get_handle(env, args[0], &self_raw) != napi_ok || self_raw == NULL) {
+    return NULL;
   }
+  weaveffi_edge_cases_Vault* self = (weaveffi_edge_cases_Vault*)self_raw;
+  weaveffi_edge_cases_Vault* cloned = weaveffi_edge_cases_Vault_clone(self);
   napi_value ret;
-  napi_get_undefined(env, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_edge_cases_register_tick_listener(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  weaveffi_napi_listener_ctx* ctx = (weaveffi_napi_listener_ctx*)calloc(1, sizeof(weaveffi_napi_listener_ctx));
-  napi_value resource_name;
-  napi_create_string_utf8(env, "weaveffi_edge_cases_register_tick_listener", NAPI_AUTO_LENGTH, &resource_name);
-  napi_create_threadsafe_function(env, args[0], NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_edge_cases_OnTick_fn_napi_calljs, &ctx->tsfn);
-  napi_unref_threadsafe_function(env, ctx->tsfn);
-  uint64_t id = weaveffi_edge_cases_register_tick_listener(weaveffi_edge_cases_OnTick_fn_napi_tramp, ctx);
-  ctx->id = id;
-  ctx->next = weaveffi_napi_listeners;
-  weaveffi_napi_listeners = ctx;
-  napi_value ret;
-  napi_create_double(env, (double)id, &ret);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_edge_cases_unregister_tick_listener(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  double id_d = 0;
-  napi_get_value_double(env, args[0], &id_d);
-  uint64_t id = (uint64_t)id_d;
-  weaveffi_edge_cases_unregister_tick_listener(id);
-  weaveffi_napi_listener_ctx** link = &weaveffi_napi_listeners;
-  while (*link != NULL) {
-    if ((*link)->id == id) {
-      weaveffi_napi_listener_ctx* found = *link;
-      *link = found->next;
-      napi_release_threadsafe_function(found->tsfn, napi_tsfn_release);
-      free(found);
-      break;
-    }
-    link = &(*link)->next;
-  }
-  napi_value ret;
-  napi_get_undefined(env, &ret);
+  weaveffi_napi_make_handle(env, cloned, &ret);
   return ret;
 }
 
@@ -418,20 +921,29 @@ static napi_value Napi_weaveffi_edge_cases_select(napi_env env, napi_callback_in
   size_t argc = 5;
   napi_value args[5];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int32_t class;
-  napi_get_value_int32(env, args[0], &class);
-  size_t from_len;
+  napi_status arg_status = napi_ok;
+  int32_t class = 0;
+  if (arg_status == napi_ok) {
+    arg_status = napi_get_value_int32(env, args[0], &class);
+  }
+  size_t from_len = 0;
   napi_get_value_string_utf8(env, args[1], NULL, 0, &from_len);
   char* from = (char*)malloc(from_len + 1);
   napi_get_value_string_utf8(env, args[1], from, from_len + 1, &from_len);
-  void* func_raw;
-  size_t func_len;
+  void* func_raw = NULL;
+  size_t func_len = 0;
   napi_get_buffer_info(env, args[2], &func_raw, &func_len);
-  void* range_raw;
-  size_t range_len;
+  void* range_raw = NULL;
+  size_t range_len = 0;
   napi_get_buffer_info(env, args[3], &range_raw, &range_len);
-  bool type_;
-  napi_get_value_bool(env, args[4], &type_);
+  bool type_ = 0;
+  if (arg_status == napi_ok) {
+    arg_status = napi_get_value_bool(env, args[4], &type_);
+  }
+  if (arg_status != napi_ok) {
+    free(from);
+    return NULL;
+  }
   weaveffi_error err = {0};
   int32_t result = weaveffi_edge_cases_select(class, from, (const uint8_t*)func_raw, func_len, (const uint8_t*)range_raw, range_len, type_, &err);
   free(from);
@@ -449,11 +961,11 @@ static napi_value Napi_weaveffi_edge_cases_nested_optional(napi_env env, napi_ca
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  void* items_raw;
-  size_t items_len;
+  void* items_raw = NULL;
+  size_t items_len = 0;
   napi_get_buffer_info(env, args[0], &items_raw, &items_len);
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_edge_cases_nested_optional((const uint8_t*)items_raw, items_len, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -470,26 +982,26 @@ static napi_value Napi_weaveffi_edge_cases_optional_params(napi_env env, napi_ca
   size_t argc = 6;
   napi_value args[6];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  void* text_raw;
-  size_t text_len;
+  void* text_raw = NULL;
+  size_t text_len = 0;
   napi_get_buffer_info(env, args[0], &text_raw, &text_len);
-  void* count_raw;
-  size_t count_len;
+  void* count_raw = NULL;
+  size_t count_len = 0;
   napi_get_buffer_info(env, args[1], &count_raw, &count_len);
-  void* outer_raw;
-  size_t outer_len;
+  void* outer_raw = NULL;
+  size_t outer_len = 0;
   napi_get_buffer_info(env, args[2], &outer_raw, &outer_len);
-  void* tags_raw;
-  size_t tags_len;
+  void* tags_raw = NULL;
+  size_t tags_len = 0;
   napi_get_buffer_info(env, args[3], &tags_raw, &tags_len);
-  void* blob_raw;
-  size_t blob_len;
+  void* blob_raw = NULL;
+  size_t blob_len = 0;
   napi_get_buffer_info(env, args[4], &blob_raw, &blob_len);
-  void* mode_raw;
-  size_t mode_len;
+  void* mode_raw = NULL;
+  size_t mode_len = 0;
   napi_get_buffer_info(env, args[5], &mode_raw, &mode_len);
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_edge_cases_optional_params((const uint8_t*)text_raw, text_len, (const uint8_t*)count_raw, count_len, (const uint8_t*)outer_raw, outer_len, (const uint8_t*)tags_raw, tags_len, (const uint8_t*)blob_raw, blob_len, (const uint8_t*)mode_raw, mode_len, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -502,20 +1014,36 @@ static napi_value Napi_weaveffi_edge_cases_optional_params(napi_env env, napi_ca
   return ret;
 }
 
-static napi_value Napi_weaveffi_edge_cases_mutable_params(napi_env env, napi_callback_info info) {
+static napi_value Napi_weaveffi_edge_cases_register_batch(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value args[2];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  size_t text_len;
-  napi_get_value_string_utf8(env, args[0], NULL, 0, &text_len);
-  char* text = (char*)malloc(text_len + 1);
-  napi_get_value_string_utf8(env, args[0], text, text_len + 1, &text_len);
-  void* blob_raw;
-  size_t blob_len;
-  napi_get_buffer_info(env, args[1], &blob_raw, &blob_len);
+  napi_status arg_status = napi_ok;
+  napi_valuetype listener_type;
+  napi_typeof(env, args[0], &listener_type);
+  weaveffi_napi_cb_ctx* listener_ctx = NULL;
+  if (listener_type == napi_object || listener_type == napi_function) {
+    listener_ctx = weaveffi_napi_cb_register(env, args[0], "weaveffi_edge_cases_BatchListener", weaveffi_edge_cases_BatchListener_napi_dispatch);
+  } else {
+    napi_throw_type_error(env, NULL, "expected a BatchListener implementation");
+    arg_status = napi_object_expected;
+  }
+  napi_valuetype keyword_type;
+  napi_typeof(env, args[1], &keyword_type);
+  weaveffi_napi_cb_ctx* keyword_ctx = NULL;
+  if (keyword_type == napi_object || keyword_type == napi_function) {
+    keyword_ctx = weaveffi_napi_cb_register(env, args[1], "weaveffi_edge_cases_Keyword", weaveffi_edge_cases_Keyword_napi_dispatch);
+  } else {
+    napi_throw_type_error(env, NULL, "expected a Keyword implementation");
+    arg_status = napi_object_expected;
+  }
+  if (arg_status != napi_ok) {
+    if (listener_ctx != NULL) weaveffi_napi_cb_release(env, listener_ctx);
+    if (keyword_ctx != NULL) weaveffi_napi_cb_release(env, keyword_ctx);
+    return NULL;
+  }
   weaveffi_error err = {0};
-  weaveffi_edge_cases_mutable_params(text, (const uint8_t*)blob_raw, blob_len, &err);
-  free(text);
+  weaveffi_edge_cases_register_batch((void*)listener_ctx, &weaveffi_edge_cases_BatchListener_napi_vtable, (void*)keyword_ctx, &weaveffi_edge_cases_Keyword_napi_vtable, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
@@ -526,11 +1054,171 @@ static napi_value Napi_weaveffi_edge_cases_mutable_params(napi_env env, napi_cal
   return ret;
 }
 
+static napi_value Napi_weaveffi_edge_cases_widgets_everywhere(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value args[4];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* list_raw = NULL;
+  size_t list_len = 0;
+  napi_get_buffer_info(env, args[0], &list_raw, &list_len);
+  void* by_name_raw = NULL;
+  size_t by_name_len = 0;
+  napi_get_buffer_info(env, args[1], &by_name_raw, &by_name_len);
+  void* sparse_raw = NULL;
+  size_t sparse_len = 0;
+  napi_get_buffer_info(env, args[2], &sparse_raw, &sparse_len);
+  void* holder_raw = NULL;
+  size_t holder_len = 0;
+  napi_get_buffer_info(env, args[3], &holder_raw, &holder_len);
+  weaveffi_error err = {0};
+  size_t out_len = 0;
+  const uint8_t* result = weaveffi_edge_cases_widgets_everywhere((const uint8_t*)list_raw, list_len, (const uint8_t*)by_name_raw, by_name_len, (const uint8_t*)sparse_raw, sparse_len, (const uint8_t*)holder_raw, holder_len, &out_len, &err);
+  if (err.code != 0) {
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  napi_create_buffer_copy(env, out_len, result, NULL, &ret);
+  weaveffi_free_bytes((uint8_t*)result, out_len);
+  return ret;
+}
+
+static void weaveffi_edge_cases_widget_stream_napi_iter_finalize(napi_env env, void* data, void* hint) {
+    (void)env;
+    (void)hint;
+    weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)data;
+    if (state->iter != NULL) {
+        weaveffi_edge_cases_WidgetStreamIterator_destroy((weaveffi_edge_cases_WidgetStreamIterator*)state->iter);
+        state->iter = NULL;
+    }
+    free(state);
+}
+
+static napi_value Napi_weaveffi_edge_cases_WidgetStreamIterator_next(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* iter_data = NULL;
+  napi_get_value_external(env, args[0], &iter_data);
+  weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)iter_data;
+  napi_value ret;
+  if (state == NULL || state->iter == NULL) {
+    napi_get_undefined(env, &ret);
+    return ret;
+  }
+  weaveffi_edge_cases_Widget* iter_item;
+  weaveffi_error iter_err = {0};
+  if (!weaveffi_edge_cases_WidgetStreamIterator_next((weaveffi_edge_cases_WidgetStreamIterator*)state->iter, &iter_item, &iter_err)) {
+    weaveffi_edge_cases_WidgetStreamIterator_destroy((weaveffi_edge_cases_WidgetStreamIterator*)state->iter);
+    state->iter = NULL;
+    if (iter_err.code != 0) {
+      napi_throw(env, weaveffi_napi_error_value(env, iter_err.code, iter_err.message, iter_err.payload_ptr, iter_err.payload_len));
+      weaveffi_error_clear(&iter_err);
+      return NULL;
+    }
+    napi_get_undefined(env, &ret);
+    return ret;
+  }
+  weaveffi_napi_make_handle(env, iter_item, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_edge_cases_WidgetStreamIterator_destroy(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  void* iter_data = NULL;
+  napi_get_value_external(env, args[0], &iter_data);
+  weaveffi_napi_iter_state* state = (weaveffi_napi_iter_state*)iter_data;
+  if (state != NULL && state->iter != NULL) {
+    weaveffi_edge_cases_WidgetStreamIterator_destroy((weaveffi_edge_cases_WidgetStreamIterator*)state->iter);
+    state->iter = NULL;
+  }
+  napi_value ret;
+  napi_get_undefined(env, &ret);
+  return ret;
+}
+
+static napi_value Napi_weaveffi_edge_cases_widget_stream(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_error err = {0};
+  void* result = weaveffi_edge_cases_widget_stream(&err);
+  if (err.code != 0) {
+    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
+    weaveffi_error_clear(&err);
+    return NULL;
+  }
+  napi_value ret;
+  weaveffi_napi_iter_state* iter_state = (weaveffi_napi_iter_state*)calloc(1, sizeof(weaveffi_napi_iter_state));
+  iter_state->iter = (void*)result;
+  napi_create_external(env, iter_state, weaveffi_edge_cases_widget_stream_napi_iter_finalize, NULL, &ret);
+  return ret;
+}
+
+typedef struct {
+    napi_deferred deferred;
+    napi_threadsafe_function tsfn;
+    int32_t err_code;
+    char* err_msg;
+    uint8_t* err_payload;
+    size_t err_payload_len;
+    void* result;
+} weaveffi_edge_cases_async_widget_napi_actx;
+
+static void weaveffi_edge_cases_async_widget_napi_cb(void* context, weaveffi_error* err, weaveffi_edge_cases_Widget* result) {
+    weaveffi_edge_cases_async_widget_napi_actx* ctx = (weaveffi_edge_cases_async_widget_napi_actx*)context;
+    if (err != NULL && err->code != 0) {
+        ctx->err_code = err->code;
+        ctx->err_msg = err->message ? strdup(err->message) : strdup("unknown error");
+        ctx->err_payload_len = err->payload_len;
+        if (err->payload_ptr != NULL && err->payload_len > 0) { ctx->err_payload = (uint8_t*)malloc(err->payload_len); memcpy(ctx->err_payload, err->payload_ptr, err->payload_len); }
+    } else {
+        ctx->result = (void*)result;
+    }
+    weaveffi_error_free(err);
+    napi_call_threadsafe_function(ctx->tsfn, ctx, napi_tsfn_blocking);
+}
+
+static void weaveffi_edge_cases_async_widget_napi_settle(napi_env env, napi_value js_cb, void* context, void* data) {
+    (void)js_cb;
+    (void)context;
+    weaveffi_edge_cases_async_widget_napi_actx* ctx = (weaveffi_edge_cases_async_widget_napi_actx*)data;
+    if (env != NULL) {
+    if (ctx->err_code != 0) {
+        napi_value err_obj = weaveffi_napi_error_value(env, ctx->err_code, ctx->err_msg, ctx->err_payload, ctx->err_payload_len);
+        napi_reject_deferred(env, ctx->deferred, err_obj);
+    } else {
+        napi_value val;
+        weaveffi_napi_make_handle(env, ctx->result, &val);
+        napi_resolve_deferred(env, ctx->deferred, val);
+    }
+    }
+    free(ctx->err_msg);
+    free(ctx->err_payload);
+    napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+    free(ctx);
+}
+
+static napi_value Napi_weaveffi_edge_cases_async_widget(napi_env env, napi_callback_info info) {
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, NULL, NULL);
+  weaveffi_edge_cases_async_widget_napi_actx* ctx = (weaveffi_edge_cases_async_widget_napi_actx*)calloc(1, sizeof(weaveffi_edge_cases_async_widget_napi_actx));
+  napi_value promise;
+  napi_create_promise(env, &ctx->deferred, &promise);
+  napi_value resource_name;
+  napi_create_string_utf8(env, "weaveffi_edge_cases_async_widget", NAPI_AUTO_LENGTH, &resource_name);
+  napi_create_threadsafe_function(env, NULL, NULL, resource_name, 0, 1, NULL, NULL, NULL, weaveffi_edge_cases_async_widget_napi_settle, &ctx->tsfn);
+  weaveffi_edge_cases_async_widget_async(weaveffi_edge_cases_async_widget_napi_cb, ctx);
+  return promise;
+}
+
 static napi_value Napi_weaveffi_edge_cases_make_widget(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  size_t label_len;
+  size_t label_len = 0;
   napi_get_value_string_utf8(env, args[0], NULL, 0, &label_len);
   char* label = (char*)malloc(label_len + 1);
   napi_get_value_string_utf8(env, args[0], label, label_len + 1, &label_len);
@@ -543,7 +1231,7 @@ static napi_value Napi_weaveffi_edge_cases_make_widget(napi_env env, napi_callba
     return NULL;
   }
   napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
+  weaveffi_napi_make_handle(env, result, &ret);
   return ret;
 }
 
@@ -551,8 +1239,14 @@ static napi_value Napi_weaveffi_edge_cases_find_widget(napi_env env, napi_callba
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t id;
-  napi_get_value_int64(env, args[0], &id);
+  napi_status arg_status = napi_ok;
+  int64_t id = 0;
+  if (arg_status == napi_ok) {
+    arg_status = weaveffi_napi_get_i64(env, args[0], &id);
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
   weaveffi_edge_cases_Widget* result = weaveffi_edge_cases_find_widget(id, &err);
   if (err.code != 0) {
@@ -561,11 +1255,7 @@ static napi_value Napi_weaveffi_edge_cases_find_widget(napi_env env, napi_callba
     return NULL;
   }
   napi_value ret;
-  if (result == NULL) {
-    napi_get_null(env, &ret);
-  } else {
-    napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
-  }
+  weaveffi_napi_make_handle(env, result, &ret);
   return ret;
 }
 
@@ -573,16 +1263,16 @@ static napi_value Napi_weaveffi_edge_cases_inspect_widget(napi_env env, napi_cal
   size_t argc = 2;
   napi_value args[2];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t widget_raw;
-  napi_get_value_int64(env, args[0], &widget_raw);
-  napi_valuetype fallback_type;
-  napi_typeof(env, args[1], &fallback_type);
-  int64_t fallback_raw = 0;
-  if (fallback_type != napi_null && fallback_type != napi_undefined) {
-    napi_get_value_int64(env, args[1], &fallback_raw);
+  napi_status arg_status = napi_ok;
+  void* widget_raw = NULL;
+  if (arg_status == napi_ok) arg_status = weaveffi_napi_get_handle(env, args[0], &widget_raw);
+  void* fallback_raw = NULL;
+  if (arg_status == napi_ok) arg_status = weaveffi_napi_get_handle(env, args[1], &fallback_raw);
+  if (arg_status != napi_ok) {
+    return NULL;
   }
   weaveffi_error err = {0};
-  const char* result = weaveffi_edge_cases_inspect_widget((const weaveffi_edge_cases_Widget*)(intptr_t)widget_raw, fallback_raw ? (const weaveffi_edge_cases_Widget*)(intptr_t)fallback_raw : NULL, &err);
+  const char* result = weaveffi_edge_cases_inspect_widget((const weaveffi_edge_cases_Widget*)widget_raw, (const weaveffi_edge_cases_Widget*)fallback_raw, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
     weaveffi_error_clear(&err);
@@ -591,26 +1281,6 @@ static napi_value Napi_weaveffi_edge_cases_inspect_widget(napi_env env, napi_cal
   napi_value ret;
   napi_create_string_utf8(env, result, NAPI_AUTO_LENGTH, &ret);
   weaveffi_free_string(result);
-  return ret;
-}
-
-static napi_value Napi_weaveffi_edge_cases_typed_handle_param(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value args[2];
-  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int64_t token_raw;
-  napi_get_value_int64(env, args[0], &token_raw);
-  int64_t raw_raw;
-  napi_get_value_int64(env, args[1], &raw_raw);
-  weaveffi_error err = {0};
-  weaveffi_edge_cases_Leaf* result = weaveffi_edge_cases_typed_handle_param((weaveffi_edge_cases_Leaf*)(intptr_t)token_raw, (weaveffi_handle_t)raw_raw, &err);
-  if (err.code != 0) {
-    napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
-    weaveffi_error_clear(&err);
-    return NULL;
-  }
-  napi_value ret;
-  napi_create_int64(env, (int64_t)(intptr_t)result, &ret);
   return ret;
 }
 
@@ -941,8 +1611,14 @@ static napi_value Napi_weaveffi_edge_cases_async_bytes(napi_env env, napi_callba
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  uint32_t size;
-  napi_get_value_uint32(env, args[0], &size);
+  napi_status arg_status = napi_ok;
+  uint32_t size = 0;
+  if (arg_status == napi_ok) {
+    arg_status = napi_get_value_uint32(env, args[0], &size);
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_edge_cases_async_bytes_napi_actx* ctx = (weaveffi_edge_cases_async_bytes_napi_actx*)calloc(1, sizeof(weaveffi_edge_cases_async_bytes_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
@@ -1170,7 +1846,7 @@ static void weaveffi_edge_cases_async_enum_napi_settle(napi_env env, napi_value 
         napi_reject_deferred(env, ctx->deferred, err_obj);
     } else {
         napi_value val;
-        napi_create_int32(env, (int32_t)ctx->result, &val);
+        napi_create_int32(env, (int32_t)(ctx->result), &val);
         napi_resolve_deferred(env, ctx->deferred, val);
     }
     }
@@ -1245,12 +1921,19 @@ static napi_value Napi_weaveffi_edge_cases_async_keywords(napi_env env, napi_cal
   size_t argc = 2;
   napi_value args[2];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  size_t class_len;
+  napi_status arg_status = napi_ok;
+  size_t class_len = 0;
   napi_get_value_string_utf8(env, args[0], NULL, 0, &class_len);
   char* class = (char*)malloc(class_len + 1);
   napi_get_value_string_utf8(env, args[0], class, class_len + 1, &class_len);
-  int32_t import;
-  napi_get_value_int32(env, args[1], &import);
+  int32_t import = 0;
+  if (arg_status == napi_ok) {
+    arg_status = napi_get_value_int32(env, args[1], &import);
+  }
+  if (arg_status != napi_ok) {
+    free(class);
+    return NULL;
+  }
   weaveffi_edge_cases_async_keywords_napi_actx* ctx = (weaveffi_edge_cases_async_keywords_napi_actx*)calloc(1, sizeof(weaveffi_edge_cases_async_keywords_napi_actx));
   napi_value promise;
   napi_create_promise(env, &ctx->deferred, &promise);
@@ -1266,11 +1949,11 @@ static napi_value Napi_weaveffi_edge_cases_keywords_roundtrip(napi_env env, napi
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  void* value_raw;
-  size_t value_len;
+  void* value_raw = NULL;
+  size_t value_len = 0;
   napi_get_buffer_info(env, args[0], &value_raw, &value_len);
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_edge_cases_keywords_roundtrip((const uint8_t*)value_raw, value_len, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -1287,10 +1970,18 @@ static napi_value Napi_weaveffi_edge_cases_legacy_value(napi_env env, napi_callb
   size_t argc = 1;
   napi_value args[1];
   napi_get_cb_info(env, info, &argc, args, NULL, NULL);
-  int32_t value;
-  napi_get_value_int32(env, args[0], &value);
+  napi_status arg_status = napi_ok;
+  int32_t value = 0;
+  if (arg_status == napi_ok) {
+    int32_t value_tmp = 0;
+    arg_status = napi_get_value_int32(env, args[0], &value_tmp);
+    value = value_tmp;
+  }
+  if (arg_status != napi_ok) {
+    return NULL;
+  }
   weaveffi_error err = {0};
-  size_t out_len;
+  size_t out_len = 0;
   const uint8_t* result = weaveffi_edge_cases_legacy_value((weaveffi_edge_cases_Legacy)value, &out_len, &err);
   if (err.code != 0) {
     napi_throw(env, weaveffi_napi_error_value(env, err.code, err.message, err.payload_ptr, err.payload_len));
@@ -1313,29 +2004,32 @@ static napi_value Init(napi_env env, napi_value exports) {
       return NULL;
     }
   }
+  weaveffi_napi_js_thread = uv_thread_self();
   napi_property_descriptor props[] = {
     { "Widget_refresh", NULL, Napi_weaveffi_edge_cases_Widget_refresh, NULL, NULL, NULL, napi_default, NULL },
     { "Widget_rename", NULL, Napi_weaveffi_edge_cases_Widget_rename, NULL, NULL, NULL, napi_default, NULL },
     { "Widget_fetch", NULL, Napi_weaveffi_edge_cases_Widget_fetch, NULL, NULL, NULL, napi_default, NULL },
     { "Widget_old_name", NULL, Napi_weaveffi_edge_cases_Widget_old_name, NULL, NULL, NULL, napi_default, NULL },
-    { "Widget_destroy", NULL, Napi_weaveffi_edge_cases_Widget_destroy, NULL, NULL, NULL, napi_default, NULL },
+    { "Widget__destroy", NULL, Napi_weaveffi_edge_cases_Widget_destroy, NULL, NULL, NULL, napi_default, NULL },
+    { "Widget__clone", NULL, Napi_weaveffi_edge_cases_Widget_clone, NULL, NULL, NULL, napi_default, NULL },
     { "Vault_open", NULL, Napi_weaveffi_edge_cases_Vault_open, NULL, NULL, NULL, napi_default, NULL },
     { "Vault_probe", NULL, Napi_weaveffi_edge_cases_Vault_probe, NULL, NULL, NULL, napi_default, NULL },
     { "Vault_peek", NULL, Napi_weaveffi_edge_cases_Vault_peek, NULL, NULL, NULL, napi_default, NULL },
-    { "Vault_destroy", NULL, Napi_weaveffi_edge_cases_Vault_destroy, NULL, NULL, NULL, napi_default, NULL },
-    { "registerBatchListener", NULL, Napi_weaveffi_edge_cases_register_batch_listener, NULL, NULL, NULL, napi_default, NULL },
-    { "unregisterBatchListener", NULL, Napi_weaveffi_edge_cases_unregister_batch_listener, NULL, NULL, NULL, napi_default, NULL },
-    { "registerTickListener", NULL, Napi_weaveffi_edge_cases_register_tick_listener, NULL, NULL, NULL, napi_default, NULL },
-    { "unregisterTickListener", NULL, Napi_weaveffi_edge_cases_unregister_tick_listener, NULL, NULL, NULL, napi_default, NULL },
+    { "Vault__destroy", NULL, Napi_weaveffi_edge_cases_Vault_destroy, NULL, NULL, NULL, napi_default, NULL },
+    { "Vault__clone", NULL, Napi_weaveffi_edge_cases_Vault_clone, NULL, NULL, NULL, napi_default, NULL },
     { "noop", NULL, Napi_weaveffi_edge_cases_noop, NULL, NULL, NULL, napi_default, NULL },
     { "select", NULL, Napi_weaveffi_edge_cases_select, NULL, NULL, NULL, napi_default, NULL },
     { "nestedOptional", NULL, Napi_weaveffi_edge_cases_nested_optional, NULL, NULL, NULL, napi_default, NULL },
     { "optionalParams", NULL, Napi_weaveffi_edge_cases_optional_params, NULL, NULL, NULL, napi_default, NULL },
-    { "mutableParams", NULL, Napi_weaveffi_edge_cases_mutable_params, NULL, NULL, NULL, napi_default, NULL },
+    { "registerBatch", NULL, Napi_weaveffi_edge_cases_register_batch, NULL, NULL, NULL, napi_default, NULL },
+    { "widgetsEverywhere", NULL, Napi_weaveffi_edge_cases_widgets_everywhere, NULL, NULL, NULL, napi_default, NULL },
+    { "widgetStream_iterNext", NULL, Napi_weaveffi_edge_cases_WidgetStreamIterator_next, NULL, NULL, NULL, napi_default, NULL },
+    { "widgetStream_iterDestroy", NULL, Napi_weaveffi_edge_cases_WidgetStreamIterator_destroy, NULL, NULL, NULL, napi_default, NULL },
+    { "widgetStream", NULL, Napi_weaveffi_edge_cases_widget_stream, NULL, NULL, NULL, napi_default, NULL },
+    { "asyncWidget", NULL, Napi_weaveffi_edge_cases_async_widget, NULL, NULL, NULL, napi_default, NULL },
     { "makeWidget", NULL, Napi_weaveffi_edge_cases_make_widget, NULL, NULL, NULL, napi_default, NULL },
     { "findWidget", NULL, Napi_weaveffi_edge_cases_find_widget, NULL, NULL, NULL, napi_default, NULL },
     { "inspectWidget", NULL, Napi_weaveffi_edge_cases_inspect_widget, NULL, NULL, NULL, napi_default, NULL },
-    { "typedHandleParam", NULL, Napi_weaveffi_edge_cases_typed_handle_param, NULL, NULL, NULL, napi_default, NULL },
     { "stringStream_iterNext", NULL, Napi_weaveffi_edge_cases_StringStreamIterator_next, NULL, NULL, NULL, napi_default, NULL },
     { "stringStream_iterDestroy", NULL, Napi_weaveffi_edge_cases_StringStreamIterator_destroy, NULL, NULL, NULL, napi_default, NULL },
     { "stringStream", NULL, Napi_weaveffi_edge_cases_string_stream, NULL, NULL, NULL, napi_default, NULL },
@@ -1355,7 +2049,7 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "keywordsRoundtrip", NULL, Napi_weaveffi_edge_cases_keywords_roundtrip, NULL, NULL, NULL, napi_default, NULL },
     { "legacyValue", NULL, Napi_weaveffi_edge_cases_legacy_value, NULL, NULL, NULL, napi_default, NULL },
   };
-  napi_define_properties(env, exports, 40, props);
+  napi_define_properties(env, exports, 42, props);
   return exports;
 }
 

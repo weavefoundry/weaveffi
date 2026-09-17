@@ -1,0 +1,7 @@
+error: weaveffi: unsupported non-direct return type for `callback return` (not yet implemented by #[weaveffi::module])
+ --> tests/ui/fail_callback_string_return.rs:1:1
+  |
+1 | #[weaveffi::module]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `weaveffi::module` (in Nightly builds, run with -Z macro-backtrace for more info)

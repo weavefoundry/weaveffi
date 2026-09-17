@@ -34,6 +34,8 @@ pub enum TypeKind {
     RichEnum,
     /// An `interfaces:` entry.
     Interface,
+    /// A `callback_interfaces:` entry.
+    CallbackInterface,
 }
 
 /// Where a type is declared: the owning module's dot-joined path and its kind.
@@ -121,7 +123,7 @@ impl ResolvedApi {
     /// declared in a *different* module is qualified with the owner's
     /// dot-joined path (`shared.Status`), so the ABI lowering emits the
     /// owner's symbol prefix; a reference to a type in the same module stays
-    /// bare. Typed handles are qualified the same way.
+    /// bare.
     pub fn resolve(&self, ty: &TypeRef, module_path: &str) -> Ty {
         match ty {
             TypeRef::I8 => Ty::I8,
@@ -137,16 +139,13 @@ impl ResolvedApi {
             TypeRef::Bool => Ty::Bool,
             TypeRef::StringUtf8 => Ty::StringUtf8,
             TypeRef::Bytes => Ty::Bytes,
-            TypeRef::BorrowedStr => Ty::BorrowedStr,
-            TypeRef::BorrowedBytes => Ty::BorrowedBytes,
-            TypeRef::Handle => Ty::Handle,
-            TypeRef::TypedHandle(name) => Ty::TypedHandle(self.qualify(name, module_path)),
             TypeRef::Named(name) => {
                 let qualified = self.qualify(name, module_path);
                 match self.types.get(bare(name)).map(|d| d.kind) {
                     Some(TypeKind::Enum) => Ty::Enum(qualified),
                     Some(TypeKind::RichEnum) => Ty::RichEnum(qualified),
                     Some(TypeKind::Interface) => Ty::Interface(qualified),
+                    Some(TypeKind::CallbackInterface) => Ty::CallbackInterface(qualified),
                     Some(TypeKind::Record) | None => Ty::Record(qualified),
                 }
             }
@@ -178,9 +177,10 @@ fn bare(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
-/// Recursively index every struct/enum/interface in the module tree by bare
-/// name. Bare names are globally unique (validation enforces it), so the map
-/// has one entry per name; the first declaration wins otherwise.
+/// Recursively index every struct, enum, interface, and callback interface in
+/// the module tree by bare name. Bare names are globally unique (validation
+/// enforces it), so the map has one entry per name; the first declaration
+/// wins otherwise.
 fn index_module(module: &Module, parent: &str, out: &mut BTreeMap<String, TypeDecl>) {
     let path = if parent.is_empty() {
         module.name.clone()
@@ -207,6 +207,9 @@ fn index_module(module: &Module, parent: &str, out: &mut BTreeMap<String, TypeDe
     for i in &module.interfaces {
         add(&i.name, TypeKind::Interface);
     }
+    for c in &module.callback_interfaces {
+        add(&c.name, TypeKind::CallbackInterface);
+    }
     for child in &module.modules {
         index_module(child, &path, out);
     }
@@ -230,7 +233,8 @@ impl AsRef<Api> for ResolvedApi {
 mod tests {
     use super::*;
     use weaveffi_ir::ir::{
-        EnumDef, EnumVariant, InterfaceDef, StructDef, StructField, CURRENT_SCHEMA_VERSION,
+        CallbackInterfaceDef, EnumDef, EnumVariant, Function, InterfaceDef, StructDef, StructField,
+        CURRENT_SCHEMA_VERSION,
     };
 
     fn module(name: &str) -> Module {
@@ -239,10 +243,9 @@ mod tests {
             doc: None,
             functions: vec![],
             interfaces: vec![],
+            callback_interfaces: vec![],
             structs: vec![],
             enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
             errors: None,
             modules: vec![],
         }
@@ -293,6 +296,21 @@ mod tests {
                     methods: vec![],
                     statics: vec![],
                 }],
+                callback_interfaces: vec![CallbackInterfaceDef {
+                    name: "Watcher".into(),
+                    doc: None,
+                    deprecated: None,
+                    methods: vec![Function {
+                        name: "on_change".into(),
+                        params: vec![],
+                        returns: None,
+                        doc: None,
+                        throws: false,
+                        r#async: false,
+                        cancellable: false,
+                        deprecated: None,
+                    }],
+                }],
                 ..module("inner")
             }],
             ..module("shared")
@@ -332,8 +350,12 @@ mod tests {
             Ty::Record("shared.Point".into())
         );
         assert_eq!(
-            api.resolve(&TypeRef::TypedHandle("Store".into()), "orders"),
-            Ty::TypedHandle("shared.inner.Store".into())
+            api.resolve(&TypeRef::Named("Watcher".into()), "orders"),
+            Ty::CallbackInterface("shared.inner.Watcher".into())
+        );
+        assert_eq!(
+            api.declaration("Watcher").unwrap().kind,
+            TypeKind::CallbackInterface
         );
     }
 

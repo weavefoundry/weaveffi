@@ -10,11 +10,26 @@
 //! WeaveFFI value-buffer format as one `(ptr, len)` pair. The generated
 //! library ships a small private buffer writer/reader implementing that
 //! format, plus one pack and one unpack routine per record and rich enum.
+//!
+//! Interfaces render as reference-counted wrapper classes: each instance
+//! adopts one strong reference, releases it through `dispose()` or a
+//! `NativeFinalizer` backstop, and can mint a second reference (the
+//! interface's `_clone` symbol) when the codec writes it into a value buffer
+//! as an object token. `Interface?` is a nullable wrapper (`Store?`).
+//!
+//! Callback interfaces render as abstract classes the consumer implements.
+//! Passing an implementation parks it in a handle table keyed by an integer
+//! that crosses as `ctx`, alongside one process-wide static vtable per
+//! interface whose entries are `NativeCallable.isolateLocal` trampolines.
+//! Because `isolateLocal` callables can only run on the owning isolate's
+//! thread, a producer must invoke callback methods synchronously during a
+//! call from Dart; invocation from another producer thread is unsupported.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
+mod callbacks;
 mod calls;
 mod codec;
 mod docs;
@@ -28,33 +43,34 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::capabilities::TargetCapabilities;
 use weaveffi_core::model::{
-    BindingModel, CallShape, CallbackBinding, EnumBinding, ErrorBinding, FnBinding,
-    InterfaceBinding, ListenerBinding, ModuleBinding, StructBinding,
+    BindingModel, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
+    ModuleBinding, StructBinding,
 };
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::pkg;
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
-use crate::calls::{render_callback_typedef, render_function, render_listener};
+use crate::callbacks::render_callback_interface;
+use crate::calls::render_function;
 use crate::entities::{render_enum, render_error, render_interface, render_struct};
 use crate::package::{render_packaged_readme, render_pubspec, render_readme};
 use crate::runtime::{
-    dart_loader_original, dart_loader_packaged, render_abi_version_check, render_buffer_runtime,
-    render_error_plumbing,
+    bundles_platform, dart_loader_original, dart_loader_packaged, render_abi_version_check,
+    render_buffer_runtime, render_callback_runtime, render_error_plumbing,
 };
 
 /// Per-target configuration for [`DartGenerator`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DartConfig {
     /// Dart package name (recorded in `pubspec.yaml`). Defaults to
     /// `"weaveffi"`.
     pub package_name: Option<String>,
     /// When `true` (the default), strip the IR module path from emitted
-    /// function and listener names, so a `contacts` module exports
-    /// `createContact` rather than `contactsCreateContact`. Set to `false`
-    /// to restore module-prefixed names.
+    /// free-function names, so a `contacts` module exports `createContact`
+    /// rather than `contactsCreateContact`. Set to `false` to restore
+    /// module-prefixed names.
     pub strip_module_prefix: bool,
     /// C ABI symbol prefix (default `"weaveffi"`). Normally set once globally
     /// via `[global] c_prefix`; honored so the `dart:ffi` bindings call the
@@ -112,10 +128,7 @@ impl DartGenerator {
     ) -> String {
         let input_basename = config.input_basename();
         let mut out = render_prelude(CommentStyle::DoubleSlash, input_basename);
-        let has_async = model
-            .modules
-            .iter()
-            .any(|m| m.callables().any(|f| f.is_async));
+        let has_async = model.has_async();
         // The default shared-library basename follows the package identity
         // (`lib<name>`), matching the producer cdylib. WEAVEFFI_LIBRARY still wins.
         let resolved = pkg::resolve(api, None, Some(input_basename));
@@ -141,20 +154,11 @@ impl DartGenerator {
         render_error_plumbing(&mut out);
         render_buffer_runtime(&mut out);
 
-        let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
-        if has_listeners {
-            out.push_str("\n// Live listener trampolines by subscription id. Holding the\n");
-            out.push_str(
-                "// NativeCallable here keeps its native thunk alive until unregistered.\n",
-            );
-            out.push_str("final Map<int, NativeCallable> _listenerCallables = {};\n");
+        if model.has_callback_interfaces() {
+            render_callback_runtime(&mut out);
         }
 
-        let has_iterators = model.modules.iter().any(|m| {
-            m.callables()
-                .any(|f| matches!(f.shape, CallShape::Iterator(_)))
-        });
-        if has_iterators {
+        if model.has_iterators() {
             out.push_str("\n// Anchors one live native iteration for its GC-finalizer backstop.\n");
             out.push_str(
                 "// A suspended `sync*` frame keeps the anchor reachable; abandoning the\n",
@@ -182,7 +186,7 @@ impl LanguageBackend for DartGenerator {
         "dart"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 
@@ -224,24 +228,14 @@ impl LanguageBackend for DartGenerator {
         render_interface(out, module, i);
     }
 
-    fn render_callback(
+    fn render_callback_interface(
         &self,
         out: &mut String,
         _module: &ModuleBinding,
-        c: &CallbackBinding,
+        cb: &CallbackInterfaceBinding,
         _config: &Self::Config,
     ) {
-        render_callback_typedef(out, c);
-    }
-
-    fn render_listener(
-        &self,
-        out: &mut String,
-        module: &ModuleBinding,
-        l: &ListenerBinding,
-        config: &Self::Config,
-    ) {
-        render_listener(out, module, l, config.strip_module_prefix);
+        render_callback_interface(out, cb);
     }
 
     fn render_function(
@@ -330,8 +324,14 @@ impl LanguageBackend for DartGenerator {
                 render_packaged_readme(&package, ctx, input_basename),
             ),
         ];
-        // Bundle every prebuilt library under native/<platform-id>/.
-        for nb in &ctx.binaries.binaries {
+        // Bundle every prebuilt desktop library under native/<platform-id>/;
+        // the loader has no slot for Android or wasm32 builds.
+        for nb in ctx
+            .binaries
+            .binaries
+            .iter()
+            .filter(|nb| bundles_platform(nb.platform))
+        {
             let dest = dart_dir
                 .join("native")
                 .join(nb.platform.id())

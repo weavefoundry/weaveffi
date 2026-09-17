@@ -16,11 +16,11 @@ pub mod lower;
 
 pub use ctype::{CType, ConstPos};
 pub use lower::{
-    callback_result_params, lower_param, lower_return, split_qualified, struct_tag, AbiParam,
-    AbiReturn,
+    callback_result_params, lower_param, lower_return, split_qualified, struct_tag, vtable_tag,
+    AbiParam, AbiReturn,
 };
 
-use crate::model::{ParamBinding, Ty};
+use crate::model::{Family, ParamBinding, Ty};
 
 /// A fully-assembled C ABI signature: the ordered parameter slots and the
 /// C return type.
@@ -38,9 +38,57 @@ pub fn error_out_param() -> AbiParam {
     AbiParam::new("out_err", CType::ptr(CType::Error))
 }
 
-/// The `void* context` token threaded through callbacks and async calls.
+/// The `void* context` token threaded through async completion callbacks.
 pub fn context_param() -> AbiParam {
     AbiParam::new("context", CType::ptr(CType::Void))
+}
+
+/// The leading `void* ctx` slot of every callback-interface method (the
+/// consumer's opaque implementation handle).
+pub fn ctx_param() -> AbiParam {
+    AbiParam::new("ctx", CType::ptr(CType::Void))
+}
+
+/// Assemble the signature of one callback-interface method as it appears in
+/// the vtable: `ctx`, then every parameter's slots, then `out_err`. The return
+/// is the method's direct C type or `void`; validation restricts callback
+/// method returns to the direct family, so no out-parameters ever appear.
+///
+/// Object parameters differ from a plain call: the producer transfers one
+/// strong reference the consumer adopts, so the slot is a mutable `{tag}*`
+/// rather than the borrowed `const {tag}*` of a top-level parameter.
+pub fn callback_method_signature(
+    params: &[ParamBinding],
+    returns: Option<&Ty>,
+    module: &str,
+) -> AbiSig {
+    let mut out = vec![ctx_param()];
+    for p in params {
+        if matches!(p.ty.family(), Family::Object { .. }) {
+            let [slot] = p.abi.as_slice() else {
+                unreachable!("object parameter '{}' has one slot", p.name);
+            };
+            let CType::Ptr { pointee, .. } = &slot.ty else {
+                unreachable!("object slot '{}' is a pointer", p.name);
+            };
+            out.push(AbiParam::new(&slot.name, CType::ptr((**pointee).clone())));
+        } else {
+            out.extend(p.abi.iter().cloned());
+        }
+    }
+    let ret = match returns {
+        Some(ty) => {
+            let r = lower_return(ty, module);
+            debug_assert!(
+                r.out_params.is_empty(),
+                "callback method returns are direct-family only"
+            );
+            r.ret
+        }
+        None => CType::Void,
+    };
+    out.push(error_out_param());
+    AbiSig { params: out, ret }
 }
 
 /// The optional `{prefix}_cancel_token*` parameter of a cancellable async call.
@@ -94,7 +142,7 @@ mod tests {
     use super::*;
 
     fn param(name: &str, ty: Ty) -> ParamBinding {
-        ParamBinding::new(name, ty, false, None, "math")
+        ParamBinding::new(name, ty, None, "math")
     }
 
     fn render(params: &[AbiParam]) -> Vec<String> {
@@ -137,6 +185,23 @@ mod tests {
         assert_eq!(
             render(&inputs),
             ["int64_t id", "weaveffi_cancel_token* cancel_token"]
+        );
+    }
+
+    #[test]
+    fn callback_method_signature_wraps_ctx_and_out_err() {
+        let sig =
+            callback_method_signature(&[param("text", Ty::StringUtf8)], Some(&Ty::Bool), "events");
+        assert_eq!(sig.ret, CType::Bool);
+        assert_eq!(
+            render(&sig.params),
+            ["void* ctx", "const char* text", "weaveffi_error* out_err"]
+        );
+        let sig = callback_method_signature(&[], None, "events");
+        assert_eq!(sig.ret, CType::Void);
+        assert_eq!(
+            render(&sig.params),
+            ["void* ctx", "weaveffi_error* out_err"]
         );
     }
 }

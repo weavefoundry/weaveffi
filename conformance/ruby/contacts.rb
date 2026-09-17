@@ -3,8 +3,10 @@
 #
 # Drives the 0.7.0 value-type surface: Contact is a plain Ruby value class
 # decoded from the value buffer the producer returns (the optional email is
-# nil-able and the list return is a native Array), while ContactBook stays an
-# owned interface handle released through FFI::AutoPointer. Throwing methods
+# nil-able and the list return is a native Array), while ContactBook is a
+# reference-counted interface wrapper whose `close` releases its strong
+# reference early (idempotent; the AutoPointer otherwise releases it at GC
+# time), and whose `dup` mints an independent wrapper. Throwing methods
 # raise the typed ContactsError subclasses (InvalidName=1, NotFound=2);
 # non-throwing methods keep the generic WeaveFFI::Error for panics only. The
 # cdylib is selected via WEAVEFFI_LIBRARY.
@@ -69,10 +71,32 @@ rescue WeaveFFI::ContactsError => e
   expect(e.code == 2, "domain rescue sees NotFound code (got #{e.code})")
 end
 
-# Each book owns independent state; explicit destroy releases it early (the
-# AutoPointer's GC release is then a no-op, so no double-free).
+# Each book owns independent state. `dup` produces a second wrapper holding
+# its own strong reference to the same object, so state is shared and closing
+# one wrapper leaves the other usable.
 other = WeaveFFI::ContactBook.new
 expect(other.count.zero?, "fresh book empty")
-other.destroy
+twin = other.dup
+expect(twin.handle.address == other.handle.address, "dup wraps the same object")
+other.add("Carol", "White", nil, WeaveFFI::ContactType::PERSONAL)
+expect(twin.count == 1, "state visible through the dup (got #{twin.count})")
+twin.close
+expect(twin.closed?, "dup reports closed")
+expect(!other.closed?, "original still open after closing the dup")
+expect(other.count == 1, "original usable after closing the dup")
+
+# Explicit close releases the wrapper's reference early; a second close is a
+# no-op (the AutoPointer's GC release is also a no-op afterward, so no
+# double-free), and using a closed wrapper raises the brand error.
+other.close
+other.close
+expect(other.closed?, "closed? after close")
+begin
+  other.count
+  raise "expected Error when using a closed ContactBook"
+rescue WeaveFFI::Error => e
+  expect(e.message.include?("after close"), "use-after-close message (got #{e.message.inspect})")
+end
+book.close
 
 puts "ruby/contacts: OK"

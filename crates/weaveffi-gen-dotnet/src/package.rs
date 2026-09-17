@@ -166,6 +166,7 @@ The resulting `.nupkg` will be in `bin/Debug/` (or `bin/Release/` with `-c Relea
 
 /// Render the README for a packaged .NET artifact, listing the bundled
 /// runtime identifiers so consumers know which platforms ship prebuilt.
+/// Platforms without a NuGet RID aren't bundled and aren't listed.
 pub(crate) fn render_packaged_readme(
     package: &ResolvedPackage,
     ctx: &PackageContext,
@@ -177,7 +178,8 @@ pub(crate) fn render_packaged_readme(
     let rids: Vec<String> = ctx
         .binaries
         .platforms()
-        .map(|p| format!("- `{}`", p.nuget_rid()))
+        .filter_map(|p| p.nuget_rid())
+        .map(|rid| format!("- `{rid}`"))
         .collect();
     let rid_list = rids.join("\n");
     format!(

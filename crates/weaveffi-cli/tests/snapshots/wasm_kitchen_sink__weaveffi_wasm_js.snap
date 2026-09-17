@@ -9,16 +9,18 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 //
 // Boundary conventions for a wasm32-unknown-unknown build:
 //
-//   Objects   -> i32 pointer into linear memory (0 = null/absent)
+//   Objects   -> i32 pointer into linear memory (0 = null/absent); one
+//                strong reference per wrapper, released by close()
 //   Enums     -> i32 discriminant value
 //   i64/u64   -> JavaScript BigInt
 //   Strings   -> NUL-terminated UTF-8 (const char*); a single i32 pointer
 //   Bytes     -> i32 data pointer + i32 length (out_len for returns)
 //   Buffered  -> records, rich enums, optionals, lists, and maps cross
 //                as one value buffer: i32 pointer + i32 length
+//   Callbacks -> i32 context key + i32 pointer to a static vtable
 
 // The ABI revision this glue was generated against.
-const _ABI_VERSION = 1;
+const _ABI_VERSION = 2;
 
 function _checkAbiVersion(wasm) {
   if (typeof wasm.weaveffi_abi_version !== 'function') {
@@ -31,8 +33,9 @@ function _checkAbiVersion(wasm) {
 }
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
- * thrown directly for unknown codes, marshalling failures, and producer
- * panics. Carries the stable ABI `code`. */
+ * thrown directly for unknown codes, marshalling failures, producer
+ * panics, and callback-interface implementations that raised (code -4).
+ * Carries the stable ABI `code`. */
 export class WeaveFFIError extends Error {
   constructor(code, message) {
     super(message ? `WeaveFFI error ${code}: ${message}` : `WeaveFFI error ${code}`);
@@ -66,14 +69,6 @@ const _KITCHEN_ERRORS_ERROR_CODES = Object.freeze({
   1: NotFound,
   2: InvalidInput,
 });
-
-// Build the KitchenErrorsError subclass matching `code`, or a generic
-// WeaveFFIError for codes outside the domain (panics, marshalling).
-function _kitchenErrorsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
-  const _cls = _KITCHEN_ERRORS_ERROR_CODES[code];
-  const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
-  return _e;
-}
 
 const _enc = new TextEncoder();
 const _dec = new TextDecoder();
@@ -154,6 +149,8 @@ class _BufWriter {
   f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }
   len(n) { this.u32(n); }
   flag(present) { this.u8(present ? 1 : 0); }
+  // An object token: the pointer (a wasm32 i32, read unsigned) widened to u64.
+  obj(ptr) { this.u64(BigInt(ptr >>> 0)); }
   str(v) {
     const b = _enc.encode(v);
     this.len(b.length);
@@ -218,6 +215,13 @@ class _BufReader {
     if (b > 1) this._bad('option flag byte out of range');
     return b === 1;
   }
+  // An object token narrowed back to a wasm32 pointer; zero is never a
+  // valid token (an absent `Interface?` uses the option flag instead).
+  obj() {
+    const t = this.u64();
+    if (t === 0n || t > 0xffffffffn) this._bad('object token out of range');
+    return Number(t);
+  }
   str() {
     const n = this.len();
     const at = this._take(n, 'string bytes');
@@ -247,9 +251,11 @@ function _allocErr(wasm) {
 
 // Throw (and free the slot) if the error slot carries a non-zero code.
 // Non-throwing wrappers route here: a non-zero code can only be a
-// producer panic or a marshalling failure, surfaced as the generic
+// producer panic (-2), a marshalling failure (-3), or a callback
+// interface implementation that raised (-4), surfaced as the generic
 // WeaveFFIError.
 function _checkErr(wasm, errPtr) {
+  _pendingForeign = null;
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code !== 0) {
@@ -263,21 +269,36 @@ function _checkErr(wasm, errPtr) {
 
 // Release an error slot on the success path.
 function _freeErr(wasm, errPtr) {
+  _pendingForeign = null;
   wasm.weaveffi_dealloc(errPtr, 16);
 }
 
-// Throw the `KitchenErrorsError` domain error (and free the slot) if the error slot
-// carries a non-zero code.
-function _checkKitchenErrorsError(wasm, errPtr) {
-  const dv = new DataView(wasm.memory.buffer);
-  const code = dv.getInt32(errPtr, true);
-  if (code !== 0) {
-    const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
-    const _e = _kitchenErrorsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
-    wasm.weaveffi_error_clear(errPtr);
-    wasm.weaveffi_dealloc(errPtr, 16);
-    throw _e;
-  }
+// The message of a callback-interface failure a trampoline reported through
+// out_err, held until the producer call on the stack returns (every error
+// checker and _freeErr clear it) so later callbacks in that call are refused.
+let _pendingForeign = null;
+
+// Translate an exception raised while a producer call was on the stack.
+// wasm32-unknown-unknown has no unwinding runtime: a producer panic executes
+// `unreachable`, so the engine throws a WebAssembly.RuntimeError instead of
+// the producer writing out_err. A trap that follows a callback-interface
+// failure is labelled with that failure (-4); any other trap is a producer
+// panic (-2). Non-trap exceptions pass through unchanged. The producer
+// frames between the trap and the call are not unwound, so a lock held
+// across a callback stays locked; a producer that snapshots its state
+// before calling out stays usable.
+function _trapError(e) {
+  const foreign = _pendingForeign;
+  _pendingForeign = null;
+  if (!(e instanceof WebAssembly.RuntimeError)) return e;
+  if (foreign !== null) return new WeaveFFIError(-4, foreign);
+  return new WeaveFFIError(-2, 'producer panicked: ' + e.message);
+}
+
+// Release the error slot a failed call never filled, then translate.
+function _trap(wasm, errPtr, e) {
+  _freeErr(wasm, errPtr);
+  return _trapError(e);
 }
 
 // Throw if a heap-boxed (consumer-owned) error carries a non-zero
@@ -286,6 +307,7 @@ function _checkKitchenErrorsError(wasm, errPtr) {
 // `mkErr` maps domain codes (and decodes payload fields) for
 // throwing callables; without it the generic WeaveFFIError is thrown.
 function _checkErrRef(wasm, errPtr, mkErr) {
+  _pendingForeign = null;
   const dv = new DataView(wasm.memory.buffer);
   const code = dv.getInt32(errPtr, true);
   if (code === 0) { wasm.weaveffi_error_free(errPtr); return; }
@@ -295,67 +317,65 @@ function _checkErrRef(wasm, errPtr, mkErr) {
   throw err;
 }
 
-// Serialize a `shared.Token` record into the value-buffer wire format.
-function _write_shared_Token(w, v) {
-  w.i64(v.id);
-  w.str(v.label);
+// `using` declarations (explicit resource management) call this symbol;
+// runtimes that predate it get the registered stand-in so the method is
+// still reachable by name.
+const _dispose = typeof Symbol.dispose === 'symbol' ? Symbol.dispose : Symbol.for('Symbol.dispose');
+
+// Finalization backstop: a wrapper that is garbage collected without
+// close() still releases its reference. The held value is the
+// [destroy, handle] pair (never the wrapper, which would keep it alive);
+// the wrapper is the unregister token so close() disarms the backstop and
+// destroy runs exactly once either way. Absent on runtimes without
+// FinalizationRegistry, where close() is the only release path.
+const _finalizer = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(([destroy, handle]) => destroy(handle))
+  : null;
+
+// Bind one strong reference to a wrapper and arm the backstop.
+function _adopt(obj, handle, destroy) {
+  obj._handle = handle;
+  obj._destroy = destroy;
+  if (_finalizer !== null) _finalizer.register(obj, [destroy, handle], obj);
+  return obj;
 }
 
-// Decode a `shared.Token` record from the value-buffer wire format.
-function _read_shared_Token(r) {
-  const v = {};
-  v.id = r.i64();
-  v.label = r.str();
-  return v;
+// Release a wrapper's reference exactly once; later calls are no-ops.
+function _release(obj) {
+  if (!obj._handle) return;
+  if (_finalizer !== null) _finalizer.unregister(obj);
+  obj._destroy(obj._handle);
+  obj._handle = 0;
 }
 
-// Serialize a `kitchen.Item` record into the value-buffer wire format.
-function _write_kitchen_Item(w, v) {
-  w.i64(v.id);
-  w.str(v.name);
-  w.i32(v.count);
-  w.bool(v.enabled);
-  w.f64(v.ratio);
-  w.u32(v.nick);
-  w.bytes(v.payload);
-  const _a1 = v.tags || [];
-  w.len(_a1.length);
-  for (const _e1 of _a1) {
-    w.str(_e1);
+// The pointer of a live wrapper, lent to the producer for one call (the
+// wrapper keeps its own reference). A closed or non-object argument is a
+// consumer programming error, reported with the marshalling code.
+function _borrow(obj) {
+  if (obj === null || obj === undefined || !obj._handle) {
+    throw new WeaveFFIError(-3, 'expected a live object wrapper');
   }
-  const _s2 = v.attrs || {};
-  const _m2 = _s2 instanceof Map ? [..._s2.entries()] : Object.entries(_s2);
-  w.len(_m2.length);
-  for (const [_k2, _v2] of _m2) {
-    w.str(_k2);
-    w.str(_v2);
-  }
-  if (v.parent === null || v.parent === undefined) {
-    w.flag(false);
-  } else {
-    w.flag(true);
-    w.i64(v.parent);
-  }
-  _write_shared_Token(w, v.token);
-  w.i32(v.priority);
+  return obj._handle;
 }
 
-// Decode a `kitchen.Item` record from the value-buffer wire format.
-function _read_kitchen_Item(r) {
-  const v = {};
-  v.id = r.i64();
-  v.name = r.str();
-  v.count = r.i32();
-  v.enabled = r.bool();
-  v.ratio = r.f64();
-  v.nick = r.u32();
-  v.payload = r.bytes();
-  v.tags = (() => { const _n = r.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(r.str()); return _arr; })();
-  v.attrs = (() => { const _n = r.len(); const _obj = {}; for (let _i = 0; _i < _n; _i++) { const _k = r.str(); _obj[_k] = r.str(); } return _obj; })();
-  v.parent = (r.flag() ? r.i64() : null);
-  v.token = _read_shared_Token(r);
-  v.priority = r.i32();
-  return v;
+// Report a callback-interface failure through the trampoline's out_err
+// slot as FOREIGN_ERROR_CODE (-4). weaveffi_error_set copies the message
+// with the producer's allocator, so the staged C string is released as
+// soon as it returns. The message is parked in _pendingForeign until the
+// producer call on the stack returns: the producer can't unwind on wasm32,
+// so it keeps running on the trampoline's default return value, and any
+// further callback it makes during that call is refused with this error
+// instead of reaching the implementation again.
+function _reportForeign(wasm, errPtr, msg) {
+  if (_pendingForeign === null) _pendingForeign = msg;
+  const [p, s] = _cstr(wasm, msg);
+  wasm.weaveffi_error_set(errPtr, -4, p);
+  wasm.weaveffi_dealloc(p, s);
+}
+
+// Report an exception thrown by a callback-interface implementation.
+function _setForeignError(wasm, errPtr, e) {
+  _reportForeign(wasm, errPtr, e instanceof Error ? (e.message || e.name) : String(e));
 }
 
 // Lazy wrapper over a producer iterator handle, implementing the JS
@@ -393,6 +413,12 @@ class _WeaveFFIIterator {
     let _has;
     try {
       _has = this._callNext(this._handle, this._slot, _err);
+    } catch (e) {
+      // A trap: the slot was never filled, so release it here.
+      this._close();
+      throw _trap(wasm, _err, e);
+    }
+    try {
       // Throws (and releases the slot) on a non-zero code.
       this._check(wasm, _err);
     } catch (e) {
@@ -416,10 +442,10 @@ class _WeaveFFIIterator {
   }
 }
 
-function _registerTrampoline(table, paramTypes, handler) {
+function _registerTrampoline(table, paramTypes, resultTypes, handler) {
   const idx = table.grow(1);
   table.set(idx, new WebAssembly.Function(
-    { parameters: paramTypes, results: [] },
+    { parameters: paramTypes, results: resultTypes },
     handler
   ));
   return idx;
@@ -432,9 +458,11 @@ export const Priority = Object.freeze({
 });
 
 /**
- * Load a WeaveFFI Wasm module from the given URL.
+ * Load a WeaveFFI Wasm module.
  *
- * @param {string} url - URL to the `.wasm` file.
+ * @param {string|URL|BufferSource|WebAssembly.Module} source - A URL to
+ *   fetch the `.wasm` from, its bytes, or an already compiled module
+ *   (use the bytes form where `fetch` cannot read files, e.g. Node).
  * @returns {Promise<Object>} The API bindings.
  *
  * Exported functions follow the C ABI naming convention:
@@ -449,6 +477,12 @@ export const Priority = Object.freeze({
  * // Record: plain objects in and out (serialized automatically).
  * const person = api.contacts.create({ name: 'Ada', age: 36 });
  *
+ * // Object: a class wrapping one producer reference; close() releases it
+ * // (or let `using` do it). Passing it lends the reference for the call.
+ * const store = new api.kv.Store();
+ * api.kv.inspect(store);
+ * store.close();
+ *
  * // Enum: pass the integer discriminant.
  * api.ui.set_color(0); // 0 = first variant
  *
@@ -459,13 +493,114 @@ export const Priority = Object.freeze({
  * // List/Map: pass arrays/objects; receive arrays/objects.
  * const names = api.data.all_names();
  */
-export async function loadWeaveffiWasm(url) {
-  const response = await fetch(url);
-  const bytes = await response.arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+export async function loadWeaveffiWasm(source) {
+  let module;
+  if (source instanceof WebAssembly.Module) {
+    module = source;
+  } else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
+    module = await WebAssembly.compile(source);
+  } else {
+    const response = await fetch(source);
+    module = await WebAssembly.compile(await response.arrayBuffer());
+  }
+  const instance = await WebAssembly.instantiate(module, {});
   const wasm = instance.exports;
 
   _checkAbiVersion(wasm);
+
+  // Build the KitchenErrorsError subclass matching `code`, or a generic
+  // WeaveFFIError for codes outside the domain (panics, marshalling,
+  // foreign callback failures).
+  function _kitchenErrorsErrorFrom(wasm, code, message, payloadPtr, payloadLen) {
+    const _cls = _KITCHEN_ERRORS_ERROR_CODES[code];
+    const _e = _cls ? (message ? new _cls(message) : new _cls()) : new WeaveFFIError(code, message);
+    return _e;
+  }
+
+  // Throw the `KitchenErrorsError` domain error (and free the slot) if the error slot
+  // carries a non-zero code.
+  function _checkKitchenErrorsError(wasm, errPtr) {
+    _pendingForeign = null;
+    const dv = new DataView(wasm.memory.buffer);
+    const code = dv.getInt32(errPtr, true);
+    if (code !== 0) {
+      const msg = _readCStr(wasm, dv.getUint32(errPtr + 4, true)) || '';
+      const _e = _kitchenErrorsErrorFrom(wasm, code, msg, dv.getUint32(errPtr + 8, true), dv.getUint32(errPtr + 12, true));
+      wasm.weaveffi_error_clear(errPtr);
+      wasm.weaveffi_dealloc(errPtr, 16);
+      throw _e;
+    }
+  }
+
+  // Serialize a `shared.Token` record into the value-buffer wire format.
+  function _write_shared_Token(w, v) {
+    w.i64(v.id);
+    w.str(v.label);
+  }
+
+  // Decode a `shared.Token` record from the value-buffer wire format.
+  function _read_shared_Token(r) {
+    const v = {};
+    v.id = r.i64();
+    v.label = r.str();
+    return v;
+  }
+
+  // Serialize a `kitchen.Item` record into the value-buffer wire format.
+  function _write_kitchen_Item(w, v) {
+    w.i64(v.id);
+    w.str(v.name);
+    w.i32(v.count);
+    w.bool(v.enabled);
+    w.f64(v.ratio);
+    w.u32(v.nick);
+    w.bytes(v.payload);
+    const _a1 = v.tags || [];
+    w.len(_a1.length);
+    for (const _e1 of _a1) {
+      w.str(_e1);
+    }
+    const _s2 = v.attrs || {};
+    const _m2 = _s2 instanceof Map ? [..._s2.entries()] : Object.entries(_s2);
+    w.len(_m2.length);
+    for (const [_k2, _v2] of _m2) {
+      w.str(_k2);
+      w.str(_v2);
+    }
+    if (v.parent === null || v.parent === undefined) {
+      w.flag(false);
+    } else {
+      w.flag(true);
+      w.i64(v.parent);
+    }
+    _write_shared_Token(w, v.token);
+    w.i32(v.priority);
+    if (v.gadget === null || v.gadget === undefined) {
+      w.flag(false);
+    } else {
+      w.flag(true);
+      w.obj(v.gadget._clone());
+    }
+  }
+
+  // Decode a `kitchen.Item` record from the value-buffer wire format.
+  function _read_kitchen_Item(r) {
+    const v = {};
+    v.id = r.i64();
+    v.name = r.str();
+    v.count = r.i32();
+    v.enabled = r.bool();
+    v.ratio = r.f64();
+    v.nick = r.u32();
+    v.payload = r.bytes();
+    v.tags = (() => { const _n = r.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(r.str()); return _arr; })();
+    v.attrs = (() => { const _n = r.len(); const _obj = {}; for (let _i = 0; _i < _n; _i++) { const _k = r.str(); _obj[_k] = r.str(); } return _obj; })();
+    v.parent = (r.flag() ? r.i64() : null);
+    v.token = _read_shared_Token(r);
+    v.priority = r.i32();
+    v.gadget = (r.flag() ? Gadget._wrap(r.obj()) : null);
+    return v;
+  }
 
   const _table = wasm.__indirect_function_table;
 
@@ -484,59 +619,121 @@ export async function loadWeaveffiWasm(url) {
     }
   }
 
-  const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], _asyncHandler);
+  const _cbPtr_i32_i32_i32 = _registerTrampoline(_table, ['i32', 'i32', 'i32'], [], _asyncHandler);
 
-  // Listener subscriptions, keyed by the context id the loader
-  // threads through the C ABI's void* context slot. Each entry
-  // holds the JS callback and the producer's subscription id.
-  let _nextLsnId = 1;
-  const _listeners = new Map();
+  // Callback-interface implementations, keyed by the integer context
+  // the loader passes as `ctx`; an entry lives until the producer
+  // calls the vtable's `free(ctx)`.
+  let _nextCbId = 1;
+  const _callbacks = new Map();
 
-  const _lsnPtr_weaveffi_kitchen_OnReady_fn = _registerTrampoline(_table, ['i32', 'i32', 'i32'], (a0, a1, _ctx) => {
-    const _l = _listeners.get(_ctx);
-    if (_l === undefined) return;
-    const _p0 = a0;
-    const _p1 = _readCStr(wasm, a1);
-    _l.callback(_p0, _p1);
+  // Trampolines for the `ReadyListener` callback interface: one WebAssembly.Function
+  // per vtable entry, mirroring the C signature of each method. Borrowed
+  // arguments are decoded before the JS method runs; object arguments
+  // are adopted; a thrown exception becomes a -4 error on out_err.
+  const _cb_ReadyListener_on_ready = _registerTrampoline(_table, ['i32', 'i32', 'i32', 'i32'], [], (_ctx, a0, a1, _err) => {
+    try {
+      const _impl = _callbacks.get(_ctx);
+      const _p0 = a0;
+      const _p1 = _readCStr(wasm, a1);
+      if (_pendingForeign !== null) {
+        _reportForeign(wasm, _err, _pendingForeign);
+        return;
+      }
+      _impl.onReady(_p0, _p1);
+    } catch (e) {
+      _setForeignError(wasm, _err, e);
+    }
   });
+  const _cb_ReadyListener_on_item = _registerTrampoline(_table, ['i32', 'i32', 'i32', 'i32', 'i32'], ['i32'], (_ctx, a0, a1, a2, _err) => {
+    try {
+      const _impl = _callbacks.get(_ctx);
+      const _p0_b = (a0 === 0 || a1 === 0) ? new Uint8Array(0) : new Uint8Array(wasm.memory.buffer, a0, a1).slice();
+      const _p0_r = new _BufReader(_p0_b);
+      const _p0 = _read_kitchen_Item(_p0_r);
+      _p0_r.end();
+      const _p1 = Gadget._wrap(a2);
+      if (_pendingForeign !== null) {
+        _reportForeign(wasm, _err, _pendingForeign);
+        return 0;
+      }
+      return _impl.onItem(_p0, _p1) ? 1 : 0;
+    } catch (e) {
+      _setForeignError(wasm, _err, e);
+      return 0;
+    }
+  });
+  // `free(ctx)`: the producer dropped its last reference; forget the
+  // implementation so it can be collected.
+  const _cb_ReadyListener_free = _registerTrampoline(_table, ['i32'], [], (_ctx) => { _callbacks.delete(_ctx); });
+  // The one static `weaveffi_kitchen_ReadyListener_vtable` for this instance, filled with the table indices
+  // above in declaration order, then `free`.
+  const _vtable_ReadyListener = wasm.weaveffi_alloc(12);
+  {
+    const _dv = new DataView(wasm.memory.buffer);
+    _dv.setUint32(_vtable_ReadyListener + 0, _cb_ReadyListener_on_ready, true);
+    _dv.setUint32(_vtable_ReadyListener + 4, _cb_ReadyListener_on_item, true);
+    _dv.setUint32(_vtable_ReadyListener + 8, _cb_ReadyListener_free, true);
+  }
 
   // A pocket-sized interface exercising the object surface
   class Gadget {
     constructor(id) {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_kitchen_Gadget_new(BigInt(id), _err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_kitchen_Gadget_new(BigInt(id), _err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
-      this._handle = _r;
+      _adopt(this, _r, wasm.weaveffi_kitchen_Gadget_destroy);
     }
     static _wrap(handle) {
-      const _o = Object.create(Gadget.prototype);
-      _o._handle = handle;
-      return _o;
+      return _adopt(Object.create(Gadget.prototype), handle, wasm.weaveffi_kitchen_Gadget_destroy);
     }
-    free() {
-      if (this._handle !== 0) {
-        wasm.weaveffi_kitchen_Gadget_destroy(this._handle);
-        this._handle = 0;
-      }
+    _clone() {
+      return wasm.weaveffi_kitchen_Gadget_clone(_borrow(this));
+    }
+    close() {
+      _release(this);
+    }
+    [_dispose]() {
+      _release(this);
     }
     describe() {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_kitchen_Gadget_describe(this._handle, _err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_kitchen_Gadget_describe(_borrow(this), _err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
       return _takeCStr(wasm, _r);
     }
     poke(times) {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_kitchen_Gadget_poke(this._handle, times, _err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_kitchen_Gadget_poke(_borrow(this), times, _err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkKitchenErrorsError(wasm, _err);
       _freeErr(wasm, _err);
       return _r;
     }
     static version() {
       const _err = _allocErr(wasm);
-      const _r = wasm.weaveffi_kitchen_Gadget_version(_err);
+      let _r;
+      try {
+        _r = wasm.weaveffi_kitchen_Gadget_version(_err);
+      } catch (e) {
+        throw _trap(wasm, _err, e);
+      }
       _checkErr(wasm, _err);
       _freeErr(wasm, _err);
       return _takeCStr(wasm, _r);
@@ -548,7 +745,12 @@ export async function loadWeaveffiWasm(url) {
     shared: {
       ping() {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_shared_ping(_err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_shared_ping(_err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _takeCStr(wasm, _r);
@@ -557,35 +759,60 @@ export async function loadWeaveffiWasm(url) {
     kitchen: {
       boolId(x) {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_bool_id(x ? 1 : 0, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_bool_id(x ? 1 : 0, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r !== 0;
       },
       i32Id(x) {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_i32_id(x, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_i32_id(x, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
       u32Id(x) {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_u32_id(x, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_u32_id(x, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
-        return _r;
+        return _r >>> 0;
       },
       i64Id(x) {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_i64_id(BigInt(x), _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_i64_id(BigInt(x), _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
       f64Id(x) {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_f64_id(x, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_f64_id(x, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
@@ -593,8 +820,14 @@ export async function loadWeaveffiWasm(url) {
       echoString(s) {
         const [a0_p, a0_s] = _cstr(wasm, s);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_echo_string(a0_p, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_s);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_echo_string(a0_p, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        } finally {
+          wasm.weaveffi_dealloc(a0_p, a0_s);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _takeCStr(wasm, _r);
@@ -603,53 +836,91 @@ export async function loadWeaveffiWasm(url) {
         const [a0_p, a0_l] = _bytes(wasm, b);
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_echo_bytes(a0_p, a0_l, _lp, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_l);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_echo_bytes(a0_p, a0_l, _lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        } finally {
+          wasm.weaveffi_dealloc(a0_p, a0_l);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
         wasm.weaveffi_dealloc(_lp, 4);
         return _takeBytes(wasm, _r, _len);
       },
-      echoBorrowedStr(s) {
-        const [a0_p, a0_s] = _cstr(wasm, s);
+      subscribe(listener) {
+        const a0_ctx = _nextCbId++;
+        _callbacks.set(a0_ctx, listener);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_echo_borrowed_str(a0_p, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_s);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_subscribe(a0_ctx, _vtable_ReadyListener, _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
-        return _takeCStr(wasm, _r);
+        return _r;
       },
-      echoBorrowedBytes(b) {
-        const [a0_p, a0_l] = _bytes(wasm, b);
+      maybeGadget(fallback) {
+        const _err = _allocErr(wasm);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_maybe_gadget((fallback === null || fallback === undefined ? 0 : _borrow(fallback)), _err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
+        _checkErr(wasm, _err);
+        _freeErr(wasm, _err);
+        return _r === 0 ? null : Gadget._wrap(_r);
+      },
+      gadgets() {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_echo_borrowed_bytes(a0_p, a0_l, _lp, _err);
-        wasm.weaveffi_dealloc(a0_p, a0_l);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_gadgets(_lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
         wasm.weaveffi_dealloc(_lp, 4);
-        return _takeBytes(wasm, _r, _len);
+        const _rd = new _BufReader(_takeBytes(wasm, _r, _len));
+        const _out = (() => { const _n = _rd.len(); const _arr = []; for (let _i = 0; _i < _n; _i++) _arr.push(Gadget._wrap(_rd.obj())); return _arr; })();
+        _rd.end();
+        return _out;
       },
-      openHandle() {
+      streamGadgets() {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_open_handle(_err);
+        let _it;
+        try {
+          _it = wasm.weaveffi_kitchen_stream_gadgets(_err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
-        return _r;
-      },
-      openTypedHandle() {
-        const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_open_typed_handle(_err);
-        _checkErr(wasm, _err);
-        _freeErr(wasm, _err);
-        return _r;
+        return new _WeaveFFIIterator(wasm, _it, 4,
+          (it, slot, ep) => wasm.weaveffi_kitchen_StreamGadgetsIterator_next(it, slot, ep),
+          (it) => wasm.weaveffi_kitchen_StreamGadgetsIterator_destroy(it),
+          _checkErr, (w, p) => Gadget._wrap(new DataView(w.memory.buffer).getUint32(p, true)));
       },
       maybeItem(id) {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_maybe_item(BigInt(id), _lp, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_maybe_item(BigInt(id), _lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkKitchenErrorsError(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -662,7 +933,13 @@ export async function loadWeaveffiWasm(url) {
       listItems() {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_list_items(_lp, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_list_items(_lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -675,7 +952,13 @@ export async function loadWeaveffiWasm(url) {
       getAttrs() {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_get_attrs(_lp, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_get_attrs(_lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -687,7 +970,12 @@ export async function loadWeaveffiWasm(url) {
       },
       streamItems() {
         const _err = _allocErr(wasm);
-        const _it = wasm.weaveffi_kitchen_stream_items(_err);
+        let _it;
+        try {
+          _it = wasm.weaveffi_kitchen_stream_items(_err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return new _WeaveFFIIterator(wasm, _it, 8,
@@ -698,7 +986,13 @@ export async function loadWeaveffiWasm(url) {
       crossModuleToken() {
         const _lp = wasm.weaveffi_alloc(4);
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_cross_module_token(_lp, _err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_cross_module_token(_lp, _err);
+        } catch (e) {
+          wasm.weaveffi_dealloc(_lp, 4);
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         const _len = new DataView(wasm.memory.buffer).getUint32(_lp, true);
@@ -717,8 +1011,14 @@ export async function loadWeaveffiWasm(url) {
             return _s;
           } });
           const [a0_p, a0_s] = _cstr(wasm, input);
-          wasm.weaveffi_kitchen_do_async_async(a0_p, _cbPtr_i32_i32_i32, ctxId);
-          wasm.weaveffi_dealloc(a0_p, a0_s);
+          try {
+            wasm.weaveffi_kitchen_do_async_async(a0_p, _cbPtr_i32_i32_i32, ctxId);
+          } catch (e) {
+            _asyncContexts.delete(ctxId);
+            reject(_trapError(e));
+          } finally {
+            wasm.weaveffi_dealloc(a0_p, a0_s);
+          }
         });
       },
       doCancellable(input) {
@@ -730,43 +1030,51 @@ export async function loadWeaveffiWasm(url) {
             return _s;
           } });
           const [a0_p, a0_s] = _cstr(wasm, input);
-          wasm.weaveffi_kitchen_do_cancellable_async(a0_p, 0, _cbPtr_i32_i32_i32, ctxId);
-          wasm.weaveffi_dealloc(a0_p, a0_s);
+          try {
+            wasm.weaveffi_kitchen_do_cancellable_async(a0_p, 0, _cbPtr_i32_i32_i32, ctxId);
+          } catch (e) {
+            _asyncContexts.delete(ctxId);
+            reject(_trapError(e));
+          } finally {
+            wasm.weaveffi_dealloc(a0_p, a0_s);
+          }
         });
       },
       /** @deprecated Use new_op instead */
       legacyOp() {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_legacy_op(_err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_legacy_op(_err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
       },
       newOp() {
         const _err = _allocErr(wasm);
-        const _r = wasm.weaveffi_kitchen_new_op(_err);
+        let _r;
+        try {
+          _r = wasm.weaveffi_kitchen_new_op(_err);
+        } catch (e) {
+          throw _trap(wasm, _err, e);
+        }
         _checkErr(wasm, _err);
         _freeErr(wasm, _err);
         return _r;
-      },
-      /** Subscribe to OnReady events */
-      registerReadyListener(callback) {
-        const _id = _nextLsnId++;
-        const _rid = wasm.weaveffi_kitchen_register_ready_listener(_lsnPtr_weaveffi_kitchen_OnReady_fn, _id);
-        _listeners.set(_id, { callback, rid: _rid });
-        return _id;
-      },
-      unregisterReadyListener(id) {
-        const _l = _listeners.get(id);
-        if (_l === undefined) return;
-        _listeners.delete(id);
-        wasm.weaveffi_kitchen_unregister_ready_listener(_l.rid);
       },
       Gadget: Gadget,
       nested: {
         hello() {
           const _err = _allocErr(wasm);
-          const _r = wasm.weaveffi_kitchen_nested_hello(_err);
+          let _r;
+          try {
+            _r = wasm.weaveffi_kitchen_nested_hello(_err);
+          } catch (e) {
+            throw _trap(wasm, _err, e);
+          }
           _checkErr(wasm, _err);
           _freeErr(wasm, _err);
           return _takeCStr(wasm, _r);

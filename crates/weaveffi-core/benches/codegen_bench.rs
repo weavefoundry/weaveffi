@@ -8,7 +8,7 @@ use weaveffi_ir::parse::parse_api_str;
 
 fn calculator_api() -> Api {
     Api {
-        version: "0.8.0".to_string(),
+        version: "0.9.0".to_string(),
         modules: vec![Module {
             name: "calculator".to_string(),
             doc: None,
@@ -20,13 +20,11 @@ fn calculator_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                     ],
@@ -35,7 +33,6 @@ fn calculator_api() -> Api {
                     cancellable: false,
                     throws: false,
                     deprecated: None,
-                    since: None,
                 },
                 Function {
                     name: "mul".to_string(),
@@ -44,13 +41,11 @@ fn calculator_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                     ],
@@ -59,7 +54,6 @@ fn calculator_api() -> Api {
                     cancellable: false,
                     throws: false,
                     deprecated: None,
-                    since: None,
                 },
                 Function {
                     name: "div".to_string(),
@@ -68,13 +62,11 @@ fn calculator_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                     ],
@@ -83,7 +75,6 @@ fn calculator_api() -> Api {
                     cancellable: false,
                     throws: false,
                     deprecated: None,
-                    since: None,
                 },
                 Function {
                     name: "echo".to_string(),
@@ -91,7 +82,6 @@ fn calculator_api() -> Api {
                     params: vec![Param {
                         name: "s".to_string(),
                         ty: TypeRef::StringUtf8,
-                        mutable: false,
                         doc: None,
                     }],
                     returns: Some(TypeRef::StringUtf8),
@@ -99,13 +89,11 @@ fn calculator_api() -> Api {
                     cancellable: false,
                     throws: false,
                     deprecated: None,
-                    since: None,
                 },
             ],
             structs: vec![],
             enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
+            callback_interfaces: vec![],
             errors: None,
             interfaces: vec![],
             modules: vec![],
@@ -180,19 +168,16 @@ fn large_api() -> Api {
                         Param {
                             name: "a".to_string(),
                             ty: TypeRef::I32,
-                            mutable: false,
                             doc: None,
                         },
                         Param {
                             name: "b".to_string(),
                             ty: TypeRef::StringUtf8,
-                            mutable: false,
                             doc: None,
                         },
                         Param {
                             name: "c".to_string(),
                             ty: TypeRef::Named(format!("M{m}Struct0")),
-                            mutable: false,
                             doc: None,
                         },
                     ],
@@ -203,7 +188,6 @@ fn large_api() -> Api {
                     cancellable: false,
                     throws: false,
                     deprecated: None,
-                    since: None,
                 })
                 .collect();
 
@@ -213,8 +197,7 @@ fn large_api() -> Api {
                 functions,
                 structs,
                 enums,
-                callbacks: vec![],
-                listeners: vec![],
+                callback_interfaces: vec![],
                 errors: None,
                 interfaces: vec![],
                 modules: vec![],
@@ -223,7 +206,7 @@ fn large_api() -> Api {
         .collect();
 
     Api {
-        version: "0.8.0".to_string(),
+        version: "0.9.0".to_string(),
         modules,
     }
 }

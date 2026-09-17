@@ -1,0 +1,5 @@
+error: weaveffi: `Iter<T>` is only valid as the outermost return type; it can't be nested in an `Option`, `Vec`, map, or another `Iter`
+ --> tests/ui/fail_nested_iter_return.rs:4:38
+  |
+4 |     pub fn maybe_stream(on: bool) -> Option<weaveffi::Iter<i32>> {
+  |                                      ^^^^^^

@@ -5,6 +5,8 @@ use weaveffi_core::package::PackageContext;
 use weaveffi_core::pkg::ResolvedPackage;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
+use crate::runtime::bundles_platform;
+
 /// Render the `pubspec.yaml` manifest for the generated Dart package.
 pub(crate) fn render_pubspec(package: &ResolvedPackage, input_basename: &str) -> String {
     let prelude = render_prelude(CommentStyle::Hash, input_basename);
@@ -21,7 +23,7 @@ pub(crate) fn render_pubspec(package: &ResolvedPackage, input_basename: &str) ->
          version: {version}\n\
          {meta}\
          environment:\n\
-         \x20 sdk: '>=3.0.0 <4.0.0'\n\
+         \x20 sdk: '>=3.1.0 <4.0.0'\n\
          dependencies:\n\
          \x20 ffi: ^2.0.0\n\n\
          {trailer}"
@@ -54,9 +56,23 @@ import 'package:{import_name}/weaveffi.dart';
    the native library at runtime via `DynamicLibrary.open` and resolve symbols
    with `lookupFunction`.
 
+## Objects and callbacks
+
+Interface objects are reference counted by the native library. Each Dart
+wrapper holds one reference: call `dispose()` when you are done with it, or let
+the garbage collector's finalizer release it. Objects nested inside records and
+collections follow the same rule.
+
+Callback interfaces are abstract classes: implement one and pass an instance to
+any function that takes it. Methods are bound with `NativeCallable.isolateLocal`,
+so the native library may only invoke them on the isolate's own thread (which
+holds when it calls them synchronously during a call from Dart). An exception
+thrown by an implementation aborts the native call and surfaces to the original
+Dart caller as a `WeaveFFIException` with `WeaveFFIException.foreignCode`.
+
 ## Requirements
 
-- Dart SDK >= 3.0.0
+- Dart SDK >= 3.1.0 (for `NativeCallable`)
 - The `ffi` package (`^2.0.0`) for `Utf8` and `calloc` helpers.
 
 {trailer}"#
@@ -76,6 +92,7 @@ pub(crate) fn render_packaged_readme(
     let platforms: Vec<String> = ctx
         .binaries
         .platforms()
+        .filter(|p| bundles_platform(*p))
         .map(|p| format!("- `native/{}/`", p.id()))
         .collect();
     let platform_list = platforms.join("\n");

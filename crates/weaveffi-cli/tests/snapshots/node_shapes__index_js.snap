@@ -194,11 +194,11 @@ function __unpackNumerics(r) {
     a: r.i8(),
     b: r.i16(),
     c: r.i32(),
-    d: Number(r.i64()),
+    d: r.i64(),
     e: r.u8(),
     f: r.u16(),
     g: r.u32(),
-    h: Number(r.u64()),
+    h: r.u64(),
     i: r.f32(),
     j: r.f64(),
   };
@@ -238,12 +238,20 @@ function __unpackShape(r) {
     case 0: return { tag: 'Empty' };
     case 1: return { tag: 'Circle', radius: r.f64() };
     case 2: return { tag: 'Rectangle', width: r.f32(), height: r.f32() };
-    case 3: return { tag: 'Bounded', min: r.i16(), max: r.i16(), weight: Number(r.u64()) };
+    case 3: return { tag: 'Bounded', min: r.i16(), max: r.i16(), weight: r.u64() };
     case 4: return { tag: 'Labeled', label: r.str(), count: r.u8() };
     default: throw new WeaveFFIError(-2, 'unknown Shape tag: ' + tag);
   }
 }
 
+wv.Channel = Object.freeze({
+  Red: 0,
+  Green: 1,
+  Blue: 2,
+  0: 'Red',
+  1: 'Green',
+  2: 'Blue',
+});
 wv.describe = function (shape) {
   return __invoke(addon.describe, [__encode(__packShape, shape)], __generic);
 };

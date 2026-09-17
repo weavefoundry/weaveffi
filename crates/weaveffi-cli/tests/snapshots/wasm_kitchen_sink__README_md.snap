@@ -15,7 +15,7 @@ Build (example):
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-Then serve the `.wasm` and use `weaveffi_wasm.js` to load it.
+Then serve the `.wasm` and use `weaveffi_wasm.js` to load it: the loader accepts a URL to fetch, the module's bytes (for Node, where `fetch` cannot read files), or an already compiled `WebAssembly.Module`.
 
 ## Complex Type Handling
 
@@ -29,9 +29,17 @@ Records are **plain JavaScript objects**. A record crosses the boundary serializ
 
 C-style enums are passed as **`i32` values** corresponding to the variant's integer discriminant. Rich (algebraic) enums are plain objects tagged by variant name (`{ tag: "Circle", radius: 2 }`) and cross the boundary serialized in a value buffer, exactly like records.
 
+### Objects
+
+Interfaces are **wrapper classes** holding one reference to a producer object (an `i32` pointer into linear memory). A wrapper you receive is yours: release it with `close()` (or bind it with `using`, which calls `Symbol.dispose`); a wrapper collected unclosed is released by a `FinalizationRegistry` backstop where the runtime provides one, and destroy runs exactly once either way. Passing a wrapper to a function lends its reference for the duration of the call. Inside a value buffer an object crosses as a `u64` token carrying one reference: the writer clones the wrapper's reference and the reader adopts the token into a new wrapper.
+
+### 64-bit Integers
+
+`i64` and `u64` are JavaScript **`bigint`** values everywhere: as arguments, returns, record fields, and callback parameters. Map keys of these types become string property names on the decoded object. A `number` is accepted where a `bigint` is expected (it's widened with `BigInt(v)`, so a fractional value throws a `RangeError`). Values crossing by value follow the wasm calling convention: an out-of-range `bigint` wraps modulo 2^64 rather than throwing, and unsigned results are read back as unsigned (`u64` via `BigInt.asUintN`, `u32` via `>>> 0`).
+
 ### Optionals
 
-Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent).
+Optional values map to **`null`** for the absent case. An optional crosses the boundary inside a value buffer as a one-byte presence flag followed by the value when present. The one exception is an optional interface, which stays a nullable object pointer (`0` = absent) and maps to `Wrapper | null`.
 
 ### Lists and Maps
 
@@ -41,11 +49,15 @@ Lists are JS arrays; maps are plain objects (a `Map` instance is also accepted o
 
 `iter<T>` functions return a **lazy JS iterator** (typed `IterableIterator<T>`): each `next()` issues exactly one producer call, so iteration streams in constant memory. The producer handle is destroyed exactly once, on exhaustion or via `return()` when iteration stops early (a `for...of` loop calls `return()` automatically on `break` or `throw`). Abandoning an iterator without exhausting or closing it leaks the handle.
 
-### Callbacks and Listeners
+### Async Functions
 
-Each listener surfaces as a `register.../unregister...` pair. `register` takes a plain JS function and returns a numeric subscription id; `unregister` takes that id and stops delivery. Delivery is **synchronous and same-thread**: `wasm32-unknown-unknown` is single-threaded, so events fire only while a call into the module is on the stack (for example, a producer function that emits during its own execution). A producer that emits from a spawned thread cannot run on this target at all.
+`async` functions return a **`Promise`**. `wasm32-unknown-unknown` has no threads, so the producer's default spawner drives each future to completion inline, inside the launch call: the completion callback fires (through a function-table trampoline) before the wrapper returns, and the Promise is already settled when you `await` it. There is nothing to pump or poll from JS. A future that returns `Pending` can't be woken on this target with the default spawner; a producer whose futures wait on external events needs its own spawner (`weaveffi::set_spawner`), and driving that executor is then the producer's responsibility, not the glue's. A typed error rejects the Promise with the same class the synchronous wrapper would throw.
 
-Callback arguments are **borrowed for the duration of the callback**: strings, byte buffers, and buffered values (records, rich enums, optionals, lists, maps) are copied or decoded into JS values before your function runs, and interface arguments wrap producer-owned objects. Read what you need inside the callback and do not retain an interface wrapper or call `free()` on it.
+### Callback Interfaces
+
+A callback interface is a TypeScript `interface`; pass any object with the matching methods where a parameter of that type is expected. The loader keeps one **static vtable per interface** in linear memory, filled with function-table indices of long-lived trampolines, and passes a small integer context key with it; the producer calls `free(ctx)` when it drops the callback, which releases your object. Delivery is **synchronous and same-thread**: `wasm32-unknown-unknown` is single-threaded, so a method runs only while a call into the module is on the stack. A producer that calls back from a spawned thread cannot run on this target at all.
+
+Method arguments that are strings, bytes, or buffered values are **borrowed for the duration of the call**: they're copied or decoded into JS values before your method runs. Object arguments transfer one reference to you: `close()` the wrapper when you're done with it. An exception thrown from a method is reported to the producer as error code `-4` (with the exception's message) and the method's default value is returned in its place; the producer then aborts the call it was making, and the original caller sees a `WeaveFFIError` with code `-4` carrying your message (see *Traps* below for how that abort reaches the caller on this target).
 
 ### Error Handling
 
@@ -59,15 +71,25 @@ functions:
 - `weaveffi_alloc(size: i32) -> i32`: allocate `size` bytes in linear memory
 - `weaveffi_dealloc(ptr: i32, size: i32)`: release a `weaveffi_alloc` block
 - `weaveffi_error_clear(err_ptr: i32)`: clear and free error resources
+- `weaveffi_error_set(err_ptr: i32, code: i32, msg: i32)`: fill an error slot (used to report callback exceptions)
 - `weaveffi_free_string(ptr: i32)`: free a producer-returned C string
 - `weaveffi_free_bytes(ptr: i32, len: i32)`: free a producer-returned buffer
 
 Wrappers of functions declared `throws` raise the declaring module's typed
 error class (a `WeaveFFIError` subclass with a per-code subclass, such as
 `KeyNotFound`); every other wrapper raises the generic `WeaveFFIError` only
-for producer panics and marshalling failures. When the matched error code
-declares payload fields, the wrapper decodes them from the error's value
-buffer and attaches them as properties on the thrown error.
+for producer panics, marshalling failures, and callback exceptions
+(code `-4`). When the matched error code declares payload fields, the
+wrapper decodes them from the error's value buffer and attaches them as
+properties on the thrown error.
+
+#### Callback failures without unwinding
+
+`wasm32-unknown-unknown` builds with `panic = "abort"`, so when a callback interface method throws, the producer can't unwind out of the call the way native targets do. Instead the runtime records the failure, the producer's code runs to completion on the method's default return value (`0`, `0n`, or `false`), and the thunk then reports code `-4` with the exception's message in place of the result, so the wrapper throws (or the Promise rejects with) the same `WeaveFFIError` a native build would produce. While that producer call is still on the stack, the glue refuses every further callback invocation with the same error rather than calling your implementation again, so your code observes the failure exactly as it would under unwinding. Producers must tolerate a callback returning its default once (a well-behaved producer already does, because a consumer could return that value on purpose).
+
+#### Traps
+
+A producer panic can't be caught on the Rust side either: it executes `unreachable`, and the engine throws a `WebAssembly.RuntimeError` out of the call. The glue translates that trap for you: the wrapper throws (or the Promise rejects with) a `WeaveFFIError` with code `-2` (`producer panicked`), or code `-4` if a callback method had already failed during the call. The error slot and every staged argument are released either way. The producer frames between the trap and the call are *not* unwound, so their cleanup does not run: a lock held across the panic stays locked, and allocations those frames owned leak.
 
 ## API Reference
 
@@ -176,47 +198,47 @@ Identity for bool
 | `b` | `bytes` | `i32, i32` | ptr + len in linear memory |
 | _returns_ | `bytes` | `i32, i32` | ptr + len in linear memory |
 
-##### `weaveffi_kitchen_echo_borrowed_str`
+##### `weaveffi_kitchen_subscribe`
 
-Borrowed string parameter
+Register a listener, returning how many are attached
 
-`weaveffi_kitchen_echo_borrowed_str(s: i32) -> i32`
-
-| Param | API Type | Wasm | Notes |
-|-------|----------|------|-------|
-| `s` | `string` | `i32` | NUL-terminated C string pointer |
-| _returns_ | `string` | `i32` | NUL-terminated C string pointer |
-
-##### `weaveffi_kitchen_echo_borrowed_bytes`
-
-Borrowed bytes parameter
-
-`weaveffi_kitchen_echo_borrowed_bytes(b: i32, i32) -> i32, i32`
+`weaveffi_kitchen_subscribe(listener: i32, i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| `b` | `bytes` | `i32, i32` | ptr + len in linear memory |
-| _returns_ | `bytes` | `i32, i32` | ptr + len in linear memory |
+| `listener` | `ReadyListener` | `i32, i32` | context key + static vtable pointer |
+| _returns_ | `i32` | `i32` | native Wasm i32 |
 
-##### `weaveffi_kitchen_open_handle`
+##### `weaveffi_kitchen_maybe_gadget`
 
-Returns an opaque handle
+Optional object in both directions
 
-`weaveffi_kitchen_open_handle() -> i64`
-
-| Param | API Type | Wasm | Notes |
-|-------|----------|------|-------|
-| _returns_ | `handle` | `i64` | opaque 64-bit handle |
-
-##### `weaveffi_kitchen_open_typed_handle`
-
-Returns a typed handle
-
-`weaveffi_kitchen_open_typed_handle() -> i32`
+`weaveffi_kitchen_maybe_gadget(fallback: i32) -> i32`
 
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
-| _returns_ | `handle` | `i32` | opaque pointer |
+| `fallback` | `Gadget?` | `i32` | nullable object pointer, 0 = absent |
+| _returns_ | `Gadget?` | `i32` | nullable object pointer, 0 = absent |
+
+##### `weaveffi_kitchen_gadgets`
+
+A list of objects
+
+`weaveffi_kitchen_gadgets() -> i32, i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `[Gadget]` | `i32, i32` | value buffer: ptr + len in linear memory |
+
+##### `weaveffi_kitchen_stream_gadgets`
+
+An iterator over objects
+
+`weaveffi_kitchen_stream_gadgets() -> i32`
+
+| Param | API Type | Wasm | Notes |
+|-------|----------|------|-------|
+| _returns_ | `iter<Gadget>` | `i32` | opaque iterator handle |
 
 ##### `weaveffi_kitchen_maybe_item`
 
@@ -319,7 +341,7 @@ Replacement for legacy_op
 
 A pocket-sized interface exercising the object surface
 
-Passed as an **opaque object pointer** (`i32`), wrapped by a JS class. Constructors return an owned handle; methods pass the handle as the implicit leading `self` argument; `free()` releases the handle via the destroy symbol.
+Passed as an **object pointer** (`i32`), wrapped by a JS class holding one reference. Constructors return an owned reference; methods lend the pointer as the implicit leading `self` argument; `close()` (or `Symbol.dispose`) releases the reference via the destroy symbol exactly once.
 
 ##### `weaveffi_kitchen_Gadget_new`
 
@@ -330,7 +352,7 @@ Create a gadget with the given id
 | Param | API Type | Wasm | Notes |
 |-------|----------|------|-------|
 | `id` | `i64` | `i64` | native Wasm i64 |
-| _returns_ | `Gadget` | `i32` | opaque object pointer |
+| _returns_ | `Gadget` | `i32` | borrowed object pointer |
 
 ##### `weaveffi_kitchen_Gadget_describe`
 
@@ -363,9 +385,26 @@ The gadget subsystem version string
 |-------|----------|------|-------|
 | _returns_ | `string` | `i32` | NUL-terminated C string pointer |
 
+##### `weaveffi_kitchen_Gadget_clone`
+
+Returns a second reference to the same object. Used when the wrapper is encoded as an object token inside a value buffer.
+
 ##### `weaveffi_kitchen_Gadget_destroy`
 
-Releases the object reference. Called by the wrapper's `free()`.
+Releases one object reference. Called by the wrapper's `close()` (and by the finalizer backstop).
+
+#### Callback Interfaces
+
+##### `ReadyListener`
+
+Consumer-implemented observer of ready items
+
+Implemented in JS as an object with the methods below. Passed as an `i32` context key plus an `i32` pointer to the static `weaveffi_kitchen_ReadyListener_vtable` vtable; the vtable's trailing `free(ctx)` entry releases the JS object.
+
+| Method | Parameters | Returns |
+|--------|------------|---------|
+| `onReady` | `code: number`, `msg: string` | `void` |
+| `onItem` | `item: Item`, `gadget: Gadget` | `boolean` |
 
 #### Structs
 
@@ -389,6 +428,7 @@ A plain JS object, serialized in a value buffer (`i32` ptr + `i32` len) at the b
 | `parent` | `i64?` |
 | `token` | `Token` |
 | `priority` | `Priority` |
+| `gadget` | `Gadget?` |
 
 #### Enums
 

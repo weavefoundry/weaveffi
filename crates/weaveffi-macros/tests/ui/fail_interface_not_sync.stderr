@@ -1,0 +1,19 @@
+error[E0277]: `Cell<i32>` cannot be shared between threads safely
+ --> tests/ui/fail_interface_not_sync.rs:1:1
+  |
+1 | #[weaveffi::module]
+  | ^^^^^^^^^^^^^^^^^^^ `Cell<i32>` cannot be shared between threads safely
+  |
+  = help: within `Counter`, the trait `Sync` is not implemented for `Cell<i32>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead
+note: required because it appears within the type `Counter`
+ --> tests/ui/fail_interface_not_sync.rs:6:16
+  |
+6 |     pub struct Counter {
+  |                ^^^^^^^
+note: required by a bound in `__wv_assert_send_sync`
+ --> tests/ui/fail_interface_not_sync.rs:1:1
+  |
+1 | #[weaveffi::module]
+  | ^^^^^^^^^^^^^^^^^^^ required by this bound in `__wv_assert_send_sync`
+  = note: this error originates in the attribute macro `weaveffi::module` (in Nightly builds, run with -Z macro-backtrace for more info)

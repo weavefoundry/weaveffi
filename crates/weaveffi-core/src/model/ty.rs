@@ -3,23 +3,23 @@
 //!
 //! The IDL's [`TypeRef`](weaveffi_ir::ir::TypeRef) is the type *as written*:
 //! a user-defined type is a bare `Named` string because the parser cannot
-//! know whether it names a record, an enum, or an interface. [`Ty`] is the
-//! type *as resolved* by validation: every user reference carries its kind,
-//! cross-module references are qualified with the owner's dot-joined module
-//! path, and there is no "unresolved" variant for a backend to trip over.
+//! know whether it names a record, an enum, an interface, or a callback
+//! interface. [`Ty`] is the type *as resolved* by validation: every user
+//! reference carries its kind, cross-module references are qualified with the
+//! owner's dot-joined module path, and there is no "unresolved" variant for a
+//! backend to trip over.
 //!
-//! Three questions about a type used to be answered by separate match trees
-//! in `abi`, `plan`, and `wire`, and each generator had its own copies on top.
-//! They are answered once here:
+//! Three questions about a type are answered once here:
 //!
 //! * [`Ty::family`]: how the type crosses a **call boundary** (by value, as a
 //!   pinned string, as a `(ptr, len)` byte pair, as a serialized value
-//!   buffer, or as an object pointer). The ABI lowering, the marshalling
-//!   plan, and every backend's argument and return handling dispatch on it.
+//!   buffer, as an object pointer, or as a callback vtable pair). The ABI
+//!   lowering, the marshalling plan, and every backend's argument and return
+//!   handling dispatch on it.
 //! * [`Ty::wire`]: how the type is encoded **inside a value buffer**. Every
 //!   backend's codec emitter dispatches on it.
-//! * [`Ty::contains_user_type`]: whether encoding the type needs a
-//!   user-defined codec function somewhere.
+//! * [`Ty::contains_user_type`] and [`Ty::contains_object`]: whether encoding
+//!   the type needs a user-defined codec function or object-token support.
 
 use std::fmt;
 
@@ -48,19 +48,10 @@ pub enum Ty {
     F64,
     /// Boolean (`bool`).
     Bool,
-    /// Owned UTF-8 string (`string`).
+    /// UTF-8 string (`string`). Borrowed as a parameter, owned as a return.
     StringUtf8,
-    /// Owned byte buffer (`bytes`).
+    /// Byte buffer (`bytes`). Borrowed as a parameter, owned as a return.
     Bytes,
-    /// Borrowed string slice (`&str`): valid only for the duration of a call.
-    BorrowedStr,
-    /// Borrowed byte slice (`&[u8]`): valid only for the duration of a call.
-    BorrowedBytes,
-    /// Opaque, untyped resource handle (`handle`).
-    Handle,
-    /// Opaque resource handle tagged with the (possibly dot-qualified) name
-    /// of what it refers to (`handle<Name>`).
-    TypedHandle(String),
     /// A user record (struct): a plain value type. Crosses the C ABI by value
     /// as a serialized buffer (`ptr` + `len`), borrowed for a call as a
     /// parameter and owned (freed with `{prefix}_free_bytes`) as a return.
@@ -73,10 +64,14 @@ pub enum Ty {
     RichEnum(String),
     /// A C-style integer enum (no variant payloads). Lowers by value.
     Enum(String),
-    /// A user interface: an opaque object reference. As a parameter the
-    /// object is borrowed for the call; as a return the caller receives a new
-    /// owned reference it must eventually release.
+    /// A user interface: a reference-counted object. As a parameter the
+    /// object is borrowed for the call; as a return (or inside a buffer) the
+    /// receiver adopts one strong reference it must eventually release.
     Interface(String),
+    /// A callback interface: a method set the consumer implements. Only valid
+    /// as a top-level parameter, where it lowers to a context pointer plus a
+    /// vtable pointer.
+    CallbackInterface(String),
     /// Optional value (`T?`): either the inner type or nothing.
     Optional(Box<Ty>),
     /// Homogeneous list (`[T]`) of the inner element type.
@@ -93,8 +88,7 @@ pub enum Ty {
 /// argument and return handling agree on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
-    /// One C slot passed by value: scalars, bools, C-style enums, and handles
-    /// (a typed handle's slot is an opaque pointer, still by value).
+    /// One C slot passed by value: scalars, bools, and C-style enums.
     Direct,
     /// One `char*` slot. Borrowed for a call as a parameter; producer-owned
     /// and released with `{prefix}_free_string` as a return.
@@ -106,12 +100,15 @@ pub enum Family {
     /// list, or map). Borrowed as a parameter; producer-owned and released
     /// with `{prefix}_free_bytes` after decoding as a return.
     Buffer,
-    /// An opaque object pointer to an interface. Borrowed as a parameter;
-    /// an owned reference (released with its `_destroy` symbol) as a return.
+    /// An object pointer to an interface. Borrowed as a parameter; one
+    /// strong reference (released with its `_destroy` symbol) as a return.
     Object {
         /// `true` for `Interface?`: null is a legal "none" value.
         nullable: bool,
     },
+    /// A callback interface: a `void* ctx` plus `const {tag}_vtable*` pair.
+    /// Only ever a parameter.
+    Callback,
     /// An `iter<T>` return: an opaque iterator handle with its own
     /// `next`/`destroy` protocol. Never a parameter.
     Iterator,
@@ -147,9 +144,8 @@ pub enum Prim {
     /// Eight bytes, IEEE 754 bits.
     F64,
     /// A `u32` byte length followed by UTF-8 bytes, no NUL terminator.
-    /// Covers `string` and `&str`.
     String,
-    /// A `u32` length followed by raw bytes. Covers `bytes` and `&[u8]`.
+    /// A `u32` length followed by raw bytes.
     Bytes,
 }
 
@@ -228,11 +224,12 @@ impl Prim {
 pub enum WireType<'a> {
     /// A fixed-width primitive, a string, or a byte blob.
     Prim(Prim),
-    /// An opaque handle token: eight bytes, little-endian, unsigned. Carries
-    /// the typed handle's referent name (if any) so backends that wrap
-    /// handles in typed structs can pick the wrapper; the encoding is the
-    /// same either way.
-    Handle(Option<&'a str>),
+    /// An object token: eight bytes, little-endian, unsigned, holding the
+    /// object pointer and carrying one strong reference. Carries the
+    /// (possibly dot-qualified) interface name so backends can wrap the
+    /// adopted pointer in the right class and, when writing, call the right
+    /// `_clone` symbol.
+    Object(&'a str),
     /// A C-style enum: an `i32` discriminant. Carries the (possibly
     /// dot-qualified) enum name so backends can wrap the integer in their
     /// typed enum.
@@ -255,17 +252,18 @@ impl Ty {
     /// How this type crosses a call boundary. Total over every `Ty`.
     pub fn family(&self) -> Family {
         match self {
-            Ty::StringUtf8 | Ty::BorrowedStr => Family::String,
-            Ty::Bytes | Ty::BorrowedBytes => Family::Bytes,
+            Ty::StringUtf8 => Family::String,
+            Ty::Bytes => Family::Bytes,
             Ty::Record(_) | Ty::RichEnum(_) | Ty::List(_) | Ty::Map(_, _) => Family::Buffer,
             Ty::Interface(_) => Family::Object { nullable: false },
-            // The one optional that is not buffered: an object reference
-            // cannot be serialized by value, so `Interface?` stays a nullable
-            // pointer.
+            // The one optional that is not buffered: `Interface?` stays a
+            // nullable pointer so the common "maybe an object" shape needs no
+            // encoding step.
             Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
                 Family::Object { nullable: true }
             }
             Ty::Optional(_) => Family::Buffer,
+            Ty::CallbackInterface(_) => Family::Callback,
             Ty::Iterator(_) => Family::Iterator,
             Ty::I8
             | Ty::I16
@@ -278,8 +276,6 @@ impl Ty {
             | Ty::F32
             | Ty::F64
             | Ty::Bool
-            | Ty::Handle
-            | Ty::TypedHandle(_)
             | Ty::Enum(_) => Family::Direct,
         }
     }
@@ -290,20 +286,15 @@ impl Ty {
         self.family() == Family::Buffer
     }
 
-    /// `true` for the two borrowed views (`&str`, `&[u8]`).
-    pub fn is_borrowed(&self) -> bool {
-        matches!(self, Ty::BorrowedStr | Ty::BorrowedBytes)
-    }
-
     /// The referenced user-type name for a record, rich enum, enum,
-    /// interface, or typed handle, or `None` for every other type.
+    /// interface, or callback interface, or `None` for every other type.
     pub fn user_name(&self) -> Option<&str> {
         match self {
             Ty::Record(n)
             | Ty::RichEnum(n)
             | Ty::Enum(n)
             | Ty::Interface(n)
-            | Ty::TypedHandle(n) => Some(n),
+            | Ty::CallbackInterface(n) => Some(n),
             _ => None,
         }
     }
@@ -318,17 +309,25 @@ impl Ty {
         }
     }
 
+    /// The callback interface name, or `None` for every other type.
+    pub fn callback_interface_name(&self) -> Option<&str> {
+        match self {
+            Ty::CallbackInterface(n) => Some(n),
+            _ => None,
+        }
+    }
+
     /// Classify this type's encoding inside a value buffer.
     ///
     /// Total over every type validation admits inside a buffered position.
-    /// Interfaces and iterators never appear inside value buffers (validation
-    /// rejects them there), so those inputs are bugs in the caller's
-    /// pipeline, not user errors.
+    /// Callback interfaces and iterators never appear inside value buffers
+    /// (validation rejects them there), so those inputs are bugs in the
+    /// caller's pipeline, not user errors.
     ///
     /// # Panics
     ///
-    /// Panics when `self` is an interface or an iterator, neither of which
-    /// can legally appear inside a value buffer.
+    /// Panics when `self` is a callback interface or an iterator, neither of
+    /// which can legally appear inside a value buffer.
     pub fn wire(&self) -> WireType<'_> {
         match self {
             Ty::Bool => WireType::Prim(Prim::Bool),
@@ -342,17 +341,16 @@ impl Ty {
             Ty::U64 => WireType::Prim(Prim::U64),
             Ty::F32 => WireType::Prim(Prim::F32),
             Ty::F64 => WireType::Prim(Prim::F64),
-            Ty::StringUtf8 | Ty::BorrowedStr => WireType::Prim(Prim::String),
-            Ty::Bytes | Ty::BorrowedBytes => WireType::Prim(Prim::Bytes),
-            Ty::Handle => WireType::Handle(None),
-            Ty::TypedHandle(n) => WireType::Handle(Some(n)),
+            Ty::StringUtf8 => WireType::Prim(Prim::String),
+            Ty::Bytes => WireType::Prim(Prim::Bytes),
+            Ty::Interface(n) => WireType::Object(n),
             Ty::Enum(name) => WireType::Enum(name),
             Ty::Record(name) | Ty::RichEnum(name) => WireType::User(name),
             Ty::Optional(inner) => WireType::Optional(inner),
             Ty::List(inner) => WireType::List(inner),
             Ty::Map(k, v) => WireType::Map(k, v),
-            Ty::Interface(_) | Ty::Iterator(_) => {
-                panic!("object references cannot appear inside value buffers: {self}")
+            Ty::CallbackInterface(_) | Ty::Iterator(_) => {
+                panic!("{self} cannot appear inside value buffers")
             }
         }
     }
@@ -361,14 +359,13 @@ impl Ty {
     /// somewhere in its encoding: it is (or transitively contains) a record
     /// or rich enum.
     pub fn contains_user_type(&self) -> bool {
-        match self {
-            Ty::Record(_) | Ty::RichEnum(_) => true,
-            Ty::Optional(inner) | Ty::List(inner) | Ty::Iterator(inner) => {
-                inner.contains_user_type()
-            }
-            Ty::Map(k, v) => k.contains_user_type() || v.contains_user_type(),
-            _ => false,
-        }
+        self.any(&|t| matches!(t, Ty::Record(_) | Ty::RichEnum(_)))
+    }
+
+    /// `true` when this type is (or transitively contains) an interface, so
+    /// encoding it needs object-token support in the codec.
+    pub fn contains_object(&self) -> bool {
+        self.any(&|t| matches!(t, Ty::Interface(_)))
     }
 
     /// `true` when `pred` holds for this type or any type nested inside it
@@ -412,11 +409,11 @@ impl fmt::Display for Ty {
             Ty::Bool => f.write_str("bool"),
             Ty::StringUtf8 => f.write_str("string"),
             Ty::Bytes => f.write_str("bytes"),
-            Ty::BorrowedStr => f.write_str("&str"),
-            Ty::BorrowedBytes => f.write_str("&[u8]"),
-            Ty::Handle => f.write_str("handle"),
-            Ty::TypedHandle(n) => write!(f, "handle<{n}>"),
-            Ty::Record(n) | Ty::RichEnum(n) | Ty::Enum(n) | Ty::Interface(n) => f.write_str(n),
+            Ty::Record(n)
+            | Ty::RichEnum(n)
+            | Ty::Enum(n)
+            | Ty::Interface(n)
+            | Ty::CallbackInterface(n) => f.write_str(n),
             Ty::Optional(inner) => write!(f, "{inner}?"),
             Ty::List(inner) => write!(f, "[{inner}]"),
             Ty::Map(k, v) => write!(f, "{{{k}:{v}}}"),
@@ -432,17 +429,14 @@ mod tests {
     #[test]
     fn families_are_total_and_agree_with_the_abi_contract() {
         assert_eq!(Ty::I32.family(), Family::Direct);
-        assert_eq!(Ty::Handle.family(), Family::Direct);
-        assert_eq!(Ty::TypedHandle("S".into()).family(), Family::Direct);
         assert_eq!(Ty::Enum("Color".into()).family(), Family::Direct);
         assert_eq!(Ty::StringUtf8.family(), Family::String);
-        assert_eq!(Ty::BorrowedStr.family(), Family::String);
         assert_eq!(Ty::Bytes.family(), Family::Bytes);
-        assert_eq!(Ty::BorrowedBytes.family(), Family::Bytes);
         for ty in [
             Ty::Record("C".into()),
             Ty::RichEnum("S".into()),
             Ty::List(Box::new(Ty::I32)),
+            Ty::List(Box::new(Ty::Interface("Store".into()))),
             Ty::Map(Box::new(Ty::StringUtf8), Box::new(Ty::I32)),
             Ty::Optional(Box::new(Ty::I32)),
             Ty::Optional(Box::new(Ty::StringUtf8)),
@@ -459,17 +453,20 @@ mod tests {
             Ty::Optional(Box::new(Ty::Interface("Store".into()))).family(),
             Family::Object { nullable: true }
         );
+        assert_eq!(
+            Ty::CallbackInterface("Listener".into()).family(),
+            Family::Callback
+        );
         assert_eq!(Ty::Iterator(Box::new(Ty::I32)).family(), Family::Iterator);
     }
 
     #[test]
-    fn wire_folds_borrowed_and_handles() {
-        assert_eq!(Ty::BorrowedStr.wire(), WireType::Prim(Prim::String));
-        assert_eq!(Ty::BorrowedBytes.wire(), WireType::Prim(Prim::Bytes));
-        assert_eq!(Ty::Handle.wire(), WireType::Handle(None));
+    fn wire_shapes() {
+        assert_eq!(Ty::StringUtf8.wire(), WireType::Prim(Prim::String));
+        assert_eq!(Ty::Bytes.wire(), WireType::Prim(Prim::Bytes));
         assert_eq!(
-            Ty::TypedHandle("Session".into()).wire(),
-            WireType::Handle(Some("Session"))
+            Ty::Interface("kv.Store".into()).wire(),
+            WireType::Object("kv.Store")
         );
         assert_eq!(Ty::RichEnum("Shape".into()).wire(), WireType::User("Shape"));
         assert_eq!(Ty::Enum("Color".into()).wire(), WireType::Enum("Color"));
@@ -478,13 +475,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "object references")]
-    fn interfaces_have_no_wire_shape() {
-        Ty::Interface("Store".into()).wire();
+    #[should_panic(expected = "cannot appear inside value buffers")]
+    fn callback_interfaces_have_no_wire_shape() {
+        Ty::CallbackInterface("Listener".into()).wire();
     }
 
     #[test]
-    fn user_type_containment_recurses() {
+    fn containment_recurses() {
         assert!(Ty::Record("C".into()).contains_user_type());
         assert!(Ty::Map(
             Box::new(Ty::StringUtf8),
@@ -492,6 +489,8 @@ mod tests {
         )
         .contains_user_type());
         assert!(!Ty::List(Box::new(Ty::Enum("Color".into()))).contains_user_type());
+        assert!(Ty::List(Box::new(Ty::Interface("Store".into()))).contains_object());
+        assert!(!Ty::List(Box::new(Ty::Record("C".into()))).contains_object());
     }
 
     #[test]
@@ -502,8 +501,8 @@ mod tests {
         )));
         assert_eq!(ty.to_string(), "[{string:a.Contact?}]");
         assert_eq!(
-            Ty::Iterator(Box::new(Ty::BorrowedStr)).to_string(),
-            "iter<&str>"
+            Ty::Iterator(Box::new(Ty::Interface("Store".into()))).to_string(),
+            "iter<Store>"
         );
         assert_eq!(Prim::String.snake(), "string");
         assert_eq!(Prim::I32.pascal(), "I32");

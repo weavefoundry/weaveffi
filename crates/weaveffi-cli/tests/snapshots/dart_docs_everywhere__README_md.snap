@@ -24,9 +24,23 @@ import 'package:weaveffi/weaveffi.dart';
    the native library at runtime via `DynamicLibrary.open` and resolve symbols
    with `lookupFunction`.
 
+## Objects and callbacks
+
+Interface objects are reference counted by the native library. Each Dart
+wrapper holds one reference: call `dispose()` when you are done with it, or let
+the garbage collector's finalizer release it. Objects nested inside records and
+collections follow the same rule.
+
+Callback interfaces are abstract classes: implement one and pass an instance to
+any function that takes it. Methods are bound with `NativeCallable.isolateLocal`,
+so the native library may only invoke them on the isolate's own thread (which
+holds when it calls them synchronously during a call from Dart). An exception
+thrown by an implementation aborts the native call and surfaces to the original
+Dart caller as a `WeaveFFIException` with `WeaveFFIException.foreignCode`.
+
 ## Requirements
 
-- Dart SDK >= 3.0.0
+- Dart SDK >= 3.1.0 (for `NativeCallable`)
 - The `ffi` package (`^2.0.0`) for `Utf8` and `calloc` helpers.
 
 <!-- END README.md -->

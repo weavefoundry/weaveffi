@@ -115,14 +115,19 @@ pub(crate) fn cmd_package(
 
     if !skipped.is_empty() && !quiet {
         eprintln!(
-            "note: these targets do not support binary packaging yet and were skipped: {}. \
-             Run `weaveffi generate` for their source bindings.",
+            "note: these targets produced no package and were skipped: {}. A target is \
+             skipped when it has no binary packaging or when no binary was found for the \
+             platforms it ships (for example `wasm32` for wasm). Run `weaveffi generate` \
+             for their source bindings.",
             skipped.join(", ")
         );
     }
 
     if packaged == 0 {
-        bail!("none of the selected targets support binary packaging yet");
+        bail!(
+            "none of the selected targets produced a package: check that --binaries (or \
+             --build) provides a library for a platform each target ships"
+        );
     }
 
     if !quiet {

@@ -26,7 +26,7 @@ Which target generators or project areas would this affect?
 - [ ] C
 - [ ] C++
 - [ ] Swift
-- [ ] Android / Kotlin
+- [ ] Kotlin (Android / JVM)
 - [ ] Node.js
 - [ ] WebAssembly
 - [ ] Python

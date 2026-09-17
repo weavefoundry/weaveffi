@@ -10,6 +10,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::os::raw::c_char;
+use std::sync::Arc;
 use weaveffi::abi::{self, c_ptr_to_string, free_string, string_to_c_ptr, weaveffi_error};
 
 #[weaveffi::module]
@@ -158,6 +159,38 @@ pub mod dispatch {
     }
 }
 
+/// Stands in for a `panic = "abort"` build, where a consumer callback failure
+/// can't unwind: the producer records it with `defer_foreign_error` and keeps
+/// running, and the thunk must report the recorded failure in place of the
+/// producer's result.
+#[weaveffi::module]
+pub mod deferred {
+    /// Record a foreign failure, then return normally with a value the
+    /// caller must never see.
+    #[weaveffi::export]
+    pub fn sync_then_fail(fail: bool) -> i32 {
+        if fail {
+            weaveffi::abi::defer_foreign_error(weaveffi::abi::ForeignError {
+                code: weaveffi::abi::FOREIGN_ERROR_CODE,
+                message: "consumer said no".to_string(),
+            });
+        }
+        77
+    }
+
+    /// The async twin of `sync_then_fail`.
+    #[weaveffi::export]
+    pub async fn later_then_fail(fail: bool) -> i32 {
+        if fail {
+            weaveffi::abi::defer_foreign_error(weaveffi::abi::ForeignError {
+                code: weaveffi::abi::FOREIGN_ERROR_CODE,
+                message: "consumer said no, later".to_string(),
+            });
+        }
+        88
+    }
+}
+
 #[weaveffi::module]
 pub mod maps {
     use std::collections::BTreeMap;
@@ -243,20 +276,125 @@ pub mod stream {
 
 #[weaveffi::module]
 pub mod bus {
-    /// Invoked for every published message with its text and weight.
-    #[weaveffi::callback]
-    #[allow(dead_code, unused_variables)]
-    fn on_message(text: String, weight: i32) {}
+    use std::sync::{Arc, Mutex, PoisonError};
 
-    /// The set of subscribers to published messages.
-    #[weaveffi::listener(event = "on_message")]
-    #[allow(dead_code)]
-    fn subscribers() {}
+    /// A message priority (a C-style enum crossing a callback boundary).
+    #[weaveffi::enumeration]
+    #[repr(i32)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Priority {
+        /// Routine.
+        Low = 0,
+        /// Urgent.
+        High = 1,
+    }
 
-    /// Publish a message, fanning it out to every registered subscriber.
+    /// A message payload (a record crossing a callback boundary).
+    #[weaveffi::record]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct Envelope {
+        /// Sequence number.
+        pub seq: i64,
+        /// Optional topic.
+        pub topic: Option<String>,
+    }
+
+    /// The consumer-implemented subscriber.
+    #[weaveffi::callback_interface]
+    pub trait Subscriber: Send + Sync {
+        /// Receive a message; returns the subscriber's running total.
+        fn on_message(&self, text: String, weight: i32, envelope: &Envelope) -> i64;
+        /// Ask the subscriber how urgent it considers `weight`.
+        fn classify(&self, weight: i32) -> Priority;
+        /// Inspect a shared object without retaining it.
+        fn on_ticker(&self, ticker: Arc<Ticker>, alt: Option<Arc<Ticker>>) -> bool;
+    }
+
+    /// A shared object handed to subscribers.
+    #[weaveffi::interface]
+    pub struct Ticker {
+        value: i64,
+    }
+
+    impl Ticker {
+        /// Create a ticker.
+        pub fn new(value: i64) -> Self {
+            Self { value }
+        }
+        /// Read the value.
+        pub fn value(&self) -> i64 {
+            self.value
+        }
+    }
+
+    /// A bus that retains its subscribers.
+    #[weaveffi::interface]
+    pub struct Bus {
+        subs: Mutex<Vec<Arc<dyn Subscriber>>>,
+    }
+
+    impl Bus {
+        /// Create an empty bus.
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                subs: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Retain a subscriber.
+        pub fn subscribe(&self, subscriber: Arc<dyn Subscriber>) {
+            self.subs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(subscriber);
+        }
+
+        /// Publish to every subscriber, returning the sum of their totals.
+        ///
+        /// A subscriber failure unwinds through this frame like a panic, so
+        /// the subscriber list is snapshotted and the lock released before
+        /// any callback runs (the same discipline a panic-safe producer uses).
+        pub fn publish(&self, text: String, weight: i32) -> i64 {
+            let env = Envelope {
+                seq: 1,
+                topic: Some("t".to_string()),
+            };
+            let subs: Vec<Arc<dyn Subscriber>> = self
+                .subs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            subs.iter()
+                .map(|s| s.on_message(text.clone(), weight, &env))
+                .sum()
+        }
+
+        /// Publish asynchronously.
+        pub async fn publish_later(&self, text: String, weight: i32) -> i64 {
+            self.publish(text, weight)
+        }
+
+        /// Drop every subscriber (the consumer's `free` must run).
+        pub fn clear(&self) {
+            self.subs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    /// Call the subscriber once directly without retaining it.
     #[weaveffi::export]
-    pub fn publish(text: String, weight: i32) {
-        emit_subscribers(&text, weight);
+    pub fn classify_once(subscriber: Arc<dyn Subscriber>, weight: i32) -> Priority {
+        subscriber.classify(weight)
+    }
+
+    /// Hand the subscriber a ticker object.
+    #[weaveffi::export]
+    pub fn tick(subscriber: &Arc<dyn Subscriber>, value: i64) -> bool {
+        let ticker = Arc::new(Ticker::new(value));
+        subscriber.on_ticker(ticker.clone(), None)
+            && subscriber.on_ticker(ticker.clone(), Some(ticker))
     }
 }
 
@@ -613,34 +751,230 @@ fn iterator_scalar_elements() {
     assert_eq!(got, vec![0, 1, 4, 9]);
 }
 
-#[test]
-fn listener_register_emit_unregister() {
+/// A consumer-side `Subscriber` implementation: the context is a heap-allocated
+/// `SubState`, the vtable is a process-wide static, exactly as a generated
+/// binding would do it.
+mod consumer_subscriber {
+    use super::*;
     use std::os::raw::c_void;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
-    static SUM: AtomicI64 = AtomicI64::new(0);
-    extern "C" fn on_msg(text: *const c_char, weight: i32, ctx: *mut c_void) {
-        assert!(!text.is_null());
-        let counter = unsafe { &*(ctx as *const AtomicI64) };
-        counter.fetch_add(weight as i64, Ordering::Relaxed);
+    pub struct SubState {
+        pub total: AtomicI64,
+        pub fail_at: i32,
+        pub last_topic: std::sync::Mutex<Option<String>>,
+        pub freed: Arc<AtomicUsize>,
     }
 
-    SUM.store(0, Ordering::Relaxed);
-    let id =
-        bus::weaveffi_bus_register_subscribers(on_msg, &SUM as *const AtomicI64 as *mut c_void);
-    assert!(id > 0);
+    unsafe extern "C" fn on_message(
+        ctx: *mut c_void,
+        text: *const c_char,
+        weight: i32,
+        envelope_ptr: *const u8,
+        envelope_len: usize,
+        out_err: *mut weaveffi_error,
+    ) -> i64 {
+        let state = &*(ctx as *const SubState);
+        let text = c_ptr_to_string(text).unwrap();
+        let env: bus::Envelope =
+            abi::decode_value(std::slice::from_raw_parts(envelope_ptr, envelope_len)).unwrap();
+        *state.last_topic.lock().unwrap() = env.topic.clone();
+        if weight == state.fail_at {
+            abi::error_set(
+                out_err,
+                abi::FOREIGN_ERROR_CODE,
+                &format!("subscriber rejected {text}"),
+            );
+            return 0;
+        }
+        abi::error_set_ok(out_err);
+        state.total.fetch_add(weight as i64, Ordering::Relaxed) + weight as i64
+    }
+
+    unsafe extern "C" fn classify(
+        _ctx: *mut c_void,
+        weight: i32,
+        out_err: *mut weaveffi_error,
+    ) -> i32 {
+        abi::error_set_ok(out_err);
+        if weight > 5 {
+            1
+        } else {
+            0
+        }
+    }
+
+    unsafe extern "C" fn on_ticker(
+        _ctx: *mut c_void,
+        ticker: *mut bus::Ticker,
+        alt: *mut bus::Ticker,
+        out_err: *mut weaveffi_error,
+    ) -> bool {
+        abi::error_set_ok(out_err);
+        // Object arguments transfer one strong reference: the consumer adopts
+        // each non-null pointer and owes exactly one `_destroy`.
+        let mut err = weaveffi_error::default();
+        let v = bus::weaveffi_bus_Ticker_value(ticker, &mut err);
+        bus::weaveffi_bus_Ticker_destroy(ticker);
+        let alt_ok = if alt.is_null() {
+            true
+        } else {
+            let same = bus::weaveffi_bus_Ticker_value(alt, &mut err) == v;
+            bus::weaveffi_bus_Ticker_destroy(alt);
+            same
+        };
+        v == 42 && alt_ok
+    }
+
+    unsafe extern "C" fn free(ctx: *mut c_void) {
+        let state = Box::from_raw(ctx as *mut SubState);
+        state.freed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub static VTABLE: bus::weaveffi_bus_Subscriber_vtable = bus::weaveffi_bus_Subscriber_vtable {
+        on_message,
+        classify,
+        on_ticker,
+        free,
+    };
+
+    pub fn new_ctx(fail_at: i32, freed: &Arc<AtomicUsize>) -> *mut c_void {
+        Box::into_raw(Box::new(SubState {
+            total: AtomicI64::new(0),
+            fail_at,
+            last_topic: std::sync::Mutex::new(None),
+            freed: Arc::clone(freed),
+        })) as *mut c_void
+    }
+}
+
+#[test]
+fn callback_interface_sync_paths() {
+    use consumer_subscriber::{new_ctx, VTABLE};
+    use std::sync::atomic::AtomicUsize;
+    let freed = Arc::new(AtomicUsize::new(0));
+    use std::sync::atomic::Ordering;
 
     let mut err = ok_err();
-    let text = string_to_c_ptr("hi");
-    bus::weaveffi_bus_publish(text, 3, &mut err);
-    bus::weaveffi_bus_publish(text, 5, &mut err);
-    assert_eq!(err.code, 0);
-    assert_eq!(SUM.load(Ordering::Relaxed), 8);
 
-    bus::weaveffi_bus_unregister_subscribers(id);
-    bus::weaveffi_bus_publish(text, 100, &mut err);
-    assert_eq!(SUM.load(Ordering::Relaxed), 8);
+    // Direct-family return through a non-retained callback: `free` runs as soon
+    // as the thunk drops its `Arc<dyn Subscriber>`.
+    let ctx = new_ctx(-1, &freed);
+    assert_eq!(
+        bus::weaveffi_bus_classify_once(ctx, &VTABLE, 9, &mut err),
+        1
+    );
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 1);
+
+    // Objects flow producer -> consumer as borrowed pointers the consumer may
+    // clone; a `&Arc<dyn Trait>` spelling lends the lifted callback.
+    let ctx = new_ctx(-1, &freed);
+    assert!(bus::weaveffi_bus_tick(ctx, &VTABLE, 42, &mut err));
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 2);
+
+    // A null vtable is a marshalling error, not a crash.
+    let r = bus::weaveffi_bus_classify_once(std::ptr::null_mut(), std::ptr::null(), 1, &mut err);
+    assert_eq!(r, 0);
+    assert_eq!(err.code, abi::MARSHAL_ERROR_CODE);
+    abi::error_clear(&mut err);
+}
+
+#[test]
+fn callback_interface_retained_and_foreign_error() {
+    use consumer_subscriber::{new_ctx, VTABLE};
+    use std::sync::atomic::AtomicUsize;
+    let freed = Arc::new(AtomicUsize::new(0));
+    use std::sync::atomic::Ordering;
+
+    let mut err = ok_err();
+
+    let b = bus::weaveffi_bus_Bus_new(&mut err);
+    assert!(!b.is_null());
+    bus::weaveffi_bus_Bus_subscribe(b, new_ctx(7, &freed), &VTABLE, &mut err);
+    bus::weaveffi_bus_Bus_subscribe(b, new_ctx(-1, &freed), &VTABLE, &mut err);
+    assert_eq!(err.code, 0);
+    assert_eq!(freed.load(Ordering::SeqCst), 0, "retained by the bus");
+
+    let text = string_to_c_ptr("hi");
+    assert_eq!(bus::weaveffi_bus_Bus_publish(b, text, 3, &mut err), 6);
+    assert_eq!(err.code, 0);
+    assert_eq!(bus::weaveffi_bus_Bus_publish(b, text, 5, &mut err), 16);
+
+    // The first subscriber fails on weight 7: the producer call is aborted and
+    // the consumer's own message comes back with FOREIGN_ERROR_CODE.
+    let r = bus::weaveffi_bus_Bus_publish(b, text, 7, &mut err);
+    assert_eq!(r, 0);
+    assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(
+        c_ptr_to_string(err.message).unwrap(),
+        "subscriber rejected hi"
+    );
+    abi::error_clear(&mut err);
+
+    // The bus is still usable afterwards.
+    assert_eq!(bus::weaveffi_bus_Bus_publish(b, text, 1, &mut err), 18);
+    assert_eq!(err.code, 0);
+
+    bus::weaveffi_bus_Bus_clear(b, &mut err);
+    assert_eq!(freed.load(Ordering::SeqCst), 2, "free runs once each");
     free_string(text);
+    bus::weaveffi_bus_Bus_destroy(b);
+}
+
+#[test]
+fn callback_interface_from_async_method() {
+    use consumer_subscriber::{new_ctx, VTABLE};
+    use std::os::raw::c_void;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    type Msg = (i32, String, i64);
+    extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
+        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
+        let (code, msg) = if err.is_null() {
+            (0, String::new())
+        } else {
+            let e = unsafe { &*err };
+            let out = (e.code, c_ptr_to_string(e.message).unwrap_or_default());
+            abi::error_free(err);
+            out
+        };
+        tx.send((code, msg, result)).unwrap();
+    }
+
+    let mut err = ok_err();
+    let b = bus::weaveffi_bus_Bus_new(&mut err);
+    let freed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    bus::weaveffi_bus_Bus_subscribe(b, new_ctx(4, &freed), &VTABLE, &mut err);
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let tx_ptr = Box::into_raw(Box::new(tx));
+    let text = string_to_c_ptr("async");
+
+    bus::weaveffi_bus_Bus_publish_later_async(b, text, 2, cb, tx_ptr as *mut c_void);
+    let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(result, 2);
+
+    // A foreign failure inside the future is delivered through the callback.
+    bus::weaveffi_bus_Bus_publish_later_async(b, text, 4, cb, tx_ptr as *mut c_void);
+    let (code, msg, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(msg, "subscriber rejected async");
+    assert_eq!(result, 0);
+
+    // The receiver was retained across the spawn: releasing the consumer's
+    // reference while a call is in flight is safe.
+    bus::weaveffi_bus_Bus_publish_later_async(b, text, 1, cb, tx_ptr as *mut c_void);
+    bus::weaveffi_bus_Bus_destroy(b);
+    let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(result, 3);
+
+    free_string(text);
+    unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
 #[test]
@@ -720,39 +1054,136 @@ fn async_result_ok_and_err_paths() {
     unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
+#[test]
+fn deferred_foreign_error_replaces_a_sync_result() {
+    let mut err = ok_err();
+    assert_eq!(
+        deferred::weaveffi_deferred_sync_then_fail(false, &mut err),
+        77
+    );
+    assert_eq!(err.code, 0);
+
+    let r = deferred::weaveffi_deferred_sync_then_fail(true, &mut err);
+    assert_eq!(r, 0, "the producer's value is discarded for the sentinel");
+    assert_eq!(err.code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(c_ptr_to_string(err.message).unwrap(), "consumer said no");
+    abi::error_clear(&mut err);
+
+    assert!(
+        abi::take_foreign_error().is_none(),
+        "the thunk drained the recorded failure"
+    );
+    assert_eq!(
+        deferred::weaveffi_deferred_sync_then_fail(false, &mut err),
+        77
+    );
+    assert_eq!(err.code, 0, "a later call on the same thread is unaffected");
+}
+
+#[test]
+fn deferred_foreign_error_fires_the_async_callback_once() {
+    use std::os::raw::c_void;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    type Msg = (i32, String, i32);
+    extern "C" fn cb(ctx: *mut c_void, err: *mut weaveffi_error, result: i32) {
+        let tx = unsafe { &*(ctx as *const mpsc::Sender<Msg>) };
+        let (code, message) = if err.is_null() {
+            (0, String::new())
+        } else {
+            let e = unsafe { &*err };
+            let out = (e.code, c_ptr_to_string(e.message).unwrap_or_default());
+            abi::error_free(err);
+            out
+        };
+        tx.send((code, message, result)).unwrap();
+    }
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let tx_ptr = Box::into_raw(Box::new(tx));
+
+    deferred::weaveffi_deferred_later_then_fail_async(false, cb, tx_ptr as *mut c_void);
+    let (code, _, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!((code, result), (0, 88));
+
+    deferred::weaveffi_deferred_later_then_fail_async(true, cb, tx_ptr as *mut c_void);
+    let (code, message, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(code, abi::FOREIGN_ERROR_CODE);
+    assert_eq!(message, "consumer said no, later");
+    assert_eq!(result, 0);
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the completion callback fires exactly once"
+    );
+
+    unsafe { drop(Box::from_raw(tx_ptr)) };
+}
+
 /// Exercises nested-module codegen: the inner module's symbols must carry the
-/// joined `outer_inner` path, and a nested function may reference a handle type
+/// joined `outer_inner` path, and a nested function may reference an interface
 /// declared in its parent module via `super::` (the `kvstore` `stats` pattern).
 #[weaveffi::module]
 pub mod outer {
-    /// A handle target type declared in the parent module.
+    use std::sync::Arc;
+
+    /// An interface declared in the parent module.
+    #[weaveffi::interface]
     pub struct Session {
         /// The session id.
         pub id: i64,
     }
 
-    /// Open a session, returning an opaque handle to it.
+    impl Session {
+        /// Open a session.
+        pub fn open(id: i64) -> Self {
+            Self { id }
+        }
+    }
+
+    /// Return the same session (an `Arc<Self>`-typed parameter and return).
     #[weaveffi::export]
-    pub fn open_session(id: i64) -> *mut Session {
-        Box::into_raw(Box::new(Session { id }))
+    pub fn share(session: Arc<Session>) -> Arc<Session> {
+        session
     }
 
     /// The nested sub-module: its symbols use the `outer_inner` prefix.
     #[weaveffi::module]
     pub mod inner {
+        use std::sync::Arc;
+
         /// A by-value record produced by the nested module.
         #[weaveffi::record]
         #[derive(Clone)]
         pub struct Report {
             /// Ten times the session id.
             pub score: i64,
+            /// The session the report is about (an object token in the buffer).
+            pub session: Option<Arc<super::Session>>,
         }
 
-        /// Summarize a parent-module `Session` handle into a nested `Report`.
+        /// Summarize a parent-module `Session` into a nested `Report`.
         #[weaveffi::export]
-        pub fn summarize(session: *const super::Session) -> Report {
-            let id = unsafe { (*session).id };
-            Report { score: id * 10 }
+        pub fn summarize(session: &super::Session, keep: Option<&super::Session>) -> Report {
+            Report {
+                score: session.id * 10 + keep.map_or(0, |k| k.id),
+                session: None,
+            }
+        }
+
+        /// Attach a retained session to a report.
+        #[weaveffi::export]
+        pub fn attach(session: Arc<super::Session>) -> Report {
+            Report {
+                score: session.id,
+                session: Some(session),
+            }
+        }
+
+        /// Read back the session inside a report.
+        #[weaveffi::export]
+        pub fn session_of(report: Report) -> Option<Arc<super::Session>> {
+            report.session
         }
     }
 }
@@ -760,19 +1191,93 @@ pub mod outer {
 #[test]
 fn nested_module_symbols_and_parent_type_reference() {
     let mut err = ok_err();
-    let session = outer::weaveffi_outer_open_session(7, &mut err);
+    let session = outer::weaveffi_outer_Session_open(7, &mut err);
     assert_eq!(err.code, 0);
     assert!(!session.is_null());
 
     // The nested function is reachable at `outer::inner::*` and its symbol
     // carries the joined module path; its record return is a value buffer.
     let mut out_len: usize = 0;
-    let ptr = outer::inner::weaveffi_outer_inner_summarize(session, &mut out_len, &mut err);
+    let ptr = outer::inner::weaveffi_outer_inner_summarize(
+        session,
+        std::ptr::null(),
+        &mut out_len,
+        &mut err,
+    );
     assert_eq!(err.code, 0);
     let report: outer::inner::Report = decode_ret(ptr, out_len);
     assert_eq!(report.score, 70);
+    assert!(report.session.is_none());
 
-    unsafe { drop(Box::from_raw(session)) };
+    let ptr =
+        outer::inner::weaveffi_outer_inner_summarize(session, session, &mut out_len, &mut err);
+    let report: outer::inner::Report = decode_ret(ptr, out_len);
+    assert_eq!(report.score, 77);
+
+    outer::weaveffi_outer_Session_destroy(session);
+}
+
+#[test]
+fn object_reference_counting() {
+    let mut err = ok_err();
+    let s = outer::weaveffi_outer_Session_open(3, &mut err);
+
+    // `share` retains through `Arc<Session>` in and hands back a new strong
+    // reference out; the pointer identity is the same allocation.
+    let again = outer::weaveffi_outer_share(s, &mut err);
+    assert_eq!(err.code, 0);
+    assert_eq!(again, s, "the same object, one more reference");
+    let third = outer::weaveffi_outer_Session_clone(s);
+    assert_eq!(third, s);
+
+    outer::weaveffi_outer_Session_destroy(s);
+    outer::weaveffi_outer_Session_destroy(again);
+    // Still alive through `third`.
+    let mut out_len: usize = 0;
+    let ptr = outer::inner::weaveffi_outer_inner_summarize(
+        third,
+        std::ptr::null(),
+        &mut out_len,
+        &mut err,
+    );
+    assert_eq!(err.code, 0);
+    let report: outer::inner::Report = decode_ret(ptr, out_len);
+    assert_eq!(report.score, 30);
+    outer::weaveffi_outer_Session_destroy(third);
+    outer::weaveffi_outer_Session_destroy(std::ptr::null_mut());
+    assert!(outer::weaveffi_outer_Session_clone(std::ptr::null()).is_null());
+}
+
+#[test]
+fn objects_inside_value_buffers_carry_a_reference() {
+    let mut err = ok_err();
+    let s = outer::weaveffi_outer_Session_open(5, &mut err);
+
+    // `attach` retains the session inside the returned record: the buffer's
+    // object token is one strong reference the consumer adopts on decode.
+    let mut out_len: usize = 0;
+    let ptr = outer::inner::weaveffi_outer_inner_attach(s, &mut out_len, &mut err);
+    assert_eq!(err.code, 0);
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, out_len) }.to_vec();
+    abi::free_bytes(ptr as *mut u8, out_len);
+    // The consumer owns `s` and the token in `bytes`: two references.
+    outer::weaveffi_outer_Session_destroy(s);
+
+    // Sending the buffer back transfers the token's reference to the producer,
+    // which returns it as the optional object result.
+    let back = outer::inner::weaveffi_outer_inner_session_of(bytes.as_ptr(), bytes.len(), &mut err);
+    assert_eq!(err.code, 0);
+    assert_eq!(back, s, "same allocation, still alive");
+    outer::weaveffi_outer_Session_destroy(back);
+
+    // A record with no object decodes to a null optional object return.
+    let none = abi::encode_value(&outer::inner::Report {
+        score: 0,
+        session: None,
+    });
+    let back = outer::inner::weaveffi_outer_inner_session_of(none.as_ptr(), none.len(), &mut err);
+    assert!(back.is_null());
+    assert_eq!(err.code, 0);
 }
 
 /// A producer module whose fallible function surfaces an IDL error domain's
@@ -877,6 +1382,7 @@ pub mod legacy {
 #[weaveffi::module]
 pub mod counters {
     use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
 
     /// The counters error domain.
     #[weaveffi::error]
@@ -934,6 +1440,43 @@ pub mod counters {
                 value: AtomicI64::new(self.value()),
                 step: self.step,
             }
+        }
+
+        /// Return a new reference to this same counter (`Arc<Self>` receiver
+        /// and return).
+        pub fn share(self: Arc<Self>) -> Arc<Self> {
+            self
+        }
+
+        /// Return the counter with the larger value, or none if both are
+        /// below `floor` (optional object parameter and return).
+        pub fn larger(&self, other: Option<&Counter>, floor: i64) -> Option<Arc<Counter>> {
+            let mine = self.value();
+            let theirs = other.map(Counter::value);
+            match theirs {
+                Some(t) if t >= mine && t >= floor => Some(Arc::new(Counter {
+                    value: AtomicI64::new(t),
+                    step: 1,
+                })),
+                _ if mine >= floor => Some(Arc::new(Counter::new(mine))),
+                _ => None,
+            }
+        }
+
+        /// Yield `n` fresh counters lazily (interface elements in an iterator).
+        pub fn fan_out(&self, n: i32) -> weaveffi::Iter<Arc<Counter>> {
+            let base = self.value();
+            weaveffi::Iter::new((0..n as i64).map(move |i| Arc::new(Counter::new(base + i))))
+        }
+
+        /// Read the value asynchronously (an async method retains `self`).
+        pub async fn value_later(&self) -> i64 {
+            self.value()
+        }
+
+        /// Return a fresh counter asynchronously (async object result).
+        pub async fn snapshot_later(self: Arc<Self>) -> Arc<Counter> {
+            self
         }
 
         /// Panic on purpose, proving panics surface as errors, not aborts.
@@ -1039,6 +1582,117 @@ fn interface_as_free_function_parameter() {
     let c = counters::weaveffi_counters_Counter_new(21, &mut err);
     assert_eq!(counters::weaveffi_counters_read_twice(c, &mut err), 42);
     counters::weaveffi_counters_Counter_destroy(c);
+}
+
+#[test]
+fn arc_self_receiver_and_optional_objects() {
+    let mut err = ok_err();
+    let c = counters::weaveffi_counters_Counter_new(10, &mut err);
+    let shared = counters::weaveffi_counters_Counter_share(c, &mut err);
+    assert_eq!(err.code, 0);
+    assert_eq!(shared, c, "`self: Arc<Self>` returns the same object");
+    counters::weaveffi_counters_Counter_destroy(shared);
+
+    let other = counters::weaveffi_counters_Counter_new(20, &mut err);
+    let bigger = counters::weaveffi_counters_Counter_larger(c, other, 0, &mut err);
+    assert_eq!(err.code, 0);
+    assert_eq!(
+        counters::weaveffi_counters_Counter_value(bigger, &mut err),
+        20
+    );
+    counters::weaveffi_counters_Counter_destroy(bigger);
+
+    let mine = counters::weaveffi_counters_Counter_larger(c, std::ptr::null(), 0, &mut err);
+    assert_eq!(
+        counters::weaveffi_counters_Counter_value(mine, &mut err),
+        10
+    );
+    counters::weaveffi_counters_Counter_destroy(mine);
+
+    let none = counters::weaveffi_counters_Counter_larger(c, other, 100, &mut err);
+    assert!(none.is_null());
+    assert_eq!(err.code, 0, "a null optional object return is not an error");
+
+    counters::weaveffi_counters_Counter_destroy(other);
+    counters::weaveffi_counters_Counter_destroy(c);
+}
+
+#[test]
+fn iterator_of_objects() {
+    let mut err = ok_err();
+    let c = counters::weaveffi_counters_Counter_new(5, &mut err);
+    let iter = counters::weaveffi_counters_Counter_fan_out(c, 3, &mut err);
+    assert_eq!(err.code, 0);
+    let mut values = Vec::new();
+    loop {
+        let mut item: *mut counters::Counter = std::ptr::null_mut();
+        if counters::weaveffi_counters_Counter_FanOutIterator_next(iter, &mut item, &mut err) == 0 {
+            break;
+        }
+        values.push(counters::weaveffi_counters_Counter_value(item, &mut err));
+        counters::weaveffi_counters_Counter_destroy(item);
+    }
+    counters::weaveffi_counters_Counter_FanOutIterator_destroy(iter);
+    counters::weaveffi_counters_Counter_destroy(c);
+    assert_eq!(values, vec![5, 6, 7]);
+}
+
+#[test]
+fn async_methods_retain_the_receiver() {
+    use std::os::raw::c_void;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    extern "C" fn on_value(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
+        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
+        assert!(err.is_null());
+        tx.send(result).unwrap();
+    }
+    extern "C" fn on_obj(
+        ctx: *mut c_void,
+        err: *mut weaveffi_error,
+        result: *mut counters::Counter,
+    ) {
+        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
+        assert!(err.is_null());
+        let mut e = weaveffi_error::default();
+        let v = counters::weaveffi_counters_Counter_value(result, &mut e);
+        counters::weaveffi_counters_Counter_destroy(result);
+        tx.send(v).unwrap();
+    }
+
+    let mut err = ok_err();
+    let (tx, rx) = mpsc::channel::<i64>();
+    let tx_ptr = Box::into_raw(Box::new(tx));
+
+    let c = counters::weaveffi_counters_Counter_new(8, &mut err);
+    counters::weaveffi_counters_Counter_value_later_async(c, on_value, tx_ptr as *mut c_void);
+    counters::weaveffi_counters_Counter_snapshot_later_async(c, on_obj, tx_ptr as *mut c_void);
+    // Releasing the consumer's reference while calls are in flight is safe:
+    // each launcher retained its own.
+    counters::weaveffi_counters_Counter_destroy(c);
+    let mut got = vec![
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    ];
+    got.sort_unstable();
+    assert_eq!(got, vec![8, 8]);
+
+    // A null receiver still completes (with a marshalling error).
+    extern "C" fn on_null(ctx: *mut c_void, err: *mut weaveffi_error, result: i64) {
+        let tx = unsafe { &*(ctx as *const mpsc::Sender<i64>) };
+        assert!(!err.is_null());
+        assert_eq!(unsafe { (*err).code }, abi::MARSHAL_ERROR_CODE);
+        abi::error_free(err);
+        tx.send(result).unwrap();
+    }
+    counters::weaveffi_counters_Counter_value_later_async(
+        std::ptr::null(),
+        on_null,
+        tx_ptr as *mut c_void,
+    );
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+    unsafe { drop(Box::from_raw(tx_ptr)) };
 }
 
 #[test]

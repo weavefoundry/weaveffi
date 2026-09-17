@@ -1,5 +1,5 @@
 fn audit_api_yaml() -> &'static str {
-    r#"version: "0.8.0"
+    r#"version: "0.9.0"
 modules:
   - name: inventory
     structs:
@@ -28,15 +28,15 @@ modules:
             params: []
             return: string
     functions:
-      - name: create_widget
+      - name: create_store
         params:
           - name: name
             type: string
-        return: handle
-      - name: get_widget_name
+        return: Store
+      - name: store_name
         params:
-          - name: id
-            type: handle
+          - name: store
+            type: Store
         return: string
       - name: list_widgets
         params: []
@@ -183,28 +183,32 @@ fn audit_swift_deinit_calls_destroy() {
 
 #[test]
 fn audit_kotlin_closeable() {
-    let out = generate_target("android");
-    let kt = read_generated(&out, "android/src/main/kotlin/com/weaveffi/WeaveFFI.kt");
+    let out = generate_target("kotlin");
+    let kt = read_generated(&out, "kotlin/src/main/kotlin/com/weaveffi/WeaveFFI.kt");
 
     assert!(
-        kt.contains(": java.io.Closeable"),
-        "Store must implement java.io.Closeable"
+        kt.contains("class Store private constructor(handle: Long) : AutoCloseable"),
+        "Store must implement AutoCloseable"
     );
     assert!(
         kt.contains("override fun close()"),
         "Store must override close()"
     );
     assert!(
-        kt.contains("nativeDestroy(handle)"),
-        "close() must call nativeDestroy(handle)"
+        kt.contains("WeaveNativeRef(handle) { h -> nativeDestroy(h) }"),
+        "the native reference must release through nativeDestroy exactly once"
     );
     assert!(
-        kt.contains("handle = 0L"),
-        "close() must zero handle after destroy to prevent double-free"
+        kt.contains("handle.getAndSet(0L)") && kt.contains("if (h != 0L) release(h)"),
+        "release must atomically zero the handle so close() and the cleaner can't double-free"
     );
     assert!(
-        kt.contains("protected fun finalize()"),
-        "Store must override finalize() as GC safety net"
+        kt.contains("weaveCleaner.register(this, ref)"),
+        "Store must register with a java.lang.ref.Cleaner as the GC safety net"
+    );
+    assert!(
+        kt.contains("internal fun cloneHandle(): Long = nativeClone(ref.get())"),
+        "Store must expose cloneHandle() so a wrapper can hand a fresh strong reference to the producer"
     );
 }
 
@@ -255,8 +259,12 @@ fn audit_dotnet_idisposable() {
         "Dispose must call weaveffi_inventory_Store_destroy"
     );
     assert!(
-        cs.contains("_disposed"),
-        "Store must track disposed state to prevent double-dispose"
+        cs.contains("Interlocked.Exchange(ref _released, 1)"),
+        "Store must release at most once, even when Dispose races the finalizer"
+    );
+    assert!(
+        cs.contains("throw new ObjectDisposedException(nameof(Store))"),
+        "Store must refuse use after Dispose instead of passing a dangling pointer"
     );
     assert!(
         cs.contains("GC.SuppressFinalize(this)"),
@@ -280,13 +288,24 @@ fn audit_cpp_raii() {
         "Store destructor must call _destroy"
     );
 
+    // ABI 2 objects are reference counted, so copies are legal: each copy
+    // takes its own strong reference via `_clone` and releases it in its own
+    // destructor, which is what makes value semantics safe.
     assert!(
-        hpp.contains("Store(const Store&) = delete"),
-        "Store must delete copy constructor"
+        hpp.contains(
+            "Store(const Store& other) : handle_(weaveffi_inventory_Store_clone(other.handle_)) {}"
+        ),
+        "Store copy constructor must take a fresh strong reference via _clone"
     );
     assert!(
-        hpp.contains("Store& operator=(const Store&) = delete"),
-        "Store must delete copy assignment"
+        hpp.contains("Store& operator=(const Store& other) {"),
+        "Store must have copy assignment"
+    );
+    assert!(
+        hpp.contains(
+            "weaveffi_inventory_Store* h = weaveffi_inventory_Store_clone(other.handle_);"
+        ),
+        "copy assignment must clone before destroying the old reference (self-assignment safe)"
     );
 
     assert!(
@@ -327,10 +346,16 @@ fn audit_no_raw_pointer_leaks() {
             h.contains("weaveffi_inventory_Store_destroy("),
             "C: missing Store_destroy declaration"
         );
+        assert!(
+            h.contains("weaveffi_inventory_Store_clone("),
+            "C: missing Store_clone declaration"
+        );
+        // `_clone` and `_destroy` are the reference-count primitives: they
+        // never fail, so they are the only object symbols without `out_err`.
         let fn_lines: Vec<&str> = h
             .lines()
             .filter(|l| l.contains("weaveffi_inventory_") && l.contains('(') && l.ends_with(';'))
-            .filter(|l| !l.contains("destroy"))
+            .filter(|l| !l.contains("_destroy(") && !l.contains("_clone("))
             .filter(|l| !l.contains("typedef"))
             .collect();
         for line in &fn_lines {
@@ -361,10 +386,10 @@ fn audit_no_raw_pointer_leaks() {
     // Kotlin JNI: owned strings freed after JNI copy, interface destroy in
     // nativeDestroy
     {
-        let jni = read_generated(&out, "android/src/main/cpp/weaveffi_jni.c");
+        let jni = read_generated(&out, "kotlin/src/main/cpp/weaveffi_jni.c");
         assert!(
             jni.contains("weaveffi_free_string("),
-            "Kotlin JNI: missing weaveffi_free_string after NewStringUTF"
+            "Kotlin JNI: missing weaveffi_free_string after the jstring copy"
         );
         assert!(
             jni.contains("_destroy("),

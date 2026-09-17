@@ -32,7 +32,7 @@ function expect(cond, msg) {
 (async () => {
   // Async record return: the Promise resolves with a plain TaskResult object.
   const result = await wv.runTask('alpha');
-  expect(result.id > 0, 'runTask assigns an id');
+  expect(typeof result.id === 'bigint' && result.id > 0n, 'runTask assigns a BigInt id');
   expect(result.value === 'completed: alpha', `runTask value (got ${result.value})`);
   expect(result.success === true, 'runTask success flag');
 
@@ -62,7 +62,10 @@ function expect(cond, msg) {
   expect(wv.cancelTask(1) === false, 'cancelTask reports not cancelled');
 
   // Every spawned task body has completed by the time its callback fires.
-  expect(wv.activeCallbacks() === 0, 'activeCallbacks settles to zero');
+  // i64 returns are BigInt.
+  const active = wv.activeCallbacks();
+  expect(typeof active === 'bigint', `activeCallbacks is a BigInt (got ${typeof active})`);
+  expect(active === 0n, `activeCallbacks settles to zero (got ${active})`);
 
   console.log('node async-demo conformance: OK');
 })().catch((e) => {

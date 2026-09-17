@@ -1,0 +1,5 @@
+error: weaveffi: `risky` returns a Result but no error domain is in scope; declare a #[weaveffi::error] enum in this module (or a parent module)
+ --> tests/ui/fail_result_without_error_domain.rs:2:5
+  |
+2 | mod bad {
+  |     ^^^

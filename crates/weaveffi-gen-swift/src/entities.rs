@@ -1,5 +1,6 @@
 //! Entity rendering: enums, rich enums, records, interfaces, typed error
-//! domains, and the recursive module walk emitting them.
+//! domains, and the recursive module walk emitting them (callback interfaces
+//! render through [`crate::callbacks`]).
 
 use std::collections::HashMap;
 
@@ -14,9 +15,10 @@ use weaveffi_core::model::{
 use weaveffi_core::utils::{local_type_name, wrapper_name};
 use weaveffi_ir::ir::Module;
 
+use crate::callbacks::render_swift_callback_interface;
 use crate::calls::{
     camel_params, render_swift_async_function, render_swift_ctor_init, render_swift_function,
-    render_swift_iterator_class, render_swift_listener, ErrCtx,
+    render_swift_iterator_class, ErrCtx,
 };
 use crate::codec::{fresh, read_value_stmts, write_value_stmts};
 use crate::types::{enum_raw_type, swift_ident, swift_str, swift_type_ctx, SwiftCtx};
@@ -384,9 +386,12 @@ fn render_swift_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBindin
     out.push_str(&w.finish());
 }
 
-/// Render one interface as a `public final class` owning its C handle: a
-/// stored `ptr`, an internal ownership-adopting `init(ptr:)`, and a `deinit`
-/// that calls the destroy symbol.
+/// Render one interface as a `public final class` owning one strong
+/// reference to its object: a stored `ptr`, an internal reference-adopting
+/// `init(ptr:)`, a `deinit` that releases the reference exactly once through
+/// the destroy symbol, and an internal `clonePtr()` that mints a second
+/// reference through the clone symbol for positions that take ownership (an
+/// object token inside a value buffer).
 ///
 /// The constructor named `new` surfaces as `public init` (throwing when the
 /// IDL marks it `throws`); every other constructor becomes a `public static
@@ -418,6 +423,14 @@ fn render_swift_interface(
     w.line("deinit {");
     w.scope(|w| {
         w.line(format!("{}(ptr)", iface.destroy_symbol));
+    });
+    w.line("}");
+    w.blank();
+    w.line("/// Returns a new strong reference to the same object, for a position that");
+    w.line("/// takes ownership of it (an object token inside a value buffer).");
+    w.line("func clonePtr() -> OpaquePointer {");
+    w.scope(|w| {
+        w.line(format!("{}(ptr)!", iface.clone_symbol));
     });
     w.line("}");
     w.dedent();
@@ -507,8 +520,8 @@ fn render_swift_interface(
 
 /// Emit every file-scope type a module (and its submodules, recursively)
 /// contributes: the typed error surface, enums and their codecs, records and
-/// their codecs, interface classes, and the sequence classes backing
-/// `iter<T>` callables.
+/// their codecs, callback-interface protocols with their vtables, interface
+/// classes, and the sequence classes backing `iter<T>` callables.
 pub(crate) fn render_swift_module_types(
     out: &mut String,
     c_prefix: &str,
@@ -537,6 +550,9 @@ pub(crate) fn render_swift_module_types(
         render_swift_struct(out, s, ctx);
         render_struct_codec(out, s, ctx);
     }
+    for cb in &mb.callback_interfaces {
+        render_swift_callback_interface(out, mb, cb, ctx);
+    }
     for i in &mb.interfaces {
         render_swift_interface(out, c_prefix, mb, i, ctx);
     }
@@ -554,9 +570,9 @@ pub(crate) fn render_swift_module_types(
     }
 }
 
-/// Emit the body of one module's namespace `enum`: listener pairs and
-/// function wrappers at this depth, then one nested namespace `enum` per
-/// submodule, re-indented to its depth.
+/// Emit the body of one module's namespace `enum`: function wrappers at this
+/// depth, then one nested namespace `enum` per submodule, re-indented to its
+/// depth.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_swift_module_body(
     out: &mut String,
@@ -572,11 +588,6 @@ pub(crate) fn render_swift_module_body(
     let mb = by_path[module_path];
     let stem = domain_stem(mb);
     let mut bodies: Vec<String> = Vec::new();
-    for l in &mb.listeners {
-        let mut buf = String::new();
-        render_swift_listener(&mut buf, module_path, mb, l, strip_module_prefix, ctx);
-        bodies.push(buf);
-    }
     for f in &mb.functions {
         let mut buf = String::new();
         let f = camel_params(f);

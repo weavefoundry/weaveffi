@@ -1,9 +1,15 @@
 //! The private Dart runtime every generated library ships: the dynamic
 //! library loaders, the error struct and generic exception plumbing, the
-//! value-buffer writer/reader pair, and the `lookupFunction` binding helper.
+//! value-buffer writer/reader pair, the callback-interface handle table, and
+//! the `lookupFunction` binding helper.
 
 use heck::{ToLowerCamelCase, ToUpperCamelCase};
 use weaveffi_core::cabi::ABI_VERSION;
+use weaveffi_core::platform::{Os, Platform};
+
+/// The reserved `weaveffi_error.code` a callback-interface trampoline reports
+/// when the Dart implementation raised (`FOREIGN_ERROR_CODE` in the ABI).
+pub(crate) const FOREIGN_ERROR_CODE: i32 = -4;
 
 /// Emit `_checkAbiVersion`, which the `_lib` initializer routes the freshly
 /// opened library through. It runs before any other lookup, so a producer
@@ -62,6 +68,30 @@ pub(crate) fn dart_loader_original(lib_base: &str) -> String {
     out
 }
 
+/// Whether the Dart package bundles a prebuilt library for `platform`: the
+/// `dart:ffi` loader resolves `native/<platform-id>/` for the desktop matrix
+/// only (Android libraries ship through Flutter's `jniLibs`, and a `.wasm`
+/// module can't be opened with `DynamicLibrary`).
+pub(crate) fn bundles_platform(platform: Platform) -> bool {
+    platform.is_desktop()
+}
+
+/// The bundled candidate paths the packaged loader tries for one OS family,
+/// in [`Platform::DESKTOP`] order, followed by the bare system library name.
+fn loader_candidates(os: Os, lib: &str) -> String {
+    let mut candidates: Vec<String> = Platform::DESKTOP
+        .iter()
+        .filter(|p| p.os() == os)
+        .map(|p| format!("'native/{}/{}'", p.id(), p.lib_filename(lib)))
+        .collect();
+    let bare = Platform::DESKTOP
+        .iter()
+        .find(|p| p.os() == os)
+        .map_or_else(|| format!("lib{lib}.so"), |p| p.lib_filename(lib));
+    candidates.push(format!("'{bare}'"));
+    candidates.join(", ")
+}
+
 /// The packaged `_openLibrary` for `lib`: try the bundled `native/<platform>/`
 /// libraries (relative to the working directory) before the bare system name.
 /// `WEAVEFFI_LIBRARY` still overrides.
@@ -75,15 +105,18 @@ pub(crate) fn dart_loader_packaged(lib: &str) -> String {
     out.push_str("  final candidates = <String>[];\n");
     out.push_str("  if (Platform.isMacOS) {\n");
     out.push_str(&format!(
-        "    candidates.addAll(['native/darwin-arm64/lib{lib}.dylib', 'native/darwin-x64/lib{lib}.dylib', 'lib{lib}.dylib']);\n"
+        "    candidates.addAll([{}]);\n",
+        loader_candidates(Os::MacOs, lib)
     ));
     out.push_str("  } else if (Platform.isWindows) {\n");
     out.push_str(&format!(
-        "    candidates.addAll(['native/windows-x64/{lib}.dll', '{lib}.dll']);\n"
+        "    candidates.addAll([{}]);\n",
+        loader_candidates(Os::Windows, lib)
     ));
     out.push_str("  } else {\n");
     out.push_str(&format!(
-        "    candidates.addAll(['native/linux-x64/lib{lib}.so', 'native/linux-arm64/lib{lib}.so', 'lib{lib}.so']);\n"
+        "    candidates.addAll([{}]);\n",
+        loader_candidates(Os::Linux, lib)
     ));
     out.push_str("  }\n");
     out.push_str("  for (final candidate in candidates) {\n");
@@ -350,6 +383,70 @@ final class _BufferReader {
     );
 }
 
+/// Emit the shared callback-interface runtime: the handle table that keeps
+/// Dart implementations alive while the producer holds them, the key
+/// allocator whose value crosses as `ctx`, the `NativeCallable` anchor list
+/// that pins every vtable trampoline for the process lifetime, and the
+/// `_foreignError` reporter trampolines route a thrown exception through.
+pub(crate) fn render_callback_runtime(out: &mut String) {
+    out.push_str(&format!(
+        r#"
+// ── WeaveFFI callback-interface runtime ──
+// A Dart implementation passed to the producer is stored here under an
+// integer key; the key (widened to a pointer) is what crosses as `ctx`, so the
+// producer never holds a Dart object and the GC never sees a raw pointer. The
+// entry lives until the producer calls the vtable's `free(ctx)`.
+final Map<int, Object> _callbackTable = {{}};
+int _nextCallbackKey = 1;
+
+Pointer<Void> _registerCallback(Object impl) {{
+  final key = _nextCallbackKey++;
+  _callbackTable[key] = impl;
+  return Pointer<Void>.fromAddress(key);
+}}
+
+Object _callbackFor(Pointer<Void> ctx) {{
+  final impl = _callbackTable[ctx.address];
+  if (impl == null) {{
+    throw StateError('callback interface context ${{ctx.address}} is not registered');
+  }}
+  return impl;
+}}
+
+// Vtable trampolines are process-wide: their NativeCallables are never closed,
+// so they are anchored here to keep the native thunks alive. `keepIsolateAlive`
+// is cleared on each so an idle isolate can still exit.
+final List<NativeCallable<Function>> _callbackCallables = [];
+
+Pointer<NativeFunction<T>> _pinCallable<T extends Function>(
+    NativeCallable<T> callable) {{
+  callable.keepIsolateAlive = false;
+  _callbackCallables.add(callable);
+  return callable.nativeFunction;
+}}
+
+// Reports a Dart exception thrown by a callback-interface implementation
+// through `weaveffi_error_set` with the reserved foreign error code ({code}).
+// The producer copies the message, so the temporary is freed right away. This
+// must never throw: it runs in the catch path of a trampoline whose C frame
+// an exception must not unwind through.
+void _foreignError(Pointer<_WeaveFFIError> outErr, Object error) {{
+  if (outErr == nullptr) return;
+  Pointer<Utf8> message = nullptr;
+  try {{
+    message = error.toString().toNativeUtf8();
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, message);
+  }} catch (_) {{
+    _weaveffiErrorSet(outErr, WeaveFFIException.foreignCode, nullptr);
+  }} finally {{
+    if (message != nullptr) calloc.free(message);
+  }}
+}}
+"#,
+        code = FOREIGN_ERROR_CODE
+    ));
+}
+
 /// Emit the dart:ffi typedef pair and `lookupFunction` binding for one C
 /// symbol.
 pub(crate) fn emit_typedef_and_lookup(
@@ -391,6 +488,18 @@ pub(crate) fn render_error_plumbing(out: &mut String) {
     out.push_str("  external int payloadLen;\n");
     out.push_str("}\n");
 
+    // Callback-interface trampolines report a failed Dart implementation
+    // through `weaveffi_error_set`, which copies the borrowed message with the
+    // producer's allocator (the producer frees `message` itself, so the
+    // consumer must never write the struct directly).
+    emit_typedef_and_lookup(
+        out,
+        "weaveffi_error_set",
+        "Pointer<_WeaveFFIError>, Int32, Pointer<Utf8>",
+        "Pointer<_WeaveFFIError>, int, Pointer<Utf8>",
+        "Void",
+        "void",
+    );
     emit_typedef_and_lookup(
         out,
         "weaveffi_error_clear",
@@ -434,10 +543,21 @@ pub(crate) fn render_error_plumbing(out: &mut String) {
         "void",
     );
 
-    out.push_str(
-        "\n/// Generic WeaveFFI failure: panics, marshalling errors, and unknown codes.\n",
-    );
+    out.push_str("\n/// Generic WeaveFFI failure: a producer panic ([panicCode]), a marshalling\n");
+    out.push_str("/// error ([marshalCode]), a callback-interface implementation that threw\n");
+    out.push_str("/// ([foreignCode], carrying the Dart exception's text), or an unknown code.\n");
     out.push_str("class WeaveFFIException implements Exception {\n");
+    out.push_str("  /// The producer reported an untyped error.\n");
+    out.push_str("  static const int genericCode = -1;\n");
+    out.push_str("  /// The producer panicked; [message] carries the panic text.\n");
+    out.push_str("  static const int panicCode = -2;\n");
+    out.push_str("  /// An argument could not be lifted by the producer.\n");
+    out.push_str("  static const int marshalCode = -3;\n");
+    out.push_str("  /// A Dart callback-interface implementation threw; [message] carries the\n");
+    out.push_str("  /// exception's text.\n");
+    out.push_str(&format!(
+        "  static const int foreignCode = {FOREIGN_ERROR_CODE};\n"
+    ));
     out.push_str("  final int code;\n");
     out.push_str("  final String message;\n");
     out.push_str("  WeaveFFIException(this.code, this.message);\n");

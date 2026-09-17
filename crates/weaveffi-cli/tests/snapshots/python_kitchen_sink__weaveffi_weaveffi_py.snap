@@ -17,6 +17,19 @@ from typing import Callable, Dict, Iterator, List, Optional
 
 
 class WeaveFFIError(Exception):
+    """An error reported through the C ABI.
+
+    Positive codes are a module's declared error codes (raised as the
+    module's typed subclasses); negative codes are runtime traps: a generic
+    producer error (-1), a producer panic (-2), a marshalling failure (-3),
+    or an exception raised by a callback-interface implementation (-4).
+    """
+
+    GENERIC_ERROR_CODE = -1
+    PANIC_ERROR_CODE = -2
+    MARSHAL_ERROR_CODE = -3
+    FOREIGN_ERROR_CODE = -4
+
     def __init__(self, code: int, message: str) -> None:
         self.code = code
         self.message = message
@@ -53,7 +66,7 @@ _lib = _load_library()
 # The ABI revision these bindings were generated against. Checked before any
 # other symbol is bound so a mismatched producer fails at import time instead
 # of misreading the error struct or a value buffer later.
-_ABI_VERSION = 1
+_ABI_VERSION = 2
 
 
 def _check_abi_version(lib: ctypes.CDLL) -> None:
@@ -75,6 +88,14 @@ def _check_abi_version(lib: ctypes.CDLL) -> None:
 
 
 _check_abi_version(_lib)
+# Callback-interface trampolines report a failed implementation through
+# weaveffi_error_set, which copies the message with the producer's allocator.
+_lib.weaveffi_error_set.argtypes = [
+    ctypes.POINTER(_WeaveFFIErrorStruct),
+    ctypes.c_int32,
+    ctypes.c_char_p,
+]
+_lib.weaveffi_error_set.restype = None
 _lib.weaveffi_error_clear.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
 _lib.weaveffi_error_clear.restype = None
 # Async completion callbacks receive a heap-boxed error the consumer owns;
@@ -130,14 +151,30 @@ def _take_string(ptr) -> Optional[str]:
     return _s
 
 
+def _borrow(obj):
+    """The raw pointer of a live object wrapper, lent to the producer for the
+    duration of one call. Raises if the wrapper was already closed."""
+    _p = obj._ptr
+    if _p is None:
+        raise WeaveFFIError(-1, f"{type(obj).__name__} used after close()")
+    return _p
+
+
 class _BufferWriter:
     """Encodes values into the WeaveFFI value-buffer wire format:
     little-endian, packed, no alignment."""
 
     def __init__(self) -> None:
         self._buf = bytearray()
+        self._objects = []
 
     def finish(self) -> bytes:
+        # Mint the object tokens last: an encoding that raised part-way
+        # (a closed wrapper, a field of the wrong type) never reaches here,
+        # so it leaks no strong references.
+        for _pos, _obj in self._objects:
+            struct.pack_into("<Q", self._buf, _pos, _obj._clone_ptr())
+        self._objects = []
         return bytes(self._buf)
 
     def write_bool(self, v) -> None:
@@ -187,6 +224,14 @@ class _BufferWriter:
     def write_bytes(self, v: bytes) -> None:
         self.write_len(len(v))
         self._buf += bytes(v)
+
+    def write_object(self, obj) -> None:
+        """Write an object token: one strong reference to `obj` the reader
+        will adopt. The wrapper is checked to be live now (a closed one
+        raises), but the reference itself is cloned in finish()."""
+        _borrow(obj)
+        self._objects.append((len(self._buf), obj))
+        self._buf += bytes(8)
 
 
 class _BufferReader:
@@ -268,6 +313,14 @@ class _BufferReader:
         _n = self.read_len()
         return bytes(self._take(_n, "bytes data"))
 
+    def read_object(self) -> int:
+        """Read an object token: one strong reference the caller adopts into
+        a wrapper. Zero never appears in a non-optional position."""
+        _p = struct.unpack("<Q", self._take(8, "object token"))[0]
+        if _p == 0:
+            raise WeaveFFIError(-1, "malformed value buffer: null object token")
+        return _p
+
     def expect_end(self) -> None:
         if self._pos != len(self._data):
             raise WeaveFFIError(-1, "malformed value buffer: trailing bytes")
@@ -290,6 +343,7 @@ def _take_buffer(ptr, length) -> bytes:
     _lib.weaveffi_free_bytes(ptr, ctypes.c_size_t(length))
     return _data
 
+import abc
 import asyncio
 import threading
 
@@ -312,10 +366,23 @@ def _async_register(cb) -> int:
     return _token
 
 
-# Registered listener trampolines, keyed by subscription id. Holding
-# the ctypes function objects here keeps them alive until unregistered;
-# without this the GC could collect a trampoline the producer still calls.
-_listener_refs: Dict[int, object] = {}
+# Live callback-interface implementations, keyed by the integer the producer
+# receives as `ctx`. An entry is added when an implementation is passed to a
+# call and removed when the producer invokes the vtable's `free(ctx)`, so the
+# implementation stays alive exactly as long as the producer may call it and
+# the producer never holds a raw reference to a Python object.
+_cb_impls: Dict[int, object] = {}
+_cb_lock = threading.Lock()
+_cb_next_ctx = 0
+
+
+def _cb_register(impl) -> int:
+    global _cb_next_ctx
+    with _cb_lock:
+        _cb_next_ctx += 1
+        _ctx = _cb_next_ctx
+        _cb_impls[_ctx] = impl
+    return _ctx
 
 
 # === Module: shared ===
@@ -447,6 +514,8 @@ class Item:
     # Cross-module struct reference
     token: "Token"
     priority: "Priority"
+    # An optional object inside a record
+    gadget: Optional["Gadget"]
 
 
 def _write_Item(_w: _BufferWriter, value: "Item") -> None:
@@ -471,6 +540,11 @@ def _write_Item(_w: _BufferWriter, value: "Item") -> None:
         _w.write_i64(value.parent)
     _write_Token(_w, value.token)
     _w.write_i32(value.priority)
+    if value.gadget is None:
+        _w.write_option_flag(False)
+    else:
+        _w.write_option_flag(True)
+        _w.write_object(value.gadget)
 
 
 def _read_Item(_r: _BufferReader) -> "Item":
@@ -487,6 +561,7 @@ def _read_Item(_r: _BufferReader) -> "Item":
         parent=(_r.read_i64() if _r.read_option_flag() else None),
         token=_read_Token(_r),
         priority=Priority(_r.read_i32()),
+        gadget=(Gadget._from_ptr(_r.read_object()) if _r.read_option_flag() else None),
     )
 
 
@@ -500,11 +575,86 @@ def _unpack_Item(data: bytes) -> "Item":
     return _decode_buffer(data, _read_Item)
 
 
+class ReadyListener(abc.ABC):
+    """
+    Consumer-implemented observer of ready items
+
+    Consumer-implemented callback interface. Subclass it, implement every abstract method, and pass an instance wherever the API takes a `ReadyListener`; the producer may call the methods from any thread until it releases the instance. An exception raised by a method is reported to the producer as WeaveFFIError.FOREIGN_ERROR_CODE (-4) and aborts the call that was in progress.
+    """
+
+    @abc.abstractmethod
+    def on_ready(self, code: int, msg: str) -> None:
+        """Fires when an item is ready
+        """
+
+    @abc.abstractmethod
+    def on_item(self, item: "Item", gadget: "Gadget") -> bool:
+        """Receives the item itself and says whether to keep listening
+        """
+
+
+_ReadyListener_on_ready_cfunctype = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int32, ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct))
+_ReadyListener_on_item_cfunctype = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct))
+_ReadyListener_vtable_free_cfunctype = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+class _ReadyListenerVtable(ctypes.Structure):
+    """The C vtable `weaveffi_kitchen_ReadyListener_vtable`."""
+
+    _fields_ = [
+        ("on_ready", _ReadyListener_on_ready_cfunctype),
+        ("on_item", _ReadyListener_on_item_cfunctype),
+        ("free", _ReadyListener_vtable_free_cfunctype),
+    ]
+
+
+def _ReadyListener_on_ready_trampoline(ctx, code, msg, out_err):
+    try:
+        _impl = _cb_impls[ctx]
+        _impl.on_ready(code, _bytes_to_string(msg))
+    except Exception as _exc:
+        # Never unwind through the C frame: report the failure and return a
+        # default; the producer aborts its call with FOREIGN_ERROR_CODE.
+        _lib.weaveffi_error_set(out_err, -4, str(_exc).encode("utf-8", "replace"))
+
+
+def _ReadyListener_on_item_trampoline(ctx, item_ptr, item_len, gadget, out_err):
+    try:
+        _impl = _cb_impls[ctx]
+        _ret = _impl.on_item(_unpack_Item(ctypes.string_at(item_ptr, item_len) if item_ptr else b""), Gadget._from_ptr(gadget))
+        return 1 if _ret else 0
+    except Exception as _exc:
+        # Never unwind through the C frame: report the failure and return a
+        # default; the producer aborts its call with FOREIGN_ERROR_CODE.
+        _lib.weaveffi_error_set(out_err, -4, str(_exc).encode("utf-8", "replace"))
+        return 0
+
+
+def _ReadyListener_vtable_free_trampoline(ctx):
+    # The producer's last reference is gone; it never touches `ctx` again.
+    _cb_impls.pop(ctx, None)
+
+
+# The one process-wide vtable for ReadyListener. The CFUNCTYPE objects are held at
+# module scope so their function pointers stay valid for the process lifetime.
+_ReadyListener_on_ready_cfunc = _ReadyListener_on_ready_cfunctype(_ReadyListener_on_ready_trampoline)
+_ReadyListener_on_item_cfunc = _ReadyListener_on_item_cfunctype(_ReadyListener_on_item_trampoline)
+_ReadyListener_vtable_free_cfunc = _ReadyListener_vtable_free_cfunctype(_ReadyListener_vtable_free_trampoline)
+_ReadyListener_vtable = _ReadyListenerVtable(_ReadyListener_on_ready_cfunc, _ReadyListener_on_item_cfunc, _ReadyListener_vtable_free_cfunc)
+
+
+_lib.weaveffi_kitchen_Gadget_clone.argtypes = [ctypes.c_void_p]
+_lib.weaveffi_kitchen_Gadget_clone.restype = ctypes.c_void_p
+_lib.weaveffi_kitchen_Gadget_destroy.argtypes = [ctypes.c_void_p]
+_lib.weaveffi_kitchen_Gadget_destroy.restype = None
+
+
 class Gadget:
     """A pocket-sized interface exercising the object surface"""
 
     @classmethod
     def _from_ptr(cls, ptr) -> "Gadget":
+        """Adopt one strong reference the producer handed over."""
         _obj = cls.__new__(cls)
         _obj._ptr = ptr
         return _obj
@@ -524,12 +674,30 @@ class Gadget:
         self._ptr = _result
 
 
+    def _clone_ptr(self):
+        """A new strong reference to the same object (a raw pointer the
+        receiver must eventually release), leaving this wrapper's own
+        reference untouched."""
+        return _lib.weaveffi_kitchen_Gadget_clone(_borrow(self))
+
+    def close(self) -> None:
+        """Release this wrapper's reference. The object itself is dropped
+        when its last reference (here or in the producer) is released.
+        Idempotent; the wrapper is unusable afterwards."""
+        _p = getattr(self, "_ptr", None)
+        self._ptr = None
+        if _p is not None:
+            _lib.weaveffi_kitchen_Gadget_destroy(_p)
+
+    def __enter__(self) -> "Gadget":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.close()
+        return False
+
     def __del__(self) -> None:
-        if self._ptr is not None:
-            _lib.weaveffi_kitchen_Gadget_destroy.argtypes = [ctypes.c_void_p]
-            _lib.weaveffi_kitchen_Gadget_destroy.restype = None
-            _lib.weaveffi_kitchen_Gadget_destroy(self._ptr)
-            self._ptr = None
+        self.close()
 
     def describe(self) -> str:
         """Render the gadget as a human-readable string
@@ -538,7 +706,7 @@ class Gadget:
         _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
         _fn.restype = ctypes.c_void_p
         _err = _WeaveFFIErrorStruct()
-        _result = _fn(self._ptr, ctypes.byref(_err))
+        _result = _fn(_borrow(self), ctypes.byref(_err))
         _check_error(_err)
         return _take_string(_result) or ""
 
@@ -555,7 +723,7 @@ class Gadget:
         _fn.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(_WeaveFFIErrorStruct)]
         _fn.restype = ctypes.c_int32
         _err = _WeaveFFIErrorStruct()
-        _result = _fn(self._ptr, times, ctypes.byref(_err))
+        _result = _fn(_borrow(self), times, ctypes.byref(_err))
         _check_kitchen_errors_error(_err)
         return _result
 
@@ -572,37 +740,6 @@ class Gadget:
         _check_error(_err)
         return _take_string(_result) or ""
 
-
-
-# Fires when an item is ready
-# Callback type OnReady: Callable[[int, str], None]
-_CFUNC_weaveffi_kitchen_OnReady_fn = ctypes.CFUNCTYPE(None, ctypes.c_int32, ctypes.c_char_p, ctypes.c_void_p)
-
-
-def register_ready_listener(callback: Callable[[int, str], None]) -> int:
-    """
-    Subscribe to OnReady events
-
-    Returns a subscription id for unregister_ready_listener().
-    """
-    def _trampoline(code, msg, _context):
-        callback(code, _bytes_to_string(msg))
-    _cfunc = _CFUNC_weaveffi_kitchen_OnReady_fn(_trampoline)
-    _fn = _lib.weaveffi_kitchen_register_ready_listener
-    _fn.argtypes = [_CFUNC_weaveffi_kitchen_OnReady_fn, ctypes.c_void_p]
-    _fn.restype = ctypes.c_uint64
-    _listener_id = int(_fn(_cfunc, None))
-    _listener_refs[_listener_id] = _cfunc
-    return _listener_id
-
-
-def unregister_ready_listener(listener_id: int) -> None:
-    """Unregister a listener previously registered with register_ready_listener()."""
-    _fn = _lib.weaveffi_kitchen_unregister_ready_listener
-    _fn.argtypes = [ctypes.c_uint64]
-    _fn.restype = None
-    _fn(ctypes.c_uint64(listener_id))
-    _listener_refs.pop(listener_id, None)
 
 
 def bool_id(x: bool) -> bool:
@@ -683,58 +820,105 @@ def echo_bytes(b: bytes) -> bytes:
     return _val
 
 
-def echo_borrowed_str(s: str) -> str:
-    """Borrowed string parameter
+def subscribe(listener: "ReadyListener") -> int:
+    """Register a listener, returning how many are attached
     """
-    _fn = _lib.weaveffi_kitchen_echo_borrowed_str
-    _fn.argtypes = [ctypes.c_char_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_void_p
+    _fn = _lib.weaveffi_kitchen_subscribe
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ReadyListenerVtable), ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.restype = ctypes.c_int32
+    _listener_ctx = _cb_register(listener)
     _err = _WeaveFFIErrorStruct()
-    _result = _fn(_string_to_bytes(s), ctypes.byref(_err))
-    _check_error(_err)
-    return _take_string(_result) or ""
-
-
-def echo_borrowed_bytes(b: bytes) -> bytes:
-    """Borrowed bytes parameter
-    """
-    _fn = _lib.weaveffi_kitchen_echo_borrowed_bytes
-    _fn.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.POINTER(ctypes.c_uint8)
-    _b_arr = (ctypes.c_uint8 * len(b))(*b)
-    _err = _WeaveFFIErrorStruct()
-    _out_len = ctypes.c_size_t(0)
-    _result = _fn(_b_arr, len(b), ctypes.byref(_out_len), ctypes.byref(_err))
-    _check_error(_err)
-    if not _result:
-        return b""
-    _val = bytes(_result[:_out_len.value])
-    _lib.weaveffi_free_bytes(_result, ctypes.c_size_t(_out_len.value))
-    return _val
-
-
-def open_handle() -> int:
-    """Returns an opaque handle
-    """
-    _fn = _lib.weaveffi_kitchen_open_handle
-    _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
-    _fn.restype = ctypes.c_uint64
-    _err = _WeaveFFIErrorStruct()
-    _result = _fn(ctypes.byref(_err))
+    _result = _fn(_listener_ctx, ctypes.byref(_ReadyListener_vtable), ctypes.byref(_err))
     _check_error(_err)
     return _result
 
 
-def open_typed_handle() -> int:
-    """Returns a typed handle
+def maybe_gadget(fallback: Optional["Gadget"]) -> Optional["Gadget"]:
+    """Optional object in both directions
     """
-    _fn = _lib.weaveffi_kitchen_open_typed_handle
+    _fn = _lib.weaveffi_kitchen_maybe_gadget
+    _fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _err = _WeaveFFIErrorStruct()
+    _result = _fn((_borrow(fallback) if fallback is not None else None), ctypes.byref(_err))
+    _check_error(_err)
+    if _result is None:
+        return None
+    return Gadget._from_ptr(_result)
+
+
+def gadgets() -> List["Gadget"]:
+    """A list of objects
+    """
+    _fn = _lib.weaveffi_kitchen_gadgets
+    _fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(_WeaveFFIErrorStruct)]
+    _fn.restype = ctypes.c_void_p
+    _err = _WeaveFFIErrorStruct()
+    _out_len = ctypes.c_size_t(0)
+    _result = _fn(ctypes.byref(_out_len), ctypes.byref(_err))
+    _check_error(_err)
+    _data = _take_buffer(_result, _out_len.value)
+    return _decode_buffer(_data, lambda _r: [Gadget._from_ptr(_r.read_object()) for _i0 in range(_r.read_len())])
+
+
+class _StreamGadgetsIterator:
+    """Lazy iterator over a producer stream: each step pulls one element
+    across the C boundary. The native handle is released exactly once, on
+    exhaustion, on close(), or when the iterator is garbage collected."""
+
+    def __init__(self, ptr):
+        self._ptr = ptr
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        _next_fn = _lib.weaveffi_kitchen_StreamGadgetsIterator_next
+        _next_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(_WeaveFFIErrorStruct)]
+        _next_fn.restype = ctypes.c_int32
+        _out_item = ctypes.c_void_p()
+        _err = _WeaveFFIErrorStruct()
+        _has = _next_fn(self._ptr, ctypes.byref(_out_item), ctypes.byref(_err))
+        _check_error(_err)
+        if not _has:
+            self._done = True
+            self._destroy()
+            raise StopIteration
+        return Gadget._from_ptr(_out_item.value)
+
+    def close(self):
+        """Release the native iterator without draining it."""
+        self._done = True
+        self._destroy()
+
+    def _destroy(self):
+        if self._ptr is not None:
+            _destroy_fn = _lib.weaveffi_kitchen_StreamGadgetsIterator_destroy
+            _destroy_fn.argtypes = [ctypes.c_void_p]
+            _destroy_fn.restype = None
+            _destroy_fn(self._ptr)
+            self._ptr = None
+
+    def __del__(self):
+        self._destroy()
+
+
+def stream_gadgets() -> Iterator["Gadget"]:
+    """
+    An iterator over objects
+
+    Returns a lazy iterator: each step pulls one element from the producer. Exhaust or close() the iterator to release its native handle (garbage collection also releases it).
+    """
+    _fn = _lib.weaveffi_kitchen_stream_gadgets
     _fn.argtypes = [ctypes.POINTER(_WeaveFFIErrorStruct)]
     _fn.restype = ctypes.c_void_p
     _err = _WeaveFFIErrorStruct()
     _result = _fn(ctypes.byref(_err))
     _check_error(_err)
-    return _result or 0
+    return _StreamGadgetsIterator(_result)
 
 
 def maybe_item(id: int) -> Optional["Item"]:

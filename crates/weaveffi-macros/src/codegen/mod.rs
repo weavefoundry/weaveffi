@@ -11,9 +11,10 @@
 //! The emission is split by surface: [`sync`] for synchronous callables,
 //! [`async_fns`] for `async fn` launchers, [`iterators`] for `iter<T>` trios,
 //! [`records`] and [`enums`] for the generated `BufferValue` serialization
-//! impls of value types, [`interfaces`] for opaque-object destructors, and
-//! [`callbacks`] for callback typedefs and listener registries. [`helpers`]
-//! and [`marshal`] hold the shared slot rendering and lift/lower machinery.
+//! impls of value types, [`interfaces`] for the object reference-count
+//! symbols, and [`callbacks`] for callback-interface vtables and foreign
+//! wrappers. [`helpers`] and [`marshal`] hold the shared slot rendering and
+//! lift/lower machinery.
 
 mod async_fns;
 mod callbacks;
@@ -166,6 +167,7 @@ fn render_symbols(
 ) -> syn::Result<TokenStream> {
     let mut fns: HashMap<String, &syn::ItemFn> = HashMap::new();
     let mut enums: HashMap<String, &syn::ItemEnum> = HashMap::new();
+    let mut traits: HashMap<String, &syn::ItemTrait> = HashMap::new();
     // Interface member signatures, keyed by `(type name, fn name)` across all
     // inherent `impl` blocks of the type.
     let mut member_sigs: HashMap<(String, String), &syn::Signature> = HashMap::new();
@@ -176,6 +178,9 @@ fn render_symbols(
             }
             syn::Item::Enum(e) => {
                 enums.insert(e.ident.to_string(), e);
+            }
+            syn::Item::Trait(t) => {
+                traits.insert(t.ident.to_string(), t);
             }
             syn::Item::Impl(i) if i.trait_.is_none() => {
                 let Some(ty_name) = impl_type_name(i) else {
@@ -228,11 +233,11 @@ fn render_symbols(
     for s in &mb.structs {
         generated.extend(records::gen_record(s)?);
     }
-    for c in &mb.callbacks {
-        generated.extend(callbacks::gen_callback_type(c)?);
-    }
-    for l in &mb.listeners {
-        generated.extend(callbacks::gen_listener(mb, l)?);
+    for c in &mb.callback_interfaces {
+        let item = traits
+            .get(&c.name)
+            .ok_or_else(|| missing("callback interface", &c.name))?;
+        generated.extend(callbacks::gen_callback_interface(c, item)?);
     }
     for i in &mb.interfaces {
         let ty = ident(&i.name);
@@ -248,7 +253,7 @@ fn render_symbols(
                 generated.extend(gen_function(m, sig, &target)?);
             }
         }
-        generated.extend(interfaces::gen_interface_destroy(i));
+        generated.extend(interfaces::gen_interface_lifecycle(i));
     }
     for f in &mb.functions {
         let sfn = fns

@@ -4,17 +4,24 @@
 //! Buffered values (records, rich enums, optionals, lists, maps, and error
 //! payloads) cross the boundary serialized in the WeaveFFI value-buffer wire
 //! format. This module emits the JS statements and expressions that encode
-//! and decode that format. Every dispatch goes through [`wire::classify`], so
-//! the wire-shape folds (handles as `u64` tokens, borrowed views as their
-//! owned forms, records and rich enums as one user-codec shape) live in
-//! `weaveffi-core`, not here.
+//! and decode that format. Every dispatch goes through [`Ty::wire`], so the
+//! wire-shape classification (objects as `u64` tokens, records and rich enums
+//! as one user-codec shape) lives in `weaveffi-core`, not here.
+//!
+//! An interface inside a buffer is an object token carrying one strong
+//! reference: the writer calls the wrapper's `_clone()` (the interface's
+//! `_clone` symbol) and writes the fresh pointer, and the reader adopts the
+//! decoded pointer into a new wrapper via the class's `_wrap`. Because the
+//! wrapper classes close over the loaded `wasm` instance, the per-type codecs
+//! are emitted inside the loader rather than at module scope.
 
-use weaveffi_core::abi::lower::split_qualified;
+use weaveffi_core::abi::split_qualified;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::BindingModel;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{Prim, WireType};
+use weaveffi_core::utils::local_type_name;
 
 /// The `_write_*`/`_read_*` codec function names for a (possibly
 /// `module.Name`-qualified) record or rich enum referenced from
@@ -44,7 +51,7 @@ fn scalar_method(wt: WireType<'_>) -> &'static str {
         WireType::Prim(Prim::I32) => "i32",
         WireType::Prim(Prim::U32) => "u32",
         WireType::Prim(Prim::I64) => "i64",
-        WireType::Prim(Prim::U64) | WireType::Handle(_) => "u64",
+        WireType::Prim(Prim::U64) => "u64",
         WireType::Prim(Prim::F32) => "f32",
         WireType::Prim(Prim::F64) => "f64",
         WireType::Prim(Prim::String) => "str",
@@ -67,6 +74,12 @@ pub(crate) fn emit_buf_write_stmts(
     match ty.wire() {
         WireType::Enum(_) => {
             w.line(format!("{wtr}.i32({val});"));
+        }
+        // An object token must carry a reference of its own: `_clone()` calls
+        // the interface's clone symbol, so the wrapper keeps the pointer it
+        // already holds.
+        WireType::Object(_) => {
+            w.line(format!("{wtr}.obj({val}._clone());"));
         }
         WireType::User(name) => {
             let (write_fn, _) = buf_codec_names(name, module);
@@ -126,12 +139,10 @@ pub(crate) fn emit_buf_write_stmts(
 /// the whole decode stays a single expression.
 pub(crate) fn buf_read_expr(ty: &Ty, module: &str, rdr: &str) -> String {
     match ty.wire() {
-        // A typed handle is an i32 pointer at the ABI but a u64 on the wire;
-        // narrowing back to a JS number keeps the two spellings interchangeable.
-        WireType::Handle(_) if matches!(ty, Ty::TypedHandle(_)) => {
-            format!("Number({rdr}.u64())")
-        }
         WireType::Enum(_) => format!("{rdr}.i32()"),
+        // The token carries one strong reference, which the new wrapper
+        // adopts; the reader rejects a zero token.
+        WireType::Object(name) => format!("{}._wrap({rdr}.obj())", local_type_name(name)),
         WireType::User(name) => {
             let (_, read_fn) = buf_codec_names(name, module);
             format!("{read_fn}({rdr})")
@@ -196,6 +207,8 @@ pub(crate) fn emit_js_buffer_runtime(out: &mut String) {
         w.line("f64(v) { this._need(8); this._dv.setFloat64(this._len, v, true); this._len += 8; }");
         w.line("len(n) { this.u32(n); }");
         w.line("flag(present) { this.u8(present ? 1 : 0); }");
+        w.line("// An object token: the pointer (a wasm32 i32, read unsigned) widened to u64.");
+        w.line("obj(ptr) { this.u64(BigInt(ptr >>> 0)); }");
         w.block("str(v) {", "}", |w| {
             w.line("const b = _enc.encode(v);");
             w.line("this.len(b.length);");
@@ -262,6 +275,13 @@ pub(crate) fn emit_js_buffer_runtime(out: &mut String) {
             w.line("if (b > 1) this._bad('option flag byte out of range');");
             w.line("return b === 1;");
         });
+        w.line("// An object token narrowed back to a wasm32 pointer; zero is never a");
+        w.line("// valid token (an absent `Interface?` uses the option flag instead).");
+        w.block("obj() {", "}", |w| {
+            w.line("const t = this.u64();");
+            w.line("if (t === 0n || t > 0xffffffffn) this._bad('object token out of range');");
+            w.line("return Number(t);");
+        });
         w.block("str() {", "}", |w| {
             w.line("const n = this.len();");
             w.line("const at = this._take(n, 'string bytes');");
@@ -286,12 +306,13 @@ pub(crate) fn emit_js_buffer_runtime(out: &mut String) {
     out.push_str(&w.finish());
 }
 
-/// Emit the module-scope `_write_*`/`_read_*` codec pair for every record and
-/// rich enum in the model, in model (declaration) order. Field order is fixed
+/// Emit the `_write_*`/`_read_*` codec pair for every record and rich enum in
+/// the model, in model (declaration) order, at `indent` (loader scope, so the
+/// object-token arms can reach the interface classes). Field order is fixed
 /// at generation time, so the codecs are direct straight-line code with no
 /// runtime dispatch.
-pub(crate) fn emit_js_buffer_codecs(out: &mut String, model: &BindingModel) {
-    let mut w = CodeWriter::two_space();
+pub(crate) fn emit_js_buffer_codecs(out: &mut String, model: &BindingModel, indent: &str) {
+    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     for m in &model.modules {
         for s in &m.structs {
             let (write_fn, read_fn) = buf_codec_names(&s.name, &m.path);

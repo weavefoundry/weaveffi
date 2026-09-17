@@ -92,13 +92,14 @@ fn validation_error_code(err: &ValidationError) -> &'static str {
         ValidationError::DuplicateEnumValue { .. } => "DuplicateEnumValue",
         ValidationError::UnknownTypeRef { .. } => "UnknownTypeRef",
         ValidationError::InvalidMapKey { .. } => "InvalidMapKey",
-        ValidationError::BorrowedTypeInInvalidPosition { .. } => "BorrowedTypeInInvalidPosition",
-        ValidationError::DuplicateCallbackName { .. } => "DuplicateCallbackName",
-        ValidationError::UnsupportedCallbackParamType { .. } => "UnsupportedCallbackParamType",
-        ValidationError::ListenerCallbackNotFound { .. } => "ListenerCallbackNotFound",
-        ValidationError::DuplicateListenerName { .. } => "DuplicateListenerName",
+        ValidationError::DuplicateCallbackInterfaceName { .. } => "DuplicateCallbackInterfaceName",
+        ValidationError::EmptyCallbackInterface { .. } => "EmptyCallbackInterface",
+        ValidationError::DuplicateCallbackMethod { .. } => "DuplicateCallbackMethod",
+        ValidationError::InvalidCallbackMethod { .. } => "InvalidCallbackMethod",
+        ValidationError::CallbackInterfaceInInvalidPosition { .. } => {
+            "CallbackInterfaceInInvalidPosition"
+        }
         ValidationError::IteratorInInvalidPosition { .. } => "IteratorInInvalidPosition",
-        ValidationError::MutableParamUnsupported { .. } => "MutableParamUnsupported",
         ValidationError::AsyncIteratorReturn { .. } => "AsyncIteratorReturn",
         ValidationError::UnsupportedSchemaVersion { .. } => "UnsupportedSchemaVersion",
         ValidationError::DuplicateInterfaceName { .. } => "DuplicateInterfaceName",
@@ -158,8 +159,8 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
         | ValidationError::EmptyStruct { module, name }
         | ValidationError::DuplicateEnumName { module, name }
         | ValidationError::EmptyEnum { module, name }
-        | ValidationError::DuplicateCallbackName { module, name }
-        | ValidationError::DuplicateListenerName { module, name } => {
+        | ValidationError::DuplicateCallbackInterfaceName { module, name }
+        | ValidationError::EmptyCallbackInterface { module, name } => {
             obj.insert("module".into(), Value::String(module.clone()));
             obj.insert("name".into(), Value::String(name.clone()));
         }
@@ -194,41 +195,21 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
         ValidationError::InvalidMapKey { key_type } => {
             obj.insert("key_type".into(), Value::String(key_type.clone()));
         }
-        ValidationError::BorrowedTypeInInvalidPosition { ty, location } => {
-            obj.insert("type".into(), Value::String(ty.clone()));
-            obj.insert("location".into(), Value::String(location.clone()));
+        ValidationError::DuplicateCallbackMethod { interface, name } => {
+            obj.insert("interface".into(), Value::String(interface.clone()));
+            obj.insert("name".into(), Value::String(name.clone()));
         }
-        ValidationError::ListenerCallbackNotFound {
-            module,
-            listener,
-            callback,
+        ValidationError::InvalidCallbackMethod {
+            interface,
+            method,
+            reason,
         } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("listener".into(), Value::String(listener.clone()));
-            obj.insert("callback".into(), Value::String(callback.clone()));
-        }
-        ValidationError::UnsupportedCallbackParamType {
-            module,
-            callback,
-            param,
-            ty,
-        } => {
-            obj.insert("module".into(), Value::String(module.clone()));
-            obj.insert("callback".into(), Value::String(callback.clone()));
-            obj.insert("param".into(), Value::String(param.clone()));
-            obj.insert("type".into(), Value::String(ty.clone()));
+            obj.insert("interface".into(), Value::String(interface.clone()));
+            obj.insert("method".into(), Value::String(method.clone()));
+            obj.insert("reason".into(), Value::String((*reason).into()));
         }
         ValidationError::IteratorInInvalidPosition { location } => {
             obj.insert("location".into(), Value::String(location.clone()));
-        }
-        ValidationError::MutableParamUnsupported {
-            function,
-            param,
-            ty,
-        } => {
-            obj.insert("function".into(), Value::String(function.clone()));
-            obj.insert("param".into(), Value::String(param.clone()));
-            obj.insert("type".into(), Value::String(ty.clone()));
         }
         ValidationError::AsyncIteratorReturn { module, function } => {
             obj.insert("module".into(), Value::String(module.clone()));
@@ -258,7 +239,8 @@ fn validation_error_to_json(err: &ValidationError) -> serde_json::Value {
             obj.insert("interface".into(), Value::String(interface.clone()));
             obj.insert("constructor".into(), Value::String(constructor.clone()));
         }
-        ValidationError::InterfaceInInvalidPosition { name, location } => {
+        ValidationError::InterfaceInInvalidPosition { name, location }
+        | ValidationError::CallbackInterfaceInInvalidPosition { name, location } => {
             obj.insert("name".into(), Value::String(name.clone()));
             obj.insert("location".into(), Value::String(location.clone()));
         }

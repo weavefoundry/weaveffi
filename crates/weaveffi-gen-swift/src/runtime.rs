@@ -1,13 +1,23 @@
 //! The private Swift runtime prelude: the value-buffer writer/reader pair,
-//! the generic brand error with its `check`/`trap` helpers, and the support
-//! classes async wrappers and listeners box their state in.
+//! the generic brand error with its `check`/`trap` helpers, the boxed
+//! continuation async wrappers thread through the C context slot, and the
+//! foreign-error helper callback-interface trampolines report through.
 
 use weaveffi_core::errors::ERROR_BRAND;
+
+/// The `weaveffi_error.code` a callback-interface trampoline reports when the
+/// consumer's implementation throws. Mirrors `weaveffi_abi::FOREIGN_ERROR_CODE`.
+const FOREIGN_ERROR_CODE: i32 = -4;
 
 /// The private Swift buffer runtime implementing the WeaveFFI value-buffer
 /// wire format: little-endian, packed, no alignment. `WvWriter` serializes,
 /// `WvReader` deserializes and traps (via `wvDecodeFailure`) on malformed
 /// input, which the spec routes through the same channel as a producer panic.
+///
+/// Object tokens (`writeObject`/`readObject`) are the `u64` widening of an
+/// interface pointer; each carries one strong reference, so the writer is
+/// handed a freshly cloned pointer and the reader hands its pointer to a
+/// wrapper that adopts it.
 const BUFFER_RUNTIME: &str = r#"/// Serializes values into the WeaveFFI value-buffer wire format
 /// (little-endian, packed, no alignment).
 struct WvWriter {
@@ -49,6 +59,9 @@ struct WvWriter {
         bytes.append(contentsOf: v)
     }
     mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
+    /// Writes an object token. `p` must be a strong reference the buffer now
+    /// owns (a freshly cloned pointer), never one a wrapper still holds.
+    mutating func writeObject(_ p: OpaquePointer) { writeUInt64(UInt64(UInt(bitPattern: p))) }
 }
 
 /// Traps on a malformed value buffer. Per the wire-format spec, consumers
@@ -126,6 +139,14 @@ struct WvReader {
         default: wvDecodeFailure("option flag byte out of range")
         }
     }
+    /// Reads an object token: one strong reference the caller must adopt
+    /// into a wrapper whose deinit releases it.
+    mutating func readObject() -> OpaquePointer {
+        guard let p = OpaquePointer(bitPattern: UInt(readUInt64())) else {
+            wvDecodeFailure("null object token")
+        }
+        return p
+    }
     func finish() {
         if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
     }
@@ -142,12 +163,13 @@ pub(crate) fn render_buffer_runtime(out: &mut String) {
 /// Append the generic brand error enum plus the `check`/`trap` helpers every
 /// wrapper body reports its error slot through.
 ///
-/// The brand error covers unknown codes, marshalling failures, and panics;
-/// typed domain errors get one enum per declaring module, emitted alongside
-/// that module's types. Domain error codes are validated positive, so the
-/// reserved negative runtime codes (generic `-1`, panic `-2`, marshalling
-/// `-3`) always reach the brand error on throwing paths and the `fatalError`
-/// trap on non-throwing ones.
+/// The brand error covers unknown codes, marshalling failures, panics, and
+/// foreign callback failures; typed domain errors get one enum per declaring
+/// module, emitted alongside that module's types. Domain error codes are
+/// validated positive, so the reserved negative runtime codes (generic `-1`,
+/// panic `-2`, marshalling `-3`, foreign callback failure `-4`) always reach
+/// the brand error on throwing paths and the `fatalError` trap on
+/// non-throwing ones.
 pub(crate) fn render_error_infra(out: &mut String) {
     out.push_str(&format!(
         "public enum {ERROR_BRAND}: Error, LocalizedError {{\n"
@@ -177,7 +199,8 @@ pub(crate) fn render_error_infra(out: &mut String) {
     out.push_str("}\n\n");
 
     // The trapping flavor for non-throwing wrappers: a non-zero code here can
-    // only be a producer panic or an argument-marshalling failure.
+    // only be a producer panic, an argument-marshalling failure, or a
+    // consumer callback implementation that threw.
     out.push_str("@inline(__always)\nfunc trap(_ err: inout weaveffi_error) {\n");
     out.push_str("    if err.code != 0 {\n");
     out.push_str("        let code = err.code\n");
@@ -199,16 +222,20 @@ pub(crate) fn render_continuation_ref(out: &mut String) {
     out.push_str("}\n\n");
 }
 
-/// Append the listener support: the closure box retained through the C
-/// `context` pointer and the registry keeping it alive until unregistration.
-pub(crate) fn render_listener_registry(out: &mut String) {
-    // A C function pointer cannot capture state, so each registered Swift
-    // closure is boxed and threaded through the `void* context` slot. The
-    // registry keeps the +1 retain alive until unregistration releases it.
-    out.push_str("final class WvCallbackBox<T> {\n");
-    out.push_str("    let value: T\n");
-    out.push_str("    init(_ value: T) { self.value = value }\n");
+/// Append the callback-interface support: the helper every trampoline calls
+/// when the consumer's implementation throws. It reports the failure through
+/// the producer-owned `out_err` slot with `weaveffi_error_set`, which copies
+/// the borrowed message, so no Swift allocation crosses the boundary and no
+/// error ever unwinds through the C frame.
+pub(crate) fn render_callback_support(out: &mut String) {
+    out.push_str(
+        "/// Reports a thrown Swift error to the producer as a foreign callback failure\n\
+         /// (code -4); the producer aborts its current call with that code and message.\n\
+         func wvForeignError(_ outErr: UnsafeMutablePointer<weaveffi_error>?, _ error: Error) {\n\
+         \x20   let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)\n",
+    );
+    out.push_str(&format!(
+        "    message.withCString {{ weaveffi_error_set(outErr, {FOREIGN_ERROR_CODE}, $0) }}\n"
+    ));
     out.push_str("}\n\n");
-    out.push_str("var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]\n");
-    out.push_str("let wvListenerLock = NSLock()\n\n");
 }

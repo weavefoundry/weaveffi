@@ -11,14 +11,17 @@ use weaveffi_core::cache::CLI_VERSION;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::{type_name as error_type_name, ERROR_BRAND};
 use weaveffi_core::manifest::{json_escape, JsonObject, JsonValue};
-use weaveffi_core::model::{BindingModel, EnumBinding, ErrorBinding, InterfaceBinding};
+use weaveffi_core::model::{
+    BindingModel, CallbackInterfaceBinding, EnumBinding, ErrorBinding, InterfaceBinding,
+};
 use weaveffi_core::package::PackageContext;
 use weaveffi_core::pkg::ResolvedPackage;
 use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::types::{
-    emit_doc, emit_fn_doc, js_fn_name, js_param_name, ts_fn_tags, ts_params, ts_ret, ts_type_for,
+    emit_doc, emit_fn_doc, js_fn_name, js_method_name, js_param_name, ts_fn_tags, ts_params,
+    ts_ret, ts_type_for,
 };
 
 /// Prepend the generated-file prelude entries (`//`, `//warning`,
@@ -100,16 +103,20 @@ pub(crate) fn render_packaged_package_json(
         .render()
 }
 
+/// The npm `os`/`cpu` pair of a platform, or `None` for a platform Node does
+/// not run on (Android, Wasm), which the packaged layout skips.
+pub(crate) fn node_platform_tokens(platform: Platform) -> Option<(&'static str, &'static str)> {
+    Some((platform.node_os()?, platform.node_cpu()?))
+}
+
 /// Render a per-platform native package's `package.json`, gated by npm `os` and
 /// `cpu` so npm installs only the matching one. The single-element `os` and
 /// `cpu` arrays keep npm's conventional inline spelling.
 pub(crate) fn render_platform_package_json(
     pkg_name: &str,
     version: &str,
-    platform: Platform,
+    (os, cpu): (&str, &str),
 ) -> String {
-    let os = platform.node_os();
-    let cpu = platform.node_cpu();
     JsonObject::new()
         .str_entry("name", pkg_name)
         .str_entry("version", version)
@@ -210,7 +217,8 @@ pub(crate) fn render_packaged_readme(
     let platforms: Vec<String> = ctx
         .binaries
         .platforms()
-        .map(|p| format!("- `{}-{}-{}`", name, p.node_os(), p.node_cpu()))
+        .filter_map(node_platform_tokens)
+        .map(|(os, cpu)| format!("- `{name}-{os}-{cpu}`"))
         .collect();
     let platform_list = platforms.join("\n");
     format!(
@@ -348,15 +356,54 @@ fn render_interface_dts(out: &mut String, i: &InterfaceBinding, error: Option<&E
                 ts_ret(f)
             ));
         }
-        w.line("/** Free the underlying native object. */");
-        w.line("destroy(): void;");
+        w.line("/**");
+        w.line(" * Release this wrapper's reference to the native object. Safe to call");
+        w.line(" * more than once; a wrapper that is never closed is released when it is");
+        w.line(" * garbage collected. Using the wrapper after `close()` throws.");
+        w.line(" */");
+        w.line("close(): void;");
+        w.line("/** Alias of `close()` for `using` declarations. */");
+        w.line("[Symbol.dispose](): void;");
+    });
+    out.push_str(&w.finish());
+}
+
+/// `.d.ts` for one callback interface: a TS `interface` with one camelCase
+/// method per IDL method. Any object with those methods (a class instance, a
+/// literal) can be passed wherever the interface is expected; 64-bit
+/// integers arrive as `bigint`s and object arguments as wrapper instances
+/// the implementation owns (and should `close()` when done).
+pub(crate) fn render_callback_interface_dts(out: &mut String, cb: &CallbackInterfaceBinding) {
+    let mut w = CodeWriter::two_space();
+    {
+        let mut d = String::new();
+        emit_doc(&mut d, &cb.doc, "");
+        w.raw(d);
+    }
+    w.block(format!("export interface {} {{", cb.name), "}", |w| {
+        for m in &cb.methods {
+            let mut d = String::new();
+            emit_fn_doc(&mut d, &m.doc, &m.params, "  ", &[]);
+            w.raw(d);
+            let params: Vec<String> = m
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", js_param_name(&p.name), ts_type_for(&p.ty)))
+                .collect();
+            let ret = m.ret.as_ref().map_or("void".to_string(), ts_type_for);
+            w.line(format!(
+                "{}({}): {ret};",
+                js_method_name(&m.name),
+                params.join(", ")
+            ));
+        }
     });
     out.push_str(&w.finish());
 }
 
 /// Render the TypeScript declarations (`types.d.ts`): the generic error
 /// brand, then per module the typed error surface, record interfaces, enums
-/// (numeric or tagged-union), interface classes, listener endpoints, and one
+/// (numeric or tagged-union), callback interfaces, interface classes, and one
 /// function signature per exported wrapper.
 pub(crate) fn render_node_dts(
     model: &BindingModel,
@@ -367,8 +414,10 @@ pub(crate) fn render_node_dts(
     out.push_str("// Generated types for WeaveFFI functions\n");
     out.push_str("/**\n");
     out.push_str(" * Base class of every error thrown by these bindings. Non-throwing\n");
-    out.push_str(" * functions reject or throw it directly for panics and marshalling\n");
-    out.push_str(" * failures; throwing functions surface a module domain subclass.\n");
+    out.push_str(" * functions reject or throw it directly for runtime traps (code -2 a\n");
+    out.push_str(" * producer panic, -3 a marshalling failure, -4 a callback interface\n");
+    out.push_str(" * implementation that threw); throwing functions surface a module\n");
+    out.push_str(" * domain subclass for their declared codes.\n");
     out.push_str(" */\n");
     out.push_str(&format!("export class {ERROR_BRAND} extends Error {{\n"));
     out.push_str("  /** The numeric ABI error code. */\n");
@@ -408,34 +457,11 @@ pub(crate) fn render_node_dts(
             out.push_str("}\n");
         }
         out.push_str(&format!("// module {}\n", m.path));
+        for cb in &m.callback_interfaces {
+            render_callback_interface_dts(&mut out, cb);
+        }
         for i in &m.interfaces {
             render_interface_dts(&mut out, i, m.error.as_ref());
-        }
-        for l in &m.listeners {
-            let Some(cb) = m.callback(&l.event_callback) else {
-                continue;
-            };
-            let cb_params: Vec<String> = cb
-                .params
-                .iter()
-                .map(|p| format!("{}: {}", js_param_name(&p.name), ts_type_for(&p.ty)))
-                .collect();
-            let register = js_fn_name(
-                &m.path,
-                &format!("register_{}", l.name),
-                strip_module_prefix,
-            );
-            let unregister = js_fn_name(
-                &m.path,
-                &format!("unregister_{}", l.name),
-                strip_module_prefix,
-            );
-            emit_doc(&mut out, &l.doc, "");
-            out.push_str(&format!(
-                "export function {register}(callback: ({}) => void): number\n",
-                cb_params.join(", ")
-            ));
-            out.push_str(&format!("export function {unregister}(id: number): void\n"));
         }
         for f in &m.functions {
             let ts_name = js_fn_name(&m.path, &f.name, strip_module_prefix);

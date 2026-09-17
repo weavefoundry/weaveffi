@@ -3,6 +3,7 @@
 
 use heck::ToSnakeCase;
 use weaveffi_core::abi::AbiParam;
+use weaveffi_core::cabi::c_param_name;
 use weaveffi_core::errors;
 use weaveffi_core::lang::{self, CPP_KEYWORDS};
 use weaveffi_core::model::ModuleBinding;
@@ -63,18 +64,45 @@ pub(crate) fn cpp_namespace_path(module: &ModuleBinding) -> String {
         .join("::")
 }
 
+/// The C++ spelling of one ABI slot name: the IDL-chosen identifier with the
+/// same keyword escape the shared C declarations apply, so the trampoline and
+/// lambda parameter lists compile against the `extern "C"` prototypes.
+pub(crate) fn slot_name(p: &AbiParam) -> String {
+    c_param_name(&p.name)
+}
+
 /// Renders ABI parameter slots to C declarations (`<type> <name>`), the form
-/// used inside the generated `extern "C"` block and callback lambdas.
+/// used inside async completion lambdas and callback-interface trampolines.
 pub(crate) fn render_param_decls(params: &[AbiParam], prefix: &str) -> Vec<String> {
     params
         .iter()
-        .map(|p| format!("{} {}", p.ty.render_c(prefix), p.name))
+        .map(|p| format!("{} {}", p.ty.render_c(prefix), slot_name(p)))
         .collect()
 }
 
-/// The idiomatic C++ spelling of an IR type. `module` and `prefix` resolve
-/// typed-handle tags against the declaring module.
-pub(crate) fn cpp_type(ty: &Ty, module: &str, prefix: &str) -> String {
+/// The opaque C tag of a (possibly dot-qualified) interface referenced from
+/// `module`: `{prefix}_{module}_{Name}`.
+pub(crate) fn interface_c_tag(name: &str, module: &str, prefix: &str) -> String {
+    c_abi_struct_name(name, module, prefix)
+}
+
+/// The `detail` accessor returning the process-wide static vtable for a
+/// callback interface, named by its local C++ class name.
+pub(crate) fn vtable_accessor(local_name: &str) -> String {
+    format!("{local_name}_vtable")
+}
+
+/// The `detail` struct holding a callback interface's trampolines, named by
+/// its local C++ class name.
+pub(crate) fn trampoline_struct(local_name: &str) -> String {
+    format!("{local_name}_trampolines")
+}
+
+/// The idiomatic C++ spelling of an IR type. Interfaces map to their RAII
+/// wrapper class, `Interface?` to `std::optional` of it, and callback
+/// interfaces to a `std::shared_ptr` of the abstract class the consumer
+/// implements.
+pub(crate) fn cpp_type(ty: &Ty) -> String {
     match ty {
         Ty::I8 => "int8_t".into(),
         Ty::I16 => "int16_t".into(),
@@ -87,12 +115,8 @@ pub(crate) fn cpp_type(ty: &Ty, module: &str, prefix: &str) -> String {
         Ty::F32 => "float".into(),
         Ty::F64 => "double".into(),
         Ty::Bool => "bool".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "std::string".into(),
-        Ty::Bytes | Ty::BorrowedBytes => "std::vector<uint8_t>".into(),
-        Ty::Handle => "void*".into(),
-        // A typed handle is an opaque token: it stays the raw prefixed tag
-        // pointer (there is no destroy symbol to wrap in a RAII class).
-        Ty::TypedHandle(n) => format!("{}*", c_abi_struct_name(n, module, prefix)),
+        Ty::StringUtf8 => "std::string".into(),
+        Ty::Bytes => "std::vector<uint8_t>".into(),
         // Records and rich (algebraic) enums are plain value types; both are
         // named by their bare local C++ type.
         Ty::Record(n) | Ty::RichEnum(n) => local_type_name(n).to_string(),
@@ -100,14 +124,11 @@ pub(crate) fn cpp_type(ty: &Ty, module: &str, prefix: &str) -> String {
         // local C++ type `Unit`; never the dot-qualified IR name (invalid C++).
         Ty::Enum(n) => local_type_name(n).to_string(),
         Ty::Interface(n) => local_type_name(n).to_string(),
-        Ty::Optional(inner) => format!("std::optional<{}>", cpp_type(inner, module, prefix)),
-        Ty::List(inner) => format!("std::vector<{}>", cpp_type(inner, module, prefix)),
+        Ty::CallbackInterface(n) => format!("std::shared_ptr<{}>", local_type_name(n)),
+        Ty::Optional(inner) => format!("std::optional<{}>", cpp_type(inner)),
+        Ty::List(inner) => format!("std::vector<{}>", cpp_type(inner)),
         Ty::Map(k, v) => {
-            format!(
-                "std::unordered_map<{}, {}>",
-                cpp_type(k, module, prefix),
-                cpp_type(v, module, prefix)
-            )
+            format!("std::unordered_map<{}, {}>", cpp_type(k), cpp_type(v))
         }
         // An `iter<T>` return renders as a per-function lazy range class, not
         // through this generic mapping.
@@ -116,32 +137,37 @@ pub(crate) fn cpp_type(ty: &Ty, module: &str, prefix: &str) -> String {
 }
 
 /// One C++ parameter declaration (`<type> <name>`) for a wrapper signature.
-/// Heavier types borrow by const reference; scalars, enums, and raw handles
-/// pass by value. A `mutable: true` string or bytes parameter borrows by
-/// non-const reference so the producer's in-place writes reach the caller.
-pub(crate) fn cpp_param_decl(
-    ty: &Ty,
-    name: &str,
-    mutable: bool,
-    module: &str,
-    prefix: &str,
-) -> String {
-    let konst = if mutable { "" } else { "const " };
+/// Heavier types borrow by const reference; scalars and enums pass by value.
+/// A callback interface is taken as a `std::shared_ptr` by value, which the
+/// wrapper moves into the heap box it hands the producer as `ctx`.
+pub(crate) fn cpp_param_decl(ty: &Ty, name: &str) -> String {
     match ty {
-        Ty::StringUtf8 | Ty::BorrowedStr => format!("{konst}std::string& {name}"),
-        Ty::Bytes | Ty::BorrowedBytes => {
-            format!("{konst}std::vector<uint8_t>& {name}")
-        }
-        Ty::TypedHandle(_) => format!("{} {name}", cpp_type(ty, module, prefix)),
+        Ty::StringUtf8 => format!("const std::string& {name}"),
+        Ty::Bytes => format!("const std::vector<uint8_t>& {name}"),
         // Records and rich enums borrow: the wrapper encodes them into a local
         // buffer, so the value stays with the caller. Interfaces borrow their
-        // handle for the call.
+        // pointer for the call.
         Ty::Record(n) | Ty::RichEnum(n) | Ty::Interface(n) => {
             format!("const {}& {name}", local_type_name(n))
         }
         Ty::Optional(_) | Ty::List(_) | Ty::Map(_, _) => {
-            format!("const {}& {name}", cpp_type(ty, module, prefix))
+            format!("const {}& {name}", cpp_type(ty))
         }
-        _ => format!("{} {name}", cpp_type(ty, module, prefix)),
+        _ => format!("{} {name}", cpp_type(ty)),
+    }
+}
+
+/// One C++ parameter declaration for a callback-interface method the consumer
+/// implements. Borrowed strings, bytes, and buffered values arrive by const
+/// reference (the trampoline owns the decoded copy for the call); object
+/// arguments transfer one strong reference, so they arrive by value as the
+/// RAII wrapper (or `std::optional` of it) the implementation now owns.
+pub(crate) fn cpp_cb_param_decl(ty: &Ty, name: &str) -> String {
+    match ty {
+        Ty::Interface(n) => format!("{} {name}", local_type_name(n)),
+        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
+            format!("{} {name}", cpp_type(ty))
+        }
+        _ => cpp_param_decl(ty, name),
     }
 }

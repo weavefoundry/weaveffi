@@ -7,35 +7,48 @@ or library-author-facing.
 
 ## High-level pipeline
 
-Every `weaveffi generate` invocation flows through the same five
-stages, in this order:
+Every `weaveffi generate` invocation flows through the same stages, in
+this order:
 
 ```text
 Input: annotated Rust (.rs) or an IDL (YAML/JSON/TOML)
    │
    ▼
 Parse        ── weaveffi-ir::parse (IDL) | weaveffi-bridge (.rs): builds an `Api` IR
-   │
+   │            (`Module`, `Function`, `StructDef`, `EnumDef`, `InterfaceDef`,
+   │            `CallbackInterfaceDef`, `ErrorDomain`, `TypeRef`)
    ▼
 Validate     ── weaveffi-core::validate: rejects errors, collects warnings,
    │            indexes every user-type declaration, and wraps the untouched
-   │            document in a `ResolvedApi` proof type
-   │
+   │            document in a `ResolvedApi` proof type; `ResolvedApi::resolve`
+   │            turns each written `TypeRef` into a `Ty` with `Family` / `WireType`
    ▼
 Configure    ── weaveffi-cli `ProjectConfig`: loads the nearest weaveffi.toml
    │            ([package], [global], [generators.<target>]) and attaches the
    │            package identity to the `ResolvedApi`
    ▼
-Generate     ── weaveffi-core::codegen::Orchestrator: dispatches every
-   │            selected target in parallel via rayon; each target builds a
-   │            `BindingModel` (every type a resolved `Ty`) and renders it
+Model        ── weaveffi-core::model::BindingModel::build(api, prefix): every
+   │            callable gets its C symbol and `AbiSig` (ordered ABI slots from
+   │            `abi::lower_param` / `lower_return`), every interface its
+   │            `_clone`/`_destroy` symbols, every callback interface its vtable
+   ▼
+Plan         ── weaveffi-core::plan: `ArgPass`, `RetPass`, `ErrorStrategy`,
+   │            `IteratorProtocol`, `AsyncProtocol`, `CallbackProtocol`: the
+   │            language-neutral calling contracts derived from the model
+   ▼
+Generate     ── weaveffi-core::codegen::Orchestrator: checks each target's
+   │            `capabilities(config)` against the features the API uses, then
+   │            dispatches every selected target in parallel via rayon; each
+   │            `LanguageBackend` renders the model and plan in its own syntax
    ▼
 Output       ── Each target writes its files under {out_dir}/{target}/
                 and updates {out_dir}/.weaveffi-cache/{target}.hash
 ```
 
 `validate` stops after the second stage; `generate`, `diff`, and `package`
-run all of them.
+run all of them. The `#[weaveffi::module]` proc-macro runs the same
+pipeline up to the plan stage inside the producer's build and renders the
+`extern "C"` thunks instead of a consumer wrapper.
 
 A `.rs` input is lowered to the IR by `weaveffi-bridge`, the same extractor
 the `#[weaveffi::module]` proc-macro uses to build a producer's C ABI glue.
@@ -49,49 +62,54 @@ The workspace is structured as a small set of stable, focused crates.
 The dependency graph is acyclic and shallow:
 
 ```text
-weaveffi-cli ──► weaveffi-core ──► weaveffi-ir
-       │              │
-       │              ├──► weaveffi-gen-c
-       │              ├──► weaveffi-gen-cpp
-       │              ├──► weaveffi-gen-swift
-       │              ├──► weaveffi-gen-android
-       │              ├──► weaveffi-gen-node
-       │              ├──► weaveffi-gen-wasm
-       │              ├──► weaveffi-gen-python
-       │              ├──► weaveffi-gen-dotnet
-       │              ├──► weaveffi-gen-dart
-       │              ├──► weaveffi-gen-go
-       │              └──► weaveffi-gen-ruby
-       └──► weaveffi-bridge ──► weaveffi-ir   (lowers annotated .rs to IR)
+Consumer side (the `weaveffi` binary):
 
-Producer side (a Rust cdylib depends on these, not on the CLI):
+weaveffi-cli ──┬──► weaveffi-gen-c        ──┐
+               ├──► weaveffi-gen-cpp      ──┤
+               ├──► weaveffi-gen-swift    ──┤
+               ├──► weaveffi-gen-kotlin   ──┤
+               ├──► weaveffi-gen-node     ──┤
+               ├──► weaveffi-gen-wasm     ──┼──► weaveffi-core ──► weaveffi-ir
+               ├──► weaveffi-gen-python   ──┤
+               ├──► weaveffi-gen-dotnet   ──┤
+               ├──► weaveffi-gen-dart     ──┤
+               ├──► weaveffi-gen-go       ──┤
+               ├──► weaveffi-gen-ruby     ──┘
+               ├──► weaveffi-core
+               └──► weaveffi-bridge ──► weaveffi-ir   (lowers annotated .rs to IR)
 
-weaveffi ──► weaveffi-macros ──► weaveffi-bridge, weaveffi-core, weaveffi-ir
-   │
-   └──► weaveffi-abi   (the C ABI runtime, re-exported as `weaveffi::abi`)
+Producer side (a Rust cdylib depends on these, never on the CLI):
 
-weaveffi-abi  ──► (stand-alone, linked at run time by every cdylib that
-                  exposes the WeaveFFI C ABI)
+weaveffi ──┬──► weaveffi-macros ──► weaveffi-bridge, weaveffi-core, weaveffi-ir
+           │                        (build-time only: the proc-macro)
+           └──► weaveffi-abi        (the C ABI runtime, re-exported as `weaveffi::abi`;
+                                     linked into every cdylib that exposes the ABI)
 
-weaveffi-fuzz ──► weaveffi-ir, weaveffi-core (workspace-private; unpublished)
+weaveffi-fuzz ──► weaveffi-ir, weaveffi-core   (workspace-private; unpublished)
 ```
+
+`weaveffi-abi` depends on no other workspace crate, and `weaveffi-core`
+depends only on `weaveffi-ir`, so a producer's runtime never pulls the
+generators in and a generator never pulls the runtime in. The two meet only
+through the ABI revision number (`weaveffi_abi::ABI_VERSION` and
+`weaveffi_core::cabi::ABI_VERSION`, kept equal by a test).
 
 | Crate                | What it owns                                                                                                                                     |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `weaveffi-ir`        | The IR types (`Api`, `Module`, `Function`, `TypeRef`, …), the `parse_api_str` parser, the `parse_type_ref` mini-grammar, and `CURRENT_SCHEMA_VERSION`. The document model only: no package or generator configuration. |
-| `weaveffi-abi`       | Stable C ABI runtime symbols: `weaveffi_abi_version`, `weaveffi_error`, `weaveffi_error_clear`, `weaveffi_free_string`, `weaveffi_free_bytes`, the arena, cancel tokens, the `lift_*`/`lower_*` marshalling converters the macro calls, and the `export_runtime!` macro. |
+| `weaveffi-abi`       | The C ABI runtime (revision `ABI_VERSION = 2`): the `weaveffi_error` struct and the `-1`..`-4` runtime codes, `weaveffi_error_set`/`_clear`/`_free`, `weaveffi_free_string`/`_bytes`, cancel tokens, and the `export_runtime!` macro that emits them as `#[no_mangle]` symbols. Plus the modules the macro-generated thunks call: `buffer` (the value-buffer reader and writer), `convert` (the `lift_*`/`lower_*` converters), `object` (reference-counted interface objects: `lower_object`, `object_clone`, `object_destroy`, `object_arc`, `object_from_token`), `callback` (consumer vtables: the `Vtable` trait, `ForeignCallback`, `check_foreign_error`), and `spawn` (the pluggable `Spawner` behind `set_spawner`, with `CatchUnwind` turning a panicking future into a `-2` completion). |
 | `weaveffi-bridge`    | The single Rust-to-IR extractor: maps `#[weaveffi::module]`-annotated source (`syn` AST) to an `Api`. Shared by the proc-macro and the CLI's `extract`/`generate <file.rs>`. |
-| `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro family. Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). Emission is decomposed into nine focused submodules under `src/codegen/` (sync calls, async launchers, iterators, records, enums, interfaces, callbacks, marshalling, and shared helpers), each stating which clause of the `weaveffi_core::plan` contracts it implements. |
+| `weaveffi-macros`    | The `#[weaveffi::module]` proc-macro and its marker attributes (`export`, `record`, `enumeration`, `interface`, `callback_interface`, `error`, `cancellable`). Lowers an annotated module through `weaveffi-bridge`, builds the `BindingModel`, and emits the `#[no_mangle] extern "C"` thunks (marshalling via `weaveffi-abi`). Emission is decomposed into focused submodules under `src/codegen/` (`sync`, `async_fns`, `iterators`, `records`, `enums`, `interfaces`, `callbacks`, `marshal`, `helpers`), each stating which clause of the `weaveffi_core::plan` contracts it implements. |
 | `weaveffi`           | The producer facade a Rust cdylib depends on: re-exports the `weaveffi-macros` attributes, `export_runtime!`, and `weaveffi-abi` as `weaveffi::abi`. |
-| `weaveffi-core`      | Validation and the `ResolvedApi` proof type, the resolved `Ty` type model with its `Family` and `WireType` classifications, the `BindingModel`, the `LanguageBackend` trait and its `Target`/`ConfiguredBackend` object-safe view, the `Orchestrator`, the `abi` C-ABI lowering model, the `cabi` shared C declaration renderer, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `pkg` package-identity policy, the `lang` per-language keyword tables, the `manifest` escaping helpers, and the per-target hash cache. |
+| `weaveffi-core`      | Validation and the `ResolvedApi` proof type, the resolved `Ty` type model with its `Family` and `WireType` classifications, the `BindingModel`, the `LanguageBackend` trait and its `Target`/`ConfiguredBackend` object-safe view, the `capabilities` feature gate, the `Orchestrator`, the `abi` C-ABI lowering model, the `cabi` shared C declaration renderer, the `plan` marshalling-plan module (the language-neutral calling contracts; see [The marshalling plan](#the-marshalling-plan)), the `errors` naming policy for generated error types, the `pkg` package-identity policy, the `lang` per-language keyword tables, the `manifest` escaping helpers, and the per-target hash cache. |
 | `weaveffi-gen-*`     | Eleven generator crates. Each implements `LanguageBackend` and produces target-specific output (header, wrapper, package metadata). Each follows a shared internal layout; see [Generator crate layout](#generator-crate-layout). |
 | `weaveffi-cli`       | The `weaveffi` binary. Loads the definition and the project's `weaveffi.toml`, applies validation, instantiates every target (via the `cli_targets!` registry in `config.rs`), and dispatches the `Orchestrator`. Subcommands live under `commands/` (`generate`, `validate`, `diff`, `package`); `extract.rs` sits beside `main.rs`; `config.rs` holds the target registry and `ProjectConfig`; `report.rs` formats CLI output. |
 | `weaveffi-fuzz`      | `cargo-fuzz` harnesses for the parsers, the validator, and `parse_type_ref`. Workspace-private (not published to crates.io).                     |
 
 Crates that contain `unsafe` code opt in explicitly: `weaveffi-abi`,
-`weaveffi-fuzz`, and any `samples/*` producer that dereferences a raw handle pointer in its own
-helpers (such as `kvstore`) add `#![allow(unsafe_code)]` at the top of
-their main source file. The thunks the `#[weaveffi::module]` macro emits
+`weaveffi-fuzz`, and any `samples/*` producer that dereferences a raw
+pointer in its own helpers (such as `kvstore`) add `#![allow(unsafe_code)]`
+at the top of their main source file. The thunks the `#[weaveffi::module]` macro emits
 instead carry a scoped `#[allow(unsafe_code)]` on each generated function, so
 a macro-based producer needs no crate-level opt-in. The workspace-wide
 `unsafe_code = deny` lint forbids it everywhere else.
@@ -152,19 +170,25 @@ that matter most:
 - `Api { version, modules }`: root node. Unknown top-level keys are
   rejected (`deny_unknown_fields`), so a stale `package:` or
   `generators:` block fails to parse instead of being silently dropped.
-- `Module { name, doc, functions, interfaces, structs, enums, callbacks,
-  listeners, errors, modules }`: modules can nest.
+- `Module { name, doc, functions, interfaces, callback_interfaces,
+  structs, enums, errors, modules }`: modules can nest.
 - `Function { name, params, returns, doc, throws, async, cancellable,
-  deprecated, since }`. The same shape describes an interface's
-  constructors, methods, and statics.
-- `InterfaceDef { name, doc, constructors, methods, statics }`: an opaque
-  object type; every interface also receives an implicit destroy symbol.
-- `TypeRef` enumerates every type reference a document can *write*:
-  primitives (`I32`, `U32`, `I64`, `F64`, `Bool`, `StringUtf8`, `Bytes`,
-  `Handle`, `BorrowedStr`, `BorrowedBytes`), the two user-type spellings
-  (`Named(String)` for any record, enum, or interface by bare or
-  dot-qualified name, and `TypedHandle(String)`), and the four composite
-  shapes (`Optional`, `List`, `Map`, `Iterator`).
+  deprecated }`. The same shape describes an interface's constructors,
+  methods, and statics and a callback interface's methods.
+- `InterfaceDef { name, doc, deprecated, constructors, methods, statics }`:
+  a reference-counted object type; every interface also receives implicit
+  `_clone` and `_destroy` symbols.
+- `CallbackInterfaceDef { name, doc, deprecated, methods }`: a method set
+  the consumer implements and the producer calls through a vtable.
+- `TypeRef` enumerates every type reference a document can *write*: the
+  thirteen primitives (`I8` through `U64`, `F32`, `F64`, `Bool`,
+  `StringUtf8`, `Bytes`), one user-type spelling (`Named(String)` for any
+  record, enum, interface, or callback interface by bare or dot-qualified
+  name), and the four composite shapes (`Optional`, `List`, `Map`,
+  `Iterator`). Schema 0.9.0 removed `Handle`, `TypedHandle`,
+  `BorrowedStr`, and `BorrowedBytes` along with `Param.mutable` and
+  `Function.since`; the parser rejects each with a message naming its
+  replacement.
 
 The document never learns what a `Named` reference *is*. That knowledge
 lives one layer up, in `weaveffi_core`:
@@ -179,31 +203,35 @@ lives one layer up, in `weaveffi_core`:
 - `weaveffi_core::model::Ty` is the *resolved* type every generator
   consumes: the same primitives and composites as `TypeRef`, but every
   user type carries its kind and dot-qualified name (`Record`, `RichEnum`,
-  `Enum`, `Interface`, `TypedHandle`). There is no unresolved variant, so
-  a generator can't forget to handle one.
+  `Enum`, `Interface`, `CallbackInterface`). There is no unresolved
+  variant, so a generator can't forget to handle one.
 - Two total classifications hang off `Ty`. `Ty::family()` says how a
-  value crosses a *call boundary* (`Direct`, `String`, `Bytes`, `Buffer`,
-  `Object { nullable }`, `Iterator`); the ABI lowering, the marshalling
-  plan, and every backend's argument handling dispatch on it.
-  `Ty::wire()` says how a value is encoded *inside a value buffer*
-  (`WireType::Prim`, `Handle`, `Enum`, `User`, `Optional`, `List`,
-  `Map`); every backend's codec emitter dispatches on it. Records, rich
-  enums, optionals, lists, and maps are the `Buffer` family: they cross
-  the ABI by value as one serialized `(const uint8_t*, size_t)` pair (see
-  the [Value Buffer Protocol](reference/value-buffers.md)), while `Enum`
-  lowers by value as an integer.
+  value crosses a *call boundary*: `Direct` (scalars, `bool`, C-style
+  enums, one slot by value), `String`, `Bytes`, `Buffer` (records, rich
+  enums, optionals, lists, maps, as one serialized `ptr`/`len` pair),
+  `Object { nullable }` (an interface or `Interface?`, one pointer slot),
+  `Callback` (a callback interface, a `ctx`/`vtable` pair), and
+  `Iterator`. The ABI lowering, the marshalling plan, and every backend's
+  argument handling dispatch on it. `Ty::wire()` says how a value is
+  encoded *inside a value buffer* (`WireType::Prim`, `Object`, `Enum`,
+  `User`, `Optional`, `List`, `Map`); every backend's codec emitter
+  dispatches on it. `Object` is the wire shape of an interface stored in
+  a record, list, map, or optional: a `u64` token carrying one strong
+  reference (see the [Value Buffer Protocol](reference/value-buffers.md)).
+  Callback interfaces and iterators have no wire shape because validation
+  never admits them inside a buffer.
 
 Every IR type derives `Debug`, `Clone`, `PartialEq`, `Eq`, `Serialize`,
 and `Deserialize`.
 
-`TypeRef` (de)serializes as a string with custom syntax (`i32`,
-`handle<T>`, `[T]`, `{K:V}`, `T?`, `&str`, `&[u8]`). The parser is
+`TypeRef` (de)serializes as a string with custom syntax (`i32`, `Name`,
+`[T]`, `{K:V}`, `T?`, `iter<T>`). The parser is
 `weaveffi_ir::ir::parse_type_ref`; both human-written IDL and the
 JSON Schema export rely on it.
 
 ### Schema versioning
 
-`CURRENT_SCHEMA_VERSION` (currently `"0.8.0"`) lives in
+`CURRENT_SCHEMA_VERSION` (currently `"0.9.0"`) lives in
 [`crates/weaveffi-ir/src/ir.rs`][ir-source]. Pre-1.0, `SUPPORTED_VERSIONS`
 contains exactly the current version; older schema revisions are rejected
 by validation with an actionable error. When you change the schema:
@@ -235,32 +263,38 @@ Errors enforced today:
 - Reserved keyword rejection (`if`, `else`, `for`, `while`, `loop`,
   `match`, `type`, `return`, `async`, `await`, `break`, `continue`,
   `fn`, `struct`, `enum`, `mod`, `use`).
-- Uniqueness of module/function/parameter/struct/enum/field/variant
-  names within their respective scopes, plus API-wide uniqueness of bare
-  type names (structs, enums, interfaces, and error domains share one
-  global namespace).
+- Uniqueness of module/function/parameter/struct/enum/field/variant/
+  interface/callback-interface names within their respective scopes, plus
+  API-wide uniqueness of bare type names (structs, enums, interfaces,
+  callback interfaces, and error domains share one global namespace).
 - Structs must have at least one field; enums at least one variant;
-  interfaces at least one member.
+  interfaces at least one member; callback interfaces at least one method.
 - Enum discriminant uniqueness within an enum.
 - Type references resolve by bare name across the whole API; the
   `ResolvedApi` index qualifies each to its owning module and kind (see
   [The IR](#the-ir) and
   [Cross-module references](reference/idl.md#cross-module-type-references)).
 - Interface members (constructors, methods, statics) share one namespace
-  per interface; constructors declare no return and cannot be async;
-  interface types are valid only as parameters, returns, and optionals of
-  those. Free functions and interface members share the module's C symbol
-  namespace.
+  per interface; constructors declare no return and cannot be async.
+  Interface types are valid in every position except as a map key. Free
+  functions and interface members (including the implicit `_clone` and
+  `_destroy`) share the module's C symbol namespace.
+- Callback-interface methods are synchronous, never `throws`, and return
+  nothing or a `Direct` value; a callback interface type is valid only as
+  a bare top-level parameter of a function, constructor, static, or
+  method.
 - `throws: true` requires an error domain in scope (the module or an
   ancestor).
-- Iterator return types are valid in return position only.
-- Map keys must be a scalar, string, or enum type.
-- `event_callback` on a listener must reference a callback in the same
-  module.
+- Iterator types are valid only as the outermost return of a synchronous
+  callable.
+- Map keys must be a scalar, `bool`, `string`, or C-style enum type.
 - Error domain name must not collide with a function name in the same
   module; codes must be positive (`0` means success and negative codes
   are reserved for the runtime) and unique within the domain; code names
   must be unique across every domain in the API.
+
+The [IDL Reference](reference/idl.md#error-catalog) lists every
+`ValidationError` variant with the message and suggestion the CLI prints.
 
 Warnings emitted today:
 
@@ -270,27 +304,30 @@ Warnings emitted today:
 - `AsyncVoidFunction` (async without a return type).
 - `DeprecatedFunction` (informational).
 
-Interfaces, typed error domains, async functions, cancellable functions,
-listeners, callbacks, iterators (`iter<T>`), typed handles (`handle<T>`),
-borrowed types (`&str`, `&[u8]`), nested modules, and cross-module type
-references are all **first-class**. They pass validation and every
-generator handles them. Do not re-add validator rejections for these
-features.
+Interfaces (in every position, including inside records, collections,
+iterator elements, and async returns), callback interfaces, typed error
+domains with structured payloads, async and cancellable functions,
+iterators (`iter<T>`), nested modules, and cross-module type references
+are all **first-class**. They pass validation and every generator handles
+them. Do not re-add validator rejections for these features.
 
-Per-target capability gating still exists as a mechanism: each
-generator declares a `TargetCapabilities` (async, callbacks, listeners,
-iterators), and the orchestrator fails generation (listing the
-offending IDL definitions) when a selected target cannot deliver a
-used feature. Today every shipped target declares full support, so the
-gate only fires if a future target (or a new gated feature) introduces
-a gap; a partial target's `allow_unsupported = true` config would opt
-into generating the rest of the surface with explicit throwing stubs in
-place of the unsupported entry points. The Wasm generator's Emscripten
-mode is the one place stubs still appear: async functions, callbacks,
-and listeners become explicit throwing stubs there (and are omitted
-from the TypeScript declarations) because Emscripten modules do not
-portably expose the trampoline machinery. Capability failures and mode
-gaps must stay loud: never skip a definition silently.
+Per-target capability gating still exists as a mechanism.
+`weaveffi_core::capabilities::Feature` names the gated features
+(`AsyncFunctions`, `CallbackInterfaces`, `Iterators`), each generator
+answers `LanguageBackend::capabilities(&self, config)` with a
+`TargetCapabilities`, and the orchestrator runs `capabilities::check`
+against `used_features(api)` before dispatch, failing generation (and
+listing the offending IDL definitions) when a selected target cannot
+deliver a used feature. The config is passed because a backend can have
+modes with different ceilings: the Wasm generator's Emscripten mode
+reports no async or callback support, and its `allow_unsupported = true`
+flag (read through `LanguageBackend::allows_unsupported`) downgrades the
+failure to a loud warning and makes the backend emit explicit throwing
+stubs in place of the unsupported entry points (omitted from the
+TypeScript declarations) because Emscripten modules do not portably expose
+the trampoline machinery. Every other shipped target declares full
+support. Capability failures and mode gaps must stay loud: never skip a
+definition silently.
 
 ## Project configuration
 
@@ -352,7 +389,8 @@ the object-safe `weaveffi_core::codegen::Target` view instead:
 ```rust,ignore
 pub trait Target: Send + Sync {
     fn name(&self) -> &'static str;               // the `--target` token
-    fn capabilities(&self) -> TargetCapabilities;
+    fn capabilities(&self) -> TargetCapabilities; // the backend's answer for its bound config
+    fn allows_unsupported(&self) -> bool;
     fn generate(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Result<()>;
     fn output_files(&self, api: &ResolvedApi, out_dir: &Utf8Path) -> Vec<String>;
     fn package(&self, api: &ResolvedApi, ctx: &PackageContext, out_dir: &Utf8Path)
@@ -372,23 +410,29 @@ pub trait LanguageBackend: Send + Sync {
     type Config: Serialize + Default + Clone + Send + Sync;
     fn name(&self) -> &'static str;
 
+    /// Required: the gated features (async, callback interfaces, iterators)
+    /// this backend implements under `config`. Modes with different
+    /// ceilings (Wasm's Emscripten mode) answer differently per config.
+    fn capabilities(&self, config: &Self::Config) -> TargetCapabilities;
+    /// Whether `config` opts into generating despite unsupported features
+    /// (the backend must then emit explicit throwing stubs). Default `false`.
+    fn allows_unsupported(&self, config: &Self::Config) -> bool { false }
+
     /// C ABI symbol prefix; the driver builds the `BindingModel` with it.
     fn prefix<'a>(&self, config: &'a Self::Config) -> &'a str { "weaveffi" }
 
-    /// The single required hook: assemble every output file. Rendering is
+    /// The other required hook: assemble every output file. Rendering is
     /// pure; the driver performs the actual writes.
     fn files(&self, api: &ResolvedApi, model: &BindingModel,
              out_dir: &Utf8Path, config: &Self::Config) -> Vec<OutputFile>;
 
-    /// Canonical per-module walk (error → enums → structs → interfaces →
-    /// callbacks → listeners → functions) with call-shape dispatch.
-    /// Single-pass backends override the `render_enum`/`render_struct`/
-    /// `render_function` hooks and call this; multi-pass backends build
-    /// their layout in `files` directly.
+    /// Canonical per-module walk (error → enums → structs → callback
+    /// interfaces → interfaces → functions) with call-shape dispatch.
+    /// Single-pass backends override the `render_*` hooks and call this;
+    /// multi-pass backends build their layout in `files` directly.
     fn emit_members(&self, out: &mut String, module: &ModuleBinding, config: &Self::Config) { /* … */ }
-    // render_error / render_enum / render_struct / render_interface /
-    // render_callback / render_listener / render_function: all default
-    // to no-op.
+    // render_error / render_enum / render_struct / render_callback_interface /
+    // render_interface / render_function: all default to no-op.
 }
 ```
 
@@ -402,9 +446,9 @@ Python, Ruby, Go, Dart, and .NET are single-pass backends: they
 override the per-entity hooks and compose `emit_members` inside their
 module scoping. The rest build their layout directly in `files`: C and
 C++ order declarations by dependency, Swift splits types from the
-namespaced module body, and Android, Node, and Wasm each render
-parallel files (Kotlin + JNI C, addon C + JS, JS + `.d.ts`) in their
-own passes.
+namespaced module body, and Kotlin, Node, and Wasm each render
+parallel files (Kotlin + JNI C, addon C + JS + `.d.ts`, JS + `.d.ts`) in
+their own passes.
 
 Generators emit code into a `String`; there is no template-engine layer
 (an early Tera prototype intended for user template overrides was removed
@@ -428,9 +472,15 @@ managed by the `CodeWriter` toolkit (see below) rather than by hand-rolled
   every backend renders (see [The marshalling plan](#the-marshalling-plan)).
 - `model::ty`: `Ty::wire()` folds every type into its wire shape inside
   a value buffer (`WireType`), so backend codec emitters dispatch on one
-  closed alphabet instead of each re-deriving the folds (handles encode
-  as `u64` tokens, borrowed views encode like their owned forms, records
-  and rich enums share one user-codec shape).
+  closed alphabet instead of each re-deriving the folds (objects encode
+  as `u64` tokens carrying one strong reference, records and rich enums
+  share one user-codec shape).
+- `capabilities`: the `Feature` alphabet, `TargetCapabilities`, and the
+  `used_features`/`check` pair the orchestrator runs before dispatch.
+- `errors`: the naming policy for generated error types (`WeaveFFIError`
+  versus `WeaveFFIException` brands, `type_name`, `exception_type_name`,
+  `pascal`), so no two targets disagree on how `KEY_NOT_FOUND` is spelled;
+  see [Naming and Package Conventions](reference/naming.md#error-domains-and-codes).
 - `cabi`: the shared renderer for C declarations (runtime prototypes,
   including `{prefix}_abi_version` and the `{PREFIX}_ABI_VERSION` macro,
   enums, interface typedefs, function prototypes) that both the C and C++
@@ -479,7 +529,7 @@ Design points that keep output stable and migrations safe:
   byte-for-byte.
 
 The Python backend (`weaveffi-gen-python`) is the reference adopter: its
-return marshalling, getters, enums, callbacks, listeners, and the central
+return marshalling, getters, enums, callback interfaces, and the central
 function renderer are built with `CodeWriter`. Remaining generators are
 being migrated onto it incrementally, each move guarded by the snapshot
 corpus.
@@ -490,8 +540,10 @@ The signatures above use `Result<T>` from `anyhow` and IR types from
 Implementation notes:
 
 - Implement `name()` (the `--target` flag value, e.g. `"swift"`), the
-  associated `Config` type, and `files()`; override `prefix()` when the
-  config carries a configurable `c_prefix`.
+  associated `Config` type, `capabilities()`, and `files()`; override
+  `prefix()` when the config carries a configurable `c_prefix` and
+  `allows_unsupported()` when a mode of the target can't deliver every
+  feature.
 - Return every emitted file from `files()`; `--dry-run` and
   `weaveffi diff` read the derived `output_files`, so there is no separate
   list to keep in sync.
@@ -501,24 +553,32 @@ Implementation notes:
 
 ## C ABI naming convention
 
-Every emitted C symbol follows
-`{c_prefix}_{module}_{function}` (default `c_prefix = "weaveffi"`).
-The `c_prefix` configuration is honored end-to-end: when set, the
-generated C output uses it consistently, including references to
-`weaveffi-abi` runtime symbols (`{c_prefix}_error`,
-`{c_prefix}_error_clear`, `{c_prefix}_free_string`,
-`{c_prefix}_free_bytes`, `{c_prefix}_abi_version`). Because the Rust
+Every emitted C symbol follows `{c_prefix}_{module_path}_{function}`
+(default `c_prefix = "weaveffi"`), interface members follow
+`{c_prefix}_{module_path}_{Interface}_{member}` with the implicit
+`_clone` and `_destroy` beside them, and callback interfaces contribute a
+`{c_prefix}_{module_path}_{Name}_vtable` type and no symbols. The
+`c_prefix` configuration is honored end-to-end: when set, the generated C
+output uses it consistently, including references to `weaveffi-abi`
+runtime symbols (`{c_prefix}_error`, `{c_prefix}_error_set`,
+`{c_prefix}_error_clear`, `{c_prefix}_error_free`,
+`{c_prefix}_free_string`, `{c_prefix}_free_bytes`,
+`{c_prefix}_abi_version`, the cancel-token functions). Because the Rust
 runtime always exports the canonical `weaveffi_*` names, the header
 `#define`s each prefixed runtime name to its canonical symbol (the
 `utils::ABI_RUNTIME_SYMBOLS` table, kept in lockstep with
-`export_runtime!`).
+`export_runtime!`). The full naming policy, including the per-language
+re-casing, is in [Naming and Package Conventions](reference/naming.md#generated-identifiers).
 
 ### ABI revision
 
-`weaveffi_abi::ABI_VERSION` (mirrored as `weaveffi_core::cabi::ABI_VERSION`
-and kept equal by a test in the `weaveffi` facade crate) numbers the
-runtime surface: the `weaveffi_error` layout, the value-buffer encoding,
-and the set and signatures of the `weaveffi_*` runtime symbols.
+`weaveffi_abi::ABI_VERSION` (currently `2`; mirrored as
+`weaveffi_core::cabi::ABI_VERSION` and kept equal by a test in the
+`weaveffi` facade crate) numbers the runtime surface: the `weaveffi_error`
+layout and runtime codes, the value-buffer encoding including object
+tokens, the object `_clone`/`_destroy` and callback vtable conventions,
+and the set and signatures of the `weaveffi_*` runtime symbols. The
+normative text is the [C ABI Contract](reference/abi.md).
 `export_runtime!` exports it as `weaveffi_abi_version()`; the C header
 declares it and defines `{PREFIX}_ABI_VERSION`. Generated consumers embed
 the revision they were built for and, where a check costs one call at
@@ -541,9 +601,12 @@ A `string` becomes one `const char*`; `bytes` becomes
 (records, rich enums, optionals, lists, maps; the `Buffer`
 [`Family`](#the-ir)) becomes the same borrowed
 `{name}_ptr` / `{name}_len` pair holding its serialized
-[value buffer](reference/value-buffers.md); bytes and buffered returns
-append a `size_t* out_len` pointer; and every fallible call ends with a
-trailing `{prefix}_error*`.
+[value buffer](reference/value-buffers.md); an interface becomes one
+borrowed `const {tag}*` parameter or one owned `{tag}*` return; a callback
+interface becomes `void* {name}_ctx, const {tag}_vtable* {name}_vtable`;
+bytes and buffered returns append a `size_t* out_len` pointer; and every
+synchronous symbol other than `_clone` and `_destroy` ends with a trailing
+`{prefix}_error* out_err`.
 
 That calling convention is defined **once**, in
 [`weaveffi_core::abi`][abi-source], rather than re-derived inside each
@@ -552,13 +615,16 @@ generator:
 - `CType`: a prefix-agnostic algebra of C types (`Int32`, `Size`,
   `Ptr { pointee, const_pos }`, `StructTag { module, name }`, …) with a
   single `render_c(prefix)` method that produces canonical C spelling.
-- `element_ctype(ty, module)`: the C type of a single element.
-- `lower_param(name, ty, module, mutable)`: expands one IDL parameter
-  into its ordered `AbiParam` slots.
+- `lower_param(name, ty, module)`: expands one IDL parameter into its
+  ordered `AbiParam` slots.
 - `lower_return(ty, module)`: the return `CType` plus any trailing
   `out_*` `AbiParam`s.
-- `callback_result_params(ty, module)`: the trailing slots an async
-  callback receives after `(context, err)`.
+- `sync_signature`, `async_input_params`, `async_callback_params`, and
+  `callback_method_signature`: assemble a whole `AbiSig` for a synchronous
+  symbol, an `_async` launcher, its completion callback, and a
+  callback-interface vtable entry, adding the fixed slots
+  (`error_out_param`, `context_param`, `ctx_param`, `cancel_token_param`)
+  in their canonical positions.
 
 The C and C++ generators render these slots straight to C
 declarations, so their headers *are* the model by construction. The
@@ -583,7 +649,7 @@ their generator rather than leaking into the shared model:
 
 Imperative generators (Go cgo, Node, Dart, Swift) build their FFI
 signatures inline with marshalling code and dispatch on `Ty::family()`
-for the shape of each slot. The Android (JNI) and Wasm backends target
+for the shape of each slot. The Kotlin (JNI) and Wasm backends target
 different ABIs entirely and do not consume the C lowering.
 
 When you add a parameter shape or change how a type crosses the
@@ -599,26 +665,33 @@ language-neutral statement of the calling contracts every backend
 renders, the questions the eleven generators used to answer
 independently (and inconsistently):
 
-- **Passing.** `ArgPass` (`ParamBinding::arg_pass()`) and `RetPass`
-  (`plan::ret_pass`): how one parameter or return crosses the boundary
-  (a direct scalar slot, a string pointer, a bytes or buffer
-  `ptr`/`len` pair, or an object handle), so marshalling code dispatches
-  on the plan instead of re-deriving the shape with local matches on
-  `Ty`.
+- **Passing in.** `ArgPass` (`ParamBinding::arg_pass()`): how one
+  parameter crosses the boundary (`Direct`, `String`, `Bytes`, `Buffer`,
+  `Object` borrowed for the call, or `Callback` as a `ctx`/`vtable` pair),
+  so marshalling code dispatches on the plan instead of re-deriving the
+  shape with local matches on `Ty`.
+- **Passing out.** `RetPass` (`plan::ret_pass`): the receiving contract
+  for a sync return, an async result, an iterator element, or a
+  callback-method argument (`Void`, `Direct`, `String`, `Bytes`, `Buffer`,
+  or `Object { destroy_symbol, clone_symbol, nullable }`). `Object` names
+  both lifecycle symbols because a wrapper that adopts one strong
+  reference eventually owes `destroy_symbol` and calls `clone_symbol`
+  whenever it needs a second reference, for example to write the object
+  into a value buffer.
 - **Errors.** `ErrorStrategy` (`Throws` | `Trap`): when a call reports
   through `out_err`, is the non-zero code a typed domain error the
   caller can catch (`throws: true`), or a producer bug the wrapper must
   trap on? `FnBinding::error_strategy()` answers it once. See the
   [Error Handling guide](guides/errors.md#throws-versus-trap).
-- **Ownership.** `ReturnFree` and `ElemFree` (via the `return_free` and
-  `elem_free` functions): after copying a returned value, or one
-  array/map/iterator element, into a native one, exactly which runtime
-  release call does the wrapper owe (`{prefix}_free_string`,
-  `{prefix}_free_bytes`, a type's `_destroy` symbol), if any?
+- **Ownership.** `Free` (`None` | `String` | `Bytes`, via
+  `RetPass::free()` and `plan::elem_free`): after copying a returned
+  value, or one list/map/iterator element, into a native one, exactly
+  which runtime release call does the wrapper owe? Adopted objects report
+  `Free::None` here and owe their `_destroy` instead.
 - **Iterators.** `IteratorProtocol` (`IteratorBinding::protocol`): the
   `iter<T>` pull contract, including the requirement that wrappers stay
   lazy (one producer `next` call per consumer step, never a hidden
-  drain into a list), the per-element release plan, and the
+  drain into a list), the per-element `RetPass`, and the
   destroy-exactly-once handle lifecycle.
 - **Async.** `AsyncProtocol` (`AsyncBinding::protocol`): the
   completion-callback contract: the callback fires exactly once from an
@@ -626,16 +699,25 @@ independently (and inconsistently):
   consumer: result buffers are released through the runtime free
   symbols, a heap-boxed error through `{prefix}_error_free`, and
   owned-object results are adopted.
+- **Callback interfaces.** `CallbackProtocol`
+  (`CallbackInterfaceBinding::protocol`): the vtable layout (one entry per
+  method in declaration order plus the trailing `free`), the `RetPass` for
+  each method argument as received inside the consumer's trampoline
+  (strings and buffers borrowed for the dispatch, objects adopted), the
+  direct-only return, and the foreign-error rule (an exception becomes
+  `weaveffi_error_set(out_err, -4, …)`, never an unwind through C).
 
 Generators are thin syntax backends over this shared plan: a backend
 that renders these plans in its own syntax cannot drift from the others
 on semantics; only the spelling differs. The producer side consumes the
 same contracts: each `weaveffi-macros` codegen submodule states which
 plan clause it implements (the generated `_async` launchers hand the
-callback owned results and a heap-boxed error, iterator thunks
-yield one element per `_next`, and error dispatch follows
-`ErrorStrategy`), so the emitted glue and every consumer wrapper agree
-by construction. When a generator needs a free/destroy or throws/trap
+callback owned results and a heap-boxed error, iterator thunks yield one
+element per `_next`, `interfaces` emits `_clone`/`_destroy` over
+`weaveffi_abi::object`, `callbacks` wraps a vtable in a
+`weaveffi_abi::callback::ForeignCallback` and checks `out_err` after every
+dispatch, and error dispatch follows `ErrorStrategy`), so the emitted glue
+and every consumer wrapper agree by construction. When a generator needs a free/destroy or throws/trap
 decision, it should consume the plan rather than re-derive the fact
 with a local match.
 
@@ -654,8 +736,8 @@ doesn't need):
 | `docs.rs`     | Doc-comment emission in the target's comment syntax               |
 | `codec.rs`    | Value-buffer encode/decode emitters, dispatched on `Ty::wire()`    |
 | `runtime.rs`  | The fixed runtime prelude the generated code relies on            |
-| `calls.rs`    | Sync/async/iterator wrappers, callbacks, listeners, marshalling   |
-| `entities.rs` | Enums, records, interfaces, typed error domains                   |
+| `calls.rs`    | Sync/async/iterator wrappers, callback trampolines, marshalling   |
+| `entities.rs` | Enums, records, interfaces, callback interfaces, typed error domains |
 | `package.rs`  | Ecosystem manifests and READMEs                                   |
 | `tests.rs`    | The crate's test module, via `#[cfg(test)] mod tests;`            |
 
@@ -676,6 +758,38 @@ collect to a `Vec` and `sort_by_key`. Never rely on `HashMap`
 iteration order for output; CI snapshot tests will fail
 non-deterministically on different platforms or insta orderings.
 
+## The test pyramid
+
+Each layer catches a different class of regression, and a change to the
+ABI or the IR usually has to pass through all of them:
+
+| Layer | Where | What it pins |
+|-------|-------|--------------|
+| Unit tests | `#[cfg(test)]` modules in every crate; `tests.rs` in each generator | Parsing, validation rules, `Ty` classification, ABI lowering, per-generator naming and codec helpers |
+| Property tests | `crates/weaveffi-abi/tests/buffer_proptest.rs` (`proptest`) | The value-buffer codec laws: `decode(encode(v)) == v` for every `BufferValue`, and encodings are self-delimiting (concatenations split back exactly; trailing bytes are an error) |
+| Compile-fail tests | `crates/weaveffi-macros/tests/ui.rs` (`trybuild`) | The proc-macro's contract: `ui/pass_*.rs` must expand and compile, `ui/fail_*.rs` must be rejected with the pinned `.stderr` (a `&mut` parameter, a callback method returning `String`, an interface that isn't `Sync`, a `Result` without an error domain, and so on) |
+| Runtime tests | `crates/weaveffi-abi/tests/export_runtime.rs`, `crates/weaveffi/tests/abi_version.rs` | `export_runtime!` exports every symbol in `ABI_RUNTIME_SYMBOLS`, and the two `ABI_VERSION` constants agree |
+| Snapshots | `crates/weaveffi-cli/tests/snapshots.rs` (`insta`) | Byte-exact output of all eleven generators over the five-fixture corpus (below) |
+| Determinism | `crates/weaveffi-cli/tests/determinism.rs` | Two runs over the kitchen-sink fixture are byte-identical |
+| CLI and output audits | `crates/weaveffi-cli/tests/cli_*.rs`, `extract_roundtrip.rs`, `no_silent_stubs.rs`, `safety_audit.rs`, `docs_examples.rs` | Exit codes and diagnostics of every subcommand, including `diff --check`; `extract` round-trips an IDL unchanged; no `unimplemented!`/`todo!` or stub markers in generator sources or their output; each target's disposal idiom really calls `_destroy` and frees strings; the README and Getting Started IDL snippets validate and generate, and every `SUMMARY.md` link resolves |
+| Conformance | `conformance/run.sh` | Real consumers in all eleven languages against the eight `samples/*` producers (`contacts`, `events`, `kvstore`, `shapes`, `async-demo`, `codec`, `inventory`, and the header-only `calculator`), each compiled and run to exit 0 |
+
+`weaveffi diff --check` is also how downstream projects gate their own
+CI: it regenerates into a temporary directory, compares with the committed
+output, and exits non-zero (with a distinct exit code for "would change")
+without writing anything.
+
+The conformance matrix is the only layer that executes generated code
+against a live producer, so it is where ownership bugs surface: every
+language runs the `events` lane (a callback interface, an object handed
+back through a callback, iterators), the `kvstore` lane (objects inside
+records, lists, and optionals; async; an eviction callback interface), the
+`async-demo` lane, the `codec` lane (every wire shape round-tripped,
+including object tokens inside buffers), and `shapes` (rich enums);
+`contacts` covers the original struct/enum/optional surface, and the
+`inventory` lanes cover nested modules with cross-module references and
+per-module error domains.
+
 ## Snapshot tests
 
 `crates/weaveffi-cli/tests/snapshots.rs` runs every generator across a
@@ -683,8 +797,10 @@ five-fixture corpus under `tests/fixtures/` (`kitchen_sink`, which
 exercises every IDL feature; `shapes`, rich enums and records;
 `nested_modules`, cross-module references; `docs_everywhere`, doc-comment
 emission; and `edge_cases`, reserved-word identifiers, deeply nested
-composites, mutable and optional parameters, and the other shapes a
-mainstream API never reaches). The eleven targets are driven by one data-driven
+composites, optional parameters, interfaces in every legal position
+including inside records, lists, maps, and iterators, callback interfaces
+carrying composite payloads and objects, and the other shapes a mainstream
+API never reaches). The eleven targets are driven by one data-driven
 `snapshot_tests!` macro, so adding a fixture or a target is a one-line
 change. Output is diffed via [`cargo-insta`][insta]. When a snapshot diff
 is intentional:
@@ -713,8 +829,10 @@ A condensed checklist (the long version lives in
    `weaveffi-gen-c`. Add it to `members` in the root `Cargo.toml` and
    depend on `weaveffi-core` and `weaveffi-ir`.
 2. Implement `weaveffi_core::backend::LanguageBackend`: define the
-   associated `Config` type, then `name`, `prefix` (if the config carries
-   a `c_prefix`), and `files` (returning every `OutputFile`). For a
+   associated `Config` type, then `name`, `capabilities` (declare every
+   feature you implement; the orchestrator fails loudly for the rest),
+   `prefix` (if the config carries a `c_prefix`), and `files` (returning
+   every `OutputFile`). For a
    single-pass layout, override the `render_enum`/`render_struct`/
    `render_function` hooks and compose `emit_members`; otherwise build the
    layout directly in `files`. Reuse `BindingModel`, `Ty::family()`, and
@@ -738,8 +856,11 @@ A condensed checklist (the long version lives in
 
 ## Where to read next
 
-- [IDL Schema](reference/idl.md): the type system and validation
+- [IDL Reference](reference/idl.md): the type system and validation
   rules from a user's perspective.
+- [C ABI Contract](reference/abi.md) and
+  [Memory and Error Model](reference/memory-error.md): the normative ABI
+  and the ownership summary every generator must honor.
 - [Project Configuration](guides/config.md): every option a
   consumer can set in `weaveffi.toml`.
 - [Stability and Versioning](stability.md): what counts as a

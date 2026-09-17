@@ -7,7 +7,6 @@
 //! cannot corrupt the emitted spec.
 
 use weaveffi_core::pkg::ResolvedPackage;
-use weaveffi_core::platform::Platform;
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::types::rb_str_literal;
@@ -67,12 +66,13 @@ end
     )
 }
 
-/// Render a platform gemspec: it stamps `s.platform` and ships the bundled
-/// native library alongside the Ruby sources.
+/// Render a platform gemspec: it stamps `s.platform` with the RubyGems
+/// platform string (`Platform::ruby_platform`) and ships the bundled native
+/// library alongside the Ruby sources.
 pub(crate) fn render_packaged_gemspec(
     package: &ResolvedPackage,
     gem_file: &str,
-    platform: Platform,
+    ruby_platform: &str,
     input_basename: &str,
 ) -> String {
     let prelude = render_prelude(CommentStyle::Hash, input_basename);
@@ -80,7 +80,6 @@ pub(crate) fn render_packaged_gemspec(
     let name = &package.name;
     let version = &package.version;
     let summary = rb_str_literal(&package.description_or_default());
-    let ruby_platform = platform.ruby_platform();
     let extra = gemspec_extra(package);
     format!(
         "{prelude}Gem::Specification.new do |s|

@@ -1,25 +1,28 @@
 //! TypeScript declaration (`.d.ts`) rendering: the error class surface,
-//! record and enum type shapes, ambient interface classes, and the nested
-//! module interface the loader's promise resolves to.
+//! record and enum type shapes, callback interfaces, ambient interface
+//! classes, and the nested module interface the loader's promise resolves to.
 
-use heck::{ToLowerCamelCase, ToUpperCamelCase};
+use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, ErrorBinding, FnBinding, InterfaceBinding,
-    ListenerBinding, ModuleBinding,
+    BindingModel, CallShape, CallbackInterfaceBinding, EnumBinding, ErrorBinding, FnBinding,
+    InterfaceBinding, ModuleBinding,
 };
 use weaveffi_core::utils::{render_prelude, render_trailer, CommentStyle};
 
 use crate::docs::{emit_doc, emit_fn_doc};
-use crate::types::{js_code_class_name, js_fn_name, js_param_name, ts_type_for};
+use crate::types::{
+    emscripten_stub, js_cb_method_name, js_code_class_name, js_fn_name, js_param_name, ts_type_for,
+};
 
 /// Render the `<module_name>.d.ts` companion: error classes, record
-/// interfaces, enum constants, rich-enum unions, ambient interface classes,
-/// the `<Name>Module` API shape, and the `load<Name>` signature. Async
-/// members and listeners are omitted in Emscripten mode, turning their
-/// runtime stubs into compile-time errors for TS consumers.
+/// interfaces, enum constants, rich-enum unions, callback interfaces, ambient
+/// interface classes, the `<Name>Module` API shape, and the `load<Name>`
+/// signature. Async members, callback interfaces, and the functions taking
+/// them are omitted in Emscripten mode, turning their runtime stubs into
+/// compile-time errors for TS consumers.
 pub(crate) fn render_wasm_dts(
     model: &BindingModel,
     module_name: &str,
@@ -68,6 +71,15 @@ pub(crate) fn render_wasm_dts(
             ));
         }
 
+        // Callback interfaces are unsupported (and never referenced) in
+        // Emscripten mode, so their shapes are omitted with the functions
+        // that take them.
+        if !emscripten {
+            for cb in &mb.callback_interfaces {
+                emit_dts_callback_interface(&mut out, cb);
+            }
+        }
+
         for i in &mb.interfaces {
             emit_dts_interface_class(&mut out, mb, i, emscripten);
         }
@@ -98,7 +110,7 @@ pub(crate) fn render_wasm_dts(
         ));
     } else {
         out.push_str(&format!(
-            "export function {load_fn}(url: string): Promise<{interface_name}>;\n\n"
+            "export function {load_fn}(source: string | URL | BufferSource | WebAssembly.Module): Promise<{interface_name}>;\n\n"
         ));
     }
     out.push_str(&render_trailer(CommentStyle::DoubleSlash, filename));
@@ -124,6 +136,70 @@ fn emit_dts_rich_enum_type(out: &mut String, e: &EnumBinding) {
                 .collect();
             let term = if i == last { ";" } else { "" };
             w.line(format!("| {{ tag: \"{}\"{fields} }}{term}", v.name));
+        }
+    });
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Emit the TypeScript `interface` a consumer implements for one callback
+/// interface: one method per declared method, camelCase, with the same
+/// parameter and return typing as any other callable. Object parameters
+/// arrive as wrappers the implementation owns (and should `close()`).
+fn emit_dts_callback_interface(out: &mut String, cb: &CallbackInterfaceBinding) {
+    let mut w = CodeWriter::two_space();
+    let mut tags = Vec::new();
+    if let Some(msg) = &cb.deprecated {
+        tags.push(format!("@deprecated {msg}"));
+    }
+    let doc = cb
+        .doc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map_or_else(
+            || {
+                "Implemented by the consumer and passed to the producer; the producer \
+                 calls these methods synchronously. An exception thrown from a method \
+                 is reported to the producer as an error (code -4) and the method's \
+                 default value is returned in its place."
+                    .to_string()
+            },
+            |d| {
+                format!(
+                    "{d}\n\nImplemented by the consumer; the producer calls these methods \
+                     synchronously. An exception thrown from a method is reported to the \
+                     producer as an error (code -4)."
+                )
+            },
+        );
+    let mut rendered = String::new();
+    emit_fn_doc(&mut rendered, &Some(doc), &[], "", &tags);
+    w.raw(rendered);
+    w.block(format!("export interface {} {{", cb.name), "}", |w| {
+        let inner = w.indent_str();
+        for m in &cb.methods {
+            let mut tags = Vec::new();
+            if let Some(msg) = &m.deprecated {
+                tags.push(format!("@deprecated {msg}"));
+            }
+            let mut doc = String::new();
+            emit_fn_doc(&mut doc, &m.doc, &m.params, &inner, &tags);
+            w.raw(doc);
+            let params: Vec<String> = m
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", js_param_name(p), ts_type_for(&p.ty)))
+                .collect();
+            let ret = m
+                .ret
+                .as_ref()
+                .map_or_else(|| "void".to_string(), ts_type_for);
+            w.line(format!(
+                "{}({}): {ret};",
+                js_cb_method_name(&m.name),
+                params.join(", ")
+            ));
         }
     });
     w.blank();
@@ -156,21 +232,28 @@ fn dts_ret(f: &FnBinding) -> String {
 }
 
 /// The JSDoc tag list for one callable: `@deprecated` first when present, a
-/// streaming note for iterator-returning callables, then the `@throws` tag
-/// matching the throws split (the typed domain error for throwing callables,
-/// the generic brand error otherwise).
+/// streaming note for iterator-returning callables, an ownership note for
+/// object-returning callables, then the `@throws` tag matching the throws
+/// split (the typed domain error for throwing callables, the generic brand
+/// error otherwise).
 fn dts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
     let mut tags = Vec::new();
     if let Some(msg) = &f.deprecated {
         tags.push(format!("@deprecated {msg}"));
     }
-    if matches!(f.shape, CallShape::Iterator(_)) {
-        tags.push(
+    match (&f.shape, f.ret.as_ref()) {
+        (CallShape::Iterator(_), _) => tags.push(
             "@returns A lazy iterator: one producer step per `next()` call. Exhaust it or \
              call `return()` to release the producer handle (a `for...of` loop does both \
              automatically); an abandoned iterator leaks the handle."
                 .to_string(),
-        );
+        ),
+        (_, Some(ret)) if ret.interface_name().is_some() => tags.push(
+            "@returns A wrapper owning one reference; `close()` it (or bind it with \
+             `using`) when done."
+                .to_string(),
+        ),
+        _ => {}
     }
     match error {
         Some(eb) if f.throws => tags.push(format!(
@@ -184,11 +267,17 @@ fn dts_fn_tags(f: &FnBinding, error: Option<&ErrorBinding>) -> Vec<String> {
     tags
 }
 
+/// Whether a callable is declared at all: in Emscripten mode async functions
+/// and functions taking callback interfaces are runtime stubs, so leaving
+/// them out makes the gap a compile-time error for TS consumers.
+fn declared(f: &FnBinding, emscripten: bool) -> bool {
+    !(emscripten && emscripten_stub(f))
+}
+
 /// Emit one module's member block inside the `<Name>Module` interface:
-/// function signatures (async ones omitted in Emscripten mode), listener
-/// pairs (omitted in Emscripten mode), `typeof` bindings for the interface
-/// classes, and nested submodule blocks, skipping subtrees with no declared
-/// content.
+/// function signatures (stubbed ones omitted in Emscripten mode), `typeof`
+/// bindings for the interface classes, and nested submodule blocks, skipping
+/// subtrees with no declared content.
 fn render_dts_module_interface(
     out: &mut String,
     model: &BindingModel,
@@ -196,27 +285,19 @@ fn render_dts_module_interface(
     indent: &str,
     emscripten: bool,
 ) {
-    fn tree_has_content(model: &BindingModel, mb: &ModuleBinding, include_listeners: bool) -> bool {
+    fn tree_has_content(model: &BindingModel, mb: &ModuleBinding) -> bool {
         !mb.functions.is_empty()
             || !mb.interfaces.is_empty()
-            || (include_listeners && !mb.listeners.is_empty())
-            || model
-                .children(mb)
-                .any(|sub| tree_has_content(model, sub, include_listeners))
+            || model.children(mb).any(|sub| tree_has_content(model, sub))
     }
-    if !tree_has_content(model, mb, !emscripten) {
+    if !tree_has_content(model, mb) {
         return;
     }
     let error = mb.error.as_ref();
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     w.block(format!("{}: {{", mb.name), "};", |w| {
         let inner = w.indent_str();
-        for f in &mb.functions {
-            // Async functions are throwing stubs in Emscripten mode; omitting
-            // them here makes the gap a compile-time error for TS consumers.
-            if emscripten && f.is_async {
-                continue;
-            }
+        for f in mb.functions.iter().filter(|f| declared(f, emscripten)) {
             let mut doc = String::new();
             emit_fn_doc(&mut doc, &f.doc, &f.params, &inner, &dts_fn_tags(f, error));
             w.raw(doc);
@@ -226,15 +307,6 @@ fn render_dts_module_interface(
                 dts_params(f),
                 dts_ret(f)
             ));
-        }
-        // Listeners are throwing stubs in Emscripten mode; omitting them here
-        // makes the gap a compile-time error for TS consumers.
-        if !emscripten {
-            for l in &mb.listeners {
-                let mut tmp = String::new();
-                render_dts_listener(&mut tmp, mb, l, &inner);
-                w.raw(tmp);
-            }
         }
         // The module object carries the interface class itself, so statics,
         // factories, and `new` are reachable as `api.kv.Store...`.
@@ -250,55 +322,6 @@ fn render_dts_module_interface(
     out.push_str(&w.finish());
 }
 
-/// Emit the TypeScript declarations for one listener's register/unregister
-/// pair. The callback parameter types come from the referenced callback
-/// typedef; the subscription id is a plain `number` (the loader keys
-/// subscriptions by its own context id, so the producer's `uint64_t` id never
-/// reaches the public surface).
-fn render_dts_listener(out: &mut String, mb: &ModuleBinding, l: &ListenerBinding, indent: &str) {
-    let Some(cb) = mb.callback(&l.event_callback) else {
-        // Validation guarantees the referenced callback exists in-module.
-        unreachable!("listener '{}' references unknown callback", l.name);
-    };
-    let register_name = format!("register_{}", l.name).to_lower_camel_case();
-    let unregister_name = format!("unregister_{}", l.name).to_lower_camel_case();
-    let cb_params: Vec<String> = cb
-        .params
-        .iter()
-        .map(|p| format!("{}: {}", js_param_name(p), ts_type_for(&p.ty)))
-        .collect();
-    let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
-    let register_doc = match &l.doc {
-        Some(d) => format!(
-            "{}\n\n@returns A subscription id for `{unregister_name}()`.",
-            d.trim()
-        ),
-        None => format!(
-            "Register a listener for the `{}` callback.\n\n@returns A \
-             subscription id for `{unregister_name}()`.",
-            cb.name
-        ),
-    };
-    let mut doc = String::new();
-    emit_doc(&mut doc, &Some(register_doc), indent);
-    w.raw(doc);
-    w.line(format!(
-        "{register_name}(callback: ({}) => void): number;",
-        cb_params.join(", ")
-    ));
-    let mut doc = String::new();
-    emit_doc(
-        &mut doc,
-        &Some(format!(
-            "Unregister a listener previously registered with `{register_name}()`."
-        )),
-        indent,
-    );
-    w.raw(doc);
-    w.line(format!("{unregister_name}(id: number): void;"));
-    out.push_str(&w.finish());
-}
-
 /// Emit the TypeScript declarations for the error surface: the generic brand
 /// error, then one domain class per declaring module with its per-code
 /// subclasses (each carrying a literal-typed `CODE` and any declared payload
@@ -306,8 +329,9 @@ fn render_dts_listener(out: &mut String, mb: &ModuleBinding, l: &ListenerBinding
 fn emit_dts_error_classes(out: &mut String, model: &BindingModel) {
     let mut w = CodeWriter::two_space();
     w.line("/** Base error for WeaveFFI failures: domain errors extend it, and it is");
-    w.line(" * thrown directly for unknown codes, marshalling failures, and producer");
-    w.line(" * panics. Carries the stable ABI `code`. */");
+    w.line(" * thrown directly for unknown codes, marshalling failures, producer");
+    w.line(" * panics, and callback-interface implementations that raised (code -4).");
+    w.line(" * Carries the stable ABI `code`. */");
     w.block(
         format!("export declare class {ERROR_BRAND} extends Error {{"),
         "}",
@@ -366,8 +390,10 @@ fn emit_dts_error_classes(out: &mut String, model: &BindingModel) {
 /// Emit the TypeScript declaration for an interface: an ambient class whose
 /// runtime binding is reached through the module object (`api.kv.Store`). The
 /// canonical `new` constructor declares `constructor`; other constructors and
-/// statics are static members; async members are omitted in Emscripten mode
-/// (they are throwing stubs at runtime).
+/// statics are static members; stubbed members are omitted in Emscripten mode.
+/// Every class declares `close()`; the `Symbol.dispose` method is present at
+/// runtime but left undeclared so the file type-checks without the
+/// `esnext.disposable` lib.
 fn emit_dts_interface_class(
     out: &mut String,
     mb: &ModuleBinding,
@@ -376,7 +402,20 @@ fn emit_dts_interface_class(
 ) {
     let error = mb.error.as_ref();
     let mut w = CodeWriter::two_space();
-    w.doc(&i.doc, DocCommentStyle::Javadoc);
+    let doc = i
+        .doc
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map_or_else(
+            || "Wraps one reference to a producer object; release it with `close()`.".to_string(),
+            |d| {
+                format!(
+                    "{d}\n\nWraps one reference to a producer object; release it with `close()`."
+                )
+            },
+        );
+    w.doc(&Some(doc), DocCommentStyle::Javadoc);
     w.block(format!("export declare class {} {{", i.name), "}", |w| {
         let inner = w.indent_str();
         if let Some(c) = i.constructors.iter().find(|c| c.name == "new") {
@@ -396,10 +435,7 @@ fn emit_dts_interface_class(
                 dts_ret(c)
             ));
         }
-        for f in &i.methods {
-            if emscripten && f.is_async {
-                continue;
-            }
+        for f in i.methods.iter().filter(|f| declared(f, emscripten)) {
             let mut doc = String::new();
             emit_fn_doc(&mut doc, &f.doc, &f.params, &inner, &dts_fn_tags(f, error));
             w.raw(doc);
@@ -410,10 +446,7 @@ fn emit_dts_interface_class(
                 dts_ret(f)
             ));
         }
-        for f in &i.statics {
-            if emscripten && f.is_async {
-                continue;
-            }
+        for f in i.statics.iter().filter(|f| declared(f, emscripten)) {
             let mut doc = String::new();
             emit_fn_doc(&mut doc, &f.doc, &f.params, &inner, &dts_fn_tags(f, error));
             w.raw(doc);
@@ -424,8 +457,11 @@ fn emit_dts_interface_class(
                 dts_ret(f)
             ));
         }
-        w.line("/** Releases the producer-owned handle exactly once. */");
-        w.line("free(): void;");
+        w.line("/** Releases this wrapper's reference exactly once; later calls are");
+        w.line(" * no-ops. Also reachable as `[Symbol.dispose]()` for `using`");
+        w.line(" * declarations. A wrapper collected unclosed is released by a");
+        w.line(" * finalizer where the runtime provides one. */");
+        w.line("close(): void;");
     });
     w.blank();
     out.push_str(&w.finish());

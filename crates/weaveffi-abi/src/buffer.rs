@@ -24,7 +24,7 @@
 //! | `f32`               | 4 bytes (IEEE 754 bits)                             |
 //! | `f64`               | 8 bytes (IEEE 754 bits)                             |
 //! | enum (C-style)      | `i32` discriminant                                  |
-//! | `handle`/`handle<T>`| `u64`                                               |
+//! | interface           | `u64` object token carrying one strong reference    |
 //! | `string`            | `u32` byte length + UTF-8 bytes (no NUL terminator) |
 //! | `bytes`             | `u32` length + raw bytes                            |
 //! | `T?`                | 1 byte flag (`0` absent, `1` present) + value       |
@@ -35,13 +35,20 @@
 //! | error payload       | the matched code's fields in declaration order      |
 //!
 //! Because the format is compositional, arbitrary nesting (`{string:[T?]}`,
-//! records containing records, and so on) works with no per-shape special
-//! cases. Interfaces, iterators, and borrowed views never appear inside a
-//! buffer; validation rejects them in buffered positions.
+//! records containing records, objects inside lists, and so on) works with
+//! no per-shape special cases. Iterators and callback interfaces never appear
+//! inside a buffer; validation rejects them in buffered positions.
+//!
+//! An interface object is encoded as a token (see [`object`](crate::object))
+//! that carries one strong reference: the writer clones the object before
+//! encoding and the reader adopts the reference. Because adopting is a
+//! side effect, a buffer holding object tokens must be decoded exactly once.
 //!
 //! Encoded lengths and counts are `u32`, capping any single string, byte
 //! buffer, or collection at `u32::MAX` entries; [`BufferWriter`] panics past
 //! that bound rather than truncating.
+
+use std::sync::Arc;
 
 /// An error produced while decoding a value buffer.
 ///
@@ -129,7 +136,7 @@ impl BufferWriter {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
-    /// Write a `u64` little-endian. Also the encoding of handles.
+    /// Write a `u64` little-endian. Also the encoding of object tokens.
     pub fn write_u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -296,7 +303,7 @@ impl<'a> BufferReader<'a> {
         ]))
     }
 
-    /// Read a `u64` little-endian. Also decodes handles.
+    /// Read a `u64` little-endian. Also decodes object tokens.
     ///
     /// # Errors
     ///
@@ -411,8 +418,8 @@ impl<'a> BufferReader<'a> {
 /// The `#[weaveffi::record]`, `#[weaveffi::enumeration]`, and
 /// `#[weaveffi::error]` expansions implement this for annotated types, and
 /// blanket implementations below cover primitives, `String`, `Vec<u8>`,
-/// `Option<T>`, `Vec<T>`, and the map types, so nested composites compose
-/// automatically.
+/// `Option<T>`, `Vec<T>`, the map types, and `Arc<T>` (an interface object
+/// token), so nested composites compose automatically.
 pub trait BufferValue: Sized {
     /// Append this value's encoding to `w`.
     fn write_value(&self, w: &mut BufferWriter);
@@ -461,6 +468,26 @@ impl BufferValue for String {
     }
     fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
         r.read_string()
+    }
+}
+
+/// An interface object inside a buffer: a `u64` token carrying one strong
+/// reference. Writing clones the `Arc`; reading adopts the reference, so a
+/// buffer holding tokens must be decoded exactly once (the generated thunks
+/// guarantee this). A zero token is a contract violation and decodes as an
+/// error.
+impl<T> BufferValue for Arc<T> {
+    fn write_value(&self, w: &mut BufferWriter) {
+        w.write_u64(crate::object::object_to_token(self));
+    }
+    fn read_value(r: &mut BufferReader<'_>) -> Result<Self, BufferDecodeError> {
+        let token = r.read_u64()?;
+        // SAFETY: by the ABI contract every non-zero token in a buffer was
+        // produced by `object_to_token` (or a consumer `_clone`) for this
+        // type and has not been adopted yet.
+        unsafe { crate::object::object_from_token(token) }.ok_or(BufferDecodeError {
+            context: "null object token",
+        })
     }
 }
 
@@ -617,6 +644,21 @@ mod tests {
         m.insert("a".to_string(), vec![1i64, 2]);
         m.insert("b".to_string(), vec![]);
         roundtrip(m);
+    }
+
+    #[test]
+    fn object_tokens_transfer_one_reference() {
+        let obj = Arc::new(String::from("shared"));
+        let bytes = encode_value(&vec![Some(Arc::clone(&obj)), None, Some(Arc::clone(&obj))]);
+        assert_eq!(Arc::strong_count(&obj), 3);
+        let back: Vec<Option<Arc<String>>> = decode_value(&bytes).unwrap();
+        assert_eq!(Arc::strong_count(&obj), 3);
+        assert!(Arc::ptr_eq(back[0].as_ref().unwrap(), &obj));
+        assert!(back[1].is_none());
+        drop(back);
+        assert_eq!(Arc::strong_count(&obj), 1);
+        let zero = [0u8; 8];
+        assert!(decode_value::<Arc<String>>(&zero).is_err());
     }
 
     #[test]

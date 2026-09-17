@@ -46,15 +46,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -62,6 +63,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -103,13 +108,38 @@ typedef enum { weaveffi_edge_cases_Mode_Fast = 1, weaveffi_edge_cases_Mode_Safe 
 typedef enum { weaveffi_edge_cases_EdgeErrors_Busy = 7 } weaveffi_edge_cases_EdgeErrors;
 typedef struct weaveffi_edge_cases_Widget weaveffi_edge_cases_Widget;
 typedef struct weaveffi_edge_cases_Vault weaveffi_edge_cases_Vault;
+typedef struct weaveffi_edge_cases_WidgetStreamIterator weaveffi_edge_cases_WidgetStreamIterator;
 typedef struct weaveffi_edge_cases_StringStreamIterator weaveffi_edge_cases_StringStreamIterator;
 typedef struct weaveffi_edge_cases_ScalarStreamIterator weaveffi_edge_cases_ScalarStreamIterator;
 typedef struct weaveffi_edge_cases_ModeStreamIterator weaveffi_edge_cases_ModeStreamIterator;
-typedef struct weaveffi_edge_cases_Leaf weaveffi_edge_cases_Leaf;
-/** Callback carrying composite payloads */
-typedef void (*weaveffi_edge_cases_OnBatch_fn)(const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, void* context);
-typedef void (*weaveffi_edge_cases_OnTick_fn)(void* context);
+/**
+ * Callback interface carrying composite payloads and objects
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_edge_cases_BatchListener_vtable {
+    /** Composite payloads cross as value buffers */
+    void (*on_batch)(void* ctx, const uint8_t* items_ptr, size_t items_len, const uint8_t* raw_ptr, size_t raw_len, const uint8_t* first_ptr, size_t first_len, weaveffi_edge_cases_Mode mode, weaveffi_error* out_err);
+    /** Objects cross as strong references the consumer must release */
+    void (*on_widget)(void* ctx, weaveffi_edge_cases_Widget* widget, weaveffi_edge_cases_Widget* fallback, const uint8_t* children_ptr, size_t children_len, weaveffi_error* out_err);
+    void (*on_tick)(void* ctx, weaveffi_error* out_err);
+    /** Scalar return travels back through the vtable */
+    bool (*should_continue)(void* ctx, int32_t class_, weaveffi_error* out_err);
+    /** Enum return travels back as its integer discriminant */
+    weaveffi_edge_cases_Mode (*pick_mode)(void* ctx, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_edge_cases_BatchListener_vtable;
+/**
+ * Callback interface whose name and methods are keywords
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_edge_cases_Keyword_vtable {
+    void (*delete_)(void* ctx, int32_t self, weaveffi_error* out_err);
+    int32_t (*import)(void* ctx, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_edge_cases_Keyword_vtable;
+typedef void (*weaveffi_edge_cases_async_widget_callback)(void* context, weaveffi_error* err, weaveffi_edge_cases_Widget* result);
 typedef void (*weaveffi_edge_cases_async_void_callback)(void* context, weaveffi_error* err);
 typedef void (*weaveffi_edge_cases_async_bytes_callback)(void* context, weaveffi_error* err, const uint8_t* result, size_t result_len);
 typedef void (*weaveffi_edge_cases_async_struct_callback)(void* context, weaveffi_error* err, const uint8_t* result_ptr, size_t result_len);
@@ -128,6 +158,9 @@ WEAVEFFI_API const char* weaveffi_edge_cases_Widget_rename(const weaveffi_edge_c
 WEAVEFFI_API void weaveffi_edge_cases_Widget_fetch_async(const weaveffi_edge_cases_Widget* self, int64_t id, weaveffi_edge_cases_Widget_fetch_callback callback, void* context);
 WEAVEFFI_DEPRECATED("Use rename instead")
 WEAVEFFI_API const char* weaveffi_edge_cases_Widget_old_name(const weaveffi_edge_cases_Widget* self, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_Widget_clone(const weaveffi_edge_cases_Widget* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_edge_cases_Widget_destroy(weaveffi_edge_cases_Widget* self);
 
 /** Deprecated interface with a throwing constructor */
@@ -136,12 +169,11 @@ WEAVEFFI_API weaveffi_edge_cases_Vault* weaveffi_edge_cases_Vault_open(const cha
 /** Throwing static */
 WEAVEFFI_API bool weaveffi_edge_cases_Vault_probe(weaveffi_error* out_err);
 WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_Vault_peek(const weaveffi_edge_cases_Vault* self, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_edge_cases_Vault* weaveffi_edge_cases_Vault_clone(const weaveffi_edge_cases_Vault* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_edge_cases_Vault_destroy(weaveffi_edge_cases_Vault* self);
 
-WEAVEFFI_API uint64_t weaveffi_edge_cases_register_batch_listener(weaveffi_edge_cases_OnBatch_fn callback, void* context);
-WEAVEFFI_API void weaveffi_edge_cases_unregister_batch_listener(uint64_t id);
-WEAVEFFI_API uint64_t weaveffi_edge_cases_register_tick_listener(weaveffi_edge_cases_OnTick_fn callback, void* context);
-WEAVEFFI_API void weaveffi_edge_cases_unregister_tick_listener(uint64_t id);
 /** No parameters and no result */
 WEAVEFFI_API void weaveffi_edge_cases_noop(weaveffi_error* out_err);
 /** Function named after a keyword whose parameters are all keywords */
@@ -149,15 +181,22 @@ WEAVEFFI_API int32_t weaveffi_edge_cases_select(int32_t class_, const char* from
 /** Optional list of optional structs, the deepest legal nesting */
 WEAVEFFI_API const uint8_t* weaveffi_edge_cases_nested_optional(const uint8_t* items_ptr, size_t items_len, size_t* out_len, weaveffi_error* out_err);
 WEAVEFFI_API const uint8_t* weaveffi_edge_cases_optional_params(const uint8_t* text_ptr, size_t text_len, const uint8_t* count_ptr, size_t count_len, const uint8_t* outer_ptr, size_t outer_len, const uint8_t* tags_ptr, size_t tags_len, const uint8_t* blob_ptr, size_t blob_len, const uint8_t* mode_ptr, size_t mode_len, size_t* out_len, weaveffi_error* out_err);
-/** Write-back parameters */
-WEAVEFFI_API void weaveffi_edge_cases_mutable_params(char* text, uint8_t* blob_ptr, size_t blob_len, weaveffi_error* out_err);
+/** Two callback interface parameters on one function */
+WEAVEFFI_API void weaveffi_edge_cases_register_batch(void* listener_ctx, const weaveffi_edge_cases_BatchListener_vtable* listener_vtable, void* keyword_ctx, const weaveffi_edge_cases_Keyword_vtable* keyword_vtable, weaveffi_error* out_err);
+/** Objects in every buffered position */
+WEAVEFFI_API const uint8_t* weaveffi_edge_cases_widgets_everywhere(const uint8_t* list_ptr, size_t list_len, const uint8_t* by_name_ptr, size_t by_name_len, const uint8_t* sparse_ptr, size_t sparse_len, const uint8_t* holder_ptr, size_t holder_len, size_t* out_len, weaveffi_error* out_err);
+/** Iterator of objects */
+WEAVEFFI_API weaveffi_edge_cases_WidgetStreamIterator* weaveffi_edge_cases_widget_stream(weaveffi_error* out_err);
+WEAVEFFI_API int32_t weaveffi_edge_cases_WidgetStreamIterator_next(weaveffi_edge_cases_WidgetStreamIterator* iter, weaveffi_edge_cases_Widget** out_item, weaveffi_error* out_err);
+WEAVEFFI_API void weaveffi_edge_cases_WidgetStreamIterator_destroy(weaveffi_edge_cases_WidgetStreamIterator* iter);
+/** Async returning an object */
+WEAVEFFI_API void weaveffi_edge_cases_async_widget_async(weaveffi_edge_cases_async_widget_callback callback, void* context);
 /** Factory for an interface with no constructor */
 WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_make_widget(const char* label, weaveffi_error* out_err);
 /** Optional interface return */
 WEAVEFFI_API weaveffi_edge_cases_Widget* weaveffi_edge_cases_find_widget(int64_t id, weaveffi_error* out_err);
 /** Interface parameter, including an optional one */
 WEAVEFFI_API const char* weaveffi_edge_cases_inspect_widget(const weaveffi_edge_cases_Widget* widget, const weaveffi_edge_cases_Widget* fallback, weaveffi_error* out_err);
-WEAVEFFI_API weaveffi_edge_cases_Leaf* weaveffi_edge_cases_typed_handle_param(weaveffi_edge_cases_Leaf* token, weaveffi_handle_t raw, weaveffi_error* out_err);
 /** Iterator of strings */
 WEAVEFFI_API weaveffi_edge_cases_StringStreamIterator* weaveffi_edge_cases_string_stream(weaveffi_error* out_err);
 WEAVEFFI_API int32_t weaveffi_edge_cases_StringStreamIterator_next(weaveffi_edge_cases_StringStreamIterator* iter, const char** out_item, weaveffi_error* out_err);

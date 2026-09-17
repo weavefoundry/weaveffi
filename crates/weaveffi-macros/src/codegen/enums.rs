@@ -14,9 +14,12 @@ use weaveffi_core::model::EnumBinding;
 use super::helpers::{ident, rust_type_ident};
 use super::marshal::{field_read_expr, field_write_stmt_ref};
 
-/// Generate the surface for one enum: `__weaveffi_from_i32` plus a
-/// `BufferValue` impl for a C-style enum, or the tag-and-fields
-/// `BufferValue` impl for a rich (algebraic) enum.
+/// Generate the surface for one enum: `__weaveffi_from_i32` /
+/// `__weaveffi_to_i32` plus a `BufferValue` impl for a C-style enum, or the
+/// tag-and-fields `BufferValue` impl for a rich (algebraic) enum.
+///
+/// `__weaveffi_to_i32` takes `&self` so a thunk can lower an enum it holds by
+/// value or by reference without requiring `Copy` or `Clone`.
 pub(crate) fn gen_enum(e: &EnumBinding, item: Option<&syn::ItemEnum>) -> syn::Result<TokenStream> {
     if e.is_rich() {
         let item = item.ok_or_else(|| {
@@ -38,6 +41,12 @@ pub(crate) fn gen_enum(e: &EnumBinding, item: Option<&syn::ItemEnum>) -> syn::Re
         let vident = ident(&v.name);
         quote!(Self::#vident => #value,)
     });
+    let first = e.variants.first().map(|v| ident(&v.name)).ok_or_else(|| {
+        syn::Error::new(
+            Span::call_site(),
+            format!("internal error: enum `{}` has no variants", e.name),
+        )
+    })?;
     Ok(quote! {
         #[allow(dead_code)]
         impl #ty {
@@ -48,13 +57,27 @@ pub(crate) fn gen_enum(e: &EnumBinding, item: Option<&syn::ItemEnum>) -> syn::Re
                     _ => ::std::option::Option::None,
                 }
             }
+
+            /// The value a callback-interface method yields after its
+            /// consumer implementation has already been reported as failed
+            /// (see `weaveffi::abi::raise_foreign_error`); never observed by
+            /// a caller because the thunk discards the producer's result.
+            #[doc(hidden)]
+            pub fn __weaveffi_placeholder() -> Self {
+                Self::#first
+            }
+
+            #[doc(hidden)]
+            pub fn __weaveffi_to_i32(&self) -> i32 {
+                match self {
+                    #(#write_arms)*
+                }
+            }
         }
 
         impl ::weaveffi::abi::BufferValue for #ty {
             fn write_value(&self, __wv_w: &mut ::weaveffi::abi::BufferWriter) {
-                __wv_w.write_i32(match self {
-                    #(#write_arms)*
-                });
+                __wv_w.write_i32(self.__weaveffi_to_i32());
             }
             fn read_value(
                 __wv_r: &mut ::weaveffi::abi::BufferReader<'_>,

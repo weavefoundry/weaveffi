@@ -2,18 +2,19 @@
 //! document becomes.
 //!
 //! This is the *document* model: [`Api`] is the root and owns a forest of
-//! [`Module`]s, each grouping [`Function`]s, [`InterfaceDef`]s, [`StructDef`]s,
-//! [`EnumDef`]s, [`CallbackDef`]s, [`ListenerDef`]s, and an optional
+//! [`Module`]s, each grouping [`Function`]s, [`InterfaceDef`]s,
+//! [`CallbackInterfaceDef`]s, [`StructDef`]s, [`EnumDef`]s, and an optional
 //! [`ErrorDomain`]. Types are referenced throughout by [`TypeRef`], which
 //! (de)serializes as a compact string (`i32`, `[string]`, `{string:i32}`,
 //! `Contact?`, and so on) rather than as a tagged object.
 //!
 //! The document model is deliberately *unresolved*: every user-defined type
 //! reference is a [`TypeRef::Named`] carrying the name exactly as written.
-//! Whether that name is a record, an enum, or an interface is decided by
-//! `weaveffi-core`'s validator, which lowers the document into the resolved
-//! binding model generators consume. Keeping the two representations distinct
-//! means an IDL document always round-trips losslessly through this crate.
+//! Whether that name is a record, an enum, an interface, or a callback
+//! interface is decided by `weaveffi-core`'s validator, which lowers the
+//! document into the resolved binding model generators consume. Keeping the
+//! two representations distinct means an IDL document always round-trips
+//! losslessly through this crate.
 //!
 //! Package identity and per-generator options are not part of the IDL: they
 //! describe how bindings are *shipped*, not what the API *is*, and live in the
@@ -33,7 +34,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// See [`docs/src/stability.md`](https://github.com/weavefoundry/weaveffi/blob/main/docs/src/stability.md)
 /// for the full schema policy and the surfaces covered by SemVer.
-pub const CURRENT_SCHEMA_VERSION: &str = "0.8.0";
+pub const CURRENT_SCHEMA_VERSION: &str = "0.9.0";
 
 /// Every IR schema version the current tools accept.
 ///
@@ -44,7 +45,7 @@ pub const SUPPORTED_VERSIONS: &[&str] = &[CURRENT_SCHEMA_VERSION];
 
 /// `skip_serializing_if` predicate for `bool` fields that default to `false`.
 /// Keeps the canonical IDL emitted by `weaveffi extract` minimal by omitting
-/// flags the user never set (e.g. `async: false`, `mutable: false`).
+/// flags the user never set (e.g. `async: false`, `throws: false`).
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -59,7 +60,7 @@ fn is_false(b: &bool) -> bool {
 #[serde(deny_unknown_fields)]
 #[schemars(description = "Top-level WeaveFFI API definition.")]
 pub struct Api {
-    /// IR schema version this document targets (for example `0.8.0`).
+    /// IR schema version this document targets (for example `0.9.0`).
     /// Validation rejects any value not listed in [`SUPPORTED_VERSIONS`].
     pub version: String,
     /// Top-level modules that make up the API surface. Each is an independent
@@ -67,16 +68,17 @@ pub struct Api {
     pub modules: Vec<Module>,
 }
 
-/// A module: a named namespace grouping related functions, types, callbacks,
-/// listeners, and an error domain.
+/// A module: a named namespace grouping related functions, types, callback
+/// interfaces, and an error domain.
 ///
 /// Modules are the IDL's unit of organization and map onto each target
 /// language's natural grouping construct (a namespace, a submodule, a symbol
 /// prefix, and so on). They may nest through [`modules`](Self::modules) to
 /// mirror a package hierarchy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
-    description = "A WeaveFFI module: a named group of functions, types, callbacks, listeners, and errors."
+    description = "A WeaveFFI module: a named group of functions, types, callback interfaces, and errors."
 )]
 pub struct Module {
     /// Module name, used as a namespace segment and a symbol-prefix component
@@ -94,18 +96,16 @@ pub struct Module {
     /// with constructors, methods, and static functions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<InterfaceDef>,
+    /// Callback interfaces declared in this module: method sets the consumer
+    /// implements and the producer calls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_interfaces: Vec<CallbackInterfaceDef>,
     /// Record (struct) types declared in this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structs: Vec<StructDef>,
     /// Enum types, C-style or algebraic, declared in this module.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enums: Vec<EnumDef>,
-    /// Callback signatures this module's functions and listeners can invoke.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub callbacks: Vec<CallbackDef>,
-    /// Event listeners (subscribe and unsubscribe endpoints) this module exposes.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub listeners: Vec<ListenerDef>,
     /// Optional error domain: the named codes this module's fallible functions
     /// report. `None` when the module declares no errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,8 +122,10 @@ pub struct Module {
 /// is lowered (a completion callback, an extra cancel-token parameter) without
 /// altering the parameter and return shape declared here. The same shape also
 /// describes an interface's constructors, methods, and statics (see
-/// [`InterfaceDef`]).
+/// [`InterfaceDef`]) and a callback interface's methods (see
+/// [`CallbackInterfaceDef`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Function {
     /// Function name, lowered to a per-language symbol (for example
     /// `create_contact`).
@@ -158,10 +160,6 @@ pub struct Function {
     /// carrying this message. `None` means the function is current.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<String>,
-    /// Version in which the function was introduced (for example `0.2.0`),
-    /// surfaced as a "since" annotation where the target language supports one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub since: Option<String>,
 }
 
 /// An interface: an opaque, stateful object type with constructors, instance
@@ -173,11 +171,15 @@ pub struct Function {
 /// resources with identity and behavior (stores, sessions, connections), in
 /// contrast to a [`StructDef`], which models a plain data record with fields.
 ///
-/// Every interface also receives an implicit destructor symbol
-/// (`{tag}_destroy`); generated wrappers release the underlying object through
-/// their language's natural disposal hook (`Drop`, `__del__`, `Disposable`,
-/// finalizers, `close()`).
+/// Objects are reference counted by the producer. Every interface receives
+/// implicit `{tag}_clone` and `{tag}_destroy` symbols; generated wrappers hold
+/// one strong reference each and release it through their language's natural
+/// disposal hook (`Drop`, `__del__`, `Disposable`, finalizers, `close()`).
+/// Because the count lives in the producer, an interface value may appear
+/// anywhere a type can: as a parameter, a return, an iterator element, a record
+/// field, a list element, or a map value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "An interface: an opaque object type with constructors, methods, and statics."
 )]
@@ -205,78 +207,68 @@ pub struct InterfaceDef {
     pub statics: Vec<Function>,
 }
 
-/// A single parameter of a [`Function`] or [`CallbackDef`].
+/// A callback interface: a set of methods the **consumer** implements and the
+/// **producer** invokes.
+///
+/// A callback interface is the inverse of an [`InterfaceDef`]. A consumer
+/// passes an implementation (a class instance, a closure record, a trait
+/// object) wherever the type appears as a parameter; the producer keeps it
+/// alive as long as it needs to and calls its methods, possibly from any
+/// thread. At the C ABI it lowers to a context pointer plus a vtable of
+/// function pointers; see the C ABI contract.
+///
+/// Methods are synchronous, can't declare `throws`, `async`, or `cancellable`,
+/// and return either nothing or a value in the direct family (integers,
+/// floats, `bool`, or a C-style enum). Parameters may use any type other than
+/// another callback interface or an iterator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    description = "A callback interface: a set of methods the consumer implements and the producer calls."
+)]
+pub struct CallbackInterfaceDef {
+    /// Callback interface type name (for example `MessageListener`).
+    pub name: String,
+    /// Human-readable documentation, propagated to the generated bindings.
+    /// `None` when undocumented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// Deprecation notice for the whole type; when set, generators annotate
+    /// the emitted type. `None` means the callback interface is current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deprecated: Option<String>,
+    /// Methods the consumer implements, in vtable order. Must be non-empty.
+    pub methods: Vec<Function>,
+}
+
+/// A single parameter of a [`Function`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Param {
     /// Parameter name as it appears in generated signatures (for example `id`).
     pub name: String,
     /// Parameter type. Serialized under the IDL key `type`.
     #[serde(rename = "type")]
     pub ty: TypeRef,
-    /// Whether the callee may write back through this parameter (for example a
-    /// buffer filled in place). Defaults to `false`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub mutable: bool,
     /// Human-readable documentation for the parameter, propagated to the
     /// generated bindings. `None` when undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc: Option<String>,
 }
 
-/// A callback signature: a function shape the host implements and native code
-/// invokes.
-///
-/// Callbacks are declared at module scope rather than as a [`TypeRef`] so the C
-/// ABI can represent them uniformly as a function pointer plus a context
-/// pointer. A [`ListenerDef`] references one by name to model an event stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct CallbackDef {
-    /// Callback name, used to name the generated function-pointer type and
-    /// referenced by [`ListenerDef::event_callback`] (for example `on_message`).
-    pub name: String,
-    /// Parameters passed to the callback each time it fires.
-    pub params: Vec<Param>,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doc: Option<String>,
-}
-
-/// An event listener: a subscribe and unsubscribe endpoint that delivers events
-/// through a [`CallbackDef`].
-///
-/// Generators expand a listener into register and unregister functions; the
-/// register call takes the named callback and returns a subscription id the
-/// caller later hands to unregister.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ListenerDef {
-    /// Listener name, lowered into the generated `register_*` and
-    /// `unregister_*` function names (for example `messages`).
-    pub name: String,
-    /// Name of the [`CallbackDef`] invoked for each event. Must match a callback
-    /// declared on the same [`Module`].
-    pub event_callback: String,
-    /// Human-readable documentation, propagated to the generated bindings.
-    /// `None` when undocumented.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub doc: Option<String>,
-}
-
 /// A reference to a type in the IDL, exactly as written.
 ///
-/// Every user-defined type (record, enum, or interface) is a
-/// [`Named`](Self::Named) reference at this level; the validator resolves the
-/// name against the declarations in scope and lowers it into the resolved
-/// kind generators consume. Keeping the document model unresolved is what
-/// makes an IDL round-trip losslessly.
+/// Every user-defined type (record, enum, interface, or callback interface) is
+/// a [`Named`](Self::Named) reference at this level; the validator resolves the
+/// name against the declarations in scope and lowers it into the resolved kind
+/// generators consume. Keeping the document model unresolved is what makes an
+/// IDL round-trip losslessly.
 ///
-/// Callback-style behavior is **not** expressed as a `TypeRef` variant.
-/// Instead, callbacks and listeners are declared at the module level via
-/// `Module.callbacks` (see [`CallbackDef`]) and `Module.listeners` (see
-/// [`ListenerDef`]), and asynchronous functions use `async: true`. These
-/// primitives cover every pattern the FFI boundary needs to support, and
-/// keep the type system free of function-typed values that the C ABI
-/// cannot represent uniformly.
+/// There is no function-typed `TypeRef`. Consumer-implemented behavior is
+/// expressed as a [`CallbackInterfaceDef`] referenced by name, and
+/// asynchronous producer work uses `async: true`. Together these cover every
+/// pattern the FFI boundary needs and keep the type system free of values the
+/// C ABI can't represent uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeRef {
     /// Signed 8-bit integer (`i8`).
@@ -301,27 +293,15 @@ pub enum TypeRef {
     F64,
     /// Boolean (`bool`).
     Bool,
-    /// Owned UTF-8 string (`string`).
+    /// UTF-8 string (`string`). Borrowed when passed in, owned when returned.
     StringUtf8,
-    /// Owned byte buffer (`bytes`).
+    /// Byte buffer (`bytes`). Borrowed when passed in, owned when returned.
     Bytes,
-    /// Opaque, untyped resource handle (`handle`). See
-    /// [`TypedHandle`](Self::TypedHandle) for the form tagged with a referent
-    /// name.
-    Handle,
-    /// Opaque resource handle tagged with the name of what it refers to
-    /// (`handle<Name>`), giving generators a distinct type per resource kind.
-    TypedHandle(String),
-    /// A reference to a user-defined type (record, enum, or interface) by its
-    /// bare or dot-qualified name (`Contact`, `shared.Status`), exactly as
-    /// parsed. Resolution happens in the validator, not here.
+    /// A reference to a user-defined type (record, enum, interface, or callback
+    /// interface) by its bare or dot-qualified name (`Contact`,
+    /// `shared.Status`), exactly as parsed. Resolution happens in the
+    /// validator, not here.
     Named(String),
-    /// Borrowed string slice (`&str`): a non-owning view valid only for the
-    /// duration of a call, used to pass input without copying.
-    BorrowedStr,
-    /// Borrowed byte slice (`&[u8]`): a non-owning view valid only for the
-    /// duration of a call.
-    BorrowedBytes,
     /// Optional value (`T?`): either the inner type or nothing.
     Optional(Box<TypeRef>),
     /// Homogeneous list (`[T]`) of the inner element type.
@@ -335,17 +315,18 @@ pub enum TypeRef {
 
 /// Parse the IDL's compact type syntax into a [`TypeRef`].
 ///
-/// Handles primitive names (`i32`, `string`, `bytes`, `handle`, and so on),
-/// borrowed forms (`&str`, `&[u8]`), typed handles (`handle<Name>`), iterators
+/// Handles primitive names (`i32`, `string`, `bytes`, and so on), iterators
 /// (`iter<T>`), lists (`[T]`), maps (`{K:V}`), and the optional suffix (`T?`).
-/// Any other bare identifier is taken to be a user-defined record, enum, or
-/// interface name and returned as [`TypeRef::Named`].
+/// Any other bare identifier is taken to be a user-defined record, enum,
+/// interface, or callback interface name and returned as [`TypeRef::Named`].
 ///
 /// # Errors
 ///
-/// Returns an error message when `s` is empty or only whitespace, or when a map
-/// type (`{K:V}`) is missing its `:` separator. The same errors propagate up
-/// from a malformed inner type of a list, map, optional, or iterator.
+/// Returns an error message when `s` is empty or only whitespace, when a map
+/// type (`{K:V}`) is missing its `:` separator, or when `s` uses one of the
+/// spellings removed in schema 0.9 (`handle`, `handle<T>`, `&str`, `&[u8]`).
+/// The same errors propagate up from a malformed inner type of a list, map,
+/// optional, or iterator.
 pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -375,16 +356,21 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
         return parse_type_ref(inner).map(|t| TypeRef::Optional(Box::new(t)));
     }
     if let Some(inner) = s
-        .strip_prefix("handle<")
-        .and_then(|rest| rest.strip_suffix('>'))
-    {
-        return Ok(TypeRef::TypedHandle(inner.into()));
-    }
-    if let Some(inner) = s
         .strip_prefix("iter<")
         .and_then(|rest| rest.strip_suffix('>'))
     {
         return parse_type_ref(inner).map(|t| TypeRef::Iterator(Box::new(t)));
+    }
+    if s == "handle" || s.starts_with("handle<") {
+        return Err(
+            "`handle` types were removed in schema 0.9; declare an interface and reference it by name"
+                .to_string(),
+        );
+    }
+    if s == "&str" || s == "&[u8]" {
+        return Err(format!(
+            "`{s}` was removed in schema 0.9; `string` and `bytes` parameters are always borrowed at the ABI"
+        ));
     }
     match s {
         "i8" => Ok(TypeRef::I8),
@@ -400,9 +386,6 @@ pub fn parse_type_ref(s: &str) -> Result<TypeRef, String> {
         "bool" => Ok(TypeRef::Bool),
         "string" => Ok(TypeRef::StringUtf8),
         "bytes" => Ok(TypeRef::Bytes),
-        "handle" => Ok(TypeRef::Handle),
-        "&str" => Ok(TypeRef::BorrowedStr),
-        "&[u8]" => Ok(TypeRef::BorrowedBytes),
         name => Ok(TypeRef::Named(name.to_string())),
     }
 }
@@ -423,13 +406,28 @@ fn map_separator(inner: &str) -> Option<usize> {
 }
 
 impl TypeRef {
-    /// The referenced user-type name for a [`Named`](Self::Named) or
-    /// [`TypedHandle`](Self::TypedHandle) reference, or `None` for every
-    /// other type.
+    /// The referenced user-type name for a [`Named`](Self::Named) reference,
+    /// or `None` for every other type.
     pub fn user_name(&self) -> Option<&str> {
         match self {
-            TypeRef::Named(n) | TypeRef::TypedHandle(n) => Some(n),
+            TypeRef::Named(n) => Some(n),
             _ => None,
+        }
+    }
+
+    /// Walk this type and every type nested inside it (optional payloads, list
+    /// elements, map keys and values, iterator items), outermost first.
+    pub fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a TypeRef)) {
+        f(self);
+        match self {
+            TypeRef::Optional(inner) | TypeRef::List(inner) | TypeRef::Iterator(inner) => {
+                inner.walk(f);
+            }
+            TypeRef::Map(k, v) => {
+                k.walk(f);
+                v.walk(f);
+            }
+            _ => {}
         }
     }
 }
@@ -449,10 +447,6 @@ fn type_ref_to_string(ty: &TypeRef) -> String {
         TypeRef::Bool => "bool".to_string(),
         TypeRef::StringUtf8 => "string".to_string(),
         TypeRef::Bytes => "bytes".to_string(),
-        TypeRef::BorrowedStr => "&str".to_string(),
-        TypeRef::BorrowedBytes => "&[u8]".to_string(),
-        TypeRef::Handle => "handle".to_string(),
-        TypeRef::TypedHandle(name) => format!("handle<{name}>"),
         TypeRef::Named(name) => name.clone(),
         TypeRef::Optional(inner) => format!("{}?", type_ref_to_string(inner)),
         TypeRef::List(inner) => format!("[{}]", type_ref_to_string(inner)),
@@ -487,9 +481,8 @@ impl<'de> Deserialize<'de> for TypeRef {
 }
 
 /// Manual `JsonSchema` impl because `TypeRef` (de)serializes as a string with
-/// custom syntax: primitive names (`i32`, `string`, ...), `&str`, `&[u8]`,
-/// `handle<{name}>`, `iter<{T}>`, `[{T}]`, `{ {K}: {V} }`, `{name}?`, or any
-/// user-defined struct/enum/interface name.
+/// custom syntax: primitive names (`i32`, `string`, ...), `iter<{T}>`,
+/// `[{T}]`, `{ {K}: {V} }`, `{name}?`, or any user-defined type name.
 impl JsonSchema for TypeRef {
     fn schema_name() -> String {
         "TypeRef".to_string()
@@ -509,10 +502,9 @@ impl JsonSchema for TypeRef {
         meta.description = Some(
             "Reference to a type. Encoded as a string with custom syntax: \
              primitives (`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, \
-             `f32`, `f64`, `bool`, `string`, `bytes`, `handle`), \
-             borrowed types (`&str`, `&[u8]`), typed handles (`handle<{name}>`), \
-             iterators (`iter<{T}>`), lists (`[{T}]`), maps (`{{K:V}}`), \
-             optionals (`{T}?`), or any user-defined struct/enum/interface name."
+             `f32`, `f64`, `bool`, `string`, `bytes`), iterators (`iter<{T}>`), \
+             lists (`[{T}]`), maps (`{{K:V}}`), optionals (`{T}?`), or any \
+             user-defined struct, enum, interface, or callback interface name."
                 .to_string(),
         );
         schema.into()
@@ -527,6 +519,7 @@ impl JsonSchema for TypeRef {
 /// algebraic enum is a value type that crosses the ABI serialized in a value
 /// buffer (an `i32` tag followed by the active variant's fields).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
     description = "An enum type. C-style when every variant is a bare discriminant; an algebraic sum type when any variant declares fields."
 )]
@@ -558,6 +551,7 @@ impl EnumDef {
 
 /// A single variant of an [`EnumDef`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnumVariant {
     /// Variant name (for example `Red`).
     pub name: String,
@@ -577,6 +571,7 @@ pub struct EnumVariant {
 
 /// A struct (record) type with named fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(description = "A struct (record) type with named fields.")]
 pub struct StructDef {
     /// Struct type name (for example `Contact`).
@@ -597,6 +592,7 @@ pub struct StructDef {
 /// A named field of a [`StructDef`], or the payload of an algebraic
 /// [`EnumVariant`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StructField {
     /// Field name (for example `email`).
     pub name: String,
@@ -612,6 +608,7 @@ pub struct StructField {
 /// A module's error domain: the named set of error codes its fallible functions
 /// can report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorDomain {
     /// Error domain name, used to name the generated error type (for example
     /// `ContactErrors`).
@@ -622,11 +619,13 @@ pub struct ErrorDomain {
 
 /// A single named error within an [`ErrorDomain`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorCode {
     /// Error code name, lowered to a variant or constant on the generated error
     /// type (for example `not_found`).
     pub name: String,
     /// Stable numeric value carried across the C ABI to identify this error.
+    /// Must be positive; non-positive codes are reserved for the runtime.
     pub code: i32,
     /// Default human-readable message describing the error.
     pub message: String,
@@ -667,9 +666,6 @@ mod tests {
             ("bool", TypeRef::Bool),
             ("string", TypeRef::StringUtf8),
             ("bytes", TypeRef::Bytes),
-            ("handle", TypeRef::Handle),
-            ("&str", TypeRef::BorrowedStr),
-            ("&[u8]", TypeRef::BorrowedBytes),
         ];
         for (s, expected) in cases {
             assert_eq!(&rt(s), expected);
@@ -680,10 +676,6 @@ mod tests {
     fn composites_round_trip() {
         assert_eq!(rt("Contact"), TypeRef::Named("Contact".into()));
         assert_eq!(rt("shared.Status"), TypeRef::Named("shared.Status".into()));
-        assert_eq!(
-            rt("handle<Session>"),
-            TypeRef::TypedHandle("Session".into())
-        );
         assert_eq!(
             rt("Contact?"),
             TypeRef::Optional(Box::new(TypeRef::Named("Contact".into())))
@@ -741,9 +733,34 @@ mod tests {
     }
 
     #[test]
+    fn removed_spellings_are_errors_with_guidance() {
+        for removed in ["handle", "handle<Session>", "&str", "&[u8]", "[handle]"] {
+            let err = parse_type_ref(removed).unwrap_err();
+            assert!(err.contains("0.9"), "{removed}: {err}");
+        }
+    }
+
+    #[test]
+    fn walk_visits_nested_types_outermost_first() {
+        let ty = parse_type_ref("{string:[Contact?]}").unwrap();
+        let mut seen = Vec::new();
+        ty.walk(&mut |t| seen.push(t.to_string()));
+        assert_eq!(
+            seen,
+            [
+                "{string:[Contact?]}",
+                "string",
+                "[Contact?]",
+                "Contact?",
+                "Contact"
+            ]
+        );
+    }
+
+    #[test]
     fn document_round_trips_through_yaml_and_json() {
         let yaml = r#"
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: contacts
     doc: Address book
@@ -753,6 +770,7 @@ modules:
         fields:
           - { name: name, type: string }
           - { name: tags, type: "[string]" }
+          - { name: book, type: "Book?" }
     enums:
       - name: Shape
         variants:
@@ -761,13 +779,15 @@ modules:
     interfaces:
       - name: Book
         constructors:
-          - { name: open, params: [{ name: path, type: "&str" }], throws: true }
+          - { name: open, params: [{ name: path, type: string }], throws: true }
         methods:
           - { name: find, params: [{ name: q, type: string }], return: "Contact?" }
-    callbacks:
-      - { name: on_change, params: [{ name: id, type: i64 }] }
-    listeners:
-      - { name: changes, event_callback: on_change }
+          - { name: watch, params: [{ name: listener, type: ChangeListener }] }
+    callback_interfaces:
+      - name: ChangeListener
+        methods:
+          - { name: on_change, params: [{ name: id, type: i64 }] }
+          - { name: should_continue, params: [], return: bool }
     errors:
       name: BookError
       codes:
@@ -779,7 +799,6 @@ modules:
         async: true
         cancellable: true
         deprecated: gone
-        since: "0.2.0"
     modules:
       - name: inner
         functions:
@@ -797,6 +816,7 @@ modules:
                 "Contact".into()
             ))))
         );
+        assert_eq!(m.callback_interfaces[0].methods.len(), 2);
         assert_eq!(m.errors.as_ref().unwrap().codes[0].fields.len(), 1);
         assert!(m.functions[0].r#async && m.functions[0].cancellable);
         assert_eq!(m.modules[0].functions[0].name, "ping");
@@ -807,6 +827,19 @@ modules:
         let yaml2 = serde_yaml::to_string(&api).unwrap();
         let back2: Api = serde_yaml::from_str(&yaml2).unwrap();
         assert_eq!(back2, api);
+    }
+
+    #[test]
+    fn removed_document_keys_are_rejected() {
+        for yaml in [
+            "version: \"0.9.0\"\nmodules:\n  - name: m\n    callbacks: []\n",
+            "version: \"0.9.0\"\nmodules:\n  - name: m\n    listeners: []\n",
+            "version: \"0.9.0\"\nmodules:\n  - name: m\n    functions:\n      - { name: f, since: \"0.1.0\" }\n",
+            "version: \"0.9.0\"\nmodules:\n  - name: m\n    functions:\n      - { name: f, params: [{ name: x, type: i32, mutable: true }] }\n",
+        ] {
+            let err = serde_yaml::from_str::<Api>(yaml).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{yaml}\n{err}");
+        }
     }
 
     #[test]
@@ -825,13 +858,11 @@ modules:
                     r#async: false,
                     cancellable: false,
                     deprecated: None,
-                    since: None,
                 }],
                 interfaces: vec![],
+                callback_interfaces: vec![],
                 structs: vec![],
                 enums: vec![],
-                callbacks: vec![],
-                listeners: vec![],
                 errors: None,
                 modules: vec![],
             }],
@@ -853,5 +884,6 @@ modules:
         assert_eq!(type_ref["type"], "string");
         assert!(json["properties"].get("package").is_none());
         assert!(json["properties"].get("generators").is_none());
+        assert!(json["definitions"].get("CallbackInterfaceDef").is_some());
     }
 }

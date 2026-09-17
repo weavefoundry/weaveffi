@@ -2,10 +2,11 @@
 //! values through the WeaveFFI wire format, plus the per-type pack and unpack
 //! routines.
 //!
-//! Every encode/decode decision dispatches on [`wire::classify`], the shared
-//! wire classification, so this backend cannot drift from the wire format's
-//! canonical folds (handles as `u64` tokens, borrowed views as their owned
-//! forms, records and rich enums as one user-codec shape).
+//! Every encode/decode decision dispatches on [`Ty::wire`], the shared wire
+//! classification, so this backend cannot drift from the wire format's
+//! canonical shapes: primitives, enums as `i32`, records and rich enums as
+//! one user-codec shape, and interfaces as `u64` object tokens carrying one
+//! strong reference.
 
 use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
@@ -14,11 +15,15 @@ use weaveffi_core::model::{EnumBinding, StructBinding};
 use weaveffi_core::model::{Prim, WireType};
 use weaveffi_core::utils::local_type_name;
 
-use crate::types::{cpp_ident, cpp_type};
+use crate::types::{cpp_ident, cpp_type, interface_c_tag};
 
 /// Emit statements appending `expr` (a C++ lvalue of IDL type `ty`) to the
 /// buffer writer variable `wtr`, in wire order. `depth` disambiguates nested
 /// loop variable names.
+///
+/// An object token is written from a *fresh* strong reference: the wrapper's
+/// `clone_handle()` calls the interface's `_clone` symbol, so the reader
+/// adopts a reference of its own and the wrapper keeps the one it holds.
 pub(crate) fn emit_write_value(w: &mut CodeWriter, ty: &Ty, expr: &str, wtr: &str, depth: usize) {
     let leaf = |w: &mut CodeWriter, method: &str| {
         w.line(format!("{wtr}.{method}({expr});"));
@@ -40,10 +45,9 @@ pub(crate) fn emit_write_value(w: &mut CodeWriter, ty: &Ty, expr: &str, wtr: &st
         WireType::Enum(_) => {
             w.line(format!("{wtr}.write_i32(static_cast<int32_t>({expr}));"));
         }
-        // Handles are opaque tokens encoded as their pointer bits in a u64.
-        WireType::Handle(_) => {
+        WireType::Object(_) => {
             w.line(format!(
-                "{wtr}.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>({expr})));"
+                "{wtr}.write_u64(static_cast<uint64_t>(reinterpret_cast<uintptr_t>({expr}.clone_handle())));"
             ));
         }
         WireType::User(n) => {
@@ -78,6 +82,9 @@ pub(crate) fn emit_write_value(w: &mut CodeWriter, ty: &Ty, expr: &str, wtr: &st
 
 /// The single expression decoding one leaf value from the reader variable
 /// `rdr`, or `None` when `ty` is a composite that needs statements.
+///
+/// An object token decodes into a new wrapper that adopts the strong
+/// reference the token carries; the wrapper's destructor releases it.
 fn read_leaf_expr(ty: &Ty, rdr: &str, module: &str, prefix: &str) -> Option<String> {
     Some(match ty.wire() {
         WireType::Prim(Prim::Bool) => format!("{rdr}.read_bool()"),
@@ -94,11 +101,10 @@ fn read_leaf_expr(ty: &Ty, rdr: &str, module: &str, prefix: &str) -> Option<Stri
         WireType::Prim(Prim::String) => format!("{rdr}.read_string()"),
         WireType::Prim(Prim::Bytes) => format!("{rdr}.read_bytes()"),
         WireType::Enum(n) => format!("static_cast<{}>({rdr}.read_i32())", local_type_name(n)),
-        // Both handle spellings decode from the same u64 token; the C++
-        // pointer type (`void*` or the prefixed tag) comes from the type map.
-        WireType::Handle(_) => format!(
-            "reinterpret_cast<{}>(static_cast<uintptr_t>({rdr}.read_u64()))",
-            cpp_type(ty, module, prefix)
+        WireType::Object(n) => format!(
+            "{}(reinterpret_cast<{}*>(static_cast<uintptr_t>({rdr}.read_u64())))",
+            local_type_name(n),
+            interface_c_tag(n, module, prefix)
         ),
         WireType::User(n) => format!("detail::read_{}({rdr})", local_type_name(n)),
         WireType::Optional(_) | WireType::List(_) | WireType::Map(_, _) => return None,
@@ -174,7 +180,11 @@ pub(crate) fn emit_read_into(
 
 /// Emit statements declaring a fresh variable `var` and decoding one value of
 /// IDL type `ty` into it from the reader variable `rdr`. Leaf types decode in
-/// a single declaration; composites declare then fill.
+/// a single declaration; composites (optionals, lists, and maps, which are
+/// always default constructible) declare then fill. Records are never
+/// default constructed here: a record holding an interface has no default
+/// constructor, so record values are only ever produced by their `read_`
+/// routine.
 pub(crate) fn emit_read_decl(
     w: &mut CodeWriter,
     ty: &Ty,
@@ -183,7 +193,7 @@ pub(crate) fn emit_read_decl(
     module: &str,
     prefix: &str,
 ) {
-    let cpp = cpp_type(ty, module, prefix);
+    let cpp = cpp_type(ty);
     if let Some(expr) = read_leaf_expr(ty, rdr, module, prefix) {
         w.line(format!("{cpp} {var} = {expr};"));
     } else {
@@ -193,6 +203,12 @@ pub(crate) fn emit_read_decl(
 }
 
 /// Emit the pack and unpack routines for one record (inside `detail`).
+///
+/// The unpack routine decodes every field into a local and then
+/// aggregate-initializes the record in one expression, so a record that holds
+/// an interface (and therefore has no default constructor) decodes like any
+/// other. If a later field fails to decode, the locals already holding
+/// adopted object references are destroyed on unwind, releasing them.
 pub(crate) fn render_record_codec(out: &mut String, s: &StructBinding, module: &str, prefix: &str) {
     let name = &s.name;
     let mut w = CodeWriter::four_space();
@@ -228,20 +244,13 @@ pub(crate) fn render_record_codec(out: &mut String, s: &StructBinding, module: &
         if s.fields.is_empty() {
             w.line("(void)r;");
         }
-        w.line(format!("{name} out{{}};"));
+        let mut inits = Vec::new();
         for f in &s.fields {
-            let member = cpp_ident(&f.name);
-            emit_read_into(
-                w,
-                &f.ty,
-                &format!("out.{member}"),
-                &format!("v_{}", f.name),
-                "r",
-                module,
-                prefix,
-            );
+            let var = format!("f_{}", f.name);
+            emit_read_decl(w, &f.ty, &var, "r", module, prefix);
+            inits.push(format!("std::move({var})"));
         }
-        w.line("return out;");
+        w.line(format!("return {name}{{{}}};", inits.join(", ")));
     });
     w.line("}");
     w.blank();
@@ -249,7 +258,8 @@ pub(crate) fn render_record_codec(out: &mut String, s: &StructBinding, module: &
 }
 
 /// Emit the pack and unpack routines for one rich enum (inside `detail`):
-/// an `i32` tag followed by the active variant's fields in wire order.
+/// an `i32` tag followed by the active variant's fields in wire order. Like
+/// records, variant payloads are aggregate-initialized from decoded locals.
 pub(crate) fn render_rich_enum_codec(
     out: &mut String,
     e: &EnumBinding,
@@ -306,19 +316,16 @@ pub(crate) fn render_rich_enum_codec(
                 if variant.fields.is_empty() {
                     w.line(format!("return {name}{{{name}::{vn}{{}}}};"));
                 } else {
-                    w.line(format!("{name}::{vn} p{{}};"));
+                    let mut inits = Vec::new();
                     for f in &variant.fields {
-                        emit_read_into(
-                            w,
-                            &f.ty,
-                            &format!("p.{}", cpp_ident(&f.name)),
-                            &format!("v_{}", f.name),
-                            "r",
-                            module,
-                            prefix,
-                        );
+                        let var = format!("f_{}", f.name);
+                        emit_read_decl(w, &f.ty, &var, "r", module, prefix);
+                        inits.push(format!("std::move({var})"));
                     }
-                    w.line(format!("return {name}{{std::move(p)}};"));
+                    w.line(format!(
+                        "return {name}{{{name}::{vn}{{{}}}}};",
+                        inits.join(", ")
+                    ));
                 }
             });
             w.line("}");

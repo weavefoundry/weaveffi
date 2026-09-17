@@ -1,28 +1,23 @@
 //! Callable rendering: the FFI typedef/lookup pairs and idiomatic Dart
-//! wrappers for sync, async, and iterator callables, plus callback typedefs
-//! and listener register/unregister pairs.
+//! wrappers for sync, async, and iterator callables.
 //!
 //! Parameter marshalling dispatches on the shared [`ArgPass`] contract and
 //! return handling on [`RetPass`], so this module never re-derives the
-//! buffered-versus-direct split from raw `Ty`s.
+//! buffered-versus-direct split from raw [`Ty`]s.
 
 use heck::ToLowerCamelCase;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
-use weaveffi_core::model::{
-    CallShape, CallbackBinding, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding,
-    ParamBinding,
-};
-use weaveffi_core::model::{Prim, WireType};
-use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy, RetPass};
+use weaveffi_core::model::{CallShape, FnBinding, IteratorBinding, ModuleBinding, ParamBinding};
+use weaveffi_core::plan::{self, ArgPass, ErrorStrategy, RetPass};
 
 use crate::codec::{read_expr, write_stmts};
-use crate::docs::{emit_doc, emit_wrapper_doc};
+use crate::docs::emit_wrapper_doc;
 use crate::entities::dart_exception_name;
 use crate::runtime::emit_typedef_and_lookup;
 use crate::types::{
-    dart_class, dart_ident, dart_type, dart_wrapper_fn_name, input_slots, return_ffi,
-    return_out_slots, returns_buffer, scalar_ffi,
+    dart_class, dart_ident, dart_type, dart_wrapper_fn_name, input_slots, object_class, return_ffi,
+    return_out_slots, returns_buffer, scalar_ffi, vtable_var,
 };
 
 /// Error-reporting context for one wrapper: which check helper guards its
@@ -31,7 +26,7 @@ use crate::types::{
 /// The split follows [`ErrorStrategy`]: a throwing callable maps `out_err`
 /// onto the module's typed domain exception, while a non-throwing callable
 /// traps through the generic brand exception (a reported error there is only
-/// ever a producer bug, never a domain error).
+/// ever a producer bug or a runtime trap, never a domain error).
 #[derive(Clone, Copy)]
 pub(crate) struct ErrCtx<'a> {
     /// `true` when the wrapper surfaces typed domain errors (`throws: true`).
@@ -190,9 +185,10 @@ pub(crate) fn render_callable(
     }
 
     // Each input parameter expands to its ABI slots (bytes and buffered
-    // values fan out to `(ptr, len)`); a bytes or buffered return adds its
-    // `out_len` slot; the trailing error slot closes the signature. An
-    // instance method's `AbiFn` carries an implicit leading `self` pointer.
+    // values fan out to `(ptr, len)`, callback interfaces to `(ctx, vtable)`);
+    // a bytes or buffered return adds its `out_len` slot; the trailing error
+    // slot closes the signature. An instance method's `AbiFn` carries an
+    // implicit leading `self` pointer.
     let mut native_params: Vec<String> = Vec::new();
     let mut dart_params: Vec<String> = Vec::new();
     if f.has_self {
@@ -261,172 +257,6 @@ pub(crate) fn render_callable(
     decl.push_str(&w.finish());
 }
 
-/// The native FFI typedef for a module-level callback declaration, shared by
-/// every listener that fires it.
-pub(crate) fn render_callback_typedef(out: &mut String, cb: &CallbackBinding) {
-    let mut slots: Vec<String> = Vec::new();
-    for p in &cb.params {
-        for (n, _) in input_slots(p) {
-            slots.push(n);
-        }
-    }
-    slots.push("Pointer<Void>".into());
-    out.push_str(&format!(
-        "\ntypedef _NativeCb_{} = Void Function({});\n",
-        cb.c_fn_type,
-        slots.join(", ")
-    ));
-}
-
-/// Emit the statements converting one callback's trampoline slots into the
-/// values handed to the user callback, returning the argument expressions.
-/// Buffered arguments arrive as borrowed `(ptr, len)` pairs valid only for
-/// the dispatch, so they are decoded here, inside the borrow window. Slot
-/// names follow the lowered ABI (`{n}` or `{n}_ptr`/`{n}_len`).
-fn emit_cb_args(w: &mut CodeWriter, cb: &CallbackBinding) -> Vec<String> {
-    let mut args = Vec::new();
-    for p in &cb.params {
-        let base = dart_ident(&p.name);
-        let n0 = dart_ident(&p.abi[0].name);
-        args.push(match p.arg_pass() {
-            ArgPass::Buffer { len, .. } => {
-                let n1 = dart_ident(&len.name);
-                w.line(format!("final {base}Data = _copyNativeBytes({n0}, {n1});"));
-                w.line(format!("final {base}Reader = _BufferReader({base}Data);"));
-                w.line(format!(
-                    "final {base}Value = {};",
-                    read_expr(&format!("{base}Reader"), &p.ty)
-                ));
-                w.line(format!("{base}Reader.expectEnd();"));
-                format!("{base}Value")
-            }
-            ArgPass::String { .. } => {
-                format!("{n0} == nullptr ? '' : {n0}.toDartString()")
-            }
-            ArgPass::Bytes { len, .. } => {
-                let n1 = dart_ident(&len.name);
-                format!("{n0} == nullptr ? <int>[] : {n0}.asTypedList({n1}).toList()")
-            }
-            // Borrowed for the duration of the callback: do not dispose().
-            ArgPass::Object {
-                nullable: false, ..
-            } => {
-                let Ty::Interface(name) = &p.ty else {
-                    unreachable!("non-nullable object params are interfaces")
-                };
-                format!("{}._({n0})", dart_class(name))
-            }
-            // A nullable borrowed object pointer: null means none.
-            ArgPass::Object { nullable: true, .. } => {
-                let Ty::Optional(inner) = &p.ty else {
-                    unreachable!("nullable object params are optional interfaces")
-                };
-                let Ty::Interface(name) = inner.as_ref() else {
-                    unreachable!("only optional interfaces stay unbuffered")
-                };
-                format!("{n0} == nullptr ? null : {}._({n0})", dart_class(name))
-            }
-            ArgPass::Direct { .. } => match &p.ty {
-                Ty::Enum(name) => format!("{}.fromValue({n0})", dart_class(name)),
-                // Borrowed for the duration of the callback: do not dispose().
-                Ty::TypedHandle(name) => format!("{}._({n0})", dart_class(name)),
-                _ => n0,
-            },
-        });
-    }
-    args
-}
-
-/// The register/unregister wrapper pair for one listener. The trampoline is an
-/// `isolateLocal` NativeCallable: WeaveFFI listeners fire synchronously on the
-/// thread calling the producer API, so arguments are converted inside the
-/// borrow window (a `.listener` callable would read freed pointers later).
-pub(crate) fn render_listener(
-    out: &mut String,
-    m: &ModuleBinding,
-    l: &ListenerBinding,
-    strip: bool,
-) {
-    let Some(cb) = m.callback(&l.event_callback) else {
-        unreachable!("validation guarantees the listener's callback exists");
-    };
-    let cb_typedef = format!("_NativeCb_{}", cb.c_fn_type);
-    let register_name = dart_wrapper_fn_name(&m.path, &format!("register_{}", l.name), strip);
-    let unregister_name = dart_wrapper_fn_name(&m.path, &format!("unregister_{}", l.name), strip);
-
-    emit_typedef_and_lookup(
-        out,
-        &l.register_symbol,
-        &format!("Pointer<NativeFunction<{cb_typedef}>>, Pointer<Void>"),
-        &format!("Pointer<NativeFunction<{cb_typedef}>>, Pointer<Void>"),
-        "Uint64",
-        "int",
-    );
-    emit_typedef_and_lookup(out, &l.unregister_symbol, "Uint64", "int", "Void", "void");
-
-    let user_fn_params: Vec<String> = cb
-        .params
-        .iter()
-        .map(|p| format!("{} {}", dart_type(&p.ty), dart_ident(&p.name)))
-        .collect();
-    let mut tramp_decls: Vec<String> = Vec::new();
-    for p in &cb.params {
-        for ((_, d), slot) in input_slots(p).iter().zip(p.abi.iter()) {
-            tramp_decls.push(format!("{d} {}", dart_ident(&slot.name)));
-        }
-    }
-    tramp_decls.push("Pointer<Void> context".into());
-
-    let mut w = CodeWriter::two_space();
-    w.blank();
-    {
-        let mut d = String::new();
-        emit_doc(&mut d, &l.doc, "");
-        w.raw(d);
-    }
-    w.line(format!(
-        "/// Registers a {} listener. Returns a subscription id for {unregister_name}().",
-        cb.name
-    ));
-    w.block(
-        format!(
-            "int {register_name}(void Function({}) callback) {{",
-            user_fn_params.join(", ")
-        ),
-        "}",
-        |w| {
-            w.line(format!(
-                "final callable = NativeCallable<{cb_typedef}>.isolateLocal(({}) {{",
-                tramp_decls.join(", ")
-            ));
-            w.scope(|w| {
-                let call_args = emit_cb_args(w, cb);
-                w.line(format!("callback({});", call_args.join(", ")));
-            });
-            w.line("});");
-            w.line(format!(
-                "final id = _{}(callable.nativeFunction, nullptr);",
-                l.register_symbol.to_lower_camel_case()
-            ));
-            w.line("_listenerCallables[id] = callable;");
-            w.line("return id;");
-        },
-    );
-
-    w.blank();
-    w.line(format!(
-        "/// Unregisters a listener previously registered with {register_name}()."
-    ));
-    w.block(format!("void {unregister_name}(int id) {{"), "}", |w| {
-        w.line(format!(
-            "_{}(id);",
-            l.unregister_symbol.to_lower_camel_case()
-        ));
-        w.line("_listenerCallables.remove(id)?.close();");
-    });
-    out.push_str(&w.finish());
-}
-
 /// The (native, dart, name) slot triples an async completion callback carries
 /// after its `(context, err)` prefix. Bytes and buffered results arrive as
 /// owned `(result, resultLen)` pairs the consumer frees; interfaces as
@@ -444,14 +274,10 @@ fn async_cb_result_slots(ret: Option<&Ty>) -> Vec<(String, String, String)> {
         RetPass::String => vec![pair("Pointer<Utf8>", "Pointer<Utf8>", "result")],
         // A (possibly nullable) adopted object pointer.
         RetPass::Object { .. } => vec![pair("Pointer<Void>", "Pointer<Void>", "result")],
-        RetPass::Void | RetPass::Direct => match ty {
-            // A typed handle's slot is an opaque adopted pointer.
-            Ty::TypedHandle(_) => vec![pair("Pointer<Void>", "Pointer<Void>", "result")],
-            ty => {
-                let (n, d) = scalar_ffi(ty);
-                vec![pair(n, d, "result")]
-            }
-        },
+        RetPass::Void | RetPass::Direct => {
+            let (n, d) = scalar_ffi(ty);
+            vec![pair(n, d, "result")]
+        }
     }
 }
 
@@ -666,26 +492,15 @@ fn emit_async_complete(out: &mut String, ty: Option<&Ty>, indent: &str) {
         // The callback receives ownership of an object result; the wrapper
         // adopts the pointer and its `dispose()` owns the eventual destroy.
         RetPass::Object { nullable, .. } => {
-            let name = object_class(ty);
-            if nullable {
-                w.line(format!(
-                    "completer.complete(result == nullptr ? null : {name}._(result));"
-                ));
-            } else {
-                w.line(format!("completer.complete({name}._(result));"));
-            }
+            w.line(format!(
+                "completer.complete({});",
+                adopt_expr("result", ty, nullable)
+            ));
         }
         RetPass::Void | RetPass::Direct => match ty {
             Ty::Enum(name) => {
                 w.line(format!(
                     "completer.complete({}.fromValue(result));",
-                    dart_class(name)
-                ));
-            }
-            // An adopted typed-handle pointer, wrapped like an interface.
-            Ty::TypedHandle(name) => {
-                w.line(format!(
-                    "completer.complete({}._(result));",
                     dart_class(name)
                 ));
             }
@@ -697,12 +512,14 @@ fn emit_async_complete(out: &mut String, ty: Option<&Ty>, indent: &str) {
     out.push_str(&w.finish());
 }
 
-/// The Dart wrapper class of a direct or nullable interface reference.
-fn object_class(ty: &Ty) -> String {
-    match ty {
-        Ty::Interface(name) => dart_class(name),
-        Ty::Optional(inner) => object_class(inner),
-        _ => unreachable!("object returns are (optional) interfaces"),
+/// The expression adopting the owned object pointer `expr` into its wrapper
+/// class; when `nullable`, a null pointer becomes Dart `null`.
+pub(crate) fn adopt_expr(expr: &str, ty: &Ty, nullable: bool) -> String {
+    let class = object_class(ty);
+    if nullable {
+        format!("{expr} == nullptr ? null : {class}._({expr})")
+    } else {
+        format!("{class}._({expr})")
     }
 }
 
@@ -710,7 +527,10 @@ fn object_class(ty: &Ty) -> String {
 /// expressions it contributes (in ABI order) and appending any cleanup
 /// statements to `frees`. Dispatches on the parameter's [`ArgPass`] contract:
 /// a buffered value is encoded into a `_BufferWriter`, staged into native
-/// memory, and passed as a borrowed `(ptr, len)` pair the callee never frees.
+/// memory, and passed as a borrowed `(ptr, len)` pair the callee never frees;
+/// an object passes the wrapper's borrowed handle; a callback interface is
+/// registered in the handle table and passed as its key plus the interface's
+/// static vtable.
 fn emit_input(
     w: &mut CodeWriter,
     p: &ParamBinding,
@@ -747,17 +567,28 @@ fn emit_input(
             frees.push(format!("if ({ptr} != nullptr) calloc.free({ptr});"));
             vec![ptr, format!("{name}.length")]
         }
-        // A borrowed object pointer; when nullable, null means none.
+        // A borrowed object pointer: the wrapper keeps its own reference and
+        // the producer clones if it retains the object. When nullable, null
+        // means none.
         ArgPass::Object {
             nullable: false, ..
         } => vec![format!("{name}._handle")],
         ArgPass::Object { nullable: true, .. } => {
             vec![format!("{name}?._handle ?? nullptr")]
         }
+        // The implementation is parked in the handle table until the producer
+        // calls the vtable's `free(ctx)`; nothing to release here.
+        ArgPass::Callback { .. } => {
+            let Ty::CallbackInterface(cb) = &p.ty else {
+                unreachable!("callback family names a callback interface")
+            };
+            vec![
+                format!("_registerCallback({name})"),
+                format!("{}.cast<Void>()", vtable_var(cb)),
+            ]
+        }
         ArgPass::Direct { .. } => match &p.ty {
             Ty::Enum(_) => vec![format!("{name}.value")],
-            // A typed handle passes its wrapped pointer, like an interface.
-            Ty::TypedHandle(_) => vec![format!("{name}._handle")],
             _ => vec![name],
         },
     }
@@ -779,7 +610,8 @@ fn emit_return_alloc(w: &mut CodeWriter, ty: &Ty, frees: &mut Vec<String>) -> Ve
 /// Emit the post-call decode of a return into the wrapper's Dart return
 /// value, dispatching on the return's [`RetPass`] contract. A buffered return
 /// is copied out of the producer's buffer, released with
-/// `weaveffi_free_bytes`, and decoded through the buffer reader.
+/// `weaveffi_free_bytes`, and decoded through the buffer reader; an object
+/// return is adopted by its wrapper class.
 fn emit_return_decode(out: &mut String, ty: &Ty, indent: &str) {
     let mut w = CodeWriter::two_space().with_depth(indent.len() / 2);
     match plan::ret_pass(Some(ty), "", "") {
@@ -806,22 +638,14 @@ fn emit_return_decode(out: &mut String, ty: &Ty, indent: &str) {
             w.line("_weaveffiFreeString(result);");
             w.line("return decoded;");
         }
-        // An owned object pointer the wrapper class adopts; when nullable,
+        // One owned strong reference the wrapper class adopts; when nullable,
         // null means none.
         RetPass::Object { nullable, .. } => {
-            let name = object_class(ty);
-            if nullable {
-                w.line("if (result == nullptr) return null;");
-            }
-            w.line(format!("return {name}._(result);"));
+            w.line(format!("return {};", adopt_expr("result", ty, nullable)));
         }
         RetPass::Void | RetPass::Direct => match ty {
             Ty::Enum(name) => {
                 w.line(format!("return {}.fromValue(result);", dart_class(name)));
-            }
-            // An adopted typed-handle pointer, wrapped like an interface.
-            Ty::TypedHandle(name) => {
-                w.line(format!("return {}._(result);", dart_class(name)));
             }
             _ => {
                 w.line("return result;");
@@ -885,28 +709,13 @@ fn emit_function_body(out: &mut String, f: &FnBinding, c_sym: &str, err: ErrCtx)
 
 /// The dart:ffi pointee type of an iterator's `out_item` slot, plus whether
 /// the element also carries a `size_t* out_len` slot (bytes and every
-/// buffered element do), driven by the element's [`ElemFree`] plan.
+/// buffered element do), driven by the element's [`RetPass`] plan.
 fn iter_item_slot(elem: &Ty) -> (String, bool) {
-    match plan::elem_free(elem) {
-        ElemFree::Bytes => ("Pointer<Uint8>".into(), true),
-        ElemFree::String => ("Pointer<Utf8>".into(), false),
-        ElemFree::None => match elem {
-            Ty::Interface(_) | Ty::TypedHandle(_) => ("Pointer<Void>".into(), false),
-            _ => (scalar_ffi(elem).0.to_string(), false),
-        },
-    }
-}
-
-/// Convert a single native by-value element (`expr`) into its Dart
-/// representation: enums map through `fromValue`, interface elements are
-/// adopted by their wrapper class, scalars pass through.
-fn direct_elem_read(expr: &str, ty: &Ty) -> String {
-    match ty {
-        Ty::Enum(n) => format!("{}.fromValue({expr})", dart_class(n)),
-        Ty::Interface(n) | Ty::TypedHandle(n) => {
-            format!("{}._({expr})", dart_class(n))
-        }
-        _ => expr.to_string(),
+    match plan::ret_pass(Some(elem), "", "") {
+        RetPass::Bytes | RetPass::Buffer => ("Pointer<Uint8>".into(), true),
+        RetPass::String => ("Pointer<Utf8>".into(), false),
+        RetPass::Object { .. } => ("Pointer<Void>".into(), false),
+        RetPass::Void | RetPass::Direct => (scalar_ffi(elem).0.to_string(), false),
     }
 }
 
@@ -946,10 +755,10 @@ fn emit_iter_lookups(out: &mut String, ib: &IteratorBinding) {
 ///
 /// The body runs lazily, on the first pull: it stages the inputs, launches
 /// the C iterator, and then issues exactly one producer `next` call per
-/// yielded element, releasing each element per the plan's [`ElemFree`] after
-/// copying or decoding (strings through `weaveffi_free_string`; bytes and
-/// buffered elements through `weaveffi_free_bytes`; interface elements are
-/// adopted by their wrapper class, whose `dispose()` owns the destroy).
+/// yielded element, receiving each per the plan's [`RetPass`] (strings are
+/// copied and freed through `weaveffi_free_string`; bytes and buffered
+/// elements through `weaveffi_free_bytes`; interface elements are adopted by
+/// their wrapper class, whose `dispose()` owns the destroy).
 ///
 /// The handle is destroyed exactly once. The `try`/`finally` destroys it when
 /// iteration exhausts, a launch or `next` error throws, or the generator is
@@ -965,7 +774,7 @@ fn emit_iterator_body(
     ib: &IteratorBinding,
     err: ErrCtx,
 ) {
-    let free_plan = plan::elem_free(&ib.elem);
+    let elem_pass = plan::ret_pass(Some(&ib.elem), "", "");
     let mut frees: Vec<String> = Vec::new();
     let mut call_args: Vec<String> = Vec::new();
     if f.has_self {
@@ -1011,39 +820,46 @@ fn emit_iterator_body(
         w.line(format!("while (_{next_var}({next_args}) != 0) {{"));
         w.scope(|w| {
             w.line(err.check_stmt());
-            match free_plan {
-                ElemFree::String => {
+            match &elem_pass {
+                RetPass::String => {
                     w.line("final itemPtr = outItem.value;");
                     w.line("final item = itemPtr.toDartString();");
                     w.line("_weaveffiFreeString(itemPtr);");
                     w.line("yield item;");
                 }
-                // Bytes and buffered elements: copy or decode, then release
-                // the producer's buffer with weaveffi_free_bytes. A raw bytes
-                // element (wire shape Bytes) copies; every other buffered
-                // element decodes.
-                ElemFree::Bytes => {
+                // A raw bytes element copies, then releases the producer's
+                // buffer with weaveffi_free_bytes.
+                RetPass::Bytes => {
                     w.line("final itemPtr = outItem.value;");
                     w.line("final itemLen = outLen.value;");
-                    if matches!(elem.wire(), WireType::Prim(Prim::Bytes)) {
-                        w.line("final item = _copyNativeBytes(itemPtr, itemLen);");
-                        w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
-                        w.line("yield item;");
-                    } else {
-                        w.line("final itemData = _copyNativeBytes(itemPtr, itemLen);");
-                        w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
-                        w.line("final itemReader = _BufferReader(itemData);");
-                        w.line(format!("final item = {};", read_expr("itemReader", elem)));
-                        w.line("itemReader.expectEnd();");
-                        w.line("yield item;");
-                    }
+                    w.line("final item = _copyNativeBytes(itemPtr, itemLen);");
+                    w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
+                    w.line("yield item;");
                 }
-                // By-value element (or an adopted interface handle).
-                ElemFree::None => {
-                    w.line(format!(
-                        "yield {};",
-                        direct_elem_read("outItem.value", elem)
-                    ));
+                // A buffered element decodes (adopting any object tokens it
+                // carries), then releases the producer's buffer.
+                RetPass::Buffer => {
+                    w.line("final itemPtr = outItem.value;");
+                    w.line("final itemLen = outLen.value;");
+                    w.line("final itemData = _copyNativeBytes(itemPtr, itemLen);");
+                    w.line("if (itemPtr != nullptr) _weaveffiFreeBytes(itemPtr, itemLen);");
+                    w.line("final itemReader = _BufferReader(itemData);");
+                    w.line(format!("final item = {};", read_expr("itemReader", elem)));
+                    w.line("itemReader.expectEnd();");
+                    w.line("yield item;");
+                }
+                // One owned strong reference per element, adopted by the
+                // wrapper class.
+                RetPass::Object { nullable, .. } => {
+                    w.line("final itemPtr = outItem.value;");
+                    w.line(format!("yield {};", adopt_expr("itemPtr", elem, *nullable)));
+                }
+                RetPass::Void | RetPass::Direct => {
+                    let read = match elem {
+                        Ty::Enum(n) => format!("{}.fromValue(outItem.value)", dart_class(n)),
+                        _ => "outItem.value".to_string(),
+                    };
+                    w.line(format!("yield {read};"));
                 }
             }
         });

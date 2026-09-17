@@ -46,15 +46,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -62,6 +63,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -117,8 +122,19 @@ typedef enum {
     weaveffi_docs_DocsErrors_invalid_status = 2
 } weaveffi_docs_DocsErrors;
 typedef struct weaveffi_docs_Notebook weaveffi_docs_Notebook;
-/** Fires after a document has been persisted successfully */
-typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
+/**
+ * Consumer-implemented observer of document-saved notifications.
+ *
+ * Implementations must be safe to call from any thread.
+ *
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_docs_SavedListener_vtable {
+    /** Fires after a document has been persisted successfully */
+    void (*on_saved)(void* ctx, int64_t doc_id, int32_t revision, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_docs_SavedListener_vtable;
 typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
 
 // Module: docs
@@ -137,12 +153,11 @@ WEAVEFFI_API int32_t weaveffi_docs_Notebook_insert(const weaveffi_docs_Notebook*
 WEAVEFFI_API const uint8_t* weaveffi_docs_Notebook_find(const weaveffi_docs_Notebook* self, int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** The number of documents currently held */
 WEAVEFFI_API int32_t weaveffi_docs_Notebook_size(const weaveffi_docs_Notebook* self, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_docs_Notebook* weaveffi_docs_Notebook_clone(const weaveffi_docs_Notebook* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_docs_Notebook_destroy(weaveffi_docs_Notebook* self);
 
-/** Subscribe to document-saved notifications */
-WEAVEFFI_API uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
-/** Subscribe to document-saved notifications */
-WEAVEFFI_API void weaveffi_docs_unregister_saved_listener(uint64_t id);
 /**
  * Create a brand new document.
  *
@@ -154,6 +169,8 @@ WEAVEFFI_API const uint8_t* weaveffi_docs_create_document(const char* title, con
 WEAVEFFI_API const uint8_t* weaveffi_docs_get_document(int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** Publish a document in the background */
 WEAVEFFI_API void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_publish_async_callback callback, void* context);
+/** Register a listener for saved notifications */
+WEAVEFFI_API void weaveffi_docs_watch(void* listener_ctx, const weaveffi_docs_SavedListener_vtable* listener_vtable, weaveffi_error* out_err);
 
 
 #ifdef __cplusplus

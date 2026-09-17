@@ -1,22 +1,28 @@
-//! Callable rendering: free functions, interface members, listeners, and the
-//! sync, iterator, and async call shapes, each marshalled per the shared
-//! passing plans ([`ArgPass`], [`RetPass`], `elem_free`).
+//! Callable rendering: free functions and interface members in the sync,
+//! iterator, and async call shapes, each marshalled per the shared passing
+//! plans ([`ArgPass`], [`RetPass`], `IteratorProtocol`, `AsyncProtocol`).
+//!
+//! Interface members are rendered twice: a declaration inside the class body
+//! (so the class is complete before any record that holds it by value) and an
+//! out-of-line `inline` definition after every value type and codec exists.
+//! Free functions are defined inline inside their module namespace, which is
+//! rendered last.
 
-use heck::{ToSnakeCase, ToUpperCamelCase};
+use heck::ToUpperCamelCase;
 use weaveffi_core::abi;
 use weaveffi_core::codegen::common::DocCommentStyle;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    AbiFn, AsyncBinding, CallShape, FnBinding, IteratorBinding, ListenerBinding, ModuleBinding,
-    ParamBinding,
+    AbiFn, AsyncBinding, CallShape, FnBinding, IteratorBinding, ModuleBinding, ParamBinding,
 };
-use weaveffi_core::plan::{elem_free, ret_pass, ArgPass, ElemFree, ErrorStrategy, RetPass};
+use weaveffi_core::plan::{ret_pass, ArgPass, ErrorStrategy, RetPass};
 use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
 
-use crate::codec::{emit_read_decl, emit_read_into, emit_write_value};
+use crate::codec::{emit_read_decl, emit_write_value};
 use crate::types::{
     cpp_fn_name, cpp_ident, cpp_namespace_path, cpp_param_decl, cpp_type, render_param_decls,
+    vtable_accessor,
 };
 
 // ── Error routing ──
@@ -49,21 +55,27 @@ fn make_error_call(f: &FnBinding, module: &ModuleBinding) -> String {
 
 // ── Parameter and return marshalling ──
 
-/// The local interface name behind an object-passed type: the interface
+/// The local wrapper class name behind an object-passed type: the interface
 /// itself, or the interface inside `Interface?`.
-fn object_iface_name(ty: &Ty) -> &str {
-    match ty {
-        Ty::Interface(n) => n,
-        Ty::Optional(inner) => object_iface_name(inner),
-        _ => unreachable!("object passing only applies to interfaces"),
-    }
+fn object_class(ty: &Ty) -> &str {
+    local_type_name(
+        ty.interface_name()
+            .expect("object passing only applies to interfaces"),
+    )
 }
 
 /// Emit the setup statements for one C++ parameter and return the C argument
 /// expressions its ABI slots receive, dispatching on the parameter's
-/// [`ArgPass`] plan. A buffered parameter is encoded into a local
-/// `detail::BufferWriter` and passed as `(data(), size())`; the caller owns
-/// the encoding for the duration of the call.
+/// [`ArgPass`] plan.
+///
+/// * A buffered parameter is encoded into a local `detail::BufferWriter` and
+///   passed as `(data(), size())`; the caller owns the encoding for the
+///   duration of the call.
+/// * An object parameter is borrowed: the wrapper's pointer is passed and the
+///   wrapper keeps its own reference. `Interface?` passes null for none.
+/// * A callback interface moves the caller's `std::shared_ptr` into a heap
+///   box that becomes `ctx`; the producer releases it through the vtable's
+///   `free`. The vtable is the process-wide static for the interface.
 fn emit_param_setup(
     w: &mut CodeWriter,
     p: &ParamBinding,
@@ -78,36 +90,38 @@ fn emit_param_setup(
             emit_write_value(w, &p.ty, &name, &buf, 0);
             vec![format!("{buf}.data()"), format!("{buf}.size()")]
         }
-        // `std::string::data()` is the non-const overload on a mutable
-        // parameter (C++17), yielding the `char*` the write-back slot wants.
-        ArgPass::String { .. } if p.mutable => vec![format!("{name}.data()")],
         ArgPass::String { .. } => vec![format!("{name}.c_str()")],
         ArgPass::Bytes { .. } => {
             vec![format!("{name}.data()"), format!("{name}.size()")]
         }
-        // An interface argument borrows: pass its raw handle as a const
-        // pointer, leaving ownership with the wrapper object. A nullable
-        // object (`Interface?`) passes null for "none".
         ArgPass::Object { nullable, .. } => {
-            let tag = c_abi_struct_name(object_iface_name(&p.ty), module, prefix);
             if nullable {
-                vec![format!(
-                    "{name}.has_value() ? static_cast<const {tag}*>({name}.value().handle()) : nullptr"
-                )]
+                vec![format!("{name}.has_value() ? {name}->handle() : nullptr")]
             } else {
-                vec![format!("static_cast<const {tag}*>({name}.handle())")]
+                vec![format!("{name}.handle()")]
             }
         }
+        ArgPass::Callback { .. } => {
+            let iface = local_type_name(
+                p.ty.callback_interface_name()
+                    .expect("callback passing only applies to callback interfaces"),
+            );
+            w.line(format!(
+                "if (!{name}) throw std::invalid_argument(\"{name}: null callback interface\");"
+            ));
+            w.line(format!(
+                "auto* {name}_ctx = new std::shared_ptr<{iface}>(std::move({name}));"
+            ));
+            vec![
+                format!("static_cast<void*>({name}_ctx)"),
+                format!("&detail::{}()", vtable_accessor(iface)),
+            ]
+        }
         ArgPass::Direct { .. } => match &p.ty {
-            Ty::Handle => vec![format!(
-                "static_cast<{prefix}_handle_t>(reinterpret_cast<uintptr_t>({name}))"
-            )],
             Ty::Enum(e) => vec![format!(
                 "static_cast<{}>(static_cast<int32_t>({name}))",
                 c_abi_struct_name(e, module, prefix)
             )],
-            // Scalars pass through; a typed handle is already the raw
-            // prefixed tag pointer.
             _ => vec![name],
         },
     }
@@ -117,7 +131,8 @@ fn emit_param_setup(
 /// return value at the writer's current depth, dispatching on the return's
 /// [`RetPass`] plan. A buffered return decodes the producer's buffer and
 /// releases it with `{prefix}_free_bytes` via a scope guard, so the release
-/// happens even when decoding throws.
+/// happens even when decoding throws. An object return is adopted into the
+/// RAII wrapper, which owes the eventual `_destroy`.
 fn emit_sync_return(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str) {
     match ret_pass(Some(ty), module, prefix) {
         RetPass::Buffer => {
@@ -139,29 +154,19 @@ fn emit_sync_return(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str) {
             ));
             w.line("return ret;");
         }
-        // An owned interface pointer is adopted by the RAII class, which
-        // destroys it when the wrapper drops. A nullable return maps null to
-        // `std::nullopt`.
         RetPass::Object { nullable, .. } => {
             if nullable {
                 w.line("if (!result) return std::nullopt;");
             }
-            w.line(format!(
-                "return {}(result);",
-                local_type_name(object_iface_name(ty))
-            ));
+            w.line(format!("return {}(result);", object_class(ty)));
         }
         RetPass::Direct => match ty {
-            Ty::Handle => {
-                w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(result));");
-            }
             Ty::Enum(n) => {
                 w.line(format!(
                     "return static_cast<{}>(result);",
                     local_type_name(n)
                 ));
             }
-            // Scalars and typed handles (the raw tag pointer) pass through.
             _ => {
                 w.line("return result;");
             }
@@ -170,80 +175,151 @@ fn emit_sync_return(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str) {
     }
 }
 
-// ── Callable rendering (free functions and interface members) ──
+// ── Callable kinds ──
 
 /// How a rendered callable is declared in the C++ surface.
 #[derive(Clone, Copy)]
 pub(crate) enum FnKind<'a> {
     /// A namespace-scope free function (`inline` linkage).
     Free,
-    /// An instance method on an interface class: passes the wrapped handle as
+    /// An instance method on an interface class: passes the wrapped pointer as
     /// the leading C argument and is declared `const` (the ABI receiver is a
     /// const pointer).
     Method {
-        /// The interface's opaque C tag, used to cast `handle_` for the call.
-        c_tag: &'a str,
+        /// The wrapper class name.
+        class: &'a str,
     },
     /// A static member function: interface statics and the factory form of
     /// constructors not named `new`.
-    Static,
+    Static {
+        /// The wrapper class name.
+        class: &'a str,
+    },
     /// The canonical constructor (an interface constructor named `new`):
-    /// rendered as a real C++ constructor adopting the returned handle.
-    Ctor,
+    /// rendered as a real C++ constructor adopting the returned pointer.
+    Ctor {
+        /// The wrapper class name.
+        class: &'a str,
+    },
 }
 
-impl FnKind<'_> {
-    /// Leading declaration keyword for this kind.
-    fn keyword(self) -> &'static str {
-        match self {
-            FnKind::Free => "inline ",
-            FnKind::Method { .. } | FnKind::Ctor => "",
-            FnKind::Static => "static ",
-        }
-    }
-
-    /// Nesting depth of the declaration: class members are one level deep.
-    fn depth(self) -> usize {
-        match self {
-            FnKind::Free => 0,
-            _ => 1,
-        }
-    }
-
+impl<'a> FnKind<'a> {
     /// The expression passed as the leading `self` C argument, when present.
     fn self_arg(self) -> Option<String> {
         match self {
-            FnKind::Method { c_tag } => Some(format!("static_cast<const {c_tag}*>(handle_)")),
+            FnKind::Method { .. } => Some("handle_".to_string()),
             _ => None,
         }
     }
 
-    /// Trailing cv-qualifier on the declaration (methods are `const`).
-    fn const_qual(self) -> &'static str {
+    /// The owning class, for member kinds.
+    fn class(self) -> Option<&'a str> {
         match self {
-            FnKind::Method { .. } => " const",
-            _ => "",
+            FnKind::Free => None,
+            FnKind::Method { class } | FnKind::Static { class } | FnKind::Ctor { class } => {
+                Some(class)
+            }
         }
     }
 }
 
+/// The name of the lazy range class an iterator-returning callable yields:
+/// `{PascalName}Iterator` for a free function (defined beside it in the module
+/// namespace) and `{Class}{PascalName}Iterator` for an interface member
+/// (defined at namespace scope after every value type).
+pub(crate) fn iterator_class_name(f: &FnBinding, kind: FnKind<'_>) -> String {
+    let pascal = f.name.to_upper_camel_case();
+    match kind.class() {
+        Some(class) => format!("{class}{pascal}Iterator"),
+        None => format!("{pascal}Iterator"),
+    }
+}
+
+/// The C++ return type of a callable in its call shape: the mapped type (or
+/// `void`) for sync, `std::future<T>` for async, and the range class for an
+/// iterator. `None` for a canonical constructor, which has no return type.
+fn return_type(f: &FnBinding, kind: FnKind<'_>) -> Option<String> {
+    if matches!(kind, FnKind::Ctor { .. }) {
+        return None;
+    }
+    let value = || f.ret.as_ref().map_or("void".to_string(), cpp_type);
+    Some(match &f.shape {
+        CallShape::Sync(_) => value(),
+        CallShape::Async(_) => format!("std::future<{}>", value()),
+        CallShape::Iterator(_) => iterator_class_name(f, kind),
+    })
+}
+
+/// The C++ parameter list of a callable. `with_defaults` adds the
+/// `= nullptr` default on a cancellable async call's `cancel_token`, which
+/// belongs on the declaration only.
+fn param_decls(f: &FnBinding, prefix: &str, with_defaults: bool) -> String {
+    let mut decls: Vec<String> = f
+        .params
+        .iter()
+        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name)))
+        .collect();
+    if f.is_async && f.cancellable {
+        let default = if with_defaults { " = nullptr" } else { "" };
+        decls.push(format!("{prefix}_cancel_token* cancel_token{default}"));
+    }
+    decls.join(", ")
+}
+
 /// Emit the doc comment and any `[[deprecated]]` attribute for a callable.
-fn emit_callable_attrs(w: &mut CodeWriter, f: &FnBinding) {
-    w.doc(&f.doc, DocCommentStyle::Javadoc);
+/// An iterator-returning callable's doc also names the range class it yields.
+fn emit_callable_attrs(w: &mut CodeWriter, f: &FnBinding, kind: FnKind<'_>) {
+    let doc = if let CallShape::Iterator(_) = &f.shape {
+        let class_name = iterator_class_name(f, kind);
+        let return_doc = format!(
+            "@return A lazy `{class_name}` range that streams one element per iteration \
+             step and releases the producer iterator when exhausted or destroyed."
+        );
+        Some(match &f.doc {
+            Some(d) => format!("{d}\n\n{return_doc}"),
+            None => return_doc,
+        })
+    } else {
+        f.doc.clone()
+    };
+    w.doc(&doc, DocCommentStyle::Javadoc);
     if let Some(msg) = &f.deprecated {
         let escaped = msg.replace('"', "\\\"");
         w.line(format!("[[deprecated(\"{escaped}\")]]"));
     }
 }
 
-/// Render one callable (free function or interface member) in whatever call
-/// shape it lowers to. `cpp_name` is the already-cased C++ name (the class
-/// name for a canonical constructor).
+/// Render the in-class declaration of an interface member (one level of
+/// indentation), with its doc comment and deprecation marker.
+pub(crate) fn render_member_decl(
+    out: &mut String,
+    f: &FnBinding,
+    cpp_name: &str,
+    kind: FnKind<'_>,
+    prefix: &str,
+) {
+    let mut w = CodeWriter::four_space().with_depth(1);
+    emit_callable_attrs(&mut w, f, kind);
+    let params = param_decls(f, prefix, true);
+    match (kind, return_type(f, kind)) {
+        (FnKind::Ctor { class }, _) => w.line(format!("{class}({params});")),
+        (FnKind::Method { .. }, Some(ret)) => w.line(format!("{ret} {cpp_name}({params}) const;")),
+        (FnKind::Static { .. }, Some(ret)) => w.line(format!("static {ret} {cpp_name}({params});")),
+        _ => unreachable!("free functions are defined inline, never declared"),
+    };
+    w.blank();
+    out.push_str(&w.finish());
+}
+
+/// Render the definition of a callable: an `inline` free function inside its
+/// module namespace (with doc comment and deprecation marker), or the
+/// out-of-line `inline` definition of an interface member declared earlier
+/// by [`render_member_decl`].
 ///
 /// Wrappers are deliberately never marked `noexcept`: a callable with
 /// `throws == false` still surfaces producer panics as the generic
 /// `WeaveFFIError`.
-pub(crate) fn render_cpp_callable(
+pub(crate) fn render_definition(
     out: &mut String,
     f: &FnBinding,
     cpp_name: &str,
@@ -251,120 +327,108 @@ pub(crate) fn render_cpp_callable(
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    match &f.shape {
-        CallShape::Sync(abi) => render_sync_callable(out, f, abi, cpp_name, kind, module, prefix),
-        CallShape::Iterator(it) => {
-            render_iterator_callable(out, f, it, cpp_name, kind, module, prefix)
-        }
-        CallShape::Async(a) => render_async_callable(out, f, a, cpp_name, kind, module, prefix),
+    let mut w = CodeWriter::four_space();
+    if matches!(kind, FnKind::Free) {
+        emit_callable_attrs(&mut w, f, kind);
     }
-}
-
-/// Render a synchronous callable: marshal the parameters (packing buffered
-/// values into local buffers), call the C symbol, run the throws-split error
-/// check, and marshal the return value (decoding buffered returns then
-/// releasing the producer buffer). For a canonical constructor the "return"
-/// adopts the handle instead.
-fn render_sync_callable(
-    out: &mut String,
-    f: &FnBinding,
-    abi: &AbiFn,
-    cpp_name: &str,
-    kind: FnKind<'_>,
-    module: &ModuleBinding,
-    prefix: &str,
-) {
-    let mut w = CodeWriter::four_space().with_depth(kind.depth());
-    emit_callable_attrs(&mut w, f);
-
-    let decls: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
-        .collect();
-
-    let is_ctor = matches!(kind, FnKind::Ctor);
-    if is_ctor {
-        // The canonical constructor adopts the handle the C constructor
-        // returns; `handle_` starts null so a throw from the error check
-        // leaves nothing for the destructor to free.
-        w.line(format!(
-            "{cpp_name}({}) : handle_(nullptr) {{",
-            decls.join(", ")
-        ));
-    } else {
-        let cpp_ret = f
-            .ret
-            .as_ref()
-            .map_or("void".to_string(), |r| cpp_type(r, &module.path, prefix));
-        w.line(format!(
-            "{}{cpp_ret} {cpp_name}({}){} {{",
-            kind.keyword(),
-            decls.join(", "),
-            kind.const_qual()
-        ));
-    }
-
-    let check = check_helper(f, module);
-    w.scope(|w| {
-        let mut c_args = Vec::new();
-        if let Some(self_arg) = kind.self_arg() {
-            c_args.push(self_arg);
+    let params = param_decls(f, prefix, false);
+    let ret = return_type(f, kind);
+    let header = match (kind, ret) {
+        (FnKind::Ctor { class }, _) => {
+            // The canonical constructor adopts the pointer the C constructor
+            // returns; `handle_` starts null so a throw from the error check
+            // leaves nothing for the destructor to release.
+            format!("inline {class}::{class}({params}) : handle_(nullptr) {{")
         }
-        for p in &f.params {
-            c_args.extend(emit_param_setup(w, p, &module.path, prefix));
+        (FnKind::Method { class }, Some(ret)) => {
+            format!("inline {ret} {class}::{cpp_name}({params}) const {{")
         }
-
-        // A bytes or buffered return carries a trailing `size_t* out_len`.
-        let has_out_len = matches!(
-            ret_pass(f.ret.as_ref(), &module.path, prefix),
-            RetPass::Buffer | RetPass::Bytes
-        );
-        if has_out_len {
-            w.line("size_t out_len = 0;");
-            c_args.push("&out_len".into());
+        (FnKind::Static { class }, Some(ret)) => {
+            format!("inline {ret} {class}::{cpp_name}({params}) {{")
         }
-        c_args.push("&err".into());
-        let args_str = c_args.join(", ");
-
-        w.line(format!("{prefix}_error err{{}};"));
-        if f.ret.is_none() {
-            w.line(format!("{}({args_str});", abi.symbol));
-        } else {
-            w.line(format!("auto result = {}({args_str});", abi.symbol));
-        }
-        w.line(format!("{check}(err);"));
-
-        if is_ctor {
-            w.line("handle_ = result;");
-        } else if let Some(ret) = &f.ret {
-            emit_sync_return(w, ret, &module.path, prefix);
-        }
+        (FnKind::Free, Some(ret)) => format!("inline {ret} {cpp_name}({params}) {{"),
+        _ => unreachable!("every non-constructor callable has a return type"),
+    };
+    w.line(header);
+    w.scope(|w| match &f.shape {
+        CallShape::Sync(abi) => emit_sync_body(w, f, abi, kind, module, prefix),
+        CallShape::Iterator(it) => emit_iterator_launch_body(w, f, it, kind, module, prefix),
+        CallShape::Async(a) => emit_async_body(w, f, a, kind, module, prefix),
     });
     w.line("}");
     w.blank();
     out.push_str(&w.finish());
 }
 
-/// Render an iterator-returning callable as a lazy range.
+/// Emit a synchronous callable's body: marshal the parameters (packing
+/// buffered values into local buffers), call the C symbol, run the
+/// throws-split error check, and marshal the return value (decoding buffered
+/// returns then releasing the producer buffer, adopting object returns). For
+/// a canonical constructor the "return" adopts the pointer instead.
+fn emit_sync_body(
+    w: &mut CodeWriter,
+    f: &FnBinding,
+    abi: &AbiFn,
+    kind: FnKind<'_>,
+    module: &ModuleBinding,
+    prefix: &str,
+) {
+    let check = check_helper(f, module);
+    let mut c_args = Vec::new();
+    if let Some(self_arg) = kind.self_arg() {
+        c_args.push(self_arg);
+    }
+    for p in &f.params {
+        c_args.extend(emit_param_setup(w, p, &module.path, prefix));
+    }
+
+    // A bytes or buffered return carries a trailing `size_t* out_len`.
+    let has_out_len = matches!(
+        ret_pass(f.ret.as_ref(), &module.path, prefix),
+        RetPass::Buffer | RetPass::Bytes
+    );
+    if has_out_len {
+        w.line("size_t out_len = 0;");
+        c_args.push("&out_len".into());
+    }
+    c_args.push("&err".into());
+    let args_str = c_args.join(", ");
+
+    w.line(format!("{prefix}_error err{{}};"));
+    if f.ret.is_none() {
+        w.line(format!("{}({args_str});", abi.symbol));
+    } else {
+        w.line(format!("auto result = {}({args_str});", abi.symbol));
+    }
+    w.line(format!("{check}(err);"));
+
+    if matches!(kind, FnKind::Ctor { .. }) {
+        w.line("handle_ = result;");
+    } else if let Some(ret) = &f.ret {
+        emit_sync_return(w, ret, &module.path, prefix);
+    }
+}
+
+// ── Iterators ──
+
+/// Render the lazy range class an iterator-returning callable yields.
 ///
-/// The C ABI yields an opaque iterator handle plus `_next`/`_destroy`. The
-/// wrapper emits a per-function move-only RAII range class (named
-/// `{PascalName}Iterator`) that owns the handle and pulls exactly one element
+/// The C ABI yields an opaque iterator pointer plus `_next`/`_destroy`. The
+/// range class is move-only, owns the pointer, and pulls exactly one element
 /// per consumer step, honoring the `iter<T>` streaming contract
 /// (`weaveffi_core::plan::IteratorProtocol`):
 ///
 /// * `begin()`/`end()` expose a single-pass input iterator with a sentinel
 ///   end, so `for (auto&& item : fn())` streams in constant memory.
-/// * Each pulled element is converted and then released per the plan's
-///   `elem_free` (strings copied then `{prefix}_free_string`; bytes and
-///   buffered values copied or decoded then `{prefix}_free_bytes`).
+/// * Each pulled element is received per the plan's `elem` (strings copied
+///   then `{prefix}_free_string`; bytes and buffered values copied or decoded
+///   then `{prefix}_free_bytes`; objects adopted into their RAII wrapper).
 /// * `destroy` runs exactly once: eagerly on exhaustion or a `next` error,
-///   from the destructor otherwise. The handle is nulled on every path.
+///   from the destructor otherwise. The pointer is nulled on every path.
 /// * Launch and per-`next` errors follow the callable's [`ErrorStrategy`]
 ///   (the typed domain exception for `Throws`, the generic `WeaveFFIError`
 ///   trap otherwise).
-fn render_iterator_callable(
+pub(crate) fn render_iterator_range(
     out: &mut String,
     f: &FnBinding,
     it: &IteratorBinding,
@@ -373,18 +437,21 @@ fn render_iterator_callable(
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    let elem_cpp = cpp_type(&it.elem, &module.path, prefix);
-    let class_name = format!("{}Iterator", f.name.to_upper_camel_case());
+    let elem_cpp = cpp_type(&it.elem);
+    let class_name = iterator_class_name(f, kind);
     let iter_tag = &it.iter_tag;
     let destroy = &it.destroy_symbol;
     let check = check_helper(f, module);
+    let owner = match kind.class() {
+        Some(class) => format!("{class}::{cpp_name}()"),
+        None => format!("{cpp_name}()"),
+    };
 
-    // ── The lazy range class ──
-    let mut w = CodeWriter::four_space().with_depth(kind.depth());
+    let mut w = CodeWriter::four_space();
     w.doc(
         &Some(format!(
             "A lazy, move-only range over the `{elem_cpp}` elements produced by \
-             `{cpp_name}()`.\n\nEach iteration step pulls exactly one element from the \
+             `{owner}`.\n\nEach iteration step pulls exactly one element from the \
              producer, so results stream in constant memory. The range owns the \
              producer-side iterator and releases it exactly once: eagerly when the \
              range is exhausted, or from the destructor when iteration is abandoned \
@@ -399,7 +466,7 @@ fn render_iterator_callable(
     });
     w.line("public:");
     w.scope(|w| {
-        w.line("/** Adopts ownership of the raw producer iterator handle. */");
+        w.line("/** Adopts ownership of the raw producer iterator. */");
         w.line(format!(
             "explicit {class_name}({iter_tag}* h) : handle_(h) {{}}"
         ));
@@ -488,61 +555,45 @@ fn render_iterator_callable(
     });
     w.line("};");
     w.blank();
-
-    // ── The launching wrapper ──
-    let return_doc = format!(
-        "@return A lazy `{class_name}` range that streams one element per iteration \
-         step and releases the producer iterator when exhausted or destroyed."
-    );
-    let fn_doc = match &f.doc {
-        Some(d) => format!("{d}\n\n{return_doc}"),
-        None => return_doc,
-    };
-    w.doc(&Some(fn_doc), DocCommentStyle::Javadoc);
-    if let Some(msg) = &f.deprecated {
-        let escaped = msg.replace('"', "\\\"");
-        w.line(format!("[[deprecated(\"{escaped}\")]]"));
-    }
-
-    let decls: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
-        .collect();
-    w.line(format!(
-        "{}{class_name} {cpp_name}({}){} {{",
-        kind.keyword(),
-        decls.join(", "),
-        kind.const_qual()
-    ));
-
-    w.scope(|w| {
-        let mut c_args = Vec::new();
-        if let Some(self_arg) = kind.self_arg() {
-            c_args.push(self_arg);
-        }
-        for p in &f.params {
-            c_args.extend(emit_param_setup(w, p, &module.path, prefix));
-        }
-        c_args.push("&err".into());
-        w.line(format!("{prefix}_error err{{}};"));
-        w.line(format!(
-            "{iter_tag}* iter = {}({});",
-            it.launch.symbol,
-            c_args.join(", ")
-        ));
-        w.line(format!("{check}(err);"));
-        w.line(format!("return {class_name}(iter);"));
-    });
-    w.line("}");
-    w.blank();
     out.push_str(&w.finish());
 }
 
+/// Emit an iterator-returning callable's body: marshal the parameters, call
+/// the launcher, check `out_err`, and wrap the returned pointer in the range
+/// class.
+fn emit_iterator_launch_body(
+    w: &mut CodeWriter,
+    f: &FnBinding,
+    it: &IteratorBinding,
+    kind: FnKind<'_>,
+    module: &ModuleBinding,
+    prefix: &str,
+) {
+    let class_name = iterator_class_name(f, kind);
+    let check = check_helper(f, module);
+    let mut c_args = Vec::new();
+    if let Some(self_arg) = kind.self_arg() {
+        c_args.push(self_arg);
+    }
+    for p in &f.params {
+        c_args.extend(emit_param_setup(w, p, &module.path, prefix));
+    }
+    c_args.push("&err".into());
+    w.line(format!("{prefix}_error err{{}};"));
+    w.line(format!(
+        "{}* iter = {}({});",
+        it.iter_tag,
+        it.launch.symbol,
+        c_args.join(", ")
+    ));
+    w.line(format!("{check}(err);"));
+    w.line(format!("return {class_name}(iter);"));
+}
+
 /// Emit the range class's `next()` member: one producer `next` call that
-/// yields the converted element (or `std::nullopt` on exhaustion), releasing
-/// the pulled slot per the plan's `elem_free` and destroying the handle
-/// exactly once on exhaustion or error.
+/// yields the received element (or `std::nullopt` on exhaustion), releasing
+/// the pulled slot per the plan's `elem` and destroying the iterator exactly
+/// once on exhaustion or error.
 fn render_iterator_next_method(
     w: &mut CodeWriter,
     f: &FnBinding,
@@ -551,11 +602,10 @@ fn render_iterator_next_method(
     prefix: &str,
     check: &str,
 ) {
-    let elem_cpp = cpp_type(&it.elem, &module.path, prefix);
+    let elem_cpp = cpp_type(&it.elem);
     let destroy = &it.destroy_symbol;
     let item_ret = abi::lower_return(&it.elem, &module.path);
     let item_ty = item_ret.ret.render_c(prefix);
-    let ef = elem_free(&it.elem);
     let strategy_doc = match f.error_strategy() {
         ErrorStrategy::Throws => "throws the module's typed exception",
         ErrorStrategy::Trap => "throws the generic WeaveFFIError",
@@ -599,122 +649,118 @@ fn render_iterator_next_method(
             w.line("return std::nullopt;");
         });
         w.line("}");
-        if it.elem.is_buffered() {
-            // A buffered element is producer-allocated: decode into an owned
-            // value, then release with free_bytes via the scope guard.
-            w.line("detail::BufferGuard item_guard{item, item_len};");
-            w.line("detail::BufferReader item_r(item, item_len);");
-            emit_read_decl(w, &it.elem, "value", "item_r", &module.path, prefix);
-            w.line("item_r.expect_end();");
-            w.line("return value;");
-        } else {
-            match (&it.elem, &ef) {
-                // Byte-buffer elements copy then release the producer buffer.
-                (Ty::Bytes | Ty::BorrowedBytes, _) => {
-                    w.line("std::vector<uint8_t> value(item, item + item_len);");
-                    w.line(format!(
-                        "{prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);"
-                    ));
+        match ret_pass(Some(&it.elem), &module.path, prefix) {
+            RetPass::Buffer => {
+                // A buffered element is producer-allocated: decode into an
+                // owned value, then release with free_bytes via the scope
+                // guard.
+                w.line("detail::BufferGuard item_guard{item, item_len};");
+                w.line("detail::BufferReader item_r(item, item_len);");
+                emit_read_decl(w, &it.elem, "value", "item_r", &module.path, prefix);
+                w.line("item_r.expect_end();");
+                w.line("return value;");
+            }
+            RetPass::Bytes => {
+                w.line("std::vector<uint8_t> value(item, item + item_len);");
+                w.line(format!(
+                    "{prefix}_free_bytes(const_cast<uint8_t*>(item), item_len);"
+                ));
+                w.line("return value;");
+            }
+            RetPass::String => {
+                w.line("std::string value(item);");
+                w.line(format!("{prefix}_free_string(item);"));
+                w.line("return value;");
+            }
+            // An object element transfers one strong reference: adopt it. A
+            // nullable element yields an engaged outer optional holding an
+            // empty inner one for null, which is distinct from exhaustion.
+            RetPass::Object { nullable, .. } => {
+                let class = object_class(&it.elem);
+                if nullable {
+                    w.line(format!("{elem_cpp} value;"));
+                    w.line("if (item) value.emplace(item);");
                     w.line("return value;");
+                } else {
+                    w.line(format!("return {class}(item);"));
                 }
-                (_, ElemFree::String) => {
-                    w.line("std::string value(item);");
-                    w.line(format!("{prefix}_free_string(item);"));
-                    w.line("return value;");
-                }
-                (Ty::Enum(n), _) => {
+            }
+            RetPass::Direct => match &it.elem {
+                Ty::Enum(n) => {
                     let n = local_type_name(n);
                     w.line(format!("return static_cast<{n}>(item);"));
-                }
-                (Ty::Handle, _) => {
-                    w.line("return reinterpret_cast<void*>(static_cast<uintptr_t>(item));");
                 }
                 _ => {
                     w.line("return item;");
                 }
-            }
+            },
+            RetPass::Void => unreachable!("iterator elements are never void"),
         }
     });
     w.line("}");
     w.blank();
 }
 
-/// Render an asynchronous callable as a `std::future` wrapper. The promise is
-/// heap-allocated, threaded through the C `context` pointer, settled by the
-/// completion callback, and deleted exactly once. A callback error settles
-/// the promise with the typed domain exception (payload fields decoded) when
-/// the callable throws, or the generic `WeaveFFIError` otherwise. The
-/// callback owns everything it receives: the boxed error and any string or
-/// buffer result are released through the runtime free symbols after
-/// copying.
-fn render_async_callable(
-    out: &mut String,
+// ── Async ──
+
+/// Emit an asynchronous callable's body as a `std::future` wrapper. The
+/// promise is heap-allocated, threaded through the C `context` pointer,
+/// settled by the completion callback, and deleted exactly once. A callback
+/// error settles the promise with the typed domain exception (payload fields
+/// decoded) when the callable throws, or the generic `WeaveFFIError`
+/// otherwise. The callback owns everything it receives: the boxed error and
+/// any string or buffer result are released through the runtime free symbols
+/// after copying, and an object result is adopted.
+fn emit_async_body(
+    w: &mut CodeWriter,
     f: &FnBinding,
     a: &AsyncBinding,
-    cpp_name: &str,
     kind: FnKind<'_>,
     module: &ModuleBinding,
     prefix: &str,
 ) {
-    let cpp_ret = f
-        .ret
-        .as_ref()
-        .map_or("void".to_string(), |r| cpp_type(r, &module.path, prefix));
-    let mut w = CodeWriter::four_space().with_depth(kind.depth());
-    emit_callable_attrs(&mut w, f);
-
-    let mut decls: Vec<String> = f
-        .params
-        .iter()
-        .map(|p| cpp_param_decl(&p.ty, &cpp_ident(&p.name), p.mutable, &module.path, prefix))
-        .collect();
-    if f.cancellable {
-        decls.push(format!("{prefix}_cancel_token* cancel_token = nullptr"));
-    }
-    w.line(format!(
-        "{}std::future<{cpp_ret}> {cpp_name}({}){} {{",
-        kind.keyword(),
-        decls.join(", "),
-        kind.const_qual()
-    ));
-
+    let cpp_ret = f.ret.as_ref().map_or("void".to_string(), cpp_type);
     let cb_params = render_param_decls(&a.callback_params, prefix).join(", ");
     let make_error = make_error_call(f, module);
+
+    w.line(format!(
+        "auto* promise_ptr = new std::promise<{cpp_ret}>();"
+    ));
+    w.line("auto future = promise_ptr->get_future();");
+
+    let mut c_args = Vec::new();
+    if let Some(self_arg) = kind.self_arg() {
+        c_args.push(self_arg);
+    }
+    for p in &f.params {
+        c_args.extend(emit_param_setup(w, p, &module.path, prefix));
+    }
+    if f.cancellable {
+        c_args.push("cancel_token".to_string());
+    }
+
+    if c_args.is_empty() {
+        w.line(format!("{}([]({cb_params}) {{", a.launch.symbol));
+    } else {
+        w.line(format!(
+            "{}({}, []({cb_params}) {{",
+            a.launch.symbol,
+            c_args.join(", ")
+        ));
+    }
     w.scope(|w| {
         w.line(format!(
-            "auto* promise_ptr = new std::promise<{cpp_ret}>();"
+            "auto* p = static_cast<std::promise<{cpp_ret}>*>(context);"
         ));
-        w.line("auto future = promise_ptr->get_future();");
-
-        let mut c_args = Vec::new();
-        if let Some(self_arg) = kind.self_arg() {
-            c_args.push(self_arg);
-        }
-        for p in &f.params {
-            c_args.extend(emit_param_setup(w, p, &module.path, prefix));
-        }
-        if f.cancellable {
-            c_args.push("cancel_token".to_string());
-        }
-
-        if c_args.is_empty() {
-            w.line(format!("{}([]({cb_params}) {{", a.launch.symbol));
-        } else {
-            w.line(format!(
-                "{}({}, []({cb_params}) {{",
-                a.launch.symbol,
-                c_args.join(", ")
-            ));
-        }
+        // The callback runs on a producer thread inside a C frame, so a
+        // decode failure (of the result or of an error payload) must settle
+        // the promise, never unwind.
+        w.line("try {");
         w.scope(|w| {
-            w.line(format!(
-                "auto* p = static_cast<std::promise<{cpp_ret}>*>(context);"
-            ));
             w.line("if (err && err->code != 0) {");
             w.scope(|w| {
                 w.line("std::string msg(err->message ? err->message : \"unknown error\");");
                 w.line(format!("p->set_exception({make_error});"));
-                w.line(format!("{prefix}_error_free(err);"));
             });
             w.line("} else {");
             w.scope(|w| {
@@ -725,14 +771,17 @@ fn render_async_callable(
                 }
             });
             w.line("}");
-            w.line("delete p;");
         });
-        w.line("}, static_cast<void*>(promise_ptr));");
-        w.line("return future;");
+        w.line("} catch (...) {");
+        w.scope(|w| {
+            w.line("p->set_exception(std::current_exception());");
+        });
+        w.line("}");
+        w.line(format!("{prefix}_error_free(err);"));
+        w.line("delete p;");
     });
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
+    w.line("}, static_cast<void*>(promise_ptr));");
+    w.line("return future;");
 }
 
 /// Settle an async promise from the callback's result slots at the writer's
@@ -746,16 +795,12 @@ fn render_async_callable(
 fn emit_async_set_value(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str) {
     match ret_pass(Some(ty), module, prefix) {
         RetPass::Buffer => {
-            // Owned `(result_ptr, result_len)` buffer: decode, then free.
+            w.line("detail::BufferGuard result_guard{result_ptr, result_len};");
             w.line("detail::BufferReader result_r(result_ptr, result_len);");
             emit_read_decl(w, ty, "value", "result_r", module, prefix);
             w.line("result_r.expect_end();");
-            w.line(format!(
-                "{prefix}_free_bytes(const_cast<uint8_t*>(result_ptr), result_len);"
-            ));
             w.line("p->set_value(std::move(value));");
         }
-        // Owned by the consumer: copy, then free.
         RetPass::String => {
             w.line("std::string value(result ? result : \"\");");
             w.line(format!("{prefix}_free_string(result);"));
@@ -768,10 +813,8 @@ fn emit_async_set_value(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str)
             ));
             w.line("p->set_value(std::move(value));");
         }
-        // Owned interface result: the callback receives ownership; adopt it.
-        // A nullable result maps null to `std::nullopt`.
         RetPass::Object { nullable, .. } => {
-            let ln = local_type_name(object_iface_name(ty));
+            let class = object_class(ty);
             if nullable {
                 w.line("if (!result) {");
                 w.scope(|w| {
@@ -779,24 +822,20 @@ fn emit_async_set_value(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str)
                 });
                 w.line("} else {");
                 w.scope(|w| {
-                    w.line(format!("p->set_value({ln}(result));"));
+                    w.line(format!("p->set_value({class}(result));"));
                 });
                 w.line("}");
             } else {
-                w.line(format!("p->set_value({ln}(result));"));
+                w.line(format!("p->set_value({class}(result));"));
             }
         }
         RetPass::Direct => match ty {
-            Ty::Handle => {
-                w.line("p->set_value(reinterpret_cast<void*>(static_cast<uintptr_t>(result)));");
-            }
             Ty::Enum(n) => {
                 w.line(format!(
                     "p->set_value(static_cast<{}>(result));",
                     local_type_name(n)
                 ));
             }
-            // Scalars and typed handles (the raw tag pointer) pass through.
             _ => {
                 w.line("p->set_value(result);");
             }
@@ -805,163 +844,24 @@ fn emit_async_set_value(w: &mut CodeWriter, ty: &Ty, module: &str, prefix: &str)
     }
 }
 
-// ── Namespace: per-module function namespaces and listeners ──
+// ── Namespace: per-module function namespaces ──
 
-/// Emit one module's nested namespace holding its listeners and free
-/// functions with bare snake_case names (`namespace kv::stats { ... }`).
-/// Modules with no functions or listeners emit nothing; their types live at
-/// the namespace root.
+/// Emit one module's nested namespace holding its free functions with bare
+/// snake_case names (`namespace kv::stats { ... }`). An iterator-returning
+/// function is preceded by its range class. Modules with no functions emit
+/// nothing; their types live at the namespace root.
 pub(crate) fn render_cpp_module_ns(out: &mut String, module: &ModuleBinding, prefix: &str) {
-    if module.functions.is_empty() && module.listeners.is_empty() {
+    if module.functions.is_empty() {
         return;
     }
     let ns = cpp_namespace_path(module);
     out.push_str(&format!("namespace {ns} {{\n\n"));
-    for l in &module.listeners {
-        render_cpp_listener(out, module, l, prefix);
-    }
     for f in &module.functions {
-        render_cpp_callable(out, f, &cpp_fn_name(&f.name), FnKind::Free, module, prefix);
+        let name = cpp_fn_name(&f.name);
+        if let CallShape::Iterator(it) = &f.shape {
+            render_iterator_range(out, f, it, &name, FnKind::Free, module, prefix);
+        }
+        render_definition(out, f, &name, FnKind::Free, module, prefix);
     }
     out.push_str(&format!("}} // namespace {ns}\n\n"));
-}
-
-/// The C++ type one callback parameter surfaces as in the user callback.
-/// Buffered values are decoded before dispatch, so they surface as full C++
-/// value types. Interface and typed-handle parameters stay raw borrowed
-/// pointers: wrapping a borrowed handle in the owning RAII class would
-/// `_destroy` it on destruction.
-fn cpp_cb_param_type(ty: &Ty, module: &str, prefix: &str) -> String {
-    match ty {
-        Ty::Interface(n) => format!("const {}*", c_abi_struct_name(n, module, prefix)),
-        Ty::Optional(inner) if matches!(inner.as_ref(), Ty::Interface(_)) => {
-            cpp_cb_param_type(inner, module, prefix)
-        }
-        other => cpp_type(other, module, prefix),
-    }
-}
-
-/// Emit any decode statements for one callback parameter and return the
-/// expression handed to the user's `std::function`, dispatching on the
-/// parameter's [`ArgPass`] plan. Buffered arguments are borrowed `(ptr, len)`
-/// pairs valid only during the dispatch, so they are decoded into owned C++
-/// values before the user callback runs.
-fn emit_cb_arg(w: &mut CodeWriter, p: &ParamBinding, module: &str, prefix: &str) -> String {
-    match p.arg_pass() {
-        ArgPass::Buffer { ptr, len } => {
-            let n0 = &ptr.name;
-            let n1 = &len.name;
-            let var = format!("{}_val", p.name);
-            let rdr = format!("{}_r", p.name);
-            let cpp = cpp_type(&p.ty, module, prefix);
-            w.line(format!("{cpp} {var}{{}};"));
-            w.line(format!("if ({n0} != nullptr) {{"));
-            w.scope(|w| {
-                w.line(format!("detail::BufferReader {rdr}({n0}, {n1});"));
-                emit_read_into(w, &p.ty, &var, &var, &rdr, module, prefix);
-                w.line(format!("{rdr}.expect_end();"));
-            });
-            w.line("}");
-            format!("std::move({var})")
-        }
-        ArgPass::String { slot } => {
-            let n0 = &slot.name;
-            format!("std::string({n0} ? {n0} : \"\")")
-        }
-        ArgPass::Bytes { ptr, len } => {
-            let n0 = &ptr.name;
-            let n1 = &len.name;
-            format!("{n0} ? std::vector<uint8_t>({n0}, {n0} + {n1}) : std::vector<uint8_t>{{}}")
-        }
-        // Borrowed for the duration of the callback; passed through raw.
-        ArgPass::Object { slot, .. } => slot.name.clone(),
-        ArgPass::Direct { slot } => {
-            let n0 = &slot.name;
-            match &p.ty {
-                Ty::Enum(e) => format!(
-                    "static_cast<{}>(static_cast<int32_t>({n0}))",
-                    local_type_name(e)
-                ),
-                Ty::Handle => {
-                    format!("reinterpret_cast<void*>(static_cast<uintptr_t>({n0}))")
-                }
-                // Typed handles stay the raw borrowed tag pointer.
-                _ => n0.clone(),
-            }
-        }
-    }
-}
-
-/// The register/unregister pair for one listener. The user `std::function` is
-/// heap-boxed and threaded through the C `context` pointer; a capture-free
-/// lambda (convertible to the C function pointer) unboxes and invokes it,
-/// decoding any borrowed buffered arguments first.
-fn render_cpp_listener(
-    out: &mut String,
-    module: &ModuleBinding,
-    l: &ListenerBinding,
-    prefix: &str,
-) {
-    let Some(cb) = module.callback(&l.event_callback) else {
-        unreachable!("validation guarantees the listener's callback exists");
-    };
-
-    let fn_params: Vec<String> = cb
-        .params
-        .iter()
-        .map(|p| cpp_cb_param_type(&p.ty, &module.path, prefix))
-        .collect();
-    let std_fn = format!("std::function<void({})>", fn_params.join(", "));
-
-    let lambda_params = render_param_decls(&cb.abi_params, prefix).join(", ");
-
-    let register_name = format!("register_{}", l.name.to_snake_case());
-    let unregister_name = format!("unregister_{}", l.name.to_snake_case());
-
-    let mut w = CodeWriter::four_space();
-    w.doc(&l.doc, DocCommentStyle::Javadoc);
-    w.line(format!(
-        "/** @return A subscription id for {unregister_name}(). */"
-    ));
-    w.line(format!(
-        "inline uint64_t {register_name}({std_fn} callback) {{"
-    ));
-    w.scope(|w| {
-        w.line(format!(
-            "auto fn = std::make_shared<{std_fn}>(std::move(callback));"
-        ));
-        w.line(format!("uint64_t id = {}(", l.register_symbol));
-        w.scope(|w| {
-            w.line(format!("[]({lambda_params}) {{"));
-            w.scope(|w| {
-                w.line(format!("auto& cb = *static_cast<{std_fn}*>(context);"));
-                let args: Vec<String> = cb
-                    .params
-                    .iter()
-                    .map(|p| emit_cb_arg(w, p, &module.path, prefix))
-                    .collect();
-                w.line(format!("cb({});", args.join(", ")));
-            });
-            w.line("},");
-            w.line("fn.get());");
-        });
-        w.line("std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());");
-        w.line("detail::wv_listener_registry()[id] = fn;");
-        w.line("return id;");
-    });
-    w.line("}");
-    w.blank();
-
-    w.line(format!(
-        "/** Unregisters a listener previously registered with {register_name}(). */"
-    ));
-    w.line(format!("inline void {unregister_name}(uint64_t id) {{"));
-    w.scope(|w| {
-        w.line(format!("{}(id);", l.unregister_symbol));
-        w.line("std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());");
-        w.line("detail::wv_listener_registry().erase(id);");
-    });
-    w.line("}");
-    w.blank();
-    out.push_str(&w.finish());
 }

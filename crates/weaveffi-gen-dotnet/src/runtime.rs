@@ -29,11 +29,27 @@ pub(crate) fn check_method_name(eb: &ErrorBinding) -> String {
 }
 
 /// Render the generic branded exception every failure surfaces through when
-/// no typed domain applies.
+/// no typed domain applies. The runtime trap codes are exposed as constants
+/// so a caller can tell a producer panic (`-2`) from a callback-interface
+/// implementation that threw (`-4`); both arrive through this class rather
+/// than a typed domain exception.
 pub(crate) fn render_exception_class(out: &mut String) {
     let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("/// <summary>Raised for any WeaveFFI failure that isn't a typed domain");
+    w.line("/// error: producer bugs, panics, marshalling failures, and exceptions");
+    w.line("/// thrown by a callback-interface implementation.</summary>");
     w.line("public class WeaveFFIException : Exception");
     w.block("{", "}", |w| {
+        w.line("/// <summary>An untyped producer error.</summary>");
+        w.line("public const int GenericErrorCode = -1;");
+        w.line("/// <summary>The producer panicked; the message carries the panic text.</summary>");
+        w.line("public const int PanicErrorCode = -2;");
+        w.line("/// <summary>An argument couldn't be lifted by the producer.</summary>");
+        w.line("public const int MarshalErrorCode = -3;");
+        w.line("/// <summary>A callback-interface implementation threw; the message");
+        w.line("/// carries the original exception's message.</summary>");
+        w.line("public const int ForeignErrorCode = -4;");
+        w.blank();
         w.line("public int Code { get; }");
         w.blank();
         w.line("public WeaveFFIException(int code, string message) : base(message)");
@@ -50,7 +66,8 @@ pub(crate) fn render_exception_class(out: &mut String) {
 /// and `FromCode` maps a raw error slot to the typed exception, falling back
 /// to the generic `WeaveFFIException` for unknown codes. Declared codes are
 /// validated positive, so every negative runtime code (generic failures,
-/// producer panics, marshalling failures) takes the fallback. When the
+/// producer panics, marshalling failures, foreign callback failures) takes
+/// the fallback. When the
 /// matched code declares payload fields, `FromCode` decodes them from the
 /// serialized payload buffer and exposes each field in the exception's
 /// `Data` dictionary, keyed by the IDL field name.
@@ -192,9 +209,31 @@ pub(crate) fn render_error_struct(out: &mut String, domains: &[&ErrorBinding]) {
     out.push_str(&w.finish());
 }
 
-/// Render the internal string and pointer helpers shared by every wrapper.
+/// Render the internal string and pointer helpers shared by every wrapper,
+/// plus the `WeaveFFIHandle` marker every object wrapper's adopting
+/// constructor takes. The marker exists because the generated file is often
+/// compiled into the consumer's own assembly, where an `internal` constructor
+/// taking a bare `IntPtr` would join overload resolution with the public IDL
+/// constructors: an `int` literal converts implicitly to `IntPtr` (`nint`) and
+/// C# prefers that over `long`, so `new Token(1)` would silently adopt the
+/// pointer `0x1`. No IDL type lowers to `WeaveFFIHandle`, so the adopting
+/// constructor can never be chosen by accident.
 pub(crate) fn render_helpers_class(out: &mut String) {
     let mut w = CodeWriter::four_space().with_depth(1);
+    w.line("/// <summary>One strong reference to a native object, on its way into");
+    w.line("/// a wrapper that adopts it. A distinct type (rather than a bare");
+    w.line("/// <c>IntPtr</c>) so the adopting constructor never competes with a");
+    w.line("/// public constructor taking an integer.</summary>");
+    w.line("internal readonly struct WeaveFFIHandle");
+    w.block("{", "}", |w| {
+        w.line("internal readonly IntPtr Value;");
+        w.blank();
+        w.line("internal WeaveFFIHandle(IntPtr value)");
+        w.block("{", "}", |w| {
+            w.line("Value = value;");
+        });
+    });
+    w.blank();
     w.line("internal static class WeaveFFIHelpers");
     w.block("{", "}", |w| {
         w.line("internal static IntPtr StringToPtr(string? s)");
@@ -219,9 +258,11 @@ pub(crate) fn render_helpers_class(out: &mut String) {
 /// The private buffer writer and reader implementing the WeaveFFI value-buffer
 /// wire format (little-endian, packed, no alignment) over managed byte arrays.
 /// The reader rejects malformed input (truncation, invalid bool or option
-/// flags, oversized length prefixes, trailing bytes) by throwing
-/// `InvalidOperationException`; a malformed buffer is always a producer or
-/// consumer bug, never a recoverable domain error.
+/// flags, oversized length prefixes, a zero object token, trailing bytes) by
+/// throwing `InvalidOperationException`; a malformed buffer is always a
+/// producer or consumer bug, never a recoverable domain error. Object tokens
+/// are the pointer zero-extended to `u64`, so the conversions go through the
+/// native-sized unsigned integer rather than `long`.
 pub(crate) fn render_buffer_classes(out: &mut String) {
     let mut w = CodeWriter::four_space().with_depth(1);
     w.block_raw(
@@ -336,6 +377,11 @@ internal sealed class WeaveFFIBufferWriter
         Ensure(v.Length);
         Array.Copy(v, 0, _buf, _len, v.Length);
         _len += v.Length;
+    }
+
+    internal void WriteObject(IntPtr token)
+    {
+        WriteU64((ulong)(nuint)(nint)token);
     }
 
     internal byte[] ToArray()
@@ -482,6 +528,16 @@ internal sealed class WeaveFFIBufferReader
         Array.Copy(_data, _pos, outBuf, 0, len);
         _pos += len;
         return outBuf;
+    }
+
+    internal IntPtr ReadObject()
+    {
+        var token = ReadU64();
+        if (token == 0)
+        {
+            throw new InvalidOperationException("malformed WeaveFFI value buffer: null object token");
+        }
+        return (nint)(nuint)token;
     }
 
     internal void ExpectEnd()

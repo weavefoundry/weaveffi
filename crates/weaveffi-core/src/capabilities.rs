@@ -1,13 +1,11 @@
 //! Per-target **feature capability declarations** and the loud-failure
 //! contract that replaces silent feature skipping.
 //!
-//! Historically a backend that did not implement an IDL feature simply
-//! omitted it from its output: Go and Ruby dropped `async` functions, nine
-//! of eleven wrappers skipped callbacks and listeners, and nothing told the
-//! user. That class of silent degradation is banned: every generator now
-//! declares a [`TargetCapabilities`] and the orchestrator refuses to run a
-//! generator against an API that uses a feature the target does not support,
-//! listing each offending declaration by path.
+//! A backend that does not implement an IDL feature must not simply omit it
+//! from its output with nothing telling the user. Every generator declares a
+//! [`TargetCapabilities`] and the orchestrator refuses to run a generator
+//! against an API that uses a feature the target does not support, listing
+//! each offending declaration by path.
 //!
 //! A backend that gains a feature flips the corresponding flag and the gate
 //! opens; a backend that loses one (or a new feature lands in the IR before
@@ -21,26 +19,24 @@ use weaveffi_ir::ir::{Api, Module, TypeRef};
 
 /// An IDL feature whose support varies (or could vary) per target.
 ///
-/// Core types (scalars, strings, bytes, structs, enums, optionals, lists,
-/// maps, handles) are mandatory for every backend and are not gated.
+/// Core types (scalars, strings, bytes, structs, enums, interfaces,
+/// optionals, lists, maps) are mandatory for every backend and are not gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     /// `async: true` functions (callback-completed launchers).
     AsyncFunctions,
-    /// Module-level callback typedefs (`callbacks:`).
-    Callbacks,
-    /// Listener register/unregister pairs (`listeners:`).
-    Listeners,
+    /// Callback interfaces (`callback_interfaces:`): consumer-implemented
+    /// vtables the producer calls into.
+    CallbackInterfaces,
     /// `iter<T>` returns (opaque iterator handle + `next`/`destroy`).
     Iterators,
 }
 
 impl Feature {
     /// Every gated feature, for exhaustive iteration in checks and tests.
-    pub const ALL: [Feature; 4] = [
+    pub const ALL: [Feature; 3] = [
         Feature::AsyncFunctions,
-        Feature::Callbacks,
-        Feature::Listeners,
+        Feature::CallbackInterfaces,
         Feature::Iterators,
     ];
 
@@ -48,8 +44,7 @@ impl Feature {
     pub fn idl_name(&self) -> &'static str {
         match self {
             Feature::AsyncFunctions => "async functions",
-            Feature::Callbacks => "callbacks",
-            Feature::Listeners => "listeners",
+            Feature::CallbackInterfaces => "callback interfaces",
             Feature::Iterators => "iterator returns (iter<T>)",
         }
     }
@@ -70,10 +65,8 @@ impl fmt::Display for Feature {
 pub struct TargetCapabilities {
     /// Whether the target generates `async: true` functions.
     pub async_functions: bool,
-    /// Whether the target generates module-level callback typedefs.
-    pub callbacks: bool,
-    /// Whether the target generates listener register/unregister pairs.
-    pub listeners: bool,
+    /// Whether the target generates callback-interface implementations.
+    pub callback_interfaces: bool,
     /// Whether the target generates `iter<T>` returns.
     pub iterators: bool,
 }
@@ -84,8 +77,7 @@ impl TargetCapabilities {
     pub const fn full() -> Self {
         Self {
             async_functions: true,
-            callbacks: true,
-            listeners: true,
+            callback_interfaces: true,
             iterators: true,
         }
     }
@@ -94,8 +86,7 @@ impl TargetCapabilities {
     pub const fn supports(&self, feature: Feature) -> bool {
         match feature {
             Feature::AsyncFunctions => self.async_functions,
-            Feature::Callbacks => self.callbacks,
-            Feature::Listeners => self.listeners,
+            Feature::CallbackInterfaces => self.callback_interfaces,
             Feature::Iterators => self.iterators,
         }
     }
@@ -117,15 +108,10 @@ fn collect_module(module: &Module, parent: &str, used: &mut BTreeMap<Feature, Ve
     } else {
         format!("{parent}.{}", module.name)
     };
-    for cb in &module.callbacks {
-        used.entry(Feature::Callbacks)
+    for cb in &module.callback_interfaces {
+        used.entry(Feature::CallbackInterfaces)
             .or_default()
             .push(format!("{path}.{}", cb.name));
-    }
-    for l in &module.listeners {
-        used.entry(Feature::Listeners)
-            .or_default()
-            .push(format!("{path}.{}", l.name));
     }
     let members = module.interfaces.iter().flat_map(|i| {
         i.constructors
@@ -218,7 +204,7 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weaveffi_ir::ir::{CallbackDef, Function, ListenerDef, Param};
+    use weaveffi_ir::ir::{CallbackInterfaceDef, Function, Param};
 
     fn func(name: &str, is_async: bool, returns: Option<TypeRef>) -> Function {
         Function {
@@ -226,7 +212,6 @@ mod tests {
             params: vec![Param {
                 name: "x".into(),
                 ty: TypeRef::I32,
-                mutable: false,
                 doc: None,
             }],
             returns,
@@ -235,7 +220,6 @@ mod tests {
             r#async: is_async,
             cancellable: false,
             deprecated: None,
-            since: None,
         }
     }
 
@@ -245,10 +229,9 @@ mod tests {
             doc: None,
             functions: vec![],
             interfaces: vec![],
+            callback_interfaces: vec![],
             structs: vec![],
             enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
             errors: None,
             modules: vec![],
         }
@@ -263,15 +246,11 @@ mod tests {
 
     fn events_api() -> Api {
         api(vec![Module {
-            callbacks: vec![CallbackDef {
-                name: "OnMessage".into(),
-                params: vec![],
+            callback_interfaces: vec![CallbackInterfaceDef {
+                name: "MessageListener".into(),
                 doc: None,
-            }],
-            listeners: vec![ListenerDef {
-                name: "message_listener".into(),
-                event_callback: "OnMessage".into(),
-                doc: None,
+                deprecated: None,
+                methods: vec![func("on_message", false, None)],
             }],
             functions: vec![
                 func("send", false, None),
@@ -304,12 +283,8 @@ mod tests {
     fn used_features_collects_locations() {
         let used = used_features(&events_api());
         assert_eq!(
-            used[&Feature::Callbacks],
-            vec!["events.OnMessage".to_string()]
-        );
-        assert_eq!(
-            used[&Feature::Listeners],
-            vec!["events.message_listener".to_string()]
+            used[&Feature::CallbackInterfaces],
+            vec!["events.MessageListener".to_string()]
         );
         assert_eq!(
             used[&Feature::AsyncFunctions],
@@ -338,7 +313,7 @@ mod tests {
     fn missing_capability_is_reported_with_locations() {
         let caps = TargetCapabilities {
             async_functions: false,
-            listeners: false,
+            callback_interfaces: false,
             ..TargetCapabilities::full()
         };
         let err = check(&events_api(), "go", &caps).unwrap_err();
@@ -351,7 +326,7 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("listeners (used by: events.message_listener)"),
+            msg.contains("callback interfaces (used by: events.MessageListener)"),
             "{msg}"
         );
     }

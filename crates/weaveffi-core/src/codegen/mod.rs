@@ -108,7 +108,7 @@ impl<B: LanguageBackend> Target for ConfiguredBackend<B> {
     }
 
     fn capabilities(&self) -> TargetCapabilities {
-        self.inner.capabilities()
+        self.inner.capabilities(&self.config)
     }
 
     fn allows_unsupported(&self) -> bool {
@@ -263,7 +263,7 @@ mod tests {
     use crate::model::BindingModel;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use weaveffi_ir::ir::{Api, CallbackDef, ListenerDef, Module};
+    use weaveffi_ir::ir::{Api, CallbackInterfaceDef, Function, Module};
 
     #[derive(Default, Clone, serde::Serialize)]
     struct TestConfig {
@@ -284,7 +284,7 @@ mod tests {
             self.name
         }
 
-        fn capabilities(&self) -> TargetCapabilities {
+        fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
             self.caps
         }
 
@@ -315,8 +315,7 @@ mod tests {
             interfaces: vec![],
             structs: vec![],
             enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
+            callback_interfaces: vec![],
             errors: None,
             modules: vec![],
         }
@@ -329,19 +328,24 @@ mod tests {
         })
     }
 
-    /// An API that uses listeners, so a target without listener support
-    /// trips the capability gate.
+    /// An API that uses a callback interface, so a target without callback
+    /// interface support trips the capability gate.
     fn listener_api() -> ResolvedApi {
         let mut m = module("math");
-        m.callbacks = vec![CallbackDef {
+        m.callback_interfaces = vec![CallbackInterfaceDef {
             name: "OnChange".into(),
-            params: vec![],
             doc: None,
-        }];
-        m.listeners = vec![ListenerDef {
-            name: "on_change".into(),
-            event_callback: "OnChange".into(),
-            doc: None,
+            deprecated: None,
+            methods: vec![Function {
+                name: "changed".into(),
+                params: vec![],
+                returns: None,
+                doc: None,
+                throws: false,
+                r#async: false,
+                cancellable: false,
+                deprecated: None,
+            }],
         }];
         ResolvedApi::assume_valid(Api {
             version: weaveffi_ir::ir::CURRENT_SCHEMA_VERSION.into(),
@@ -370,7 +374,7 @@ mod tests {
                 name,
                 calls: Arc::clone(calls),
                 caps: TargetCapabilities {
-                    listeners: false,
+                    callback_interfaces: false,
                     ..TargetCapabilities::full()
                 },
             },
@@ -401,7 +405,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("target 'strict' does not support"), "{err}");
-        assert!(err.contains("math.on_change"), "{err}");
+        assert!(err.contains("math.OnChange"), "{err}");
         assert!(!err.contains("target 'opted'"), "{err}");
         assert_eq!(strict_calls.load(Ordering::SeqCst), 0);
         assert_eq!(opted_calls.load(Ordering::SeqCst), 0);

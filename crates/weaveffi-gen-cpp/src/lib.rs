@@ -1,13 +1,15 @@
 //! C++ wrapper generator for WeaveFFI.
 //!
 //! Produces an idiomatic `weaveffi.hpp` header (value structs, `std::variant`
-//! sum types, move semantics, `std::optional`, `std::vector`, exception-based
-//! error handling) plus a `CMakeLists.txt` skeleton on top of the C ABI
-//! emitted by [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). Implements
-//! [`LanguageBackend`]; the shared driver bridges it into the generator
-//! pipeline.
+//! sum types, reference-counted RAII object wrappers, `std::optional`,
+//! `std::vector`, exception-based error handling) plus a `CMakeLists.txt`
+//! skeleton on top of the C ABI emitted by
+//! [`weaveffi-gen-c`](../weaveffi_gen_c/index.html). The header inlines the
+//! same `extern "C"` declarations through `weaveffi_core::cabi`, so it is
+//! self-contained. Implements [`LanguageBackend`]; the shared driver bridges
+//! it into the generator pipeline.
 //!
-//! The generated surface follows the 0.7.0 value-buffer layout:
+//! The generated surface follows ABI revision 2:
 //!
 //! * Records are plain C++ value structs with typed members; rich (algebraic)
 //!   enums are `std::variant`-backed sum types with one payload struct per
@@ -15,32 +17,49 @@
 //!   the WeaveFFI value-buffer format as one `(const uint8_t*, size_t)` pair,
 //!   through a small private reader/writer in `detail` plus one generated
 //!   pack and unpack routine per type.
-//! * Interfaces remain move-only RAII classes owning an opaque handle;
-//!   constructors, methods, and statics map onto class members and the
-//!   destructor calls the destroy symbol.
-//! * Free functions and listeners live in a nested namespace per IDL module
+//! * Interfaces are reference-counted objects owned by the producer. Each
+//!   becomes an RAII class holding one strong reference: the destructor calls
+//!   the `_destroy` symbol exactly once, copying calls `_clone` (so C++ copy
+//!   semantics equal a reference-count clone), and moving transfers the
+//!   pointer. A top-level object parameter is borrowed for the call; a
+//!   returned object, an async result, and an iterator element are adopted.
+//!   `Interface?` maps to `std::optional<Wrapper>` with a null pointer as
+//!   `std::nullopt`. An interface inside a record, list, map value, optional,
+//!   or rich-enum payload is held by value and crosses the buffer as a `u64`
+//!   token minted with `_clone` on write and adopted on read.
+//! * Callback interfaces become abstract classes with one pure virtual method
+//!   per IDL method. The consumer passes a `std::shared_ptr<Iface>`; the
+//!   wrapper boxes it on the heap as `ctx`, hands the producer the one
+//!   process-wide static vtable for the interface, and the vtable's `free`
+//!   deletes the box. Trampolines decode borrowed arguments, adopt object
+//!   arguments, and report any exception through `{prefix}_error_set` with
+//!   the foreign-error code `-4` instead of unwinding through the C frame.
+//! * Free functions live in a nested namespace per IDL module
 //!   (`kv::stats::get_stats`), with bare snake_case names.
-//! * An `iter<T>` callable returns a move-only lazy range class
-//!   (`{PascalName}Iterator`) that pulls one element per iteration step and
-//!   releases the producer iterator from its destructor (or eagerly on
-//!   exhaustion), per the `weaveffi_core::plan` iterator contract. Buffered
-//!   elements are decoded per pull and released with `weaveffi_free_bytes`.
+//! * An `iter<T>` callable returns a move-only lazy range class that pulls
+//!   one element per iteration step and releases the producer iterator from
+//!   its destructor (or eagerly on exhaustion), per the `weaveffi_core::plan`
+//!   iterator contract. Buffered elements are decoded per pull and released
+//!   with `{prefix}_free_bytes`; object elements are adopted.
 //! * Each declaring module's error domain becomes an exception type derived
 //!   from the generic `WeaveFFIError`, with one subclass per code. A code
 //!   that declares payload fields exposes them as typed members on its
 //!   subclass, decoded from the error's payload buffer. A callable with
 //!   `throws == true` throws the typed domain exception; a callable with
-//!   `throws == false` still checks `out_err` (a nonzero code can only be a
-//!   producer panic) and throws the generic `WeaveFFIError`. Domain codes are
-//!   validated positive-only, so a negative runtime code (generic error,
-//!   producer panic, marshalling failure) always surfaces as the generic
+//!   `throws == false` still checks `out_err` and throws the generic
+//!   `WeaveFFIError`. Domain codes are validated positive-only, so a negative
+//!   runtime code (generic error, producer panic, marshalling failure, or a
+//!   callback implementation that threw) always surfaces as the generic
 //!   `WeaveFFIError`, never a typed domain exception. No wrapper is marked
 //!   `noexcept` for exactly that reason.
+//! * `check_abi_version()` compares the producer's exported ABI revision with
+//!   the one this header was generated against.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 #![warn(clippy::doc_markdown)]
 
+mod callbacks;
 mod calls;
 mod codec;
 mod entities;
@@ -53,25 +72,26 @@ use serde::{Deserialize, Serialize};
 use weaveffi_core::backend::{LanguageBackend, OutputFile};
 use weaveffi_core::cabi;
 use weaveffi_core::capabilities::TargetCapabilities;
-use weaveffi_core::model::Ty;
-use weaveffi_core::model::{BindingModel, CallShape, EnumBinding, InterfaceBinding, ModuleBinding};
+use weaveffi_core::model::{BindingModel, EnumBinding, ModuleBinding};
 use weaveffi_core::package::{PackageContext, PackagedFile};
 use weaveffi_core::resolved::ResolvedApi;
 use weaveffi_core::utils::{
     render_abi_prefix_aliases, render_prelude, render_trailer, CommentStyle,
 };
 
+use crate::callbacks::{render_callback_class, render_callback_trampolines};
 use crate::calls::render_cpp_module_ns;
 use crate::entities::{
-    interface_deps, render_cpp_enums, render_cpp_interface, render_cpp_record,
+    render_cpp_enums, render_cpp_interface_class, render_cpp_interface_forward_decls,
+    render_cpp_interface_iterators, render_cpp_interface_members, render_cpp_record,
     render_cpp_rich_enum, render_domain_error, topo_order, ValueDef,
 };
 use crate::package::{render_cmake, render_packaged_cmake, render_packaged_readme, render_readme};
-use crate::runtime::{render_buffer_runtime, render_generic_error, render_listener_registry};
+use crate::runtime::{render_buffer_runtime, render_generic_error};
 
 /// Per-target configuration for [`CppGenerator`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CppConfig {
     /// C++ namespace (default `"weaveffi"`).
     pub namespace: Option<String>,
@@ -130,7 +150,7 @@ impl LanguageBackend for CppGenerator {
         "cpp"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 
@@ -198,7 +218,15 @@ impl LanguageBackend for CppGenerator {
                 render_packaged_readme(lib, header_name, ctx, input_basename),
             ),
         ];
-        for nb in &ctx.binaries.binaries {
+        // The packaged CMake selects among the desktop platforms only, so
+        // Android and Wasm binaries (which belong to other ecosystems'
+        // packages) are not bundled here.
+        for nb in ctx
+            .binaries
+            .binaries
+            .iter()
+            .filter(|nb| nb.platform.is_desktop())
+        {
             let dest = dir
                 .join("lib")
                 .join(nb.platform.id())
@@ -209,38 +237,26 @@ impl LanguageBackend for CppGenerator {
     }
 }
 
-/// True when the API surface moves any value through the WeaveFFI buffer
-/// format, which requires emitting the private reader/writer runtime: any
-/// record or rich enum exists, any error code declares payload fields, or any
-/// callable, callback, or iterator moves a buffered value.
-fn model_needs_buffers(model: &BindingModel) -> bool {
-    model.modules.iter().any(|m| {
-        !m.structs.is_empty()
-            || m.enums.iter().any(EnumBinding::is_rich)
-            || m.error
-                .as_ref()
-                .is_some_and(|e| e.declared_here && e.codes.iter().any(|c| !c.fields.is_empty()))
-            || m.callbacks
-                .iter()
-                .any(|cb| cb.params.iter().any(|p| p.ty.is_buffered()))
-            || m.callables().any(|f| {
-                f.params.iter().any(|p| p.ty.is_buffered())
-                    || f.ret.as_ref().is_some_and(|r| match r {
-                        Ty::Iterator(inner) => inner.is_buffered(),
-                        other => other.is_buffered(),
-                    })
-            })
-    })
-}
-
 /// Render the complete C++ header from the driver-built binding model.
 ///
-/// Layout inside `namespace {namespace}`: the generic error surface, the
-/// private value-buffer runtime (when any buffered value crosses the ABI),
-/// plain enums, value types (record structs and rich-enum variants) in
-/// dependency order with their pack/unpack routines, typed exception domains,
-/// the listener registry, interface classes in dependency order, and finally
-/// one nested namespace per module holding its listeners and free functions.
+/// Layout inside `namespace {namespace}`, in an order that keeps every type
+/// complete before it is held by value or marshalled:
+///
+/// 1. the generic error surface and the private value-buffer runtime (when
+///    any buffered value crosses the ABI);
+/// 2. plain enums;
+/// 3. forward declarations of every value type, interface class,
+///    callback-interface class, and member iterator range class;
+/// 4. interface class definitions (the reference-counting skeleton plus
+///    member *declarations*), so records can hold objects by value;
+/// 5. value types (record structs and rich-enum variants) in dependency
+///    order with their pack/unpack routines;
+/// 6. typed exception domains;
+/// 7. callback-interface abstract classes and their trampolines and static
+///    vtables;
+/// 8. the range classes of iterator-returning interface members;
+/// 9. the out-of-line definitions of every interface member; and
+/// 10. one nested namespace per module holding its free functions.
 pub(crate) fn render_cpp_header(
     model: &BindingModel,
     namespace: &str,
@@ -248,7 +264,7 @@ pub(crate) fn render_cpp_header(
     filename: &str,
 ) -> String {
     let prefix = model.prefix.as_str();
-    let needs_buffers = model_needs_buffers(model);
+    let needs_buffers = model.has_buffers();
     let has_rich_enums = model
         .modules
         .iter()
@@ -265,34 +281,22 @@ pub(crate) fn render_cpp_header(
     out.push_str("#include <memory>\n");
     out.push_str("#include <stdexcept>\n");
     out.push_str("#include <exception>\n");
+    out.push_str("#include <utility>\n");
     if has_rich_enums {
         out.push_str("#include <variant>\n");
     }
     if needs_buffers {
-        // The buffer runtime needs memcpy (float bits) and std::move.
+        // The buffer runtime needs memcpy for float bits.
         out.push_str("#include <cstring>\n");
-        out.push_str("#include <utility>\n");
     }
-    if model
-        .modules
-        .iter()
-        .any(|m| m.callables().any(|f| f.is_async))
-    {
+    if model.has_async() {
         out.push_str("#include <future>\n");
     }
     // The lazy iterator range classes need std::input_iterator_tag and
     // std::ptrdiff_t.
-    if model.modules.iter().any(|m| {
-        m.callables()
-            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
-    }) {
+    if model.has_iterators() {
         out.push_str("#include <cstddef>\n");
         out.push_str("#include <iterator>\n");
-    }
-    let has_listeners = model.modules.iter().any(|m| !m.listeners.is_empty());
-    if has_listeners {
-        out.push_str("#include <functional>\n");
-        out.push_str("#include <mutex>\n");
     }
     out.push('\n');
 
@@ -313,6 +317,38 @@ pub(crate) fn render_cpp_header(
     // Enums first: they reference no other types and are used by value.
     for module in &model.modules {
         render_cpp_enums(&mut out, module);
+    }
+
+    // Forward declarations let interface member declarations name any value
+    // type, interface, callback interface, or range class as a parameter or
+    // return type before its definition.
+    let forward_start = out.len();
+    for module in &model.modules {
+        for s in &module.structs {
+            out.push_str(&format!("struct {};\n", s.name));
+        }
+        for e in module.enums.iter().filter(|e| e.is_rich()) {
+            out.push_str(&format!("struct {};\n", e.name));
+        }
+        for i in &module.interfaces {
+            render_cpp_interface_forward_decls(&mut out, i);
+        }
+        for cb in &module.callback_interfaces {
+            out.push_str(&format!("class {};\n", cb.name));
+        }
+    }
+    if out.len() > forward_start {
+        out.push('\n');
+    }
+
+    // Interface classes: the RAII skeleton and member declarations only. A
+    // record may hold an object by value, so the class must be complete
+    // before the value types; the member bodies, which marshal value types,
+    // follow those.
+    for module in &model.modules {
+        for i in &module.interfaces {
+            render_cpp_interface_class(&mut out, i, prefix);
+        }
     }
 
     // Value types (records and rich enums) in dependency order: a member of
@@ -344,10 +380,9 @@ pub(crate) fn render_cpp_header(
             .collect::<Vec<_>>(),
     );
     for &idx in &value_order {
-        let (v, module) = &value_entries[idx];
-        match v {
-            ValueDef::Record(s) => render_cpp_record(&mut out, s, &module.path, prefix),
-            ValueDef::Rich(e) => render_cpp_rich_enum(&mut out, e, &module.path, prefix),
+        match &value_entries[idx].0 {
+            ValueDef::Record(s) => render_cpp_record(&mut out, s),
+            ValueDef::Rich(e) => render_cpp_rich_enum(&mut out, e),
         }
     }
     if !value_entries.is_empty() {
@@ -375,37 +410,35 @@ pub(crate) fn render_cpp_header(
         }
     }
 
-    if has_listeners {
-        // Listener closures are heap-boxed and threaded through the C `context`
-        // pointer; the registry pins each box (type-erased) until unregistration.
-        render_listener_registry(&mut out);
+    // Callback interfaces: the abstract class, then the trampolines (which
+    // decode record arguments and adopt object arguments) and the static
+    // vtable in `detail`.
+    for m in &model.modules {
+        for cb in &m.callback_interfaces {
+            render_callback_class(&mut out, cb);
+            render_callback_trampolines(&mut out, cb, &m.path, prefix);
+        }
     }
 
-    // Interface classes in dependency order: a member that returns another
-    // interface constructs it inline, which needs that class complete.
-    let iface_entries: Vec<(&InterfaceBinding, &ModuleBinding)> = model
-        .modules
-        .iter()
-        .flat_map(|m| m.interfaces.iter().map(move |i| (i, m)))
-        .collect();
-    let iface_order = topo_order(
-        &iface_entries
-            .iter()
-            .map(|(i, _)| i.name.clone())
-            .collect::<Vec<_>>(),
-        &iface_entries
-            .iter()
-            .map(|(i, _)| interface_deps(i))
-            .collect::<Vec<_>>(),
-    );
-    for &idx in &iface_order {
-        let (i, module) = &iface_entries[idx];
-        render_cpp_interface(&mut out, i, module, prefix);
+    // Range classes of iterator-returning members need their element types
+    // complete and are constructed by the member definitions that follow.
+    for m in &model.modules {
+        for i in &m.interfaces {
+            render_cpp_interface_iterators(&mut out, i, m, prefix);
+        }
+    }
+
+    // Interface member definitions: every type they accept, return, or
+    // marshal through is now complete.
+    for m in &model.modules {
+        for i in &m.interfaces {
+            render_cpp_interface_members(&mut out, i, m, prefix);
+        }
     }
 
     // Module namespaces last: every type is defined, so a function may accept
-    // or return any of them by value. Functions and listeners get bare
-    // snake_case names inside `namespace {module path}`.
+    // or return any of them by value. Functions get bare snake_case names
+    // inside `namespace {module path}`.
     for module in &model.modules {
         render_cpp_module_ns(&mut out, module, prefix);
     }
@@ -414,3 +447,6 @@ pub(crate) fn render_cpp_header(
 
     out
 }
+
+#[cfg(test)]
+mod tests;

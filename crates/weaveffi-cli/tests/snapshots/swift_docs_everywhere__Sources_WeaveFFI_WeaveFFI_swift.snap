@@ -83,6 +83,9 @@ struct WvWriter {
         bytes.append(contentsOf: v)
     }
     mutating func writeOptionFlag(_ present: Bool) { bytes.append(present ? 1 : 0) }
+    /// Writes an object token. `p` must be a strong reference the buffer now
+    /// owns (a freshly cloned pointer), never one a wrapper still holds.
+    mutating func writeObject(_ p: OpaquePointer) { writeUInt64(UInt64(UInt(bitPattern: p))) }
 }
 
 /// Traps on a malformed value buffer. Per the wire-format spec, consumers
@@ -160,6 +163,14 @@ struct WvReader {
         default: wvDecodeFailure("option flag byte out of range")
         }
     }
+    /// Reads an object token: one strong reference the caller must adopt
+    /// into a wrapper whose deinit releases it.
+    mutating func readObject() -> OpaquePointer {
+        guard let p = OpaquePointer(bitPattern: UInt(readUInt64())) else {
+            wvDecodeFailure("null object token")
+        }
+        return p
+    }
     func finish() {
         if remaining != 0 { wvDecodeFailure("trailing bytes after value") }
     }
@@ -170,13 +181,12 @@ private final class ContinuationRef<T, E: Error> {
     init(_ value: CheckedContinuation<T, E>) { self.value = value }
 }
 
-final class WvCallbackBox<T> {
-    let value: T
-    init(_ value: T) { self.value = value }
+/// Reports a thrown Swift error to the producer as a foreign callback failure
+/// (code -4); the producer aborts its current call with that code and message.
+func wvForeignError(_ outErr: UnsafeMutablePointer<weaveffi_error>?, _ error: Error) {
+    let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    message.withCString { weaveffi_error_set(outErr, -4, $0) }
 }
-
-var wvListenerContexts: [UInt64: UnsafeMutableRawPointer] = [:]
-let wvListenerLock = NSLock()
 
 /// Typed errors reported by the `docs` module.
 public enum DocsErrorsError: Error, LocalizedError {
@@ -279,6 +289,53 @@ func wvReadDocument(_ r: inout WvReader) -> Document {
     return Document(id: v1, title: v2, status: v3, tags: v4)
 }
 
+/// Consumer-implemented observer of document-saved notifications.
+///
+/// Implementations must be safe to call from any thread.
+///
+/// Implement this protocol and pass the value where the API expects it; the
+/// producer keeps it alive for as long as it holds the callback and may call
+/// any method from any thread. A thrown error aborts the producer's call and
+/// surfaces to the original caller as a foreign error (code -4).
+public protocol SavedListener {
+    /// Fires after a document has been persisted successfully
+    /// - Parameter docId: Identifier of the saved document
+    /// - Parameter revision: Monotonically increasing revision
+    func onSaved(docId: Int64, revision: Int32) throws
+}
+
+/// Retains one `SavedListener` implementation across the C boundary; the producer's
+/// `free` entry releases it.
+final class WvSavedListenerBox {
+    let impl: any SavedListener
+    init(_ impl: any SavedListener) { self.impl = impl }
+}
+
+/// The process-wide `weaveffi_docs_SavedListener_vtable` the producer calls `SavedListener`
+/// implementations through. Every entry recovers the box from `ctx`, copies
+/// or adopts its arguments, and reports a thrown error through `out_err`
+/// instead of unwinding.
+enum WvSavedListenerVtable {
+    static let value = weaveffi_docs_SavedListener_vtable(
+        on_saved: { ctx, doc_id, revision, out_err in
+            let wvBox = Unmanaged<WvSavedListenerBox>.fromOpaque(ctx!).takeUnretainedValue()
+            do {
+                try wvBox.impl.onSaved(docId: doc_id, revision: revision)
+            } catch {
+                wvForeignError(out_err, error)
+            }
+        },
+        free: { ctx in
+            Unmanaged<WvSavedListenerBox>.fromOpaque(ctx!).release()
+        }
+    )
+    static let pointer: UnsafePointer<weaveffi_docs_SavedListener_vtable> = {
+        let cell = UnsafeMutablePointer<weaveffi_docs_SavedListener_vtable>.allocate(capacity: 1)
+        cell.initialize(to: value)
+        return UnsafePointer(cell)
+    }()
+}
+
 /// An ordered collection of documents.
 ///
 /// Notebooks own their documents and release them when destroyed.
@@ -291,6 +348,12 @@ public final class Notebook {
 
     deinit {
         weaveffi_docs_Notebook_destroy(ptr)
+    }
+
+    /// Returns a new strong reference to the same object, for a position that
+    /// takes ownership of it (an object token inside a value buffer).
+    func clonePtr() -> OpaquePointer {
+        weaveffi_docs_Notebook_clone(ptr)!
     }
     /// Create an empty notebook
     public init() {
@@ -346,30 +409,6 @@ public final class Notebook {
 }
 
 public enum Docs {
-    /// Subscribe to document-saved notifications
-    /// - Returns: A subscription id for ``unregisterSavedListener(_:)``.
-    public static func registerSavedListener(_ callback: @escaping (Int64, Int32) -> Void) -> UInt64 {
-        let box = WvCallbackBox(callback)
-        let ctx = Unmanaged.passRetained(box).toOpaque()
-        let id = weaveffi_docs_register_saved_listener({ doc_id, revision, context in
-            let cb = Unmanaged<WvCallbackBox<(Int64, Int32) -> Void>>.fromOpaque(context!).takeUnretainedValue().value
-            cb(doc_id, revision)
-        }, ctx)
-        wvListenerLock.lock()
-        wvListenerContexts[id] = ctx
-        wvListenerLock.unlock()
-        return id
-    }
-    /// Unregisters a listener previously registered with ``registerSavedListener(_:)``.
-    public static func unregisterSavedListener(_ id: UInt64) {
-        weaveffi_docs_unregister_saved_listener(id)
-        wvListenerLock.lock()
-        let ctx = wvListenerContexts.removeValue(forKey: id)
-        wvListenerLock.unlock()
-        if let ctx = ctx {
-            Unmanaged<WvCallbackBox<(Int64, Int32) -> Void>>.fromOpaque(ctx).release()
-        }
-    }
     /// Create a brand new document.
     ///
     /// The document starts in `Draft` status; callers must publish
@@ -436,6 +475,14 @@ public enum Docs {
                 }
             }, ctx)
         }
+    }
+    /// Register a listener for saved notifications
+    /// - Parameter listener: Receiver of saved notifications
+    public static func watch(listener: SavedListener) -> Void {
+        var err = weaveffi_error(code: 0, message: nil, payload_ptr: nil, payload_len: 0)
+        let listener_ctx = Unmanaged.passRetained(WvSavedListenerBox(listener)).toOpaque()
+        weaveffi_docs_watch(listener_ctx, WvSavedListenerVtable.pointer, &err)
+        trap(&err)
     }
 }
 

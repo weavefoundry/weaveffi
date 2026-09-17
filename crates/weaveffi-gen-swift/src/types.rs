@@ -42,15 +42,16 @@ pub(crate) fn swift_type_for(t: &Ty) -> String {
         Ty::F32 => "Float".to_string(),
         Ty::F64 => "Double".to_string(),
         Ty::Bool => "Bool".to_string(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "String".to_string(),
-        Ty::Bytes | Ty::BorrowedBytes => "Data".to_string(),
-        // Handles, plain and typed alike, are opaque `u64` resource tokens in
-        // the wire format; Swift surfaces both as `UInt64` and converts to
-        // the typed C pointer at the direct ABI boundary.
-        Ty::Handle | Ty::TypedHandle(_) => "UInt64".to_string(),
-        Ty::Enum(name) | Ty::Record(name) | Ty::RichEnum(name) | Ty::Interface(name) => {
-            local_type_name(name).to_string()
-        }
+        Ty::StringUtf8 => "String".to_string(),
+        Ty::Bytes => "Data".to_string(),
+        // An interface surfaces as its wrapper class and a callback interface
+        // as the protocol the consumer implements; both are file-scope types
+        // named after the IDL type.
+        Ty::Enum(name)
+        | Ty::Record(name)
+        | Ty::RichEnum(name)
+        | Ty::Interface(name)
+        | Ty::CallbackInterface(name) => local_type_name(name).to_string(),
         Ty::Optional(inner) => format!("{}?", swift_type_for(inner)),
         Ty::List(inner) => format!("[{}]", swift_type_for(inner)),
         Ty::Map(k, v) => format!("[{}: {}]", swift_type_for(k), swift_type_for(v)),
@@ -102,9 +103,11 @@ impl SwiftCtx<'_> {
 /// with a module namespace (see [`SwiftCtx::ty_name`]).
 pub(crate) fn swift_type_ctx(t: &Ty, ctx: SwiftCtx) -> String {
     match t {
-        Ty::Record(name) | Ty::RichEnum(name) | Ty::Enum(name) | Ty::Interface(name) => {
-            ctx.ty_name(local_type_name(name))
-        }
+        Ty::Record(name)
+        | Ty::RichEnum(name)
+        | Ty::Enum(name)
+        | Ty::Interface(name)
+        | Ty::CallbackInterface(name) => ctx.ty_name(local_type_name(name)),
         Ty::Optional(inner) => format!("{}?", swift_type_ctx(inner, ctx)),
         Ty::List(inner) => format!("[{}]", swift_type_ctx(inner, ctx)),
         Ty::Map(k, v) => format!("[{}: {}]", swift_type_ctx(k, ctx), swift_type_ctx(v, ctx)),
@@ -139,6 +142,19 @@ pub(crate) fn iterator_class_name(it: &IteratorBinding, c_prefix: &str) -> Strin
         .strip_prefix(&format!("{c_prefix}_"))
         .unwrap_or(&it.iter_tag)
         .to_upper_camel_case()
+}
+
+/// The internal box class retaining one implementation of the callback
+/// interface named `name` (possibly dot-qualified) across the C boundary:
+/// `Wv{Name}Box`.
+pub(crate) fn callback_box_name(name: &str) -> String {
+    format!("Wv{}Box", local_type_name(name))
+}
+
+/// The internal namespace holding the process-wide vtable for the callback
+/// interface named `name` (possibly dot-qualified): `Wv{Name}Vtable`.
+pub(crate) fn callback_vtable_name(name: &str) -> String {
+    format!("Wv{}Vtable", local_type_name(name))
 }
 
 /// Swift literal initializing the by-value `out_item` slot used while pulling

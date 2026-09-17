@@ -13,8 +13,21 @@ using System.Runtime.InteropServices;
 
 namespace WeaveFFI
 {
+    /// <summary>Raised for any WeaveFFI failure that isn't a typed domain
+    /// error: producer bugs, panics, marshalling failures, and exceptions
+    /// thrown by a callback-interface implementation.</summary>
     public class WeaveFFIException : Exception
     {
+        /// <summary>An untyped producer error.</summary>
+        public const int GenericErrorCode = -1;
+        /// <summary>The producer panicked; the message carries the panic text.</summary>
+        public const int PanicErrorCode = -2;
+        /// <summary>An argument couldn't be lifted by the producer.</summary>
+        public const int MarshalErrorCode = -3;
+        /// <summary>A callback-interface implementation threw; the message
+        /// carries the original exception's message.</summary>
+        public const int ForeignErrorCode = -4;
+
         public int Code { get; }
 
         public WeaveFFIException(int code, string message) : base(message)
@@ -51,6 +64,20 @@ namespace WeaveFFI
                 NativeMethods.weaveffi_error_clear(ref err);
                 throw new WeaveFFIException(code, msg);
             }
+        }
+    }
+
+    /// <summary>One strong reference to a native object, on its way into
+    /// a wrapper that adopts it. A distinct type (rather than a bare
+    /// <c>IntPtr</c>) so the adopting constructor never competes with a
+    /// public constructor taking an integer.</summary>
+    internal readonly struct WeaveFFIHandle
+    {
+        internal readonly IntPtr Value;
+
+        internal WeaveFFIHandle(IntPtr value)
+        {
+            Value = value;
         }
     }
 
@@ -183,6 +210,11 @@ namespace WeaveFFI
             Ensure(v.Length);
             Array.Copy(v, 0, _buf, _len, v.Length);
             _len += v.Length;
+        }
+
+        internal void WriteObject(IntPtr token)
+        {
+            WriteU64((ulong)(nuint)(nint)token);
         }
 
         internal byte[] ToArray()
@@ -329,6 +361,16 @@ namespace WeaveFFI
             Array.Copy(_data, _pos, outBuf, 0, len);
             _pos += len;
             return outBuf;
+        }
+
+        internal IntPtr ReadObject()
+        {
+            var token = ReadU64();
+            if (token == 0)
+            {
+                throw new InvalidOperationException("malformed WeaveFFI value buffer: null object token");
+            }
+            return (nint)(nuint)token;
         }
 
         internal void ExpectEnd()
@@ -558,7 +600,7 @@ namespace WeaveFFI
         private const string LibName = "weaveffi";
 
         // The ABI revision these bindings were generated against.
-        internal const uint AbiVersion = 1;
+        internal const uint AbiVersion = 2;
 
         // Runs before the first P/Invoke through this class, so a producer built
         // for a different ABI revision fails loudly instead of misreading the
@@ -585,6 +627,12 @@ namespace WeaveFFI
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern uint weaveffi_abi_version();
 
+        // Fills a producer-owned error slot with a copy of `message`; callback
+        // trampolines report a thrown exception through it so no managed
+        // allocation is ever handed to the producer's allocator.
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void weaveffi_error_set(IntPtr err, int code, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void weaveffi_free_string(IntPtr ptr);
 
@@ -598,16 +646,16 @@ namespace WeaveFFI
         internal static extern void weaveffi_error_free(IntPtr err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_describe", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_describe(IntPtr shape_ptr, UIntPtr shape_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shapes_describe(IntPtr shape_ptr, UIntPtr shape_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_scale", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_scale(IntPtr shape_ptr, UIntPtr shape_len, double factor, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shapes_scale(IntPtr shape_ptr, UIntPtr shape_len, double factor, out UIntPtr out_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_sum_bytes", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern ulong weaveffi_shapes_sum_bytes(IntPtr values_ptr, UIntPtr values_len, ref WeaveFFIError err);
+        internal static extern ulong weaveffi_shapes_sum_bytes(IntPtr values_ptr, UIntPtr values_len, ref WeaveFFIError out_err);
 
         [DllImport(LibName, EntryPoint = "weaveffi_shapes_make_numerics", CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr weaveffi_shapes_make_numerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j, out UIntPtr out_len, ref WeaveFFIError err);
+        internal static extern IntPtr weaveffi_shapes_make_numerics(sbyte a, short b, int c, long d, byte e, ushort f, uint g, ulong h, float i, double j, out UIntPtr out_len, ref WeaveFFIError out_err);
 
     }
 

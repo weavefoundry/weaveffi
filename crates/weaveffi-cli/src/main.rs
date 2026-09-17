@@ -49,7 +49,7 @@ enum Commands {
         /// Output directory for generated artifacts
         #[arg(short, long, default_value = "./generated")]
         out: String,
-        /// Comma-separated list of targets to generate (c, cpp, swift, android, node, wasm, python, dotnet, dart, go, ruby)
+        /// Comma-separated list of targets to generate (c, cpp, swift, kotlin, node, wasm, python, dotnet, dart, go, ruby)
         #[arg(short, long)]
         target: Option<String>,
         /// Path to weaveffi.toml (default: the nearest one at or above the input file)
@@ -90,7 +90,8 @@ enum Commands {
         #[arg(long)]
         config: Option<String>,
         /// Directory of prebuilt native libraries laid out as `<dir>/<platform>/<lib>`
-        /// (platform ids: darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64)
+        /// (platform ids: darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64,
+        /// android-arm64, android-x64, wasm32)
         #[arg(long)]
         binaries: Option<String>,
         /// Cargo package to cross-compile as the native producer (one cdylib per platform)
@@ -115,7 +116,7 @@ enum Commands {
         format: Option<String>,
         /// Downgrade validation errors to warnings and emit the IDL anyway.
         /// Useful for bootstrapping from source that references types it does
-        /// not yet declare (e.g. opaque handle targets you will define later).
+        /// not yet declare (e.g. an interface you will define later).
         #[arg(long)]
         warn: bool,
     },

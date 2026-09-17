@@ -232,6 +232,12 @@ function __graphicsErrorFrom(code, message, payload) {
   return _err;
 }
 
+wv.Unit = Object.freeze({
+  pixels: 0,
+  points: 1,
+  0: 'pixels',
+  1: 'points',
+});
 wv.newCanvas = function (width) {
   const _r = __invoke(addon.newCanvas, [width], __generic);
   return __decode(__unpackCanvas, _r);

@@ -2,9 +2,14 @@
 //! renderers for any wire shape, plus the per-record and per-rich-enum
 //! codec pairs (`_wv_write_{stem}`, `_wv_read_{stem}`).
 //!
-//! Every dispatch here goes through [`wire::classify`], so this module never
-//! re-derives the wire folds (handles as `u64` tokens, borrowed views as
-//! their owned forms, records and rich enums as one user-codec shape).
+//! Every dispatch here goes through [`Ty::wire`], so this module never
+//! re-derives the wire folds (records and rich enums as one user-codec
+//! shape, C-style enums as `i32`, interfaces as `u64` object tokens).
+//!
+//! An object token carries one strong reference. Writing one calls the
+//! wrapper's `_wv_clone_ptr` (the interface's `_clone` symbol) so the
+//! wrapper keeps its own reference; reading one adopts the pointer into a
+//! fresh wrapper through `_from_ptr`, whose finalizer owes the `_destroy`.
 
 use heck::ToSnakeCase;
 use weaveffi_core::codegen::CodeWriter;
@@ -24,7 +29,7 @@ pub(crate) fn wv_stem(name: &str) -> String {
 
 /// The `WvBufferWriter` method encoding one scalar wire shape, or `None` for
 /// the composite shapes that need statement-level rendering. C-style enums
-/// encode as their `i32` discriminant; handles as raw `u64` tokens.
+/// encode as their `i32` discriminant.
 fn wv_scalar_writer(shape: &WireType) -> Option<&'static str> {
     Some(match shape {
         WireType::Prim(Prim::Bool) => "write_bool",
@@ -35,7 +40,7 @@ fn wv_scalar_writer(shape: &WireType) -> Option<&'static str> {
         WireType::Prim(Prim::I32) | WireType::Enum(_) => "write_i32",
         WireType::Prim(Prim::U32) => "write_u32",
         WireType::Prim(Prim::I64) => "write_i64",
-        WireType::Prim(Prim::U64) | WireType::Handle(_) => "write_u64",
+        WireType::Prim(Prim::U64) => "write_u64",
         WireType::Prim(Prim::F32) => "write_f32",
         WireType::Prim(Prim::F64) => "write_f64",
         WireType::Prim(Prim::String) => "write_string",
@@ -56,7 +61,7 @@ fn wv_scalar_reader(shape: &WireType) -> Option<&'static str> {
         WireType::Prim(Prim::I32) | WireType::Enum(_) => "read_i32",
         WireType::Prim(Prim::U32) => "read_u32",
         WireType::Prim(Prim::I64) => "read_i64",
-        WireType::Prim(Prim::U64) | WireType::Handle(_) => "read_u64",
+        WireType::Prim(Prim::U64) => "read_u64",
         WireType::Prim(Prim::F32) => "read_f32",
         WireType::Prim(Prim::F64) => "read_f64",
         WireType::Prim(Prim::String) => "read_string",
@@ -114,6 +119,11 @@ pub(crate) fn render_wv_write(
         WireType::User(n) => {
             w.line(format!("{q}_wv_write_{}({wvar}, {expr})", wv_stem(n)));
         }
+        // An object token carries one strong reference, so the wrapper's
+        // `_clone` symbol mints a fresh one; the wrapper keeps its own.
+        WireType::Object(_) => {
+            w.line(format!("{wvar}.write_u64({expr}._wv_clone_ptr.address)"));
+        }
         _ => unreachable!("scalar handled above"),
     }
 }
@@ -169,6 +179,14 @@ pub(crate) fn render_wv_read(
         }
         WireType::User(n) => {
             w.line(format!("{var} = {q}_wv_read_{}({rvar})", wv_stem(n)));
+        }
+        // The reader adopts the token's strong reference into a new wrapper
+        // whose finalizer owes the `_destroy`; a zero token is malformed.
+        WireType::Object(n) => {
+            w.line(format!(
+                "{var} = {}._from_ptr({rvar}.read_object_token)",
+                local_type_name(n)
+            ));
         }
         _ => unreachable!("scalar handled above"),
     }

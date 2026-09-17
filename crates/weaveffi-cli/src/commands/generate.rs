@@ -64,7 +64,7 @@ mod tests {
         std::fs::write(
             &yml,
             concat!(
-                "version: \"0.8.0\"\n",
+                "version: \"0.9.0\"\n",
                 "modules:\n",
                 "  - name: math\n",
                 "    functions:\n",
@@ -96,7 +96,7 @@ mod tests {
         for expected in [
             "c/weaveffi.h",
             "swift/Package.swift",
-            "android/build.gradle",
+            "kotlin/build.gradle.kts",
             "node/types.d.ts",
             "wasm/weaveffi_wasm.js",
             "python/weaveffi/__init__.py",

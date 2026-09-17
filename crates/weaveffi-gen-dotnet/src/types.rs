@@ -8,10 +8,18 @@ use weaveffi_core::model::FnBinding;
 use weaveffi_core::model::Ty;
 use weaveffi_core::utils::local_type_name;
 
-/// The C# type of a `handle<T>` reference: a generated `{T}Handle` wrapper
-/// struct named after the referent's bare local type name.
-pub(crate) fn typed_handle_cs(name: &str) -> String {
-    format!("{}Handle", local_type_name(name))
+/// The C# interface a consumer implements for one callback interface: the
+/// bare local name with the conventional `I` prefix (`ISubscriber` for
+/// `Subscriber`, or for a cross-module `bus.Subscriber`).
+pub(crate) fn callback_interface_cs(name: &str) -> String {
+    format!("I{}", local_type_name(name))
+}
+
+/// The internal static class hosting one callback interface's vtable and
+/// trampolines, named from the C module path and the bare name so two
+/// modules declaring the same callback interface name never collide.
+pub(crate) fn vtable_class_cs(module_path: &str, name: &str) -> String {
+    format!("WeaveFFIVtable_{module_path}_{name}")
 }
 
 /// The idiomatic C# surface type for one IR type, as it appears in wrapper
@@ -29,12 +37,8 @@ pub(crate) fn cs_type(ty: &Ty) -> String {
         Ty::F32 => "float".into(),
         Ty::F64 => "double".into(),
         Ty::Bool => "bool".into(),
-        Ty::StringUtf8 | Ty::BorrowedStr => "string".into(),
-        Ty::Handle => "ulong".into(),
-        // Typed handles surface as a generated `{T}Handle` wrapper struct; a
-        // cross-module referent (e.g. `kv.Token`) uses the bare local name.
-        Ty::TypedHandle(name) => typed_handle_cs(name),
-        Ty::Bytes | Ty::BorrowedBytes => "byte[]".into(),
+        Ty::StringUtf8 => "string".into(),
+        Ty::Bytes => "byte[]".into(),
         // Records are plain data classes; rich enums are abstract sum types.
         // Both are value types decoded from value buffers.
         Ty::Record(name) | Ty::RichEnum(name) => local_type_name(name).into(),
@@ -51,21 +55,21 @@ pub(crate) fn cs_type(ty: &Ty) -> String {
             Ty::F32 => "float?".into(),
             Ty::F64 => "double?".into(),
             Ty::Bool => "bool?".into(),
-            Ty::Handle => "ulong?".into(),
-            Ty::TypedHandle(name) => format!("{}?", typed_handle_cs(name)),
             Ty::Enum(name) => format!("{}?", local_type_name(name)),
-            Ty::StringUtf8 | Ty::BorrowedStr => "string?".into(),
+            Ty::StringUtf8 => "string?".into(),
             Ty::Record(name) | Ty::RichEnum(name) => {
                 format!("{}?", local_type_name(name))
             }
+            // `Interface?` and nested composites are nullable reference types.
             _ => format!("{}?", cs_type(inner)),
         },
         Ty::List(inner) => format!("{}[]", cs_type(inner)),
         Ty::Iterator(inner) => format!("IEnumerable<{}>", cs_type(inner)),
         Ty::Map(k, v) => format!("Dictionary<{}, {}>", cs_type(k), cs_type(v)),
-        // Interfaces surface as their opaque-handle wrapper class; a
+        // Interfaces surface as their reference-counted wrapper class; a
         // cross-module reference (`kv.Store`) uses the bare local name.
         Ty::Interface(name) => local_type_name(name).into(),
+        Ty::CallbackInterface(name) => callback_interface_cs(name),
     }
 }
 
@@ -87,18 +91,15 @@ pub(crate) fn pinvoke_type(ty: &Ty) -> String {
         // slot in arrays and leave garbage in the upper bits of returns.
         Ty::Bool => "byte".into(),
         Ty::StringUtf8
-        | Ty::BorrowedStr
         | Ty::Bytes
-        | Ty::BorrowedBytes
         | Ty::Record(_)
         | Ty::RichEnum(_)
         | Ty::Interface(_)
+        | Ty::CallbackInterface(_)
         | Ty::Optional(_)
         | Ty::List(_)
         | Ty::Iterator(_)
         | Ty::Map(_, _) => "IntPtr".into(),
-        Ty::Handle => "ulong".into(),
-        Ty::TypedHandle(_) => "IntPtr".into(),
         Ty::Enum(_) => "int".into(),
     }
 }
@@ -113,7 +114,7 @@ pub(crate) fn cs_pinvoke_ctype(ty: &CType) -> String {
         CType::Bool => "byte".into(),
         CType::Uint32 => "uint".into(),
         CType::Int64 => "long".into(),
-        CType::Uint64 | CType::Handle => "ulong".into(),
+        CType::Uint64 => "ulong".into(),
         CType::Double => "double".into(),
         CType::Float => "float".into(),
         CType::Size => "UIntPtr".into(),
@@ -125,6 +126,7 @@ pub(crate) fn cs_pinvoke_ctype(ty: &CType) -> String {
         CType::Char => "sbyte".into(),
         CType::Ptr { .. }
         | CType::StructTag { .. }
+        | CType::VtableTag { .. }
         | CType::CancelToken
         | CType::Error
         | CType::Named(_) => "IntPtr".into(),
@@ -159,9 +161,7 @@ pub(crate) fn is_cs_value_type(ty: &Ty) -> bool {
             | Ty::F32
             | Ty::F64
             | Ty::Bool
-            | Ty::Handle
             | Ty::Enum(_)
-            | Ty::TypedHandle(_)
     )
 }
 

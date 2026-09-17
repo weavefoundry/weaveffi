@@ -15,9 +15,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
+#include <utility>
 #include <variant>
 #include <cstring>
-#include <utility>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -51,15 +51,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -67,6 +68,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -118,7 +123,14 @@ WEAVEFFI_API const uint8_t* weaveffi_shapes_make_numerics(int8_t a, int16_t b, i
 
 namespace weaveffi {
 
-/** Base exception for every error reported through the C ABI. */
+/**
+ * Base exception for every error reported through the C ABI.
+ *
+ * Positive codes are the module's declared error codes (see the typed
+ * domain exceptions); negative codes are runtime traps: -1 a generic
+ * producer error, -2 a producer panic, -3 a marshalling failure, -4 a
+ * callback-interface implementation that threw.
+ */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -126,6 +138,17 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+/**
+ * Throws WeaveFFIError when the loaded producer library was built for a
+ * different WeaveFFI ABI revision than this header. Call once at startup.
+ */
+inline void check_abi_version() {
+    uint32_t actual = weaveffi_abi_version();
+    if (actual != WEAVEFFI_ABI_VERSION) {
+        throw WeaveFFIError(-1, "WeaveFFI ABI revision mismatch: header " + std::to_string(WEAVEFFI_ABI_VERSION) + ", library " + std::to_string(actual));
+    }
+}
 
 namespace detail {
 
@@ -211,7 +234,8 @@ public:
  * Decodes values from the WeaveFFI value-buffer wire format. A malformed
  * buffer is a producer/consumer contract violation (both sides are generated
  * from one IDL), so every decode failure throws the generic WeaveFFIError,
- * the same channel as a producer panic.
+ * the same channel as a producer panic. Object tokens adopted before a
+ * failure live in RAII wrappers that release them on unwind.
  */
 class BufferReader {
     const uint8_t* data_;
@@ -326,6 +350,9 @@ enum class Channel : int32_t {
     Blue = 2
 };
 
+struct Numerics;
+struct Shape;
+
 /** One field per supported numeric primitive */
 struct Numerics {
     int8_t a;
@@ -414,18 +441,17 @@ inline void write_Numerics(BufferWriter& w, const Numerics& v) {
 
 /** Decodes a `Numerics` from the WeaveFFI value-buffer format. */
 inline Numerics read_Numerics(BufferReader& r) {
-    Numerics out{};
-    out.a = r.read_i8();
-    out.b = r.read_i16();
-    out.c = r.read_i32();
-    out.d = r.read_i64();
-    out.e = r.read_u8();
-    out.f = r.read_u16();
-    out.g = r.read_u32();
-    out.h = r.read_u64();
-    out.i = r.read_f32();
-    out.j = r.read_f64();
-    return out;
+    int8_t f_a = r.read_i8();
+    int16_t f_b = r.read_i16();
+    int32_t f_c = r.read_i32();
+    int64_t f_d = r.read_i64();
+    uint8_t f_e = r.read_u8();
+    uint16_t f_f = r.read_u16();
+    uint32_t f_g = r.read_u32();
+    uint64_t f_h = r.read_u64();
+    float f_i = r.read_f32();
+    double f_j = r.read_f64();
+    return Numerics{std::move(f_a), std::move(f_b), std::move(f_c), std::move(f_d), std::move(f_e), std::move(f_f), std::move(f_g), std::move(f_h), std::move(f_i), std::move(f_j)};
 }
 
 /** Encodes a `Shape` in the WeaveFFI value-buffer format. */
@@ -474,28 +500,24 @@ inline Shape read_Shape(BufferReader& r) {
         return Shape{Shape::Empty{}};
     }
     case 1: {
-        Shape::Circle p{};
-        p.radius = r.read_f64();
-        return Shape{std::move(p)};
+        double f_radius = r.read_f64();
+        return Shape{Shape::Circle{std::move(f_radius)}};
     }
     case 2: {
-        Shape::Rectangle p{};
-        p.width = r.read_f32();
-        p.height = r.read_f32();
-        return Shape{std::move(p)};
+        float f_width = r.read_f32();
+        float f_height = r.read_f32();
+        return Shape{Shape::Rectangle{std::move(f_width), std::move(f_height)}};
     }
     case 3: {
-        Shape::Bounded p{};
-        p.min = r.read_i16();
-        p.max = r.read_i16();
-        p.weight = r.read_u64();
-        return Shape{std::move(p)};
+        int16_t f_min = r.read_i16();
+        int16_t f_max = r.read_i16();
+        uint64_t f_weight = r.read_u64();
+        return Shape{Shape::Bounded{std::move(f_min), std::move(f_max), std::move(f_weight)}};
     }
     case 4: {
-        Shape::Labeled p{};
-        p.label = r.read_string();
-        p.count = r.read_u8();
-        return Shape{std::move(p)};
+        std::string f_label = r.read_string();
+        uint8_t f_count = r.read_u8();
+        return Shape{Shape::Labeled{std::move(f_label), std::move(f_count)}};
     }
     default:
         break;

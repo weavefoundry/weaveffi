@@ -8,8 +8,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 // Generated TypeScript declarations for WeaveFFI Wasm bindings
 
 /** Base error for WeaveFFI failures: domain errors extend it, and it is
- * thrown directly for unknown codes, marshalling failures, and producer
- * panics. Carries the stable ABI `code`. */
+ * thrown directly for unknown codes, marshalling failures, producer
+ * panics, and callback-interface implementations that raised (code -4).
+ * Carries the stable ABI `code`. */
 export declare class WeaveFFIError extends Error {
   constructor(code: number, message?: string);
   code: number;
@@ -59,6 +60,8 @@ export interface Item {
   /** Cross-module struct reference */
   token: Token;
   priority: Priority;
+  /** An optional object inside a record */
+  gadget: Gadget | null;
 }
 
 /** Task priority levels */
@@ -72,10 +75,31 @@ export declare const Priority: Readonly<{
 }>;
 export type Priority = (typeof Priority)[keyof typeof Priority];
 
-/** A pocket-sized interface exercising the object surface */
+/**
+ * Consumer-implemented observer of ready items
+ *
+ * Implemented by the consumer; the producer calls these methods synchronously. An exception thrown from a method is reported to the producer as an error (code -4).
+ */
+export interface ReadyListener {
+  /**
+   * Fires when an item is ready
+   */
+  onReady(code: number, msg: string): void;
+  /**
+   * Receives the item itself and says whether to keep listening
+   */
+  onItem(item: Item, gadget: Gadget): boolean;
+}
+
+/**
+ * A pocket-sized interface exercising the object surface
+ *
+ * Wraps one reference to a producer object; release it with `close()`.
+ */
 export declare class Gadget {
   /**
    * Create a gadget with the given id
+   * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
    * @throws {WeaveFFIError} if the native call fails
    */
   constructor(id: bigint);
@@ -94,8 +118,11 @@ export declare class Gadget {
    * @throws {WeaveFFIError} if the native call fails
    */
   static version(): string;
-  /** Releases the producer-owned handle exactly once. */
-  free(): void;
+  /** Releases this wrapper's reference exactly once; later calls are
+   * no-ops. Also reachable as `[Symbol.dispose]()` for `using`
+   * declarations. A wrapper collected unclosed is released by a
+   * finalizer where the runtime provides one. */
+  close(): void;
 }
 
 export interface WeaveffiWasmModule {
@@ -138,25 +165,27 @@ export interface WeaveffiWasmModule {
      */
     echoBytes(b: Uint8Array): Uint8Array;
     /**
-     * Borrowed string parameter
+     * Register a listener, returning how many are attached
      * @throws {WeaveFFIError} if the native call fails
      */
-    echoBorrowedStr(s: string): string;
+    subscribe(listener: ReadyListener): number;
     /**
-     * Borrowed bytes parameter
+     * Optional object in both directions
+     * @returns A wrapper owning one reference; `close()` it (or bind it with `using`) when done.
      * @throws {WeaveFFIError} if the native call fails
      */
-    echoBorrowedBytes(b: Uint8Array): Uint8Array;
+    maybeGadget(fallback: Gadget | null): Gadget | null;
     /**
-     * Returns an opaque handle
+     * A list of objects
      * @throws {WeaveFFIError} if the native call fails
      */
-    openHandle(): bigint;
+    gadgets(): Gadget[];
     /**
-     * Returns a typed handle
+     * An iterator over objects
+     * @returns A lazy iterator: one producer step per `next()` call. Exhaust it or call `return()` to release the producer handle (a `for...of` loop does both automatically); an abandoned iterator leaks the handle.
      * @throws {WeaveFFIError} if the native call fails
      */
-    openTypedHandle(): number;
+    streamGadgets(): IterableIterator<Gadget>;
     /**
      * Optional struct return
      * @throws {KitchenErrorsError} on a domain error code
@@ -204,14 +233,6 @@ export interface WeaveffiWasmModule {
      * @throws {WeaveFFIError} if the native call fails
      */
     newOp(): number;
-    /**
-     * Subscribe to OnReady events
-     *
-     * @returns A subscription id for `unregisterReadyListener()`.
-     */
-    registerReadyListener(callback: (code: number, msg: string) => void): number;
-    /** Unregister a listener previously registered with `registerReadyListener()`. */
-    unregisterReadyListener(id: number): void;
     Gadget: typeof Gadget;
     nested: {
       /**
@@ -223,6 +244,6 @@ export interface WeaveffiWasmModule {
   };
 }
 
-export function loadWeaveffiWasm(url: string): Promise<WeaveffiWasmModule>;
+export function loadWeaveffiWasm(source: string | URL | BufferSource | WebAssembly.Module): Promise<WeaveffiWasmModule>;
 
 // END weaveffi_wasm.d.ts

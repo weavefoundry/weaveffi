@@ -7,20 +7,23 @@
 //!
 //! * **Passing** ([`ArgPass`], [`RetPass`]): how each argument crosses into
 //!   its ABI slots (by value, pinned string/bytes, serialized value buffer,
-//!   or borrowed object pointer) and what the wrapper does with the result
-//!   (use, copy, decode, or adopt) before any owed release.
+//!   borrowed object pointer, or callback context plus vtable) and what the
+//!   wrapper does with the result (use, copy, decode, or adopt) before any
+//!   owed release.
 //! * **Errors** ([`ErrorStrategy`]): when a call reports through `out_err`,
 //!   is that a typed domain error the caller can catch, or a producer bug the
 //!   wrapper must trap on?
-//! * **Ownership** ([`RetPass::free`], [`ElemFree`]): after copying a
-//!   returned value into a native one, exactly which runtime release call
-//!   does the wrapper owe, if any?
+//! * **Ownership** ([`RetPass::free`], [`Free`]): after copying a returned
+//!   value into a native one, exactly which runtime release call does the
+//!   wrapper owe, if any?
 //! * **Iterators** ([`IteratorProtocol`]): the pull contract of `iter<T>`,
 //!   including the requirement that wrappers stay **lazy** (one producer
 //!   `next` per consumer step, never a hidden drain into a list).
 //! * **Async** ([`AsyncProtocol`]): the completion-callback contract,
 //!   including the rule that results and errors are owned by the consumer
 //!   and released through the runtime free symbols.
+//! * **Callback interfaces** ([`CallbackProtocol`]): the contract for the
+//!   consumer-implemented vtable the producer calls back into.
 //!
 //! Every classification here derives from [`Ty::family`], so a backend that
 //! renders these plans in its own syntax cannot drift from the others on
@@ -28,7 +31,9 @@
 
 use crate::abi::split_qualified;
 use crate::abi::AbiParam;
-use crate::model::{AsyncBinding, Family, FnBinding, IteratorBinding, ParamBinding, Ty};
+use crate::model::{
+    AsyncBinding, CallbackInterfaceBinding, Family, FnBinding, IteratorBinding, ParamBinding, Ty,
+};
 
 /// How a callable's `out_err` slot is interpreted by idiomatic wrappers.
 ///
@@ -44,13 +49,17 @@ pub enum ErrorStrategy {
     /// `error` value, ...), decodes any payload fields from the error's
     /// `payload_ptr`/`payload_len` buffer, and surfaces it through the
     /// target's normal error channel so callers can catch and match on it.
+    /// A *negative* code (a runtime trap: panic, marshalling failure,
+    /// foreign callback failure) is still a programming error and follows
+    /// [`Trap`](Self::Trap) even on a throwing function.
     Throws,
     /// The function does not throw: the only way `out_err` reports failure
-    /// is a producer bug (most commonly a caught panic, code `-2`). The
-    /// wrapper surfaces it through the target's *programming-error* idiom
-    /// (a Python `WeaveFFIError`, a Go `panic`, a Swift `fatalError`, a C#
-    /// exception). It must never be silently ignored, and it must never be
-    /// dressed up as a typed domain error.
+    /// is a producer bug or a runtime trap (a caught panic, code `-2`; a
+    /// consumer callback that raised, code `-4`). The wrapper surfaces it
+    /// through the target's *programming-error* idiom (a Python
+    /// `WeaveFFIError`, a Go `panic`, a Swift `fatalError`, a C# exception).
+    /// It must never be silently ignored, and it must never be dressed up as
+    /// a typed domain error.
     Trap,
 }
 
@@ -75,8 +84,7 @@ impl FnBinding {
 /// header about arity or slot order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgPass<'a> {
-    /// One slot passed by value: scalars, bools, C-style enums, and handles
-    /// (including typed handles, whose slot is an opaque pointer).
+    /// One slot passed by value: scalars, bools, and C-style enums.
     Direct {
         /// The single ABI slot.
         slot: &'a AbiParam,
@@ -99,7 +107,9 @@ pub enum ArgPass<'a> {
     /// A buffered value (record, rich enum, optional, list, or map): the
     /// wrapper serializes it into the value-buffer wire format
     /// ([`Ty::wire`]), passes the encoding as a borrowed `(ptr, len)` pair,
-    /// and releases its own encoding after the call returns.
+    /// and releases its own encoding after the call returns. Any object
+    /// token written into the encoding must be a freshly cloned reference
+    /// (see [`clone_symbol`]).
     Buffer {
         /// The `const uint8_t*` data slot.
         ptr: &'a AbiParam,
@@ -107,13 +117,23 @@ pub enum ArgPass<'a> {
         len: &'a AbiParam,
     },
     /// A borrowed object pointer: the wrapper passes the wrapped object's
-    /// native handle and retains ownership. When `nullable`, the IDL type is
-    /// `Interface?` and null means none.
+    /// native handle and retains its own reference. When `nullable`, the IDL
+    /// type is `Interface?` and null means none.
     Object {
         /// The single object-pointer slot.
         slot: &'a AbiParam,
         /// `true` for `Interface?`: null is a legal "none" argument.
         nullable: bool,
+    },
+    /// A callback interface: the wrapper registers its native implementation
+    /// in a handle table, passes the table key as `ctx` and the interface's
+    /// static vtable as `vtable`, and removes the entry when the producer
+    /// calls the vtable's `free` (see [`CallbackProtocol`]).
+    Callback {
+        /// The `void*` context slot.
+        ctx: &'a AbiParam,
+        /// The `const {vtable}*` slot.
+        vtable: &'a AbiParam,
     },
 }
 
@@ -157,6 +177,10 @@ impl ParamBinding {
                 slot: single(),
                 nullable,
             },
+            Family::Callback => {
+                let (ctx, vtable) = pair();
+                ArgPass::Callback { ctx, vtable }
+            }
             Family::Iterator => unreachable!("iterators are never parameters"),
         }
     }
@@ -175,17 +199,16 @@ pub enum Free {
     Bytes,
 }
 
-/// How a callable's result crosses back to the wrapper: the receiving
-/// contract, including the decode step and the release obligation.
+/// How a value produced by the producer crosses back to the wrapper: the
+/// receiving contract, including the decode step and the release obligation.
 ///
-/// Only the sync and async call shapes consult this; an iterator's result
-/// contract lives in [`IteratorProtocol`].
+/// Sync returns, async results, and iterator elements all use this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetPass {
     /// No return value.
     Void,
-    /// By-value return (scalar, bool, C-style enum, handle): use directly,
-    /// nothing to free.
+    /// By-value return (scalar, bool, C-style enum): use directly, nothing to
+    /// free.
     Direct,
     /// Owned `const char*`: copy into the native string, then release with
     /// `{prefix}_free_string`.
@@ -194,15 +217,20 @@ pub enum RetPass {
     /// `{prefix}_free_bytes`.
     Bytes,
     /// Owned `(const uint8_t*, out_len)` value buffer: decode via the wire
-    /// format ([`Ty::wire`]), then release with `{prefix}_free_bytes`.
+    /// format ([`Ty::wire`]), adopting any object tokens it carries, then
+    /// release with `{prefix}_free_bytes`.
     Buffer,
-    /// An owned object reference the wrapper adopts into its disposal idiom.
-    /// When `nullable`, the IDL type is `Interface?` and a null return means
-    /// none.
+    /// One strong object reference the wrapper adopts into its disposal
+    /// idiom. When `nullable`, the IDL type is `Interface?` and a null return
+    /// means none.
     Object {
         /// The `{prefix}_{module}_{Name}_destroy` symbol the adopted
         /// reference eventually owes.
         destroy_symbol: String,
+        /// The `{prefix}_{module}_{Name}_clone` symbol the wrapper calls when
+        /// it needs a second reference (for example to write the object into
+        /// a value buffer).
+        clone_symbol: String,
         /// `true` for `Interface?`: a null return is a legal "none" result.
         nullable: bool,
     },
@@ -221,15 +249,16 @@ impl RetPass {
     }
 }
 
-/// The receiving contract for a value of type `ty` returned from a callable
+/// The receiving contract for a value of type `ty` produced by a callable
 /// declared inside `module` under `prefix`. `None` (a void return) is
 /// [`RetPass::Void`].
 ///
 /// # Panics
 ///
 /// Panics on an iterator return, whose contract is [`IteratorProtocol`], not
-/// a value-passing plan; backends dispatch on
-/// [`CallShape`](crate::model::CallShape) before consulting this.
+/// a value-passing plan (backends dispatch on
+/// [`CallShape`](crate::model::CallShape) before consulting this), and on a
+/// callback interface, which validation never admits as a return.
 pub fn ret_pass(ty: Option<&Ty>, module: &str, prefix: &str) -> RetPass {
     let Some(ty) = ty else {
         return RetPass::Void;
@@ -239,25 +268,25 @@ pub fn ret_pass(ty: Option<&Ty>, module: &str, prefix: &str) -> RetPass {
         Family::String => RetPass::String,
         Family::Bytes => RetPass::Bytes,
         Family::Buffer => RetPass::Buffer,
-        Family::Object { nullable } => RetPass::Object {
-            destroy_symbol: destroy_symbol(
-                ty.interface_name()
-                    .expect("object family names an interface"),
-                module,
-                prefix,
-            ),
-            nullable,
-        },
+        Family::Object { nullable } => {
+            let iface = ty
+                .interface_name()
+                .expect("object family names an interface");
+            RetPass::Object {
+                destroy_symbol: destroy_symbol(iface, module, prefix),
+                clone_symbol: clone_symbol(iface, module, prefix),
+                nullable,
+            }
+        }
+        Family::Callback => panic!("callback interfaces are never returned"),
         Family::Iterator => panic!("iterator returns follow IteratorProtocol, not a RetPass"),
     }
 }
 
-/// The release call a consumer wrapper owes for one *element* it copied out
-/// of an iterator `next` slot. This is [`Free`] under its historical name.
-pub type ElemFree = Free;
-
-/// The per-element release owed for one iterator element of type `ty`.
-pub fn elem_free(ty: &Ty) -> ElemFree {
+/// The per-element release owed for one iterator element of type `ty`. An
+/// object element is adopted (see [`IteratorProtocol::elem`]) and owes
+/// [`Free::None`] here.
+pub fn elem_free(ty: &Ty) -> Free {
     match ty.family() {
         Family::String => Free::String,
         Family::Bytes | Family::Buffer => Free::Bytes,
@@ -270,6 +299,13 @@ pub fn elem_free(ty: &Ty) -> ElemFree {
 pub fn destroy_symbol(name: &str, current_module: &str, prefix: &str) -> String {
     let (module, name) = split_qualified(name, current_module);
     format!("{prefix}_{module}_{name}_destroy")
+}
+
+/// The `{prefix}_{module}_{Name}_clone` symbol for a (possibly
+/// dot-qualified) interface name referenced from `current_module`.
+pub fn clone_symbol(name: &str, current_module: &str, prefix: &str) -> String {
+    let (module, name) = split_qualified(name, current_module);
+    format!("{prefix}_{module}_{name}_clone")
 }
 
 /// The `iter<T>` pull contract every backend renders.
@@ -285,8 +321,9 @@ pub fn destroy_symbol(name: &str, current_module: &str, prefix: &str) -> String 
 ///    step**. Draining the producer into a hidden list defeats the point of
 ///    `iter<T>` (constant-memory streaming) and is a contract violation.
 /// 2. **Element ownership.** Each `next` writes an element the consumer now
-///    owns; after copying (or decoding) it, the wrapper owes
-///    [`elem_free`](Self::elem_free).
+///    owns; the wrapper receives it exactly as it would a return of the same
+///    type ([`elem`](Self::elem)): copy and free a string or bytes, decode
+///    and free a buffer, adopt an object.
 /// 3. **Handle lifecycle.** `destroy` is called exactly once: eagerly on
 ///    exhaustion, and from the wrapper's disposal idiom (RAII destructor,
 ///    finalizer, `close()`, generator cleanup) when iteration is abandoned
@@ -298,19 +335,30 @@ pub fn destroy_symbol(name: &str, current_module: &str, prefix: &str) -> String 
 pub struct IteratorProtocol<'a> {
     /// The lowered iterator surface: launcher, `next`, and destroy symbols.
     pub binding: &'a IteratorBinding,
-    /// The release owed for each element copied out of a `next` slot.
-    pub elem_free: ElemFree,
+    /// How each element written by `next` is received.
+    pub elem: RetPass,
+    /// The release owed for each element copied out of a `next` slot
+    /// (`elem.free()`, kept for convenience).
+    pub elem_free: Free,
     /// How `out_err` reports from the launcher and each `next` call are
     /// interpreted.
     pub error: ErrorStrategy,
 }
 
 impl IteratorBinding {
-    /// Build the full pull contract for this iterator.
-    pub fn protocol<'a>(&'a self, f: &FnBinding) -> IteratorProtocol<'a> {
+    /// Build the full pull contract for this iterator, resolving the element
+    /// plan against the declaring `module` and `prefix`.
+    pub fn protocol<'a>(
+        &'a self,
+        f: &FnBinding,
+        module: &str,
+        prefix: &str,
+    ) -> IteratorProtocol<'a> {
+        let elem = ret_pass(Some(&self.elem), module, prefix);
         IteratorProtocol {
             binding: self,
-            elem_free: elem_free(&self.elem),
+            elem_free: elem.free(),
+            elem,
             error: f.error_strategy(),
         }
     }
@@ -329,11 +377,11 @@ impl IteratorBinding {
 /// 2. **Owned results.** Everything passed to the callback is owned by the
 ///    consumer. String results are released with `{prefix}_free_string`,
 ///    byte and buffered-value results with `{prefix}_free_bytes`, and
-///    interface-object results transfer ownership of the object (the
-///    wrapper adopts the pointer). This is what lets runtimes that defer
-///    callback bodies past the native return (Dart's
-///    `NativeCallable.listener`, for example) decode safely; a wrapper that
-///    processes results inline still copies or decodes first and then frees.
+///    interface-object results transfer one strong reference (the wrapper
+///    adopts the pointer). This is what lets runtimes that defer callback
+///    bodies past the native return (Dart's `NativeCallable.listener`, for
+///    example) decode safely; a wrapper that processes results inline still
+///    copies or decodes first and then frees.
 /// 3. **Foreign-thread delivery.** The callback runs on a producer thread,
 ///    so the wrapper must hop back to its native scheduler before touching
 ///    consumer state (`call_soon_threadsafe`, a threadsafe function, a
@@ -371,20 +419,75 @@ impl AsyncBinding {
     }
 }
 
+/// The callback-interface contract every backend renders.
+///
+/// A callback interface is the consumer's side of the boundary: the consumer
+/// supplies an implementation, the producer calls it. The contract has four
+/// clauses:
+///
+/// 1. **One static vtable per interface.** The wrapper emits exactly one
+///    process-wide vtable value for the interface whose entries are
+///    trampolines from the C signature ([`CallbackMethodBinding::abi_params`])
+///    into the native implementation, plus a trailing `free` entry.
+/// 2. **Context is a handle-table key.** The wrapper stores the native
+///    implementation in a table keyed by an integer or pointer it passes as
+///    `ctx`, so the implementation stays alive as long as the producer holds
+///    the callback and garbage collectors never see a raw pointer.
+/// 3. **Arguments are received like returns.** Strings, bytes, and buffers
+///    arriving in a trampoline are borrowed for the call: the wrapper copies
+///    or decodes them before returning and frees nothing. Object arguments
+///    transfer one strong reference the wrapper adopts. Method returns are
+///    direct values written straight into the C return.
+/// 4. **Foreign failures trap.** When the native implementation raises, the
+///    trampoline calls `{prefix}_error_set(out_err, -4, message)` and returns
+///    a default value; it must never let an exception unwind through the C
+///    frame. The producer then aborts its call with `FOREIGN_ERROR_CODE`.
+///
+/// Trampolines may be invoked from any producer thread; the wrapper is
+/// responsible for whatever thread affinity its runtime demands (a GIL
+/// acquisition, a JNI attach, a threadsafe-function hop).
+///
+/// [`CallbackMethodBinding::abi_params`]: crate::model::CallbackMethodBinding::abi_params
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackProtocol<'a> {
+    /// The lowered callback interface: vtable tag and methods.
+    pub binding: &'a CallbackInterfaceBinding,
+    /// How each method's parameters are received inside a trampoline, in
+    /// method order then parameter order.
+    pub method_args: Vec<Vec<RetPass>>,
+}
+
+impl CallbackInterfaceBinding {
+    /// Build the full contract for this callback interface, resolving each
+    /// parameter's receiving plan against the declaring `module` and
+    /// `prefix`.
+    pub fn protocol<'a>(&'a self, module: &str, prefix: &str) -> CallbackProtocol<'a> {
+        CallbackProtocol {
+            binding: self,
+            method_args: self
+                .methods
+                .iter()
+                .map(|m| {
+                    m.params
+                        .iter()
+                        .map(|p| ret_pass(Some(&p.ty), module, prefix))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn arg_pass_classifies_every_family() {
-        let pb = |name: &str, ty: Ty| ParamBinding::new(name, ty, false, None, "m");
+        let pb = |name: &str, ty: Ty| ParamBinding::new(name, ty, None, "m");
         assert!(matches!(
             pb("x", Ty::I32).arg_pass(),
             ArgPass::Direct { slot } if slot.name == "x"
-        ));
-        assert!(matches!(
-            pb("h", Ty::Handle).arg_pass(),
-            ArgPass::Direct { .. }
         ));
         assert!(matches!(
             pb("s", Ty::StringUtf8).arg_pass(),
@@ -417,6 +520,10 @@ mod tests {
             .arg_pass(),
             ArgPass::Object { nullable: true, .. }
         ));
+        assert!(matches!(
+            pb("l", Ty::CallbackInterface("Listener".into())).arg_pass(),
+            ArgPass::Callback { ctx, vtable } if ctx.name == "l_ctx" && vtable.name == "l_vtable"
+        ));
     }
 
     #[test]
@@ -432,6 +539,7 @@ mod tests {
             Ty::Record("Contact".into()),
             Ty::RichEnum("Shape".into()),
             Ty::List(Box::new(Ty::StringUtf8)),
+            Ty::List(Box::new(Ty::Interface("Store".into()))),
             Ty::Optional(Box::new(Ty::I64)),
         ] {
             assert_eq!(
@@ -444,6 +552,7 @@ mod tests {
             ret_pass(Some(&Ty::Interface("kv.Store".into())), "m", "weaveffi"),
             RetPass::Object {
                 destroy_symbol: "weaveffi_kv_Store_destroy".into(),
+                clone_symbol: "weaveffi_kv_Store_clone".into(),
                 nullable: false,
             }
         );
@@ -455,6 +564,7 @@ mod tests {
             ),
             RetPass::Object {
                 destroy_symbol: "weaveffi_kv_Store_destroy".into(),
+                clone_symbol: "weaveffi_kv_Store_clone".into(),
                 nullable: true,
             }
         );
@@ -470,5 +580,6 @@ mod tests {
         assert_eq!(elem_free(&Ty::Bytes), Free::Bytes);
         assert_eq!(elem_free(&Ty::Record("Entry".into())), Free::Bytes);
         assert_eq!(elem_free(&Ty::Optional(Box::new(Ty::I32))), Free::Bytes);
+        assert_eq!(elem_free(&Ty::Interface("Store".into())), Free::None);
     }
 }

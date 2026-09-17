@@ -39,7 +39,7 @@ impl LanguageBackend for Counting {
         "counting"
     }
 
-    fn capabilities(&self) -> TargetCapabilities {
+    fn capabilities(&self, _config: &Self::Config) -> TargetCapabilities {
         TargetCapabilities::full()
     }
 
@@ -68,8 +68,7 @@ fn api() -> ResolvedApi {
             interfaces: vec![],
             structs: vec![],
             enums: vec![],
-            callbacks: vec![],
-            listeners: vec![],
+            callback_interfaces: vec![],
             errors: None,
             modules: vec![],
         }],

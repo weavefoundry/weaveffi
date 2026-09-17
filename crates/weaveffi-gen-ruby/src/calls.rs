@@ -1,26 +1,28 @@
 //! Callable rendering: FFI attachments, the sync/async/iterator wrapper
-//! bodies, listener registration, and the parameter and return marshalling
-//! they share.
+//! bodies, and the parameter and return marshalling they share.
 //!
-//! Marshalling dispatch goes through the shared plan layer
-//! ([`ArgPass`], [`RetPass`], [`ElemFree`]) rather than crate-local
-//! `Ty` folds, so this backend cannot drift from the others on
-//! call-boundary semantics.
+//! Marshalling dispatch goes through the shared plan layer ([`ArgPass`],
+//! [`RetPass`], [`Free`]) rather than crate-local `Ty` folds, so this
+//! backend cannot drift from the others on call-boundary semantics: objects
+//! are borrowed as parameters and adopted as returns, and a callback
+//! interface crosses as a registry key plus the interface's static vtable.
 
 use heck::ToSnakeCase;
 use weaveffi_core::abi::CType;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    AsyncBinding, CallShape, CallbackBinding, FnBinding, IteratorBinding, ListenerBinding,
-    ModuleBinding, ParamBinding,
+    AsyncBinding, CallShape, FnBinding, IteratorBinding, ModuleBinding, ParamBinding,
 };
-use weaveffi_core::plan::{self, ArgPass, ElemFree, ErrorStrategy, RetPass};
+use weaveffi_core::plan::{self, ArgPass, ErrorStrategy, Free, RetPass};
 use weaveffi_core::utils::{local_type_name, wrapper_name};
 
+use crate::callbacks::rb_vtable_const;
 use crate::docs::{emit_doc, emit_param_docs};
 use crate::entities::{rb_checker_name, rb_error_factory_name};
-use crate::types::{rb_abi_types, rb_ffi_type, rb_mem_type, rb_param_name, rb_read_method};
+use crate::types::{
+    rb_abi_types, rb_direct_from_c, rb_ffi_type, rb_mem_type, rb_param_name, rb_read_method,
+};
 
 /// How a rendered Ruby callable is scoped and spelled in the generated
 /// module: at module scope as a singleton method, or inside an interface
@@ -33,8 +35,8 @@ pub(crate) enum RbScope<'a> {
         /// Whether the emitted name drops the module-path prefix.
         strip_module_prefix: bool,
     },
-    /// An instance method on an interface class: `def name`, passing
-    /// `@handle` as the leading C argument.
+    /// An instance method on an interface class: `def name`, passing the
+    /// wrapper's borrowed `handle` as the leading C argument.
     Method {
         /// The top-level Ruby module name qualifying module singleton calls.
         module_name: &'a str,
@@ -92,9 +94,11 @@ impl<'a> RbScope<'a> {
         }
     }
 
-    /// The `@handle` argument instance methods pass as the leading C slot.
+    /// The borrowed object pointer instance methods pass as the leading C
+    /// slot, through the `handle` accessor so a closed wrapper raises instead
+    /// of passing NULL.
     fn self_arg(&self) -> Option<&'static str> {
-        matches!(self, RbScope::Method { .. }).then_some("@handle")
+        matches!(self, RbScope::Method { .. }).then_some("handle")
     }
 
     /// The `def` opener for `f` with the given formal parameter names.
@@ -199,198 +203,6 @@ pub(crate) fn render_attach_function(out: &mut String, f: &FnBinding) {
     out.push_str(&w.finish());
 }
 
-/// `callback :{c_fn_type}, [...], :void` declaration for a module callback.
-/// Listener `attach_function`s reference the type by this symbol. Borrowed
-/// string params use `:string` so the ffi gem hands the block a Ruby String.
-pub(crate) fn render_callback_decl(out: &mut String, c: &CallbackBinding) {
-    let mut w = CodeWriter::two_space().with_depth(1);
-    let mut d = String::new();
-    emit_doc(&mut d, &c.doc, "  ");
-    w.raw(d);
-    w.line(format!(
-        "callback :{}, [{}], :void",
-        c.c_fn_type,
-        rb_abi_types(&c.abi_params, false).join(", ")
-    ));
-    out.push_str(&w.finish());
-}
-
-/// Attach one listener's register/unregister C symbol pair.
-pub(crate) fn render_listener_ffi(out: &mut String, l: &ListenerBinding) {
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.line(format!(
-        "attach_function :{}, [:{}, :pointer], :uint64",
-        l.register_symbol, l.callback_c_fn_type
-    ));
-    w.line(format!(
-        "attach_function :{}, [:uint64], :void",
-        l.unregister_symbol
-    ));
-    out.push_str(&w.finish());
-}
-
-/// The trampoline formal parameter names one callback parameter contributes,
-/// derived from its emitted Ruby spelling per its [`ArgPass`] shape (a
-/// borrowed pointer/length pair for bytes and buffered values, one formal
-/// otherwise).
-fn rb_tramp_formals(p: &ParamBinding) -> Vec<String> {
-    let n = rb_param_name(&p.name);
-    match p.arg_pass() {
-        ArgPass::Bytes { .. } | ArgPass::Buffer { .. } => {
-            vec![format!("{n}_ptr"), format!("{n}_len")]
-        }
-        _ => vec![n],
-    }
-}
-
-/// Idiomatic register/unregister pair for one listener. The user passes a
-/// block; the trampoline converts each C argument and the `FFI::Function` is
-/// pinned in `@listener_refs` until unregistered.
-pub(crate) fn render_listener_wrapper(
-    out: &mut String,
-    module: &ModuleBinding,
-    l: &ListenerBinding,
-    strip_module_prefix: bool,
-) {
-    let Some(cb) = module.callbacks.iter().find(|c| c.name == l.event_callback) else {
-        unreachable!("listener '{}' references unknown callback", l.name);
-    };
-    let register_name = wrapper_name(
-        &module.path,
-        &format!("register_{}", l.name),
-        strip_module_prefix,
-    )
-    .to_snake_case();
-    let unregister_name = wrapper_name(
-        &module.path,
-        &format!("unregister_{}", l.name),
-        strip_module_prefix,
-    )
-    .to_snake_case();
-
-    let mut w = CodeWriter::two_space().with_depth(1);
-    w.blank();
-    let mut d = String::new();
-    emit_doc(&mut d, &l.doc, "  ");
-    w.raw(d);
-    w.line(format!(
-        "# Registers a {} listener block. Returns a subscription id for",
-        cb.name
-    ));
-    w.line(format!("# {unregister_name}."));
-
-    // Trampoline formals: one per ABI slot, plus the ignored context.
-    let tramp_formals: Vec<String> = cb
-        .params
-        .iter()
-        .flat_map(rb_tramp_formals)
-        .chain(std::iter::once("_context".to_string()))
-        .collect();
-    let tramp_types = rb_abi_types(&cb.abi_params, false);
-    let call_args: Vec<String> = cb.params.iter().map(rb_cb_arg_expr).collect();
-    let buffered_params: Vec<_> = cb
-        .params
-        .iter()
-        .filter(|p| matches!(p.arg_pass(), ArgPass::Buffer { .. }))
-        .collect();
-    w.block(format!("def self.{register_name}(&block)"), "end", |w| {
-        w.block(
-            format!(
-                "trampoline = FFI::Function.new(:void, [{}]) do |{}|",
-                tramp_types.join(", "),
-                tramp_formals.join(", ")
-            ),
-            "end",
-            |w| {
-                // Borrowed buffered arguments are only valid during the
-                // dispatch: decode them before invoking the user's block. A
-                // malformed buffer can't raise across the C boundary, so the
-                // event is dropped with a warning instead.
-                if !buffered_params.is_empty() {
-                    w.line("begin");
-                    w.scope(|w| {
-                        for p in &buffered_params {
-                            let n = rb_param_name(&p.name);
-                            w.line(format!(
-                                "{n}_r = WvBufferReader.new({n}_ptr.null? ? ''.b : \
-                                 {n}_ptr.read_string({n}_len))"
-                            ));
-                            crate::codec::render_wv_read(
-                                w,
-                                &format!("{n}_r"),
-                                &format!("{n}_v"),
-                                &p.ty,
-                                0,
-                                "",
-                            );
-                            w.line(format!("{n}_r.expect_end!"));
-                        }
-                    });
-                    w.line("rescue Error => e");
-                    w.scope(|w| {
-                        w.line(format!(
-                            "warn \"weaveffi: dropped {} event: #{{e.message}}\"",
-                            cb.name
-                        ));
-                        w.line("next");
-                    });
-                    w.line("end");
-                }
-                w.line(format!("block.call({})", call_args.join(", ")));
-            },
-        );
-        w.line(format!(
-            "listener_id = {}(trampoline, FFI::Pointer::NULL)",
-            l.register_symbol
-        ));
-        w.line("@listener_refs[listener_id] = trampoline");
-        w.line("listener_id");
-    });
-
-    w.blank();
-    w.line(format!(
-        "# Unregisters a listener previously registered with {register_name}."
-    ));
-    w.block(
-        format!("def self.{unregister_name}(listener_id)"),
-        "end",
-        |w| {
-            w.line(format!("{}(listener_id)", l.unregister_symbol));
-            w.line("@listener_refs.delete(listener_id)");
-            w.line("nil");
-        },
-    );
-    out.push_str(&w.finish());
-}
-
-/// The Ruby expression converting one callback parameter's trampoline
-/// arguments into the idiomatic value passed to the user block, per the
-/// parameter's [`ArgPass`] contract. Buffered parameters are decoded into a
-/// `{n}_v` local before the dispatch, so their expression is just that local.
-fn rb_cb_arg_expr(p: &ParamBinding) -> String {
-    let n = rb_param_name(&p.name);
-    match p.arg_pass() {
-        ArgPass::Buffer { .. } => format!("{n}_v"),
-        ArgPass::Bytes { .. } => {
-            format!("({n}_ptr.null? ? ''.b : {n}_ptr.read_string({n}_len))")
-        }
-        // `:string` slots arrive as Ruby Strings (copied by ffi) or nil.
-        ArgPass::String { .. } => n,
-        // Borrowed by contract: the producer owns callback arguments for the
-        // duration of the call, so opaque pointers pass through raw; a
-        // nullable object slot surfaces nil for null.
-        ArgPass::Object {
-            nullable: false, ..
-        } => n,
-        ArgPass::Object { nullable: true, .. } => format!("({n}.null? ? nil : {n})"),
-        ArgPass::Direct { .. } => match &p.ty {
-            Ty::Bool => format!("({n} != 0)"),
-            // Scalars, enums (their integer constants), and handles pass raw.
-            _ => n,
-        },
-    }
-}
-
 /// Render the sync wrapper for one callable: convert the parameters, make
 /// the C call with a stack `ErrorStruct`, route the out-err slot through the
 /// function's checker, then convert the result per the scope.
@@ -413,7 +225,7 @@ fn render_sync_function_wrapper(
     let mut d = String::new();
     emit_doc(&mut d, &f.doc, &doc_ind);
     w.raw(d);
-    emit_param_docs(&mut w, f);
+    emit_param_docs(&mut w, &f.params);
     w.block(scope.def_open(f, &params), "end", |w| {
         if let Some(msg) = &f.deprecated {
             let escaped = msg.replace('"', "\\\"");
@@ -561,7 +373,10 @@ fn render_async_function_wrapper(
                 w.line("if err && err[:code] != 0");
                 w.scope(|w| {
                     w.line("code = err[:code]");
-                    w.line("msg = err[:message].null? ? '' : err[:message].read_string");
+                    w.line(
+                        "msg = err[:message].null? ? '' : \
+                         err[:message].read_string.force_encoding(Encoding::UTF_8)",
+                    );
                     if typed_error {
                         // Copy the payload before releasing the boxed error.
                         w.line(
@@ -658,8 +473,11 @@ fn render_async_result_push(
             w.line("end");
         }
         RetPass::String => {
-            // Owned by the consumer: copy, then free.
-            w.line("_wv_s = result.null? ? '' : result.read_string");
+            // Owned by the consumer: copy (tagged UTF-8, since ffi's
+            // read_string yields BINARY), then free.
+            w.line(
+                "_wv_s = result.null? ? '' : result.read_string.force_encoding(Encoding::UTF_8)",
+            );
             w.line(format!(
                 "{m}weaveffi_free_string(result) unless result.null?"
             ));
@@ -702,27 +520,10 @@ fn render_async_result_push(
                 w.line("end");
             }
         }
-        RetPass::Direct => match ret.as_ref() {
-            Some(Ty::Bool) => {
-                w.line("queue << (result != 0)");
-            }
-            Some(Ty::TypedHandle(name)) => {
-                let local = local_type_name(name);
-                w.line("if result.null?");
-                w.scope(|w| {
-                    w.line("queue << Error.new(-1, 'null pointer')");
-                });
-                w.line("else");
-                w.scope(|w| {
-                    w.line(format!("queue << {local}.new(result)"));
-                });
-                w.line("end");
-            }
-            // Scalars, enums, and untyped handles pass through by value.
-            _ => {
-                w.line("queue << result");
-            }
-        },
+        RetPass::Direct => {
+            let ty = ret.as_ref().expect("direct return has a type");
+            w.line(format!("queue << {}", rb_direct_from_c(ty, "result")));
+        }
     }
     out.push_str(&w.finish());
 }
@@ -734,12 +535,12 @@ fn render_async_result_push(
 /// pull, so a handle cannot leak when the returned enumerator is never
 /// started (launch errors therefore raise on the first pull rather than at
 /// call time). Each consumer step issues exactly one C `next` call, each
-/// yielded element is released per its element plan (strings and bytes freed
-/// after copying; record and rich-enum pointers adopted by their
-/// finalizer-bearing wrappers), and `destroy` runs exactly once from an
-/// `ensure` block, so an early `break` or an error raised mid-iteration still
-/// releases the handle. Launch and per-`next` errors follow the function's
-/// [`ErrorStrategy`].
+/// yielded element is received per its element plan (strings and bytes
+/// copied then freed, value buffers decoded then freed, object references
+/// adopted into finalizer-bearing wrappers), and `destroy` runs exactly once
+/// from an `ensure` block, so an early `break` or an error raised
+/// mid-iteration still releases the handle. Launch and per-`next` errors
+/// follow the function's [`ErrorStrategy`].
 fn render_iterator_function_wrapper(
     out: &mut String,
     module: &ModuleBinding,
@@ -753,6 +554,7 @@ fn render_iterator_function_wrapper(
     let q = scope.qualifier();
     let checker = rb_checker_name(f, module.error.as_ref());
     let params: Vec<String> = f.params.iter().map(|p| rb_param_name(&p.name)).collect();
+    let protocol = it.protocol(f, &module.path, "");
 
     let mut w = CodeWriter::two_space().with_depth(depth);
     w.blank();
@@ -802,7 +604,7 @@ fn render_iterator_function_wrapper(
                         let elem = &it.elem;
                         // A pointer/length element pair (bytes, or any
                         // buffered value) carries an extra out-length slot.
-                        let needs_len = matches!(plan::elem_free(elem), ElemFree::Bytes);
+                        let needs_len = matches!(protocol.elem_free, Free::Bytes);
                         let item_mem = rb_mem_type(elem);
                         w.line(format!("out_item = FFI::MemoryPointer.new({item_mem})"));
                         if needs_len {
@@ -821,6 +623,7 @@ fn render_iterator_function_wrapper(
                         render_iterator_item_yield(
                             &mut tmp,
                             elem,
+                            &protocol.elem,
                             &"  ".repeat(depth + 5),
                             scope.module_name(),
                         );
@@ -843,32 +646,37 @@ fn render_iterator_function_wrapper(
 }
 
 /// Convert the value written into `out_item` and yield it to the enumerator's
-/// yielder `y`, releasing the element per its [`weaveffi_core::plan::ElemFree`]
-/// plan first (copy, free, then yield, so an early `break` during the yield
-/// cannot leak the element). `qualifier` is the top-level Ruby module name
-/// when rendering inside a class body, where `weaveffi_free_*` calls need an
-/// explicit receiver.
-fn render_iterator_item_yield(out: &mut String, elem: &Ty, ind: &str, qualifier: Option<&str>) {
+/// yielder `y`, receiving the element per its [`RetPass`] plan first (copy or
+/// decode, free, then yield, so an early `break` during the yield cannot
+/// leak the element; an object element is adopted). `qualifier` is the
+/// top-level Ruby module name when rendering inside a class body, where
+/// `weaveffi_free_*` calls need an explicit receiver.
+fn render_iterator_item_yield(
+    out: &mut String,
+    elem: &Ty,
+    pass: &RetPass,
+    ind: &str,
+    qualifier: Option<&str>,
+) {
     let m = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let mut w = CodeWriter::two_space().with_depth(ind.len() / 2);
-    if elem.is_buffered() {
-        // A buffered element is a producer-allocated value buffer: copy the
-        // bytes, release them, then decode and yield the value.
-        w.line("item_ptr = out_item.read_pointer");
-        w.line("item_len = out_item_len.read(:size_t)");
-        w.line("_wv_data = item_ptr.null? ? ''.b : item_ptr.read_string(item_len)");
-        w.line(format!(
-            "{m}weaveffi_free_bytes(item_ptr, item_len) unless item_ptr.null?"
-        ));
-        w.line("_wv_r = WvBufferReader.new(_wv_data)");
-        crate::codec::render_wv_read(&mut w, "_wv_r", "_wv_item", elem, 0, &m);
-        w.line("_wv_r.expect_end!");
-        w.line("y << _wv_item");
-        out.push_str(&w.finish());
-        return;
-    }
-    match elem {
-        Ty::StringUtf8 | Ty::BorrowedStr => {
+    match pass {
+        RetPass::Void => unreachable!("iterator elements always have a type"),
+        RetPass::Buffer => {
+            // A buffered element is a producer-allocated value buffer: copy
+            // the bytes, release them, then decode and yield the value.
+            w.line("item_ptr = out_item.read_pointer");
+            w.line("item_len = out_item_len.read(:size_t)");
+            w.line("_wv_data = item_ptr.null? ? ''.b : item_ptr.read_string(item_len)");
+            w.line(format!(
+                "{m}weaveffi_free_bytes(item_ptr, item_len) unless item_ptr.null?"
+            ));
+            w.line("_wv_r = WvBufferReader.new(_wv_data)");
+            crate::codec::render_wv_read(&mut w, "_wv_r", "_wv_item", elem, 0, &m);
+            w.line("_wv_r.expect_end!");
+            w.line("y << _wv_item");
+        }
+        RetPass::String => {
             w.line("item_ptr = out_item.read_pointer");
             w.line("if item_ptr.null?");
             w.scope(|w| {
@@ -876,13 +684,13 @@ fn render_iterator_item_yield(out: &mut String, elem: &Ty, ind: &str, qualifier:
             });
             w.line("else");
             w.scope(|w| {
-                w.line("item = item_ptr.read_string");
+                w.line("item = item_ptr.read_string.force_encoding(Encoding::UTF_8)");
                 w.line(format!("{m}weaveffi_free_string(item_ptr)"));
                 w.line("y << item");
             });
             w.line("end");
         }
-        Ty::Bytes | Ty::BorrowedBytes => {
+        RetPass::Bytes => {
             w.line("item_ptr = out_item.read_pointer");
             w.line("item_len = out_item_len.read(:size_t)");
             w.line("if item_ptr.null?");
@@ -897,28 +705,27 @@ fn render_iterator_item_yield(out: &mut String, elem: &Ty, ind: &str, qualifier:
             });
             w.line("end");
         }
-        // A yielded typed handle is a new owned reference; the wrapper adopts
-        // the pointer.
-        Ty::TypedHandle(name) => {
-            let local = local_type_name(name);
+        // A yielded object is one strong reference the wrapper adopts,
+        // without re-running initialize. A nullable element yields nil for a
+        // null pointer.
+        RetPass::Object { nullable, .. } => {
+            let local = local_type_name(
+                elem.interface_name()
+                    .expect("object element names an interface"),
+            );
             w.line("item_ptr = out_item.read_pointer");
-            w.line(format!("y << {local}.new(item_ptr) unless item_ptr.null?"));
+            if *nullable {
+                w.line(format!(
+                    "y << (item_ptr.null? ? nil : {local}._from_ptr(item_ptr))"
+                ));
+            } else {
+                w.line("raise Error.new(-1, 'null pointer') if item_ptr.null?");
+                w.line(format!("y << {local}._from_ptr(item_ptr)"));
+            }
         }
-        // A yielded interface is a new owned reference; wrap it without
-        // re-running initialize.
-        Ty::Interface(name) => {
-            let local = local_type_name(name);
-            w.line("item_ptr = out_item.read_pointer");
-            w.line(format!(
-                "y << {local}._from_ptr(item_ptr) unless item_ptr.null?"
-            ));
-        }
-        Ty::Bool => {
-            w.line("y << (out_item.read_int32 != 0)");
-        }
-        _ => {
-            let read = rb_read_method(elem);
-            w.line(format!("y << out_item.{read}"));
+        RetPass::Direct => {
+            let read = format!("out_item.{}", rb_read_method(elem));
+            w.line(format!("y << {}", rb_direct_from_c(elem, &read)));
         }
     }
     out.push_str(&w.finish());
@@ -927,23 +734,34 @@ fn render_iterator_item_yield(out: &mut String, elem: &Ty, ind: &str, qualifier:
 /// The Ruby argument expressions one wrapper parameter contributes to the C
 /// call, driven by its [`ArgPass`] contract. A buffered parameter contributes
 /// its packed `(ptr, len)` pair, bytes contribute a copied native buffer plus
-/// its length, and everything else is a single expression.
+/// its length, an object contributes its borrowed pointer, a callback
+/// interface contributes its registry key plus the interface's static
+/// vtable, and everything else is a single expression.
 fn rb_call_args(p: &ParamBinding) -> Vec<String> {
     let name = rb_param_name(&p.name);
     match p.arg_pass() {
         ArgPass::Buffer { .. } => vec![format!("{name}_buf"), format!("{name}_data.bytesize")],
         ArgPass::Bytes { .. } => vec![format!("{name}_buf"), format!("{name}.bytesize")],
         ArgPass::String { .. } => vec![name],
+        // Borrowed for the call: the wrapper keeps its own reference.
         ArgPass::Object {
             nullable: false, ..
         } => vec![format!("{name}.handle")],
         // A nullable borrowed object pointer: nil passes as NULL.
         ArgPass::Object { nullable: true, .. } => vec![format!("{name}&.handle")],
+        // The registry key (see `render_param_conversion`) and the one
+        // process-wide vtable for the interface.
+        ArgPass::Callback { .. } => {
+            let cb =
+                p.ty.callback_interface_name()
+                    .expect("callback plan names a callback interface");
+            vec![
+                format!("{name}_ctx"),
+                format!("{}.to_ptr", rb_vtable_const(cb)),
+            ]
+        }
         ArgPass::Direct { .. } => match &p.ty {
             Ty::Bool => vec![format!("{name}_c")],
-            // Typed handles occupy an opaque pointer slot borrowed from the
-            // wrapper object.
-            Ty::TypedHandle(_) => vec![format!("{name}.handle")],
             _ => vec![name],
         },
     }
@@ -953,8 +771,10 @@ fn rb_call_args(p: &ParamBinding) -> Vec<String> {
 /// C call slots reference (see [`rb_call_args`]), per its [`ArgPass`]
 /// contract. A buffered parameter is packed into its value-buffer encoding
 /// and copied into a `MemoryPointer` the C call borrows for its duration; the
-/// caller keeps ownership and the callee never frees it. `qualifier` names
-/// the top-level Ruby module when rendering inside a class body.
+/// caller keeps ownership and the callee never frees it. A callback interface
+/// implementation is stored in the module's registry, whose key becomes the
+/// `ctx` slot. `qualifier` names the top-level Ruby module when rendering
+/// inside a class body.
 fn render_param_conversion(out: &mut String, p: &ParamBinding, ind: &str, qualifier: Option<&str>) {
     let q = qualifier.map(|q| format!("{q}.")).unwrap_or_default();
     let name = rb_param_name(&p.name);
@@ -974,6 +794,9 @@ fn render_param_conversion(out: &mut String, p: &ParamBinding, ind: &str, qualif
                 "{name}_buf = FFI::MemoryPointer.new(:uint8, {name}.bytesize)"
             ));
             w.line(format!("{name}_buf.put_bytes(0, {name})"));
+        }
+        ArgPass::Callback { .. } => {
+            w.line(format!("{name}_ctx = {q}_wv_cb_register({name})"));
         }
         ArgPass::Direct { .. } if matches!(p.ty, Ty::Bool) => {
             w.line(format!("{name}_c = {name} ? 1 : 0"));
@@ -1005,8 +828,10 @@ fn render_return_code(out: &mut String, ty: &Ty, ind: &str, qualifier: Option<&s
             w.line("_wv_value");
         }
         RetPass::String => {
+            // ffi's read_string yields a BINARY string; the ABI guarantees
+            // UTF-8, so retag it before handing it to the caller.
             w.line("return '' if result.null?");
-            w.line("str = result.read_string");
+            w.line("str = result.read_string.force_encoding(Encoding::UTF_8)");
             w.line(format!("{m}weaveffi_free_string(result)"));
             w.line("str");
         }
@@ -1038,19 +863,9 @@ fn render_return_code(out: &mut String, ty: &Ty, ind: &str, qualifier: Option<&s
                 w.line(format!("{local}._from_ptr(result)"));
             }
         }
-        RetPass::Direct => match ty {
-            Ty::Bool => {
-                w.line("result != 0");
-            }
-            Ty::TypedHandle(name) => {
-                w.line("raise Error.new(-1, 'null pointer') if result.null?");
-                w.line(format!("{name}.new(result)"));
-            }
-            // Scalars, enums, and untyped handles pass through by value.
-            _ => {
-                w.line("result");
-            }
-        },
+        RetPass::Direct => {
+            w.line(rb_direct_from_c(ty, "result"));
+        }
     }
     out.push_str(&w.finish());
 }

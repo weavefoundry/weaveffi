@@ -79,9 +79,19 @@ fn generator_sources_ban_unimplemented_and_todo() {
     );
 }
 
+/// The Ruby callback-interface mixin's abstract-method default, which is the
+/// one legitimate "not implemented" in generated output (see the exemption in
+/// [`generated_output_has_no_stub_markers`]).
+fn is_abstract_callback_default(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("raise NotImplementedError, \"#{self.class}#")
+        || t.starts_with("# include this module to inherit NotImplementedError defaults")
+}
+
 /// Every file generated for the feature-complete samples (structs, builders,
-/// enums, optionals, lists, maps, bytes, handles, callbacks, listeners, async,
-/// iterators, submodules) must be free of stub markers across all targets.
+/// enums, optionals, lists, maps, bytes, objects in every position, callback
+/// interfaces, async, iterators, submodules) must be free of stub markers
+/// across all targets.
 #[test]
 fn generated_output_has_no_stub_markers() {
     let root = workspace_root();
@@ -89,6 +99,7 @@ fn generated_output_has_no_stub_markers() {
         root.join("samples/contacts/src/lib.rs"),
         root.join("samples/events/src/lib.rs"),
         root.join("samples/kvstore/src/lib.rs"),
+        root.join("samples/codec/src/lib.rs"),
     ];
 
     // Case-insensitive marker list. Bare "not supported" is deliberately
@@ -98,7 +109,7 @@ fn generated_output_has_no_stub_markers() {
     // "yet" in "not yet supported" is what distinguishes capability drift: a
     // target that declares a feature `true` (so the gate lets generation
     // through) but then emits a runtime-throwing TODO stub for it. That is
-    // exactly the Android `iter<T>` regression the capability gate exists to
+    // exactly the Kotlin `iter<T>` regression the capability gate exists to
     // prevent, so it must stay a hard build failure.
     let banned = [
         "unimplemented",
@@ -139,7 +150,18 @@ fn generated_output_has_no_stub_markers() {
             let Ok(text) = fs::read_to_string(&file) else {
                 continue; // non-UTF-8 artifacts have no text stubs to check
             };
-            let lower = text.to_lowercase();
+            // A callback interface is implemented by the *consumer*, and the
+            // idiomatic way to publish its method set in dynamic languages is
+            // an abstract default that raises until overridden (Ruby's
+            // `raise NotImplementedError, "#{self.class}#m is not implemented"`).
+            // That is an API contract the consumer sees, not a generator
+            // stub, so those lines are exempt from the scan.
+            let lower: String = text
+                .lines()
+                .filter(|l| !is_abstract_callback_default(l))
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+                .join("\n");
             for marker in banned {
                 if lower.contains(marker) {
                     violations.push(format!(

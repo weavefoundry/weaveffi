@@ -22,3 +22,7 @@ proc-macro2 = "1.0"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+trybuild = "1.0.120"
+weaveffi = { path = "../weaveffi" }

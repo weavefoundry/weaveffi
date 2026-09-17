@@ -4,11 +4,10 @@
 //! as the original kitchen-sink IDL when run on the hand-annotated Rust
 //! file at `crates/weaveffi-cli/tests/fixtures/kitchen_sink_annotated.rs`,
 //! including the full surface: the `Gadget` interface, the `KitchenErrors`
-//! domain, and per-function `throws`. Lossy fields (struct field defaults,
-//! iterator returns, standalone `since` without `#[deprecated]`, callback
-//! param docs, error-code `doc:` separate from `message:`) are documented
-//! in `docs/src/guides/extract.md` and skipped by name in the assertions
-//! below.
+//! domain, the `ReadyListener` callback interface, and per-function
+//! `throws`. Lossy fields (struct field defaults, callback param docs,
+//! error-code `doc:` separate from `message:`) are documented in
+//! `docs/src/guides/extract.md` and skipped by name in the assertions below.
 
 use std::collections::BTreeMap;
 
@@ -24,7 +23,6 @@ fn normalize(ty: &TypeRef) -> TypeRef {
     }
     match ty {
         TypeRef::Named(name) => TypeRef::Named(last_segment(name)),
-        TypeRef::TypedHandle(name) => TypeRef::TypedHandle(last_segment(name)),
         TypeRef::Optional(inner) => TypeRef::Optional(Box::new(normalize(inner))),
         TypeRef::List(inner) => TypeRef::List(Box::new(normalize(inner))),
         TypeRef::Iterator(inner) => TypeRef::Iterator(Box::new(normalize(inner))),
@@ -188,34 +186,23 @@ fn roundtrip_kitchen_sink() {
         // struct field defaults from Rust syntax (documented gap).
     }
 
-    // Callbacks
-    assert_eq!(kitchen_ex.callbacks.len(), kitchen_orig.callbacks.len());
-    let on_ready_orig = &kitchen_orig.callbacks[0];
-    let on_ready_ex = &kitchen_ex.callbacks[0];
-    assert_eq!(on_ready_ex.name, on_ready_orig.name);
-    assert_eq!(on_ready_ex.doc, on_ready_orig.doc);
-    assert_eq!(on_ready_ex.params.len(), on_ready_orig.params.len());
-    for (a, b) in on_ready_ex.params.iter().zip(on_ready_orig.params.iter()) {
-        assert_eq!(a.name, b.name);
-        assert_types_equivalent(&a.ty, &b.ty, &format!("callback param {}", b.name));
+    // Callback interfaces
+    assert_eq!(
+        kitchen_ex.callback_interfaces.len(),
+        kitchen_orig.callback_interfaces.len()
+    );
+    let listener_orig = &kitchen_orig.callback_interfaces[0];
+    let listener_ex = &kitchen_ex.callback_interfaces[0];
+    assert_eq!(listener_ex.name, listener_orig.name);
+    assert_eq!(listener_ex.doc, listener_orig.doc);
+    assert_eq!(listener_ex.methods.len(), listener_orig.methods.len());
+    for (a, b) in listener_ex.methods.iter().zip(listener_orig.methods.iter()) {
+        assert_functions_equivalent(a, b, &format!("ReadyListener method {}", b.name));
     }
 
-    // Listeners
-    assert_eq!(kitchen_ex.listeners.len(), kitchen_orig.listeners.len());
-    let listener_orig = &kitchen_orig.listeners[0];
-    let listener_ex = &kitchen_ex.listeners[0];
-    assert_eq!(listener_ex.name, listener_orig.name);
-    assert_eq!(listener_ex.event_callback, listener_orig.event_callback);
-    assert_eq!(listener_ex.doc, listener_orig.doc);
-
     // Functions: every original IDL function must reappear in extracted
-    // output with matching shape, except for `stream_items` which has
-    // no Rust syntax for `iter<T>` (documented gap).
-    let lossy_functions: &[&str] = &["stream_items"];
+    // output with matching shape.
     for orig in &kitchen_orig.functions {
-        if lossy_functions.contains(&orig.name.as_str()) {
-            continue;
-        }
         let extracted = function_by_name(kitchen_ex, &orig.name);
         assert_eq!(
             extracted.params.len(),
@@ -226,11 +213,6 @@ fn roundtrip_kitchen_sink() {
         for (a, b) in extracted.params.iter().zip(orig.params.iter()) {
             assert_eq!(a.name, b.name, "{} param name mismatch", orig.name);
             assert_types_equivalent(&a.ty, &b.ty, &format!("{} param {}", orig.name, b.name));
-            assert_eq!(
-                a.mutable, b.mutable,
-                "{} param {} mutable mismatch",
-                orig.name, b.name
-            );
             // Param.doc is allowed to differ (documented gap).
         }
         match (&extracted.returns, &orig.returns) {
@@ -254,17 +236,11 @@ fn roundtrip_kitchen_sink() {
             "{} throws mismatch",
             orig.name
         );
-        // `since` without an accompanying `#[deprecated(since = ...)]` is
-        // not recoverable: `new_op` has `since: 0.3.0` in the IDL but no
-        // way to express that in Rust syntax alone.
-        if orig.deprecated.is_some() {
-            assert_eq!(
-                extracted.deprecated, orig.deprecated,
-                "{} deprecated mismatch",
-                orig.name
-            );
-            assert_eq!(extracted.since, orig.since, "{} since mismatch", orig.name);
-        }
+        assert_eq!(
+            extracted.deprecated, orig.deprecated,
+            "{} deprecated mismatch",
+            orig.name
+        );
     }
 
     // Error domain: `#[weaveffi::error]` makes the domain derivable, so name,

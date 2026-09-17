@@ -1,7 +1,8 @@
 # FAQ
 
-The top ten questions we hear about WeaveFFI. For broader context see the
-[introduction](intro.md), the [comparison page](comparison.md), and the
+The questions we hear most about WeaveFFI. For broader context see the
+[introduction](intro.md), the [comparison page](comparison.md), the
+[C ABI contract](reference/abi.md), and the
 [per-target generator docs](generators/README.md).
 
 ## 1. Why not UniFFI?
@@ -11,23 +12,30 @@ production at Mozilla, and is the right choice if you only need Swift,
 Kotlin, and Python. We built WeaveFFI because we needed:
 
 - **More targets out of the box.** WeaveFFI ships first-class generators
-  for C, C++, Swift, Kotlin/Android, Node.js, Wasm, Python, .NET, Dart,
-  Go, and Ruby, eleven in total. UniFFI's first-party language list is
-  shorter and the rest live as community extensions of varying maturity.
+  for C, C++, Swift, Kotlin, Node.js, Wasm, Python, .NET, Dart, Go, and
+  Ruby, eleven in total, all consuming one C ABI. UniFFI's first-party
+  language list is shorter and the rest live as external bindgens of varying
+  maturity.
 - **A standalone CLI workflow.** WeaveFFI is a single binary
-  (`cargo install weaveffi-cli`) with `validate`, `lint`, `diff`,
-  `watch`, `format`, and `extract` subcommands designed to
-  drop into CI. UniFFI is a build-script integration first.
+  (`cargo install weaveffi-cli`) with `generate`, `validate`, `diff`,
+  `extract`, and `package` subcommands designed to drop into CI. UniFFI is a
+  build-script integration first.
 - **A non-Rust-only story.** WeaveFFI's IR is language-agnostic: any
-  backend that can expose a stable C ABI (Rust, C, C++, Zig, …) can be
-  driven from the same IDL. UniFFI is Rust-first.
+  backend that can expose a stable C ABI (Rust, C, C++, Zig, ...) can be
+  driven from the same IDL and implement the same generated header. UniFFI
+  is Rust-first and its scaffolding ABI is private.
 - **A YAML/JSON/TOML IDL with a JSON Schema.** WeaveFFI ships
   `weaveffi.schema.json` for editor autocompletion. UniFFI's UDL is
-  custom-syntax and proc-macro is Rust-only.
+  custom-syntax and its proc-macro path is Rust-only.
 
-If your matrix is only Swift+Kotlin+Python and you want maximum
-maturity today, UniFFI is the safer pick. See the
-[comparison page](comparison.md) for the full table.
+Since ABI revision 2 the object model is comparable: WeaveFFI interfaces are
+reference-counted `Arc<T>` objects that can be shared and nested inside
+records and collections, and callback interfaces are traits the consumer
+implements. UniFFI is still ahead on callback methods that return strings,
+records, or objects, on async callback methods, and on cross-crate type
+imports (see the [roadmap](roadmap.md)). If your matrix is only
+Swift+Kotlin+Python and you want maximum maturity today, UniFFI is the safer
+pick. See the [comparison page](comparison.md) for the full table.
 
 ## 2. Can I use it with C++ codebases?
 
@@ -50,41 +58,50 @@ Two distinct cases:
 Yes, with a curated set of built-in generic shapes rather than open
 user-defined generics:
 
-- `handle<T>`: typed opaque pointers (compile-time-checked handle
-  types per resource).
-- `iter<T>`: lazy streaming sequences with `_next` / `_destroy` ABI.
+- `iter<T>`: lazy streaming sequences with a `_next` / `_destroy` ABI.
 - `[T]`: homogeneous lists.
-- `{K:V}`: homogeneous maps (serialized as value buffers at the
-  C ABI).
+- `{K:V}`: homogeneous maps.
 - `T?`: optionals.
-- `&str`, `&[u8]`: borrowed views (no copy at the boundary).
 
-We deliberately do **not** support arbitrary user-defined generics
-(e.g. `Result<MyType, MyError>` parameterized at the IDL level).
-Cross-language generic monomorphization is a rabbit hole; the
-built-in shapes cover ~95% of real-world FFI surface area without
-requiring every target generator to implement type-erasure logic.
+All four compose with each other and with every other type, including
+interface objects: `[Store]`, `{string:Store}`, `Store?`, and `iter<Store>`
+are all valid, and records may carry any of them as fields. Lists, maps,
+optionals, records, and rich enums cross the C ABI serialized as
+[value buffers](reference/value-buffers.md); objects inside them travel as
+tokens that carry one strong reference.
+
+We deliberately do **not** support arbitrary user-defined generics (for
+example `Result<MyType, MyError>` parameterized at the IDL level) or traits
+with generic methods. Cross-language generic monomorphization is a rabbit
+hole; the built-in shapes cover the large majority of real-world FFI surface
+area without requiring every target generator to implement type-erasure
+logic. Trait-object interfaces (one declared method set, several producer
+implementations) are on the [roadmap](roadmap.md).
 
 ## 4. What's the runtime overhead?
 
 WeaveFFI itself adds **no runtime** beyond the small `weaveffi-abi`
-crate (a few hundred lines: error helpers, string/byte-slice
-allocators, cancel tokens). Per-call overhead is the cost of:
+crate (error helpers, string and byte-buffer allocators, the value-buffer
+codec, the object reference-count shims, the callback vtable shims, cancel
+tokens, and the async spawner hook). Per-call overhead is the cost of:
 
-1. Marshalling arguments across the C ABI (string→`const char*`,
-   list→`*ptr + len`, etc.). Borrowed types (`&str`, `&[u8]`) avoid
-   copies.
+1. Marshalling arguments across the C ABI (`string` to `const char*`,
+   `bytes` to `ptr + len`, and so on). String and byte parameters are
+   borrowed views for the duration of the call, so the producer copies only
+   what it keeps.
 2. The single `extern "C"` function call.
 3. Marshalling the return value back.
 
 For primitive arguments and return types, this is roughly the cost of
-a normal function call plus an out-pointer write for the error. For
-larger structs, lists, and maps, it's dominated by the underlying
-allocation/copy cost, not by anything WeaveFFI inserts.
+a normal function call plus an out-pointer write for the error. Passing an
+object is one pointer; the producer clones the `Arc` only if it retains it.
+For larger structs, lists, and maps, it's dominated by the encode/decode of
+the value buffer, which is a single allocation per value on each side.
 
 Async functions add a callback indirection (the C ABI is callback-based)
-plus whatever runtime your backend uses. There is no scheduler imposed
-by WeaveFFI; the implementation chooses how to spawn work.
+plus whatever executor drives the future. The default spawner runs each
+future on a dedicated thread; producers that already have a runtime plug it
+in with `weaveffi::set_spawner` (see question 13).
 
 ## 5. How are errors propagated?
 
@@ -92,7 +109,9 @@ At the C ABI, generated functions take a trailing `weaveffi_error*
 out_err` parameter. On success the runtime sets `code = 0` and
 `message = NULL`. On failure it sets a non-zero code and a
 heap-allocated UTF-8 message that the caller frees via
-`weaveffi_error_clear`.
+`weaveffi_error_clear`. Negative codes are reserved for the runtime:
+`-1` generic, `-2` producer panic, `-3` marshalling failure, and `-4`
+a consumer callback-interface implementation raised.
 
 Above the ABI, error surfacing is opt-in per function: a module
 declares an error domain (`errors:` in the IDL) with named, stable
@@ -132,9 +151,10 @@ Yes, via two escape hatches in increasing order of power:
 
 1. **Project config** (`[generators.<target>]` tables in the
    `weaveffi.toml` next to your definition). Controls Swift module
-   names, Android package, C prefix, C++ namespace, Dart/Go/Ruby package
-   names, module-prefix stripping (`strip_module_prefix`), and other
-   per-target knobs. See the [Project Configuration guide](guides/config.md).
+   names, the Kotlin package, C prefix, C++ namespace, Dart/Go/Ruby package
+   names, module-prefix stripping (`strip_module_prefix`), Wasm's
+   Emscripten mode, and other per-target knobs. See the
+   [Project Configuration guide](guides/config.md).
 2. **Hook commands** (`pre_generate` / `post_generate` in the
    config). Run arbitrary shell commands before and after generation,
    useful for `prettier`, `swiftformat`, `gofmt`, etc.
@@ -185,20 +205,26 @@ Windows-specific issue, please open an issue.
 ## 9. How do I distribute the cdylib?
 
 You build a platform-specific shared library per target triple and
-ship it alongside the generated package. Three common patterns:
+ship it alongside the generated package. `weaveffi package` does the
+assembly: point it at prebuilt libraries with `--binaries <dir>` (or let it
+cross-compile a Rust producer with `--build <crate>`) and it lays each
+target's package out the way its ecosystem expects, including
+`jniLibs/<abi>/` for Kotlin and the `.wasm` binary inside an npm package for
+Wasm (which needs a `wasm32` build). Three common layouts:
 
 - **Per-platform npm/PyPI/gem packages.** Publish one package per
-  `(os, arch)` and use a small loader in the consumer that picks the
-  right binary at install or runtime. WeaveFFI generates the
-  TypeScript/Python/Ruby loader, you supply the binaries.
+  `(os, arch)` and let the generated loader pick the right binary at
+  runtime. WeaveFFI generates the TypeScript/Python/Ruby loader, you supply
+  the binaries.
 - **`xcframework` for Swift.** Bundle iOS device, iOS simulator,
   and macOS slices into a single `.xcframework` that SwiftPM can
   consume. The generated `Package.swift` references it as a
   `.binaryTarget`.
-- **`.aar` for Android.** Package the JNI shim + per-ABI `.so` files
-  into an Android Archive that Gradle resolves like any other
-  dependency. The generated `build.gradle` skeleton is compatible
-  with this layout.
+- **`.aar` for Android.** Package the JNI shim plus per-ABI `.so` files
+  (`android-arm64`, `android-x64`) into an Android Archive that Gradle
+  resolves like any other dependency. The generated `build.gradle.kts` is
+  compatible with this layout, and the same wrapper also runs on the desktop
+  JVM.
 
 The name, version, and metadata stamped into every generated manifest
 (`package.json`, `pyproject.toml`, `*.gemspec`, `*.csproj`, `pubspec.yaml`,
@@ -206,10 +232,11 @@ The name, version, and metadata stamped into every generated manifest
 [`[package]` table](guides/config.md#package) of your `weaveffi.toml`, so you
 set your identity once and every ecosystem stays in sync.
 
-There is no opinionated "weaveffi publish" command today; you use
-each ecosystem's normal publish flow. The
-[generator-specific docs](generators/README.md) cover the recommended
-build matrix per language.
+There is no "weaveffi publish" command; you use each ecosystem's normal
+publish flow on the output of `weaveffi package`. See the
+[Packaging and Distribution guide](guides/packaging.md) and the
+[generator-specific docs](generators/README.md) for the recommended build
+matrix per language.
 
 ## 10. What's the licensing?
 
@@ -223,3 +250,97 @@ projects without restriction. Generated code carries no license header
 of its own; it's yours to license however you like. Contributions
 to the WeaveFFI repo are accepted under the same MIT-or-Apache-2.0
 dual license; see [`CONTRIBUTING.md`](https://github.com/weavefoundry/weaveffi/blob/main/CONTRIBUTING.md#license).
+
+## 11. Who owns an object, and when is it freed?
+
+The producer does. Every interface object is reference counted on the native
+side (an `Arc<T>` in a Rust producer), and the C ABI exposes two symbols per
+interface: `{tag}_clone`, which returns a new strong reference to the same
+object, and `{tag}_destroy`, which releases one. The object is dropped when
+the last reference goes away, wherever that reference lives.
+
+Each generated wrapper holds exactly one strong reference and releases it
+through the language's natural disposal hook: `deinit` in Swift, the
+destructor in C++ (copying a wrapper calls `_clone`), `close()` or a `using`
+declaration in Node.js and Wasm, `close()` or a `with` block in Python,
+`Dispose()` in .NET, `close()` (`AutoCloseable`) in Kotlin, `dispose()` in
+Dart, `Close()` in Go, and `close` in Ruby. Every managed target also
+registers a garbage-collector backstop (`Cleaner`, `FinalizationRegistry`,
+`__del__`, a finalizer, `NativeFinalizer`, `runtime.SetFinalizer`,
+`FFI::AutoPointer`) so a wrapper that's never closed still releases its
+reference eventually. Closing a wrapper twice is a no-op; using one after
+closing it throws.
+
+Because the count lives in the producer, ownership is uniform in every
+position: an object returned from a call, produced by an iterator, delivered
+by an async completion, or passed to a callback-interface method is one
+reference the consumer adopts. An object passed *to* the producer as a
+parameter is borrowed for the call, and the producer clones it if it keeps
+it. An object inside a record, list, map, or optional travels as a token
+carrying one reference, so two wrappers (or a wrapper and a producer-side
+`Arc`) can point at the same object and neither can free it out from under
+the other. See [Memory Ownership](guides/memory.md) and the
+[C ABI contract](reference/abi.md#objects-interfaces).
+
+## 12. How do callback interfaces work?
+
+A callback interface is a set of methods the consumer implements and the
+producer calls. In the IDL it's a `callback_interfaces:` entry with
+`methods:`; in Rust it's
+
+```rust
+#[weaveffi::callback_interface]
+pub trait EvictionListener: Send + Sync {
+    fn on_evict(&self, entry: &Entry, reason: EvictionReason) -> bool;
+}
+```
+
+accepted by any function, constructor, static, or method as
+`Arc<dyn EvictionListener>`. Each target exposes it as the natural thing to
+implement: a Swift `protocol`, a Kotlin, Go, or C# interface, a Python `ABC`,
+a Dart `abstract class`, a C++ class with virtual methods passed as a
+`std::shared_ptr`, a TypeScript `interface` in Node.js and Wasm, and a Ruby
+module. At the C ABI it's a `void* ctx` plus a static vtable of function
+pointers with a trailing `free(ctx)`; the producer may call the methods any
+number of times from any thread and calls `free` exactly once when it drops
+its last reference. There is no unregister call to forget.
+
+Methods are synchronous, never `throws` or `async`, and return nothing, a
+scalar, `bool`, or a C-style enum; parameters may be anything except another
+callback interface or an iterator, and an object parameter hands the consumer
+a reference it adopts. If the consumer's implementation raises, the wrapper
+reports it through the method's `out_err` slot with `FOREIGN_ERROR_CODE`
+(`-4`); the producer aborts the call it was making (in Rust, the call
+unwinds) and the original caller sees that code and message instead of a
+crash. Producers should therefore not hold a `Mutex` guard across a callback
+call. Richer return types and async callback methods are on the
+[roadmap](roadmap.md). The `events` and `kvstore` [samples](samples.md) show
+both patterns.
+
+## 13. Which executor runs my async functions?
+
+Whichever you install. An `async` export lowers to a launcher that returns
+immediately and a completion callback that fires exactly once, from a
+producer thread. Something has to drive the future in between, and the
+`weaveffi-abi` runtime has a pluggable `Spawner` hook for that. The default
+spawner needs no runtime: it detaches a thread per future and blocks on it,
+which is fine for CPU-bound work and for futures woken from other threads.
+
+A producer whose futures need a reactor (Tokio's I/O or timers, for example)
+calls `weaveffi::set_spawner` once at startup:
+
+```rust
+let handle = tokio::runtime::Handle::current();
+weaveffi::set_spawner(move |fut| {
+    handle.spawn(fut);
+})
+.expect("spawner installed once");
+```
+
+The first call wins; a second returns `SpawnerAlreadySet`. Every future handed
+to a spawner is already wrapped so a panic inside it is caught and reported
+through the completion callback as `PANIC_ERROR_CODE`, so a spawner never
+sees an unwinding future. On `wasm32`, which has no threads, the default
+spawner drives the future inline before the launcher returns. Consumers don't
+see any of this: they get `async/await`, `Promise`, `suspend`, `Task<T>`, or
+`Future<T>` as usual. See the [Async Functions guide](guides/async.md).

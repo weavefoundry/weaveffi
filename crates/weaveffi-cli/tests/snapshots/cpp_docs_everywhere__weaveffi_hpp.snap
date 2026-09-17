@@ -15,11 +15,9 @@ source: crates/weaveffi-cli/tests/snapshots.rs
 #include <memory>
 #include <stdexcept>
 #include <exception>
-#include <cstring>
 #include <utility>
+#include <cstring>
 #include <future>
-#include <functional>
-#include <mutex>
 
 #ifndef WEAVEFFI_API
 #  if defined(_WIN32) || defined(__CYGWIN__)
@@ -53,15 +51,16 @@ extern "C" {
    producer exports weaveffi_abi_version() so a consumer can refuse to load
    a library built for a different revision instead of misreading its
    error struct or value buffers. */
-#define WEAVEFFI_ABI_VERSION 1u
+#define WEAVEFFI_ABI_VERSION 2u
 WEAVEFFI_API uint32_t weaveffi_abi_version(void);
-
-typedef uint64_t weaveffi_handle_t;
 
 /* Error slot written by every fallible call. `payload_ptr`/`payload_len`
    hold the matched error code's fields serialized in the WeaveFFI value
    buffer format (null when the code declares no fields); both the message
-   and the payload are released by weaveffi_error_clear. */
+   and the payload are released by weaveffi_error_clear. Positive codes are
+   the module's declared error codes; negative codes are runtime traps:
+   -1 generic, -2 producer panic, -3 marshalling failure, -4 a callback
+   interface implementation raised. */
 typedef struct weaveffi_error {
     int32_t code;
     const char* message;
@@ -69,6 +68,10 @@ typedef struct weaveffi_error {
     size_t payload_len;
 } weaveffi_error;
 
+/* Fill `err` with `code` and a producer-owned copy of `message`. Callback
+   interface trampolines call this to report a failure in the consumer's
+   implementation (code -4) without allocating with a foreign allocator. */
+WEAVEFFI_API void weaveffi_error_set(weaveffi_error* err, int32_t code, const char* message);
 WEAVEFFI_API void weaveffi_error_clear(weaveffi_error* err);
 
 /* Async completion callbacks receive a heap-boxed error the consumer
@@ -112,8 +115,19 @@ typedef enum {
     weaveffi_docs_DocsErrors_invalid_status = 2
 } weaveffi_docs_DocsErrors;
 typedef struct weaveffi_docs_Notebook weaveffi_docs_Notebook;
-/** Fires after a document has been persisted successfully */
-typedef void (*weaveffi_docs_OnSaved_fn)(int64_t doc_id, int32_t revision, void* context);
+/**
+ * Consumer-implemented observer of document-saved notifications.
+ *
+ * Implementations must be safe to call from any thread.
+ *
+ *
+ * Consumer-implemented callback interface. The consumer passes a context pointer plus a pointer to a static instance of this vtable; the producer may call any entry from any thread until it calls `free(ctx)` exactly once.
+ */
+typedef struct weaveffi_docs_SavedListener_vtable {
+    /** Fires after a document has been persisted successfully */
+    void (*on_saved)(void* ctx, int64_t doc_id, int32_t revision, weaveffi_error* out_err);
+    void (*free)(void* ctx);
+} weaveffi_docs_SavedListener_vtable;
 typedef void (*weaveffi_docs_publish_async_callback)(void* context, weaveffi_error* err, bool result);
 
 /**
@@ -131,12 +145,11 @@ WEAVEFFI_API int32_t weaveffi_docs_Notebook_insert(const weaveffi_docs_Notebook*
 WEAVEFFI_API const uint8_t* weaveffi_docs_Notebook_find(const weaveffi_docs_Notebook* self, int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** The number of documents currently held */
 WEAVEFFI_API int32_t weaveffi_docs_Notebook_size(const weaveffi_docs_Notebook* self, weaveffi_error* out_err);
+/** Returns a new strong reference to the same object (the pointer value is unchanged). Null is a no-op returning null. */
+WEAVEFFI_API weaveffi_docs_Notebook* weaveffi_docs_Notebook_clone(const weaveffi_docs_Notebook* self);
+/** Releases one strong reference; the object is dropped when the last reference is released. Null is a no-op. */
 WEAVEFFI_API void weaveffi_docs_Notebook_destroy(weaveffi_docs_Notebook* self);
 
-/** Subscribe to document-saved notifications */
-WEAVEFFI_API uint64_t weaveffi_docs_register_saved_listener(weaveffi_docs_OnSaved_fn callback, void* context);
-/** Subscribe to document-saved notifications */
-WEAVEFFI_API void weaveffi_docs_unregister_saved_listener(uint64_t id);
 /**
  * Create a brand new document.
  *
@@ -148,12 +161,21 @@ WEAVEFFI_API const uint8_t* weaveffi_docs_create_document(const char* title, con
 WEAVEFFI_API const uint8_t* weaveffi_docs_get_document(int64_t id, size_t* out_len, weaveffi_error* out_err);
 /** Publish a document in the background */
 WEAVEFFI_API void weaveffi_docs_publish_async_async(int64_t id, weaveffi_docs_publish_async_callback callback, void* context);
+/** Register a listener for saved notifications */
+WEAVEFFI_API void weaveffi_docs_watch(void* listener_ctx, const weaveffi_docs_SavedListener_vtable* listener_vtable, weaveffi_error* out_err);
 
 } // extern "C"
 
 namespace weaveffi {
 
-/** Base exception for every error reported through the C ABI. */
+/**
+ * Base exception for every error reported through the C ABI.
+ *
+ * Positive codes are the module's declared error codes (see the typed
+ * domain exceptions); negative codes are runtime traps: -1 a generic
+ * producer error, -2 a producer panic, -3 a marshalling failure, -4 a
+ * callback-interface implementation that threw.
+ */
 class WeaveFFIError : public std::runtime_error {
     int32_t code_;
 
@@ -161,6 +183,17 @@ public:
     WeaveFFIError(int32_t code, const std::string& msg) : std::runtime_error(msg), code_(code) {}
     int32_t code() const { return code_; }
 };
+
+/**
+ * Throws WeaveFFIError when the loaded producer library was built for a
+ * different WeaveFFI ABI revision than this header. Call once at startup.
+ */
+inline void check_abi_version() {
+    uint32_t actual = weaveffi_abi_version();
+    if (actual != WEAVEFFI_ABI_VERSION) {
+        throw WeaveFFIError(-1, "WeaveFFI ABI revision mismatch: header " + std::to_string(WEAVEFFI_ABI_VERSION) + ", library " + std::to_string(actual));
+    }
+}
 
 namespace detail {
 
@@ -246,7 +279,8 @@ public:
  * Decodes values from the WeaveFFI value-buffer wire format. A malformed
  * buffer is a producer/consumer contract violation (both sides are generated
  * from one IDL), so every decode failure throws the generic WeaveFFIError,
- * the same channel as a producer panic.
+ * the same channel as a producer panic. Object tokens adopted before a
+ * failure live in RAII wrappers that release them on unwind.
  */
 class BufferReader {
     const uint8_t* data_;
@@ -368,6 +402,75 @@ enum class Status : int32_t {
     Archived = 2
 };
 
+struct Document;
+class Notebook;
+class SavedListener;
+
+/**
+ * An ordered collection of documents.
+ *
+ * Notebooks own their documents and release them when destroyed.
+ */
+class Notebook {
+    weaveffi_docs_Notebook* handle_;
+
+public:
+    /** Adopts one strong reference to a producer object. */
+    explicit Notebook(weaveffi_docs_Notebook* h) : handle_(h) {}
+
+    /** Releases this wrapper's reference; the object is dropped with its last one. */
+    ~Notebook() {
+        if (handle_) weaveffi_docs_Notebook_destroy(handle_);
+    }
+
+    /** Copies share the object: the copy takes a new strong reference. */
+    Notebook(const Notebook& other) : handle_(weaveffi_docs_Notebook_clone(other.handle_)) {}
+
+    Notebook& operator=(const Notebook& other) {
+        if (this != &other) {
+            weaveffi_docs_Notebook* h = weaveffi_docs_Notebook_clone(other.handle_);
+            if (handle_) weaveffi_docs_Notebook_destroy(handle_);
+            handle_ = h;
+        }
+        return *this;
+    }
+
+    Notebook(Notebook&& other) noexcept : handle_(other.handle_) {
+        other.handle_ = nullptr;
+    }
+
+    Notebook& operator=(Notebook&& other) noexcept {
+        if (this != &other) {
+            if (handle_) weaveffi_docs_Notebook_destroy(handle_);
+            handle_ = other.handle_;
+            other.handle_ = nullptr;
+        }
+        return *this;
+    }
+
+    /** The wrapped pointer, borrowed: this wrapper keeps its reference. */
+    const weaveffi_docs_Notebook* handle() const { return handle_; }
+
+    /** A new strong reference the caller owns (for example to write into a value buffer). */
+    weaveffi_docs_Notebook* clone_handle() const { return weaveffi_docs_Notebook_clone(handle_); }
+
+    /** Create an empty notebook */
+    Notebook();
+
+    /** Add a document, returning its position in the notebook */
+    int32_t insert(const Document& document) const;
+
+    /** Look up a document by identifier, failing when none matches */
+    Document find(int64_t id) const;
+
+    /** The number of documents currently held */
+    int32_t size() const;
+
+    /** The largest number of documents one notebook will hold */
+    static int32_t max_documents();
+
+};
+
 /**
  * Represents a single document tracked by the system.
  *
@@ -399,19 +502,19 @@ inline void write_Document(BufferWriter& w, const Document& v) {
 
 /** Decodes a `Document` from the WeaveFFI value-buffer format. */
 inline Document read_Document(BufferReader& r) {
-    Document out{};
-    out.id = r.read_i64();
-    out.title = r.read_string();
-    out.status = static_cast<Status>(r.read_i32());
+    int64_t f_id = r.read_i64();
+    std::string f_title = r.read_string();
+    Status f_status = static_cast<Status>(r.read_i32());
+    std::vector<std::string> f_tags{};
     {
-        size_t v_tags_n = r.read_len();
-        out.tags.reserve(v_tags_n);
-        for (size_t v_tags_i = 0; v_tags_i < v_tags_n; ++v_tags_i) {
-            std::string v_tags_item = r.read_string();
-            out.tags.push_back(std::move(v_tags_item));
+        size_t f_tags_n = r.read_len();
+        f_tags.reserve(f_tags_n);
+        for (size_t f_tags_i = 0; f_tags_i < f_tags_n; ++f_tags_i) {
+            std::string f_tags_item = r.read_string();
+            f_tags.push_back(std::move(f_tags_item));
         }
     }
-    return out;
+    return Document{std::move(f_id), std::move(f_title), std::move(f_status), std::move(f_tags)};
 }
 
 } // namespace detail
@@ -439,6 +542,8 @@ namespace detail {
 /** Map a `docs` error code and payload to its typed exception (WeaveFFIError for runtime codes, DocsErrorsError for unknown codes). */
 inline std::exception_ptr make_docs_error(int32_t code, const std::string& msg, const uint8_t* payload_ptr, size_t payload_len) {
     if (code < 0) return std::make_exception_ptr(WeaveFFIError(code, msg));
+    (void)payload_ptr;
+    (void)payload_len;
     switch (code) {
     case 1: return std::make_exception_ptr(NotFoundError(msg));
     case 2: return std::make_exception_ptr(InvalidStatusError(msg));
@@ -457,125 +562,98 @@ inline void check_docs(weaveffi_error& err) {
 
 } // namespace detail
 
+/**
+ * Consumer-implemented observer of document-saved notifications.
+ *
+ * Implementations must be safe to call from any thread.
+ *
+ *
+ * Implement this interface and pass a `std::shared_ptr<SavedListener>` to any function that accepts one. The producer may call the methods from any thread until it releases its last reference to the implementation. An exception thrown by a method is reported to the producer as a foreign error (code -4) and aborts the call that triggered it.
+ */
+class SavedListener {
+public:
+    virtual ~SavedListener() = default;
+
+    /** Fires after a document has been persisted successfully */
+    virtual void on_saved(int64_t doc_id, int32_t revision) = 0;
+};
+
 namespace detail {
 
-inline std::mutex& wv_listener_mutex() {
-    static std::mutex m;
-    return m;
-}
+/** Vtable trampolines adapting a `SavedListener` implementation to `weaveffi_docs_SavedListener_vtable`. */
+struct SavedListener_trampolines {
+    static void on_saved(void* ctx, int64_t doc_id, int32_t revision, weaveffi_error* out_err) {
+        try {
+            SavedListener& impl = **static_cast<std::shared_ptr<SavedListener>*>(ctx);
+            impl.on_saved(doc_id, revision);
+            return;
+        } catch (const std::exception& e) {
+            weaveffi_error_set(out_err, -4, e.what());
+        } catch (...) {
+            weaveffi_error_set(out_err, -4, "SavedListener::on_saved threw a non-standard exception");
+        }
+    }
 
-inline std::unordered_map<uint64_t, std::shared_ptr<void>>& wv_listener_registry() {
-    static std::unordered_map<uint64_t, std::shared_ptr<void>> registry;
-    return registry;
+    /** Releases the implementation box once the producer drops its last reference. */
+    static void free_ctx(void* ctx) {
+        delete static_cast<std::shared_ptr<SavedListener>*>(ctx);
+    }
+};
+
+/** The process-wide vtable every `SavedListener` implementation is passed with. */
+inline const weaveffi_docs_SavedListener_vtable& SavedListener_vtable() {
+    static const weaveffi_docs_SavedListener_vtable vtable = {
+        &SavedListener_trampolines::on_saved,
+        &SavedListener_trampolines::free_ctx,
+    };
+    return vtable;
 }
 
 } // namespace detail
 
-/**
- * An ordered collection of documents.
- *
- * Notebooks own their documents and release them when destroyed.
- */
-class Notebook {
-    void* handle_;
+inline Notebook::Notebook() : handle_(nullptr) {
+    weaveffi_error err{};
+    auto result = weaveffi_docs_Notebook_new(&err);
+    detail::check(err);
+    handle_ = result;
+}
 
-public:
-    explicit Notebook(void* h) : handle_(h) {}
+inline int32_t Notebook::insert(const Document& document) const {
+    detail::BufferWriter document_buf;
+    detail::write_Document(document_buf, document);
+    weaveffi_error err{};
+    auto result = weaveffi_docs_Notebook_insert(handle_, document_buf.data(), document_buf.size(), &err);
+    detail::check(err);
+    return result;
+}
 
-    ~Notebook() {
-        if (handle_) weaveffi_docs_Notebook_destroy(static_cast<weaveffi_docs_Notebook*>(handle_));
-    }
+inline Document Notebook::find(int64_t id) const {
+    size_t out_len = 0;
+    weaveffi_error err{};
+    auto result = weaveffi_docs_Notebook_find(handle_, id, &out_len, &err);
+    detail::check_docs(err);
+    detail::BufferGuard result_guard{result, out_len};
+    detail::BufferReader result_r(result, out_len);
+    Document ret = detail::read_Document(result_r);
+    result_r.expect_end();
+    return ret;
+}
 
-    Notebook(const Notebook&) = delete;
-    Notebook& operator=(const Notebook&) = delete;
+inline int32_t Notebook::size() const {
+    weaveffi_error err{};
+    auto result = weaveffi_docs_Notebook_size(handle_, &err);
+    detail::check(err);
+    return result;
+}
 
-    Notebook(Notebook&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
-    }
-
-    Notebook& operator=(Notebook&& other) noexcept {
-        if (this != &other) {
-            if (handle_) weaveffi_docs_Notebook_destroy(static_cast<weaveffi_docs_Notebook*>(handle_));
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
-    }
-
-    void* handle() const { return handle_; }
-
-    /** Create an empty notebook */
-    Notebook() : handle_(nullptr) {
-        weaveffi_error err{};
-        auto result = weaveffi_docs_Notebook_new(&err);
-        detail::check(err);
-        handle_ = result;
-    }
-
-    /** Add a document, returning its position in the notebook */
-    int32_t insert(const Document& document) const {
-        detail::BufferWriter document_buf;
-        detail::write_Document(document_buf, document);
-        weaveffi_error err{};
-        auto result = weaveffi_docs_Notebook_insert(static_cast<const weaveffi_docs_Notebook*>(handle_), document_buf.data(), document_buf.size(), &err);
-        detail::check(err);
-        return result;
-    }
-
-    /** Look up a document by identifier, failing when none matches */
-    Document find(int64_t id) const {
-        size_t out_len = 0;
-        weaveffi_error err{};
-        auto result = weaveffi_docs_Notebook_find(static_cast<const weaveffi_docs_Notebook*>(handle_), id, &out_len, &err);
-        detail::check_docs(err);
-        detail::BufferGuard result_guard{result, out_len};
-        detail::BufferReader result_r(result, out_len);
-        Document ret = detail::read_Document(result_r);
-        result_r.expect_end();
-        return ret;
-    }
-
-    /** The number of documents currently held */
-    int32_t size() const {
-        weaveffi_error err{};
-        auto result = weaveffi_docs_Notebook_size(static_cast<const weaveffi_docs_Notebook*>(handle_), &err);
-        detail::check(err);
-        return result;
-    }
-
-    /** The largest number of documents one notebook will hold */
-    static int32_t max_documents() {
-        weaveffi_error err{};
-        auto result = weaveffi_docs_Notebook_max_documents(&err);
-        detail::check(err);
-        return result;
-    }
-
-};
+inline int32_t Notebook::max_documents() {
+    weaveffi_error err{};
+    auto result = weaveffi_docs_Notebook_max_documents(&err);
+    detail::check(err);
+    return result;
+}
 
 namespace docs {
-
-/** Subscribe to document-saved notifications */
-/** @return A subscription id for unregister_saved_listener(). */
-inline uint64_t register_saved_listener(std::function<void(int64_t, int32_t)> callback) {
-    auto fn = std::make_shared<std::function<void(int64_t, int32_t)>>(std::move(callback));
-    uint64_t id = weaveffi_docs_register_saved_listener(
-        [](int64_t doc_id, int32_t revision, void* context) {
-            auto& cb = *static_cast<std::function<void(int64_t, int32_t)>*>(context);
-            cb(doc_id, revision);
-        },
-        fn.get());
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry()[id] = fn;
-    return id;
-}
-
-/** Unregisters a listener previously registered with register_saved_listener(). */
-inline void unregister_saved_listener(uint64_t id) {
-    weaveffi_docs_unregister_saved_listener(id);
-    std::lock_guard<std::mutex> lock(detail::wv_listener_mutex());
-    detail::wv_listener_registry().erase(id);
-}
 
 /**
  * Create a brand new document.
@@ -623,16 +701,29 @@ inline std::future<bool> publish_async(int64_t id) {
     auto future = promise_ptr->get_future();
     weaveffi_docs_publish_async_async(id, [](void* context, weaveffi_error* err, bool result) {
         auto* p = static_cast<std::promise<bool>*>(context);
-        if (err && err->code != 0) {
-            std::string msg(err->message ? err->message : "unknown error");
-            p->set_exception(detail::make_error(err->code, msg));
-            weaveffi_error_free(err);
-        } else {
-            p->set_value(result);
+        try {
+            if (err && err->code != 0) {
+                std::string msg(err->message ? err->message : "unknown error");
+                p->set_exception(detail::make_error(err->code, msg));
+            } else {
+                p->set_value(result);
+            }
+        } catch (...) {
+            p->set_exception(std::current_exception());
         }
+        weaveffi_error_free(err);
         delete p;
     }, static_cast<void*>(promise_ptr));
     return future;
+}
+
+/** Register a listener for saved notifications */
+inline void watch(std::shared_ptr<SavedListener> listener) {
+    if (!listener) throw std::invalid_argument("listener: null callback interface");
+    auto* listener_ctx = new std::shared_ptr<SavedListener>(std::move(listener));
+    weaveffi_error err{};
+    weaveffi_docs_watch(static_cast<void*>(listener_ctx), &detail::SavedListener_vtable(), &err);
+    detail::check(err);
 }
 
 } // namespace docs

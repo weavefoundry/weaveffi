@@ -1,5 +1,5 @@
 const GENERATOR_DOCS_YAML: &str = r#"
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: contacts
     enums:
@@ -205,10 +205,10 @@ fn doc_node_dts_optional_and_list_return() {
 }
 
 #[test]
-fn doc_android_kotlin_wrapper() {
+fn doc_kotlin_wrapper() {
     let (_dir, out) = generate_all_for_docs();
     let kt = std::fs::read_to_string(
-        out.join("generated/android/src/main/kotlin/com/weaveffi/WeaveFFI.kt"),
+        out.join("generated/kotlin/src/main/kotlin/com/weaveffi/WeaveFFI.kt"),
     )
     .unwrap();
 
@@ -231,10 +231,10 @@ fn doc_android_kotlin_wrapper() {
 }
 
 #[test]
-fn doc_android_jni_shim() {
+fn doc_kotlin_jni_shim() {
     let (_dir, out) = generate_all_for_docs();
     let jni =
-        std::fs::read_to_string(out.join("generated/android/src/main/cpp/weaveffi_jni.c")).unwrap();
+        std::fs::read_to_string(out.join("generated/kotlin/src/main/cpp/weaveffi_jni.c")).unwrap();
 
     assert!(
         jni.contains("#include \"weaveffi.h\""),
@@ -251,10 +251,10 @@ fn doc_android_jni_shim() {
 }
 
 #[test]
-fn doc_android_cmake_exists() {
+fn doc_kotlin_cmake_exists() {
     let (_dir, out) = generate_all_for_docs();
     let cmake =
-        std::fs::read_to_string(out.join("generated/android/src/main/cpp/CMakeLists.txt")).unwrap();
+        std::fs::read_to_string(out.join("generated/kotlin/src/main/cpp/CMakeLists.txt")).unwrap();
 
     assert!(cmake.contains("add_library(weaveffi SHARED weaveffi_jni.c)"));
     assert!(cmake.contains("target_include_directories(weaveffi PRIVATE ../../../../c)"));
@@ -266,7 +266,7 @@ fn doc_wasm_loader_generated() {
     let js = std::fs::read_to_string(out.join("generated/wasm/weaveffi_wasm.js")).unwrap();
 
     assert!(
-        js.contains("export async function loadWeaveffiWasm(url)"),
+        js.contains("export async function loadWeaveffiWasm(source)"),
         "loader function missing: {js}"
     );
     assert!(
@@ -327,7 +327,7 @@ fn summary_md_all_links_resolve() {
 /// The README quickstart IDL, kept in sync with the `kvstore.yml` snippet in
 /// `README.md` step 2 (trimmed `Store` interface plus `KvError` domain).
 const README_QUICKSTART_YAML: &str = r#"
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: kv
     errors:
@@ -436,7 +436,7 @@ fn readme_quickstart_generates_c_header() {
 }
 
 const GETTING_STARTED_YAML: &str = r#"
-version: "0.8.0"
+version: "0.9.0"
 modules:
   - name: math
     structs:
@@ -573,8 +573,8 @@ fn readme_uses_only_current_schema_version() {
     // Only the IDL `version:` key is a schema version; the `weaveffi.toml`
     // example's `version = "0.1.0"` is the package version and is fine.
     assert!(
-        readme.contains("version: \"0.8.0\""),
-        "README should reference schema version 0.8.0"
+        readme.contains("version: \"0.9.0\""),
+        "README should reference schema version 0.9.0"
     );
     for old in [
         "0.1.0", "0.2.0", "0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.7.0",
@@ -593,7 +593,7 @@ fn readme_lists_all_eleven_targets_in_table() {
         "**C**",
         "**C++**",
         "**Swift**",
-        "**Android**",
+        "**Kotlin**",
         "**Node.js**",
         "**Wasm**",
         "**Python**",

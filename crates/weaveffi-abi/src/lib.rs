@@ -1,4 +1,8 @@
-//! C ABI runtime: error struct, memory helpers, and utility functions.
+//! C ABI runtime: error struct, memory helpers, reference-counted objects,
+//! callback-interface vtables, the value-buffer codec, and the async spawner.
+//!
+//! The normative description of the contract this crate implements is
+//! `docs/src/reference/abi.md` in the WeaveFFI repository.
 #![deny(missing_docs)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
@@ -7,15 +11,26 @@
 #![allow(unsafe_code)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-pub mod arena;
 pub mod buffer;
+pub mod callback;
 pub mod convert;
 mod macros;
+pub mod object;
+pub mod spawn;
 
 pub use buffer::{
     decode_value, encode_value, BufferDecodeError, BufferReader, BufferValue, BufferWriter,
 };
+pub use callback::{
+    check_foreign_error, defer_foreign_error, lift_callback, raise_foreign_error,
+    take_foreign_error, CallbackInterface, ForeignCallback, ForeignError, Vtable,
+};
 pub use convert::{lift_byte_slice, lift_bytes, lower_bytes};
+pub use object::{
+    lower_object, lower_object_opt, object_arc, object_clone, object_destroy, object_from_token,
+    object_ref, object_to_token,
+};
+pub use spawn::{set_spawner, spawn, BoxFuture, CatchUnwind, Spawner, SpawnerAlreadySet};
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -31,10 +46,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// revision, turning a silent memory-layout mismatch into a clear error.
 ///
 /// The number only changes when the runtime surface (the `weaveffi_error`
-/// layout, the value-buffer encoding, or the set and signatures of the
-/// `weaveffi_*` runtime symbols) changes incompatibly. It is independent of
-/// the crate version and of the IDL schema version.
-pub const ABI_VERSION: u32 = 1;
+/// layout, the value-buffer encoding, the object or callback-interface
+/// conventions, or the set and signatures of the `weaveffi_*` runtime
+/// symbols) changes incompatibly. It is independent of the crate version and
+/// of the IDL schema version.
+///
+/// Revision 2 introduced reference-counted objects (`_clone`), object tokens
+/// inside value buffers, callback-interface vtables, `weaveffi_error_set`,
+/// and the foreign error code, and removed handles and the arena.
+pub const ABI_VERSION: u32 = 2;
 
 /// Return [`ABI_VERSION`]; the body behind the exported
 /// `weaveffi_abi_version` thunk.
@@ -42,16 +62,6 @@ pub const ABI_VERSION: u32 = 1;
 pub const fn abi_version() -> u32 {
     ABI_VERSION
 }
-
-/// Public opaque handle type exposed to foreign callers.
-pub type weaveffi_handle_t = u64;
-
-/// The producer-side spelling of the IDL's opaque `handle` type.
-///
-/// An alias of `u64`; the token's value is opaque to consumers and round-trips
-/// unchanged. Spell a parameter or return as `weaveffi::Handle` to extract it
-/// as `handle`; a bare `u64` extracts as the `u64` scalar instead.
-pub type Handle = u64;
 
 /// Error struct passed across the C ABI boundary.
 ///
@@ -135,6 +145,18 @@ pub fn error_set(out_err: *mut weaveffi_error, code: i32, message: &str) {
     err.message = cstr.into_raw();
 }
 
+/// The body of the exported `weaveffi_error_set` thunk: fill `out_err` from a
+/// borrowed C string the consumer owns.
+///
+/// Callback-interface implementations call this to report a failure without
+/// allocating the message with a foreign allocator (the producer frees
+/// `message` with its own). A null or non-UTF-8 `message` yields an empty
+/// message; the code is always recorded.
+pub fn error_set_c(out_err: *mut weaveffi_error, code: i32, message: *const c_char) {
+    let message = c_ptr_to_string(message).unwrap_or_default();
+    error_set(out_err, code, &message);
+}
+
 /// Populate an error with a code, message, and an owned payload buffer (the
 /// matched error code's fields serialized in the [`buffer`] format).
 ///
@@ -198,9 +220,9 @@ pub fn error_set_with_payload(
 /// ```
 pub trait ErrorReport {
     /// The non-zero status code written to [`weaveffi_error::code`]. Defaults to
-    /// the generic error code `-1`.
+    /// [`GENERIC_ERROR_CODE`].
     fn code(&self) -> i32 {
-        -1
+        GENERIC_ERROR_CODE
     }
 
     /// The human-readable message written to [`weaveffi_error::message`].
@@ -260,6 +282,11 @@ pub fn result_to_out_err<T, E: ErrorReport>(
     }
 }
 
+/// The reserved error code for an **untyped producer error**: the default
+/// [`ErrorReport::code`], used by `Result<T, String>` and other error types
+/// that don't map onto a declared domain code.
+pub const GENERIC_ERROR_CODE: i32 = -1;
+
 /// The reserved error code reporting a producer **panic**.
 ///
 /// Generated thunks wrap the producer call in `catch_unwind`; a panic is
@@ -276,27 +303,43 @@ pub const PANIC_ERROR_CODE: i32 = -2;
 ///
 /// Both sides are generated from the same IDL, so a marshalling failure is a
 /// producer/consumer contract violation, not a domain error; wrappers surface
-/// it through the same trap channel as [`PANIC_ERROR_CODE`]. Before this code
-/// existed, generated thunks reported lift failures with code `1`, which any
-/// error domain could legally claim as a typed code.
+/// it through the same trap channel as [`PANIC_ERROR_CODE`].
 pub const MARSHAL_ERROR_CODE: i32 = -3;
 
-/// Best-effort extraction of a panic payload's message (`&str` and `String`
-/// payloads; anything else yields a fixed placeholder).
+/// The reserved error code reporting that a **consumer callback-interface
+/// implementation failed**.
+///
+/// A consumer's method implementation that raises reports it through the
+/// vtable entry's `out_err` slot with this code (via `weaveffi_error_set`);
+/// the producer aborts the call it was making and the original caller
+/// observes this code with the consumer's message. See [`callback`].
+pub const FOREIGN_ERROR_CODE: i32 = -4;
+
+/// Best-effort extraction of a panic payload's message (`&str`, `String`,
+/// and [`ForeignError`] payloads; anything else yields a fixed placeholder).
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
+    } else if let Some(f) = payload.downcast_ref::<ForeignError>() {
+        f.message.clone()
     } else {
         "producer panicked".to_string()
     }
 }
 
-/// Report a caught panic through `out_err` with [`PANIC_ERROR_CODE`] and the
-/// payload's message. Generated thunks call this from their `catch_unwind`
-/// error arm.
+/// Report a caught unwind through `out_err`. A [`ForeignError`] payload (a
+/// consumer callback-interface implementation raised, or returned a value
+/// the producer could not lift) is reported with the payload's own code
+/// (normally [`FOREIGN_ERROR_CODE`]) and message; any other payload is a
+/// producer panic and is reported as [`PANIC_ERROR_CODE`]. Generated thunks
+/// call this from their `catch_unwind` error arm.
 pub fn error_set_panic(out_err: *mut weaveffi_error, payload: &(dyn std::any::Any + Send)) {
+    if let Some(f) = payload.downcast_ref::<ForeignError>() {
+        error_set(out_err, f.code, &f.message);
+        return;
+    }
     error_set(
         out_err,
         PANIC_ERROR_CODE,
@@ -530,14 +573,14 @@ impl<T> Iterator for Iter<T> {
 /// Drive a future to completion on the current thread, blocking until it
 /// resolves.
 ///
-/// This is the minimal, dependency-free executor the `#[weaveffi::module]`
-/// expansion uses to run an exported `async fn` on the worker thread it spawns
-/// for each async launch, then invoke the completion callback with the result.
-/// It parks the thread between polls and wakes on `Waker::wake`, so a future
+/// This is the minimal, dependency-free executor behind the default
+/// [`Spawner`]: each async launch runs its future on a fresh thread through
+/// this function, then invokes the completion callback with the result. It
+/// parks the thread between polls and wakes on `Waker::wake`, so a future
 /// that yields (for example, one awaiting a channel woken from another thread)
 /// makes progress without busy-spinning. There is no reactor, so a future that
-/// depends on an external runtime's I/O driver (such as Tokio's) will not be
-/// driven by this helper.
+/// depends on an external runtime's I/O driver (such as Tokio's) needs that
+/// runtime installed with [`set_spawner`] instead.
 ///
 /// # Examples
 ///
@@ -585,9 +628,9 @@ pub fn c_ptr_to_string(ptr: *const c_char) -> Option<String> {
 /// Borrow a NUL-terminated C string as a `&str` without copying.
 /// Returns `None` if `ptr` is null or the bytes aren't valid UTF-8.
 ///
-/// This is the zero-copy lift for a `&str` parameter: the generated thunk
-/// borrows the caller's buffer for the duration of the call instead of
-/// allocating an owned `String`.
+/// This is the zero-copy lift for a producer parameter spelled `&str`: the
+/// generated thunk borrows the caller's buffer for the duration of the call
+/// instead of allocating an owned `String`.
 ///
 /// # Safety
 ///
@@ -727,9 +770,46 @@ mod tests {
     }
 
     #[test]
+    fn error_set_c_copies_a_borrowed_message() {
+        let mut err = weaveffi_error::default();
+        let msg = CString::new("from the consumer").unwrap();
+        error_set_c(&mut err, FOREIGN_ERROR_CODE, msg.as_ptr());
+        drop(msg);
+        assert_eq!(err.code, FOREIGN_ERROR_CODE);
+        assert_eq!(c_ptr_to_string(err.message).unwrap(), "from the consumer");
+        error_clear(&mut err);
+        error_set_c(&mut err, 3, ptr::null());
+        assert_eq!(err.code, 3);
+        assert_eq!(c_ptr_to_string(err.message).unwrap(), "");
+        error_clear(&mut err);
+    }
+
+    #[test]
+    fn foreign_error_payload_is_reported_as_foreign_code() {
+        let mut err = weaveffi_error::default();
+        let payload: Box<dyn std::any::Any + Send> = Box::new(ForeignError {
+            code: FOREIGN_ERROR_CODE,
+            message: "listener threw".into(),
+        });
+        error_set_panic(&mut err, &*payload);
+        assert_eq!(err.code, FOREIGN_ERROR_CODE);
+        assert_eq!(c_ptr_to_string(err.message).unwrap(), "listener threw");
+        error_clear(&mut err);
+
+        let payload: Box<dyn std::any::Any + Send> = Box::new("bug");
+        error_set_panic(&mut err, &*payload);
+        assert_eq!(err.code, PANIC_ERROR_CODE);
+        assert_eq!(
+            c_ptr_to_string(err.message).unwrap(),
+            "producer panicked: bug"
+        );
+        error_clear(&mut err);
+    }
+
+    #[test]
     fn error_report_string_uses_generic_code() {
         let e = "boom".to_string();
-        assert_eq!(ErrorReport::code(&e), -1);
+        assert_eq!(ErrorReport::code(&e), GENERIC_ERROR_CODE);
         assert_eq!(ErrorReport::message(&e), "boom");
         assert_eq!(ErrorReport::code(&"boom"), -1);
         assert_eq!(ErrorReport::message(&"boom"), "boom");

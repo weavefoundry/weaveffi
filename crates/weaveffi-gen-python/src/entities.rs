@@ -371,14 +371,17 @@ fn render_dataclass_fields(w: &mut CodeWriter, fields: &[FieldBinding]) {
 
 // ── Interfaces ──
 
-/// Render one interface as an opaque-object wrapper class, following the
-/// struct wrapper's ownership pattern: the class owns the raw C pointer and
-/// releases it exactly once, calling the interface's destroy symbol from
-/// `__del__`. A constructor named `new` becomes `__init__`; every other
-/// constructor becomes a `@classmethod` factory; methods pass `self._ptr` as
-/// the leading C argument; statics are `@staticmethod`s. `_from_ptr` wraps a
-/// pointer the producer already handed over (a C return value) without
-/// re-running the FFI constructor.
+/// Render one interface as a reference-counted object wrapper class. The
+/// class holds one strong reference (the raw C pointer) and releases it
+/// exactly once through the interface's destroy symbol, from `close()`, the
+/// context-manager exit, or the `__del__` backstop. `_from_ptr` adopts a
+/// pointer the producer handed over (a return, an async result, an iterator
+/// element, or a buffer token); `_clone_ptr` produces a second strong
+/// reference through the clone symbol, which the buffer codec uses when it
+/// writes the object into a value buffer. A constructor named `new` becomes
+/// `__init__`; every other constructor becomes a `@classmethod` factory;
+/// methods lend `self` as the leading borrowed C argument; statics are
+/// `@staticmethod`s.
 pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &InterfaceBinding) {
     let error = module.error.as_ref();
 
@@ -398,13 +401,26 @@ pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &Int
         }
     }
 
-    out.push_str(&format!("\n\nclass {}:\n", i.name));
+    let name = &i.name;
+    let clone = &i.clone_symbol;
+    let destroy = &i.destroy_symbol;
+
+    // The reference-count pair is bound once, at module scope, so the
+    // wrapper's disposal path never touches the binding tables.
+    out.push_str(&format!(
+        "\n\n_lib.{clone}.argtypes = [ctypes.c_void_p]\n\
+         _lib.{clone}.restype = ctypes.c_void_p\n\
+         _lib.{destroy}.argtypes = [ctypes.c_void_p]\n\
+         _lib.{destroy}.restype = None\n"
+    ));
+
+    out.push_str(&format!("\n\nclass {name}:\n"));
     emit_docstring(out, &i.doc, "    ");
 
     out.push_str(&format!(
-        "\n    @classmethod\n    def _from_ptr(cls, ptr) -> \"{}\":",
-        i.name
+        "\n    @classmethod\n    def _from_ptr(cls, ptr) -> \"{name}\":"
     ));
+    out.push_str("\n        \"\"\"Adopt one strong reference the producer handed over.\"\"\"");
     out.push_str("\n        _obj = cls.__new__(cls)");
     out.push_str("\n        _obj._ptr = ptr");
     out.push_str("\n        return _obj");
@@ -413,21 +429,38 @@ pub(crate) fn render_interface(out: &mut String, module: &ModuleBinding, i: &Int
     if let Some(c) = new_ctor {
         render_callable(out, c, error, &FnScope::Init);
     } else {
-        // No canonical constructor: expose the same raw-pointer `__init__`
-        // the struct wrappers use, so factories stay the only public path.
-        out.push_str("\n\n    def __init__(self, _ptr: int) -> None:");
-        out.push_str("\n        self._ptr = _ptr\n");
+        // No canonical constructor: instances only come from factories and
+        // producer returns, so `__init__` is not a public path.
+        out.push_str("\n\n    def __init__(self) -> None:");
+        out.push_str(&format!(
+            "\n        raise TypeError(\"{name} cannot be instantiated directly\")\n"
+        ));
     }
 
-    let destroy = &i.destroy_symbol;
+    out.push_str("\n\n    def _clone_ptr(self):");
+    out.push_str("\n        \"\"\"A new strong reference to the same object (a raw pointer the");
+    out.push_str("\n        receiver must eventually release), leaving this wrapper's own");
+    out.push_str("\n        reference untouched.\"\"\"");
+    out.push_str(&format!("\n        return _lib.{clone}(_borrow(self))"));
+
+    out.push_str("\n\n    def close(self) -> None:");
+    out.push_str("\n        \"\"\"Release this wrapper's reference. The object itself is dropped");
+    out.push_str("\n        when its last reference (here or in the producer) is released.");
+    out.push_str("\n        Idempotent; the wrapper is unusable afterwards.\"\"\"");
+    out.push_str("\n        _p = getattr(self, \"_ptr\", None)");
+    out.push_str("\n        self._ptr = None");
+    out.push_str("\n        if _p is not None:");
+    out.push_str(&format!("\n            _lib.{destroy}(_p)"));
+
+    out.push_str(&format!("\n\n    def __enter__(self) -> \"{name}\":"));
+    out.push_str("\n        return self");
+
+    out.push_str("\n\n    def __exit__(self, *exc) -> bool:");
+    out.push_str("\n        self.close()");
+    out.push_str("\n        return False");
+
     out.push_str("\n\n    def __del__(self) -> None:");
-    out.push_str("\n        if self._ptr is not None:");
-    out.push_str(&format!(
-        "\n            _lib.{destroy}.argtypes = [ctypes.c_void_p]"
-    ));
-    out.push_str(&format!("\n            _lib.{destroy}.restype = None"));
-    out.push_str(&format!("\n            _lib.{destroy}(self._ptr)"));
-    out.push_str("\n            self._ptr = None");
+    out.push_str("\n        self.close()");
 
     for c in &i.constructors {
         if c.name != "new" {

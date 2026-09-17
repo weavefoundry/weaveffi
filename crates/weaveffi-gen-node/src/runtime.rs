@@ -1,18 +1,19 @@
 //! The emitted JS runtime prelude: addon loading, the generic error brand
-//! and invoke helpers, the private value-buffer reader/writer, and the shared
-//! lazy iterator class.
+//! and invoke helpers, the object borrow helper, the private value-buffer
+//! reader/writer, and the shared lazy iterator class.
 //!
 //! Everything here is fixed text (or near-fixed text) embedded at the top of
 //! `index.js`; the per-entity wrappers in [`crate::entities`] call into it.
 
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
-use weaveffi_core::model::{BindingModel, CallShape};
 
 /// The private buffer writer/reader runtime embedded in `index.js` whenever
 /// the model uses value buffers. Little-endian, packed, no alignment; decode
 /// failures throw the generic error brand (a malformed buffer is a contract
-/// violation, not a typed domain error).
+/// violation, not a typed domain error). The 64-bit methods take and return
+/// `bigint`s (the writers also accept numbers and decimal strings, which is
+/// what map keys arrive as).
 pub(crate) const BUFFER_RUNTIME_JS: &str = r#"// --- Private value-buffer runtime (WeaveFFI wire format) --------------------
 // Little-endian, packed, no alignment. Decoders reject truncated buffers,
 // invalid bool/flag bytes, hostile length prefixes, and trailing bytes.
@@ -197,13 +198,25 @@ pub(crate) fn render_error_brand_js(out: &mut String) {
     ));
 }
 
-/// True when any callable in the model returns `iter<T>`, so the addon and
-/// loader must emit the shared lazy-iterator support.
-pub(crate) fn model_has_iterators(model: &BindingModel) -> bool {
-    model.modules.iter().any(|m| {
-        m.callables()
-            .any(|f| matches!(f.shape, CallShape::Iterator(_)))
-    })
+/// Emit the shared object helper every interface wrapper and every
+/// object-typed argument routes through. `__borrow` unwraps a live wrapper
+/// to the handle the callee borrows for the call (the wrapper keeps its own
+/// reference); a closed wrapper or a foreign value is a programming error
+/// reported through the generic brand with the marshalling code.
+pub(crate) fn render_object_helpers_js(out: &mut String) {
+    out.push_str(&format!(
+        "// Borrow a live object wrapper's native handle for one call. The wrapper\n\
+         // keeps its own reference; the producer clones if it retains the object.\n\
+         function __borrow(o, cls) {{\n  \
+           if (!(o instanceof cls)) {{\n    \
+             throw new {ERROR_BRAND}(-3, 'expected an instance of ' + cls.name);\n  \
+           }}\n  \
+           if (!o._handle) {{\n    \
+             throw new {ERROR_BRAND}(-3, cls.name + ' used after close()');\n  \
+           }}\n  \
+           return o._handle;\n\
+         }}\n\n"
+    ));
 }
 
 /// Emit the shared lazy iterator class the JS loader hands out for every

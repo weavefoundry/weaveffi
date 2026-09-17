@@ -39,10 +39,19 @@ pub(crate) fn emit_wrapper_doc(w: &mut CodeWriter, f: &FnBinding, err: ErrCtx) {
         w.line("/// The native iterator handle is destroyed exactly once: eagerly when");
         w.line("/// the iteration completes or fails, or by a GC finalizer if the");
         w.line("/// iteration is abandoned before it is exhausted.");
-        if matches!(ib.elem, Ty::Interface(_)) {
+        if ib.elem.interface_name().is_some() {
             w.line("///");
             w.line("/// Each yielded element is owned by the caller: call its `dispose()`");
             w.line("/// when you are done with it.");
+        }
+    } else if let Some(ret) = f.ret.as_ref().filter(|r| r.interface_name().is_some()) {
+        separator(w, &mut has_content);
+        if matches!(ret, Ty::Optional(_)) {
+            w.line("/// Returns `null` when the producer reports no object. A non-null result");
+            w.line("/// is owned by the caller: call its `dispose()` when you are done with it.");
+        } else {
+            w.line("/// The returned object is owned by the caller: call its `dispose()` when");
+            w.line("/// you are done with it.");
         }
     }
     if let Some(exc) = err.thrown_exception() {

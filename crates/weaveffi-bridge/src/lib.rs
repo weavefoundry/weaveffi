@@ -20,29 +20,33 @@
 //!   an asynchronous symbol; a `fn -> Result<T, E>` is fallible (`throws` in
 //!   the IDL; the return type is `T` and errors are reported through the ABI's
 //!   `out_err`).
-//! * `#[weaveffi::interface]` on a `struct` declares an interface (opaque
-//!   object type). Its `impl` block's `pub fn`s become the interface's
-//!   members: an associated function returning `Self` is a constructor, a
-//!   `&self` function is a method, and any other associated function is a
-//!   static.
+//! * `#[weaveffi::interface]` on a `struct` declares an interface (opaque,
+//!   reference-counted object type). Its `impl` block's `pub fn`s become the
+//!   interface's members: an associated function returning `Self` (or
+//!   `Arc<Self>`) is a constructor, a `&self` or `self: Arc<Self>` function is
+//!   a method, and any other associated function is a static.
 //! * `#[weaveffi::record]` on a `struct` declares a by-value record.
 //! * `#[weaveffi::enumeration]` on a `#[repr(i32)]` `enum` declares a C-style
-//!   enum.
-//! * `#[weaveffi::callback]` on a `fn` declares a callback signature, and
-//!   `#[weaveffi::listener(event = "Name")]` declares an event listener.
+//!   enum; an enum with data-carrying variants declares a rich enum.
+//! * `#[weaveffi::error]` on an enum declares the module's error domain.
+//! * `#[weaveffi::callback_interface]` on a `trait` declares a callback
+//!   interface: a method set the consumer implements. Producers accept one as
+//!   `Arc<dyn Trait>`.
 //!
-//! The type mapping mirrors the IDL: `String`/`&str` are strings, `Vec<u8>` and
-//! `&[u8]` are byte buffers, every integer primitive (including `u64`) is the
-//! matching scalar, `weaveffi::Handle` is an opaque `handle`, `*mut T`/`*const T`
-//! is a typed handle, and other named paths are records, enums, or interfaces
-//! resolved later.
+//! The type mapping mirrors the IDL: `String` (or `&str`) is a string, `Vec<u8>`
+//! (or `&[u8]`) is a byte buffer, every integer primitive (including `u64`) is
+//! the matching scalar, `Vec<T>`, `Option<T>`, and `HashMap`/`BTreeMap` are the
+//! list, optional, and map types, `weaveffi::Iter<T>` is an `iter<T>` return,
+//! `Arc<T>` names the interface `T` (an object reference), `Arc<dyn Trait>`
+//! names the callback interface `Trait`, and any other named path is a record,
+//! enum, or interface resolved later.
 
 #![deny(missing_docs)]
 
 use syn::spanned::Spanned;
 use weaveffi_ir::ir::{
-    Api, CallbackDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function, InterfaceDef,
-    ListenerDef, Module, Param, StructDef, StructField, TypeRef, CURRENT_SCHEMA_VERSION,
+    Api, CallbackInterfaceDef, EnumDef, EnumVariant, ErrorCode, ErrorDomain, Function,
+    InterfaceDef, Module, Param, StructDef, StructField, TypeRef, CURRENT_SCHEMA_VERSION,
 };
 
 /// Match a WeaveFFI marker attribute by its final path segment.
@@ -57,10 +61,6 @@ fn is_marker(attr: &syn::Attribute, name: &str) -> bool {
 /// Whether any attribute in `attrs` is the WeaveFFI marker `name`.
 pub fn has_marker(attrs: &[syn::Attribute], name: &str) -> bool {
     attrs.iter().any(|a| is_marker(a, name))
-}
-
-fn find_marker<'a>(attrs: &'a [syn::Attribute], name: &str) -> Option<&'a syn::Attribute> {
-    attrs.iter().find(|a| is_marker(a, name))
 }
 
 fn has_repr_i32(attrs: &[syn::Attribute]) -> bool {
@@ -96,33 +96,6 @@ fn parse_deprecated(attrs: &[syn::Attribute]) -> (Option<String>, Option<String>
         note = Some("deprecated".to_string());
     }
     (since, note)
-}
-
-/// Parse the listener's referenced callback from
-/// `#[weaveffi::listener(event = "Name")]` (the legacy `event_callback` key is
-/// also accepted).
-fn parse_listener_event(attr: &syn::Attribute) -> syn::Result<String> {
-    if matches!(attr.meta, syn::Meta::Path(_)) {
-        return Err(syn::Error::new_spanned(
-            attr,
-            "#[weaveffi::listener] requires `event = \"<callback name>\"`",
-        ));
-    }
-    let mut callback = None;
-    attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("event") || meta.path.is_ident("event_callback") {
-            let value = meta.value()?;
-            let lit: syn::LitStr = value.parse()?;
-            callback = Some(lit.value());
-        }
-        Ok(())
-    })?;
-    callback.ok_or_else(|| {
-        syn::Error::new_spanned(
-            attr,
-            "#[weaveffi::listener] requires `event = \"<callback name>\"`",
-        )
-    })
 }
 
 fn extract_doc(attrs: &[syn::Attribute]) -> Option<String> {
@@ -199,6 +172,41 @@ fn type_path_ident(ty: &syn::Type) -> Option<String> {
     p.path.segments.last().map(|s| s.ident.to_string())
 }
 
+/// The bare name of the single trait a `dyn Trait` object names, ignoring
+/// auto-trait and lifetime bounds (`dyn Listener + Send + Sync + 'static`).
+fn trait_object_name(ty: &syn::Type) -> Option<String> {
+    let syn::Type::TraitObject(obj) = ty else {
+        return None;
+    };
+    let mut names = obj.bounds.iter().filter_map(|b| match b {
+        syn::TypeParamBound::Trait(t) => {
+            let name = t.path.segments.last()?.ident.to_string();
+            (!matches!(name.as_str(), "Send" | "Sync" | "Unpin")).then_some(name)
+        }
+        _ => None,
+    });
+    let first = names.next()?;
+    names.next().is_none().then_some(first)
+}
+
+/// Peel `Arc<T>` to its `T`, returning any other type unchanged.
+///
+/// `Arc` is how a producer spells an interface object it holds or returns
+/// (`Arc<Store>`, `Arc<Self>`) and a callback interface it accepts
+/// (`Arc<dyn Listener>`); the IR names the pointee type in both cases.
+pub fn peel_arc(ty: &syn::Type) -> &syn::Type {
+    if let syn::Type::Path(p) = ty {
+        if let Some(seg) = p.path.segments.last() {
+            if seg.ident == "Arc" {
+                if let Ok(inner) = single_generic_arg(seg) {
+                    return inner;
+                }
+            }
+        }
+    }
+    ty
+}
+
 /// Whether a parameter's type is the reserved `weaveffi::CancelToken`.
 ///
 /// A `#[weaveffi::cancellable]` `async fn` accepts a `CancelToken` as its final
@@ -214,42 +222,52 @@ fn is_cancel_token(ty: &syn::Type) -> bool {
 ///
 /// This is the canonical mapping every caller shares. Notable conventions:
 ///
-/// * `String` is an owned `string`, `&str` a borrowed one; `Vec<u8>` is owned
-///   `bytes`, `&[u8]` borrowed.
-/// * every integer primitive maps to its matching scalar (`u64` included);
-///   `weaveffi::Handle` is the opaque `handle`, and `*mut T` / `*const T` is a
-///   typed `handle<T>`.
-/// * `Vec<T>`, `Option<T>`, and `HashMap`/`BTreeMap` map to list, optional, and
-///   map types; any other named path is a record or enum reference.
+/// * `String` and `&str` are both the `string` type; `Vec<u8>` and `&[u8]`
+///   are both `bytes`. A reference is a producer-side calling convention (the
+///   thunk lifts an owned value and lends it), not an IDL distinction.
+/// * every integer primitive maps to its matching scalar (`u64` included).
+/// * `Vec<T>` and `&[T]` are lists, `Option<T>` is an optional, and
+///   `HashMap`/`BTreeMap` are maps.
+/// * `weaveffi::Iter<T>` is an `iter<T>` return.
+/// * `Arc<T>` and `&T` name the interface `T`; `Arc<dyn Trait>` names the
+///   callback interface `Trait`. Any other named path is a record, enum,
+///   interface, or callback interface reference resolved by the validator.
 ///
 /// # Errors
 ///
 /// Returns a spanned error for type syntax WeaveFFI cannot express across the
-/// FFI boundary (for example a slice that is not `&[u8]`, or a generic with the
-/// wrong arity).
+/// FFI boundary (raw pointers, `Box<dyn Trait>`, tuples, a generic with the
+/// wrong arity, and so on).
 pub fn type_ref_from_syn(ty: &syn::Type) -> syn::Result<TypeRef> {
     match ty {
         syn::Type::Reference(r) => {
             if let syn::Type::Path(p) = r.elem.as_ref() {
                 if p.path.is_ident("str") {
-                    return Ok(TypeRef::BorrowedStr);
+                    return Ok(TypeRef::StringUtf8);
                 }
             }
             if let syn::Type::Slice(slice) = r.elem.as_ref() {
                 if is_ident(&slice.elem, "u8") {
-                    return Ok(TypeRef::BorrowedBytes);
+                    return Ok(TypeRef::Bytes);
                 }
+                return Ok(TypeRef::List(Box::new(type_ref_from_syn(&slice.elem)?)));
             }
             type_ref_from_syn(&r.elem)
         }
-        syn::Type::Ptr(p) => {
-            let name = type_path_ident(&p.elem).ok_or_else(|| {
+        syn::Type::Ptr(_) => Err(syn::Error::new(
+            ty.span(),
+            "weaveffi: raw pointers cannot cross the FFI boundary; declare the pointee as a \
+             #[weaveffi::interface] and pass it as `&T` or `Arc<T>`",
+        )),
+        syn::Type::TraitObject(_) => {
+            let name = trait_object_name(ty).ok_or_else(|| {
                 syn::Error::new(
                     ty.span(),
-                    "unsupported pointer target; expected a named type",
+                    "weaveffi: a trait object must name exactly one #[weaveffi::callback_interface] \
+                     trait (plus optional `Send`/`Sync` bounds)",
                 )
             })?;
-            Ok(TypeRef::TypedHandle(name))
+            Ok(TypeRef::Named(name))
         }
         syn::Type::Path(type_path) => {
             let seg = type_path
@@ -271,9 +289,17 @@ pub fn type_ref_from_syn(ty: &syn::Type) -> syn::Result<TypeRef> {
                 "bool" => Ok(TypeRef::Bool),
                 "String" => Ok(TypeRef::StringUtf8),
                 "u64" => Ok(TypeRef::U64),
-                // `weaveffi::Handle` (an alias of `u64`) is the explicit
-                // opaque-handle spelling; a bare `u64` is a real scalar.
-                "Handle" => Ok(TypeRef::Handle),
+                // `Arc<T>` is a reference to the interface object `T`, and
+                // `Arc<dyn Trait>` a consumer-implemented callback interface;
+                // the IR names the pointee in both cases.
+                "Arc" => type_ref_from_syn(single_generic_arg(seg)?),
+                "Box" | "Rc" => Err(syn::Error::new(
+                    ty.span(),
+                    format!(
+                        "weaveffi: `{ident}` cannot cross the FFI boundary; objects and callback \
+                         interfaces are shared, so spell them as `Arc<T>` / `Arc<dyn Trait>`"
+                    ),
+                )),
                 "Vec" => {
                     let inner = single_generic_arg(seg)?;
                     if is_ident(inner, "u8") {
@@ -395,41 +421,90 @@ fn extract_params(
                 syn::Pat::Ident(id) => id.ident.to_string(),
                 _ => return Err(syn::Error::new(pt.span(), "unsupported parameter pattern")),
             };
-            let mutable =
-                matches!(pt.ty.as_ref(), syn::Type::Reference(r) if r.mutability.is_some());
+            if matches!(pt.ty.as_ref(), syn::Type::Reference(r) if r.mutability.is_some()) {
+                return Err(syn::Error::new(
+                    pt.ty.span(),
+                    "weaveffi: `&mut` parameters cannot cross the FFI boundary; take the value \
+                     by `&T` or by value and return the updated result",
+                ));
+            }
+            let ty = type_ref_from_syn(&pt.ty)?;
+            // The proc macro path skips `validate_api` (see the macro crate),
+            // so the one type shape lowering can't represent as a parameter
+            // must be caught here with a span instead of panicking later.
+            let mut has_iterator = false;
+            ty.walk(&mut |t| has_iterator |= matches!(t, TypeRef::Iterator(_)));
+            if has_iterator {
+                return Err(syn::Error::new(
+                    pt.ty.span(),
+                    "weaveffi: `Iter<T>` is a pull handle the consumer drives and is only \
+                     valid as a function's outermost return type, not as a parameter",
+                ));
+            }
             Ok(Param {
                 name: param_name,
-                ty: type_ref_from_syn(&pt.ty)?,
-                mutable,
+                ty,
                 doc: extract_doc(&pt.attrs),
             })
         })
         .collect()
 }
 
-fn extract_function(item: &syn::ItemFn) -> syn::Result<Function> {
-    let (since, deprecated) = parse_deprecated(&item.attrs);
+/// Map one `fn` signature (free function, interface member, or callback
+/// method) to the IR [`Function`]. `returns` is supplied by the caller because
+/// constructors and `Self` returns need interface-aware handling.
+fn function_from_sig(
+    sig: &syn::Signature,
+    attrs: &[syn::Attribute],
+    returns: Option<TypeRef>,
+) -> syn::Result<Function> {
+    if let Some(ret) = &returns {
+        let nested_iterator = |t: &TypeRef| {
+            let mut found = false;
+            t.walk(&mut |inner| found |= matches!(inner, TypeRef::Iterator(_)));
+            found
+        };
+        let invalid = match ret {
+            TypeRef::Iterator(elem) => nested_iterator(elem),
+            other => nested_iterator(other),
+        };
+        if invalid {
+            let span = match &sig.output {
+                syn::ReturnType::Type(_, ty) => ty.span(),
+                other => other.span(),
+            };
+            return Err(syn::Error::new(
+                span,
+                "weaveffi: `Iter<T>` is only valid as the outermost return type; it can't be \
+                 nested in an `Option`, `Vec`, map, or another `Iter`",
+            ));
+        }
+    }
     Ok(Function {
-        name: item.sig.ident.to_string(),
-        params: extract_params(&item.sig.inputs)?,
-        returns: return_type_from_syn(&item.sig.output)?,
-        doc: extract_doc(&item.attrs),
-        throws: output_is_result(&item.sig.output),
-        r#async: item.sig.asyncness.is_some(),
-        cancellable: has_marker(&item.attrs, "cancellable"),
-        deprecated,
-        since,
+        name: sig.ident.to_string(),
+        params: extract_params(&sig.inputs)?,
+        returns,
+        doc: extract_doc(attrs),
+        throws: output_is_result(&sig.output),
+        r#async: sig.asyncness.is_some(),
+        cancellable: has_marker(attrs, "cancellable"),
+        deprecated: parse_deprecated(attrs).1,
     })
 }
 
-/// Whether the (peeled) return type names the interface itself (`Self` or the
-/// interface's own name), which classifies an associated function as a
-/// constructor.
+fn extract_function(item: &syn::ItemFn) -> syn::Result<Function> {
+    let returns = return_type_from_syn(&item.sig.output)?;
+    function_from_sig(&item.sig, &item.attrs, returns)
+}
+
+/// Whether the (peeled) return type names the interface itself (`Self`,
+/// `Arc<Self>`, or the interface's own name), which classifies an associated
+/// function as a constructor.
 fn returns_self(output: &syn::ReturnType, iface: &str) -> bool {
     let syn::ReturnType::Type(_, ty) = output else {
         return false;
     };
-    match type_path_ident(peel_result(ty)) {
+    match type_path_ident(peel_arc(peel_result(ty))) {
         Some(name) => name == "Self" || name == iface,
         None => false,
     }
@@ -442,35 +517,40 @@ fn returns_self(output: &syn::ReturnType, iface: &str) -> bool {
 /// interface-named) return on a constructor is dropped: the IR leaves a
 /// constructor's `return` empty because the instance is implicit.
 fn extract_member(item: &syn::ImplItemFn, iface: &str, is_ctor: bool) -> syn::Result<Function> {
-    let (since, deprecated) = parse_deprecated(&item.attrs);
     let returns = if is_ctor {
         None
     } else {
         match return_type_from_syn(&item.sig.output)? {
-            // `fn hand(&self) -> Self` style returns name the interface.
+            // `fn hand(&self) -> Arc<Self>` style returns name the interface.
             Some(TypeRef::Named(name)) if name == "Self" => Some(TypeRef::Named(iface.to_string())),
             other => other,
         }
     };
-    Ok(Function {
-        name: item.sig.ident.to_string(),
-        params: extract_params(&item.sig.inputs)?,
-        returns,
-        doc: extract_doc(&item.attrs),
-        throws: output_is_result(&item.sig.output),
-        r#async: item.sig.asyncness.is_some(),
-        cancellable: has_marker(&item.attrs, "cancellable"),
-        deprecated,
-        since,
-    })
+    function_from_sig(&item.sig, &item.attrs, returns)
+}
+
+/// Whether a method receiver is one WeaveFFI can lift: `&self` (a borrow for
+/// the call) or `self: Arc<Self>` (a retained reference).
+///
+/// `&mut self` and by-value `self` are rejected: the object is shared across
+/// the FFI boundary (and may be in use on other threads), so mutable state
+/// needs interior mutability.
+pub fn receiver_is_supported(recv: &syn::Receiver) -> bool {
+    if recv.mutability.is_some() {
+        return false;
+    }
+    if recv.reference.is_some() {
+        return true;
+    }
+    recv.colon_token.is_some() && type_path_ident(&recv.ty).as_deref() == Some("Arc")
 }
 
 /// Classify and extract every `pub fn` of an interface's `impl` block into
 /// the interface's constructors, methods, and statics.
 ///
-/// * a function with a `&self` receiver is a **method**;
-/// * an associated function returning `Self` (or the interface type,
-///   optionally inside `Result`) is a **constructor**;
+/// * a function with a `&self` or `self: Arc<Self>` receiver is a **method**;
+/// * an associated function returning `Self` or `Arc<Self>` (or the interface
+///   type, optionally inside `Result`) is a **constructor**;
 /// * any other associated function is a **static**.
 ///
 /// Non-`pub` items are private helpers and stay unexported.
@@ -484,12 +564,12 @@ fn members_from_impl(item_impl: &syn::ItemImpl, iface: &mut InterfaceDef) -> syn
         }
         match f.sig.receiver() {
             Some(recv) => {
-                if recv.mutability.is_some() || recv.reference.is_none() {
+                if !receiver_is_supported(recv) {
                     return Err(syn::Error::new(
                         recv.span(),
-                        "weaveffi: interface methods must take `&self`; use interior \
-                         mutability (Mutex, RwLock, Cell) for mutable state, because the \
-                         object is shared across the FFI boundary",
+                        "weaveffi: interface methods must take `&self` or `self: Arc<Self>`; \
+                         use interior mutability (Mutex, RwLock, atomics) for mutable state, \
+                         because the object is shared across the FFI boundary",
                     ));
                 }
                 iface.methods.push(extract_member(f, &iface.name, false)?);
@@ -507,21 +587,43 @@ fn members_from_impl(item_impl: &syn::ItemImpl, iface: &mut InterfaceDef) -> syn
     Ok(())
 }
 
-fn extract_callback(item: &syn::ItemFn) -> syn::Result<CallbackDef> {
-    Ok(CallbackDef {
-        name: item.sig.ident.to_string(),
-        params: extract_params(&item.sig.inputs)?,
+/// Extract a `#[weaveffi::callback_interface]` trait into a
+/// [`CallbackInterfaceDef`].
+///
+/// Every trait method is a callback method the consumer implements. Methods
+/// must take `&self`; the validator additionally rejects `async`, `Result`
+/// returns, and non-direct return types, so those are mapped faithfully here
+/// and reported with the IDL-level diagnostics.
+fn extract_callback_interface(item: &syn::ItemTrait) -> syn::Result<CallbackInterfaceDef> {
+    let mut methods = Vec::new();
+    for trait_item in &item.items {
+        let syn::TraitItem::Fn(f) = trait_item else {
+            continue;
+        };
+        match f.sig.receiver() {
+            Some(recv) if recv.reference.is_some() && recv.mutability.is_none() => {}
+            Some(recv) => {
+                return Err(syn::Error::new(
+                    recv.span(),
+                    "weaveffi: callback interface methods must take `&self`",
+                ));
+            }
+            None => {
+                return Err(syn::Error::new(
+                    f.sig.span(),
+                    "weaveffi: callback interface methods must take `&self` (associated \
+                     functions can't be implemented by the consumer)",
+                ));
+            }
+        }
+        let returns = return_type_from_syn(&f.sig.output)?;
+        methods.push(function_from_sig(&f.sig, &f.attrs, returns)?);
+    }
+    Ok(CallbackInterfaceDef {
+        name: item.ident.to_string(),
         doc: extract_doc(&item.attrs),
-    })
-}
-
-fn extract_listener(item: &syn::ItemFn) -> syn::Result<ListenerDef> {
-    let attr = find_marker(&item.attrs, "listener")
-        .ok_or_else(|| syn::Error::new(item.span(), "missing #[weaveffi::listener] attribute"))?;
-    Ok(ListenerDef {
-        name: item.sig.ident.to_string(),
-        event_callback: parse_listener_event(attr)?,
-        doc: extract_doc(&item.attrs),
+        deprecated: parse_deprecated(&item.attrs).1,
+        methods,
     })
 }
 
@@ -722,27 +824,23 @@ fn extract_error_domain(item: &syn::ItemEnum) -> syn::Result<ErrorDomain> {
 /// # Errors
 ///
 /// Returns a spanned error when an annotated item cannot be mapped to the IR
-/// (an unsupported type, an enum without `#[repr(i32)]`, a listener missing its
-/// `event`, and so on).
+/// (an unsupported type, an enum without `#[repr(i32)]`, a callback interface
+/// method without `&self`, and so on).
 pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
     let name = item_mod.ident.to_string();
     let mut functions = Vec::new();
     let mut interfaces: Vec<InterfaceDef> = Vec::new();
     let mut structs = Vec::new();
     let mut enums = Vec::new();
-    let mut callbacks = Vec::new();
-    let mut listeners = Vec::new();
+    let mut callback_interfaces = Vec::new();
     let mut modules = Vec::new();
     let mut errors: Option<ErrorDomain> = None;
 
     if let Some((_, items)) = &item_mod.content {
         for item in items {
             match item {
-                syn::Item::Fn(f) if has_marker(&f.attrs, "listener") => {
-                    listeners.push(extract_listener(f)?);
-                }
-                syn::Item::Fn(f) if has_marker(&f.attrs, "callback") => {
-                    callbacks.push(extract_callback(f)?);
+                syn::Item::Trait(t) if has_marker(&t.attrs, "callback_interface") => {
+                    callback_interfaces.push(extract_callback_interface(t)?);
                 }
                 syn::Item::Fn(f) if has_marker(&f.attrs, "export") => {
                     functions.push(extract_function(f)?);
@@ -806,8 +904,7 @@ pub fn module_from_item_mod(item_mod: &syn::ItemMod) -> syn::Result<Module> {
         interfaces,
         structs,
         enums,
-        callbacks,
-        listeners,
+        callback_interfaces,
         errors,
         modules,
     })
@@ -991,41 +1088,68 @@ mod tests {
     }
 
     #[test]
-    fn handle_and_typed_handle() {
+    fn references_and_arcs_name_the_pointee() {
         let m = one_module(
             r#"
             #[weaveffi::module]
             mod m {
                 #[weaveffi::export]
-                pub fn open() -> weaveffi::Handle { 0 }
+                pub fn open(name: &str, data: &[u8], tags: &[String]) -> Arc<Store> { todo!() }
+                #[weaveffi::export]
+                pub fn peek(store: &Store, other: Option<Arc<Store>>) -> Option<Arc<Store>> { None }
+            }
+        "#,
+        );
+        let open = &m.functions[0];
+        assert_eq!(open.params[0].ty, TypeRef::StringUtf8);
+        assert_eq!(open.params[1].ty, TypeRef::Bytes);
+        assert_eq!(
+            open.params[2].ty,
+            TypeRef::List(Box::new(TypeRef::StringUtf8))
+        );
+        assert_eq!(open.returns, Some(TypeRef::Named("Store".into())));
+        let peek = &m.functions[1];
+        assert_eq!(peek.params[0].ty, TypeRef::Named("Store".into()));
+        let opt_store = TypeRef::Optional(Box::new(TypeRef::Named("Store".into())));
+        assert_eq!(peek.params[1].ty, opt_store);
+        assert_eq!(peek.returns, Some(opt_store));
+    }
+
+    #[test]
+    fn raw_pointers_and_boxes_are_rejected() {
+        let err = api_from_src(
+            r#"
+            #[weaveffi::module]
+            mod m {
                 #[weaveffi::export]
                 pub fn close(token: *mut Token) {}
             }
         "#,
-        );
-        assert_eq!(m.functions[0].returns, Some(TypeRef::Handle));
-        assert_eq!(
-            m.functions[1].params[0].ty,
-            TypeRef::TypedHandle("Token".into())
-        );
-    }
-
-    #[test]
-    fn bare_u64_is_a_scalar_not_a_handle() {
-        let m = one_module(
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("raw pointers"));
+        let err = api_from_src(
             r#"
             #[weaveffi::module]
             mod m {
                 #[weaveffi::export]
-                pub fn sum(values: Vec<u8>) -> u64 { 0 }
-                #[weaveffi::export]
-                pub fn token(h: Handle) -> Handle { h }
+                pub fn listen(l: Box<dyn Listener>) {}
             }
         "#,
-        );
-        assert_eq!(m.functions[0].returns, Some(TypeRef::U64));
-        assert_eq!(m.functions[1].params[0].ty, TypeRef::Handle);
-        assert_eq!(m.functions[1].returns, Some(TypeRef::Handle));
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Arc<dyn Trait>"));
+        let err = api_from_src(
+            r#"
+            #[weaveffi::module]
+            mod m {
+                #[weaveffi::export]
+                pub fn bump(counter: &mut i32) {}
+            }
+        "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("&mut"));
     }
 
     #[test]
@@ -1036,7 +1160,7 @@ mod tests {
             mod m {
                 #[weaveffi::export]
                 #[weaveffi::cancellable]
-                pub async fn compact(store: *mut Store, cancel: weaveffi::CancelToken) -> i64 { 0 }
+                pub async fn compact(store: Arc<Store>, cancel: weaveffi::CancelToken) -> i64 { 0 }
             }
         "#,
         );
@@ -1046,26 +1170,106 @@ mod tests {
         // Only `store` survives; the `CancelToken` is dropped from the IDL.
         assert_eq!(f.params.len(), 1);
         assert_eq!(f.params[0].name, "store");
-        assert_eq!(f.params[0].ty, TypeRef::TypedHandle("Store".into()));
+        assert_eq!(f.params[0].ty, TypeRef::Named("Store".into()));
     }
 
     #[test]
-    fn callback_and_listener() {
+    fn interface_members_and_receivers() {
         let m = one_module(
             r#"
             #[weaveffi::module]
             mod m {
-                #[weaveffi::callback]
-                pub fn on_message(text: String) {}
-                #[weaveffi::listener(event = "on_message")]
-                pub fn messages() {}
+                #[weaveffi::interface]
+                pub struct Store;
+                impl Store {
+                    pub fn open(path: String) -> Result<Arc<Self>, StoreError> { todo!() }
+                    pub fn new() -> Self { Store }
+                    pub fn len(&self) -> u64 { 0 }
+                    pub fn share(self: Arc<Self>) -> Arc<Self> { self }
+                    pub fn default_path() -> String { String::new() }
+                    fn private(&self) {}
+                }
             }
         "#,
         );
-        assert_eq!(m.callbacks.len(), 1);
-        assert_eq!(m.callbacks[0].name, "on_message");
-        assert_eq!(m.listeners.len(), 1);
-        assert_eq!(m.listeners[0].event_callback, "on_message");
+        let s = &m.interfaces[0];
+        assert_eq!(s.constructors.len(), 2);
+        assert!(s.constructors[0].throws);
+        assert_eq!(s.constructors[0].returns, None);
+        assert_eq!(s.methods.len(), 2);
+        assert_eq!(s.methods[1].returns, Some(TypeRef::Named("Store".into())));
+        assert_eq!(s.statics.len(), 1);
+    }
+
+    #[test]
+    fn mut_self_receiver_is_rejected() {
+        let err = api_from_src(
+            r#"
+            #[weaveffi::module]
+            mod m {
+                #[weaveffi::interface]
+                pub struct Store;
+                impl Store {
+                    pub fn bump(&mut self) {}
+                }
+            }
+        "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("&self"));
+    }
+
+    #[test]
+    fn callback_interface_trait() {
+        let m = one_module(
+            r#"
+            #[weaveffi::module]
+            mod m {
+                /// Receives messages.
+                #[weaveffi::callback_interface]
+                pub trait Listener: Send + Sync {
+                    fn on_message(&self, text: String, meta: Option<Meta>);
+                    fn level(&self) -> i32;
+                }
+                #[weaveffi::export]
+                pub fn subscribe(listener: Arc<dyn Listener>) {}
+                #[weaveffi::export]
+                pub fn subscribe_bounded(listener: Arc<dyn Listener + Send + Sync>) {}
+            }
+        "#,
+        );
+        assert_eq!(m.callback_interfaces.len(), 1);
+        let cb = &m.callback_interfaces[0];
+        assert_eq!(cb.name, "Listener");
+        assert_eq!(cb.doc.as_deref(), Some("Receives messages."));
+        assert_eq!(cb.methods.len(), 2);
+        assert_eq!(cb.methods[0].params.len(), 2);
+        assert_eq!(cb.methods[1].returns, Some(TypeRef::I32));
+        assert_eq!(
+            m.functions[0].params[0].ty,
+            TypeRef::Named("Listener".into())
+        );
+        assert_eq!(
+            m.functions[1].params[0].ty,
+            TypeRef::Named("Listener".into())
+        );
+    }
+
+    #[test]
+    fn callback_interface_methods_need_self() {
+        let err = api_from_src(
+            r#"
+            #[weaveffi::module]
+            mod m {
+                #[weaveffi::callback_interface]
+                pub trait Listener {
+                    fn make() -> i32;
+                }
+            }
+        "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("&self"));
     }
 
     #[test]

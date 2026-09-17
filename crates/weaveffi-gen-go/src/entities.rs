@@ -1,22 +1,58 @@
-//! Entity rendering: plain and rich enums, records, typed error domains,
-//! typed-handle wrappers, and interface wrapper types.
-
-use std::collections::HashSet;
+//! Entity rendering: plain and rich enums, records, typed error domains, and
+//! interface (object) wrapper types.
 
 use heck::ToUpperCamelCase;
 use weaveffi_core::codegen::CodeWriter;
 use weaveffi_core::errors::ERROR_BRAND;
-use weaveffi_core::model::Ty;
 use weaveffi_core::model::{
-    BindingModel, CallShape, EnumBinding, ErrorBinding, InterfaceBinding, ModuleBinding,
-    StructBinding,
+    CallShape, EnumBinding, ErrorBinding, InterfaceBinding, ModuleBinding, StructBinding,
 };
-use weaveffi_core::utils::{c_abi_struct_name, local_type_name};
+use weaveffi_core::utils::local_type_name;
 
 use crate::calls::{render_async_function, render_function, ErrCtx};
 use crate::codec::{emit_buffer_read, emit_buffer_write};
 use crate::docs::emit_doc;
-use crate::types::{go_str, go_type, handle_wrapper};
+use crate::types::{adopt_fn, go_str, go_type, token_fn, untoken_fn};
+
+/// One `name rest` line inside a struct or const block, with its optional
+/// doc comment, for [`emit_aligned`].
+struct AlignedEntry {
+    doc: Option<String>,
+    name: String,
+    rest: String,
+}
+
+/// Emit `entries` as the body of a struct or const block the way gofmt lays
+/// it out: gofmt aligns the second column of consecutive lines and starts a
+/// fresh column after a comment line, so each run of entries following a
+/// documented one (or the start) is padded to the widest name in that run.
+fn emit_aligned(w: &mut CodeWriter, entries: &[AlignedEntry]) {
+    let docs: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let mut d = String::new();
+            emit_doc(&mut d, &e.doc, "\t", Some(&e.name));
+            d
+        })
+        .collect();
+    let mut i = 0;
+    while i < entries.len() {
+        let mut j = i + 1;
+        while j < entries.len() && docs[j].is_empty() {
+            j += 1;
+        }
+        let width = entries[i..j]
+            .iter()
+            .map(|e| e.name.len())
+            .max()
+            .unwrap_or(0);
+        for (e, d) in entries[i..j].iter().zip(&docs[i..j]) {
+            w.raw(d.clone());
+            w.line(format!("{:<width$} {}", e.name, e.rest));
+        }
+        i = j;
+    }
+}
 
 /// The PascalCase helper stem of the domain in effect for `module`, naming
 /// the per-domain `wvMap{Stem}` helper (derived from the *declaring* module's
@@ -41,12 +77,7 @@ pub(crate) fn domain_stem(module: &ModuleBinding) -> Option<String> {
 /// negative codes (generic error, producer panic, marshalling failure) can
 /// never match a `case` arm here: they fall through to the generic
 /// [`ERROR_BRAND`] fallback rather than a typed domain case.
-pub(crate) fn render_error(
-    out: &mut String,
-    module: &ModuleBinding,
-    eb: &ErrorBinding,
-    prefix: &str,
-) {
+pub(crate) fn render_error(out: &mut String, module: &ModuleBinding, eb: &ErrorBinding) {
     let stem = eb.owner_path.to_upper_camel_case();
     let ty = &eb.type_name;
     let dotted = module.segments.join(".");
@@ -79,14 +110,16 @@ pub(crate) fn render_error(
 
     w.line(format!("// {ty} codes."));
     w.block("const (", ")", |w| {
-        for c in &eb.codes {
-            let cname = format!("{ty}{}", c.name.to_upper_camel_case());
-            let doc = c.doc.clone().unwrap_or_else(|| c.message.clone());
-            let mut cd = String::new();
-            emit_doc(&mut cd, &Some(doc), "\t", Some(&cname));
-            w.raw(cd);
-            w.line(format!("{cname} int32 = {}", c.value));
-        }
+        let entries: Vec<AlignedEntry> = eb
+            .codes
+            .iter()
+            .map(|c| AlignedEntry {
+                doc: Some(c.doc.clone().unwrap_or_else(|| c.message.clone())),
+                name: format!("{ty}{}", c.name.to_upper_camel_case()),
+                rest: format!("int32 = {}", c.value),
+            })
+            .collect();
+        emit_aligned(w, &entries);
     });
     w.blank();
 
@@ -101,13 +134,16 @@ pub(crate) fn render_error(
             "// {pname} carries the structured fields of {cname}."
         ));
         w.block(format!("type {pname} struct {{"), "}", |w| {
-            for f in &c.fields {
-                let fname = f.name.to_upper_camel_case();
-                let mut fd = String::new();
-                emit_doc(&mut fd, &f.doc, "\t", Some(&fname));
-                w.raw(fd);
-                w.line(format!("{fname} {}", go_type(&f.ty)));
-            }
+            let entries: Vec<AlignedEntry> = c
+                .fields
+                .iter()
+                .map(|f| AlignedEntry {
+                    doc: f.doc.clone(),
+                    name: f.name.to_upper_camel_case(),
+                    rest: go_type(&f.ty),
+                })
+                .collect();
+            emit_aligned(w, &entries);
         });
         w.blank();
     }
@@ -140,16 +176,7 @@ pub(crate) fn render_error(
                         w.line(format!("p := &{pname}{{}}"));
                         for f in &c.fields {
                             let fname = f.name.to_upper_camel_case();
-                            emit_buffer_read(
-                                w,
-                                "r",
-                                &format!("p.{fname}"),
-                                &f.ty,
-                                &fname,
-                                0,
-                                prefix,
-                                &eb.owner_path,
-                            );
+                            emit_buffer_read(w, "r", &format!("p.{fname}"), &f.ty, &fname, 0);
                         }
                         w.line("r.expectEnd()");
                         w.line("e.Payload = p");
@@ -184,13 +211,16 @@ pub(crate) fn render_enum(out: &mut String, e: &EnumBinding) {
     w.line(format!("type {name} int32"));
     w.blank();
     w.block("const (", ")", |w| {
-        for v in &e.variants {
-            let vname = format!("{name}{}", v.name.to_upper_camel_case());
-            let mut vd = String::new();
-            emit_doc(&mut vd, &v.doc, "\t", Some(&vname));
-            w.raw(vd);
-            w.line(format!("{vname} {name} = {}", v.value));
-        }
+        let entries: Vec<AlignedEntry> = e
+            .variants
+            .iter()
+            .map(|v| AlignedEntry {
+                doc: v.doc.clone(),
+                name: format!("{name}{}", v.name.to_upper_camel_case()),
+                rest: format!("{name} = {}", v.value),
+            })
+            .collect();
+        emit_aligned(w, &entries);
     });
     w.blank();
     out.push_str(&w.finish());
@@ -204,7 +234,7 @@ pub(crate) fn render_enum(out: &mut String, e: &EnumBinding) {
 /// values only cross the ABI inside value buffers.
 ///
 /// A plain C-style enum is skipped here (it is handled by [`render_enum`]).
-pub(crate) fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: &EnumBinding) {
+pub(crate) fn render_rich_enum(out: &mut String, e: &EnumBinding) {
     if !e.is_rich() {
         return;
     }
@@ -239,13 +269,16 @@ pub(crate) fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: 
             w.line(format!("type {vn} struct{{}}"));
         } else {
             w.block(format!("type {vn} struct {{"), "}", |w| {
-                for f in &v.fields {
-                    let fname = f.name.to_upper_camel_case();
-                    let mut fd = String::new();
-                    emit_doc(&mut fd, &f.doc, "\t", Some(&fname));
-                    w.raw(fd);
-                    w.line(format!("{fname} {}", go_type(&f.ty)));
-                }
+                let entries: Vec<AlignedEntry> = v
+                    .fields
+                    .iter()
+                    .map(|f| AlignedEntry {
+                        doc: f.doc.clone(),
+                        name: f.name.to_upper_camel_case(),
+                        rest: go_type(&f.ty),
+                    })
+                    .collect();
+                emit_aligned(w, &entries);
             });
         }
         w.blank();
@@ -301,16 +334,7 @@ pub(crate) fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: 
                     for f in &v.fields {
                         let fname = f.name.to_upper_camel_case();
                         let site = format!("{}{fname}", v.name.to_upper_camel_case());
-                        emit_buffer_read(
-                            w,
-                            "r",
-                            &format!("x.{fname}"),
-                            &f.ty,
-                            &site,
-                            0,
-                            prefix,
-                            module,
-                        );
+                        emit_buffer_read(w, "r", &format!("x.{fname}"), &f.ty, &site, 0);
                     }
                     w.line("return x");
                 }
@@ -332,8 +356,10 @@ pub(crate) fn render_rich_enum(out: &mut String, prefix: &str, module: &str, e: 
 /// Render one record as a plain Go value struct with exported, typed fields,
 /// plus its pack/unpack pair serializing the fields in declaration (wire)
 /// order. Records have no C symbols: no create, no destroy, no getters, no
-/// builders; instances only cross the ABI inside value buffers.
-pub(crate) fn render_struct(out: &mut String, prefix: &str, module: &str, s: &StructBinding) {
+/// builders; instances only cross the ABI inside value buffers. An interface
+/// field holds a wrapper pointer and crosses as an object token (see
+/// [`crate::codec`]).
+pub(crate) fn render_struct(out: &mut String, s: &StructBinding) {
     let name = s.name.to_upper_camel_case();
 
     let mut w = CodeWriter::tabs();
@@ -341,13 +367,16 @@ pub(crate) fn render_struct(out: &mut String, prefix: &str, module: &str, s: &St
     emit_doc(&mut d, &s.doc, "", Some(&name));
     w.raw(d);
     w.block(format!("type {name} struct {{"), "}", |w| {
-        for f in &s.fields {
-            let fname = f.name.to_upper_camel_case();
-            let mut fd = String::new();
-            emit_doc(&mut fd, &f.doc, "\t", Some(&fname));
-            w.raw(fd);
-            w.line(format!("{fname} {}", go_type(&f.ty)));
-        }
+        let entries: Vec<AlignedEntry> = s
+            .fields
+            .iter()
+            .map(|f| AlignedEntry {
+                doc: f.doc.clone(),
+                name: f.name.to_upper_camel_case(),
+                rest: go_type(&f.ty),
+            })
+            .collect();
+        emit_aligned(w, &entries);
     });
     w.blank();
 
@@ -374,16 +403,7 @@ pub(crate) fn render_struct(out: &mut String, prefix: &str, module: &str, s: &St
             w.line(format!("var v {name}"));
             for f in &s.fields {
                 let fname = f.name.to_upper_camel_case();
-                emit_buffer_read(
-                    w,
-                    "r",
-                    &format!("v.{fname}"),
-                    &f.ty,
-                    &fname,
-                    0,
-                    prefix,
-                    module,
-                );
+                emit_buffer_read(w, "r", &format!("v.{fname}"), &f.ty, &fname, 0);
             }
             w.line("return v");
         },
@@ -392,9 +412,17 @@ pub(crate) fn render_struct(out: &mut String, prefix: &str, module: &str, s: &St
     out.push_str(&w.finish());
 }
 
-/// Render one interface as an opaque-object wrapper: a struct owning the
-/// `*C.{c_tag}` handle, freed by an explicit `Close` (idempotent, nils the
-/// pointer).
+/// Render one interface as a reference-counted object wrapper: a struct
+/// holding one strong reference (`*C.{c_tag}`) released by an explicit
+/// `Close` (idempotent, nils the pointer) or, as a backstop, by a
+/// `runtime.SetFinalizer` hook, so `destroy` runs exactly once per wrapper.
+///
+/// Three private helpers accompany the type: `wvAdopt{Name}` wraps an owned
+/// pointer coming back from the producer (a return, an async result, an
+/// iterator element, a callback-method argument) and returns nil for a null
+/// pointer, so `Interface?` needs no separate path; `wvToken{Name}` clones
+/// the wrapper's reference into a value-buffer object token; and
+/// `wvUntoken{Name}` adopts the reference a token carries.
 ///
 /// Constructors become package-level factory functions named
 /// `{PascalCtor}{Type}` (`new` gives `NewStore`, `open` gives `OpenStore`);
@@ -411,14 +439,83 @@ pub(crate) fn render_interface(
 ) {
     let name = local_type_name(&iface.name).to_upper_camel_case();
     let c_tag = &iface.c_tag;
+    let adopt = adopt_fn(&iface.name);
+    let token = token_fn(&iface.name);
+    let untoken = untoken_fn(&iface.name);
 
     let mut w = CodeWriter::tabs();
     let mut d = String::new();
     emit_doc(&mut d, &iface.doc, "", Some(&name));
-    w.raw(d);
+    if d.is_empty() {
+        w.line(format!(
+            "// {name} is a reference-counted object owned by the native library."
+        ));
+    } else {
+        w.raw(d);
+        w.line("//");
+    }
+    w.line("// Each wrapper holds one strong reference; Close releases it, and a");
+    w.line("// finalizer releases it if the wrapper is garbage collected first.");
+    if let Some(msg) = &iface.deprecated {
+        w.line("//");
+        w.line(format!("// Deprecated: {msg}"));
+    }
     w.block(format!("type {name} struct {{"), "}", |w| {
         w.line(format!("ptr *C.{c_tag}"));
     });
+    w.blank();
+
+    w.line(format!(
+        "// {adopt} adopts one owned strong reference into a new wrapper. A null"
+    ));
+    w.line("// pointer adopts to nil.");
+    w.block(
+        format!("func {adopt}(ptr *C.{c_tag}) *{name} {{"),
+        "}",
+        |w| {
+            w.block("if ptr == nil {", "}", |w| {
+                w.line("return nil");
+            });
+            w.line(format!("s := &{name}{{ptr: ptr}}"));
+            w.line(format!("runtime.SetFinalizer(s, (*{name}).Close)"));
+            w.line("return s");
+        },
+    );
+    w.blank();
+
+    w.line(format!(
+        "// {token} clones o's reference into a value-buffer object token. The"
+    ));
+    w.line("// wrapper keeps its own reference; the token carries the new one.");
+    w.block(format!("func {token}(o *{name}) uint64 {{"), "}", |w| {
+        w.block("if o == nil || o.ptr == nil {", "}", |w| {
+            w.line(format!(
+                "panic(\"weaveffi: nil or closed {name} cannot be encoded in a non-optional position\")"
+            ));
+        });
+        w.line(format!(
+            "return uint64(uintptr(unsafe.Pointer(C.{}(o.ptr))))",
+            iface.clone_symbol
+        ));
+    });
+    w.blank();
+
+    w.line(format!(
+        "// {untoken} adopts the strong reference carried by a value-buffer object"
+    ));
+    w.line("// token.");
+    w.block(
+        format!("func {untoken}(token uint64) *{name} {{"),
+        "}",
+        |w| {
+            w.block("if token == 0 {", "}", |w| {
+                w.line("panic(\"weaveffi: malformed value buffer: null object token\")");
+            });
+            w.line(format!(
+                "return {adopt}((*C.{c_tag})(C.wvHandlePtr(C.uintptr_t(token))))"
+            ));
+        },
+    );
     w.blank();
     out.push_str(&w.finish());
 
@@ -449,100 +546,16 @@ pub(crate) fn render_interface(
     }
 
     let mut w = CodeWriter::tabs();
+    w.line("// Close releases the wrapper's strong reference. Calling it more than once");
+    w.line("// is harmless; the object itself is dropped by the native library when its");
+    w.line("// last reference (from any wrapper, record, or producer) is released.");
     w.block(format!("func (s *{name}) Close() {{"), "}", |w| {
         w.block("if s.ptr != nil {", "}", |w| {
             w.line(format!("C.{}(s.ptr)", iface.destroy_symbol));
             w.line("s.ptr = nil");
+            w.line("runtime.SetFinalizer(s, nil)");
         });
     });
     w.blank();
-    out.push_str(&w.finish());
-}
-
-/// Collect every typed-handle referent reachable from the model's type
-/// positions, deduplicated by wrapper name in first-occurrence order (which
-/// keeps the emitted set deterministic).
-pub(crate) fn collect_typed_handles(model: &BindingModel, prefix: &str) -> Vec<(String, String)> {
-    fn visit(
-        ty: &Ty,
-        module: &str,
-        prefix: &str,
-        seen: &mut HashSet<String>,
-        out: &mut Vec<(String, String)>,
-    ) {
-        match ty {
-            Ty::TypedHandle(n) => {
-                let name = handle_wrapper(n);
-                if seen.insert(name.clone()) {
-                    out.push((name, c_abi_struct_name(n, module, prefix)));
-                }
-            }
-            Ty::Optional(i) | Ty::List(i) | Ty::Iterator(i) => {
-                visit(i, module, prefix, seen, out);
-            }
-            Ty::Map(k, v) => {
-                visit(k, module, prefix, seen, out);
-                visit(v, module, prefix, seen, out);
-            }
-            _ => {}
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for m in &model.modules {
-        for s in &m.structs {
-            for f in &s.fields {
-                visit(&f.ty, &m.path, prefix, &mut seen, &mut out);
-            }
-        }
-        for e in &m.enums {
-            for v in &e.variants {
-                for f in &v.fields {
-                    visit(&f.ty, &m.path, prefix, &mut seen, &mut out);
-                }
-            }
-        }
-        if let Some(eb) = &m.error {
-            if eb.declared_here {
-                for c in &eb.codes {
-                    for f in &c.fields {
-                        visit(&f.ty, &m.path, prefix, &mut seen, &mut out);
-                    }
-                }
-            }
-        }
-        for cb in &m.callbacks {
-            for p in &cb.params {
-                visit(&p.ty, &m.path, prefix, &mut seen, &mut out);
-            }
-        }
-        for f in m.callables() {
-            for p in &f.params {
-                visit(&p.ty, &m.path, prefix, &mut seen, &mut out);
-            }
-            if let Some(ret) = &f.ret {
-                visit(ret, &m.path, prefix, &mut seen, &mut out);
-            }
-        }
-    }
-    out
-}
-
-/// Render one wrapper struct per typed-handle referent. A typed handle is a
-/// borrowed opaque id with no destroy symbol, so the wrapper carries no
-/// `Close`.
-pub(crate) fn render_typed_handles(out: &mut String, handles: &[(String, String)]) {
-    let mut w = CodeWriter::tabs();
-    for (name, tag) in handles {
-        w.line(format!(
-            "// {name} is a typed handle naming a producer-owned resource. It wraps"
-        ));
-        w.line("// the opaque C pointer and owes no release call.");
-        w.block(format!("type {name} struct {{"), "}", |w| {
-            w.line(format!("ptr *C.{tag}"));
-        });
-        w.blank();
-    }
     out.push_str(&w.finish());
 }

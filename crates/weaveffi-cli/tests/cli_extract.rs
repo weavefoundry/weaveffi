@@ -281,50 +281,19 @@ mod async_demo {
 }
 
 #[test]
-fn extract_typed_handle_param() {
-    let (_dir, src_path) = write_src(
-        r#"
-#[weaveffi::module]
-mod sessions {
-    #[weaveffi::export]
-    fn close(session: *mut Session) {
-        todo!()
-    }
-}
-"#,
-    );
-
-    // `Session` is an opaque handle target the source never declares, so the
-    // extracted IDL does not validate; `--warn` emits it anyway for bootstrapping.
-    let output = assert_cmd::Command::cargo_bin("weaveffi")
-        .expect("binary not found")
-        .args(["extract", src_path.to_str().unwrap(), "--warn"])
-        .output()
-        .expect("failed to run extract");
-
-    assert!(output.status.success(), "extract command failed");
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let api: serde_yaml::Value =
-        serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let param = &api["modules"].as_sequence().unwrap()[0]["functions"]
-        .as_sequence()
-        .unwrap()[0]["params"]
-        .as_sequence()
-        .unwrap()[0];
-    assert_eq!(param["name"].as_str().unwrap(), "session");
-    assert_eq!(param["type"].as_str().unwrap(), "handle<Session>");
-}
-
-#[test]
 fn extract_fails_loud_on_invalid_api_without_warn() {
-    // An undeclared handle target makes the extracted API fail validation.
+    // An undeclared object type makes the extracted API fail validation.
     // Without `--warn`, `extract` must abort instead of emitting broken IDL.
     let (_dir, src_path) = write_src(
         r#"
+use std::sync::Arc;
+
 #[weaveffi::module]
 mod sessions {
+    use std::sync::Arc;
+
     #[weaveffi::export]
-    fn close(session: *mut Session) {
+    fn close(session: Arc<Session>) {
         todo!()
     }
 }
@@ -349,18 +318,33 @@ mod sessions {
 }
 
 #[test]
-fn extract_listener_definition() {
+fn extract_callback_interface_definition() {
     let (_dir, src_path) = write_src(
         r#"
+use std::sync::Arc;
+
 #[weaveffi::module]
 mod events {
-    /// Fired when data arrives.
-    #[weaveffi::callback]
-    fn OnData(payload: String) {}
+    use std::sync::Arc;
 
-    /// Subscribe to OnData events.
-    #[weaveffi::listener(event = "OnData")]
-    fn data_listener() {}
+    #[weaveffi::interface]
+    struct Ticker;
+
+    impl Ticker {
+        pub fn new() -> Self { Ticker }
+    }
+
+    /// Consumer-implemented sink for data events.
+    #[weaveffi::callback_interface]
+    trait DataListener: Send + Sync {
+        /// Fired when data arrives.
+        fn on_data(&self, payload: String, source: Arc<Ticker>);
+        /// Asks whether to keep delivering.
+        fn keep_going(&self, n: i32) -> bool;
+    }
+
+    #[weaveffi::export]
+    fn subscribe(listener: Arc<dyn DataListener>) {}
 }
 "#,
     );
@@ -371,31 +355,46 @@ mod events {
         .output()
         .expect("failed to run extract");
 
-    assert!(output.status.success(), "extract command failed");
+    assert!(
+        output.status.success(),
+        "extract command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let api: serde_yaml::Value =
         serde_yaml::from_str(&stdout).expect("output should be valid YAML");
     let module = &api["modules"].as_sequence().unwrap()[0];
 
-    let callbacks = module["callbacks"].as_sequence().unwrap();
-    assert_eq!(callbacks.len(), 1);
-    assert_eq!(callbacks[0]["name"].as_str().unwrap(), "OnData");
+    let interfaces = module["callback_interfaces"].as_sequence().unwrap();
+    assert_eq!(interfaces.len(), 1);
+    let listener = &interfaces[0];
+    assert_eq!(listener["name"].as_str().unwrap(), "DataListener");
     assert_eq!(
-        callbacks[0]["doc"].as_str(),
-        Some("Fired when data arrives.")
+        listener["doc"].as_str(),
+        Some("Consumer-implemented sink for data events.")
     );
 
-    let listeners = module["listeners"].as_sequence().unwrap();
-    assert_eq!(listeners.len(), 1);
-    assert_eq!(listeners[0]["name"].as_str().unwrap(), "data_listener");
+    let methods = listener["methods"].as_sequence().unwrap();
+    assert_eq!(methods.len(), 2);
+    assert_eq!(methods[0]["name"].as_str().unwrap(), "on_data");
+    assert_eq!(methods[0]["doc"].as_str(), Some("Fired when data arrives."));
+    let params = methods[0]["params"].as_sequence().unwrap();
+    assert_eq!(params[0]["type"].as_str().unwrap(), "string");
     assert_eq!(
-        listeners[0]["event_callback"].as_str().unwrap(),
-        "OnData",
-        "listener should reference its callback by name"
+        params[1]["type"].as_str().unwrap(),
+        "Ticker",
+        "an `Arc<Interface>` parameter extracts as the bare interface type"
     );
+    assert_eq!(methods[1]["name"].as_str().unwrap(), "keep_going");
+    assert_eq!(methods[1]["return"].as_str().unwrap(), "bool");
+
+    let subscribe = &module["functions"].as_sequence().unwrap()[0];
     assert_eq!(
-        listeners[0]["doc"].as_str(),
-        Some("Subscribe to OnData events.")
+        subscribe["params"].as_sequence().unwrap()[0]["type"]
+            .as_str()
+            .unwrap(),
+        "DataListener",
+        "an `Arc<dyn Trait>` parameter extracts as the callback interface"
     );
 }
 
@@ -495,7 +494,7 @@ mod store {
 }
 
 #[test]
-fn extract_deprecated_attribute_to_since() {
+fn extract_deprecated_attribute_to_note() {
     let (_dir, src_path) = write_src(
         r#"
 #[weaveffi::module]
@@ -524,15 +523,18 @@ mod legacy {
         .as_sequence()
         .unwrap()[0];
     assert_eq!(func["name"].as_str().unwrap(), "add_old");
-    assert_eq!(func["since"].as_str().unwrap(), "0.2.0");
     assert_eq!(func["deprecated"].as_str().unwrap(), "Use add_v2 instead");
+    assert!(
+        func.get("since").is_none(),
+        "schema 0.9.0 has no `since`; the version rides in the deprecation note only"
+    );
 }
 
 #[test]
-fn extract_mutable_reference_to_mutable_flag() {
-    // Only string and bytes parameters support `mutable: true` (buffered
-    // types cross the ABI as borrowed serialized buffers with no write-back
-    // lowering), so the fixture uses `&mut String`.
+fn extract_rejects_mutable_reference_params() {
+    // Write-back parameters were removed with schema 0.9.0: every parameter
+    // is borrowed or moved across the boundary, so `&mut T` has no lowering
+    // and the extractor must refuse it with an actionable message.
     let (_dir, src_path) = write_src(
         r#"
 #[weaveffi::module]
@@ -551,25 +553,120 @@ mod buffers {
         .output()
         .expect("failed to run extract");
 
-    assert!(output.status.success(), "extract command failed");
+    assert!(
+        !output.status.success(),
+        "extract should reject `&mut` parameters"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`&mut` parameters cannot cross the FFI boundary"),
+        "unexpected diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn extract_rejects_raw_pointers_and_box() {
+    for (ty, needle) in [
+        ("*mut Widget", "raw pointers cannot cross the FFI boundary"),
+        ("Box<Widget>", "`Box` cannot cross the FFI boundary"),
+    ] {
+        let (_dir, src_path) = write_src(&format!(
+            r#"
+#[weaveffi::module]
+mod objects {{
+    #[weaveffi::interface]
+    struct Widget;
+
+    impl Widget {{
+        pub fn new() -> Self {{ Widget }}
+    }}
+
+    #[weaveffi::export]
+    fn take(w: {ty}) {{}}
+}}
+"#
+        ));
+
+        let output = assert_cmd::Command::cargo_bin("weaveffi")
+            .expect("binary not found")
+            .args(["extract", src_path.to_str().unwrap()])
+            .output()
+            .expect("failed to run extract");
+
+        assert!(!output.status.success(), "extract should reject `{ty}`");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(needle),
+            "unexpected diagnostic for `{ty}`: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn extract_arc_object_shapes() {
+    // `Arc<T>` in every position lowers to the bare interface type, with
+    // `Option`, `Vec`, and record fields composing on top.
+    let (_dir, src_path) = write_src(
+        r#"
+use std::sync::Arc;
+
+#[weaveffi::module]
+mod graph {
+    use std::sync::Arc;
+
+    #[weaveffi::interface]
+    struct Node;
+
+    #[weaveffi::record]
+    struct Edge {
+        from: Arc<Node>,
+        to: Option<Arc<Node>>,
+    }
+
+    impl Node {
+        pub fn new() -> Self { Node }
+        pub fn me(self: Arc<Self>) -> Arc<Self> { self }
+        pub fn parent(&self) -> Option<Arc<Node>> { None }
+        pub fn children(&self) -> Vec<Arc<Node>> { vec![] }
+        pub fn edges(&self) -> weaveffi::Iter<Arc<Node>> { weaveffi::Iter::new(vec![]) }
+    }
+}
+"#,
+    );
+
+    let output = assert_cmd::Command::cargo_bin("weaveffi")
+        .expect("binary not found")
+        .args(["extract", src_path.to_str().unwrap()])
+        .output()
+        .expect("failed to run extract");
+
+    assert!(
+        output.status.success(),
+        "extract command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let api: serde_yaml::Value =
         serde_yaml::from_str(&stdout).expect("output should be valid YAML");
-    let params = &api["modules"].as_sequence().unwrap()[0]["functions"]
-        .as_sequence()
-        .unwrap()[0]["params"]
-        .as_sequence()
-        .unwrap();
-    assert_eq!(params[0]["name"].as_str().unwrap(), "buf");
-    assert_eq!(params[0]["mutable"].as_bool(), Some(true));
-    assert_eq!(params[1]["name"].as_str().unwrap(), "value");
-    // value is not &mut, so mutable is false (omitted from YAML by serde
-    // default skip).
-    assert!(
-        params[1].get("mutable").is_none() || params[1]["mutable"].as_bool() == Some(false),
-        "non-mut param should not have mutable=true: {:?}",
-        params[1]
-    );
+    let module = &api["modules"].as_sequence().unwrap()[0];
+
+    let edge = &module["structs"].as_sequence().unwrap()[0];
+    let fields = edge["fields"].as_sequence().unwrap();
+    assert_eq!(fields[0]["type"].as_str().unwrap(), "Node");
+    assert_eq!(fields[1]["type"].as_str().unwrap(), "Node?");
+
+    let node = &module["interfaces"].as_sequence().unwrap()[0];
+    let methods = node["methods"].as_sequence().unwrap();
+    let by_name = |n: &str| {
+        methods
+            .iter()
+            .find(|m| m["name"].as_str() == Some(n))
+            .unwrap_or_else(|| panic!("missing method {n}"))
+    };
+    assert_eq!(by_name("me")["return"].as_str().unwrap(), "Node");
+    assert_eq!(by_name("parent")["return"].as_str().unwrap(), "Node?");
+    assert_eq!(by_name("children")["return"].as_str().unwrap(), "[Node]");
+    assert_eq!(by_name("edges")["return"].as_str().unwrap(), "iter<Node>");
 }
 
 #[test]
