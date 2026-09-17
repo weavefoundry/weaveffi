@@ -137,7 +137,7 @@ mod tests {
         result_ptr: *const u8,
         result_len: usize,
     ) {
-        let tx = unsafe { &*(context as *const mpsc::Sender<TaskCbMsg>) };
+        let tx = unsafe { adopt_ctx::<TaskCbMsg>(context) };
         let code = if err.is_null() {
             0
         } else {
@@ -158,7 +158,7 @@ mod tests {
         results_ptr: *const u8,
         results_len: usize,
     ) {
-        let tx = unsafe { &*(context as *const mpsc::Sender<BatchCbMsg>) };
+        let tx = unsafe { adopt_ctx::<BatchCbMsg>(context) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
         // Decode the borrowed value buffer before returning; the launcher
         // frees it once the callback completes.
@@ -172,35 +172,39 @@ mod tests {
     }
 
     extern "C" fn n_tasks_callback(context: *mut c_void, err: *mut weaveffi_error, result: i32) {
-        let tx = unsafe { &*(context as *const mpsc::Sender<(bool, i32)>) };
+        let tx = unsafe { adopt_ctx::<(bool, i32)>(context) };
         let had_error = !err.is_null() && unsafe { (*err).code } != 0;
         let _ = tx.send((had_error, result));
     }
 
-    /// Intentionally leak a callback-context box.
+    /// Box a clone of the test's sender as the `context` for one async
+    /// launch, to be adopted by the completion callback with [`adopt_ctx`].
     ///
     /// The `#[weaveffi::module]` async launchers invoke the completion callback
-    /// on a detached worker thread, so a worker may still be inside the
-    /// callback's `send` when the test's `recv` returns (the receiver unblocks
-    /// as soon as the message is queued, before `send` finishes). Reclaiming the
-    /// box here would free the `Sender` out from under that in-flight `send`, a
-    /// use-after-free. The test deliberately leaks the context instead, which
-    /// keeps the channel alive for the brief remaining life of any in-flight
-    /// callback; the OS reclaims the memory at process exit.
-    fn leak_ctx<T>(ptr: *mut T) {
-        std::mem::forget(unsafe { Box::from_raw(ptr) });
+    /// on a detached worker thread, and the test's `recv` unblocks as soon as
+    /// the message is queued, before that worker has finished `send`. Handing
+    /// the callback a borrowed sender and freeing it after `recv` would
+    /// therefore free the channel out from under an in-flight `send`. Giving
+    /// each launch its own owned sender, released by the callback itself,
+    /// means the channel is torn down by whichever side lets go last.
+    fn ctx_for<T>(tx: &mpsc::Sender<T>) -> *mut c_void {
+        Box::into_raw(Box::new(tx.clone())).cast()
+    }
+
+    /// Take ownership of the sender [`ctx_for`] boxed for this callback. The
+    /// "callback fires exactly once" contract makes this a single adoption.
+    unsafe fn adopt_ctx<T>(ctx: *mut c_void) -> Box<mpsc::Sender<T>> {
+        unsafe { Box::from_raw(ctx.cast()) }
     }
 
     #[test]
     fn run_task_calls_callback() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
         let name = CString::new("test-task").unwrap();
 
-        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, tx_ptr as *mut c_void);
+        weaveffi_tasks_run_task_async(name.as_ptr(), task_callback, ctx_for(&tx));
 
         let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        leak_ctx(tx_ptr);
         assert_eq!(code, 0);
 
         let r = result.expect("success path passes a result buffer");
@@ -212,13 +216,11 @@ mod tests {
     #[test]
     fn run_task_empty_name_reports_invalid_name() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
 
         let empty = CString::new("").unwrap();
-        weaveffi_tasks_run_task_async(empty.as_ptr(), task_callback, tx_ptr as *mut c_void);
+        weaveffi_tasks_run_task_async(empty.as_ptr(), task_callback, ctx_for(&tx));
 
         let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        leak_ctx(tx_ptr);
         assert_eq!(code, 1, "TaskError::InvalidName's declared code");
         assert!(result.is_none(), "error path passes a null result buffer");
     }
@@ -226,15 +228,13 @@ mod tests {
     #[test]
     fn run_task_null_name_reports_marshal_error_through_the_callback() {
         let (tx, rx) = mpsc::channel::<TaskCbMsg>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
 
         // The launcher has no out_err slot, so an argument that fails to lift
         // is reported through the completion callback with the reserved
         // marshalling code, exactly like the sync path would report it.
-        weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, tx_ptr as *mut c_void);
+        weaveffi_tasks_run_task_async(std::ptr::null(), task_callback, ctx_for(&tx));
 
         let (code, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        leak_ctx(tx_ptr);
         assert_eq!(code, abi::MARSHAL_ERROR_CODE);
         assert!(result.is_none());
     }
@@ -242,7 +242,6 @@ mod tests {
     #[test]
     fn run_batch_processes_sequentially() {
         let (tx, rx) = mpsc::channel::<BatchCbMsg>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
         // The list-of-strings parameter is buffered: encode `Vec<String>`
         // and pass the (ptr, len) pair. The launcher copies the bytes before
         // returning, so the local buffer only needs to outlive the call.
@@ -252,15 +251,9 @@ mod tests {
             "task-c".to_string(),
         ]);
 
-        weaveffi_tasks_run_batch_async(
-            names.as_ptr(),
-            names.len(),
-            batch_callback,
-            tx_ptr as *mut c_void,
-        );
+        weaveffi_tasks_run_batch_async(names.as_ptr(), names.len(), batch_callback, ctx_for(&tx));
 
         let (had_error, results) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(results.len(), 3);
 
@@ -276,18 +269,11 @@ mod tests {
     #[test]
     fn run_batch_empty_names() {
         let (tx, rx) = mpsc::channel::<BatchCbMsg>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
 
         let names = abi::encode_value(&Vec::<String>::new());
-        weaveffi_tasks_run_batch_async(
-            names.as_ptr(),
-            names.len(),
-            batch_callback,
-            tx_ptr as *mut c_void,
-        );
+        weaveffi_tasks_run_batch_async(names.as_ptr(), names.len(), batch_callback, ctx_for(&tx));
 
         let (had_error, results) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert!(results.is_empty());
     }
@@ -331,10 +317,8 @@ mod tests {
     #[test]
     fn run_n_tasks_invokes_callback_with_n() {
         let (tx, rx) = mpsc::channel::<(bool, i32)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
-        weaveffi_tasks_run_n_tasks_async(7, n_tasks_callback, tx_ptr as *mut c_void);
+        weaveffi_tasks_run_n_tasks_async(7, n_tasks_callback, ctx_for(&tx));
         let (had_error, result) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        leak_ctx(tx_ptr);
         assert!(!had_error);
         assert_eq!(result, 7);
     }
@@ -343,15 +327,13 @@ mod tests {
     fn active_callbacks_returns_to_zero() {
         let mut err = weaveffi_error::default();
         let (tx, rx) = mpsc::channel::<(bool, i32)>();
-        let tx_ptr = Box::into_raw(Box::new(tx));
 
         for i in 0..16 {
-            weaveffi_tasks_run_n_tasks_async(i, n_tasks_callback, tx_ptr as *mut c_void);
+            weaveffi_tasks_run_n_tasks_async(i, n_tasks_callback, ctx_for(&tx));
         }
         for _ in 0..16 {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        leak_ctx(tx_ptr);
 
         for _ in 0..50 {
             if weaveffi_tasks_active_callbacks(&mut err) == 0 {
