@@ -1,3 +1,13 @@
+## [0.23.0](https://github.com/weavefoundry/weaveffi/compare/v0.22.0...v0.23.0) (2026-09-17)
+
+### ⚠ BREAKING CHANGES
+
+* ship ABI 2 with Arc objects and callback interfaces (#47)
+
+### Features
+
+* ship ABI 2 with Arc objects and callback interfaces ([#47](https://github.com/weavefoundry/weaveffi/issues/47)) ([4799056](https://github.com/weavefoundry/weaveffi/commit/47990560afbb72bd885e214d4798fa9452d9109c))
+
 ## [0.22.0](https://github.com/weavefoundry/weaveffi/compare/v0.21.0...v0.22.0) (2026-09-03)
 
 ### ⚠ BREAKING CHANGES
