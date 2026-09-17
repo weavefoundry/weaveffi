@@ -1,8 +1,9 @@
 # Naming and Package Conventions
 
 This page has two halves. The first is the naming policy for the WeaveFFI
-project itself: brand names, repository slugs, and package names across
-registries. The second is the naming policy the **generators** apply to
+project itself: brand names, repository slugs, package names across
+registries, and the names of the generator targets. The second is the
+naming policy the **generators** apply to
 the identifiers they emit from your IDL: C symbols, wrapper classes,
 functions, error types, and the Kotlin package. Every rule in the second
 half was checked against the output of `weaveffi generate` for the
@@ -30,6 +31,51 @@ everywhere, including in generated code (`WeaveFFIError`,
 Rationale: condensed top-level slugs unify handles across registries and
 are ergonomic to type; hyphenated subpackages remain idiomatic and map
 cleanly to ecosystems that normalize to underscores or CamelCase.
+
+### Target names
+
+A generator's target name is the one identifier that appears everywhere
+the generator does: the `--target` flag, the `[generators.<target>]`
+table in `weaveffi.toml`, the output directory under `generated/`, the
+`weaveffi-gen-<target>` crate, and the page under
+[Generators](../generators/README.md). The eleven targets are `c`, `cpp`,
+`swift`, `kotlin`, `node`, `wasm`, `python`, `dotnet`, `dart`, `go`, and
+`ruby`.
+
+The rule is to name the target after the thing a consumer holds and
+identifies with, which is sometimes a language and sometimes a runtime:
+
+- When the emitted surface is idiomatic to one language, the target is
+  that language (`swift`, `python`, `dart`, `go`, `ruby`, `kotlin`).
+- When one runtime serves several languages equally, the target is the
+  runtime (`dotnet`, `node`, `wasm`). Two targets that emit the same
+  language for different runtimes are named by runtime so they can be
+  told apart (`node` and `wasm` both emit JavaScript).
+- A deployment platform is never a target name. Where a target runs on
+  more than one platform, the platform is a setting under its
+  `[generators.<target>]` table, so adding a platform never renames the
+  target.
+
+The two cases that look inconsistent are both applications of the same
+rule:
+
+- `dotnet`, not `csharp`. The generator emits C#, but the P/Invoke surface
+  and the NuGet package are consumed equally from C#, F#, and Visual Basic,
+  so the runtime is what a consumer identifies with.
+- `kotlin`, not `android` or `jvm`. The generator was called `android`
+  through schema `0.8.0`. It was renamed because the same output runs on
+  Android and on a desktop JVM (the conformance harness drives it with
+  `kotlinc` and `java`, with no Android SDK), so a platform name described
+  only one of its runtimes. It isn't `jvm` because the emitted API depends
+  on Kotlin-only features (`suspend fun` for async, sealed classes for rich
+  enums, data classes for records), and a Java caller would not find it
+  idiomatic; naming it after the runtime would promise a language-neutral
+  surface the generator doesn't provide.
+
+A new generator should pick its name by the same test: if a second
+language could consume the output as naturally as the first, name the
+target after the runtime; otherwise name it after the language. Don't
+name it after the platform it happens to ship on first.
 
 ### Code identifiers by ecosystem
 
