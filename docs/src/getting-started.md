@@ -34,6 +34,8 @@ cargo install weaveffi-cli
 
 This puts the `weaveffi` binary on your `PATH`.
 
+For tab completion in your shell, see [Shell Completions](reference/completions.md).
+
 ## 2) Define your API as an IDL
 
 Describe the API once in a language-neutral IDL. Create `math.yml` with a

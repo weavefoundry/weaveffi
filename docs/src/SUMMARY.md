@@ -15,6 +15,7 @@
   - [Value Buffer Protocol](reference/value-buffers.md)
   - [Memory & Error Model](reference/memory-error.md)
   - [Naming and Package Conventions](reference/naming.md)
+  - [Shell Completions](reference/completions.md)
 - [Generators](generators/README.md)
   - [Kotlin](generators/kotlin.md)
   - [C](generators/c.md)
